@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/luohoa97/cordial/main/packaging/icons/org.cordial.Cordial.svg" alt="Cordial" width="460">
 </p>
 
-# Run Roblox on Linux natively — Plugins, all yours.
+# Run Roblox on Linux natively — Plugins, all yours. (Please don't DMCA take down this hobby project)
 
 Cordial loads Roblox's official Android x86-64 engine directly on Linux through a
 purpose-built runtime: the AOSP bionic linker, a bionic/glibc shim, a JNI VM in

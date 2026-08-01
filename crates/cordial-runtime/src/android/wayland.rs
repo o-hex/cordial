@@ -326,7 +326,11 @@ static TEXT_INPUT_MANAGER_METHODS: [WlMessage; 2] = [
 ];
 static TEXT_INPUT_MANAGER_INTERFACE: WlInterface = WlInterface {
     name: c"zwp_text_input_manager_v3".as_ptr(),
-    version: 1,
+    // Version 2. The manager's own request set is unchanged from 1 — the bump
+    // is on `zwp_text_input_v3` — so binding higher costs nothing and takes
+    // whatever the compositor offers. `bind` below clamps to the advertised
+    // version, so a v1-only compositor still works.
+    version: 2,
     method_count: 2,
     methods: TEXT_INPUT_MANAGER_METHODS.as_ptr(),
     event_count: 0,
@@ -751,6 +755,25 @@ struct ImeState {
     enabled: bool,
     /// The last `textbox_generation()` this was synchronised against.
     synced_generation: Option<u32>,
+    /// Whether the input method has produced any text for the current focus
+    /// session — set by the first `commit_string` or `preedit_string` to
+    /// arrive, cleared on `leave`.
+    ///
+    /// This is what stops the two paths inserting the same character twice.
+    /// Both `wl_keyboard` and `zwp_text_input_v3` can deliver text, and which
+    /// one actually does depends entirely on the user's setup: with no input
+    /// source configured — `org.gnome.desktop.input-sources sources` empty,
+    /// which is the default on a fresh GNOME — the compositor answers `enable`
+    /// with nothing but `done`, and every character arrives through
+    /// `wl_keyboard`. Configure an engine such as ibus typing-booster and the
+    /// same keystrokes arrive as preedit and commits instead, with the
+    /// compositor free to also forward the raw key.
+    ///
+    /// So neither path can be the only one, and neither can be trusted to be
+    /// silent. The keyboard path inserts text only while this is false; once
+    /// an input method speaks for this session it owns the text and the
+    /// keyboard is left to arrows, Enter and shortcuts.
+    ime_producing: bool,
 }
 
 struct XkbState {
@@ -1104,7 +1127,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     }
 
     let text_input_manager = text_input_manager_global.and_then(|(name, ver)| {
-        let m = bind(name, 1, ver, &TEXT_INPUT_MANAGER_INTERFACE, "zwp_text_input_manager_v3");
+        let m = bind(name, 2, ver, &TEXT_INPUT_MANAGER_INTERFACE, "zwp_text_input_manager_v3");
         (!m.is_null()).then_some(m)
     });
 
@@ -1263,6 +1286,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
             pending: PendingImeGroup::default(),
             enabled: false,
             synced_generation: None,
+            ime_producing: false,
         }),
         active_handle: AtomicI64::new(0),
     };
@@ -1738,6 +1762,16 @@ impl WaylandWindow {
             return;
         }
         let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else { return };
+
+        // If an input method is producing text for this session, it owns the
+        // text and the keyboard must not also insert it — otherwise every
+        // character an engine commits arrives twice. Editing keys still go
+        // through: an IME consumes the characters it composes, not the arrows.
+        let ime_owns_text = {
+            let ime = self.ime.lock().unwrap_or_else(|e| e.into_inner());
+            ime.ime_producing
+        };
+
         let typed = std::str::from_utf8(&text_buf[..text_len]).unwrap_or("");
         // Same keysym set as `window.rs`'s X11 path — see its comment for why
         // these six are handled as edits rather than as text, and why an
@@ -1750,6 +1784,7 @@ impl WaylandWindow {
             0xff53 => super::input::Edit::Move(super::input::Caret::Right),
             0xff50 => super::input::Edit::Move(super::input::Caret::Home),
             0xff57 => super::input::Edit::Move(super::input::Caret::End),
+            _ if ime_owns_text => return,
             _ => super::input::Edit::Insert(typed),
         };
         if let Some((contents, caret)) = super::input::edit_text_buffer(edit) {
@@ -1974,7 +2009,16 @@ impl WaylandWindow {
 }
 
 unsafe extern "C" fn ti_enter(_data: *mut c_void, _ti: *mut c_void, _surface: *mut c_void) {}
-unsafe extern "C" fn ti_leave(_data: *mut c_void, _ti: *mut c_void, _surface: *mut c_void) {}
+unsafe extern "C" fn ti_leave(_data: *mut c_void, _ti: *mut c_void, _surface: *mut c_void) {
+    // Focus left this surface: whatever the input method was doing no longer
+    // applies, so the keyboard path takes the text back until an input method
+    // speaks again.
+    if let Some(w) = current() {
+        let mut ime = w.ime.lock().unwrap_or_else(|e| e.into_inner());
+        ime.ime_producing = false;
+        ime.preedit = None;
+    }
+}
 
 unsafe extern "C" fn ti_preedit_string(
     _data: *mut c_void,
@@ -1988,6 +2032,9 @@ unsafe extern "C" fn ti_preedit_string(
     // nullable, NUL-terminated argument.
     let text = (!text.is_null()).then(|| unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned());
     let mut ime = w.ime.lock().unwrap_or_else(|e| e.into_inner());
+    // An input method has spoken for this session, so the keyboard path must
+    // stop inserting text — see `ImeState::ime_producing`.
+    ime.ime_producing = true;
     // A new preedit_string replaces the previous one entirely — this
     // assignment, not an append, is that rule.
     ime.pending.preedit = Some(text.map(|t| (t, cursor_begin, cursor_end)));

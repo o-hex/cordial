@@ -744,9 +744,8 @@ fn android_meta_state(x11_state: c_uint) -> i32 {
 // why the keysym table in particular carries over unchanged: X11 keysyms and
 // XKB keysyms are the same numbering.
 use super::input::{
-    deliver_key, deliver_surface_redraw, deliver_touch, edit_text_buffer, keysym_to_android,
-    pass_key_event, pass_mouse_button, pass_mouse_move, pass_text, report_keyboard_state, Caret,
-    Edit, ACTION_BUTTON_PRESS, ACTION_BUTTON_RELEASE, ACTION_DOWN, ACTION_HOVER_MOVE, ACTION_MOVE,
+    deliver_key, deliver_surface_redraw, deliver_touch, keysym_to_android,
+    pass_key_event, pass_mouse_button, pass_mouse_move, report_keyboard_state, ACTION_BUTTON_PRESS, ACTION_BUTTON_RELEASE, ACTION_DOWN, ACTION_HOVER_MOVE, ACTION_MOVE,
     ACTION_UP, BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_TERTIARY,
 };
 
@@ -898,44 +897,9 @@ impl HostWindow {
             super::trace(format_args!("unmapped X11 keysym {keysym:#x}"));
         }
 
-        // And the text path. Android text fields are edited by state, not by
-        // keystrokes — delivering the key alone leaves the box empty, which is
-        // exactly what the login form did before this. Only on key-down: a
-        // release would deliver the same state twice.
-        if down {
-            // Only when the engine has told us a box is focused, via
-            // `showKeyboard`. Sending text with no focused box means sending it
-            // to handle 0, which is not a box — the engine drops it, silently,
-            // which is exactly how this failed before.
-            let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else {
-                return;
-            };
-            let typed = if n > 0 {
-                std::str::from_utf8(&text[..n as usize]).unwrap_or("")
-            } else {
-                ""
-            };
-            // Editing keys, before text: an IME consumes these itself rather
-            // than committing them, and `XLookupString` reports nothing for
-            // them anyway. Keysyms from keysymdef.h.
-            let edit = match keysym {
-                0xff08 => Edit::Backspace,           // XK_BackSpace
-                0xffff => Edit::Delete,              // XK_Delete
-                0xff51 => Edit::Move(Caret::Left),   // XK_Left
-                0xff53 => Edit::Move(Caret::Right),  // XK_Right
-                0xff50 => Edit::Move(Caret::Home),   // XK_Home
-                0xff57 => Edit::Move(Caret::End),    // XK_End
-                _ => Edit::Insert(typed),
-            };
-            if let Some((contents, caret)) = edit_text_buffer(edit) {
-                // AGDK's GameTextInput path, and Roblox's own. Both are driven
-                // for the same reason as the mouse: the first is the documented
-                // contract, the second is what the interface reads.
-                let _ =
-                    cordial_linker_sys::game_activity::text_input(handle, &contents, caret, caret);
-                pass_text(which, &contents, caret);
-            }
-        }
+        // Nothing further: Roblox edits its own TextBox from the key events
+        // above. The shadow buffer that used to live here is gone — see the
+        // equivalent note in `wayland.rs::dispatch_key`.
     }
 
     /// Drain and deliver whatever X11 input is already queued, then return.

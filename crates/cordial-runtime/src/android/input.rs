@@ -268,7 +268,35 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
             }
         }
     }
-    let f = PASS_TEXT.load(std::sync::atomic::Ordering::Relaxed);
+    // `nativePassText` is deliberately NOT driven per keystroke.
+    //
+    // The two calls are not alternatives. `syncTextboxTextAndCursorPosition2`
+    // takes no box handle and updates whichever box has focus — that is the
+    // per-keystroke update. `nativePassText` takes the handle `showKeyboard`
+    // issued and is the *finish* call: on Android it is the soft keyboard
+    // delivering its final text and dismissing itself.
+    //
+    // Driving both on every character meant typing one letter and then hanging
+    // up, which is precisely what the trace showed — the character landed and
+    // the box immediately lost focus:
+    //
+    //     textbox focused ... current=0 bytes
+    //     key down "g" focus=Some(140515299098752)
+    //     text -> "g" caret=1
+    //     textbox blurred
+    //     ... textbox focused ... current=1 bytes   <- the "g" was accepted
+    //
+    // So the field really was receiving the text; every keystroke also ended
+    // the editing session, which is why it needed re-clicking per character and
+    // why no caret ever persisted.
+    //
+    // `CORDIAL_PASS_TEXT_ON_KEY=1` restores the old behaviour for anyone
+    // testing this claim rather than taking it on trust.
+    let f = if std::env::var_os("CORDIAL_PASS_TEXT_ON_KEY").is_some() {
+        PASS_TEXT.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        std::ptr::null_mut()
+    };
     if !f.is_null() {
         // `nativePassText(long, String, boolean, int)`. The boolean's meaning is
         // not declared anywhere Cordial can read, so it stays a knob until a run

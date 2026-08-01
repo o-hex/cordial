@@ -1776,17 +1776,59 @@ impl WaylandWindow {
             super::trace(format_args!("wayland: unmapped keysym {keysym:#x}"));
         }
 
-        // Nothing further. Roblox edits its own TextBox from the key events
-        // delivered above, exactly as it does on desktop — verified by running
-        // with the text path disabled and watching characters appear.
+        if !down {
+            return;
+        }
+        let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else { return };
+
+        // `CORDIAL_NO_TEXT_BUFFER=1` sends key events only and never text.
         //
-        // Cordial used to keep a shadow copy of the field here and push it back
-        // as authoritative. That caused every text bug in this file's history:
-        // the box cleared on focus because the copy started empty, the editing
-        // session ended on every keystroke because the whole string was
-        // re-delivered each time, and characters landed at the end because the
-        // caret was this side's guess rather than the engine's fact. None of it
-        // was needed.
+        // Cordial keeping a shadow copy of a field Roblox owns is a design
+        // error, not a feature: it is why an empty group cleared the box, why
+        // characters land at the end of the string regardless of where the
+        // caret actually is, and why the caret position is this side's guess
+        // rather than the engine's fact. Editing a text field is the input
+        // method's job on Android and the engine's job on desktop; it is not
+        // the host shim's job in either case.
+        //
+        // The open question is whether Roblox's engine edits its own TextBox
+        // from `nativePassKeyEvent` alone, as it does on desktop, in which case
+        // the buffer can be deleted outright rather than repaired. This switch
+        // is how that gets answered by running rather than by argument.
+        if std::env::var_os("CORDIAL_NO_TEXT_BUFFER").is_some() {
+            return;
+        }
+
+        // If an input method is producing text for this session, it owns the
+        // text and the keyboard must not also insert it — otherwise every
+        // character an engine commits arrives twice. Editing keys still go
+        // through: an IME consumes the characters it composes, not the arrows.
+        let ime_owns_text = {
+            let ime = self.ime.lock().unwrap_or_else(|e| e.into_inner());
+            ime.ime_producing
+        };
+
+        let typed = std::str::from_utf8(&text_buf[..text_len]).unwrap_or("");
+        // Same keysym set as `window.rs`'s X11 path — see its comment for why
+        // these six are handled as edits rather than as text, and why an
+        // unmapped keysym still falls through to `Edit::Insert` instead of
+        // being dropped.
+        let edit = match keysym {
+            0xff08 => super::input::Edit::Backspace, // XK_BackSpace
+            0xffff => super::input::Edit::Delete,    // XK_Delete
+            0xff51 => super::input::Edit::Move(super::input::Caret::Left),
+            0xff53 => super::input::Edit::Move(super::input::Caret::Right),
+            0xff50 => super::input::Edit::Move(super::input::Caret::Home),
+            0xff57 => super::input::Edit::Move(super::input::Caret::End),
+            _ if ime_owns_text => return,
+            _ => super::input::Edit::Insert(typed),
+        };
+        if let Some((contents, caret)) = super::input::edit_text_buffer(edit) {
+            if handle != 0 {
+                let _ = cordial_linker_sys::game_activity::text_input(handle, &contents, caret, caret);
+            }
+            self.send_current_text(which);
+        }
     }
 }
 

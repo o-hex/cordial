@@ -86,7 +86,27 @@ install(TARGETS badcpu ARCHIVE DESTINATION lib)
 # it records the Java classes and methods Roblox actually reaches for, which is the
 # only reliable way to turn the framework-API inventory into a work queue.
 set(JNIVM_ENABLE_DEBUG ON CACHE BOOL "" FORCE)
-set(JNIVM_ENABLE_TRACE ON CACHE BOOL "" FORCE)
+
+# JNIVM_ENABLE_TRACE printfs *every* JNI call libjnivm handles. That is
+# genuinely how most of the framework surface was discovered — `String.getBytes`
+# being unresolved on the text-entry path was found in exactly this output, and
+# nothing else would have shown it.
+#
+# It is also ruinous to leave on. The engine polls `MotionEvent.getRawX`,
+# `getRawY` and `getAxisValue` per pointer per frame, so this writes several
+# thousand unbuffered lines a second, forever, on the hot path. It was on
+# unconditionally and it made the whole machine lag, not just Cordial.
+#
+# So: off by default, and one flag to get it back when diagnosing.
+#
+#     cmake -DCORDIAL_JNI_TRACE=ON ...
+#
+# `--dump-classes` remains available without it (that is JNIVM_ENABLE_DEBUG,
+# above, which costs nothing per call) and answers "what did Roblox reach for"
+# for most purposes. Reach for the trace when the question is "and what happened
+# when it did".
+option(CORDIAL_JNI_TRACE "Log every JNI call libjnivm handles (very slow)" OFF)
+set(JNIVM_ENABLE_TRACE ${CORDIAL_JNI_TRACE} CACHE BOOL "" FORCE)
 set(JNIVM_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
 set(JNIVM_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libjnivm

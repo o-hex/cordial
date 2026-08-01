@@ -100,6 +100,46 @@ inline std::shared_ptr<String> str(const char* v) {
     return std::make_shared<String>(std::string(v ? v : ""));
 }
 
+/// `java.lang.String.getBytes(String charsetName)`
+///
+/// libjnivm provides `String` but not this method, and the engine reaches it on
+/// the text-entry path: it reads AGDK's `gametextinput/State.text` field and
+/// then converts that string to bytes before consuming it. Observed as the last
+/// thing to happen on every keystroke before nothing happened:
+///
+///     Invoked Field Getter Class=`com/google/androidgamesdk/gametextinput/State` Field=`text`
+///     Found symbol, Class=`java/lang/String`, Method=`getBytes`, Signature=`(Ljava/lang/String;)[B`
+///     Call Unknown Member Function Class=`java/lang/String` Method=`getBytes`
+///
+/// "Call Unknown Member Function" is the engine asking and getting nothing, so
+/// the text it had just read was converted to no bytes at all. Every keystroke
+/// reached AGDK correctly and died here.
+///
+/// The charset argument is accepted and ignored. libjnivm's `String` derives
+/// `std::string` and holds UTF-8 already, and the only charset Android's text
+/// input path asks for is UTF-8; honouring a request for anything else would
+/// mean carrying an encoder for a case that does not arise. If a non-UTF-8
+/// charset is ever observed here, that is worth a real conversion rather than a
+/// silent wrong answer.
+class StringBridge {
+public:
+    static std::shared_ptr<jnivm::Array<jbyte>> getBytes(ENV*, Object* self,
+                                                         std::shared_ptr<String>) {
+        auto* str = dynamic_cast<String*>(self);
+        const std::string text = str ? static_cast<const std::string&>(*str) : std::string();
+        auto out = std::make_shared<jnivm::Array<jbyte>>(static_cast<jsize>(text.size()));
+        if (!text.empty()) {
+            memcpy(out->getArray(), text.data(), text.size());
+        }
+        return out;
+    }
+
+    static void Register(ENV* env) {
+        auto c = env->GetClass("java/lang/String");
+        c->HookInstanceFunction(env, "getBytes", &StringBridge::getBytes);
+    }
+};
+
 /// `com.roblox.engine.jni.model.DeviceStaticParams`
 ///
 /// The device description Roblox reads once at startup and then believes for the
@@ -515,6 +555,7 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
     if (!env) {
         return;
     }
+    cordial::StringBridge::Register(env);
     cordial::DeviceStaticParams::Register(env);
     cordial::NativeTextBoxInfo::Register(env);
     cordial::NativeGLJavaInterface::Register(env);

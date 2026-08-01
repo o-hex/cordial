@@ -2008,6 +2008,27 @@ impl WaylandWindow {
             (g.delete, g.commit, g.preedit)
         };
 
+        // A `done` carrying nothing is an acknowledgement, not an edit. The
+        // compositor sends one in reply to `enable()`, and with no input method
+        // configured it sends *only* these — the trace of a working client
+        // shows `done(2)` through `done(13)` with no commit_string between
+        // them.
+        //
+        // Treating that as an empty edit is destructive, because what gets
+        // pushed to the engine is this side's whole idea of the field's
+        // contents, which at focus time is nothing:
+        //
+        //     textbox focused handle=139983126597760 current=0 bytes
+        //     text -> "" caret=0                  <- the field is cleared here
+        //     textbox blurred                     <- and the engine drops focus
+        //
+        // Every keystroke after that logged `focus=None`, because there was no
+        // longer a focused box to type into. So: an empty group changes
+        // nothing and must not reach the engine at all.
+        if delete.is_none() && commit.is_none() && preedit_update.is_none() {
+            return;
+        }
+
         // Applied in protocol order: delete relative to the cursor as it
         // stood before this group, then the commit is inserted at the
         // (now-current) cursor, then the new preedit — which may be "no

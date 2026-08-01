@@ -423,13 +423,27 @@ public:
 /// `com.roblox.client.startup.NativeHelper`
 ///
 /// The engine's own status channel back into the app. `onFlagsFailed` is the one
-/// Cordial has been getting, and it arrives with no explanation — so these are
-/// implemented mainly to make the engine's verdict visible rather than to do
-/// anything with it.
+/// Cordial has always gotten, on every launch — this is now investigated to a
+/// conclusion (docs/analysis/flag-init.md, commits e553d85 and bee6c14), not an
+/// open question. Confirmed live, with a debugger: it is written by
+/// `RBX::NativeDataModelManager::getFlagsFromEngine()`'s completion lambda, on a
+/// background thread whose outcome did not move across every combination this
+/// session's own bring-up could vary — the real 139-name flag list resolving
+/// correctly, the real 1.2 MB ClientSettings document being accepted
+/// (`nativeInitClientSettings` returns 0), ordering relative to
+/// `initializeNativeCode`, none of it. It has also been confirmed, separately,
+/// not to gate rendering (render-gate.md). So the message below is misleading
+/// in a way that has already cost two people real investigation time: it reads
+/// as "your flag data failed to load", and that is not what happened — the
+/// flags did load. Whatever this verdict is actually testing remains unknown;
+/// only that it is not "do I have flags".
 class NativeHelper : public Object {
 public:
     static void onFlagsFailed(ENV*, Object*) {
-        fprintf(stderr, "[roblox] flags FAILED — the engine could not load its flag set\n");
+        fprintf(stderr,
+            "[roblox] flags: engine reported onFlagsFailed (this is not the same "
+            "as flag data failing to load, and does not block startup — see "
+            "docs/analysis/flag-init.md)\n");
     }
     static void onFlagsLoaded(ENV*, Object*, std::shared_ptr<Object>) {
         fprintf(stderr, "[roblox] flags loaded\n");

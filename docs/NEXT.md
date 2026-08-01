@@ -670,8 +670,26 @@ read fault counts taken on a thrashing machine as a property of the client.
 - With ASLR disabled `libroblox` loads at `0x7fffefec0000`.
 - lldb is at `/home/linuxbrew/.linuxbrew/bin/lldb`. No gdb, no strace.
 - **Never inject input with `XTestFake*`** — it takes over the real cursor on the
-  machine you are using. Target the window with `XSendEvent`, found by `WM_CLASS`
-  `cordial`.
+  machine you are using.
+- **The `XSendEvent` advice that used to sit here is dead.** It said to target the
+  window by `WM_CLASS` `cordial`. Since [ADR-011](adr/ADR-011-wayland-and-libadwaita.md)
+  there is no X11 window to target, and an agent following it lost most of a
+  session discovering that — Sober is native Wayland too, and forcing
+  `XDG_SESSION_TYPE=x11` only makes SDL fail outright because the X11 socket is
+  not forwarded into the flatpak on a Wayland session. **Wayland has no
+  window-targeted input injection at all**, by design: `wlr-virtual-keyboard` and
+  the `RemoteDesktop` portal both inject at the compositor and land on whatever
+  has focus, which is the category the rule above forbids.
+  - **For Cordial's own window, do not synthesise at the protocol level.** Cordial
+    *is* the Wayland client, so call the path directly — `input::pass_key_event`
+    and `input::pass_text` are `pub`, and `wayland.rs`'s `dispatch_key` exercises
+    the keysym translation above them. No compositor is involved and nothing can
+    reach the developer's session.
+  - **For another application, nest a compositor.** Run it under a headless
+    `cage`/`weston` on its own `WAYLAND_DISPLAY`; a virtual-keyboard client bound
+    to *that* compositor is global only within a compositor containing one
+    window. Neither is installed on this machine as of 2026-08-02. `INFERRED` —
+    the nesting approach is standard practice but has not been tried here.
 
 ## Measuring anything
 
@@ -711,6 +729,43 @@ So the line is not the tool, it is **what you take away**:
 **One rule, applied to any binary including Roblox: observe freely, do not
 transcribe.** Sober was built by observing Roblox and nobody treats it as tainted
 for it.
+
+### What an attempt to trace Sober's text path established, and where it stopped
+
+Attempted 2026-08-02. **No call sequence was captured** — the blocker was input
+delivery, not the debugger. Recorded so nobody repeats the dead ends.
+
+- **Sober loads `libroblox.so` the same "outside the system linker" way Cordial
+  does.** No mapping in any process of its tree is named `libroblox`; the image
+  lives in an unnamed `memfd`, and it is mapped **thirteen times** at different
+  bases within one process, each an identically sized `r-xp`/`rw-p` pair. Why
+  thirteen is not established and was not pursued — that is engine internals.
+- **`LD_PRELOAD` interposition cannot work on these natives, in Sober or here.**
+  Cordial's own `crates/cordial-linker-sys/src/lib.rs` resolves them through
+  `cordial_linker_dlsym` — its *own* linker, off the ELF symbol table — and calls
+  a raw pointer. The system dynamic linker is never asked to resolve
+  `Java_com_roblox_engine_jni_NativeGLInterface_*`, so a shim shadowing that name
+  is never consulted. The `memfd`/no-named-mapping result says Sober's loader
+  does the equivalent. This is a dead end, not an untested idea.
+- **The six text-path natives are exported and their offsets are one command
+  away**, so the `0xCC` technique needs no preparation beyond a load base:
+  ```bash
+  readelf --dyn-syms -W lib/x86_64/libroblox.so | grep NativeGLInterface_
+  ```
+  Verified against the APK Sober had already downloaded. Offsets are not written
+  down here on purpose: they change every build, and a stale table would be read
+  as fact.
+- **Sober's own binaries are stripped bare.** `nm -D` and `readelf --dyn-syms` on
+  `/app/bin/sober` and `libloader.so` return zero dynamic symbols, no symtab, and
+  `strings` finds no `showKeyboard`, `setSoftKeyboardActive`, `restartInput` or
+  `gametextinput`. So the host→engine direction has no entry point reachable by
+  name. The legitimate route is breakpointing `RegisterNatives`/`GetMethodID` and
+  reading the `name`/`fnPtr` arguments off the call — recognising an unnamed
+  function by its shape instead would be the forbidden move.
+- **The remaining blocker is a keystroke**, and per the input rule above that
+  means either a human typing while breakpoints are already planted, or a nested
+  headless compositor. `ptrace_scope` is 0, so attaching works; that step was
+  simply never reached.
 
 ---
 

@@ -150,9 +150,17 @@ ABI-unsafely. Do not reach for it.
 
 ## Two practical cautions
 
-**Never synthesise input with `XTestFake*` or anything else global.** It moves
-the user's real pointer. This has already hijacked a developer's cursor once
-mid-session. Window-targeted `XSendEvent` only.
+**Never synthesise input with `XTestFake*`, `ydotool`, `wlr-virtual-keyboard`,
+the `RemoteDesktop` portal, or anything else that injects at the compositor.**
+It lands on whatever has focus, which is the developer's session. This has
+already hijacked a developer's cursor once mid-session.
+
+This rule used to end "window-targeted `XSendEvent` only", which no longer means
+anything — [ADR-011](docs/adr/ADR-011-wayland-and-libadwaita.md) is Wayland, and
+Wayland has no window-targeted injection. To drive Cordial's own input, call
+`input::pass_key_event`/`input::pass_text` directly; Cordial is the client, so
+there is nothing to send through. To drive somebody else's window, nest a
+headless compositor on its own `WAYLAND_DISPLAY` and inject inside that.
 
 **Do not test with an account anyone cares about**, and keep test accounts on a
 separate IP. The risk is collateral rather than causal: enforcement is automated,

@@ -1781,6 +1781,24 @@ impl WaylandWindow {
         }
         let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else { return };
 
+        // `CORDIAL_NO_TEXT_BUFFER=1` sends key events only and never text.
+        //
+        // Cordial keeping a shadow copy of a field Roblox owns is a design
+        // error, not a feature: it is why an empty group cleared the box, why
+        // characters land at the end of the string regardless of where the
+        // caret actually is, and why the caret position is this side's guess
+        // rather than the engine's fact. Editing a text field is the input
+        // method's job on Android and the engine's job on desktop; it is not
+        // the host shim's job in either case.
+        //
+        // The open question is whether Roblox's engine edits its own TextBox
+        // from `nativePassKeyEvent` alone, as it does on desktop, in which case
+        // the buffer can be deleted outright rather than repaired. This switch
+        // is how that gets answered by running rather than by argument.
+        if std::env::var_os("CORDIAL_NO_TEXT_BUFFER").is_some() {
+            return;
+        }
+
         // If an input method is producing text for this session, it owns the
         // text and the keyboard must not also insert it — otherwise every
         // character an engine commits arrives twice. Editing keys still go

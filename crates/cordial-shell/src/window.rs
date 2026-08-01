@@ -359,6 +359,15 @@ pub fn build(
     // what makes the window keep `app` alive and quit with it.
     window.set_application(Some(app));
 
+    // The other half of the joke, and the half that is actually seen: the task
+    // switcher and the dock take the icon from here. `APP_ID` deliberately does
+    // not change -- it is the single-instance key and has to match the desktop
+    // file's own name -- so the brand rides on the window's icon rather than on
+    // the application's identity. Both icons ship, so this name always
+    // resolves; see `branding`, which also explains why nothing polls for the
+    // date and why the repository never rebrands.
+    window.set_icon_name(Some(cordial_shell::branding::current().icon()));
+
     // Immediately left of Settings, which is what packing it second at the end
     // produces, and always present. A control that comes and goes is hard to
     // find at the moment you want it and moves everything beside it when it

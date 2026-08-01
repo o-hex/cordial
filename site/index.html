@@ -130,5 +130,43 @@ flatpak install cordial io.github.luohoa97.Cordial</code></pre>
   </footer>
 
 </div>
+
+<script>
+// Frostbite: the same page wearing the inverted palette, on two days a year.
+//
+// Client-side and hardcoded on purpose. The page is static and the switch is
+// a date comparison, so there is nothing to build, nothing to schedule and
+// nothing to deploy on the day -- and if scripting is off, the page is simply
+// Cordial, which is the correct fallback for a joke.
+//
+// Nothing polls. This runs once on load and never again: a timer for
+// something that changes twice a year would be a wakeup for no observable
+// benefit, and a visitor who leaves the tab open across midnight seeing the
+// old name is not a bug worth a setInterval.
+//
+// The name changes here and in the title, and the gradient inverts. What does
+// NOT change is anything anyone might quote: the install command, the app id,
+// the flatpak remote, the repository name. Renaming those would turn a joke
+// into a broken instruction.
+(function () {
+  var now = new Date();                       // local time: the visitor's calendar
+  var m = now.getMonth() + 1, d = now.getDate();
+  var frostbite = (m === 4 && d === 1) || (m === 12 && d === 21);
+  if (!frostbite) return;
+
+  document.title = document.title.replace(/^Cordial/, 'Frostbite');
+  document.querySelectorAll('h1').forEach(function (h) {
+    if (h.textContent.trim() === 'Cordial') h.textContent = 'Frostbite';
+  });
+
+  // The exact per-channel inversion of the mango gradient, which is why the
+  // two read as twins rather than as a recolour:
+  //   #FF1B6B -> #00E494   #FF7A18 -> #0085E7   #B4E600 -> #4B19FF
+  var css = document.createElement('style');
+  css.textContent = ':root{--brand-a:#00E494;--brand-b:#0085E7;--brand-c:#4B19FF;}';
+  document.head.appendChild(css);
+  document.documentElement.setAttribute('data-brand', 'frostbite');
+})();
+</script>
 </body>
 </html>

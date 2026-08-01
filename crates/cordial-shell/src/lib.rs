@@ -23,6 +23,7 @@
 //! and `cordial-runtime` already depends on this crate for `host_window`, so
 //! putting the gate here costs no new edge and needs no second copy.
 
+pub mod branding;
 pub mod host_window;
 pub mod network;
 pub mod profile;

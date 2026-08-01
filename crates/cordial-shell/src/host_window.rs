@@ -50,7 +50,10 @@ pub const APP_ID: &str = "Cordial";
 /// were editing looked exactly like a committed one, and an afternoon went into
 /// a regression nobody could attribute to a tree.
 pub fn title() -> String {
-    format!("Cordial {}", env!("CORDIAL_BUILD_VERSION"))
+    // The name rather than a literal, so the twice-a-year joke reaches the one
+    // place a user actually reads it. See `branding`: decided once, never
+    // polled, and never applied to anything in the repository.
+    format!("{} {}", crate::branding::current().name(), env!("CORDIAL_BUILD_VERSION"))
 }
 
 /// How much of a monitor to leave for whatever else is on it.
@@ -530,7 +533,10 @@ mod tests {
         // is worse than one that reports none, and this is here so that a
         // future suffix has to be justified rather than pasted back.
         let t = title();
-        assert!(t.starts_with("Cordial "), "{t}");
+        // Whichever face today wears -- the version has to follow the name
+        // either way, and on two days a year the name is not "Cordial".
+        let name = crate::branding::current().name();
+        assert!(t.starts_with(&format!("{name} ")), "{t}");
         for backend in ["OpenGL", "GLES", "Vulkan"] {
             assert!(!t.contains(backend), "{t} names a graphics backend");
         }

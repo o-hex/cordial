@@ -54,6 +54,14 @@ pub enum Cmd {
     Key { down: bool, evdev: i32, modifiers: i32 },
     Text(String),
     Scroll { x: f32, y: f32, detents: f32 },
+    /// Fullscreen the window, or restore it.
+    ///
+    /// Here because a resize is the one condition that has ever produced the
+    /// render stall this surface was built to investigate, and until now the
+    /// only way to drive one was `CORDIAL_SCRIPT`, which is fixed at launch --
+    /// so provoking it meant restarting the client, which loses the state you
+    /// were trying to provoke it in.
+    Fullscreen(bool),
 }
 
 static QUEUE: Mutex<Vec<Cmd>> = Mutex::new(Vec::new());
@@ -222,6 +230,10 @@ fn handle(line: &str) -> String {
             push(Cmd::Text(rest.to_string()));
             "ok".into()
         }
+        "fullscreen" | "windowed" => {
+            push(Cmd::Fullscreen(verb == "fullscreen"));
+            "ok".into()
+        }
         "scroll" => match (num(it.next()), num(it.next()), num(it.next())) {
             (Some(x), Some(y), Some(d)) => {
                 push(Cmd::Scroll { x, y, detents: d });
@@ -288,6 +300,7 @@ pub fn apply_queued(handle: i64) {
             Cmd::Scroll { x, y, detents } => {
                 crate::android::input::wheel(handle, x, y, 0.0, detents, now_ms())
             }
+            Cmd::Fullscreen(on) => crate::android::backend_set_fullscreen(on),
         }
     }
 }

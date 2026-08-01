@@ -612,6 +612,40 @@ Each was tested and each cost time. The evidence is the point.
   engine" that survived several experiments. Use a flag with an observable
   behavioural effect, and run a control.
 
+## 5. System time equals user time — and it is almost all the engine's
+
+A 30s run spends about as long in the kernel as in userland (17.3s user, 16.8s
+system) and racks up roughly 49,000 voluntary context switches. That looked like
+Cordial's pump loop thrashing. It is not.
+
+Measured across four full 30s runs against the real APK on Wayland, sampling
+every thread's `wchan` and its own `voluntary_ctxt_switches` counter from
+`/proc/<pid>/task/*/status` every 200ms:
+
+| | share of voluntary switches | parked in |
+|---|---|---|
+| `HttpClient` (engine's network thread) | ~57% | `poll_schedule_timeout` — a scheduled timer, not socket I/O, cycling ~900/s while otherwise idle |
+| `RBX Worker A`–`P` (engine task pool, one per core) | ~36% | `futex_do_wait` |
+| Cordial's own thread running `pump()` | ~4% | `ep_poll` — the single deliberate 50 ms-bounded `epoll_wait` |
+| other engine threads named `Main` | ~3% | |
+
+So **~93% is inside `libroblox.so`**, which is not Cordial's to fix under
+[ADR-001](adr/ADR-001-in-process-hooking.md). The per-iteration non-blocking
+`poll(fds, 1, 0)` on the Wayland fd and `wl_display_flush()` contribute no
+blocking `wchan` at all — they show up in the thread's running samples, not its
+sleeping ones. Cordial names no thread `Main`; those four are the engine's.
+
+**Disproved: `FIntTaskSchedulerAutoThreadLimit` is not a lever here.** Set to 1
+and to 2 (against an unset default matching core count), verified reaching the
+engine by the `flags: 1 override(s) applied` line. `RBX Worker A`…`P` still all
+spawn, and user time, system time and switch count are indistinguishable from
+baseline across every run. Negative result, repeated, recorded so nobody spends
+an afternoon on it again.
+
+**The 1,274 major page faults in the original measurement were environmental.**
+Same harness with ~3 GB less swap pressure: single and double digits. Do not
+read fault counts taken on a thrashing machine as a property of the client.
+
 ---
 
 # How to work on this

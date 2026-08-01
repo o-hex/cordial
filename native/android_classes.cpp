@@ -550,6 +550,15 @@ public:
 
 } // namespace cordial
 
+// Defined in accessibility.cpp — kept in its own file rather than added to
+// this one because it answers a platform surface (`android.view.accessibility.*`)
+// nothing else here touches, and because its own header comment is long
+// enough (the push-vs-pull accessibility-tree question) that folding it into
+// this file's already-long one would bury it.
+namespace cordial {
+void register_accessibility_classes(jnivm::ENV* env);
+}
+
 extern "C" void cordial_register_android_classes(void* env_ptr) {
     auto* env = static_cast<jnivm::ENV*>(env_ptr);
     if (!env) {
@@ -565,6 +574,7 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
     cordial::SessionReporterJavaInterface::Register(env);
     cordial::VideoCodecCapability::Register(env);
     cordial::MediaCodecInfoUtils::Register(env);
+    cordial::register_accessibility_classes(env);
     if (getenv("CORDIAL_JNI_TRACE")) {
         fprintf(stderr, "[classes] Cordial's Java side registered\n");
     }

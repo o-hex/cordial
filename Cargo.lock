@@ -288,6 +288,7 @@ dependencies = [
  "cordial-plugins",
  "serde_json",
  "ureq",
+ "zbus",
  "zip",
 ]
 

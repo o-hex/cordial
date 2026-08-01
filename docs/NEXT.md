@@ -469,6 +469,103 @@ are two capabilities.
 
 ---
 
+## 4. Accessibility — the AT-SPI bridge is built and verified live; whether Roblox ever reaches it is not
+
+New in this change: `native/accessibility.cpp` hooks
+`android.view.accessibility.{AccessibilityManager,AccessibilityNodeInfo,
+AccessibilityEvent}` the same way every other class in `android_classes.cpp`
+answers a platform service, mirrors whatever the engine populates into a
+small registry, and `crates/cordial-runtime/src/android/accessibility.rs`
+republishes that registry as a real `org.a11y.atspi.*` application on the
+accessibility bus — Linux's TalkBack equivalent, which is what Orca and other
+screen readers actually read.
+
+**This was written and tested with no Roblox APK available in the
+environment.** `crates/cordial-runtime/src/bin/load.rs --apk` needs one the
+user supplies, and none was reachable — a Waydroid instance was present but
+came back from a freeze/thaw cycle with a broken guest network (`adb`: `no
+route to host`, persisting past several retries and a `waydroid show-full-ui`
+re-attach; not debugged further, since resurrecting one stale container is
+not the point of this change). That has two consequences, and they should
+not be conflated:
+
+**Verified live, with evidence, no Roblox involved:** the AT-SPI-facing half
+of the bridge. `crates/cordial-runtime/examples/accessibility_probe.rs`
+seeds three synthetic nodes (a button, a checkbox, a label — clearly labelled
+as fixtures, never Roblox data) straight into the same C++ registry
+`AccessibilityNodeInfo`'s real hooks write to, then starts the bridge for
+real. Queried externally over the actual accessibility bus:
+
+```text
+$ busctl --address="unix:path=/run/user/1001/at-spi/bus" tree :1.253
+└─ /org/a11y/atspi/accessible
+   ├─ /org/a11y/atspi/accessible/node
+   │  ├─ /org/a11y/atspi/accessible/node/1
+   │  ├─ /org/a11y/atspi/accessible/node/2
+   │  └─ /org/a11y/atspi/accessible/node/3
+   └─ /org/a11y/atspi/accessible/root
+```
+
+with `GetRole`/`GetRoleName`/`GetState`/`GetExtents` all reading back
+correctly (`push button` for the seeded button, `[1124075776, 0]` for its
+state word — hand-verified against `ATSPI_ROLE_PUSH_BUTTON`/the
+`AtspiStateType` ordinals in `/usr/include/at-spi-2.0/atspi/atspi-constants.h`,
+bit-for-bit), and — after fixing a real bug found this way, not guessed —
+`org.a11y.atspi.Registry`'s own tree lists Cordial as an embedded
+application, meaning `busctl --user tree org.a11y.atspi.Registry`-style
+discovery works, not only a direct connection to a known bus name.
+
+**The bug, for the record:** the first `Socket.Embed` call sent
+`&(bus_name, ROOT_PATH)` as the method body, which `zbus`/`zvariant` encodes
+as *two* top-level arguments (`ss`) rather than the *one* struct-typed
+argument (`(so)`) the real method takes — confirmed via `gdbus introspect`
+against the live registry before writing the fix. The registry's own daemon
+did not error, it simply never replied (`NoReply: Remote peer disconnected`),
+which would have been very easy to misdiagnose as a permissions or
+bus-address problem rather than a wire-format one. Fixed in
+`android::accessibility::connect` by wrapping the struct in an extra
+one-element tuple and using a real `OwnedObjectPath` rather than a bare
+`&str` for the path half. **Correction to this task's own brief:**
+`busctl --user tree org.a11y.atspi.Registry` alone does not reach the
+accessibility bus — `--user` targets the *session* bus, and the AT-SPI bus is
+a separate socket obtained via `org.a11y.Bus.GetAddress`; the working form is
+`busctl --address="unix:path=<that address>" tree org.a11y.atspi.Registry`.
+
+**Not verified, and not claimed:** anything about what Roblox's engine
+actually does. `native/accessibility.cpp`'s own header comment lays out the
+structural question this leaves open — real Android's accessibility tree is
+*pull* (`AccessibilityNodeProvider`, Java/Kotlin app code the platform calls
+into on demand), not *push*, and per this project's own established finding
+on `MainGameActivity.bootstrapTheApp()`, Java/Kotlin application logic
+cannot execute under Cordial at all. If Roblox's Android build implements
+accessibility that way, no amount of hooking `AccessibilityNodeInfo` reaches
+it, for the same structural reason hooking getters alone never reached
+FastFlags bootstrap. What *is* plausible, and is what this file is written
+to catch if true, is the engine building nodes directly over JNI the way it
+does everything else in `android_classes.cpp` (a native-to-Java push, no app
+subclass involved) — but only a live run with `CORDIAL_ACCESSIBILITY=1
+CORDIAL_JNI_TRACE=1` (or `--dump-classes`) against a real APK, past sign-in,
+with a genuine assistive technology attached, distinguishes the two. **Do
+this before claiming Cordial makes Roblox screen-reader-usable** — everything
+in this section is "the pipe works", not "there is water in it".
+
+**Also not done, on purpose:** forwarding
+`AccessibilityManager.sendAccessibilityEvent` as a real AT-SPI signal — it is
+captured (see `cordial_accessibility_next_event`) and currently only logged
+to stderr by the poll loop, because getting `org.a11y.atspi.Event.Object`'s
+own signal shapes right needs the same live-verification treatment `Embed`
+just got, and this change was long enough already. `Action::DoAction` also
+always answers `false`, honestly rather than as a stub that lies — see
+`android/accessibility.rs`'s own header comment on why there is no receiver
+for an invoked action to reach yet, the same shape of gap as the provider
+question above.
+
+**Deaf users need nothing from this work** — captions and visual alerts are a
+different, unbuilt piece of work; nothing here touches it, and nothing cheap
+and real for it turned up while doing this one.
+
+---
+
 # Do not re-run these
 
 Each was tested and each cost time. The evidence is the point.

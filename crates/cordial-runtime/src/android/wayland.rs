@@ -1296,14 +1296,10 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     unsafe {
         if !pointer.is_null() {
             (host.wl.add_listener)(pointer, &POINTER_LISTENER as *const PointerListener as *const c_void, std::ptr::null_mut());
-            // Hide the host cursor over this window — same reasoning as
-            // `window.rs`'s blank-pixmap cursor: Roblox draws its own, and a
-            // second host-drawn one sitting on top of it is a visible bug,
-            // not a preference. `CORDIAL_SHOW_CURSOR=1` restores it for
-            // debugging.
-            if std::env::var_os("CORDIAL_SHOW_CURSOR").is_none() {
-                (host.wl.marshal_flags)(pointer, WL_POINTER_SET_CURSOR, std::ptr::null(), 1, 0, 0u32, std::ptr::null_mut::<c_void>(), 0i32, 0i32);
-            }
+            // The cursor is hidden from `pointer_enter`, not here — see
+            // `hide_pointer`. Sending it at setup was wrong twice over: there
+            // is no valid serial to send yet, and the request has to be
+            // repeated on every enter regardless.
         }
         if !keyboard.is_null() {
             (host.wl.add_listener)(keyboard, &KEYBOARD_LISTENER as *const KeyboardListener as *const c_void, std::ptr::null_mut());
@@ -1485,13 +1481,14 @@ impl WaylandWindow {
 
 unsafe extern "C" fn pointer_enter(
     _data: *mut c_void,
-    _pointer: *mut c_void,
-    _serial: u32,
+    pointer: *mut c_void,
+    serial: u32,
     _surface: *mut c_void,
     x: i32,
     y: i32,
 ) {
     if let Some(w) = current() {
+        w.hide_pointer(pointer, serial);
         w.dispatch_pointer_motion(fixed_to_f32(x), fixed_to_f32(y));
     }
 }
@@ -1837,6 +1834,40 @@ impl WaylandWindow {
     /// engine — the one place both the hardware-key path and the IME `done`
     /// path funnel through, so they cannot disagree about how a live preedit
     /// is displayed.
+    /// Hide the host cursor over this surface.
+    ///
+    /// `wl_pointer.set_cursor` takes the serial of the `wl_pointer.enter` it is
+    /// answering, and a compositor ignores the request with any other value —
+    /// which is why doing this once at setup with a serial of `0`, as this
+    /// previously did, silently did nothing and left two cursors on screen.
+    ///
+    /// It also has to be repeated on *every* enter: the cursor a client sets
+    /// applies to that enter only, and reverts as soon as the pointer leaves
+    /// and returns. A null surface is the protocol's way of saying "no cursor
+    /// at all", which is what Roblox wants because it draws its own.
+    ///
+    /// `CORDIAL_SHOW_CURSOR=1` restores the host cursor for debugging input.
+    fn hide_pointer(&self, pointer: *mut c_void, serial: u32) {
+        if pointer.is_null() || std::env::var_os("CORDIAL_SHOW_CURSOR").is_some() {
+            return;
+        }
+        // SAFETY: `pointer` is the live `wl_pointer` this event arrived on, and
+        // the argument list matches `set_cursor`'s `uoii` signature.
+        unsafe {
+            (self.wl.marshal_flags)(
+                pointer,
+                WL_POINTER_SET_CURSOR,
+                std::ptr::null(),
+                1,
+                0,
+                serial,
+                std::ptr::null_mut::<c_void>(),
+                0i32,
+                0i32,
+            );
+        }
+    }
+
     fn send_current_text(&self, which: i64) {
         let (committed, caret) = super::input::text_buffer_snapshot();
         let preedit = self.ime.lock().unwrap_or_else(|e| e.into_inner()).preedit.clone();

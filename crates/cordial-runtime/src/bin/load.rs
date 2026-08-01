@@ -329,6 +329,17 @@ fn main() -> ExitCode {
 
     cordial_runtime::android::set_trace(std::env::var_os("CORDIAL_ANDROID_TRACE").is_some());
 
+    // Started this early, before `JNI_OnLoad`, so the AT-SPI bus connection
+    // (a D-Bus round trip) has as much time as possible to finish before the
+    // engine's first `AccessibilityManager.isEnabled()` check — the whole
+    // point of `native/accessibility.cpp` reading a plain atomic there rather
+    // than blocking on D-Bus is wasted if this is started too late for the
+    // atomic to have flipped by the time it matters. Not a hard ordering
+    // guarantee (the bridge thread and the engine's own load sequence race),
+    // but every millisecond of head start narrows that race rather than
+    // widening it.
+    cordial_runtime::android::accessibility::start();
+
     let table = symtab::build(opt.host_libc);
     let totals = table.totals();
 

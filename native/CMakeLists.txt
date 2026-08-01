@@ -92,7 +92,7 @@ set(JNIVM_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libjnivm
                  ${CMAKE_CURRENT_BINARY_DIR}/libjnivm EXCLUDE_FROM_ALL)
 
-add_library(cordial_jni_shim STATIC jni_shim.cpp android_classes.cpp game_activity.cpp init_params.cpp)
+add_library(cordial_jni_shim STATIC jni_shim.cpp android_classes.cpp game_activity.cpp init_params.cpp accessibility.cpp)
 target_link_libraries(cordial_jni_shim PUBLIC jnivm)
 
 install(TARGETS cordial_jni_shim jnivm ARCHIVE DESTINATION lib)

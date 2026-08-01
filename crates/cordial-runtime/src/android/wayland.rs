@@ -79,7 +79,7 @@
 //! it was meant to pair with actually exists in the buffer yet.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // ------------------------------------------------------------- wire layout
@@ -1643,10 +1643,31 @@ unsafe extern "C" fn keyboard_enter(
     _surface: *mut c_void,
     _keys: *const WlArray,
 ) {
+    KEYBOARD_FOCUSED.store(true, Ordering::Release);
 }
-unsafe extern "C" fn keyboard_leave(_data: *mut c_void, _kb: *mut c_void, _serial: u32, _surface: *mut c_void) {}
+/// Whether the compositor currently gives this surface keyboard focus.
+///
+/// `wl_keyboard.leave` was an empty stub, so Cordial kept processing every key
+/// the seat delivered even after focus moved to another window — a `Ctrl+C`
+/// typed into a terminal appeared in Cordial's own trace. That is a real
+/// privacy problem and not merely a correctness one: a game client has no
+/// business seeing keystrokes aimed at other applications, whatever it does
+/// with them afterwards.
+///
+/// Wayland is not at fault here; the compositor sends `leave` precisely so a
+/// client knows to stop. Cordial simply was not listening.
+static KEYBOARD_FOCUSED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn keyboard_leave(_data: *mut c_void, _kb: *mut c_void, _serial: u32, _surface: *mut c_void) {
+    KEYBOARD_FOCUSED.store(false, Ordering::Release);
+}
 
 unsafe extern "C" fn keyboard_key(_data: *mut c_void, _kb: *mut c_void, _serial: u32, _time: u32, key: u32, state: u32) {
+    // Not ours to see. The seat can still deliver events around a focus
+    // change; `KEYBOARD_FOCUSED` is what makes that harmless.
+    if !KEYBOARD_FOCUSED.load(Ordering::Acquire) {
+        return;
+    }
     if let Some(w) = current() {
         w.dispatch_key(key, state == 1);
     }

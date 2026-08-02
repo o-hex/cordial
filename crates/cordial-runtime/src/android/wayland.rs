@@ -774,8 +774,12 @@ unsafe impl Send for WaylandWindow {}
 unsafe impl Sync for WaylandWindow {}
 
 static WINDOW: OnceLock<WaylandWindow> = OnceLock::new();
-/// TEMPORARY INSTRUMENTATION -- not for commit.
-static INSTRUMENTED: OnceLock<bool> = OnceLock::new();
+
+/// TEMPORARY INSTRUMENTATION -- not for commit. `CORDIAL_INSTR=1`.
+fn instr_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_INSTR").is_some())
+}
 
 // -------------------------------------------------------------- construction
 
@@ -1161,10 +1165,16 @@ impl WaylandWindow {
             unsafe { (egl.resize)(egl_win, width, height, 0, 0) };
         }
         let handle = self.active_handle.load(Ordering::Relaxed);
+        if instr_on() {
+            eprintln!("[instr] surface_resized -> {width}x{height}");
+        }
         if handle != 0 {
             if let Err(e) = cordial_linker_sys::game_activity::surface_resized(handle, format, width, height) {
                 super::trace(format_args!("wayland: surface resize failed: {e}"));
             }
+        }
+        if instr_on() {
+            eprintln!("[instr] surface_resized {width}x{height} returned");
         }
     }
 
@@ -1187,6 +1197,9 @@ impl WaylandWindow {
         if moved {
             INSTR_SET_POSITIONS.fetch_add(1, Ordering::Relaxed);
             INSTR_QUEUE_COMMITS.fetch_add(1, Ordering::Relaxed);
+            if instr_on() {
+                eprintln!("[instr] set_position({x}, {y}) size={w}x{h}");
+            }
             // SAFETY: `self.subsurface` is a live proxy for the process's
             // lifetime and `set_position`'s signature is "ii".
             unsafe {
@@ -1204,6 +1217,15 @@ impl WaylandWindow {
             // queue_commit`.
             self.host.0.queue_commit();
         }
+        // `onSurfaceRedrawNeededNative` was tried here, on both halves of this
+        // function, and **did not help** — see docs/NEXT.md §1e. The reasoning
+        // was that `window.rs` drives that native from the final X11 `Expose`
+        // and this backend drives it from nowhere, so an idle engine has nothing
+        // telling it the canvas moved. The measurement says the engine already
+        // repaints on `surface_resized` by itself: over the idle fullscreen
+        // cycle of two otherwise identical 240-second runs, presents totalled
+        // ~75 without the call and ~74 with it. Left out rather than kept as a
+        // plausible-sounding no-op.
         self.apply_resize(w, h);
     }
 
@@ -2178,7 +2200,6 @@ extern "C" {
 }
 
 // TEMPORARY INSTRUMENTATION -- not for commit. See the session notes.
-static INSTR_PUMPS: AtomicI64 = AtomicI64::new(0);
 static INSTR_SET_POSITIONS: AtomicI64 = AtomicI64::new(0);
 static INSTR_QUEUE_COMMITS: AtomicI64 = AtomicI64::new(0);
 
@@ -2193,71 +2214,19 @@ pub fn instr_geometry() -> String {
     )
 }
 
-#[allow(dead_code)]
-fn instr_tick(w: &WaylandWindow) {
-    use std::sync::OnceLock;
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    static LAST: Mutex<Option<(std::time::Instant, u64, u64, i64)>> = Mutex::new(None);
-    let start = *START.get_or_init(std::time::Instant::now);
-    let now = std::time::Instant::now();
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    let (t0, p0, q0, i0) = *last.get_or_insert((now, 0, 0, 0));
-    if now.duration_since(t0).as_millis() < 1000 {
-        return;
-    }
-    let p = super::glcount::QUEUE_PRESENT.load(Ordering::Relaxed);
-    let q = super::looper::POLLS.load(Ordering::Relaxed);
-    let i = INSTR_PUMPS.load(Ordering::Relaxed);
-    let dt = now.duration_since(t0).as_secs_f64();
-    eprintln!(
-        "[instr] t={:5.1}s presents/s={:6.1} looperpolls/s={:9.0} pumps/s={:8.0} rect={:?} placed={:?} setpos={} qcommit={}",
-        now.duration_since(start).as_secs_f64(),
-        (p - p0) as f64 / dt,
-        (q - q0) as f64 / dt,
-        (i - i0) as f64 / dt,
-        w.host.0.content_rect(),
-        *w.placed_at.lock().unwrap_or_else(|e| e.into_inner()),
-        INSTR_SET_POSITIONS.load(Ordering::Relaxed),
-        INSTR_QUEUE_COMMITS.load(Ordering::Relaxed),
-    );
-    *last = Some((now, p, q, i));
-}
-
-/// Drive fullscreen from a timer, so the transition can be observed without a
-/// click. `CORDIAL_FS_TEST=<enter>,<leave>` in seconds.
-fn instr_fullscreen(w: &WaylandWindow) {
-    use std::sync::OnceLock;
-    static SCHEDULE: OnceLock<Option<(f64, f64)>> = OnceLock::new();
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    static DONE: Mutex<(bool, bool)> = Mutex::new((false, false));
-    let sched = *SCHEDULE.get_or_init(|| {
-        let v = std::env::var("CORDIAL_FS_TEST").ok()?;
-        let (a, b) = v.split_once(',')?;
-        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-    });
-    let Some((enter, leave)) = sched else { return };
-    let start = *START.get_or_init(std::time::Instant::now);
-    let t = start.elapsed().as_secs_f64();
-    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
-    if !done.0 && t >= enter {
-        done.0 = true;
-        eprintln!("[instr] t={t:5.1}s gtk_window_fullscreen()");
-        w.host.0.set_fullscreen(true);
-    }
-    if !done.1 && t >= leave {
-        done.1 = true;
-        eprintln!("[instr] t={t:5.1}s gtk_window_unfullscreen()");
-        w.host.0.set_fullscreen(false);
+/// Drive fullscreen without a click, from `looper::pump`'s scripted timeline.
+/// `gtk_window_fullscreen` is a request to the compositor made by this client
+/// about its own window, so it exercises the same configure path a dragged
+/// edge does without going anywhere near the developer's session.
+pub fn instr_set_fullscreen(on: bool) {
+    if let Some(w) = current() {
+        w.host.0.set_fullscreen(on);
     }
 }
 
 impl WaylandWindow {
     fn pump(&self, handle: i64) {
         self.active_handle.store(handle, Ordering::Relaxed);
-        if INSTRUMENTED.get_or_init(|| std::env::var_os("CORDIAL_INSTR").is_some()) == &true {
-            instr_fullscreen(self);
-        }
-
         let (gw, gh, _) = self.geometry();
         super::input::report_keyboard_state((gw, gh));
 

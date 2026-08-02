@@ -527,7 +527,7 @@ matching buffer makes GTK stall on the engine's frame rate. `wp_viewporter`
 scaling the stale buffer hides the seam by showing a stretched old frame, which
 is a different wrong picture rather than none.
 
-## 1c. A Wayland protocol error killed a signed-in session. Not reproduced — but the reason it was undiagnosable is fixed
+## 1c. A Wayland protocol error killed a signed-in session. Reproduced logged out, and the timer turns out to be Mesa's
 
 Reported once, on a real signed-in session, minutes after reaching the home
 page:
@@ -555,20 +555,88 @@ Gdk-Message: 16:04:10.242: Error 71 (Protocol error) dispatching to Wayland disp
 
 So the object and the reason are now on the record: `wp_commit_timer_v1`
 error 1, which is `commit_timer_v1.error.timestamp_exists` — a second
-`set_timestamp` on a surface that already had one before its next commit. That
-is `wp_commit_timing_v1`, GTK's frame-timing protocol, on a surface GTK owns.
-
-**`INFERRED`, and the obvious next thing to test:** Cordial commits the *parent*
-toplevel itself (`host.queue_commit`, to latch the subsurface's
-`set_position`), and GTK also drives that same surface through its frame clock.
-Two clients of one surface, one of which schedules timestamps, is the shape the
-error describes. Nobody has tested it — the way to would be a control run with
-`queue_commit` suppressed, checking whether the error stops and whether the
-canvas then sits under the header bar as it did before that call existed.
+`set_timestamp` on a surface that already had one before its next commit.
 
 Five earlier logged-out runs (two at 120s and 180s before any change, three at
 180s after) reached `APP_READY (Landing)` with no protocol error, which is
 consistent with roughly one in eight rather than with "does not happen".
+
+### The timer is Mesa's, on Cordial's own canvas. It is not GTK's, and `queue_commit` is not a commit
+
+**Correction, and this paragraph replaces the one it grew out of.** What used to
+stand here read the error as "Cordial commits the *parent* toplevel itself
+(`host.queue_commit`), and GTK also drives that same surface through its frame
+clock. Two clients of one surface." It also called `wp_commit_timing_v1` "GTK's
+frame-timing protocol, on a surface GTK owns". **Every clause of that is wrong.**
+`WAYLAND_DEBUG=1` on a run that reproduced the error says so by object id — one
+run in thirteen, 20-second runs, logged out. The log is the whole answer.
+
+The surfaces, from that log:
+
+```text
+-> wl_compositor#4.create_surface(new id wl_surface#47)      GTK's toplevel
+-> wl_compositor#108.create_surface(new id wl_surface#76)    the engine's canvas
+-> wl_subcompositor#104.get_subsurface(new id wl_subsurface#75, wl_surface#76, wl_surface#47)
+```
+
+and the object the compositor killed the connection over:
+
+```text
+{mesa vk display queue} -> wp_commit_timing_manager_v1#63.get_timer(new id wp_commit_timer_v1#105, wl_surface#76)
+{mesa vk display queue} -> wp_commit_timer_v1#105.set_timestamp(0, 197598, 391623000)
+wl_display#1.error(wp_commit_timer_v1#105, 1, "Commit already has timestamp")
+```
+
+The timer belongs to **Mesa's Vulkan WSI**, and it is attached to
+**`wl_surface#76` — the engine's own canvas subsurface**, not to GTK's toplevel.
+GDK creates no `wp_commit_timer_v1` anywhere in the log; every `set_timestamp`
+on #105 is Mesa's, one per present.
+
+`HostWindow::queue_commit` is `gtk_widget_queue_draw`. It does not emit
+`wl_surface.commit` and never did — it asks GTK to repaint, and GTK's own commit
+is what latches `set_position`. Cordial sends no request whatever on GTK's
+surface. Counted over a 45-second run: `wl_subsurface.set_position` fired **0**
+times and `queue_commit` **0** times after startup, because `sync_canvas_geometry`
+acts only when the content rectangle moves and on an untouched window it never
+does.
+
+What the wire does show is Mesa issuing, for every present of #76:
+
+```text
+-> wl_surface#76.attach(wl_buffer#122, 0, 0)
+-> wl_surface#76.damage(0, 0, 2147483647, 2147483647)
+-> wp_commit_timer_v1#105.set_timestamp(0, 197598, 391623000)
+-> wp_fifo_v1#106.set_barrier()
+-> wp_fifo_v1#106.wait_barrier()
+-> wl_surface#76.commit()
+-> wp_fifo_v1#106.wait_barrier()
+-> wl_surface#76.commit()
+```
+
+two commits per present, driven from two of Mesa's event queues at once —
+`{mesa vk display queue}` and `{mesa vk surface 76 swapchain 1 queue}` interleave
+throughout the trace. Immediately before the error a present was issued **1 ms**
+after the previous one against an otherwise steady 20 ms cadence, and
+`wl_buffer#122` was re-attached before its `release` had been dispatched. Two
+threads inside one swapchain's present path is what that looks like, and a second
+`set_timestamp` before the intervening commit is what the compositor refused.
+
+**Not established: whether Cordial provokes it.** The one thing Cordial does that
+an ordinary Vulkan client does not is hand Mesa a `wl_display` that GDK also owns
+— and there are *two* Vulkan swapchains on that connection, because GTK renders
+through Mesa's WSI too and took commit timers on `wl_surface#47` earlier in the
+same log. Nothing was measured either way.
+
+**A rate to plan against, so nobody reads a clean run as a fix.** Sixteen
+25-second baseline runs gave one occurrence; thirteen 20-second `WAYLAND_DEBUG`
+runs gave one. In the reproducing log the error fired ~3.6 s into a presenting
+burst, so the exposure that counts is **frames presented, not seconds elapsed** —
+on the order of one in ten thousand presents. A 240-second run with continuous
+input (~6,000 presents) came back clean, and that is **not** evidence of
+anything.
+
+**Do not re-run:** the "two committers on one surface" theory, or a control with
+`queue_commit` suppressed. Both are answered above, by object id.
 
 ### Why that line was the whole of the evidence, and why it will not be again
 
@@ -672,6 +740,157 @@ appearing later in the session — a monitor hotplug, a seat — would run
 `registry_global` against `open()`'s long-dead stack frame. That is §1a bug 2
 with a write instead of a call. Now `Box::leak`ed. Not observed to fire; fixed
 because it is one of the two shapes this file has already been bitten by.
+
+## 1d. The frame rate. `vkQueuePresentKHR` over a fixed window measures the engine's idle throttle, not the frame rate
+
+**This corrects the metric the rest of this file uses**, including §1a's own
+"547, 548 and 550 over three consecutive 25-second runs" and the 1286-1625 over
+120-180 s recorded elsewhere. Those numbers are real and they are not frame
+rates. Sampled per second instead of totalled, the curve is:
+
+```text
+[instr] t=  4.0s presents/s=  59.5
+[instr] t= 13.1s presents/s=  60.0
+[instr] t= 16.3s presents/s=   1.0
+[instr] t= 31.5s presents/s=   1.0     ... and 1.0 for the rest of the run
+```
+
+About 60 per second for roughly the first thirteen seconds, and then **exactly
+1.0 per second**, for as long as the run lasts. Every historical total is that
+curve integrated: 60x13 + 1x12 is 792, 50x11 + 1x14 is 564, and the 526-658
+spread across sixteen 25-second baseline runs is the burst ending a second or
+two earlier or later.
+
+**The cause is that nothing is happening.** Deliver pointer motion through
+Cordial's own input path — `input::deliver_touch` plus `input::pass_mouse_move`,
+which "Debugging facts that cost real time" below already permits because no
+compositor is involved — and the rate holds at 50-60 per second for a whole
+240-second run with no collapse at all. Turn the motion off mid-run and it drops
+to 1.0 within two seconds; turn it back on and it is at 50 within one. Both
+directions, twice, in one run.
+
+**The control that matters: it is not the Wayland backend.** The identical
+binary on X11, no input, same session, shows the same 60-then-1.0 collapse at the
+same point in the run — three times on each backend. So this is the engine's own
+idle behaviour on the app shell, not `wayland.rs`, not the subsurface, and not
+anything about commits.
+
+**Ruled out:** that the engine thinks it lost the window.
+`onWindowFocusChangedNative(true)` re-sent 25 s into a run, after the collapse,
+returns `Ok(Some(()))` and changes nothing — still 1.0 per second. Do not spend
+another session on the focus native; `native/game_activity.cpp` already sends it
+once at surface handoff and that call is doing its job.
+
+**What this does and does not say about 45 fps against Sober's 70.** Measured
+here, with continuous input:
+
+| | presents/s |
+|---|---|
+| windowed, 1280x721 | 49-60 |
+| fullscreen, 3440x1394 | 49.4 mean over 26 samples |
+| idle, any size | 1.0 |
+
+**The rate is the refresh rate of the output the window is on**, and quadrupling
+the pixel count does not move it: this desk has a 1920x1200@60.002 panel and a
+3440x1440@49.998 monitor, and the numbers above are those two refresh rates. So
+the engine is not GPU-bound here at all — it is hard vsync-locked, because Mesa
+is using `wp_fifo_v1` on this surface, visible on the wire as
+`set_barrier`/`wait_barrier` around every commit.
+
+A reported 70 is *above* both of these refresh rates, so whatever Sober is doing
+is not FIFO-throttled. That is a swapchain present-mode difference; it lives in
+`vulkan.rs`, which this work did not touch. **Nothing here reproduces or explains
+a 45.** With input the engine sits exactly on refresh at both sizes tried. The
+owner's 45 is presumably inside an experience, where there is real scene load and
+the answer may be entirely different; that was never measured.
+
+**How to measure it next time.** Per-second deltas of
+`android::glcount::QUEUE_PRESENT`, with input being delivered, and say which
+resolution. A total over a fixed window with an idle app shell answers a
+different question than the one being asked.
+
+**Unexplained and left alone:** `ALooper_pollOnce` is called about **9.5 million
+times per second**, constantly, on both backends. Cordial's own pump loop
+accounts for 20-60 of those per second, counted separately in the same runs, so
+the rest is an engine thread spinning. It costs a core and it was not
+investigated.
+
+## 1e. Fullscreen moves the canvas through two wrong (position, size) pairings
+
+Driven in-process with `gtk_window_fullscreen` from a scripted timer — allowed,
+and not input injection — twice per direction in one 240-second run. What Cordial
+actually sends, logged at the call:
+
+```text
+script: fullscreen
+  set_position(0, 46) size=1280x721      <- fullscreen position, windowed size
+  surface_resized -> 3440x1394
+script: windowed
+  set_position(12, 58) size=3440x1394    <- an intermediate inset, fullscreen size
+  surface_resized -> 1280x721
+  set_position(25, 71) size=1280x721     <- settled, about three seconds later
+```
+
+`sync_canvas_geometry` reads one `content_rect()` and applies its position and
+its size together, so these are not Cordial tearing them apart — GTK reports the
+rectangle in that order as the transition settles, and each intermediate is
+faithfully forwarded. Exactly **one** `surface_resized` per transition, so there
+is no swapchain-rebuild storm; the cost is that the canvas is visibly out of
+register with the window for the seconds in between.
+
+**Which size the intermediate `set_position(12, 58)` carries is a race.** Across
+four leave-fullscreen transitions in two runs it was `3440x1394` twice and
+`1280x721` twice — GTK had applied the position half of the transition and the
+size half in either order by the time the pump sampled it. That is the same
+non-atomicity §1b is about, arriving through the allocation rather than through
+the buffer, and §1b's `set_sync`-while-resizing remedy is still the untried
+candidate for both.
+
+**Why it looks permanent.** At 1.0 present per second (§1d) the wrong frame stays
+on screen until the engine draws again, and the engine draws again when the user
+moves the mouse — which is exactly what dragging the window edge does. With input
+flowing the same transition corrects itself in about three seconds and the rate
+never leaves 50/s.
+
+**Not reproduced: a state that stays broken.** The report is of a canvas that
+stays wrong until the window is dragged. What is reproducible from a timer is a
+transient. `gtk_window_fullscreen` may not exercise the same path as a
+compositor-driven fullscreen, and the owner's case may involve a different size
+or monitor. Anyone with a keyboard should check it by hand before this is called
+closed.
+
+**Tried and it did not help: `onSurfaceRedrawNeededNative` on a geometry
+change.** `window.rs` drives that native from the final X11 `Expose` and this
+backend drove it from nowhere at all, so the argument was that an idle engine has
+nothing telling it the canvas moved. Two otherwise identical 240-second runs,
+minutes apart in one session, over the idle fullscreen cycle: **~75 presents
+without the call and ~74 with it**, and the per-second shape is the same either
+way. The engine already repaints on `surface_resized` by itself. The call was
+removed again rather than left in looking like a fix; `sync_canvas_geometry`
+carries a comment saying so, so that the next person reaches for something else.
+
+**How both of the above were driven, since it needs no human.** `CORDIAL_INSTR=1`
+plus `CORDIAL_SCRIPT=20:motion-on,70:fullscreen,100:windowed,130:motion-off,
+160:fullscreen,190:windowed,220:motion-on` runs the whole timeline from
+`looper::pump` in one launch — `gtk_window_fullscreen` for the transitions and
+Cordial's own `input::deliver_touch`/`pass_mouse_move` for the pointer, so no
+compositor is involved and nothing can reach the developer's session. One launch
+covers both fullscreen directions twice, with and without input, and prints
+presents, looper polls, pump iterations and the content rectangle every second.
+Use it instead of a handful of short runs; every launch is a window on somebody's
+desktop.
+
+**Three readings from a `WAYLAND_DEBUG=1` run that are wrong, retracted here
+before they mislead anyone.** That run showed (a) the pump thread emitting no
+tick for 12.6 s after leaving fullscreen, (b) presents at 0-3/s for a further
+twelve seconds with input still flowing, and (c) fullscreen running at 20-25/s.
+All three looked like findings. All three are artefacts of the tracer: the same
+script without `WAYLAND_DEBUG`, minutes later in the same session, has **no tick
+gap over two seconds anywhere in the run**, holds 50/s straight through both
+transitions, and averages 49.4/s in fullscreen. `WAYLAND_DEBUG` writes a line per
+request on a connection three parties share. **Do not measure timing under it** —
+use it for object identity and request order, which is what it is good for and
+what settled §1c.
 
 ## 2. Sign-in itself
 
@@ -1176,6 +1395,17 @@ read fault counts taken on a thrashing machine as a property of the client.
   moved with machine load, so before/after samples taken under different load are
   meaningless.
 - Label anything you could not test **`INFERRED`**.
+- **Know what your instrument costs.** `WAYLAND_DEBUG=1` produced three separate
+  timing "findings" in one session that all evaporated when the same script was
+  run without it (§1e). It is excellent for object identity and request order and
+  worthless for anything with a clock in it.
+- **A total is not a rate.** `vkQueuePresentKHR` counted over a fixed window on
+  the landing page measures the engine's idle throttle far more than its frame
+  rate — §1d has the curve. Sample per second, and say whether input was being
+  delivered.
+- **Prefer one long run to many short ones.** A launch puts a window on the
+  owner's desktop. `CORDIAL_SCRIPT` (§1e) exists so that one `--run 240` can
+  carry a whole matrix of conditions with its own controls inside it.
 
 ## A limit on the capture, stated honestly
 

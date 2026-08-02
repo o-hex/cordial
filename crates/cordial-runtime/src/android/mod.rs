@@ -141,6 +141,13 @@ pub fn backend_instr_geometry() -> String {
     }
 }
 
+/// TEMPORARY INSTRUMENTATION -- not for commit.
+pub fn backend_set_fullscreen(on: bool) {
+    if let Backend::Wayland = backend() {
+        wayland::instr_set_fullscreen(on);
+    }
+}
+
 /// Drain and deliver whatever host input is queued, for the active backend.
 pub fn pump_input_events(handle: i64) {
     match backend() {

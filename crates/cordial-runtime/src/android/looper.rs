@@ -192,9 +192,56 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
     let mut tick = start;
     let (mut p0, mut q0, mut i0) = (0u64, 0u64, 0u64);
     let mut iters: u64 = 0;
+    // `CORDIAL_SCRIPT=60:fullscreen,90:windowed,120:motion-off` -- a timeline of
+    // things a human would otherwise have to do by hand, so that one launch
+    // covers what would otherwise be several. Fullscreen through
+    // `gtk_window_fullscreen` and pointer motion through Cordial's own input
+    // path are both allowed; nothing here goes near the compositor.
+    let mut script: Vec<(f64, String)> = std::env::var("CORDIAL_SCRIPT")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.split_once(':'))
+        .filter_map(|(t, a)| Some((t.trim().parse().ok()?, a.trim().to_string())))
+        .collect();
+    script.reverse();
+    let mut motion = false;
 
     while std::time::Instant::now() < deadline {
         iters += 1;
+        if instr {
+            let t = start.elapsed().as_secs_f64();
+            while script.last().is_some_and(|(at, _)| t >= *at) {
+                let (_, action) = script.pop().expect("just peeked");
+                eprintln!("[instr] t={t:5.1}s script: {action}");
+                match action.as_str() {
+                    "fullscreen" => super::backend_set_fullscreen(true),
+                    "windowed" => super::backend_set_fullscreen(false),
+                    "motion-on" => motion = true,
+                    "motion-off" => motion = false,
+                    other => eprintln!("[instr] unknown script action {other}"),
+                }
+            }
+            if motion {
+                // Wiggle the pointer inside the canvas through Cordial's own
+                // input path. No compositor is involved, so nothing can reach
+                // the developer's own session -- see docs/NEXT.md's rule.
+                if let Some(handle) = game_activity_handle {
+                    let (x, y) = (640.0 + 100.0 * (t as f32).sin(), 360.0 + 100.0 * (t as f32).cos());
+                    let ms = (t * 1000.0) as i64;
+                    super::input::deliver_touch(
+                        handle,
+                        super::input::ACTION_HOVER_MOVE,
+                        x,
+                        y,
+                        0,
+                        0,
+                        ms,
+                        0,
+                    );
+                    super::input::pass_mouse_move(x, y);
+                }
+            }
+        }
         if instr && tick.elapsed() >= std::time::Duration::from_secs(1) {
             let dt = tick.elapsed().as_secs_f64();
             tick = std::time::Instant::now();

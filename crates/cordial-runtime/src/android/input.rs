@@ -235,6 +235,9 @@ pub fn deliver_key(
     event_time_ms: i64,
     down_time_ms: i64,
 ) {
+    if no_agdk_key() {
+        return;
+    }
     match cordial_linker_sys::game_activity::key(
         handle,
         down,
@@ -383,6 +386,9 @@ pub fn report_keyboard_state(current_geometry: (i32, i32)) {
 /// both 32 — so "only D works" is the signature of a raw evdev code reaching
 /// something that wanted an Android one, and one traced keystroke settles it.
 pub fn pass_key_event(down: bool, key_code: i32, modifiers: i32) {
+    if no_pass_key() {
+        return;
+    }
     let f = PASS_KEY_EVENT.load(std::sync::atomic::Ordering::Relaxed);
     if f.is_null() {
         report_unregistered("nativePassKeyEvent");
@@ -618,6 +624,35 @@ pub fn trace_wheel() -> bool {
 fn no_agdk_touch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CORDIAL_NO_AGDK_TOUCH").is_some())
+}
+
+/// `CORDIAL_NO_AGDK_KEY=1` and `CORDIAL_NO_PASS_KEY=1` — send a keystroke down
+/// only one of the two paths that currently both carry it.
+///
+/// **Every key press is delivered to the engine twice**, through AGDK's
+/// `onKeyDownNative` and through `NativeInputInterface.nativePassKeyEvent`, and
+/// until now there was no way to run either alone. The touch path has had that
+/// control since the focus-bounce investigation; the key path never did, so
+/// nobody has ever observed one in isolation.
+///
+/// That matters because the symptom does not look like a mapping error. Both
+/// natives are registered, both are called, both receive the correct Android
+/// keycodes, and both report the engine consumed them — measured — and yet only
+/// `D` moves the character, and Ctrl+Alt makes it *jump*. Jump is `SPACE`, and
+/// no encoding of Ctrl or Alt is anywhere near `SPACE` in any of the four
+/// numbering schemes in play here, so this is not an off-by-N. Two deliveries
+/// of one press, interpreted differently, is the variable nobody has removed.
+///
+/// Both default to sending, which is the behaviour every measurement so far was
+/// taken under.
+fn no_agdk_key() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_NO_AGDK_KEY").is_some())
+}
+
+fn no_pass_key() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_NO_PASS_KEY").is_some())
 }
 
 /// Whether to acknowledge the keyboard to the engine at all. **Off by default.**

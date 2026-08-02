@@ -97,29 +97,37 @@ built cannot.
 If you want an executor, this is the wrong project, and pull requests adding one
 will be declined.
 
-## Status: early. It runs and draws; you cannot sign in yet.
+## Status: early. You can sign in and reach the app; the input is wrong.
 
 | | |
 |---|---|
 | Loads `libroblox.so` natively | ✅ |
 | App shell reaches `APP_READY (Landing)` | ✅ |
-| Renders — Vulkan, with GLES2 fallback | ✅ |
+| Renders — Vulkan on both backends | ✅ |
 | Networking / HTTPS | ✅ |
+| **Signing in** | ✅ **via Quick Sign-in**, which is a code flow and needs no typing |
+| Typing into text fields | ❌ characters reach the engine correctly and are not drawn until the field loses focus |
 | Mouse: navigation, buttons, field focus | ✅ |
-| Typing into text fields | ❌ the last step before sign-in |
-| Audio | ❌ OpenSL ES is stubbed to report failure; nothing translates it to PipeWire yet |
-| Clean shutdown | ✅ full pause/stop/destroy sequence |
-| Stable | ✅ 26 consecutive clean launches |
-| Frame rate | ✅ ~27 fps on Vulkan, ~33 fps on GLES |
-| Signed in | ❌ login form renders and is reachable; typing is the blocker |
-| Plugins | 🟡 host and capability broker built; not yet wired to the running client |
+| Mouse: turning the camera in an experience | ❌ |
+| Scroll wheel | ❌ `AXIS_VSCROLL`/`AXIS_HSCROLL` are never populated |
+| Keyboard in an experience | ❌ |
+| Staying signed in across a restart | ❌ the engine never writes its cookies to disk, and nothing else does either |
+| Window — libadwaita header bar, engine as a subsurface | ✅ |
+| Launching from the shell | ✅ finds a build, or explains how to get one |
+| Audio | ❌ OpenSL ES reports failure honestly; a PipeWire backend exists but nothing reaches it before sign-in |
+| Web views (Marketplace, Profile, Communities…) | ❌ the surface is mapped; `openNativeOverlay` now reports instead of silently swallowing |
+| Clean shutdown | ✅ full pause/stop/destroy sequence, observed in the engine's own log |
+| Plugins | 🟡 host, capability broker and per-profile settings built; not yet wired to the running client |
 
-Measured with `vkQueuePresentKHR`: 656, 656 and 655 presents over 24 s across
-three runs, unchanged by injected input — so it renders continuously rather than
-on demand.
+Measured with `vkQueuePresentKHR`: 547, 548 and 550 presents over 25 s across
+three runs — it renders continuously rather than on demand.
 
-The blocker now is sign-in. Without a session the client sits on the logged-out
-landing page, so there is nothing much to do with it.
+**The blocker is no longer sign-in, it is input.** Roblox queries
+`android.view.InputDevice` to decide what hardware exists and Cordial does not
+implement it, so the client cannot tell that a keyboard or a mouse is present.
+Sessions are the other half: the engine hands its cookies to the platform and
+never persists them itself, which on Android is the Java side's job and here is
+nobody's, so every launch starts logged out.
 
 **Do not install this expecting to play Roblox.** Install it if you want to work
 on it.

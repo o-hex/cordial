@@ -28,17 +28,35 @@
 // otherwise would only move that failure somewhere less legible. See
 // `pipewire_backend.cpp` for how "unreachable" is decided.
 //
-// Recording (`SL_IID_RECORD`) stays unimplemented on purpose, and now for a
-// sharper reason than when this comment was first written. It is not that
-// capturing the microphone is out of scope — `audio_classes.cpp` implements
-// that path, gated so that no PipeWire capture stream exists unless Roblox has
-// asked to record. It is that Roblox's Android build does not record through
-// OpenSL ES at all: it records through
-// `org.webrtc.voiceengine.WebRtcAudioRecord`, which wraps
-// `android.media.AudioRecord`, and the shipping dex declares exactly that
-// surface. So `CreateAudioRecorder` continues to report failure, because
-// implementing it would add a second way to open the microphone that nothing
-// asks for, and one door is easier to keep shut than two.
+// Recording (`SL_IID_RECORD`) is implemented here, which reverses what this
+// comment said until now. The previous revision refused `CreateAudioRecorder`
+// outright, arguing that Roblox records through
+// `org.webrtc.voiceengine.WebRtcAudioRecord` rather than through OpenSL ES and
+// that implementing a recorder would add "a second way to open the microphone
+// that nothing asks for". The second half of that still holds as a principle;
+// the first half was an inference from the dex declaring a WebRTC surface, and
+// it does not survive `docs/analysis/undefined-symbols.tsv`: `libroblox.so`
+// references `SL_IID_RECORD` as a linked data symbol. That does not prove the
+// engine calls `CreateAudioRecorder` — a linked IID proves the code that
+// *could* was compiled in, no more — but it does mean the OpenSL recorder is a
+// path the engine has, and refusing it was closing a door on the basis that
+// nobody had checked whether anyone was behind it.
+//
+// The privacy rule is what makes implementing it the safer answer rather than
+// the riskier one. A recorder object exists from `CreateAudioRecorder` and
+// survives `Realize`, and neither of those opens anything: the PipeWire capture
+// stream is created by `SLRecordItf::SetRecordState(SL_RECORDSTATE_RECORDING)`
+// and destroyed — not paused, not muted, destroyed — by `SL_RECORDSTATE_PAUSED`,
+// `SL_RECORDSTATE_STOPPED` and `Destroy`. So the microphone's lifetime is
+// exactly the engine's own recording state, which is a thing an outside
+// observer can check with `pw-dump` while the client runs, and is what
+// `native/audio_probe.cpp` checks. Refusing to implement the recorder would
+// have made that guarantee vacuous rather than true.
+//
+// `WebRtcAudioRecord` in `audio_classes.cpp` is still refused, and that is not
+// an inconsistency: voice chat there has no downlink (`WebRtcAudioTrack` is not
+// implemented), so a microphone opened for it would be feeding a session with
+// nothing to play the other side of.
 //
 // Device *enumeration* is likewise not here. Roblox reads
 // `AudioManager.getDevices(int)` and `android.media.AudioDeviceInfo`, which are
@@ -66,12 +84,17 @@
 // pattern AOSP's own OpenSL ES implementation uses, and the only one that
 // does not require this file to reproduce Khronos's actual UUID byte values.
 
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <deque>
 #include <mutex>
+#include <string>
+#include <thread>
 
 #include "pipewire_backend.h"
 
@@ -99,6 +122,7 @@ constexpr SLboolean SL_BOOLEAN_TRUE = 1;
 
 constexpr SLresult SL_RESULT_SUCCESS = 0x00000000;
 constexpr SLresult SL_RESULT_PARAMETER_INVALID = 0x00000002;
+constexpr SLresult SL_RESULT_RESOURCE_ERROR = 0x00000004;
 constexpr SLresult SL_RESULT_BUFFER_INSUFFICIENT = 0x00000007;
 constexpr SLresult SL_RESULT_CONTENT_UNSUPPORTED = 0x00000009;
 // See the file header: this is 12, not 7.
@@ -112,9 +136,13 @@ constexpr SLint32 SL_PRIORITY_NORMAL = 0x00000000;
 constexpr SLmillibel SL_MILLIBEL_MAX = 0x7FFF;
 constexpr SLmillibel SL_MILLIBEL_MIN = -SL_MILLIBEL_MAX - 1;
 
+constexpr SLuint32 SL_DATALOCATOR_IODEVICE = 0x00000003;
 constexpr SLuint32 SL_DATALOCATOR_OUTPUTMIX = 0x00000004;
 // Android extension range; see the file header comment.
 constexpr SLuint32 SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE = 0x800007BD;
+
+constexpr SLuint32 SL_IODEVICE_AUDIOINPUT = 0x00000001;
+constexpr SLuint32 SL_DEFAULTDEVICEID_AUDIOINPUT = 0xFFFFFFFF;
 
 constexpr SLuint32 SL_DATAFORMAT_PCM = 0x00000002;
 constexpr SLuint32 SL_ANDROID_DATAFORMAT_PCM_EX = 0x00000004;
@@ -125,6 +153,10 @@ constexpr SLuint32 SL_BYTEORDER_BIGENDIAN = 0x00000001;
 constexpr SLuint32 SL_PLAYSTATE_STOPPED = 0x00000001;
 constexpr SLuint32 SL_PLAYSTATE_PAUSED = 0x00000002;
 constexpr SLuint32 SL_PLAYSTATE_PLAYING = 0x00000003;
+
+constexpr SLuint32 SL_RECORDSTATE_STOPPED = 0x00000001;
+constexpr SLuint32 SL_RECORDSTATE_PAUSED = 0x00000002;
+constexpr SLuint32 SL_RECORDSTATE_RECORDING = 0x00000003;
 
 constexpr SLuint32 SL_TIME_UNKNOWN = 0xFFFFFFFF;
 
@@ -154,6 +186,17 @@ struct SLDataLocator_OutputMix {
 struct SLDataLocator_AndroidSimpleBufferQueue {
     SLuint32 locatorType;
     SLuint32 numBuffers;
+};
+
+/// The source side of an audio recorder: which input device the recording
+/// comes from. `device` is an `SLObjectItf` naming a specific IO device
+/// object; Android's own recorders leave it null and set `deviceID` to
+/// `SL_DEFAULTDEVICEID_AUDIOINPUT`, which is the only shape accepted below.
+struct SLDataLocator_IODevice {
+    SLuint32 locatorType;
+    SLuint32 deviceType;
+    SLuint32 deviceID;
+    void* device; // SLObjectItf, never dereferenced here
 };
 
 /// Classic `SLDataFormat_PCM` (7 `SLuint32` fields) and the Android
@@ -233,6 +276,32 @@ struct SLPlayItf_ {
     SLresult (*GetMarkerPosition)(SLPlayItf self, SLmillisecond* pMsec);
     SLresult (*SetPositionUpdatePeriod)(SLPlayItf self, SLmillisecond mSec);
     SLresult (*GetPositionUpdatePeriod)(SLPlayItf self, SLmillisecond* pMsec);
+};
+
+// --------------------------------------------------------------- SLRecordItf
+//
+// Deliberately the same shape as `SLPlayItf_` one field at a time, because it
+// is: the spec defines the two symmetrically, and a recorder's state machine
+// is the player's with `SetPlayState` renamed. The one asymmetry that matters
+// here is not in the vtable at all — see `record_SetRecordState`, where a
+// state change is what creates and destroys a microphone.
+
+struct SLRecordItf_;
+using SLRecordItf = const SLRecordItf_* const*;
+
+struct SLRecordItf_ {
+    SLresult (*SetRecordState)(SLRecordItf self, SLuint32 state);
+    SLresult (*GetRecordState)(SLRecordItf self, SLuint32* pState);
+    SLresult (*SetDurationLimit)(SLRecordItf self, SLmillisecond msec);
+    SLresult (*GetPosition)(SLRecordItf self, SLmillisecond* pMsec);
+    SLresult (*RegisterCallback)(SLRecordItf self, void* callback, void* pContext);
+    SLresult (*SetCallbackEventsMask)(SLRecordItf self, SLuint32 eventFlags);
+    SLresult (*GetCallbackEventsMask)(SLRecordItf self, SLuint32* pEventFlags);
+    SLresult (*SetMarkerPosition)(SLRecordItf self, SLmillisecond mSec);
+    SLresult (*ClearMarkerPosition)(SLRecordItf self);
+    SLresult (*GetMarkerPosition)(SLRecordItf self, SLmillisecond* pMsec);
+    SLresult (*SetPositionUpdatePeriod)(SLRecordItf self, SLmillisecond mSec);
+    SLresult (*GetPositionUpdatePeriod)(SLRecordItf self, SLmillisecond* pMsec);
 };
 
 // --------------------------------------------------------------- SLVolumeItf
@@ -767,13 +836,42 @@ SLresult volume_GetStereoPosition(SLVolumeItf, SLpermille* pStereoPosition) {
     return SL_RESULT_SUCCESS;
 }
 
-SLresult androidconfig_SetConfiguration(SLAndroidConfigurationItf, const SLchar*, const void*, SLuint32) {
+SLresult androidconfig_SetConfiguration(SLAndroidConfigurationItf, const SLchar* configKey,
+                                         const void* pConfigValue, SLuint32 valueSize) {
     // Every key defined for this interface (stream type, performance mode,
     // recording preset) is a hint about which physical Android audio path
     // or scheduling class to use. None of that exists on this host — the
     // request genuinely does not apply, which is different from an
     // unimplemented feature — so accepting and discarding is the correct
     // translation, not a shortcut.
+    //
+    // Discarded, but not unrecorded. Which keys Roblox sets is the cheapest
+    // available evidence of how it separates voice from game audio
+    // (`androidRecordingPreset` = VOICE_COMMUNICATION would say so outright),
+    // and nobody has yet observed the engine reach this interface at all. One
+    // line per distinct key, so a client that sets one per player does not
+    // turn this into a log flood.
+    if (configKey) {
+        static std::mutex seen_mutex;
+        static std::deque<std::string> seen;
+        const std::string key(reinterpret_cast<const char*>(configKey));
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        bool first = true;
+        for (const std::string& s : seen) {
+            if (s == key) { first = false; break; }
+        }
+        if (first) {
+            seen.push_back(key);
+            SLuint32 value = 0;
+            if (pConfigValue && valueSize >= sizeof(SLuint32)) {
+                std::memcpy(&value, pConfigValue, sizeof(SLuint32));
+            }
+            std::fprintf(stderr,
+                "I/Cordial-OpenSLES         SLAndroidConfigurationItf::SetConfiguration('%s', "
+                "%u, %u bytes) — accepted and discarded; there is no Android audio path to "
+                "select on this host.\n", key.c_str(), value, valueSize);
+        }
+    }
     return SL_RESULT_SUCCESS;
 }
 SLresult androidconfig_GetConfiguration(SLAndroidConfigurationItf, const SLchar*, SLuint32* pValueSize,
@@ -789,6 +887,359 @@ SLresult androidconfig_AcquireJavaProxy(SLAndroidConfigurationItf, SLuint32, voi
     return SL_RESULT_FEATURE_UNSUPPORTED; // no JNI environment behind this player to proxy into
 }
 SLresult androidconfig_ReleaseJavaProxy(SLAndroidConfigurationItf, SLuint32) {
+    return SL_RESULT_SUCCESS;
+}
+
+// -------------------------------------------------------- AudioRecorderObject
+//
+// The microphone, and the one object in this file whose *lifetime rules* are
+// load-bearing rather than incidental. Stated once, here, because every method
+// below is arranged to keep them:
+//
+//     CreateAudioRecorder   opens nothing
+//     Realize               opens nothing
+//     SetRecordState(RECORDING)  opens the capture stream
+//     SetRecordState(PAUSED)     destroys it
+//     SetRecordState(STOPPED)    destroys it
+//     Destroy                    destroys it
+//
+// `Realize` opening nothing is the one that looks wrong next to
+// `player_Realize`, which does open its stream. It is not symmetric on purpose:
+// realizing a player is inaudible, and realizing a recorder that opened a
+// capture stream would light the desktop's microphone indicator for an object
+// the engine has merely constructed. The cost of the asymmetry is that a
+// microphone that cannot be opened is reported at `SetRecordState` rather than
+// at `Realize`, which is later than Android would report it but is the only
+// place the answer can be found without holding the device to find it.
+//
+// Pausing destroying the stream rather than deactivating it is the same rule
+// as `CaptureStream::close`'s: a paused-but-connected capture node is still a
+// lit indicator and still shows every other application that Cordial holds the
+// device. Samples arriving during a pause are discarded either way, so nothing
+// is lost by not being there for them.
+
+/// One caller-owned buffer waiting to be filled with captured PCM. The
+/// direction is the mirror image of `PlaybackStream`'s pending list — the
+/// caller supplies empty space rather than full data — but the ownership
+/// contract is identical and comes from the same place: the buffer belongs to
+/// the caller and must stay valid until its drain callback fires.
+struct RecordBuffer {
+    uint8_t* data;
+    uint32_t size;
+    uint32_t filled;
+};
+
+struct AudioRecorderObject {
+    const SLObjectItf_* objectVtable;
+    const SLRecordItf_* recordVtable;
+    const SLAndroidSimpleBufferQueueItf_* bufferQueueVtable;
+    const SLAndroidConfigurationItf_* androidConfigVtable;
+
+    std::atomic<SLuint32> state{SL_OBJECT_STATE_UNREALIZED};
+    std::atomic<SLuint32> recordState{SL_RECORDSTATE_STOPPED};
+
+    cordial::audio::CaptureStream capture;
+
+    uint32_t rateHz = 0;
+    uint32_t channels = 0;
+    uint32_t bytesPerFrame = 0;
+    uint32_t numBuffers = 2;
+
+    std::mutex mutex;
+    std::deque<RecordBuffer> pending;
+    uint32_t enqueuedIndex = 0;
+    slAndroidSimpleBufferQueueCallback callback = nullptr;
+    void* callbackContext = nullptr;
+    uint64_t framesRecorded = 0;
+
+    std::thread pump;
+    /// The pump's own id, kept separately from `pump` because `pump.detach()`
+    /// resets `pump.get_id()` to "not a thread" — so asking `pump` whether the
+    /// caller is it stops working precisely after the detach that
+    /// `stop_capture` performs, which is exactly when `Destroy` needs the
+    /// answer.
+    std::atomic<std::thread::id> pumpId{};
+    std::atomic<bool> pumping{false};
+    /// Set by `Destroy` when it was called from the pump thread itself and so
+    /// cannot free this object; the pump deletes itself on the way out
+    /// instead. See `stop_capture` for why that case is not hypothetical.
+    std::atomic<bool> abandoned{false};
+
+    std::atomic<SLmillisecond> markerPositionMs{0};
+    std::atomic<SLmillisecond> positionUpdatePeriodMs{0};
+
+    /// Moves captured samples from `capture` into whatever buffer the caller
+    /// has at the front of the queue, and fires the drain callback for each
+    /// buffer that fills.
+    ///
+    /// A thread rather than a PipeWire callback because `CaptureStream` was
+    /// built for `android.media.AudioRecord.read`, whose caller polls on its
+    /// own schedule; the buffering therefore lives inside `CaptureStream` and
+    /// what is left out here is a copy, not a realtime deadline. 2 ms is a
+    /// quarter of the shortest buffer either caller uses (WebRTC's 10 ms
+    /// frame), which is often enough that a buffer is never late for want of
+    /// asking and rare enough to cost nothing measurable.
+    void run_pump() {
+        // Recorded by the pump itself, first thing, so that a callback firing
+        // immediately still finds the answer set. Doing it from the thread that
+        // started the pump would leave a window in which it was not.
+        pumpId.store(std::this_thread::get_id());
+        while (pumping.load()) {
+            bool completed = false;
+            slAndroidSimpleBufferQueueCallback cb = nullptr;
+            void* ctx = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                cb = callback;
+                ctx = callbackContext;
+                if (!pending.empty()) {
+                    RecordBuffer& front = pending.front();
+                    uint32_t got = capture.read(front.data + front.filled, front.size - front.filled);
+                    front.filled += got;
+                    if (bytesPerFrame != 0) framesRecorded += got / bytesPerFrame;
+                    if (front.filled >= front.size) {
+                        pending.pop_front();
+                        completed = true;
+                    }
+                }
+            }
+            // Outside the lock, for the same reason the playback side does it:
+            // the ordinary buffer-queue pattern is to re-enqueue from inside
+            // this callback, which would deadlock against its own mutex.
+            if (completed && cb) {
+                cb(reinterpret_cast<SLAndroidSimpleBufferQueueItf>(&bufferQueueVtable), ctx);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+        // Must be the last statement: `Destroy` hands ownership over this way
+        // when it could not free the object itself. Nothing may touch a member
+        // after it.
+        if (abandoned.load()) delete this;
+    }
+
+    bool on_pump_thread() const { return pumpId.load() == std::this_thread::get_id(); }
+
+    /// Opens the microphone and starts the pump. Called only from
+    /// `record_SetRecordState(SL_RECORDSTATE_RECORDING)`.
+    bool start_capture() {
+        if (capture.is_open()) return true;
+        // Empty target: `CaptureStream::open` connects to whatever PipeWire
+        // calls the default source, read at this moment rather than cached, so
+        // changing the desktop's default microphone between two recordings is
+        // picked up without restarting the client.
+        if (!capture.open(rateHz, channels, std::string())) {
+            return false;
+        }
+        pumping.store(true);
+        pump = std::thread([this] { run_pump(); });
+        return true;
+    }
+
+    /// Stops the pump and destroys the capture stream. Idempotent, because
+    /// `Destroy` after `SetRecordState(STOPPED)` is the ordinary sequence and
+    /// a double close must not be an error.
+    ///
+    /// The `on_pump_thread` branch is not defensive padding. Stopping a
+    /// recorder from inside its own buffer-queue callback is a normal thing for
+    /// an OpenSL caller to do — it is how you stop after N buffers — and it
+    /// arrives here on the pump thread, where `join()` is a thread joining
+    /// itself, which is `std::terminate` rather than a deadlock you could at
+    /// least see in a backtrace. The thread has already been told to stop and
+    /// will return the moment the callback does, so detaching costs nothing;
+    /// what it costs `Destroy` is dealt with by `abandoned`.
+    void stop_capture() {
+        pumping.store(false);
+        if (pump.joinable()) {
+            if (on_pump_thread()) {
+                pump.detach();
+            } else {
+                pump.join();
+            }
+        }
+        capture.close();
+    }
+};
+
+SLresult recorder_Realize(SLObjectItf self, SLboolean) {
+    // Opens nothing; see the section comment. The engine gets a realized
+    // recorder and the microphone stays shut until it asks to record.
+    strip_const<AudioRecorderObject>(self)->state.store(SL_OBJECT_STATE_REALIZED);
+    return SL_RESULT_SUCCESS;
+}
+SLresult recorder_GetState(SLObjectItf self, SLuint32* pState) {
+    if (!pState) return SL_RESULT_PARAMETER_INVALID;
+    *pState = strip_const<AudioRecorderObject>(self)->state.load();
+    return SL_RESULT_SUCCESS;
+}
+SLresult recorder_GetInterface(SLObjectItf self, SLInterfaceID iid, void* pInterface) {
+    if (!pInterface) return SL_RESULT_PARAMETER_INVALID;
+    auto* r = strip_const<AudioRecorderObject>(self);
+    if (iid == SL_IID_RECORD) {
+        *reinterpret_cast<const void**>(pInterface) = &r->recordVtable;
+        return SL_RESULT_SUCCESS;
+    }
+    if (iid == SL_IID_ANDROIDSIMPLEBUFFERQUEUE) {
+        *reinterpret_cast<const void**>(pInterface) = &r->bufferQueueVtable;
+        return SL_RESULT_SUCCESS;
+    }
+    if (iid == SL_IID_ANDROIDCONFIGURATION) {
+        *reinterpret_cast<const void**>(pInterface) = &r->androidConfigVtable;
+        return SL_RESULT_SUCCESS;
+    }
+    return SL_RESULT_FEATURE_UNSUPPORTED;
+}
+void recorder_Destroy(SLObjectItf self) {
+    auto* r = strip_const<AudioRecorderObject>(self);
+    // Before anything else: a destroyed recorder must not leave a microphone
+    // behind it, including when the engine destroys one it never stopped. This
+    // is the line that makes the privacy rule hold for a caller that simply
+    // drops the object.
+    r->stop_capture();
+    r->recordState.store(SL_RECORDSTATE_STOPPED);
+    r->state.store(SL_OBJECT_STATE_UNREALIZED);
+    if (r->on_pump_thread()) {
+        // Destroyed from inside its own buffer callback. The pump is still on
+        // the stack below us, so freeing here would return into a deleted
+        // object; `run_pump` frees itself instead once it unwinds. The
+        // microphone is already shut either way, which is the part that could
+        // not have waited.
+        r->abandoned.store(true);
+        return;
+    }
+    delete r;
+}
+
+AudioRecorderObject* recorder_from_record(SLRecordItf self) {
+    return reinterpret_cast<AudioRecorderObject*>(strip_const<char>(self) -
+                                                   offsetof(AudioRecorderObject, recordVtable));
+}
+
+SLresult record_SetRecordState(SLRecordItf self, SLuint32 state) {
+    auto* r = recorder_from_record(self);
+    switch (state) {
+        case SL_RECORDSTATE_RECORDING:
+            if (!r->start_capture()) {
+                // Stays stopped. A recorder reporting RECORDING with no stream
+                // behind it is the stub-that-lies pattern this project keeps
+                // paying for: the engine would sit on a buffer queue that never
+                // drains, with nothing to say why.
+                std::fprintf(stderr,
+                    "E/Cordial-OpenSLES         SetRecordState(RECORDING) could not open a "
+                    "capture stream; staying STOPPED rather than reporting a recording that "
+                    "is not happening.\n");
+                r->recordState.store(SL_RECORDSTATE_STOPPED);
+                return SL_RESULT_RESOURCE_ERROR;
+            }
+            break;
+        case SL_RECORDSTATE_PAUSED:
+        case SL_RECORDSTATE_STOPPED:
+            // Both destroy the stream. See the section comment on why pausing
+            // is not allowed to mean "keep the device, discard the samples".
+            r->stop_capture();
+            break;
+        default:
+            return SL_RESULT_PARAMETER_INVALID;
+    }
+    r->recordState.store(state);
+    return SL_RESULT_SUCCESS;
+}
+SLresult record_GetRecordState(SLRecordItf self, SLuint32* pState) {
+    if (!pState) return SL_RESULT_PARAMETER_INVALID;
+    *pState = recorder_from_record(self)->recordState.load();
+    return SL_RESULT_SUCCESS;
+}
+SLresult record_SetDurationLimit(SLRecordItf, SLmillisecond) {
+    // A promise to stop recording after N milliseconds. Nothing here enforces
+    // one, and accepting it would be a promise about the microphone
+    // specifically — the worst possible subject for a stub to be wrong about.
+    return SL_RESULT_FEATURE_UNSUPPORTED;
+}
+SLresult record_GetPosition(SLRecordItf self, SLmillisecond* pMsec) {
+    if (!pMsec) return SL_RESULT_PARAMETER_INVALID;
+    auto* r = recorder_from_record(self);
+    std::lock_guard<std::mutex> lock(r->mutex);
+    // Genuinely tracked, unlike the playback side's `play_GetPosition`: the
+    // pump counts every frame it hands to the caller, so this is a real
+    // position rather than an estimate that would have to be invented.
+    *pMsec = r->rateHz == 0 ? 0
+                            : static_cast<SLmillisecond>(r->framesRecorded * 1000 / r->rateHz);
+    return SL_RESULT_SUCCESS;
+}
+SLresult record_RegisterCallback(SLRecordItf, void*, void*) {
+    return SL_RESULT_SUCCESS; // accepted; see SetCallbackEventsMask
+}
+SLresult record_SetCallbackEventsMask(SLRecordItf, SLuint32) {
+    // SL_RECORDEVENT_HEADATLIMIT and friends all need the duration limit and
+    // marker machinery this recorder does not run. Accepting interest in an
+    // event that structurally never occurs is not the same claim as promising
+    // it will fire — the same reasoning as `play_SetCallbackEventsMask`.
+    return SL_RESULT_SUCCESS;
+}
+SLresult record_GetCallbackEventsMask(SLRecordItf, SLuint32* pEventFlags) {
+    if (pEventFlags) *pEventFlags = 0;
+    return SL_RESULT_SUCCESS;
+}
+SLresult record_SetMarkerPosition(SLRecordItf self, SLmillisecond mSec) {
+    recorder_from_record(self)->markerPositionMs.store(mSec);
+    return SL_RESULT_SUCCESS;
+}
+SLresult record_ClearMarkerPosition(SLRecordItf self) {
+    recorder_from_record(self)->markerPositionMs.store(0);
+    return SL_RESULT_SUCCESS;
+}
+SLresult record_GetMarkerPosition(SLRecordItf self, SLmillisecond* pMsec) {
+    if (pMsec) *pMsec = recorder_from_record(self)->markerPositionMs.load();
+    return SL_RESULT_SUCCESS;
+}
+SLresult record_SetPositionUpdatePeriod(SLRecordItf self, SLmillisecond mSec) {
+    recorder_from_record(self)->positionUpdatePeriodMs.store(mSec);
+    return SL_RESULT_SUCCESS;
+}
+SLresult record_GetPositionUpdatePeriod(SLRecordItf self, SLmillisecond* pMsec) {
+    if (pMsec) *pMsec = recorder_from_record(self)->positionUpdatePeriodMs.load();
+    return SL_RESULT_SUCCESS;
+}
+
+AudioRecorderObject* recorder_from_absq(SLAndroidSimpleBufferQueueItf self) {
+    return reinterpret_cast<AudioRecorderObject*>(strip_const<char>(self) -
+                                                   offsetof(AudioRecorderObject, bufferQueueVtable));
+}
+
+SLresult rec_absq_Enqueue(SLAndroidSimpleBufferQueueItf self, const void* pBuffer, SLuint32 size) {
+    if (!pBuffer || size == 0) return SL_RESULT_PARAMETER_INVALID;
+    auto* r = recorder_from_absq(self);
+    std::lock_guard<std::mutex> lock(r->mutex);
+    if (r->pending.size() >= r->numBuffers) return SL_RESULT_BUFFER_INSUFFICIENT;
+    // On the recording side the caller's buffer is written to rather than read
+    // from, so the const has to come off. It is the caller's own memory and the
+    // buffer-queue contract is precisely that it is ours to fill until the
+    // drain callback says otherwise.
+    r->pending.push_back({static_cast<uint8_t*>(const_cast<void*>(pBuffer)), size, 0});
+    ++r->enqueuedIndex;
+    return SL_RESULT_SUCCESS;
+}
+SLresult rec_absq_Clear(SLAndroidSimpleBufferQueueItf self) {
+    auto* r = recorder_from_absq(self);
+    std::lock_guard<std::mutex> lock(r->mutex);
+    r->pending.clear();
+    return SL_RESULT_SUCCESS;
+}
+SLresult rec_absq_GetState(SLAndroidSimpleBufferQueueItf self,
+                            SLAndroidSimpleBufferQueueState* pState) {
+    if (!pState) return SL_RESULT_PARAMETER_INVALID;
+    auto* r = recorder_from_absq(self);
+    std::lock_guard<std::mutex> lock(r->mutex);
+    pState->count = static_cast<SLuint32>(r->pending.size());
+    pState->index = r->enqueuedIndex;
+    return SL_RESULT_SUCCESS;
+}
+SLresult rec_absq_RegisterCallback(SLAndroidSimpleBufferQueueItf self,
+                                    slAndroidSimpleBufferQueueCallback callback, void* pContext) {
+    auto* r = recorder_from_absq(self);
+    std::lock_guard<std::mutex> lock(r->mutex);
+    r->callback = callback;
+    r->callbackContext = pContext;
     return SL_RESULT_SUCCESS;
 }
 
@@ -810,6 +1261,27 @@ constexpr SLObjectItf_ kAudioPlayerObjectMethods = {
     player_Realize, object_Resume, player_GetState, player_GetInterface, object_RegisterCallback,
     object_AbortAsyncOperation, player_Destroy, object_SetPriority, object_GetPriority,
     object_SetLossOfControlInterfaces,
+};
+
+constexpr SLObjectItf_ kAudioRecorderObjectMethods = {
+    recorder_Realize, object_Resume, recorder_GetState, recorder_GetInterface,
+    object_RegisterCallback, object_AbortAsyncOperation, recorder_Destroy, object_SetPriority,
+    object_GetPriority, object_SetLossOfControlInterfaces,
+};
+
+constexpr SLRecordItf_ kRecordMethods = {
+    record_SetRecordState, record_GetRecordState, record_SetDurationLimit, record_GetPosition,
+    record_RegisterCallback, record_SetCallbackEventsMask, record_GetCallbackEventsMask,
+    record_SetMarkerPosition, record_ClearMarkerPosition, record_GetMarkerPosition,
+    record_SetPositionUpdatePeriod, record_GetPositionUpdatePeriod,
+};
+
+/// A separate table from the player's `kAndroidSimpleBufferQueueMethods`
+/// because the two queues run in opposite directions — the player's `Enqueue`
+/// hands over full buffers, the recorder's hands over empty ones — and sharing
+/// one table would mean a run-time type tag deciding which meaning applied.
+constexpr SLAndroidSimpleBufferQueueItf_ kRecorderBufferQueueMethods = {
+    rec_absq_Enqueue, rec_absq_Clear, rec_absq_GetState, rec_absq_RegisterCallback,
 };
 
 constexpr SLOutputMixItf_ kOutputMixMethods = {
@@ -934,15 +1406,88 @@ SLresult engine_CreateAudioPlayer(SLEngineItf, SLObjectItf* pPlayer, SLDataSourc
     return SL_RESULT_SUCCESS;
 }
 
-SLresult engine_CreateAudioRecorder(SLEngineItf, SLObjectItf* pRecorder, SLDataSource*, SLDataSink*,
-                                     SLuint32, const SLInterfaceID*, const SLboolean*) {
-    // Deliberately unimplemented — see the file header. This is not the path
-    // Roblox records through (that is `WebRtcAudioRecord`, in
-    // `audio_classes.cpp`), so failing cleanly here closes a door nothing
-    // knocks on rather than removing a capability. A recorder object that
-    // silently never delivered a buffer would be the worse answer either way.
-    if (pRecorder) *pRecorder = nullptr;
-    return SL_RESULT_FEATURE_UNSUPPORTED;
+SLresult engine_CreateAudioRecorder(SLEngineItf, SLObjectItf* pRecorder, SLDataSource* pAudioSrc,
+                                     SLDataSink* pAudioSnk, SLuint32 numInterfaces,
+                                     const SLInterfaceID* pInterfaceIds,
+                                     const SLboolean* pInterfaceRequired) {
+    if (!pRecorder) return SL_RESULT_PARAMETER_INVALID;
+    *pRecorder = nullptr;
+    if (!pAudioSrc || !pAudioSnk || !pAudioSrc->pLocator || !pAudioSnk->pLocator ||
+        !pAudioSnk->pFormat) {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+
+    // Source: an IO device, and specifically the default audio input. A
+    // request for a *named* input device is refused rather than quietly served
+    // from the default — the caller asked for a particular microphone and
+    // getting a different one without being told is worse than being refused.
+    // (Which microphone the default is comes from PipeWire; Android's device
+    // list, including how a caller would learn the ids, is `audio_classes.cpp`.)
+    SLuint32 srcLocatorType = *static_cast<const SLuint32*>(pAudioSrc->pLocator);
+    if (srcLocatorType != SL_DATALOCATOR_IODEVICE) return SL_RESULT_CONTENT_UNSUPPORTED;
+    auto* srcLocator = static_cast<const SLDataLocator_IODevice*>(pAudioSrc->pLocator);
+    if (srcLocator->deviceType != SL_IODEVICE_AUDIOINPUT) return SL_RESULT_CONTENT_UNSUPPORTED;
+    if (srcLocator->deviceID != SL_DEFAULTDEVICEID_AUDIOINPUT) {
+        std::fprintf(stderr,
+            "E/Cordial-OpenSLES         CreateAudioRecorder asked for input device id 0x%08X; "
+            "only SL_DEFAULTDEVICEID_AUDIOINPUT is implemented, and serving a different "
+            "microphone than the one asked for would be worse than refusing.\n",
+            srcLocator->deviceID);
+        return SL_RESULT_CONTENT_UNSUPPORTED;
+    }
+
+    SLuint32 snkLocatorType = *static_cast<const SLuint32*>(pAudioSnk->pLocator);
+    if (snkLocatorType != SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE) {
+        return SL_RESULT_CONTENT_UNSUPPORTED;
+    }
+    auto* snkLocator = static_cast<const SLDataLocator_AndroidSimpleBufferQueue*>(pAudioSnk->pLocator);
+
+    SLuint32 formatType = *static_cast<const SLuint32*>(pAudioSnk->pFormat);
+    if (formatType != SL_DATAFORMAT_PCM) return SL_RESULT_CONTENT_UNSUPPORTED;
+    auto* fmt = static_cast<const SLDataFormat_PCM*>(pAudioSnk->pFormat);
+    // `CaptureStream` negotiates SPA_AUDIO_FORMAT_S16 and only that, so
+    // anything else is refused here rather than delivered as reinterpreted
+    // bytes. Playback can afford a lookup table of layouts because PipeWire
+    // converts on the way out; capture would have to convert on the way in,
+    // which is work nothing has asked for.
+    if (fmt->bitsPerSample != 16 || fmt->containerSize != 16 ||
+        fmt->endianness == SL_BYTEORDER_BIGENDIAN) {
+        std::fprintf(stderr,
+            "E/Cordial-OpenSLES         CreateAudioRecorder asked for %u-bit samples in a "
+            "%u-bit container; this backend records signed 16-bit native-endian PCM only.\n",
+            fmt->bitsPerSample, fmt->containerSize);
+        return SL_RESULT_CONTENT_UNSUPPORTED;
+    }
+    if (fmt->numChannels == 0 || fmt->samplesPerSec == 0) return SL_RESULT_PARAMETER_INVALID;
+
+    for (SLuint32 i = 0; i < numInterfaces; ++i) {
+        SLInterfaceID id = pInterfaceIds[i];
+        bool required = pInterfaceRequired ? pInterfaceRequired[i] != SL_BOOLEAN_FALSE : true;
+        bool known = id == SL_IID_RECORD || id == SL_IID_ANDROIDSIMPLEBUFFERQUEUE ||
+                     id == SL_IID_ANDROIDCONFIGURATION;
+        if (required && !known) return SL_RESULT_FEATURE_UNSUPPORTED;
+    }
+
+    auto* recorder = new AudioRecorderObject();
+    recorder->objectVtable = &kAudioRecorderObjectMethods;
+    recorder->recordVtable = &kRecordMethods;
+    recorder->bufferQueueVtable = &kRecorderBufferQueueMethods;
+    recorder->androidConfigVtable = &kAndroidConfigurationMethods;
+    recorder->rateHz = fmt->samplesPerSec / 1000; // milliHertz -> Hz, as for playback
+    recorder->channels = fmt->numChannels;
+    recorder->bytesPerFrame = fmt->numChannels * 2; // S16, checked above
+    recorder->numBuffers = snkLocator->numBuffers != 0 ? snkLocator->numBuffers : 2;
+
+    // Worth a line even on the success path: this is the moment a Roblox that
+    // records through OpenSL ES becomes distinguishable from one that does not,
+    // and nobody has yet observed it happen. No microphone is opened here.
+    std::fprintf(stderr,
+        "I/Cordial-OpenSLES         CreateAudioRecorder(%u Hz, %u channel(s), %u buffers) — "
+        "recorder created; no capture stream exists until SetRecordState(RECORDING).\n",
+        recorder->rateHz, recorder->channels, recorder->numBuffers);
+
+    *pRecorder = reinterpret_cast<SLObjectItf>(&recorder->objectVtable);
+    return SL_RESULT_SUCCESS;
 }
 SLresult engine_CreateMidiPlayer(SLEngineItf, SLObjectItf* pPlayer, SLDataSource*, SLDataSource*,
                                   SLDataSink*, SLDataSink*, SLDataSink*, SLuint32, const SLInterfaceID*,
@@ -1034,6 +1579,16 @@ uint32_t slCreateEngine(void** engine, uint32_t numOptions, const void* pEngineO
     // atomic or a mutex), so there is no laxer mode for these to opt out of.
     (void)numOptions;
     (void)pEngineOptions;
+
+    // Announced on entry, before anything can decline. Whether the engine calls
+    // this at all is the first question about Cordial's audio and it has been
+    // answered "not at the Landing screen" only — with no line printed on the
+    // way in, an absent engine and a refused one looked identical in a log, and
+    // the PipeWire "session confirmed reachable" line below is not a substitute
+    // because it is also printed by device enumeration.
+    std::fprintf(stderr,
+        "I/Cordial-OpenSLES         slCreateEngine called by the engine (%u option(s), %u "
+        "interface(s) requested).\n", numOptions, numInterfaces);
 
     if (engine) *engine = nullptr;
 

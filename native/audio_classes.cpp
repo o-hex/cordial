@@ -12,14 +12,16 @@
 //    OpenSL routing surface genuinely is not how Android enumerates audio
 //    hardware, and it is not where a device picker gets its list.
 //
-// 2. **The microphone is not OpenSL ES either.** Roblox records through
-//    `org.webrtc.voiceengine.WebRtcAudioRecord`, which wraps
-//    `android.media.AudioRecord`. `SLEngineItf::CreateAudioRecorder` in
-//    `opensles.cpp` reports `SL_RESULT_FEATURE_UNSUPPORTED` and continues to,
-//    and that is not a gap left by this file: it is a path Roblox's Android
-//    build does not record through, so implementing it would add a second way
-//    to open the microphone with nothing asking for one. One door is easier to
-//    keep shut than two.
+// 2. **The microphone has two possible doors, and this file is one of them.**
+//    This comment used to say the other one did not exist — that Roblox records
+//    only through `org.webrtc.voiceengine.WebRtcAudioRecord`, so
+//    `SLEngineItf::CreateAudioRecorder` could refuse forever. That was an
+//    inference from the dex declaring a WebRTC surface, and
+//    `docs/analysis/undefined-symbols.tsv` disagrees: `libroblox.so` links
+//    `SL_IID_RECORD`. `opensles.cpp` now implements the OpenSL recorder, with
+//    the microphone's lifetime tied to `SLRecordItf`'s record state exactly as
+//    the rule below requires. Two doors, then — and both are shut by the same
+//    rule rather than one of them being shut by not existing.
 //
 // Every method below was taken from the shipping dex with `dexproto.py`, not
 // from memory of the Android SDK. The seven `AudioDeviceInfo` getters, the
@@ -40,9 +42,17 @@
 // and still shows every other application that Cordial is holding the capture
 // device, which is the harm; whether samples are flowing is not the part a
 // user can see. `CaptureStream::close()` therefore destroys the `pw_stream`
-// rather than deactivating it, and the only two places in Cordial that call
-// `CaptureStream::open()` are `AudioRecord::startRecording` and
-// `WebRtcAudioRecord::startRecording` below.
+// rather than deactivating it.
+//
+// There are exactly two callers of `CaptureStream::open()` in Cordial:
+// `AudioRecord::startRecording` below, and
+// `AudioRecorderObject::start_capture` in `opensles.cpp`, which runs only from
+// `SLRecordItf::SetRecordState(SL_RECORDSTATE_RECORDING)`. Both close on stop,
+// on pause and on destroy. The OpenSL half of that was observed against
+// PipeWire's own registry on 2026-08-02: no capture node existed while the
+// recorder was merely realized, one appeared within half a second of
+// `RECORDING`, and it was gone again on `PAUSED`, on `STOPPED` and after
+// `Destroy` — including when the stop came from inside the buffer callback.
 //
 // Two consequences worth stating because they are the kind of thing a later
 // change makes by accident:
@@ -64,6 +74,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -341,9 +352,21 @@ public:
     /// The default device is placed first within its direction. Android's
     /// `AudioDeviceInfo` has no `isDefault()` and the dex does not declare
     /// one, so ordering is the only channel available for saying which device
-    /// the host would pick — and it is the channel Android's own
-    /// implementation uses, so a caller that takes element zero gets the
-    /// answer it would get on a phone.
+    /// the host would pick.
+    ///
+    /// **`INFERRED`**: that a caller taking element zero therefore gets the
+    /// host's default is a hope about the caller, not an observed fact about
+    /// this one. Nothing has been seen calling `getDevices` yet (the one-shot
+    /// line below exists to catch it when something does), and an earlier
+    /// revision of this comment asserted that AOSP's own implementation orders
+    /// the array this way, which is not something this project has any way to
+    /// check and should not have been written as established.
+    ///
+    /// What *is* established is the routing, which does not depend on this
+    /// ordering at all: `PlaybackStream` connects with `PW_ID_ANY` and
+    /// autoconnect, so audio goes wherever PipeWire's default sink is at the
+    /// time — measured on 2026-08-02 by capturing that sink's monitor while a
+    /// tone was pushed through `SLAndroidSimpleBufferQueueItf::Enqueue`.
     static std::shared_ptr<jnivm::Array<AudioDeviceInfo>> getDevices(ENV*, Object*, jint flags) {
         const bool want_inputs = (flags & GET_DEVICES_INPUTS) != 0;
         const bool want_outputs = (flags & GET_DEVICES_OUTPUTS) != 0;
@@ -365,6 +388,19 @@ public:
         for (size_t i = 0; i < chosen.size(); ++i) {
             (*out)[static_cast<jint>(i)] = chosen[i];
         }
+        // Once, and only the first time. Whether Roblox asks for the device
+        // list at all is a question `--dump-classes` cannot answer — the dump
+        // lists this class because Cordial registered it, not because anything
+        // called it — and it is the difference between a device list that is
+        // used and one that is merely correct.
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            std::fprintf(stderr,
+                "I/Cordial-Audio           AudioManager.getDevices(0x%X) called by the engine; "
+                "answering with %zu of %zu PipeWire device(s), default first.\n",
+                flags, chosen.size(), devices.size());
+        }
         return out;
     }
 
@@ -378,6 +414,13 @@ public:
     /// that happens to exist. A caller that gets null knows it does not know;
     /// a caller handed an arbitrary device does not.
     static std::shared_ptr<AudioDeviceInfo> getCommunicationDevice(ENV*, Object*) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            std::fprintf(stderr,
+                "I/Cordial-Audio           AudioManager.getCommunicationDevice called by the "
+                "engine.\n");
+        }
         for (const audio::DeviceInfo& d : audio::enumerate_devices()) {
             if (d.is_source && d.is_default) return make_device_info(d);
         }
@@ -456,6 +499,14 @@ public:
                                               jint channelConfig, jint audioFormat,
                                               jint bufferSizeInBytes) {
         auto r = std::make_shared<AudioRecord>();
+        // Worth a line every time rather than once: each construction is a
+        // recorder that could go on to open the microphone, and a log that
+        // shows one of them and hides the rest is a log nobody can count with.
+        // Constructing one opens nothing; only `startRecording` does.
+        std::fprintf(stderr,
+            "I/Cordial-Audio           android.media.AudioRecord constructed (%d Hz, "
+            "channelConfig 0x%X, format %d); no capture stream until startRecording.\n",
+            sampleRateInHz, channelConfig, audioFormat);
         r->sampleRate = sampleRateInHz > 0 ? sampleRateInHz : DEFAULT_SAMPLE_RATE;
         r->channelCount = channelConfig == 0x0c ? 2 : 1;
         r->bufferSizeBytes = bufferSizeInBytes > 0 ? bufferSizeInBytes : 4096;
@@ -777,6 +828,38 @@ public:
 
 } // namespace
 
+/// `CORDIAL_AUDIO_SELFTEST=1` prints the device list Roblox would be given, at
+/// the moment the audio classes are registered.
+///
+/// It exists because of a gap that took a while to notice: the whole audio
+/// backend can be verified out of process (`native/audio_probe.cpp` does), and
+/// none of that says whether it works *inside* `cordial-run`, where bionic's
+/// linker, libjnivm and a second libc are in the same address space. Until
+/// something in Roblox actually asks for audio, this is the only way to find
+/// out, and "nothing asked, so nothing was tested" is how a backend stays
+/// broken for a year without anyone being wrong about it.
+///
+/// Off by default and enumeration-only. It opens no stream of any kind — see
+/// the microphone rule at the top of this file, which this must not be the
+/// exception to.
+void audio_selftest() {
+    if (!std::getenv("CORDIAL_AUDIO_SELFTEST")) return;
+    std::vector<audio::DeviceInfo> devices = audio::enumerate_devices();
+    std::fprintf(stderr,
+        "I/Cordial-Audio           selftest: PipeWire reports %zu audio device(s).\n",
+        devices.size());
+    for (const audio::DeviceInfo& d : devices) {
+        auto info = make_device_info(d);
+        std::fprintf(stderr,
+            "I/Cordial-Audio           selftest:   id=%d %s%s type=%d productName='%s'\n",
+            info->id, d.is_source ? "input " : "output", d.is_default ? " (host default)" : "",
+            info->type, info->productName.c_str());
+    }
+    std::fprintf(stderr,
+        "I/Cordial-Audio           selftest: capture streams open = %u (must be 0: listing "
+        "microphones does not use one).\n", audio::active_capture_streams());
+}
+
 void register_audio_classes(jnivm::ENV* env) {
     CharSequence::Register(env);
     AudioDeviceInfo::Register(env);
@@ -784,6 +867,7 @@ void register_audio_classes(jnivm::ENV* env) {
     AudioRecord::Register(env);
     WebRtcAudioManager::Register(env);
     WebRtcAudioRecord::Register(env);
+    audio_selftest();
 }
 
 } // namespace cordial

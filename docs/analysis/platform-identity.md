@@ -9,12 +9,20 @@ platform names. It is the only platform-shaped *value* in the Java surface
 examined here — the four parameter classes carry none, and the `AConfiguration_*`
 route is ruled out at the symbol level.
 
-**What is not:** that this changes anything. Twenty-five controlled runs found
-**no behavioural difference that reproduced** — the engine reads the string and
-never prints it, and the one candidate effect (§3b) appeared three times and then
-failed to repeat across twenty-one more runs. The claim that experiences see a
-desktop client is `INFERRED` and needs the check in §4, which wants somebody who
-can sign in and enter a place.
+**What is not:** that this changes anything, and in particular **not that it
+fixes the keyboard**. Twenty-five controlled runs found no behavioural difference
+that reproduced — the engine reads the string and never prints it, and the one
+candidate effect (§3b) appeared three times and then failed to repeat across
+twenty-one more runs. Every run in this file stops at the landing page, so
+nothing here touches in-experience input at all. The claim that experiences see a
+desktop client is `INFERRED`; §4 is the two-launch check that would settle it.
+
+**The thing this pass did establish, and it was not the thing it went looking
+for:** `PlatformParams.isKeyboardDevice` and `isMouseDevice` are **never read by
+the engine** (§2e), with a control in the same run proving the probe worked. The
+belief that Cordial already describes desktop peripherals to the engine — written
+into `native/init_params.cpp`'s own header and load-bearing for several days of
+input work — was two-thirds wrong. Only `isTouchDevice` is read.
 
 ---
 
@@ -270,23 +278,65 @@ different `--lib-dir`), which is an uncontrolled confound over focus and pointer
 that could not be removed after the fact. A rerun on a quiet machine is cheap and
 would settle whether the three are real.
 
-## 4. What would settle it
+## 4. What would settle it, in two launches
 
-Everything above stops at the landing page, because a signed-out client never
-enters an experience and this pass could not sign one in or click anything.
-The claim that actually matters — that experiences see a desktop client — lives
-in Lua and needs one command inside a running experience:
+Everything above stops at the landing page. A signed-out client never enters an
+experience, and this pass could neither sign one in nor click anything, so the
+claim that actually matters — that experiences see a desktop client, and that the
+keyboard works there — was not reachable from here. **Nothing in this file should
+be read as evidence about the keyboard.**
+
+It needs somebody who can join a place. Put this in a `LocalScript` under
+`StarterPlayer/StarterPlayerScripts` of a place you own, publish it private, and
+join it from Cordial. It prints to the client log, so it lands in
+`<profile>/data/files/appData/logs/*_Player_*.log` under `[FLog::Output]` with no
+UI to read:
 
 ```lua
-print(game:GetService("UserInputService"):GetPlatform())
-print(game:GetService("UserInputService").TouchEnabled,
-      game:GetService("UserInputService").KeyboardEnabled,
-      game:GetService("UserInputService").MouseEnabled)
-print(game:GetService("GuiService"):IsTenFootInterface())
+local UIS = game:GetService("UserInputService")
+print("CORDIAL-PROBE platform =", UIS:GetPlatform().Name)
+print("CORDIAL-PROBE touch/kbd/mouse =",
+      UIS.TouchEnabled, UIS.KeyboardEnabled, UIS.MouseEnabled)
+print("CORDIAL-PROBE gamepad/tenfoot =",
+      UIS.GamepadEnabled, game:GetService("GuiService"):IsTenFootInterface())
+UIS.InputBegan:Connect(function(input, processed)
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        print("CORDIAL-PROBE key", input.KeyCode.Name, "processed:", processed)
+    end
+end)
 ```
 
-Run it under `CORDIAL_PLATFORM_NAME=Linux` and again under
-`CORDIAL_PLATFORM_NAME=Android`, in the same session, same experience. If
-`GetPlatform()` moves, this is the mechanism. If it does not, the change is still
-the truthful answer and the mechanism is still open — and this file should be
-corrected to say so.
+Two launches, same place, same session, differing in exactly one string:
+
+```bash
+export XDG_DATA_HOME=~/.local/share            # your usual profile
+cd ~/Projects/cordial
+
+# treatment: what Cordial now ships
+CORDIAL_PLATFORM_NAME=Linux   ./target/release/cordial-run \
+  --lib-dir <lib/x86_64> --apk <base.apk> --host-libc --game-activity --run 180
+
+# control: the client exactly as it behaved before this change
+CORDIAL_PLATFORM_NAME=Android ./target/release/cordial-run \
+  --lib-dir <lib/x86_64> --apk <base.apk> --host-libc --game-activity --run 180
+```
+
+Then, for each:
+
+```bash
+grep 'CORDIAL-PROBE' ~/.local/share/cordial/profiles/default/data/files/appData/logs/*_Player_*.log
+```
+
+How to read it:
+
+* `platform = Linux` under the first and `Android` under the second — this is the
+  mechanism, and `getPlatformName` is `Enum.Platform`. Say so here and delete the
+  `INFERRED` label.
+* `platform = Android` under both — `getPlatformName` is the *user's* platform
+  name, not the client's (§2d's other reading). The value stays, because it is
+  still the true one, but this file must be corrected to say the mechanism was
+  not found, and the search moves on.
+* `KeyboardEnabled` and the `CORDIAL-PROBE key` lines are the ones that bear on
+  the actual complaint. If keys print here but the character does not move, the
+  break is above the engine's input layer and below Lua, and neither this change
+  nor `PlatformParams` is where to look next.

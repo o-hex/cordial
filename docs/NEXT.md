@@ -498,6 +498,30 @@ not when it renders — and sign-in is still blocked on §2 below, unrelated to
 anything in this section. X11 stays in the tree, and stays load-bearing as
 the control, until that condition is actually met.
 
+## 1b. The canvas lags the window for a frame after a resize
+
+Reported and reproduced visually: for a split second during a resize the GTK
+window is already the new size while the engine's canvas is still the old one,
+leaving a black band where nothing has been drawn.
+
+The cause is `wl_subsurface.set_desync` at `wayland.rs:895`, and it is not a
+mistake — a subsurface starts *synchronised*, and desync is what lets the engine
+present at its own rate instead of waiting for GTK to commit. The cost is that a
+resize stops being atomic: GTK resizes the toplevel and commits immediately,
+while the canvas keeps its old buffer until the engine happens to render again.
+
+The fix is not to abandon desync. It is to be **synchronised only while
+resizing** — `set_sync` on the `xdg_toplevel` configure, `set_desync` once the
+engine has presented at the new size — so a resize commits atomically and normal
+rendering stays independent. `INFERRED`: this is the standard remedy for a
+toolkit window hosting an independently-driven surface and has not been tried
+here.
+
+Two things not to reach for. Delaying `ack_configure` until the engine has a
+matching buffer makes GTK stall on the engine's frame rate. `wp_viewporter`
+scaling the stale buffer hides the seam by showing a stretched old frame, which
+is a different wrong picture rather than none.
+
 ## 2. Sign-in itself
 
 Without a session the client sits on the landing page. Avatar thumbnails fail

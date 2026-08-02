@@ -440,6 +440,100 @@ public:
     }
 };
 
+// ------------------------------------------------------------- who is signed in
+//
+// The account the mirrors below answer from, and the sinks the DataModel
+// notification handler reports a login and a logout through.
+//
+// **This is what made a restored session still land on the landing page.** The
+// cookie store persists a real session and the engine confirms it holds the
+// cookies, and the run still ends `app ready: Landing`, because
+// `PlatformAccountRouter` does not consult the cookie — it asks these mirrors,
+// was told user 0 with an empty name, and routed accordingly without ever
+// reaching the network. docs/design/sign-in.md §1.3 said these were
+// presentation-layer only; §9 of that document records that it was wrong.
+//
+// Written from whichever thread the engine delivers `DID_LOG_IN` on and read
+// from the engine's own threads whenever it wants to know who is playing, so
+// it is guarded rather than plain.
+//
+// Nothing here prints a username or a user id at any verbosity. A username is a
+// person; `crates/cordial-runtime/src/identity.rs` carries the rest of that
+// reasoning and is the only place these values are written down.
+
+namespace {
+std::mutex g_identity_mutex;
+bool g_identity_known = false;
+jlong g_identity_user_id = 0;
+std::string g_identity_username;
+std::string g_identity_display_name;
+jint g_identity_membership = 0;
+bool g_identity_under13 = false;
+bool g_identity_subscription = false;
+
+// Atomic rather than under `g_identity_mutex`: the login sink calls back into
+// `cordial_identity_publish`, which takes that mutex, so reading the pointer
+// under it would deadlock the first time anybody signed in.
+std::atomic<void (*)(const char*)> g_identity_login_sink{nullptr};
+std::atomic<void (*)()> g_identity_logout_sink{nullptr};
+} // namespace
+
+jlong identity_user_id() {
+    std::lock_guard<std::mutex> lock(g_identity_mutex);
+    return g_identity_user_id;
+}
+
+std::string identity_username() {
+    std::lock_guard<std::mutex> lock(g_identity_mutex);
+    return g_identity_username;
+}
+
+/// Falls back to the username, because that is what an account with no display
+/// name set actually shows on Roblox. Empty here would render a nameless header
+/// for a user who is definitely signed in.
+std::string identity_display_name() {
+    std::lock_guard<std::mutex> lock(g_identity_mutex);
+    return g_identity_display_name.empty() ? g_identity_username : g_identity_display_name;
+}
+
+jint identity_membership_type() {
+    std::lock_guard<std::mutex> lock(g_identity_mutex);
+    return g_identity_membership;
+}
+
+bool identity_is_under13() {
+    std::lock_guard<std::mutex> lock(g_identity_mutex);
+    return g_identity_under13;
+}
+
+bool identity_has_subscription() {
+    std::lock_guard<std::mutex> lock(g_identity_mutex);
+    return g_identity_subscription;
+}
+
+/// Whether anybody is signed in at all, for the diagnostics that must not name
+/// who. `g_identity_known` rather than a non-zero id, so that the one place
+/// that decides what "signed in" means is the publish call.
+bool identity_known() {
+    std::lock_guard<std::mutex> lock(g_identity_mutex);
+    return g_identity_known;
+}
+
+/// `CORDIAL_TRACE_IDENTITY=1`: name each mirror the engine asks, and never the
+/// answer.
+///
+/// This exists because filling the mirrors in was not enough on its own and
+/// there was no way to tell "the engine never asked" from "the engine asked and
+/// routed on something else" — two completely different pieces of work with the
+/// same symptom, which is a landing page. It reports the *field*, and whether an
+/// identity was known at the time; a username or a user id never reaches it.
+void trace_identity(const char* field) {
+    static const bool on = getenv("CORDIAL_TRACE_IDENTITY") != nullptr;
+    if (!on) return;
+    fprintf(stderr, "[cordial] identity asked: %s (%s)\n", field,
+            identity_known() ? "signed in" : "nobody");
+}
+
 /// `com.roblox.engine.jni.NativeGLJavaInterface`
 ///
 /// The engine's main line back into Java: device parameters, keyboard, screen
@@ -583,7 +677,7 @@ public:
     /// state changed — `APP_READY`, `PURCHASE_ROBUX` and the rest — and on
     /// Android some of those are what send the user to a web page.
     ///
-    /// Left as reports rather than acted on: which type maps to which
+    /// Most are still reports rather than acted on: which type maps to which
     /// destination lives in Roblox's Java, and is not established here.
     /// Resolving them is worth doing on its own account, because an unresolved
     /// JNI call leaves a pending exception that the next JNI call on the same
@@ -593,10 +687,61 @@ public:
         fprintf(stderr, "[roblox] app bridge: %s %s\n",
                 type ? type->c_str() : "(null)", data ? data->c_str() : "");
     }
+
+    /// The one notification Cordial acts on rather than only prints.
+    ///
+    /// **`DID_LOG_IN` is the engine handing over the answer the identity
+    /// mirrors above were inventing a zero for.** Its payload carries exactly
+    /// the fields `NativeUserJavaInterface` and `StartAppParams` want:
+    ///
+    ///     DID_LOG_IN {"username":…,"membershipType":…,"isUnder13":…,
+    ///                 "hasRobloxSubscription":…,"countryCode":…,
+    ///                 "userId":…,"displayName":…}
+    ///
+    /// and it lands roughly twenty-five milliseconds before `APP_READY Home`.
+    /// Before this, Cordial received it, printed it in full, and dropped it —
+    /// so the next launch went back to `Landing` with a perfectly good cookie,
+    /// and a real person's username sat in the terminal scrollback meanwhile.
+    ///
+    /// `DID_SIGN_UP` and `DID_SWITCH_ACCOUNT` are handled the same way and are
+    /// **INFERRED**: they are adjacent strings in `libroblox.so` and neither has
+    /// been seen to fire under Cordial, so they are routed through the same
+    /// parse, which stores nothing if the payload is not identity-shaped. That
+    /// makes a wrong guess about them a no-op rather than a wrong account.
+    ///
+    /// `LUA_UNAUTHORIZED_LOG_OUT` clears alongside `DID_LOG_OUT` for the reason
+    /// the clearing exists at all: it is precisely the case where the server has
+    /// stopped honouring the session, and an identity that outlived it would
+    /// present a signed-in shell that can fetch nothing.
     static void onDataModelNotificationCallback(ENV*, Class*, std::shared_ptr<String> type,
                                                 std::shared_ptr<String> data) {
+        const std::string kind = type ? static_cast<const std::string&>(*type) : std::string();
+        const std::string payload = data ? static_cast<const std::string&>(*data) : std::string();
+
+        const bool login = kind == "DID_LOG_IN" || kind == "DID_SIGN_UP"
+                        || kind == "DID_SWITCH_ACCOUNT";
+        const bool logout = kind == "DID_LOG_OUT" || kind == "LUA_UNAUTHORIZED_LOG_OUT";
+
+        if (login) {
+            // The payload is a username, a display name and a user id — a real
+            // person — so its size is reported and its content is not. This
+            // used to be printed whole, which is the leak this line replaces.
+            fprintf(stderr, "[roblox] datamodel notification: %s <identity elided, %zu bytes>\n",
+                    kind.c_str(), payload.size());
+            if (auto* sink = g_identity_login_sink.load(std::memory_order_acquire)) {
+                sink(payload.c_str());
+            }
+            return;
+        }
+        if (logout) {
+            fprintf(stderr, "[roblox] datamodel notification: %s\n", kind.c_str());
+            if (auto* sink = g_identity_logout_sink.load(std::memory_order_acquire)) {
+                sink();
+            }
+            return;
+        }
         fprintf(stderr, "[roblox] datamodel notification: %s %s\n",
-                type ? type->c_str() : "(null)", data ? data->c_str() : "");
+                type ? type->c_str() : "(null)", payload.c_str());
     }
 
     /// Not a getter despite the name — it returns void because it is a request,
@@ -688,29 +833,55 @@ public:
 
 /// `com.roblox.engine.jni.user.NativeUserJavaInterface`
 ///
-/// Who is signed in. Nobody is: Cordial has no auth yet, and the honest answer to
-/// every one of these is the signed-out value rather than a plausible-looking
-/// fake. A fabricated user id would flow straight into telemetry and analytics as
-/// if it were real.
+/// Who is signed in, answered from the identity above once a login has
+/// established one and reported as nobody until then.
+///
+/// **The signed-out answers are still the honest ones and are not defaults to
+/// be improved on.** A fabricated user id would flow straight into telemetry
+/// and analytics as if it were real, and would make the client claim an account
+/// it holds no cookie for. Nothing here invents a value; it reports what the
+/// engine's own `DID_LOG_IN` said, or that there is nobody.
 class NativeUserJavaInterface : public Object {
 public:
-    static jlong getUserId(ENV*, Class*) { return 0; }
+    static jlong getUserId(ENV*, Class*) {
+        trace_identity("getUserId");
+        return identity_user_id();
+    }
     static jboolean getIsUnder13(ENV*, Class*) {
         // This mirrors account state; it is not the age gate. Roblox enforces age
         // restrictions server-side from the account itself, so a real under-13
         // account is restricted whether or not the client says so here.
         //
-        // Defaulting to under-13 therefore protects nobody and degrades the
-        // client for the majority of players, who are teens and adults. Once auth
-        // exists this comes from the signed-in account and stops being a default
-        // at all.
-        return false;
+        // Which is also why the signed-out answer is false rather than true:
+        // defaulting to under-13 protects nobody and degrades the client for the
+        // majority of players, who are teens and adults. Signed in, it is the
+        // account's own value, straight out of `DID_LOG_IN`.
+        trace_identity("getIsUnder13");
+        return identity_is_under13();
     }
-    static jint getMembershipType(ENV*, Class*) { return 0; }
-    static jboolean getHasRobloxSubscription(ENV*, Class*) { return false; }
-    static std::shared_ptr<String> getUsername(ENV*, Class*) { return str(""); }
-    static std::shared_ptr<String> getDisplayName(ENV*, Class*) { return str(""); }
-    static std::shared_ptr<String> getAlternateName(ENV*, Class*) { return str(""); }
+    static jint getMembershipType(ENV*, Class*) {
+        trace_identity("getMembershipType");
+        return identity_membership_type();
+    }
+    static jboolean getHasRobloxSubscription(ENV*, Class*) {
+        trace_identity("getHasRobloxSubscription");
+        return identity_has_subscription();
+    }
+    static std::shared_ptr<String> getUsername(ENV*, Class*) {
+        trace_identity("getUsername");
+        return str(identity_username().c_str());
+    }
+    static std::shared_ptr<String> getDisplayName(ENV*, Class*) {
+        trace_identity("getDisplayName");
+        return str(identity_display_name().c_str());
+    }
+    static std::shared_ptr<String> getAlternateName(ENV*, Class*) {
+        // Left empty even when signed in. `DID_LOG_IN` carries no alternate
+        // name, and this is the field Roblox uses for a region-specific second
+        // name; echoing the username into it would tell the engine an alternate
+        // name exists when the notification never said one did.
+        return str("");
+    }
     static std::shared_ptr<String> getPlatformName(ENV*, Class*) {
         // Roblox's own name for the platform family, not Cordial's. The engine
         // branches on this for input handling and store behaviour, and it only
@@ -879,6 +1050,63 @@ void register_cookie_classes(jnivm::ENV* env);
 // this file's preamble.
 namespace cordial {
 void register_audio_classes(jnivm::ENV* env);
+}
+
+// -------------------------------------------------------- the identity, in and out
+//
+// Cordial's own boundary, not Roblox's: `crates/cordial-runtime/src/identity.rs`
+// owns the profile directory, the parse and the file, and this side owns the
+// mirrors the engine reads. Split there rather than parsing JSON here for the
+// same reason `cookies.cpp` hands out a host and keeps the jar — the half that
+// touches personal data should be the half with the tests and the `Debug` that
+// refuses to print it.
+
+/// Hand the mirrors an identity. Called on a restore before anything starts,
+/// and again on every `DID_LOG_IN`.
+///
+/// Copies out of both pointers before returning, so the caller may free them.
+extern "C" void cordial_identity_publish(long long user_id, const char* username,
+                                         const char* display_name, long long membership_type,
+                                         int is_under13, int has_subscription) {
+    std::lock_guard<std::mutex> lock(cordial::g_identity_mutex);
+    cordial::g_identity_user_id = static_cast<jlong>(user_id);
+    cordial::g_identity_username = username ? username : "";
+    cordial::g_identity_display_name = display_name ? display_name : "";
+    cordial::g_identity_membership = static_cast<jint>(membership_type);
+    cordial::g_identity_under13 = is_under13 != 0;
+    cordial::g_identity_subscription = has_subscription != 0;
+    cordial::g_identity_known = true;
+}
+
+/// Put the mirrors back to reporting nobody.
+///
+/// Everything is reset, not just the id. A leftover username with a zeroed id
+/// is a self-contradicting client, and the engine reads the two through
+/// different calls at different times, so it would see exactly that.
+extern "C" void cordial_identity_clear() {
+    std::lock_guard<std::mutex> lock(cordial::g_identity_mutex);
+    cordial::g_identity_user_id = 0;
+    cordial::g_identity_username.clear();
+    cordial::g_identity_display_name.clear();
+    cordial::g_identity_membership = 0;
+    cordial::g_identity_under13 = false;
+    cordial::g_identity_subscription = false;
+    cordial::g_identity_known = false;
+}
+
+/// Install the sinks `onDataModelNotificationCallback` reports through, or
+/// clear them with null.
+///
+/// Separate from class registration so the control run — same binary,
+/// `CORDIAL_SKIP_IDENTITY=1` — differs in exactly whether anything is
+/// listening, rather than in whether the engine's callback resolves at all.
+/// That is the same split `cordial_cookies_set_host_sink` makes, and for the
+/// same reason: a behavioural difference must not be confusable with a
+/// registration failure.
+extern "C" void cordial_identity_set_sinks(void (*on_login)(const char*),
+                                           void (*on_logout)()) {
+    cordial::g_identity_login_sink.store(on_login, std::memory_order_release);
+    cordial::g_identity_logout_sink.store(on_logout, std::memory_order_release);
 }
 
 extern "C" void cordial_register_android_classes(void* env_ptr) {

@@ -415,6 +415,19 @@ pub mod game_activity {
         ) -> c_int;
         fn cordial_cookies_set_host_sink(sink: Option<extern "C" fn(*const c_char)>);
         fn cordial_cookies_register_handler(f: *mut c_void, err: *mut c_char, n: usize) -> c_int;
+        fn cordial_identity_set_sinks(
+            on_login: Option<extern "C" fn(*const c_char)>,
+            on_logout: Option<extern "C" fn()>,
+        );
+        fn cordial_identity_publish(
+            user_id: i64,
+            username: *const c_char,
+            display_name: *const c_char,
+            membership_type: i64,
+            is_under13: c_int,
+            has_subscription: c_int,
+        );
+        fn cordial_identity_clear();
         fn cordial_cookies_get_for_domain(
             f: *mut c_void,
             class_name: *const c_char,
@@ -511,6 +524,66 @@ pub mod game_activity {
             )
         };
         if rc == 0 { Ok(out != 0) } else { Err(take_err(err)) }
+    }
+
+    /// Hand the framework layer the identity its Java mirrors answer from.
+    ///
+    /// `NativeUserJavaInterface` and `StartAppParams` both report who is signed
+    /// in, and both used to report nobody. They live in `native/`, not in
+    /// `libroblox.so`, so this call takes no engine symbol and has no ordering
+    /// constraint against the engine — only against
+    /// `nativeAppBridgeV2StartAppWithParams`, which copies four of these fields
+    /// into the app-start parameters once and never asks again.
+    ///
+    /// A username identifies a person. It crosses this boundary as bytes and is
+    /// never printed on either side; see `crate::identity` in `cordial-runtime`
+    /// for the rest of that reasoning.
+    pub fn identity_publish(
+        user_id: i64,
+        username: &str,
+        display_name: &str,
+        membership_type: i64,
+        is_under13: bool,
+        has_subscription: bool,
+    ) {
+        // A name carrying an interior nul is not something the engine produces,
+        // and truncating one would publish a different account than the one that
+        // signed in. Refused whole instead.
+        let (Ok(user), Ok(display)) = (CString::new(username), CString::new(display_name)) else {
+            return;
+        };
+        // SAFETY: both pointers are valid for the duration of the call, and the
+        // C side copies out of them before returning.
+        unsafe {
+            cordial_identity_publish(
+                user_id,
+                user.as_ptr(),
+                display.as_ptr(),
+                membership_type,
+                is_under13 as c_int,
+                has_subscription as c_int,
+            )
+        }
+    }
+
+    /// Put the mirrors back to reporting nobody, on a logout.
+    pub fn identity_clear() {
+        // SAFETY: no arguments, and the C side takes its own lock.
+        unsafe { cordial_identity_clear() }
+    }
+
+    /// Install the sinks the DataModel notification handler reports through.
+    ///
+    /// `on_login` receives a `DID_LOG_IN` payload; `on_logout` is called with
+    /// nothing on a `DID_LOG_OUT`. Both are plain `extern "C"` functions with
+    /// static lifetime, which is why the C side can hold them for the life of
+    /// the process.
+    pub fn identity_set_sinks(
+        on_login: extern "C" fn(*const c_char),
+        on_logout: extern "C" fn(),
+    ) {
+        // SAFETY: both are static function pointers with C ABI.
+        unsafe { cordial_identity_set_sinks(Some(on_login), Some(on_logout)) }
     }
 
     /// A cookie jar on its way between the engine and the profile directory.

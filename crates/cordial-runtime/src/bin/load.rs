@@ -353,6 +353,24 @@ fn main() -> ExitCode {
 
     cordial_runtime::android::set_trace(std::env::var_os("CORDIAL_ANDROID_TRACE").is_some());
 
+    // Who is signed in, before anything can ask.
+    //
+    // This is deliberately the earliest thing after the profile is settled, and
+    // it can be: unlike the cookie restore below, it calls into no engine
+    // symbol at all. `NativeUserJavaInterface` and `StartAppParams` live in
+    // Cordial's own framework layer, so there is nothing to be too early for —
+    // whereas being *late* is a real failure with two shapes, because
+    // `StartAppParams` copies four of these fields once inside
+    // `nativeAppBridgeV2StartAppWithParams` and the engine can query the other
+    // mirror at any moment before that.
+    //
+    // The cookie alone was never enough: with a real session restored and the
+    // engine confirmed holding it, `PlatformAccountRouter` still routed to
+    // Landing, because it asks these mirrors and they said user 0. See
+    // `cordial_runtime::identity` and docs/design/sign-in.md §9.
+    cordial_runtime::identity::listen();
+    cordial_runtime::identity::restore();
+
     // Started this early, before `JNI_OnLoad`, so the AT-SPI bus connection
     // (a D-Bus round trip) has as much time as possible to finish before the
     // engine's first `AccessibilityManager.isEnabled()` check — the whole
@@ -1315,6 +1333,45 @@ fn main() -> ExitCode {
                                                         ) {
                                                             cordial_runtime::cookies::probe(f, g, "restore");
                                                         }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // And the engine's own copy of who is
+                                        // signed in, which is a third place
+                                        // and not a duplicate of the two
+                                        // mirrors `identity::restore` fills.
+                                        //
+                                        // Measured, because filling the mirrors
+                                        // in was not enough on its own:
+                                        // `CORDIAL_TRACE_IDENTITY=1` shows the
+                                        // engine asking all six of
+                                        // `NativeUserJavaInterface`'s methods
+                                        // four times each, being told a real
+                                        // user every time, and still reaching
+                                        // `app ready: Landing`. The mirrors are
+                                        // what Cordial answers when asked; this
+                                        // is what the engine keeps for itself.
+                                        //
+                                        // Here rather than earlier for the same
+                                        // reason as the cookie restore above:
+                                        // this class's natives return cleanly
+                                        // and do nothing until
+                                        // `nativeAppBridgeV2InitWithParams` has
+                                        // built what they write into. Still
+                                        // before `StartLuaAppDM`, which is what
+                                        // starts the app shell that routes.
+                                        if cordial_runtime::identity::enabled() {
+                                            match lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetUserId",
+                                            ) {
+                                                None => println!(
+                                                    "  [identity] nativeSetUserId not exported; the engine will not know who is signed in"
+                                                ),
+                                                Some(f) => {
+                                                    if cordial_runtime::identity::push_user_id(f) {
+                                                        println!("  [identity] the engine has been told which user is signed in");
                                                     }
                                                 }
                                             }

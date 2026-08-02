@@ -4,12 +4,17 @@
 persistence §5.2 proposed now exists (`crates/cordial-runtime/src/cookies.rs`,
 `native/cookies.cpp`), so a session survives a restart. **§8 records what that
 implementation measured, including two places where §5.2 was wrong** — read it
-before trusting §5.2's positions. Everything about *obtaining* a session (§3,
-§4) is unchanged and still discovery.
+before trusting §5.2's positions. **§9 records the rest of the fix, and with it
+that §1.3's central inference was wrong**: the identity mirrors are not
+presentation-layer, they are what routes the user, and a restored cookie on its
+own leaves you on the landing page. Read §9 before §1.3. Everything about
+*obtaining* a session (§3, §4) is unchanged and still discovery.
 
 No credentials were used, entered, or created while writing this document or
-implementing §8. This document exists to turn "there is no sign-in" from a known
-gap into a scoped, evidence-backed plan.
+implementing §8 and §9. §9's measurements were made against a throwaway account
+the owner signed in on an isolated profile, and no account's username, display
+name or user id appears anywhere in this repository. This document exists to
+turn "there is no sign-in" from a known gap into a scoped, evidence-backed plan.
 
 **Related:** `docs/design/instances-and-launch.md` (a related, independently
 written and *not yet verified* theory about a `roblox://` ticket-launch path —
@@ -117,6 +122,17 @@ mirrors of it — filling them in without a real cookie would produce a client
 that *displays* a fake identity while still getting 401s from every
 `authenticated/*` endpoint, which is worse than the current honest state, not
 better.
+
+> **This inference was wrong, and §9 disproves it by running the thing.** The
+> half that survives is the warning: filling the mirrors in *without* a real
+> cookie would indeed produce a client claiming an account it cannot
+> authenticate as, which is why nothing in §9 invents a value. The half that is
+> wrong is "presentation-layer". Restore a genuine cookie, confirm the engine
+> holds it, and leave the mirrors at zero, and the client still reaches
+> `APP_READY (Landing)` — measured on a real signed-in profile. The mirrors are
+> not a display of the routing decision, they are an input to it, and so is a
+> third call this section did not know about, `nativeSetUserId`. The cookie is
+> necessary and was never sufficient.
 
 **[verified: log]** Two more facts from the same run that constrain the
 picture:
@@ -492,7 +508,7 @@ put in it** — which is the actual blocker, per §4.
 
 | Question | Answer | Confidence |
 |---|---|---|
-| What does the engine expect differently when logged in? | Two identity mirrors (`NativeUserJavaInterface`, `StartAppParams`) plus, more importantly, a real cookie flowing through the engine's own HTTP client — the mirrors alone don't unblock `authenticated/*` calls. | Verified (log) for the HTTP-layer part; the mirrors' role is inferred but low-risk to fill in regardless. |
+| What does the engine expect differently when logged in? | **Three** things, all required: a real cookie in the engine's HTTP client, the two identity mirrors (`NativeUserJavaInterface`, `StartAppParams`), and `NativeSettingsInterface.nativeSetUserId`. This row used to say the mirrors were secondary; §9 measured all three and any one missing leaves the client on `Landing`. | Verified (live run, with a control) for all three. |
 | Where does the session live? | Three-way cookie sync between the engine's HTTP client and Android's WebView `CookieManager`, via `NativeSettingsInterface`'s three cookie natives plus `JNICookieProtocol`'s callback. | Verified (dex, readelf, log) for the contract shape; `nativeSetMultipleCookies` itself was not observed firing. |
 | Is a WebView required? | For captcha: yes, and expect it to fire in practice — even a native (`CaptchaNative`) captcha screen was found, so this stays unsettled but the WebView path still needs building regardless (§7.5). For plain username/password: **no** — `FIntLuaAppLoginMethod` (default `"1"`) makes this Lua-rendered by default, confirmed by calling the engine's own native directly and by a `LoginNative` screen with real username/password copy shipped in the app's own content (§7). | Captcha: verified-adjacent, refined but not overturned. Password path: **verified**, resolved from §3.3's "possibly not, unconfirmed." |
 | Is there a path that avoids it? | No confirmed one. Local-device "magic login" is the most promising unverified lead; a join-ticket path already assumed by another design doc remains unresolved. | Inferred, both. |
@@ -501,10 +517,12 @@ put in it** — which is the actual blocker, per §4.
 **The one thing this document changes about the project's understanding of
 its own blocker:** it is not "Cordial has no auth." It is "Cordial has no way
 to *obtain* a session, and every way of obtaining one that was found requires
-either a WebView, a second device, or an unresolved ticket flow." The stub
-code in `NativeUserJavaInterface` is not the blocker — it is honestly
-reporting a true fact (nobody is signed in) and would need real data fed to
-it regardless of which acquisition path gets built.
+either a WebView, a second device, or an unresolved ticket flow."
+
+The sentence that used to follow — "the stub code in `NativeUserJavaInterface`
+is not the blocker" — **was wrong, and it was wrong in the expensive direction.**
+It was honestly reporting a true fact, and it was also the thing keeping a
+signed-in user on the landing page after the cookie work landed. §9.
 
 ---
 
@@ -905,7 +923,176 @@ either. The session is therefore saved by reading the jar back on a thirty-secon
 timer and at teardown, which needs no callback; if the callback does fire it
 only makes those saves prompt.
 
-**Still out of scope here:** §5.2 steps 3 and 4 (`StartAppParams` and
-`NativeUserJavaInterface`). §1.3's finding stands — those are presentation-layer
-mirrors, and the cookie is what unblocks `authenticated/*`. Whether they now
-need filling in is answerable only against a genuinely signed-in run.
+**Out of scope when §8 was written, and done in §9:** §5.2 steps 3 and 4
+(`StartAppParams` and `NativeUserJavaInterface`). This paragraph used to say
+"§1.3's finding stands — those are presentation-layer mirrors, and the cookie is
+what unblocks `authenticated/*`", and then that whether they needed filling in
+was answerable only against a genuinely signed-in run. The second half was
+right and the first half was wrong: the signed-in run happened, and the answer
+is that the mirrors decide the route. §9.
+
+---
+
+## 9. Implemented: the restored session now signs you in
+
+§8 made a session survive a restart and the user was still on the landing page.
+This section is why, and it overturns §1.3.
+
+Every measurement below was made on a throwaway account, on an isolated profile
+under its own `XDG_DATA_HOME`, signed in by the owner. **No credentials were
+entered and no account's username, display name or user id appears in this
+document, in any commit, or in any test fixture.** Where a value would be the
+evidence, its length or its presence is given instead — the same discipline
+`cookies.rs` already keeps for a jar.
+
+### 9.1 The cookie is necessary and was never sufficient **[verified: live run]**
+
+The starting position, on a profile with a real signed-in cookie store:
+
+```text
+  [cookies] .roblox.com: engine holds 5 cookie(s) after restore
+  [cookies] apis.roblox.com: engine holds 5 cookie(s) after restore
+  [cookies] auth.roblox.com: engine holds 5 cookie(s) after restore
+  [cookies] roblox.com: engine holds 5 cookie(s) after restore
+  [cookies] restored 4 domain(s)
+[roblox] app ready: PlatformAccountRouter
+[roblox] app ready: Startup
+[roblox] app ready: Landing
+```
+
+The engine has the session, confirms it by reading its own jar back, and routes
+to the landing page anyway. §1.3 predicted the opposite.
+
+### 9.2 The engine hands over the identity, and Cordial was dropping it **[verified: live run]**
+
+`onDataModelNotificationCallback` — already hooked, and already the thing that
+prints `[roblox] datamodel notification:` — carries it. From the owner's own
+sign-in, values elided:
+
+```text
+onDataModelNotification: Received type(DID_LOG_IN, 28), data({"username":…,
+  "membershipType":0,"isUnder13":false,"hasRobloxSubscription":false,
+  "countryCode":…,"userId":…,"displayName":…})
+onDataModelNotification: Received type(APP_READY, 10), data(Home)
+```
+
+Those are exactly the fields §1.2 lists as hard-zeroed in `StartAppParams` and
+§1.1 lists as stubbed in `NativeUserJavaInterface`. Before this change,
+`grep -rn DID_LOG_IN` over the whole repository returned nothing: Cordial
+received it, printed it in full, and dropped it. **Printing it in full was also
+a privacy defect** — a real person's username and user id went to stderr on
+every sign-in — and that line now reports the payload's size and nothing else.
+
+`DID_LOG_OUT` and `LUA_UNAUTHORIZED_LOG_OUT` clear the stored identity.
+`DID_SIGN_UP` and `DID_SWITCH_ACCOUNT` are routed through the same parse.
+**Those four are INFERRED**: they are strings in `libroblox.so` next to
+`DID_LOG_IN`, `POST_PURCHASE` and `UNREAD_COUNT`, and none has been observed
+firing under Cordial, because reaching any of them needs a click. The parse
+stores nothing that is not identity-shaped, so a wrong guess about the payload
+of one of them is a no-op rather than a wrong account.
+
+### 9.3 Filling the two mirrors in is still not enough **[verified: live run, with a probe]**
+
+With the identity restored into both mirrors, the client still reached
+`Landing`. `CORDIAL_TRACE_IDENTITY=1` — which names the field asked and whether
+anybody is signed in, and never the value — settles that the engine does ask:
+
+```text
+      4 [cordial] identity asked: getDisplayName (signed in)
+      4 [cordial] identity asked: getHasRobloxSubscription (signed in)
+      4 [cordial] identity asked: getIsUnder13 (signed in)
+      4 [cordial] identity asked: getMembershipType (signed in)
+      4 [cordial] identity asked: getUserId (signed in)
+      4 [cordial] identity asked: getUsername (signed in)
+[roblox] app ready: Landing
+```
+
+That probe exists because "the engine never asked" and "the engine asked and
+routed on something else" are completely different pieces of work with the same
+symptom, and the symptom is a landing page.
+
+### 9.4 The third leg is `nativeSetUserId` **[verified: live run]**
+
+`NativeSettingsInterface.nativeSetUserId(String)` is listed in §2.1 as a real
+export that nothing in this repository called. It is the engine's own copy of
+who is signed in, as distinct from what Cordial's Java side answers when asked.
+Called after `nativeAppBridgeV2InitWithParams` and before
+`nativeAppBridgeStartLuaAppDM` — the same window §8.2 established for the cookie
+natives, and for the same reason — the client reaches:
+
+```text
+  [identity] restored a signed-in user from …/identity (username 11 bytes)
+  [identity] the engine has been told which user is signed in
+[cordial] app start as a signed-in user
+[roblox] app ready: PlatformAccountRouter
+[roblox] app ready: Startup
+[roblox] app ready: Home
+[roblox] app ready: RootSwitchNavigator
+[roblox] datamodel notification: DID_LOG_IN <identity elided, 161 bytes>
+[roblox] datamodel notification: LUA_HOME_PAGE_LOADED
+[roblox] datamodel notification: HOME_PAGE_INTERACTIVE
+```
+
+So all three are required together: the cookie, the two mirrors, and this. Which
+one is load-bearing for which decision was not isolated further — only that the
+mirrors alone leave you on `Landing` (§9.3) and the mirrors plus this reach
+`Home`.
+
+### 9.5 The bootstrap is two launches, and that is inherent
+
+`DID_LOG_IN` fires when a login happens. A run with a restored cookie and no
+identity reaches `Landing` and emits no notification at all — measured, as the
+control in §9.6. So the launch that signs in is the launch that captures the
+identity, and every launch after it restores one. Exactly the shape of the
+cookie store, for the same reason: the engine keeps neither on disk.
+
+It also fires on a *restored* run, about a second after `APP_READY (Home)`,
+which is what makes the capture path observable without a second sign-in: the
+store is rewritten on every launch that reaches Home, and the file's checksum
+changes to prove it.
+
+### 9.6 What is verified, and what is not
+
+**Verified, with a control, on a real signed-in profile:**
+
+| Run | Store | Result |
+|---|---|---|
+| identity absent | — | `app ready: Landing`, no `DID_LOG_IN` at all |
+| identity present, three consecutive runs | restored | `Landing` → `Startup` → **`Home`** → `RootSwitchNavigator`, `DID_LOG_IN` captured and saved on each |
+| identity present, `CORDIAL_SKIP_IDENTITY=1`, three consecutive runs | untouched | `app ready: Landing`, `app start as nobody signed in`, store byte-for-byte unchanged |
+
+The control is the same binary and the same profile with one environment
+variable different, matching `CORDIAL_SKIP_COOKIES`.
+
+**Verified, on the store itself:** written `0600` by temporary file and rename
+through the same writer as the cookie store; a missing, malformed or
+future-schema file reads as an ordinary signed-out launch rather than a failure
+to start; a zero user id or an empty username is refused rather than persisted,
+because zero is exactly what the mirrors said before any of this existed.
+
+**INFERRED, and deliberately not depended on:**
+
+- The logout types (§9.2). Reaching one needs a click.
+- `DID_SIGN_UP` and `DID_SWITCH_ACCOUNT` carrying the same payload shape.
+- That `getAlternateName` should stay empty when signed in. `DID_LOG_IN` carries
+  no alternate name, so echoing the username into it would claim one exists.
+
+**Not established, and the honest reason:**
+
+- **The capture path has never been driven by a human actually signing in under
+  this build.** It was demonstrated the other way round: the store was seeded
+  once, by hand, from the `DID_LOG_IN` payload in the engine's own FastLog from
+  the owner's sign-in — which is byte-for-byte what the capture path would have
+  written had it existed at that moment — and every launch since has re-captured
+  and rewritten it through the real code path. The remaining gap is the first
+  launch of a genuinely new sign-in, which needs someone to type a password.
+- Whether `nativeSetUserId` alone would have been enough without the mirrors.
+  Not isolated, because the mirrors are needed regardless — `StartAppParams`
+  hands the app shell a username it would otherwise render as nobody.
+- What the engine does over the network differently now. `DFLogHttpTrace` was
+  set in the profile's `flags.json` and produced no `[FLog::Http]` channel in
+  the engine's own log, so the 401-versus-200 comparison §5.2 step 5 asks for
+  was **not** obtained. What did change is visible instead in the assets: a
+  logged-out run asks for `rbxthumb://type=AvatarHeadShot&id=` with an empty
+  id, and a restored one fetches a real `tr.rbxcdn.com/…-AvatarHeadshot-…`
+  thumbnail.

@@ -20,6 +20,7 @@ pub mod android;
 pub mod client_settings;
 pub mod cookies;
 pub mod flags;
+pub mod identity;
 pub mod plugin_host;
 pub mod profile;
 pub mod bionic;

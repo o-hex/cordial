@@ -18,8 +18,10 @@
 //! A profile now holds configuration as well as storage — the user's
 //! `flags.json`, `plugin-grants.json`, `plugins/<id>/settings.json` for each
 //! plugin that keeps anything, and, since the engine turned out never to write
-//! its cookies anywhere, the session itself in `cookies` at `0600`
-//! (`cookies.rs`). See
+//! its cookies anywhere, the session itself: `cookies` at `0600`
+//! (`cookies.rs`), and beside it `identity` at `0600` (`identity.rs`), which
+//! holds the account's user id and username because the cookie alone leaves the
+//! client on the landing page. See
 //! [ADR-013](../../../docs/adr/ADR-013-per-profile-configuration.md), which
 //! extends ADR-012 and records why grants in particular had to stop being
 //! global: a plugin approved in a throwaway profile was silently approved in

@@ -29,6 +29,13 @@
 //! measurement above disproves. The ADR records the reversal rather than
 //! quietly contradicting it.
 //!
+//! **The cookie is necessary and is not sufficient**, which cost a second round
+//! of this. With the store restored and the engine confirmed holding five
+//! cookies for each of four domains, the client still reached `app ready:
+//! Landing`, because `PlatformAccountRouter` asks who is signed in rather than
+//! what cookies are held. [`crate::identity`] is the other half, and neither
+//! half alone signs anybody in.
+//!
 //! **Where it goes, and why not the keyring.** The profile directory, which is
 //! already `0700` and already holds everything else about that account, with
 //! the file itself at `0600`. A keyring adds an unlock prompt to every launch
@@ -61,6 +68,7 @@
 //! diagnostic here reports a count or a size.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -303,7 +311,7 @@ pub fn load(dir: &Path) -> Vec<(String, Jar)> {
     out
 }
 
-/// Write the store, at `0600`, atomically.
+/// Write a file in a profile at `0600`, atomically.
 ///
 /// Temp file plus rename rather than truncate-and-write. An interrupted write
 /// to the real path would leave a jar cut off mid-value, and half a cookie
@@ -315,9 +323,15 @@ pub fn load(dir: &Path) -> Vec<(String, Jar)> {
 /// The mode is set on the temp file *before* anything is written to it, not
 /// after: a `0644` window with a live session in it is still a window, and it
 /// is the one an attacker with a loop would use.
-pub fn save(dir: &Path, records: &[(String, Jar)]) -> std::io::Result<()> {
-    let final_path = dir.join(FILE);
-    let tmp = dir.join(format!("{FILE}.new"));
+///
+/// **Shared with [`crate::identity`] rather than copied into it.** The identity
+/// store beside this one holds a username and a user id for the same account,
+/// and a second writer would be a second chance to get the mode or the rename
+/// wrong — including later, when only one of the two gets a fix. Every property
+/// this function has is a property that store needs too.
+pub(crate) fn write_private(dir: &Path, name: &str, body: &str) -> std::io::Result<()> {
+    let final_path = dir.join(name);
+    let tmp = dir.join(format!("{name}.new"));
 
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -328,8 +342,17 @@ pub fn save(dir: &Path, records: &[(String, Jar)]) -> std::io::Result<()> {
     // `mode` only applies when the call creates the file, so a leftover temp
     // from an interrupted run would keep whatever mode it had.
     f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
 
-    writeln!(f, "{HEADER}")?;
+    std::fs::rename(&tmp, &final_path)
+}
+
+/// Write the store, at `0600`, atomically. See [`write_private`].
+pub fn save(dir: &Path, records: &[(String, Jar)]) -> std::io::Result<()> {
+    let mut body = String::new();
+    writeln!(body, "{HEADER}").expect("writing to a String cannot fail");
     for (host, jar) in records {
         // The jar is escaped, because it genuinely does contain tabs — see
         // `escape`. The *host* is not, and a host containing a separator is
@@ -339,12 +362,9 @@ pub fn save(dir: &Path, records: &[(String, Jar)]) -> std::io::Result<()> {
         if host.contains(['\t', '\n']) {
             continue;
         }
-        writeln!(f, "{host}\t{}", escape(jar.expose()))?;
+        writeln!(body, "{host}\t{}", escape(jar.expose())).expect("writing to a String cannot fail");
     }
-    f.sync_all()?;
-    drop(f);
-
-    std::fs::rename(&tmp, &final_path)
+    write_private(dir, FILE, &body)
 }
 
 /// How often the jar is written out even if nothing has announced a change.

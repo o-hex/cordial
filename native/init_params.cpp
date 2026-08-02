@@ -53,6 +53,24 @@ using jnivm::String;
 jnivm::ENV* process_env();
 std::shared_ptr<String> jstr_shared(const char* v);
 
+/// Who is signed in — defined in `android_classes.cpp`, beside the
+/// `NativeUserJavaInterface` mirror it also answers.
+///
+/// Declared here rather than shared through a header because the whole of the
+/// framework layer's cross-file surface is declarations like these, and one
+/// header for four accessors would be the only one in `native/`.
+///
+/// **`StartAppParams` and `NativeUserJavaInterface` have to agree.** They are
+/// different calls at different times, and the engine reads both; a client that
+/// starts its app shell as nobody and then answers a later query as somebody is
+/// self-contradicting in a way that shows up far from here. One source, read
+/// twice, is what stops that.
+jlong identity_user_id();
+std::string identity_username();
+jint identity_membership_type();
+bool identity_is_under13();
+bool identity_known();
+
 namespace {
 std::shared_ptr<String> S(const char* v) {
     return std::make_shared<String>(std::string(v ? v : ""));
@@ -738,12 +756,29 @@ public:
         p->appStarterPlace = S("");
         p->appStarterScript = S("");
         p->selectedTheme = S("Dark");
-        p->username = S("");
         p->platformParams = PlatformParams::Create(env, assets, width, height);
         p->surface = std::move(surface);
-        p->appUserId = 0;
-        p->isUnder13 = false;
-        p->membershipType = 0;
+        // The four identity fields, from the account `DID_LOG_IN` named, or the
+        // signed-out values when nobody has signed in on this profile.
+        //
+        // **These four being hardcoded to zero is what kept a restored session
+        // on the landing page.** `PlatformAccountRouter` runs after the cookie
+        // has gone back into the engine, asks who is signed in, is told user 0
+        // with an empty name, and routes to Landing without ever asking the
+        // network — so a perfectly good cookie changed nothing. Measured with a
+        // real signed-in store: five cookies held per domain, still `Landing`.
+        //
+        // This object is built once, inside
+        // `nativeAppBridgeV2StartAppWithParams`, and the engine never asks for
+        // these fields again — so the identity has to be restored before that
+        // call, which `crates/cordial-runtime/src/identity.rs` does at startup
+        // rather than anywhere near here.
+        p->username = S(identity_username().c_str());
+        p->appUserId = identity_user_id();
+        p->isUnder13 = identity_is_under13();
+        p->membershipType = identity_membership_type();
+        fprintf(stderr, "[cordial] app start as %s\n",
+                identity_known() ? "a signed-in user" : "nobody signed in");
         p->vrContext = AndroidActivity::Create(env);
         to_jni(env, p);
         return p;

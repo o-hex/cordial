@@ -4,6 +4,22 @@
 
 # Run Roblox on Linux natively — Plugins, all yours. (Please don't DMCA take down this hobby project)
 
+> [!IMPORTANT]
+> **This project is looking for a maintainer.** Its original author has stepped
+> away, and the honest thing is to say so at the top rather than let anyone
+> discover it after investing a weekend.
+>
+> It is not abandoned mid-collapse — it works. You can sign in, stay signed in,
+> load a game, move around, turn the camera and hear sound. What it lacks is
+> somebody to own it. [**docs/HANDOVER.md**](docs/HANDOVER.md) is written for
+> exactly that person: every open thread with what is genuinely known about it,
+> which claims are `INFERRED` and why, and the measurement traps that have
+> already cost people afternoons.
+>
+> If you want to start smaller, the [good first
+> issues](https://github.com/luohoa97/cordial/labels/good%20first%20issue) are
+> real ones, and none of them needs a Roblox account.
+
 Cordial loads Roblox's official Android x86-64 engine directly on Linux through a
 purpose-built runtime: the AOSP bionic linker, a bionic/glibc shim, a JNI VM in
 place of Android's, and a framework layer that answers the client's calls. No

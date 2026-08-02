@@ -122,23 +122,29 @@ pub fn spawn(build: &Build, claim: Claim, run_seconds: Option<u64>) -> Result<In
         .arg(&run);
 
     // The profile stops being a directory name and starts meaning something
-    // here: `CORDIAL_FILES_DIR` is where the engine puts `appData`, its cookie
-    // store and its own logs. Without it every profile would share one storage
-    // directory and the lock would be guarding nothing.
+    // here. `--profile` is the whole of it: the client resolves the directory
+    // itself and everything inside it follows — the engine's `appData`, its
+    // logs, the cookie store and the saved identity.
     //
-    // **This is a bridge, and the argument is the destination.** `cordial-run`
-    // hardcodes `cordial/instances/default/` off `XDG_DATA_HOME` and takes no
-    // `--profile`; it rejects arguments it does not know, so passing one now
-    // would fail every launch. What it should take is `--profile <name>`, the
-    // profile *name* and nothing else — the owner's decision, and the right
-    // one: settings live inside the profile directory and the client reads
-    // them from the root it was given, so one argument fixes where everything
-    // else lives. Passing settings on the command line would duplicate the
-    // source of truth and could not reflect a change made while the client is
-    // running, which is exactly what the dynamic DFFlag families exist for.
-    // When that argument lands, this line becomes `--profile <name>` and the
-    // engine resolves the directory itself.
-    command.env("CORDIAL_FILES_DIR", claim.profile_dir().join("data"));
+    // `CORDIAL_FILES_DIR` alone was not enough, and the way it failed is worth
+    // keeping. It moved only the engine's own data directory, while the cookie
+    // and identity stores resolve through `profile::active()`, which without
+    // the argument falls back to `profiles/default`. So picking any other
+    // profile put the engine's files in the right place and its *session* in
+    // the wrong one: cookies did not respect profiles, and every profile shared
+    // one login. The bridge outlived the thing it was bridging to — `--profile`
+    // landed and this was never moved over.
+    //
+    // The profile is passed and the settings inside it are not, deliberately.
+    // One value decides where everything else lives, and an argument cannot
+    // change while the client runs, which is exactly what the dynamic DFFlag
+    // families exist for (ADR-013).
+    let profile_name = claim
+        .profile_dir()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "the profile directory has no usable name".to_string())?;
+    command.arg("--profile").arg(profile_name);
 
     // ADR-011 makes Wayland the display backend and says X11 "is not developed
     // further", but `cordial-run` still defaults to X11 and takes Wayland only

@@ -60,12 +60,17 @@ without an account can settle any of it, and no automated agent should try.
   `--dump-classes` shows Roblox naming `org.fmod.AudioDevice` — FMOD's *Java*
   `AudioTrack` output path. If FMOD picks that inside an experience, the whole
   OpenSL bridge is the wrong door. Unresolved.
-- **The 1 fps report.** Presents drop to exactly 1.0/s when nothing is
-  happening; this is an idle throttle and it is documented in AGENTS.md. A user
-  reported 1 fps while actively playing, which — if the throttle is what they
-  saw — would mean input is not reaching the engine in the way its idle
-  heuristic counts. Pointer capture landed after that report and may be the fix.
-  Nobody has re-measured with it in.
+- ~~**The 1 fps report.**~~ **Withdrawn, and worth reading as a cautionary
+  tale.** A report of 1 fps in an experience looked like a perfect match for the
+  documented idle throttle, which drops presents to exactly 1.0/s when nothing
+  is happening. A whole theory followed: input not reaching the engine in the
+  way its idle heuristic counts, with pointer capture as the likely fix. It was
+  the developer's own machine under memory pressure from unrelated applications,
+  and the same session on a quiet machine was "buttery smooth" on an Intel iGPU.
+  Nothing in Cordial was at fault. Two coincidences did the damage — the number
+  matched a real documented behaviour exactly, and the throttle was fresh in
+  everyone's mind. **Ask what else was running before believing a performance
+  report, including your own.**
 
 **Do not test with an account anyone cares about**, and keep test accounts on a
 separate IP. Enforcement is automated, runs in waves, and associates accounts

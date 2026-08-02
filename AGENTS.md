@@ -165,3 +165,19 @@ headless compositor on its own `WAYLAND_DISPLAY` and inject inside that.
 **Do not test with an account anyone cares about**, and keep test accounts on a
 separate IP. The risk is collateral rather than causal: enforcement is automated,
 runs in waves, and associates accounts sharing an address.
+
+**Give your runs their own data root.** A profile is held by one instance at a
+time, by `flock`, so a second launch against it is refused rather than allowed to
+corrupt Roblox's storage ([ADR-012](docs/adr/ADR-012-profiles-and-instances.md)).
+Everything defaults to the `default` profile, so several agents testing at once
+collide on that lock and read it as a bug in the thing they were working on:
+
+```bash
+XDG_DATA_HOME=~/.cache/cordial-agent-<yours> just client --run 30
+```
+
+Both the shell's profile root and the client's data directory derive from
+`XDG_DATA_HOME`, so that redirects the lot. Use a path on disk — `/tmp` is tmpfs
+and comes out of RAM — and delete it when you are done. `CORDIAL_PROFILE_ROOT`
+redirects `profile.rs` only, which is what the unit tests use; it does **not**
+move the client, which still hardcodes its own path.

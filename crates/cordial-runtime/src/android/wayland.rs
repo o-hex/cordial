@@ -28,6 +28,28 @@
 //! exactly that family. If a further protocol is genuinely needed
 //! here, generate it — or take it from GTK, which is in the process now.
 //!
+//! **Two more were added anyway, and this paragraph is the justification owed
+//! for it.** `pointer-constraints-unstable-v1` and
+//! `relative-pointer-unstable-v1` are what a locked pointer is made of, and
+//! neither of the two escapes above was open. Taking them from GTK does not
+//! work: `nm -D` on this host's `libgtk-4.so.1` exports no
+//! `zwp_pointer_constraints_v1_interface`, and `strings` finds neither
+//! interface name anywhere in the library, so GDK4 does not speak either
+//! protocol and has no table to borrow. Generating them needs
+//! `wayland-protocols`' XML, and this host has no `/usr/share/wayland-protocols`
+//! at all — a build-time dependency on a package the developer does not have
+//! installed is a worse trade than four small tables.
+//!
+//! So the mitigation is the one the failure above actually calls for. Every
+//! signature below was taken from `wayland-scanner private-code` run over the
+//! upstream XML and copied from its output rather than written from the
+//! protocol description, all four interfaces are version 1 with no `since`
+//! prefixes to get wrong, and `pointer_constraints_tables_match_wayland_scanner`
+//! in the tests pins each signature string and every count against what that
+//! generator emitted. That is a weaker guarantee than generating at build time
+//! and a much stronger one than reading the XML and typing what it seemed to
+//! say.
+//!
 //! ## The engine's surface is a subsurface, not a toplevel
 //!
 //! This file used to give the engine an `xdg_toplevel` of its own, which made
@@ -298,6 +320,132 @@ const TEXT_INPUT_SET_CONTENT_TYPE: u32 = 5;
 const TEXT_INPUT_SET_CURSOR_RECTANGLE: u32 = 6;
 const TEXT_INPUT_COMMIT: u32 = 7;
 
+
+// ------------------------------------------- zwp_pointer_constraints_v1
+//
+// The locked pointer, which is what a first-person camera and a
+// right-button camera drag both are on a desktop: the cursor stops moving,
+// stops being able to leave the window, and the client is fed relative motion
+// instead. Confinement — the other half of this protocol — keeps the cursor
+// visible inside a region and is not what either wants, so `confine_pointer`
+// is declared for the method count and never sent.
+//
+// Every signature here is `wayland-scanner private-code`'s own output over
+// `pointer-constraints-unstable-v1.xml`, not a transcription of the XML. See
+// the module doc for why this file grew two hand-written protocols after
+// telling the reader not to.
+
+static POINTER_CONSTRAINTS_METHODS: [WlMessage; 3] = [
+    WlMessage { name: c"destroy".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
+    WlMessage {
+        name: c"lock_pointer".as_ptr(),
+        signature: c"noo?ou".as_ptr(),
+        types: NO_TYPES.0.as_ptr(),
+    },
+    WlMessage {
+        name: c"confine_pointer".as_ptr(),
+        signature: c"noo?ou".as_ptr(),
+        types: NO_TYPES.0.as_ptr(),
+    },
+];
+static POINTER_CONSTRAINTS_INTERFACE: WlInterface = WlInterface {
+    name: c"zwp_pointer_constraints_v1".as_ptr(),
+    version: 1,
+    method_count: 3,
+    methods: POINTER_CONSTRAINTS_METHODS.as_ptr(),
+    event_count: 0,
+    events: std::ptr::null(),
+};
+
+const POINTER_CONSTRAINTS_LOCK_POINTER: u32 = 1;
+
+// ---------------------------------------------- zwp_locked_pointer_v1
+
+static LOCKED_POINTER_METHODS: [WlMessage; 3] = [
+    WlMessage { name: c"destroy".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
+    WlMessage {
+        name: c"set_cursor_position_hint".as_ptr(),
+        signature: c"ff".as_ptr(),
+        types: NO_TYPES.0.as_ptr(),
+    },
+    WlMessage {
+        name: c"set_region".as_ptr(),
+        signature: c"?o".as_ptr(),
+        types: NO_TYPES.0.as_ptr(),
+    },
+];
+static LOCKED_POINTER_EVENTS: [WlMessage; 2] = [
+    WlMessage { name: c"locked".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
+    WlMessage { name: c"unlocked".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
+];
+static LOCKED_POINTER_INTERFACE: WlInterface = WlInterface {
+    name: c"zwp_locked_pointer_v1".as_ptr(),
+    version: 1,
+    method_count: 3,
+    methods: LOCKED_POINTER_METHODS.as_ptr(),
+    event_count: 2,
+    events: LOCKED_POINTER_EVENTS.as_ptr(),
+};
+
+const LOCKED_POINTER_DESTROY: u32 = 0;
+const LOCKED_POINTER_SET_CURSOR_POSITION_HINT: u32 = 1;
+
+/// `zwp_pointer_constraints_v1.lifetime.persistent`. The alternative,
+/// `oneshot` (1), makes the compositor destroy the constraint the first time it
+/// deactivates — and it deactivates on every alt-tab. Persistent means the lock
+/// comes back when the window is focused again, which is what a first-person
+/// camera wants; the escape path is Cordial destroying the object, not the
+/// compositor happening to.
+const POINTER_CONSTRAINT_LIFETIME_PERSISTENT: u32 = 2;
+
+/// `WL_MARSHAL_FLAG_DESTROY`. `wl_proxy_marshal_flags`'s `flags` argument, which
+/// every other call in this file passes 0 for. A request declared
+/// `type="destructor"` in the XML has to be sent with this or the proxy leaks:
+/// the request reaches the compositor either way, and the client-side object is
+/// what is left dangling.
+const WL_MARSHAL_FLAG_DESTROY: u32 = 1;
+
+// ------------------------------------------ zwp_relative_pointer_manager_v1
+//
+// A locked pointer stops producing `wl_pointer.motion` entirely — that is the
+// point of it — so without this the lock would silence the camera rather than
+// free it. `relative_motion` is the replacement, and it is the only place
+// pointer movement comes from while the lock is active.
+
+static RELATIVE_POINTER_MANAGER_METHODS: [WlMessage; 2] = [
+    WlMessage { name: c"destroy".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
+    WlMessage {
+        name: c"get_relative_pointer".as_ptr(),
+        signature: c"no".as_ptr(),
+        types: NO_TYPES.0.as_ptr(),
+    },
+];
+static RELATIVE_POINTER_MANAGER_INTERFACE: WlInterface = WlInterface {
+    name: c"zwp_relative_pointer_manager_v1".as_ptr(),
+    version: 1,
+    method_count: 2,
+    methods: RELATIVE_POINTER_MANAGER_METHODS.as_ptr(),
+    event_count: 0,
+    events: std::ptr::null(),
+};
+
+const RELATIVE_POINTER_MANAGER_GET_RELATIVE_POINTER: u32 = 1;
+
+static RELATIVE_POINTER_METHODS: [WlMessage; 1] =
+    [WlMessage { name: c"destroy".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() }];
+static RELATIVE_POINTER_EVENTS: [WlMessage; 1] = [WlMessage {
+    name: c"relative_motion".as_ptr(),
+    signature: c"uuffff".as_ptr(),
+    types: NO_TYPES.0.as_ptr(),
+}];
+static RELATIVE_POINTER_INTERFACE: WlInterface = WlInterface {
+    name: c"zwp_relative_pointer_v1".as_ptr(),
+    version: 1,
+    method_count: 1,
+    methods: RELATIVE_POINTER_METHODS.as_ptr(),
+    event_count: 1,
+    events: RELATIVE_POINTER_EVENTS.as_ptr(),
+};
 
 // ----------------------------------------------------- subsurface opcodes
 //
@@ -604,6 +752,27 @@ struct KeyboardListener {
     repeat_info: unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32),
 }
 
+/// `zwp_locked_pointer_v1`'s two events, which are how the compositor answers
+/// a lock request. **There is no reply that means "refused"** — a compositor
+/// that declines simply never sends `locked`, which is why
+/// `sync_pointer_lock` times the request out rather than waiting for an error
+/// that cannot arrive.
+#[repr(C)]
+struct LockedPointerListener {
+    locked: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    unlocked: unsafe extern "C" fn(*mut c_void, *mut c_void),
+}
+
+/// The four `wl_fixed_t` arguments are two pairs, not four numbers: the
+/// accelerated delta the compositor's pointer profile produced, then the raw
+/// unaccelerated one. Cordial uses the accelerated pair, because that is what
+/// every other application on the desktop moves by and a camera that ignores
+/// the user's own pointer-speed setting is a bug report.
+#[repr(C)]
+struct RelativePointerListener {
+    relative_motion: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32, i32, i32, i32, i32),
+}
+
 /// Nine slots, not six. The last three are `zwp_text_input_v3` version 2's
 /// `action`/`language`/`preedit_hint`, and they are here for the same reason
 /// `PointerListener` carries slots for scroll events nothing implements: the
@@ -740,6 +909,24 @@ pub struct WaylandWindow {
     #[allow(dead_code)]
     keyboard: *mut c_void,
     text_input: *mut c_void,
+    /// `zwp_pointer_constraints_v1`, or null on a compositor that has none.
+    /// Null is not an error: everything except pointer capture works without
+    /// it, exactly as text entry works without `zwp_text_input_manager_v3`.
+    pointer_constraints: *mut c_void,
+    /// The `zwp_relative_pointer_v1` for this seat's pointer, created once and
+    /// kept for the process's life. It delivers `relative_motion` whenever the
+    /// pointer has focus, lock or no lock; `dispatch_relative_motion` is what
+    /// decides to act on it, so there is nothing to create and destroy per
+    /// lock.
+    relative_pointer: *mut c_void,
+    /// The live `zwp_locked_pointer_v1`, or null when the pointer is free.
+    /// Destroying this object *is* the release — there is no "unlock" request
+    /// — so this being null and the pointer being free are the same statement.
+    locked_pointer: Mutex<*mut c_void>,
+    /// When the current lock was asked for, so a compositor that silently
+    /// declines can be reported once instead of leaving the camera dead with no
+    /// explanation. `None` while no request is outstanding.
+    lock_requested_at: Mutex<Option<std::time::Instant>>,
     conn_fd: c_int,
 
     buffers: Mutex<Geometry>,
@@ -795,6 +982,8 @@ struct Globals {
     subcompositor: Option<(u32, u32)>,
     seat: Option<(u32, u32)>,
     text_input_manager: Option<(u32, u32)>,
+    pointer_constraints: Option<(u32, u32)>,
+    relative_pointer_manager: Option<(u32, u32)>,
 }
 
 unsafe extern "C" fn registry_global(
@@ -813,6 +1002,8 @@ unsafe extern "C" fn registry_global(
         "wl_subcompositor" => globals.subcompositor = Some((name, version)),
         "wl_seat" => globals.seat = Some((name, version)),
         "zwp_text_input_manager_v3" => globals.text_input_manager = Some((name, version)),
+        "zwp_pointer_constraints_v1" => globals.pointer_constraints = Some((name, version)),
+        "zwp_relative_pointer_manager_v1" => globals.relative_pointer_manager = Some((name, version)),
         _ => {}
     }
 }
@@ -1038,6 +1229,46 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         (wl.marshal_flags)(seat, WL_SEAT_GET_KEYBOARD, wl.keyboard_interface, 1, 0, std::ptr::null_mut::<c_void>())
     };
 
+    // ---- pointer capture. Both halves are optional and independent of each
+    // other only in principle: a lock with no relative pointer is a pointer
+    // that has stopped moving and reports nothing, which is worse than no lock
+    // at all. So the constraints manager is only kept when the relative-pointer
+    // manager is there too, and the pair is treated as one capability.
+    let relative_pointer = globals.relative_pointer_manager.and_then(|(name, ver)| {
+        let mgr = bind(name, 1, ver, &RELATIVE_POINTER_MANAGER_INTERFACE, "zwp_relative_pointer_manager_v1");
+        if mgr.is_null() || pointer.is_null() {
+            return None;
+        }
+        // SAFETY: `mgr` and `pointer` are live proxies; the argument list
+        // matches `get_relative_pointer`'s "no" signature.
+        let rp = unsafe {
+            (wl.marshal_flags)(
+                mgr,
+                RELATIVE_POINTER_MANAGER_GET_RELATIVE_POINTER,
+                &RELATIVE_POINTER_INTERFACE,
+                1,
+                0,
+                std::ptr::null_mut::<c_void>(),
+                pointer,
+            )
+        };
+        (!rp.is_null()).then_some(rp)
+    });
+    let pointer_constraints = match (globals.pointer_constraints, relative_pointer) {
+        (Some((name, ver)), Some(_)) => {
+            bind(name, 1, ver, &POINTER_CONSTRAINTS_INTERFACE, "zwp_pointer_constraints_v1")
+        }
+        _ => {
+            eprintln!(
+                "[android] wayland: this compositor advertises no \
+                 zwp_pointer_constraints_v1/zwp_relative_pointer_manager_v1 pair; \
+                 the pointer cannot be captured, so first person and camera drags \
+                 will let the cursor leave the window"
+            );
+            std::ptr::null_mut()
+        }
+    };
+
     // ---- text-input-v3: created against the seat, listener wired once the
     // window exists (below), since its handlers use `current()`.
     let text_input = text_input_manager.and_then(|mgr| {
@@ -1090,6 +1321,10 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         pointer,
         keyboard,
         text_input: text_input.unwrap_or(std::ptr::null_mut()),
+        pointer_constraints,
+        relative_pointer: relative_pointer.unwrap_or(std::ptr::null_mut()),
+        locked_pointer: Mutex::new(std::ptr::null_mut()),
+        lock_requested_at: Mutex::new(None),
         conn_fd,
         buffers: Mutex::new(Geometry { width: cw, height: ch, format: super::window::WINDOW_FORMAT_RGBA_8888 }),
         placed_at: Mutex::new((cx, cy)),
@@ -1121,6 +1356,13 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         }
         if !keyboard.is_null() {
             (host.wl.add_listener)(keyboard, &KEYBOARD_LISTENER as *const KeyboardListener as *const c_void, std::ptr::null_mut());
+        }
+        if !host.relative_pointer.is_null() {
+            (host.wl.add_listener)(
+                host.relative_pointer,
+                &RELATIVE_POINTER_LISTENER as *const RelativePointerListener as *const c_void,
+                std::ptr::null_mut(),
+            );
         }
         if !host.text_input.is_null() {
             (host.wl.add_listener)(
@@ -1511,6 +1753,366 @@ static POINTER_LISTENER: PointerListener = PointerListener {
     axis_relative_direction: pointer_axis_relative_direction,
 };
 
+// ----------------------------------------------------------- pointer capture
+//
+// Two things wanted a captured pointer and neither had one. A right-button
+// camera drag ran until the cursor reached the edge of the window and then
+// stopped turning, with the cursor left sitting on whatever was outside; first
+// person had no capture at all, so looking around meant the pointer walking out
+// of the window. Both are the same missing mechanism: `zwp_pointer_constraints_v1`
+// to stop the cursor moving, and `zwp_relative_pointer_v1` to keep being told
+// how far it tried to.
+//
+// **The escape path is the part to be careful with.** A lock this file takes
+// and does not give back is not a bug in a game client, it is the developer's
+// own desktop with a cursor they cannot move, and it has to survive Cordial
+// misbehaving rather than only Cordial behaving. There are four ways out and
+// they are deliberately independent: the button coming up, the engine saying it
+// no longer wants it, Escape (which also latches the lock off until whatever
+// asked for it stops asking), and the process ending — the compositor releases
+// a constraint when the client that made it goes, so even a kill returns the
+// cursor.
+
+/// Whether the compositor has answered a lock request with `locked`.
+///
+/// Distinct from "Cordial asked for one", which is `locked_pointer` being
+/// non-null. Activation is the compositor's decision — the surface has to have
+/// pointer focus and the compositor may decline entirely — so treating the
+/// request as the fact is how a client ends up feeding a camera relative motion
+/// that is never going to arrive.
+static POINTER_LOCK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Set when the user presses Escape out of a lock, and cleared only once
+/// nothing wants the lock any more.
+///
+/// Without the latch, Escape releases the pointer and the very next pump sees
+/// the engine still asking for a locked centre and takes it straight back — an
+/// escape hatch that lasts 50ms is not one.
+static POINTER_LOCK_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
+/// `CORDIAL_NO_POINTER_LOCK=1` — never capture the pointer, whatever the engine
+/// or the mouse buttons say.
+///
+/// The control for every claim made about this path: with it set the cursor
+/// leaves the window on a camera drag exactly as it did before any of this
+/// existed, in the same session, which is the comparison AGENTS.md asks for.
+/// It is also the honest answer to "Cordial has my cursor and I want it to stop
+/// doing that" without editing anything.
+fn no_pointer_lock() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_NO_POINTER_LOCK").is_some())
+}
+
+/// `CORDIAL_NO_DRAG_LOCK=1` — leave the engine's own request as the only thing
+/// that captures the pointer.
+///
+/// The drag lock is Cordial's policy, not the engine's: while a mouse button is
+/// held over the canvas the pointer is captured, because that is what a camera
+/// drag is on every desktop and it is the reported bug. It is separable from the
+/// engine-driven lock so that the two can be told apart in a trace rather than
+/// guessed at from one combined behaviour.
+fn no_drag_lock() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_NO_DRAG_LOCK").is_some())
+}
+
+/// `CORDIAL_FORCE_POINTER_LOCK=1` — ask for the lock unconditionally, with no
+/// button held and whatever the engine says.
+///
+/// This exists because the request cannot otherwise be exercised without a
+/// human holding a mouse button, and "the wire format of a request nobody has
+/// ever sent" is precisely the thing this file has been bitten by twice. With
+/// it set, `lock_pointer` and the `set_cursor_position_hint`/`destroy` pair go
+/// on the wire on a schedule and the connection either survives them or does
+/// not.
+///
+/// **Do not set this on a session you are using.** It takes the cursor as soon
+/// as the pointer is over the canvas and the only ways back are Escape, moving
+/// focus away, or the process ending. It is meant for a nested headless
+/// compositor, which has no pointer to take. It announces itself loudly for
+/// that reason.
+fn force_pointer_lock() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("CORDIAL_FORCE_POINTER_LOCK").is_some();
+        if on {
+            eprintln!(
+                "[android] wayland: CORDIAL_FORCE_POINTER_LOCK=1 — the pointer will be \
+                 captured as soon as it is over the canvas, with no button held. Escape \
+                 releases it."
+            );
+        }
+        on
+    })
+}
+
+unsafe extern "C" fn locked_pointer_locked(_data: *mut c_void, _lp: *mut c_void) {
+    POINTER_LOCK_ACTIVE.store(true, Ordering::Release);
+    if let Some(w) = current() {
+        *w.lock_requested_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    // Arriving at a lock is not a movement. Without this the first relative
+    // motion after the cursor stops would be added to whatever absolute delta
+    // was outstanding.
+    super::input::reset_mouse_delta();
+    if super::input::trace_mouse() {
+        eprintln!("[cordial] pointer lock: compositor sent locked");
+    }
+}
+
+/// `unlocked` — the compositor took the lock away, which it does on focus loss
+/// and on anything else it considers reason enough.
+///
+/// The object stays alive because the lifetime is `persistent`: the compositor
+/// may reactivate it when focus returns, and destroying it here would turn a
+/// temporary deactivation into a permanent one. What has to happen is only that
+/// relative motion stops being treated as camera movement.
+unsafe extern "C" fn locked_pointer_unlocked(_data: *mut c_void, _lp: *mut c_void) {
+    POINTER_LOCK_ACTIVE.store(false, Ordering::Release);
+    super::input::reset_mouse_delta();
+    if super::input::trace_mouse() {
+        eprintln!("[cordial] pointer lock: compositor sent unlocked");
+    }
+}
+
+static LOCKED_POINTER_LISTENER: LockedPointerListener =
+    LockedPointerListener { locked: locked_pointer_locked, unlocked: locked_pointer_unlocked };
+
+unsafe extern "C" fn relative_pointer_motion(
+    _data: *mut c_void,
+    _rp: *mut c_void,
+    _utime_hi: u32,
+    _utime_lo: u32,
+    dx: i32,
+    dy: i32,
+    _dx_unaccel: i32,
+    _dy_unaccel: i32,
+) {
+    // Relative motion arrives whenever the seat's pointer has focus, lock or no
+    // lock. Acting on it unlocked would double every ordinary mouse movement,
+    // since `wl_pointer.motion` is still arriving and already produces a delta.
+    if !POINTER_LOCK_ACTIVE.load(Ordering::Acquire) || !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(w) = current() {
+        w.dispatch_relative_motion(fixed_to_f32(dx), fixed_to_f32(dy));
+    }
+}
+
+static RELATIVE_POINTER_LISTENER: RelativePointerListener =
+    RelativePointerListener { relative_motion: relative_pointer_motion };
+
+impl WaylandWindow {
+    /// One relative movement while the pointer is captured.
+    ///
+    /// The absolute position stays where the lock caught it, deliberately. A
+    /// locked pointer *has* no absolute position — the compositor is not moving
+    /// it — and inventing one that drifts would put the engine's idea of the
+    /// cursor somewhere the cursor is not, which is what the cursor position
+    /// hint on release then has to undo.
+    ///
+    /// `INFERRED`, and it is the load-bearing inference of this whole path:
+    /// that `nativePassMouseMove`'s last two floats are the delta and that the
+    /// camera turns on them rather than on the first two. It is the same
+    /// inference `pass_mouse_move` already documents and was already relying on
+    /// — real deltas are what made the camera turn at all — so a locked pointer
+    /// is not a new assumption, it is the existing one with the absolute pair
+    /// held still. If a captured camera turns out not to turn, this is the
+    /// first thing to doubt and `CORDIAL_TRACE_MOUSE=1` prints every argument.
+    fn dispatch_relative_motion(&self, dx: f32, dy: f32) {
+        let (x, y) = *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner());
+        // Deliberately not also `deliver_touch`. AGDK's touch path carries an
+        // absolute position and nothing else; while the pointer is locked that
+        // position does not change, so every event would say the finger had not
+        // moved. The `NativeInputInterface` path is the one that moves anything
+        // here anyway — see `input.rs`'s note on why `nativePassMouseMove`
+        // rather than `onTouchEventNative` is what the interface reads.
+        super::input::pass_mouse_move_delta(x, y, dx, dy);
+    }
+
+    /// Take or release the pointer to match what the engine and the mouse are
+    /// currently asking for. Called once per pump.
+    fn sync_pointer_lock(&self) {
+        // Two independent reasons to capture. The engine's own is the one that
+        // covers first person, where nothing about the mouse buttons says a
+        // camera is being turned; the drag is Cordial's policy and covers the
+        // reported bug directly.
+        //
+        // The engine is asked *before* the control gate deliberately: with
+        // `CORDIAL_NO_POINTER_LOCK=1` this still polls and still traces, so the
+        // control run answers "what would it have done" rather than only "it
+        // did nothing". A control that also turns off the instrumentation is
+        // not a control, it is a second unknown.
+        let engine_wants = super::input::engine_wants_pointer_lock() == Some(true);
+        if self.pointer_constraints.is_null() || no_pointer_lock() {
+            return;
+        }
+
+        // The right and middle buttons, and emphatically **not the left one**.
+        // A left-button drag is how every draggable thing in Roblox's own
+        // interface is used — a slider, a scrollbar, a window in Studio — and
+        // capturing the pointer for those would freeze the cursor mid-drag and
+        // leave the control chasing a delta it cannot show. Right is the camera
+        // drag this was reported for and middle is the pan; both are gestures
+        // where the cursor is meant to stay put, which is exactly the
+        // distinction Roblox's own desktop client draws.
+        const CAMERA_BUTTONS: i32 = super::input::BUTTON_SECONDARY | super::input::BUTTON_TERTIARY;
+        let dragging = !no_drag_lock()
+            && self.pointer_buttons.load(Ordering::Relaxed) & CAMERA_BUTTONS != 0
+            && POINTER_ON_CANVAS.load(Ordering::Acquire);
+        let asked = engine_wants || dragging || force_pointer_lock();
+
+        // The Escape latch lifts only when nothing is asking any more, so
+        // pressing Escape in first person gives the cursor back for as long as
+        // the engine keeps wanting it — until the user leaves first person,
+        // at which point the next request is honoured normally.
+        if !asked {
+            POINTER_LOCK_SUPPRESSED.store(false, Ordering::Release);
+        }
+        let want = asked && !POINTER_LOCK_SUPPRESSED.load(Ordering::Acquire);
+
+        let held = !self.locked_pointer.lock().unwrap_or_else(|e| e.into_inner()).is_null();
+        if want && !held {
+            self.lock_pointer();
+        } else if !want && held {
+            self.release_pointer();
+        }
+
+        // A compositor may decline, and the protocol gives it no way to say so
+        // — there is no error and no reply, only the absence of `locked`. Say
+        // that plainly once rather than leaving a dead camera to be explained
+        // as a bug in the input path.
+        let mut requested = self.lock_requested_at.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = *requested {
+            if at.elapsed() > std::time::Duration::from_secs(1) {
+                *requested = None;
+                if !LOCK_REFUSAL_REPORTED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[android] wayland: asked the compositor to lock the pointer and it \
+                         never answered with `locked`. The lock is the compositor's decision \
+                         and it may decline; the cursor stays free and camera drags will run \
+                         off the edge of the window."
+                    );
+                }
+            }
+        }
+    }
+
+    fn lock_pointer(&self) {
+        let mut slot = self.locked_pointer.lock().unwrap_or_else(|e| e.into_inner());
+        if !slot.is_null() {
+            return;
+        }
+        // SAFETY: `pointer_constraints`, `surface` and `pointer` are live
+        // proxies for the process's lifetime; the argument list matches
+        // `lock_pointer`'s "noo?ou" signature, with a null region meaning the
+        // whole surface.
+        let lp = unsafe {
+            (self.wl.marshal_flags)(
+                self.pointer_constraints,
+                POINTER_CONSTRAINTS_LOCK_POINTER,
+                &LOCKED_POINTER_INTERFACE,
+                1,
+                0,
+                std::ptr::null_mut::<c_void>(),
+                self.surface,
+                self.pointer,
+                std::ptr::null_mut::<c_void>(),
+                POINTER_CONSTRAINT_LIFETIME_PERSISTENT,
+            )
+        };
+        if lp.is_null() {
+            return;
+        }
+        // SAFETY: `lp` is the proxy just created, and the listener has one slot
+        // per event `LOCKED_POINTER_INTERFACE` declares.
+        unsafe {
+            (self.wl.add_listener)(
+                lp,
+                &LOCKED_POINTER_LISTENER as *const LockedPointerListener as *const c_void,
+                std::ptr::null_mut(),
+            );
+            (self.wl.flush)(self.display);
+        }
+        *slot = lp;
+        *self.lock_requested_at.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now());
+        if super::input::trace_mouse() {
+            let (x, y) = *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner());
+            eprintln!("[cordial] pointer lock: requested at ({x}, {y})");
+        }
+    }
+
+    /// Give the pointer back, and put the cursor where the engine's cursor was.
+    ///
+    /// `set_cursor_position_hint` is sent before the destroy and is only
+    /// honoured then — the protocol says the hint applies when the lock is
+    /// lifted, and a hint sent to a destroyed object is a hint sent to nothing.
+    /// Without it the cursor reappears wherever it was when the lock was taken,
+    /// which after a long camera drag is not where the person looking at the
+    /// screen thinks it is.
+    fn release_pointer(&self) {
+        let mut slot = self.locked_pointer.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_null() {
+            return;
+        }
+        let (x, y) = *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `*slot` is the live locked-pointer proxy; the two calls match
+        // `set_cursor_position_hint`'s "ff" and `destroy`'s empty signature,
+        // the latter sent with the destroy flag its `type="destructor"`
+        // declaration requires.
+        unsafe {
+            (self.wl.marshal_flags)(
+                *slot,
+                LOCKED_POINTER_SET_CURSOR_POSITION_HINT,
+                std::ptr::null(),
+                1,
+                0,
+                f32_to_fixed(x),
+                f32_to_fixed(y),
+            );
+            (self.wl.marshal_flags)(
+                *slot,
+                LOCKED_POINTER_DESTROY,
+                std::ptr::null(),
+                1,
+                WL_MARSHAL_FLAG_DESTROY,
+            );
+            (self.wl.flush)(self.display);
+        }
+        *slot = std::ptr::null_mut();
+        POINTER_LOCK_ACTIVE.store(false, Ordering::Release);
+        *self.lock_requested_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // The cursor is about to be somewhere again, and where it went is not a
+        // movement the user made with it.
+        super::input::reset_mouse_delta();
+        if super::input::trace_mouse() {
+            eprintln!("[cordial] pointer lock: released, cursor hinted to ({x}, {y})");
+        }
+    }
+
+    /// The Escape hatch, in both senses. Returns whether a lock was actually
+    /// released, so the caller can say so.
+    fn escape_pointer_lock(&self) -> bool {
+        let held = !self.locked_pointer.lock().unwrap_or_else(|e| e.into_inner()).is_null();
+        if !held {
+            return false;
+        }
+        POINTER_LOCK_SUPPRESSED.store(true, Ordering::Release);
+        self.release_pointer();
+        true
+    }
+}
+
+/// So a compositor that declines to lock says so once rather than every second.
+static LOCK_REFUSAL_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// `wl_fixed_t` from a float — the inverse of [`fixed_to_f32`], and the only
+/// place this file sends one rather than receiving it.
+fn f32_to_fixed(v: f32) -> i32 {
+    (v * 256.0).round() as i32
+}
+
 // ----------------------------------------------------------------- keyboard
 
 const MAP_FAILED: *mut c_void = -1isize as *mut c_void;
@@ -1637,6 +2239,15 @@ static KEYBOARD_FOCUSED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn keyboard_leave(_data: *mut c_void, _kb: *mut c_void, _serial: u32, _surface: *mut c_void) {
     KEYBOARD_FOCUSED.store(false, Ordering::Release);
+    // A window that does not have focus has no business holding the cursor.
+    // The compositor deactivates the lock by itself here — that is what
+    // `unlocked` is for — but the *request* would survive, and with a
+    // `persistent` lifetime it would be honoured again the moment focus came
+    // back, even though by then nobody may be dragging anything. Dropping the
+    // request is what makes alt-tab a way out rather than a pause.
+    if let Some(w) = current() {
+        w.release_pointer();
+    }
 }
 
 unsafe extern "C" fn keyboard_key(_data: *mut c_void, _kb: *mut c_void, _serial: u32, _time: u32, key: u32, state: u32) {
@@ -1730,6 +2341,21 @@ impl WaylandWindow {
             let unicode = if n > 0 { text_buf[0] as i32 } else { 0 };
             (keysym, unicode, n.max(0) as usize, text_buf, meta)
         };
+
+        // Escape gives the cursor back, and the key still reaches the engine.
+        //
+        // Deliberately not a combination nobody would find. The one thing a
+        // person tries when an application has taken their pointer is Escape,
+        // and a hatch that has to be looked up is a hatch that is not there
+        // when it is needed. Escape already means "leave what I am doing" in
+        // Roblox, so it is also the key whose ordinary meaning agrees.
+        //
+        // `keysym` is not used for this: the lock is a physical-key affair and
+        // `KEY_ESC` is 1 in evdev, whatever the layout has made of it.
+        const KEY_ESC: u32 = 1;
+        if down && evdev_key == KEY_ESC && self.escape_pointer_lock() {
+            eprintln!("[android] wayland: Escape released the pointer lock");
+        }
 
         let handle = self.active_handle.load(Ordering::Relaxed);
         let now = self.now_ms();
@@ -2216,6 +2842,26 @@ pub fn instr_geometry() -> String {
     )
 }
 
+/// Close the window from inside the process, for `looper::pump`'s scripted
+/// timeline — the only way to test the close-to-exit path without a human
+/// clicking, and without going anywhere near the developer's session.
+///
+/// `gtk_window_close` is a faithful stand-in for the close button rather than a
+/// shortcut past it: the compositor's `xdg_toplevel.close` reaches GTK as a
+/// `GDK_DELETE` event, GTK turns that into the window's `close-request` signal,
+/// and `gtk_window_close` emits *that same signal*. Both end in the default
+/// handler destroying the window, which is what `window_closed` observes. What
+/// it does not cover is the compositor's half — that the close event arrives at
+/// GTK at all — which is GTK's own well-travelled code and not something
+/// Cordial could break.
+pub fn instr_close_window() {
+    use gtk4::prelude::GtkWindowExt;
+    if let Some(w) = current() {
+        println!("[instr] closing the window");
+        w.host.0.window().close();
+    }
+}
+
 /// Drive fullscreen without a click, from `looper::pump`'s scripted timeline.
 /// `gtk_window_fullscreen` is a request to the compositor made by this client
 /// about its own window, so it exercises the same configure path a dragged
@@ -2246,6 +2892,13 @@ impl WaylandWindow {
         self.host.0.pump();
         self.sync_canvas_geometry();
         self.sync_ime_focus();
+        // Polled rather than driven by an event, because the engine's own
+        // request for a locked centre is a *getter* — `nativeGetMainWindow
+        // IsMouseLockedCenter` — with nothing that calls out when it changes.
+        // Once per pump is roughly 20 times a second, which is a JNI call and
+        // an atomic load against a decision a person makes a few times a
+        // minute.
+        self.sync_pointer_lock();
 
         // The documented thread-safe idiom for a `wl_display` connection that
         // more than one thread touches — and more than one does: Mesa's own
@@ -2357,6 +3010,49 @@ pub fn pump_input_events(handle: i64) {
         w.pump(handle);
     }
 }
+
+/// Whether the window has been closed.
+///
+/// **This is what makes closing the window end the process**, and until it
+/// existed nothing did. `cordial-run` had no run-until-the-window-closes mode
+/// at all: `--run` was a hard timer, the shell passed it a day, and closing the
+/// window left the client running headless for the rest of that day — holding
+/// the profile's `flock` the whole time, so the launcher refused to start
+/// anything and the only way out was `kill`. It was observed in the wild, on a
+/// client reparented to systemd after its launcher quit, holding the
+/// developer's real profile for half an hour.
+///
+/// The signal is GTK's `wl_surface` going away. GTK owns the `xdg_toplevel`
+/// (see the module doc), so the compositor's `close` event is delivered to GTK,
+/// not here; GTK's default handler destroys the window, which unrealizes it and
+/// drops its `GdkSurface`. `HostWindow::wl_surface` reads that surface, so
+/// `None` is "GTK no longer has a window", which is a stronger and simpler
+/// statement than trying to intercept a protocol event that is not this file's
+/// to receive.
+///
+/// Deliberately not a minimise or a hide check: GTK4 keeps a minimised window
+/// realized, so this cannot fire for one. A false positive here exits a session
+/// somebody was using, which is worse than the bug being fixed, so the
+/// condition is the narrow one.
+pub fn window_closed() -> bool {
+    // Once true, always true. `wl_surface()` is read through GTK, and after
+    // teardown has begun there is nothing to be gained from asking it again.
+    if WINDOW_CLOSED.load(Ordering::Acquire) {
+        return true;
+    }
+    let Some(w) = current() else { return false };
+    if w.host.0.wl_surface().is_none() {
+        WINDOW_CLOSED.store(true, Ordering::Release);
+        // Say it plainly. A client that ends because its window closed and one
+        // that ends because a timer expired look identical from outside, and
+        // the difference is the whole of what was just fixed.
+        println!("[android] wayland: the window was closed; shutting the engine down");
+        return true;
+    }
+    false
+}
+
+static WINDOW_CLOSED: AtomicBool = AtomicBool::new(false);
 
 // ------------------------------------------------------------- ANativeWindow_*
 //
@@ -2586,6 +3282,85 @@ mod tests {
             TEXT_INPUT_EVENTS.len() * std::mem::size_of::<*const c_void>(),
             "TextInputListener must be exactly one function pointer per declared event"
         );
+    }
+
+    /// Every string and count of the two pointer-capture protocols, against
+    /// what `wayland-scanner private-code` emitted for the upstream XML.
+    ///
+    /// The module doc owes the reader this: two hand-written protocols were
+    /// added after that doc told the next person not to add any. The mitigation
+    /// promised there is that nothing below was typed from the protocol
+    /// description — it was copied out of the generator's own output — and this
+    /// is what stops that staying true only until someone edits a signature by
+    /// hand. Compare against `wayland-scanner private-code
+    /// pointer-constraints-unstable-v1.xml`:
+    ///
+    /// ```text
+    /// { "lock_pointer", "noo?ou", ... }
+    /// { "set_cursor_position_hint", "ff", ... }
+    /// { "relative_motion", "uuffff", ... }
+    /// ```
+    ///
+    /// A signature wrong by one argument makes `wl_proxy_marshal_flags` read
+    /// the wrong number of variadic arguments off the stack and corrupt the
+    /// wire, and an event table shorter than what the compositor sends indexes
+    /// past the end of a listener array — the two failures this file has
+    /// already paid for once each.
+    #[test]
+    fn pointer_capture_tables_match_wayland_scanner() {
+        fn sig(m: &WlMessage) -> &str {
+            // SAFETY: every signature in this file is a `c"..."` literal.
+            unsafe { CStr::from_ptr(m.signature) }.to_str().expect("ASCII literal")
+        }
+
+        assert_eq!(sig(&POINTER_CONSTRAINTS_METHODS[1]), "noo?ou", "lock_pointer");
+        assert_eq!(sig(&POINTER_CONSTRAINTS_METHODS[2]), "noo?ou", "confine_pointer");
+        assert_eq!(sig(&LOCKED_POINTER_METHODS[1]), "ff", "set_cursor_position_hint");
+        assert_eq!(sig(&LOCKED_POINTER_METHODS[2]), "?o", "set_region");
+        assert_eq!(sig(&RELATIVE_POINTER_MANAGER_METHODS[1]), "no", "get_relative_pointer");
+        assert_eq!(sig(&RELATIVE_POINTER_EVENTS[0]), "uuffff", "relative_motion");
+
+        // Opcodes are positions in these arrays, so naming one that has moved
+        // sends a different request entirely.
+        assert_eq!(POINTER_CONSTRAINTS_LOCK_POINTER, 1);
+        assert_eq!(LOCKED_POINTER_DESTROY, 0);
+        assert_eq!(LOCKED_POINTER_SET_CURSOR_POSITION_HINT, 1);
+        assert_eq!(RELATIVE_POINTER_MANAGER_GET_RELATIVE_POINTER, 1);
+
+        for (iface, methods, events) in [
+            (&POINTER_CONSTRAINTS_INTERFACE, POINTER_CONSTRAINTS_METHODS.len(), 0),
+            (&LOCKED_POINTER_INTERFACE, LOCKED_POINTER_METHODS.len(), LOCKED_POINTER_EVENTS.len()),
+            (&RELATIVE_POINTER_MANAGER_INTERFACE, RELATIVE_POINTER_MANAGER_METHODS.len(), 0),
+            (&RELATIVE_POINTER_INTERFACE, RELATIVE_POINTER_METHODS.len(), RELATIVE_POINTER_EVENTS.len()),
+        ] {
+            assert_eq!(iface.method_count, methods as c_int);
+            assert_eq!(iface.event_count, events as c_int);
+            // All four are version 1 upstream, which is also why no signature
+            // above carries a `since` prefix. Raising one means adding that
+            // version's events here first — the `zwp_text_input_v3` lesson.
+            assert_eq!(iface.version, 1);
+        }
+
+        assert_eq!(
+            std::mem::size_of::<LockedPointerListener>(),
+            LOCKED_POINTER_EVENTS.len() * std::mem::size_of::<*const c_void>(),
+        );
+        assert_eq!(
+            std::mem::size_of::<RelativePointerListener>(),
+            RELATIVE_POINTER_EVENTS.len() * std::mem::size_of::<*const c_void>(),
+        );
+    }
+
+    /// `wl_fixed_t` round-trips, because the cursor position hint is the one
+    /// place this file *sends* one and a wrong scale would put the cursor 256
+    /// times too far out on release — off the monitor, on a locked pointer,
+    /// which is the failure mode with the worst possible manners.
+    #[test]
+    fn a_cursor_position_hint_survives_the_fixed_point_conversion() {
+        assert_eq!(f32_to_fixed(1.0), 256);
+        assert_eq!(f32_to_fixed(0.0), 0);
+        assert_eq!(fixed_to_f32(f32_to_fixed(640.5)), 640.5);
+        assert_eq!(fixed_to_f32(f32_to_fixed(-3.25)), -3.25);
     }
 
     #[test]

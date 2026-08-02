@@ -169,8 +169,88 @@ pub fn prepare_for_current_thread() -> bool {
 /// still bounded by the same 50ms `epoll_wait` timeout either way. `None` (no
 /// handle) is the case for callers that never bring AGDK up at all, e.g. the
 /// app-bridge-only path driven by `CORDIAL_SKIP_AGDK`.
+/// Set from the `SIGTERM`/`SIGINT` handler. The only thing a signal handler is
+/// allowed to touch here, and the only thing it needs to: the pump notices
+/// within one 50ms iteration and takes the same way out as a closed window.
+static SIGNALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const SIGINT: c_int = 2;
+const SIGTERM: c_int = 15;
+
+extern "C" {
+    fn signal(signum: c_int, handler: usize) -> usize;
+    #[link_name = "_exit"]
+    fn libc_exit(status: c_int) -> !;
+}
+
+/// Ask to shut down at the next iteration.
+///
+/// A second signal does not wait. Teardown drives five calls into the engine
+/// and then pumps for half a second, and if any of that hangs — which is a real
+/// possibility on a client that is already in trouble, and the reason somebody
+/// is sending signals at all — a person pressing Ctrl-C twice expects the
+/// process to go, not to be told politely that it is already going. `_exit` is
+/// async-signal-safe; nothing else attempted here would be.
+extern "C" fn on_terminating_signal(_sig: c_int) {
+    if SIGNALLED.swap(true, Ordering::Relaxed) {
+        // SAFETY: `_exit` is async-signal-safe by specification, and this is
+        // the second signal — the polite path has already been tried.
+        unsafe { libc_exit(1) };
+    }
+}
+
+/// `SIGTERM` and `SIGINT` end the run the same way closing the window does.
+///
+/// `SIGTERM` is what a plain `kill` sends, what systemd sends, and what the
+/// shell sends when it offers to close a client that is holding a profile. It
+/// used to kill the process outright, which is survivable — the kernel drops
+/// the `flock` on exit however the exit happens — but it also meant the engine
+/// never got its shutdown sequence, and Roblox has storage open. Converging on
+/// the same teardown as `--run` is what makes a terminated session flush what
+/// a timed-out one flushes.
+fn install_signal_handlers() {
+    // SAFETY: `signal` with a plain `extern "C" fn(c_int)` handler is the
+    // oldest interface in C; the handler below touches one atomic and, at
+    // worst, `_exit`.
+    unsafe {
+        signal(SIGTERM, on_terminating_signal as *const () as usize);
+        signal(SIGINT, on_terminating_signal as *const () as usize);
+    }
+}
+
+/// Whether anything has asked this run to end early — a closed window or a
+/// terminating signal. `--run` expiring is the third way and is the loop's own
+/// condition, so that all three arrive at the same teardown.
+fn asked_to_stop() -> Option<&'static str> {
+    if SIGNALLED.load(Ordering::Relaxed) {
+        return Some("a terminating signal");
+    }
+    // `CORDIAL_NO_CLOSE_EXIT=1` — the control. With it set, closing the window
+    // leaves the process running exactly as it did before any of this existed,
+    // so a run that ends can be shown to have ended *because* of the close and
+    // not because the timer happened to be short. It is also the reason the
+    // signal branch above is not behind the same switch: a control that also
+    // disables `kill` is a trap.
+    if !no_close_exit() && super::window_closed() {
+        return Some("the window closing");
+    }
+    None
+}
+
+fn no_close_exit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_NO_CLOSE_EXIT").is_some())
+}
+
 pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
-    let deadline = std::time::Instant::now() + duration;
+    install_signal_handlers();
+    // `--run 0` means no deadline at all: run until the window is closed or a
+    // signal arrives. That is what a person playing a game wants — a session
+    // should end when they end it, not when a number somebody picked runs out
+    // — and it is only safe to offer now that closing the window is a way out.
+    // A zero-length run was previously indistinguishable from an instant one,
+    // which is not a use anything had.
+    let deadline = (!duration.is_zero()).then(|| std::time::Instant::now() + duration);
 
     // Watch the display connection alongside the engine's own descriptors, so
     // a keypress or a click ends the wait immediately.
@@ -206,7 +286,11 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
     script.reverse();
     let mut motion = false;
 
-    while std::time::Instant::now() < deadline {
+    while deadline.is_none_or(|d| std::time::Instant::now() < d) {
+        if let Some(why) = asked_to_stop() {
+            println!("[android] ending the run: {why}");
+            break;
+        }
         iters += 1;
         if instr {
             let t = start.elapsed().as_secs_f64();
@@ -218,6 +302,11 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                     "windowed" => super::backend_set_fullscreen(false),
                     "motion-on" => motion = true,
                     "motion-off" => motion = false,
+                    // The close button, without a button. This is how the
+                    // close-to-exit path is tested: `close` at t=10 should end
+                    // the process at t=10 whatever `--run` says, and with
+                    // `CORDIAL_NO_CLOSE_EXIT=1` set it should not.
+                    "close" => super::backend_close_window(),
                     other => eprintln!("[instr] unknown script action {other}"),
                 }
             }
@@ -276,7 +365,11 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
         crate::cookies::flush_if_dirty();
     }
 
-    // Clean teardown, once the run ends. Cordial previously just fell through
+    // Clean teardown, however the run ended — the timer expiring, the window
+    // closing, or a terminating signal. The three converge here on purpose:
+    // there is one shutdown sequence and three ways to reach it, rather than a
+    // tidy path for the timer and an abrupt one for everything a person
+    // actually does. Cordial previously just fell through
     // to `main`'s `_exit(0)` here, which is indistinguishable from the
     // process being killed mid-frame as far as the engine is concerned — it
     // never got a chance to flush the flag cache and telemetry it writes to

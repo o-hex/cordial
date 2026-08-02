@@ -294,6 +294,10 @@ static SYNC_TEXTBOX: std::sync::atomic::AtomicPtr<c_void> =
 /// `updateKeyboardSize`, the acknowledgement that an editor is up.
 static UPDATE_KEYBOARD_SIZE: std::sync::atomic::AtomicPtr<c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// `nativeGetMainWindowIsMouseLockedCenter`. See
+/// [`engine_wants_pointer_lock`].
+static GET_MOUSE_LOCKED_CENTER: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 /// Focus generation the keyboard state was last reported for.
 static KEYBOARD_REPORTED: Mutex<Option<u32>> = Mutex::new(None);
 
@@ -314,6 +318,79 @@ pub fn set_input_natives(
     PASS_TEXT.store(pass_text, std::sync::atomic::Ordering::Relaxed);
     SYNC_TEXTBOX.store(sync_textbox, std::sync::atomic::Ordering::Relaxed);
     UPDATE_KEYBOARD_SIZE.store(update_keyboard_size, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `NativeInputInterface.nativeGetMainWindowIsMouseLockedCenter()Z`, resolved
+/// separately from [`set_input_natives`] because it is the only one of these
+/// that Cordial *reads* rather than writes.
+pub fn set_mouse_lock_native(native: *mut c_void) {
+    GET_MOUSE_LOCKED_CENTER.store(native, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the engine currently wants the pointer locked to the centre of the
+/// window — first person, or anything else that turns the camera with the mouse
+/// rather than with a cursor.
+///
+/// `None` means Cordial does not know, and that is a third answer rather than a
+/// polite `false`: the native may not be exported by this build, may not be
+/// resolvable yet during startup, or may have failed. A caller that treats
+/// "unknown" as "no lock wanted" is making the stub lie in the sense AGENTS.md
+/// means it; here the caller keeps its own drag-driven lock instead, which is
+/// honest about resting on something other than the engine's word.
+///
+/// **The direction of this call is the hypothesis worth being explicit about.**
+/// The native is a getter on `NativeInputInterface` and had never been called by
+/// Cordial, so nothing about a running session distinguishes "the platform is
+/// supposed to poll it" from "the engine calls something else and this is dead".
+/// Android has no pointer to lock, so the real client on real Android may never
+/// have a true answer to give — and a false that never changes is exactly what
+/// a dead getter and an idle one both look like. `CORDIAL_TRACE_MOUSE=1` prints
+/// every transition so that a session in first person settles it; until one
+/// has, the *engine-driven* half of pointer capture is `INFERRED` and the
+/// drag-driven half is not.
+///
+/// Called through `call_static_bare_bool`, the same `(JNIEnv*, jclass)` shape
+/// every other `NativeInputInterface` native here is called with — see
+/// `native/game_activity.cpp`'s `cordial_input_mouse_move`, which passes the
+/// class object in exactly this position.
+pub fn engine_wants_pointer_lock() -> Option<bool> {
+    let f = GET_MOUSE_LOCKED_CENTER.load(std::sync::atomic::Ordering::Relaxed);
+    if f.is_null() {
+        return None;
+    }
+    // A native that throws once will throw every pump, and 20 identical lines a
+    // second buries whatever the session was actually about. One line, then
+    // never again — and never again also means never *called* again, because
+    // the failure was in the call itself.
+    static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    match cordial_linker_sys::game_activity::call_static_bare_bool(
+        f,
+        "com/roblox/engine/jni/NativeInputInterface",
+    ) {
+        Ok(v) => {
+            if trace_mouse() {
+                static LAST: Mutex<Option<bool>> = Mutex::new(None);
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                if *last != Some(v) {
+                    *last = Some(v);
+                    eprintln!("[cordial] nativeGetMainWindowIsMouseLockedCenter() -> {v}");
+                }
+            }
+            Some(v)
+        }
+        Err(e) => {
+            FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[cordial] nativeGetMainWindowIsMouseLockedCenter() failed ({e}); \
+                 not asking again this session. Pointer capture now depends on the \
+                 mouse button alone."
+            );
+            None
+        }
+    }
 }
 
 /// Tell the engine whether an editor is up, when that has changed.
@@ -522,6 +599,23 @@ fn mouse_delta(x: f32, y: f32) -> (f32, f32) {
 /// value that says the pointer never moves.
 pub fn pass_mouse_move(x: f32, y: f32) {
     let (dx, dy) = mouse_delta(x, y);
+    pass_mouse_move_delta(x, y, dx, dy);
+}
+
+/// As [`pass_mouse_move`], but with the movement supplied rather than derived
+/// from the previous position.
+///
+/// This is what a captured pointer needs. Under `zwp_pointer_constraints_v1`
+/// the cursor stops moving on purpose, so there is no new absolute position to
+/// subtract a previous one from — the movement arrives on its own, through
+/// `zwp_relative_pointer_v1`, and the absolute pair stays wherever the lock
+/// caught it. Subtracting two identical positions would report that the mouse
+/// had not moved, which is the same "constant zeros" bug the delta arguments
+/// were added to fix, arriving by a different route.
+///
+/// `MOUSE_LAST` is deliberately left alone: it tracks where the *cursor* is,
+/// and while the pointer is locked the cursor is not going anywhere.
+pub fn pass_mouse_move_delta(x: f32, y: f32, dx: f32, dy: f32) {
     let f = PASS_MOUSE_MOVE.load(std::sync::atomic::Ordering::Relaxed);
     if f.is_null() {
         report_unregistered("nativePassMouseMove");

@@ -46,7 +46,11 @@ usage: cordial-load --lib-dir <dir> [options]
   --host-libc       also resolve libc from the host (ABI-unsafe; diagnostic only)
   --jni-onload      stand up a JavaVM and call JNI_OnLoad
   --game-activity   implies --jni-onload; bring Roblox up and hand it a surface
-  --run <secs>      how long to let Roblox run after handover (default 15)
+  --run <secs>      how long to let Roblox run after handover (default 15).
+                    0 means no timer: run until the window is closed or the
+                    process is sent SIGTERM/SIGINT. Closing the window ends the
+                    process either way — the timer is a backstop for headless
+                    and scripted runs, not the way a session is meant to end
   --dump-classes <f>  implies --jni-onload; write the Java classes Roblox asked
                     for to <f> — the observed Phase 2 backlog
   -v, --verbose     list every symbol and how it resolved
@@ -78,6 +82,17 @@ env:
                                      negative inverts the direction
   CORDIAL_TRACE_WHEEL=1              log every wheel event and the arguments
                                      nativePassMouseWheel received
+  CORDIAL_NO_POINTER_LOCK=1          never capture the pointer, whatever the
+                                     engine or the mouse asks for. The control
+                                     for the capture path; it still polls and
+                                     traces the engine's own request, so a
+                                     control run says what it would have done
+  CORDIAL_NO_DRAG_LOCK=1             capture only when the engine asks, not
+                                     while a right/middle button is held
+  CORDIAL_NO_CLOSE_EXIT=1            closing the window does not end the
+                                     process — the old behaviour, kept as the
+                                     control for the close path. SIGTERM and
+                                     --run are unaffected
   CORDIAL_SIGNIN_PROBE=1             ask the engine whether login is Lua-rendered
   CORDIAL_NO_VULKAN=1                make the host look like it has no Vulkan
                                      loader, forcing the GLES2/EGL fallback
@@ -1214,6 +1229,30 @@ fn main() -> ExitCode {
                                                 "  input: nativePassMouseWheel {}",
                                                 if wh.is_null() { "NOT exported; the scroll wheel will do nothing" } else { "resolved" }
                                             );
+
+                                            // The one native on this interface
+                                            // Cordial reads rather than writes:
+                                            // whether the engine wants the
+                                            // pointer locked to the window
+                                            // centre. Nothing had ever called
+                                            // it, so a first-person camera had
+                                            // no way to ask for the cursor.
+                                            // See `input::engine_wants_pointer_lock`
+                                            // for what is still INFERRED about
+                                            // which direction it is meant to be
+                                            // read in.
+                                            let ml = lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeInputInterface_nativeGetMainWindowIsMouseLockedCenter",
+                                            ).unwrap_or(std::ptr::null_mut());
+                                            cordial_runtime::android::input::set_mouse_lock_native(ml);
+                                            println!(
+                                                "  input: nativeGetMainWindowIsMouseLockedCenter {}",
+                                                if ml.is_null() {
+                                                    "NOT exported; pointer capture falls back to the mouse button alone"
+                                                } else {
+                                                    "resolved"
+                                                }
+                                            );
                                         }
 
                                         // A read-only probe of the engine's own
@@ -1491,7 +1530,13 @@ fn main() -> ExitCode {
                                                     Err(e) => println!("  setInputConnectionNative failed: {e}"),
                                                 }
                                                 let secs = opt.run_seconds;
-                                                println!("  pumping the looper for {secs}s");
+                                                if secs == 0 {
+                                                    println!(
+                                                        "  pumping the looper until the window is closed (no --run timer)"
+                                                    );
+                                                } else {
+                                                    println!("  pumping the looper for {secs}s");
+                                                }
                                                 // Android's UI thread runs the
                                                 // message loop; AGDK put its
                                                 // pipes on this thread's looper.

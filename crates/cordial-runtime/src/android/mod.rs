@@ -148,6 +148,27 @@ pub fn backend_set_fullscreen(on: bool) {
     }
 }
 
+/// Close the window as the close button would, from a scripted run. See
+/// [`wayland::instr_close_window`] for why this is a fair test of the real
+/// close path and not a shortcut past it.
+pub fn backend_close_window() {
+    if let Backend::Wayland = backend() {
+        wayland::instr_close_window();
+    }
+}
+
+/// Whether the user has closed the engine's window, for the active backend.
+///
+/// The X11 backend answers `false` unconditionally rather than growing a second
+/// implementation of this: ADR-011 makes X11 the diagnostic fallback, and a
+/// closed window there still ends the way it always has, on `--run`.
+pub fn window_closed() -> bool {
+    match backend() {
+        Backend::Wayland => wayland::window_closed(),
+        Backend::X11 => false,
+    }
+}
+
 /// Drain and deliver whatever host input is queued, for the active backend.
 pub fn pump_input_events(handle: i64) {
     match backend() {

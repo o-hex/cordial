@@ -19,6 +19,13 @@ cordial-plugins = { path = "../cordial-plugins" }
 # with its parent. ADR-002 already accepted core taking a GTK dependency; this
 # is where the runtime takes it too.
 cordial-shell = { path = "../cordial-shell" }
+# Only for `instr_close_window`, which is how the window-close shutdown path is
+# driven from a scripted run — see `wayland::instr_close_window`. The window
+# itself is `cordial-shell`'s and stays there; this is the one GTK *call* the
+# runtime makes, and it needs the trait that carries it. Same version
+# cordial-shell pins, because two versions of gtk4-rs in one process would be
+# two sets of GObject type registrations for the same C types.
+gtk4 = { version = "0.11", features = ["v4_10"] }
 ureq = "3.3.0"
 # The client-settings document is JSON and user flag overrides have to be merged
 # into it correctly. A textual splice on a 1.2 MB document is not correctness.

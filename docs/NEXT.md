@@ -451,19 +451,24 @@ a click, which nothing here may synthesise (see AGENTS.md).
 # 1. Does the engine draw its own text when no soft keyboard is reported?
 #    The experiment §1's correction above asks for. Click a field, type "abc".
 CORDIAL_KEYBOARD_REPORT=1 CORDIAL_TRACE_TEXT=1 CORDIAL_WAYLAND=1 \
-  ./target/release/cordial-load --lib-dir <lib> --apk <apk> \
+  ./target/release/cordial-run --lib-dir <lib> --apk <apk> \
   --host-libc --game-activity --run 120
 
 # 2. Does the zwp_text_input_v3 "has no event 8" freeze still happen, and on
 #    which object? Click into a field; WAYLAND_DEBUG prints every event with
 #    its object id, so the id that receives opcode 8 can be matched against
 #    what created it earlier in the same log.
-WAYLAND_DEBUG=1 CORDIAL_WAYLAND=1 ./target/release/cordial-load ... 2>&1 \
-  | tee /tmp/ti.log; grep -n "text_input\|no event" /tmp/ti.log
+WAYLAND_DEBUG=1 CORDIAL_WAYLAND=1 ./target/release/cordial-run ... 2>&1 \
+  | tee ~/.cache/ti.log; grep -n "text_input\|no event" ~/.cache/ti.log
 ```
 
-The second one is the only way anyone has to diagnose that bug rather than
-guess at it, and this change did not touch it.
+**Experiment 2 is answered, and the answer did not need a click** — see
+§1c below. Event 8 is `preedit_hint`, added in `zwp_text_input_v3` **version
+2**, which this file's own `bind` had always asked for while the hand-written
+table beside it described version 1. The table is fixed. The experiment is
+still worth running once as confirmation, because nobody has yet seen mutter
+send opcode 6, 7 or 8 to Cordial — but it is no longer the only way to
+diagnose it.
 
 **Three things worth knowing before touching this code.**
 
@@ -521,6 +526,127 @@ Two things not to reach for. Delaying `ack_configure` until the engine has a
 matching buffer makes GTK stall on the engine's frame rate. `wp_viewporter`
 scaling the stale buffer hides the seam by showing a stretched old frame, which
 is a different wrong picture rather than none.
+
+## 1c. A Wayland protocol error killed a signed-in session. Not reproduced — but the reason it was undiagnosable is fixed
+
+Reported once, on a real signed-in session, minutes after reaching the home
+page:
+
+```text
+[roblox] datamodel notification: LUA_HOME_PAGE_LOADED
+[roblox] datamodel notification: HOME_PAGE_INTERACTIVE
+[cookies] periodic: saved 4 domain(s), 5032 bytes
+Gdk-Message: 14:10:43.968: Error 71 (Protocol error) dispatching to Wayland display.
+```
+
+**Not reproduced**, and this section does not claim to have fixed it. Five
+logged-out runs against the real APK on this compositor — two before any change
+(120s and 180s) and three after (180s each) — all reached `APP_READY (Landing)`
+and none produced a protocol error. Reproducing it needs a signed-in account,
+which is §2's problem.
+
+### Why that line was the whole of the evidence, and why it will not be again
+
+Errno 71 is `EPROTO`, and **only** a compositor-sent `wl_display.error`
+produces it. Measured, by asking mutter to bind a global it never advertised:
+
+```text
+wl_registry#2: error 0: global wl_compositor (999999) is unavailable
+roundtrip=-1 wl_display_get_error=71 (Protocol error) errno=71 (Protocol error)
+```
+
+So the compositor did name the object and the reason. **GDK then threw it
+away.** GTK4 calls `wl_log_set_handler_client` with a handler that logs at
+`G_LOG_LEVEL_DEBUG`, and debug is dropped unless `G_MESSAGES_DEBUG` names the
+domain — so libwayland's one useful line is discarded about 50ms before GDK
+prints its errno and calls `_exit(1)`. Confirmed by planting the same
+deliberate bad `bind` inside `open()` and launching the real client: the entire
+output was one `Gdk-Message` line, byte-for-byte the shape of the report above.
+With `G_MESSAGES_DEBUG=all`, the same run also printed
+
+```text
+(Cordial:96812): Gdk-DEBUG: wl_registry#107: error 0: global wl_compositor (999999) is unavailable
+```
+
+`cordial_shell::host_window::unmute_waylands_own_errors` now installs a
+`Gdk`-domain handler that re-emits those lines as `[wayland] ...` regardless of
+`G_MESSAGES_DEBUG`, filtered so the ~122 portal-settings debug lines GDK also
+emits per launch stay out of the way. Verified with the deliberate error, three
+consecutive launches, against the same three launches of the pre-change binary
+that printed nothing.
+
+**So the next occurrence is self-diagnosing.** Whoever hits it again should
+paste the `[wayland] <interface>#<id>: error <code>: <reason>` line — that
+single line names the offending object and the compositor's own words for what
+was wrong with it, which is the whole answer.
+
+### What was found instead, and it is a real bug: the text-input table described the wrong protocol version
+
+Chasing the above through `WAYLAND_DEBUG=1` turned up a different, definite
+defect, and **corrects what §1a's module doc said about it.**
+
+`wayland.rs` binds `zwp_text_input_manager_v3` at version 2 — measured on the
+wire, `wl_registry#107.bind(26, "zwp_text_input_manager_v3", 2, ...)`, because
+GNOME 50's mutter advertises 2. A `zwp_text_input_v3` created by a v2 manager
+**is** a v2 object; the version a client passes to `wl_proxy_marshal_flags`
+does not change what the compositor believes it may send. And version 2 adds
+three events to version 1's six: `action` (6), `language` (7) and
+`preedit_hint` (8).
+
+The hand-written table in `wayland.rs` declared six. **Event 8 is
+`preedit_hint`** — checked against `wayland-scanner`'s own generated table for
+the shipped XML, which matches the corrected table name-for-name and
+signature-for-signature. The old comment's explanation, that "event 8 exists in
+`zwp_text_input_v2`", named a different protocol and was wrong.
+
+**This is not the EPROTO above, and conflating them would send the next person
+the wrong way.** An opcode past the end of a client's own table is refused
+*inside libwayland*, not by the compositor; it leaves `errno` at whatever it
+happened to be. Reproduced standalone against this compositor by binding
+`wl_seat` at version 8 behind deliberately short and complete tables, five
+times each in one session:
+
+```text
+SHORT  bound wl_seat v8, table declares 1 event(s): roundtrip=-1  wl_display_get_error=11 (Resource temporarily unavailable)
+FULL   bound wl_seat v8, table declares 2 event(s): roundtrip= 4  wl_display_get_error=0 (none)
+
+5/5 SHORT runs killed the display; 5/5 FULL runs were clean.
+```
+
+11, not 71 — and the whole display dies, every client on the connection
+included, which is the freeze §1a recorded rather than a crash.
+
+The fix is the complete v2 table, three no-op listener slots, and `bind` taking
+its version from `TEXT_INPUT_MANAGER_INTERFACE.version` so the request and the
+table cannot drift apart again. Two unit tests pin it.
+
+**Still unverified:** that mutter ever actually sends opcode 6, 7 or 8 to
+Cordial. Those need an input method composing into a focused field, which needs
+a click. What *is* established is that the object is live all session — the
+trace shows `zwp_text_input_v3#71.enter(wl_surface#47)` arriving as soon as the
+toplevel takes keyboard focus, with no `enable` sent and no field clicked — so
+there is no window in a session where a v2 event would be harmless.
+
+### Ruled out as the cause of the EPROTO, so nobody re-runs them
+
+- **Short listener arrays on `wl_pointer`/`wl_keyboard`/`wl_registry`.** Dumped
+  the host `libwayland-client.so`'s own tables directly: `wl_pointer` declares
+  11 events, `wl_keyboard` 6, `wl_registry` 2, and the structs in `wayland.rs`
+  have exactly 11, 6 and 2 fields. §1a's defensive padding was correct.
+- **§1a's padding being load-bearing.** It is not, on this compositor:
+  `wl_seat` is bound at version 1, so mutter never sends `frame` or the axis
+  events at all — zero `wl_pointer#70.frame` in a full 120s run. Keep the
+  slots; do not cite them as tested.
+- **Anything reachable without signing in.** Five runs, no error.
+
+### One thing fixed on the way, of the same family and never observed to fire
+
+`open()` registered the `wl_registry` listener with a pointer to a
+`Globals` **local**, and the registry proxy is never destroyed. Any global
+appearing later in the session — a monitor hotplug, a seat — would run
+`registry_global` against `open()`'s long-dead stack frame. That is §1a bug 2
+with a write instead of a call. Now `Box::leak`ed. Not observed to fire; fixed
+because it is one of the two shapes this file has already been bitten by.
 
 ## 2. Sign-in itself
 

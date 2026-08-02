@@ -64,21 +64,59 @@
 //! window controls. `pointer_enter` records which surface the pointer is on
 //! and nothing is delivered unless it is the engine's.
 //!
-//! ## The `zwp_text_input_v3` client is untouched, and still has a live bug
+//! ## `zwp_text_input_v3` had a version-2 event table written to version 1
 //!
-//! Recorded here rather than left to be rediscovered. `interface
-//! 'zwp_text_input_v3' has no event 8` appears at runtime and freezes the
-//! landing page. `zwp_text_input_v3` has six events, 0 to 5; event 8 exists in
-//! `zwp_text_input_v2`. An opcode past the end of an interface's event table
-//! is the same shape of fault as the crash recorded on [`PointerListener`]
-//! further down this file, which was a table disagreeing with what the
-//! compositor actually sends.
+//! **Correction to what this comment used to say.** It recorded `interface
+//! 'zwp_text_input_v3' has no event 8` as a live bug and explained it as
+//! "event 8 exists in `zwp_text_input_v2`", a different protocol. That is
+//! wrong, and the real explanation is entirely inside this file.
 //!
-//! It was **not** fixed here, and it was not reproduced here either: it needs
-//! a click into a text field, and this change was made in an environment with
-//! no way to click. Do not read the surrounding work as having addressed it.
+//! `zwp_text_input_v3` **version 2** — which is what GNOME 50's mutter
+//! advertises, and what the `bind` below has always asked for — adds three
+//! events to the six version 1 has: `action` (6), `language` (7) and
+//! `preedit_hint` (8). Event 8 is `preedit_hint`. The table here declared six.
+//! An object's version on the wire is inherited from the object that created
+//! it, and nothing about passing a smaller number to `wl_proxy_marshal_flags`
+//! changes what the compositor believes it may send — so binding the manager
+//! at 2 and describing the child at 1 asks for events this file then cannot
+//! receive.
 //!
-//! One thing this change *did* establish about it, from `WAYLAND_DEBUG=1`:
+//! Measured on the wire, `WAYLAND_DEBUG=1`, before the fix:
+//!
+//! ```text
+//! wl_registry#107.global(26, "zwp_text_input_manager_v3", 2)
+//!  -> wl_registry#107.bind(26, "zwp_text_input_manager_v3", 2, new id [unknown]#74)
+//!  -> zwp_text_input_manager_v3#74.get_text_input(new id [unknown]#71, wl_seat#103)
+//! zwp_text_input_v3#71.enter(wl_surface#47)
+//! ```
+//!
+//! Note the last line: the compositor starts talking to this object as soon as
+//! the toplevel takes keyboard focus, with no `enable` sent and no field
+//! clicked. There is no window in a session where it is dormant.
+//!
+//! The failure that follows is *not* a protocol error and this is worth being
+//! precise about, because a wrong errno sends the next person somewhere else.
+//! Reproduced standalone against this same compositor, by binding `wl_seat` at
+//! version 8 behind a deliberately one-event table:
+//!
+//! ```text
+//! interface 'wl_seat' has no event 1
+//! roundtrip=-1  wl_display_get_error=11 (Resource temporarily unavailable)
+//! ```
+//!
+//! libwayland refuses the event, puts the *whole display* into a permanent
+//! error state, and leaves `errno` at whatever it was — 11, not 71. Every
+//! client on the connection stops, which is the freeze. A `wl_display.error`
+//! sent by the compositor is the other thing, gives 71 (`EPROTO`), and prints
+//! `<interface>#<id>: error <code>: <reason>` first.
+//!
+//! The rule this file already applied to `wl_pointer`/`wl_keyboard` is the fix,
+//! plus its converse: declare the complete event set for the version bound, and
+//! never bind above the version whose table is written here. `bind` now takes
+//! its version from `TEXT_INPUT_MANAGER_INTERFACE.version` so the two cannot
+//! drift apart when wayland-protocols ships a version 3.
+//!
+//! One thing established earlier and still true, from `WAYLAND_DEBUG=1`:
 //! bringing GTK into the process does not add a second text-input object.
 //! There is exactly one `get_text_input` on the connection and it is this
 //! file's, because GDK creates its own only when a GTK text widget takes
@@ -154,9 +192,14 @@ static TEXT_INPUT_MANAGER_METHODS: [WlMessage; 2] = [
 static TEXT_INPUT_MANAGER_INTERFACE: WlInterface = WlInterface {
     name: c"zwp_text_input_manager_v3".as_ptr(),
     // Version 2. The manager's own request set is unchanged from 1 — the bump
-    // is on `zwp_text_input_v3` — so binding higher costs nothing and takes
-    // whatever the compositor offers. `bind` below clamps to the advertised
-    // version, so a v1-only compositor still works.
+    // is on `zwp_text_input_v3` — but binding higher is *not* free, and this
+    // number is the one that decides what the compositor may send on the child
+    // object: a `zwp_text_input_v3` created by a v2 manager is a v2 object
+    // however small a version this file passes to `wl_proxy_marshal_flags`.
+    // `TEXT_INPUT_EVENTS` below therefore has to be complete for this number,
+    // and `bind` reads it from here rather than repeating the literal, so the
+    // table and the request cannot drift. `bind` still clamps to what the
+    // compositor advertised, so a v1-only compositor works unchanged.
     version: 2,
     method_count: 2,
     methods: TEXT_INPUT_MANAGER_METHODS.as_ptr(),
@@ -168,7 +211,7 @@ const TEXT_INPUT_MANAGER_GET_TEXT_INPUT: u32 = 1;
 
 // ------------------------------------------------------------ zwp_text_input_v3
 
-static TEXT_INPUT_METHODS: [WlMessage; 8] = [
+static TEXT_INPUT_METHODS: [WlMessage; 11] = [
     WlMessage { name: c"destroy".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
     WlMessage { name: c"enable".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
     WlMessage { name: c"disable".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
@@ -193,8 +236,23 @@ static TEXT_INPUT_METHODS: [WlMessage; 8] = [
         types: NO_TYPES.0.as_ptr(),
     },
     WlMessage { name: c"commit".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
+    // Version 2's three additions. None of them is sent by this file, and
+    // `set_available_actions` in particular must not be sent casually — an
+    // array containing `none`, or the same action twice, is the interface's own
+    // `invalid_action` protocol error and would kill the connection. They are
+    // declared so that `method_count` matches the version bound, in the same
+    // spirit as the event table below: a table that describes a different
+    // protocol version from the one on the wire is the bug this whole section
+    // is about.
+    WlMessage {
+        name: c"set_available_actions".as_ptr(),
+        signature: c"2a".as_ptr(),
+        types: NO_TYPES.0.as_ptr(),
+    },
+    WlMessage { name: c"show_input_panel".as_ptr(), signature: c"2".as_ptr(), types: NO_TYPES.0.as_ptr() },
+    WlMessage { name: c"hide_input_panel".as_ptr(), signature: c"2".as_ptr(), types: NO_TYPES.0.as_ptr() },
 ];
-static TEXT_INPUT_EVENTS: [WlMessage; 6] = [
+static TEXT_INPUT_EVENTS: [WlMessage; 9] = [
     WlMessage { name: c"enter".as_ptr(), signature: c"o".as_ptr(), types: NO_TYPES.0.as_ptr() },
     WlMessage { name: c"leave".as_ptr(), signature: c"o".as_ptr(), types: NO_TYPES.0.as_ptr() },
     WlMessage {
@@ -213,13 +271,23 @@ static TEXT_INPUT_EVENTS: [WlMessage; 6] = [
         types: NO_TYPES.0.as_ptr(),
     },
     WlMessage { name: c"done".as_ptr(), signature: c"u".as_ptr(), types: NO_TYPES.0.as_ptr() },
+    // Version 2, and where the recorded `has no event 8` came from. The
+    // leading `2` in each
+    // signature is the `since` version, exactly as `wayland-scanner` emits it
+    // (`wl_seat`'s own `name` event reads `2s` in the host library); the
+    // demarshaller skips it, so it is documentation that cannot go stale.
+    WlMessage { name: c"action".as_ptr(), signature: c"2uu".as_ptr(), types: NO_TYPES.0.as_ptr() },
+    WlMessage { name: c"language".as_ptr(), signature: c"2s".as_ptr(), types: NO_TYPES.0.as_ptr() },
+    WlMessage { name: c"preedit_hint".as_ptr(), signature: c"2uuu".as_ptr(), types: NO_TYPES.0.as_ptr() },
 ];
 static TEXT_INPUT_INTERFACE: WlInterface = WlInterface {
     name: c"zwp_text_input_v3".as_ptr(),
-    version: 1,
-    method_count: 8,
+    // Must equal the manager's, because that is what the compositor gives this
+    // object — see the module doc.
+    version: 2,
+    method_count: 11,
     methods: TEXT_INPUT_METHODS.as_ptr(),
-    event_count: 6,
+    event_count: 9,
     events: TEXT_INPUT_EVENTS.as_ptr(),
 };
 
@@ -279,6 +347,20 @@ struct WlClient {
     roundtrip: unsafe extern "C" fn(*mut c_void) -> c_int,
     marshal_flags: ProxyMarshalFlags,
     add_listener: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> c_int,
+    /// What a proxy's version *actually* is, rather than what the call site
+    /// that made it guessed. A child object inherits its parent's version, so
+    /// this is the only honest source for the number `wl_proxy_marshal_flags`
+    /// should be given when creating one — see the text-input section of the
+    /// module doc for what a guess cost here.
+    get_version: unsafe extern "C" fn(*mut c_void) -> u32,
+    /// Set once the connection is unusable. Non-zero means every later request
+    /// is discarded and every dispatch fails, so a run that reaches this is
+    /// over whatever it does next; `pump` reports it rather than letting the
+    /// process die with only GDK's `Error %d ... dispatching to Wayland
+    /// display` to go on, which names neither the object nor the reason.
+    get_error: unsafe extern "C" fn(*mut c_void) -> c_int,
+    get_protocol_error:
+        unsafe extern "C" fn(*mut c_void, *mut *const WlInterface, *mut u32) -> u32,
 
     registry_interface: *const WlInterface,
     compositor_interface: *const WlInterface,
@@ -370,6 +452,9 @@ impl WlClient {
             roundtrip: sym!("wl_display_roundtrip"),
             marshal_flags: sym!("wl_proxy_marshal_flags"),
             add_listener: sym!("wl_proxy_add_listener"),
+            get_version: sym!("wl_proxy_get_version"),
+            get_error: sym!("wl_display_get_error"),
+            get_protocol_error: sym!("wl_display_get_protocol_error"),
             registry_interface: sym!("wl_registry_interface"),
             compositor_interface: sym!("wl_compositor_interface"),
             subcompositor_interface: sym!("wl_subcompositor_interface"),
@@ -519,6 +604,14 @@ struct KeyboardListener {
     repeat_info: unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32),
 }
 
+/// Nine slots, not six. The last three are `zwp_text_input_v3` version 2's
+/// `action`/`language`/`preedit_hint`, and they are here for the same reason
+/// `PointerListener` carries slots for scroll events nothing implements: the
+/// compositor sends by opcode, `dispatch_event` indexes this array by that
+/// opcode with no bounds check of its own, and the version the compositor
+/// thinks this object has is the manager's, not the number this file passes
+/// around. Leaving them out is what produced `interface 'zwp_text_input_v3'
+/// has no event 8` — see the module doc for the measurement.
 #[repr(C)]
 struct TextInputListener {
     enter: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
@@ -527,6 +620,9 @@ struct TextInputListener {
     commit_string: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char),
     delete_surrounding_text: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32),
     done: unsafe extern "C" fn(*mut c_void, *mut c_void, u32),
+    action: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32),
+    language: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char),
+    preedit_hint: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32),
 }
 
 // -------------------------------------------------------------------- state
@@ -770,12 +866,26 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     if registry.is_null() {
         return Err("wl_display_get_registry failed".into());
     }
-    let mut globals = Globals::default();
+    // Leaked on purpose, and this is not tidiness that got away.
+    //
+    // The registry proxy is never destroyed, so its listener stays registered
+    // for the process's whole life, and `wl_registry.global` fires again
+    // whenever the compositor adds one — a monitor hotplug, a seat appearing.
+    // A `&mut` to a local here would have `open()`'s stack frame under it,
+    // long since returned and reused, and `registry_global` writes through
+    // that pointer. That is the *exact* shape of §1a's bug 2, where a
+    // stack-local `XdgSurfaceListener` stayed registered and the first
+    // configure that arrived afterwards jumped through reused stack bytes; the
+    // only difference is that this one writes rather than calls, so it would
+    // corrupt something instead of crashing where it happened. Not observed to
+    // fire — a global has to arrive that this file matches on — which is why
+    // it is worth fixing now rather than after it does.
+    let globals: &'static mut Globals = Box::leak(Box::new(Globals::default()));
     unsafe {
         (wl.add_listener)(
             registry,
             &REGISTRY_LISTENER as *const RegistryListener as *const c_void,
-            &mut globals as *mut Globals as *mut c_void,
+            globals as *mut Globals as *mut c_void,
         );
         if (wl.roundtrip)(display) < 0 {
             return Err("wl_display_roundtrip failed while enumerating globals".into());
@@ -849,8 +959,13 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         return Err("binding wl_seat failed".into());
     }
 
+    // The version asked for comes from the table, not from a literal repeated
+    // here. Those two numbers being allowed to disagree is the whole of the
+    // freeze recorded in the module doc: this call said 2, `TEXT_INPUT_EVENTS`
+    // described 1, and the compositor sent event 8 to a six-slot listener.
     let text_input_manager = text_input_manager_global.and_then(|(name, ver)| {
-        let m = bind(name, 2, ver, &TEXT_INPUT_MANAGER_INTERFACE, "zwp_text_input_manager_v3");
+        let want = TEXT_INPUT_MANAGER_INTERFACE.version as u32;
+        let m = bind(name, want, ver, &TEXT_INPUT_MANAGER_INTERFACE, "zwp_text_input_manager_v3");
         (!m.is_null()).then_some(m)
     });
 
@@ -920,13 +1035,18 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     // ---- text-input-v3: created against the seat, listener wired once the
     // window exists (below), since its handlers use `current()`.
     let text_input = text_input_manager.and_then(|mgr| {
+        // The child's version is the manager's, read back rather than assumed:
+        // this used to pass a literal 1 while the manager was bound at 2, which
+        // made every version check on this side answer for a protocol the
+        // compositor was not speaking.
         // SAFETY: `mgr`/`seat` are live proxies bound above.
+        let version = unsafe { (wl.get_version)(mgr) };
         let ti = unsafe {
             (wl.marshal_flags)(
                 mgr,
                 TEXT_INPUT_MANAGER_GET_TEXT_INPUT,
                 &TEXT_INPUT_INTERFACE,
-                1,
+                version,
                 0,
                 std::ptr::null_mut::<c_void>(),
                 seat,
@@ -1902,6 +2022,25 @@ unsafe extern "C" fn ti_done(_data: *mut c_void, _ti: *mut c_void, _serial: u32)
     }
 }
 
+/// `action` (version 2): the input method reports that the user activated the
+/// field — the on-screen keyboard's Go/Search key. Nothing is done with it
+/// because Cordial never sends `set_available_actions`, so the protocol says
+/// no action is available and this cannot legitimately arrive; the slot exists
+/// so that a compositor which sends it anyway is ignored rather than fatal.
+/// If Roblox's `returnKeyType` is ever wired through (docs/NEXT.md §1), this is
+/// where Enter-from-the-IME belongs.
+unsafe extern "C" fn ti_action(_data: *mut c_void, _ti: *mut c_void, _action: u32, _serial: u32) {}
+/// `language` (version 2): a BCP 47 tag for whatever the input method is
+/// currently composing in, sent on creation and on every change. Roblox has no
+/// call that takes it, so it is accepted and dropped.
+unsafe extern "C" fn ti_language(_data: *mut c_void, _ti: *mut c_void, _language: *const c_char) {}
+/// `preedit_hint` (version 2): how a range of the composing string should be
+/// styled — underline, selection, spelling error. Cordial does not draw the
+/// preedit itself (it splices it into the string the engine renders, see
+/// `splice_preedit`), so there is nothing here to style. **This is event 8**,
+/// the one whose absence produced the freeze recorded in the module doc.
+unsafe extern "C" fn ti_preedit_hint(_data: *mut c_void, _ti: *mut c_void, _start: u32, _end: u32, _hint: u32) {}
+
 static TEXT_INPUT_LISTENER: TextInputListener = TextInputListener {
     enter: ti_enter,
     leave: ti_leave,
@@ -1909,6 +2048,9 @@ static TEXT_INPUT_LISTENER: TextInputListener = TextInputListener {
     commit_string: ti_commit_string,
     delete_surrounding_text: ti_delete_surrounding_text,
     done: ti_done,
+    action: ti_action,
+    language: ti_language,
+    preedit_hint: ti_preedit_hint,
 };
 
 
@@ -2036,8 +2178,73 @@ impl WaylandWindow {
             unsafe { (self.wl.cancel_read)(self.display) };
         }
         unsafe { (self.wl.dispatch_pending)(self.display) };
+        self.report_display_error();
+    }
+
+    /// Say what killed the connection, once, in Cordial's own words.
+    ///
+    /// A session was lost to nothing but this, on a signed-in home page:
+    ///
+    /// ```text
+    /// Gdk-Message: 14:10:43.968: Error 71 (Protocol error) dispatching to Wayland display.
+    /// ```
+    ///
+    /// GDK prints that from `_gdk_wayland_display_queue_events` and then calls
+    /// `_exit(1)`, so it is the last line there is. It names an errno and
+    /// nothing else — not the interface, not the object, not the reason —
+    /// and 71 is `EPROTO`, which means the *compositor* rejected something
+    /// this client sent.
+    ///
+    /// The description of *what* it rejected is recovered elsewhere, by
+    /// [`cordial_shell::host_window`]'s GDK-domain log handler; read that
+    /// function's comment first, because it is the one that actually works.
+    /// This is the second net, and a poor one: whichever side pulls the error
+    /// off the socket dispatches it, and when GDK does, it exits before this
+    /// ever runs. Measured with a deliberate bad `bind`, GDK won 3 times out of
+    /// 3 — so **the absence of this line means nothing**. What it adds when it
+    /// does win is the interface and protocol error code in Cordial's own
+    /// voice, and coverage of the non-`EPROTO` case, where libwayland itself
+    /// gave up on an event and GDK's line would report a meaningless errno.
+    ///
+    /// Deliberately not a panic. The display is already unusable and every
+    /// later request is discarded, so there is nothing to salvage; the point is
+    /// only that the next person gets the object and the code.
+    fn report_display_error(&self) {
+        // SAFETY: `self.display` is live for the process's lifetime, and both
+        // calls are pure reads of state libwayland already recorded.
+        let err = unsafe { (self.wl.get_error)(self.display) };
+        if err == 0 {
+            return;
+        }
+        if DISPLAY_ERROR_REPORTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mut interface: *const WlInterface = std::ptr::null();
+        let mut id: u32 = 0;
+        let code = unsafe { (self.wl.get_protocol_error)(self.display, &mut interface, &mut id) };
+        // 71 is EPROTO: the compositor sent `wl_display.error`, and then
+        // `interface`/`id`/`code` are populated. Any other errno means
+        // libwayland itself gave up — a malformed or unknown event, most
+        // likely an opcode past the end of one of the hand-written tables at
+        // the top of this file — and they are not.
+        let name = if interface.is_null() {
+            "(none)".to_string()
+        } else {
+            // SAFETY: a `wl_interface` libwayland owns; `name` is a static C
+            // string in whichever table declared it.
+            unsafe { CStr::from_ptr((*interface).name) }.to_string_lossy().into_owned()
+        };
+        eprintln!(
+            "[android] wayland: the display connection is dead (errno {err}); \
+             compositor error on {name}#{id}, code {code}. \
+             The compositor's own description of it is on stderr just above this line."
+        );
     }
 }
+
+/// So that a dead connection is described once rather than on every pump tick
+/// for however many ticks happen before the process goes.
+static DISPLAY_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 
 pub fn pump_input_events(handle: i64) {
     if let Some(w) = current() {
@@ -2250,6 +2457,43 @@ mod tests {
     // `cordial_shell::host_window`, which is what sets the app_id now that GTK
     // owns the toplevel. Same test, same ADR-009 reason; it has to sit beside
     // the constant that actually reaches the wire or it pins nothing.
+
+    /// The listener array `wl_proxy_add_listener` is handed must have one
+    /// function pointer per event the interface declares, and the interface
+    /// must declare every event of the version bound. Getting that wrong is
+    /// how `interface 'zwp_text_input_v3' has no event 8` happened: the table
+    /// described version 1 while `bind` asked for version 2, and the fatal
+    /// gap was three events wide.
+    ///
+    /// Only the hand-written interface can be checked here. `wl_pointer` and
+    /// `wl_keyboard` come from the host's own `libwayland-client.so`, so their
+    /// `event_count` is not a constant this crate can see at compile time —
+    /// which is exactly why the module doc says the listeners for those must
+    /// carry the *complete current* event set rather than the one matching
+    /// some version this file picked.
+    #[test]
+    fn the_text_input_listener_has_a_slot_for_every_event_declared() {
+        assert_eq!(TEXT_INPUT_EVENTS.len() as c_int, TEXT_INPUT_INTERFACE.event_count);
+        assert_eq!(TEXT_INPUT_METHODS.len() as c_int, TEXT_INPUT_INTERFACE.method_count);
+        assert_eq!(
+            std::mem::size_of::<TextInputListener>(),
+            TEXT_INPUT_EVENTS.len() * std::mem::size_of::<*const c_void>(),
+            "TextInputListener must be exactly one function pointer per declared event"
+        );
+    }
+
+    /// A `zwp_text_input_v3` is created by the manager and therefore *is*
+    /// whatever version the manager was bound at, whatever number this file
+    /// passes to `wl_proxy_marshal_flags`. These two drifting apart is the
+    /// whole bug, so they are pinned together rather than left as a comment.
+    #[test]
+    fn the_text_input_and_its_manager_declare_the_same_version() {
+        assert_eq!(TEXT_INPUT_INTERFACE.version, TEXT_INPUT_MANAGER_INTERFACE.version);
+        // Version 2 is what GNOME 50's mutter advertises, measured on the wire:
+        // `wl_registry#107.global(26, "zwp_text_input_manager_v3", 2)`. Raising
+        // this means adding the new version's events to the table above first.
+        assert_eq!(TEXT_INPUT_INTERFACE.version, 2);
+    }
 
     #[test]
     fn no_preedit_leaves_committed_text_untouched() {

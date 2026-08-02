@@ -158,7 +158,59 @@ pub fn init_wayland() -> Result<(), String> {
     gtk::gdk::set_allowed_backends("wayland");
     glib::set_prgname(Some(APP_ID));
     adw::init().map_err(|e| format!("libadwaita would not initialise: {e}"))?;
+    unmute_waylands_own_errors();
     Ok(())
+}
+
+/// Let libwayland's fatal messages reach the terminal again.
+///
+/// A session was lost with this as its entire epitaph:
+///
+/// ```text
+/// Gdk-Message: 14:10:43.968: Error 71 (Protocol error) dispatching to Wayland display.
+/// ```
+///
+/// GDK prints that and calls `_exit(1)`. It names an errno and nothing else,
+/// and 71 is `EPROTO` — the compositor rejected something the client sent.
+/// libwayland *does* say which object and why, but GTK4 calls
+/// `wl_log_set_handler_client` with a handler that logs at
+/// `G_LOG_LEVEL_DEBUG`, and debug is dropped unless `G_MESSAGES_DEBUG` names
+/// the domain. So the one line that answers the question is discarded by
+/// default, roughly 50ms before the process dies.
+///
+/// Measured, by binding a global name mutter never advertised. Without this,
+/// the whole of the output is the `Gdk-Message` above. With
+/// `G_MESSAGES_DEBUG=all`, and now with this:
+///
+/// ```text
+/// wl_registry#107: error 0: global wl_compositor (999999) is unavailable
+/// ```
+///
+/// Installing a `Gdk`-domain handler rather than setting `G_MESSAGES_DEBUG`
+/// keeps the other ~122 debug lines GDK emits per launch (portal settings,
+/// mostly) out of the way; a handler registered here is called whatever
+/// `G_MESSAGES_DEBUG` says, because that filter lives in GLib's *default*
+/// handler and this replaces it for one domain.
+///
+/// The substring test is the weak part and is deliberately small. These are
+/// the shapes libwayland uses when a connection is finished: `<interface>#<id>:
+/// error <code>: <reason>` for a compositor-sent `wl_display.error`, and
+/// `interface '<name>' has no event <n>` for an opcode past the end of one of
+/// the hand-written tables in `cordial_runtime::android::wayland`. Missing a
+/// third shape costs a diagnostic, not correctness — everything still goes to
+/// GDK's own handler as well.
+fn unmute_waylands_own_errors() {
+    glib::log_set_handler(
+        Some("Gdk"),
+        glib::LogLevels::LEVEL_DEBUG,
+        false,
+        false,
+        |_domain, _level, message| {
+            if message.contains(": error ") || message.contains("has no event") {
+                eprintln!("[wayland] {message}");
+            }
+        },
+    );
 }
 
 /// A built, not-yet-presented shell window.

@@ -93,7 +93,26 @@ mod tests {
         assert!(err.contains("refused"), "{err}");
     }
 
+    /// `#[ignore]`, and it has to stay that way.
+    ///
+    /// This drives the real portal against the real session bus, which means it
+    /// really does open a browser on the machine running it. `cargo test
+    /// --workspace` is run constantly here — by every contributor, by every
+    /// agent, and by anything watching the tree — so a test with that side
+    /// effect spawned tens of browser tabs at a developer who was trying to use
+    /// their desktop. A test is allowed to be slow or to need a fixture; it is
+    /// not allowed to take over the machine it runs on.
+    ///
+    /// Run it deliberately when changing the portal call:
+    ///
+    /// ```text
+    /// cargo test -p cordial-plugins -- --ignored urlopen
+    /// ```
+    ///
+    /// The scheme validation above is what actually guards the capability, and
+    /// that is covered by ordinary tests that open nothing.
     #[test]
+    #[ignore = "opens a real browser window; run with --ignored"]
     fn an_http_url_round_trips_through_the_real_portal_when_one_is_reachable() {
         if !have_session_bus() {
             eprintln!("skipping: no DBUS_SESSION_BUS_ADDRESS in this environment");

@@ -71,7 +71,21 @@ mod tests {
         assert!(send("   ", "body").is_err());
     }
 
+    /// `#[ignore]`, for the same reason as `urlopen`'s twin of this test.
+    ///
+    /// It posts a real notification to the real desktop. `cargo test
+    /// --workspace` runs constantly here, so this put a banner on the
+    /// developer's screen every time anyone — or any agent — ran the suite.
+    /// Its sibling in `urlopen.rs` was opening a browser tab the same way and
+    /// managed tens of them before it was caught.
+    ///
+    /// Run it deliberately when changing the portal call:
+    ///
+    /// ```text
+    /// cargo test -p cordial-plugins -- --ignored notify
+    /// ```
     #[test]
+    #[ignore = "posts a real desktop notification; run with --ignored"]
     fn a_notification_round_trips_through_the_real_portal_when_one_is_reachable() {
         if !have_session_bus() {
             eprintln!("skipping: no DBUS_SESSION_BUS_ADDRESS in this environment");

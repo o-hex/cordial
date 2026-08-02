@@ -8,9 +8,55 @@
 _default:
     @just --list
 
-# Build everything, release (Clang required; AOSP bionic will not build with GCC)
-build:
-    cargo build --release
+# Build: just build [host|distrobox|nix]  (Clang required; bionic will not build with GCC)
+build where="host":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Each environment gets its own CARGO_TARGET_DIR. They have different
+    # toolchains and different libraries visible, so sharing target/ between
+    # them means every switch is a full rebuild at best, and at worst a binary
+    # linked against headers from one and libraries from the other.
+    #
+    # A container-built binary still runs on the host: distrobox shares the
+    # filesystem, and the libraries this needs are present on the host already —
+    # webkitgtk in particular is installed there as a runtime library, and only
+    # its *headers* were missing, which is why building outside the host works
+    # and running outside it is unnecessary.
+    case "{{ where }}" in
+      host)
+        cargo build --release
+        ;;
+      distrobox)
+        # The optional dependencies are the point of this one. native/CMakeLists.txt
+        # silently omits the audio backend when libpipewire-0.3 is absent, and the
+        # web views want webkitgtk6.0-devel, both of which mean `dnf install` and a
+        # reboot on an immutable host. A container is neither.
+        box="${CORDIAL_DISTROBOX:-my-distrobox}"
+        # Not `grep -q`. It exits at the first match and closes the pipe, which
+        # SIGPIPEs `distrobox list`, and `set -o pipefail` then reports the whole
+        # pipeline as failed — so the check inverted and claimed a container that
+        # plainly exists did not. Plain grep reads all of its input.
+        if ! distrobox list 2>/dev/null | grep "| $box " >/dev/null; then
+            echo "no distrobox called '$box' (set CORDIAL_DISTROBOX to pick another)" >&2
+            distrobox list 2>/dev/null >&2 || true
+            exit 1
+        fi
+        distrobox enter "$box" -- bash -lc \
+          'CARGO_TARGET_DIR=target-distrobox cargo build --release'
+        echo "built into target-distrobox/release"
+        ;;
+      nix)
+        # Unverified on an ostree host, where /nix is part of the read-only image
+        # and nix-daemon is disabled. See CONTRIBUTING.md.
+        nix develop --command bash -c \
+          'CARGO_TARGET_DIR=target-nix cargo build --release'
+        echo "built into target-nix/release"
+        ;;
+      *)
+        echo "usage: just build [host|distrobox|nix]" >&2
+        exit 1
+        ;;
+    esac
 
 # Run the workspace tests
 test:
@@ -19,7 +65,7 @@ test:
 # Build and test, the pre-pull-request gate
 check: build test
 
-# Start Cordial: just dev [--apk /path/to/base.apk]
+# Start Cordial: just dev [--in host|distrobox|nix] [--apk /path/to/base.apk]
 dev *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -29,15 +75,35 @@ dev *args:
     # no arguments, which looks like a broken recipe rather than a missing
     # `set --`.
     set -- {{ args }}
-    apk="" extra=()
+    apk="" env=host extra=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --apk)   apk="${2:-}"; shift 2 ;;
             --apk=*) apk="${1#*=}"; shift ;;
+            # `--in` rather than a positional, because a positional would swallow
+            # `--apk` as its value — which it did, the first time this was written.
+            --in)    env="${2:-}"; shift 2 ;;
+            --in=*)  env="${1#*=}"; shift ;;
             *)       extra+=("$1"); shift ;;
         esac
     done
-    cargo build --release
+    just build "$env"
+    # Each build environment has its own target directory, so the runner has to
+    # be told which one it is looking at. Assuming ./target meant `just build
+    # distrobox` followed by `just dev` silently ran the older HOST binary — a
+    # stale build that still executes is this project's most expensive kind of
+    # mistake, and it has already cost two measurements of code that was never
+    # under test.
+    case "$env" in
+      host)      bindir=target/release ;;
+      distrobox) bindir=target-distrobox/release ;;
+      nix)       bindir=target-nix/release ;;
+      *)         echo "usage: just dev [--in host|distrobox|nix] [--apk PATH]" >&2; exit 1 ;;
+    esac
+    if [ ! -x "$bindir/cordial-shell" ]; then
+        echo "no cordial-shell in $bindir — did 'just build $env' succeed?" >&2
+        exit 1
+    fi
     # Deliberately no check that the APK exists and no advice about how to get
     # one. Finding a build, and explaining what to do when there is not one, is
     # the shell's job — it is what the user actually sees, and a second copy of
@@ -45,14 +111,14 @@ dev *args:
     if [ -n "$apk" ]; then
         export CORDIAL_APK="$apk"
     fi
-    exec ./target/release/cordial-shell ${extra+"${extra[@]}"}
+    exec "./$bindir/cordial-shell" ${extra+"${extra[@]}"}
 
-# Run the engine directly, skipping the shell: just client [--apk PATH] [--run SECS]
+# Run the engine directly: just client [--in host|distrobox|nix] [--apk PATH] [--run SECS]
 client *args:
     #!/usr/bin/env bash
     set -euo pipefail
     set -- {{ args }}
-    apk="" lib="" run="600" extra=()
+    apk="" lib="" run="600" env=host extra=()
     # `--apk` and `--lib-dir` are spelled the way cordial-run spells them: this
     # recipe exists to stop people assembling that command by hand, not to teach
     # a second vocabulary for it. Anything unrecognised passes straight through,
@@ -65,6 +131,8 @@ client *args:
             --lib-dir=*) lib="${1#*=}"; shift ;;
             --run)       run="${2:-}"; shift 2 ;;
             --run=*)     run="${1#*=}"; shift ;;
+            --in)        env="${2:-}"; shift 2 ;;
+            --in=*)      env="${1#*=}"; shift ;;
             *)           extra+=("$1"); shift ;;
         esac
     done
@@ -105,11 +173,23 @@ client *args:
         echo "pass --lib-dir if the engine lives somewhere else" >&2
         exit 1
     fi
-    cargo build --release
+    just build "$env"
+    # Whichever environment built it, run that one. Defaulting to ./target here
+    # would silently run a stale host binary after a container build.
+    case "$env" in
+      host)      bindir=target/release ;;
+      distrobox) bindir=target-distrobox/release ;;
+      nix)       bindir=target-nix/release ;;
+      *)         echo "usage: just client [--in host|distrobox|nix] ..." >&2; exit 1 ;;
+    esac
+    if [ ! -x "$bindir/cordial-run" ]; then
+        echo "no cordial-run in $bindir — did 'just build $env' succeed?" >&2
+        exit 1
+    fi
     # A long default timer on purpose: a run that ends on its own while somebody
     # is still reading the screen looks exactly like a crash, and that has
     # already cost one debugging session here.
-    exec ./target/release/cordial-run \
+    exec "./$bindir/cordial-run" \
         --lib-dir "$lib" --apk "$apk" \
         --host-libc --game-activity --run "$run" ${extra+"${extra[@]}"}
 

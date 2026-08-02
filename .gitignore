@@ -20,3 +20,7 @@ appData/LocalStorage/_memProfStorage*.json
 
 # Agent worktrees; these are live checkouts, not project content.
 .claude/worktrees/
+
+# Per-environment build outputs (just build distrobox|nix)
+target-distrobox/
+target-nix/

@@ -52,7 +52,65 @@ pub fn hit(index: usize) -> i64 {
         report();
         std::process::abort();
     }
+    if is_fatal(SYMBOLS[index].0) {
+        fatal(SYMBOLS[index].0);
+    }
     0
+}
+
+/// Symbols where returning `0` is not a harmless placeholder but a lie the
+/// caller cannot survive.
+///
+/// Every stub returns `0`, which is right for most of them: a counter nobody
+/// reads, a capability query answered "no". For these it is fatal, and in the
+/// worst way — the caller is *told it succeeded* and proceeds.
+///
+/// `pthread_once` returning 0 means "your initialiser ran". It did not, so
+/// whatever it was meant to set up is uninitialised and the next access is a
+/// null dereference somewhere with no visible relationship to this call.
+/// `pthread_getspecific` returning 0 is a NULL the caller dereferences at once.
+///
+/// This is precisely the failure AGENTS.md's "never make a stub lie" is about,
+/// and it was found the expensive way: `cordial-run --lib-dir DIR` without
+/// `--host-libc` segfaulted at exit 139 with `[stub] pthread_once` and
+/// `[stub] pthread_getspecific` as the last two lines before the core dump.
+/// Nobody reading a SIGSEGV would connect it to a stub returning success.
+fn is_fatal(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        "pthread_once"
+            | "pthread_getspecific"
+            | "pthread_setspecific"
+            | "pthread_key_create"
+            | "pthread_key_delete"
+    )
+}
+
+/// Say what happened and stop, rather than returning a lie and crashing later.
+///
+/// A named exit beats a SIGSEGV by the whole distance between "this symbol is
+/// not implemented, here is the switch that resolves it" and a core dump three
+/// frames into someone else's thread-local teardown.
+fn fatal(symbol: &str) -> ! {
+    eprintln!();
+    eprintln!("[stub] {symbol} is not implemented, and returning a placeholder would crash.");
+    eprintln!(
+        "       It is thread-local storage: answering 0 tells the caller its \
+         initialiser ran when it did not."
+    );
+    eprintln!("       Pass --host-libc to resolve libc from the host, which is what the");
+    eprintln!("       --game-activity path does and why that path does not hit this.");
+    report();
+    // `_exit` for the same reason the loader uses it: Roblox's static
+    // initialisers registered atexit handlers that expect a live Android
+    // process, and running them here would replace this message with the crash
+    // it exists to prevent.
+    unsafe { libc_exit(1) }
+}
+
+extern "C" {
+    #[link_name = "_exit"]
+    fn libc_exit(status: std::ffi::c_int) -> !;
 }
 
 /// Every stub called at least once, most-called first. This is the work queue.

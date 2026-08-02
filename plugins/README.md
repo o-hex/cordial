@@ -7,8 +7,10 @@ discovers them under `~/.local/share/cordial/plugins/`.
 {
   "id": "flag-inspector",
   "name": "Flag Inspector",
+  "version": "1.0.0",
   "entry": "main.ts",
-  "capabilities": ["flags.read", "log"]
+  "capabilities": ["flags.read", "log"],
+  "dependencies": { "some-other-plugin": "^1.2.0" }
 }
 ```
 
@@ -31,6 +33,89 @@ allowed to do is decided per account. An existing
 `~/.config/cordial/plugin-grants.json` from before this changed is moved into the
 first profile that looks for one, and every other profile starts at default deny
 — see [ADR-013](../docs/adr/ADR-013-per-profile-configuration.md).
+
+## Versions and dependencies
+
+`version` is a semantic version, `major.minor.patch`. It is optional — a plugin
+without one still loads, so nothing written before this existed stopped working
+— but a plugin cannot be published or depended upon without it.
+
+`dependencies` names **other Cordial plugins**, by id. It is not npm's field
+under another roof: if you also need a JavaScript package, that is your
+`deno.json`'s business and Cordial neither reads nor validates it. One key
+cannot honestly mean both, and you may well need both.
+
+A requirement is written in one of exactly two forms, and a bare version is
+refused:
+
+| | |
+|---|---|
+| `"=1.2.0"` | that version and nothing else |
+| `"^1.2.0"` | anything compatible with it |
+
+`"1.2.0"` on its own means *exactly that version* in npm and *`^1.2.0`* in
+Cargo. Rather than pick one and be wrong for half of you, Cordial refuses it and
+the error names both forms. `>=`, `~`, `*` and comma-separated lists are refused
+too — every operator in the language is one you have to understand before you
+can tell what an install will do.
+
+A dependency is installed before the plugin that needs it, and **started**
+before it too. That matters: `events.subscribe` only matches types somebody has
+already declared, so a plugin that subscribes to another's events needs that
+other one running first. It is the same order, from the same graph, on purpose.
+
+Cordial refuses, by name, on a missing dependency, a requirement nothing
+satisfies, a cycle, and two dependents needing incompatible versions of one
+plugin — there is one directory per plugin id, so exactly one version can win.
+
+## Publishing: an archive and an index entry
+
+A distribution archive is a `.tar.zst` of your plugin directory's **contents**,
+with `plugin.json` at its root:
+
+```bash
+tar --zstd -cf flag-inspector-1.0.0.tar.zst -C plugins/flag-inspector .
+sha256sum flag-inspector-1.0.0.tar.zst
+```
+
+An index is one static JSON file listing what is available — see
+[`index.example.json`](index.example.json), whose URLs and hashes are
+deliberately fake. It is meant to be served straight out of a git repository, so
+that what is on offer is a diff somebody can read, anyone who dislikes it can
+fork it, and hosting it costs nothing.
+
+**Who runs an index, and who decides what goes in one, is not settled.** Nothing
+in Cordial names a URL and nothing assumes there is only one. A curated list and
+an index you host yourself are the same file in the same format; where two of
+them publish the same version of the same plugin pointing at different bytes,
+Cordial refuses rather than picking, because picking is the decision nobody has
+made yet.
+
+**Index signing is not implemented.** The intended scheme is a detached minisign
+signature beside the index, checked before the JSON is parsed. Until that
+exists, an index is exactly as trustworthy as wherever you got it. The content
+hash on each entry protects the *download* against a mirror serving different
+bytes; it cannot protect against a tampered index, because a tampered index
+carries a matching hash.
+
+What the index says a plugin requests is checked against the archive when it is
+unpacked. An entry advertising `log` cannot ship a manifest asking for
+`assets.override` — that refuses the install, because the capabilities you
+approved were the ones you were shown.
+
+## Installing does not make a plugin safe
+
+Everything above answers one question: *are these the bytes that were
+published, unpacked without escaping the directory they were meant for?* None of
+it answers whether those bytes deserve your trust. A hash proves provenance, not
+intent.
+
+**The capabilities are still the boundary, and they are still yours to grant.**
+Installing a plugin that depends on another does not grant the other one
+anything: Cordial refuses a plan where any plugin in it — including one that
+arrived only as somebody else's dependency — asks for something you have not
+granted it by name. Being listed in an index is not review, and should not be
+read as any.
 
 ## What a plugin cannot do
 

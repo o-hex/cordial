@@ -309,7 +309,10 @@ mod tests {
     /// Build an index without repeating a url and a hash for every entry. The
     /// hash is derived from the id and version so two entries never collide,
     /// and nothing in this module looks at either field.
-    fn index(entries: &[(&str, &str, &[&str], &[(&str, &str)])]) -> Index {
+    /// id, version, requested capabilities, dependencies.
+    type Published<'a> = (&'a str, &'a str, &'a [&'a str], &'a [(&'a str, &'a str)]);
+
+    fn index(entries: &[Published<'_>]) -> Index {
         let mut plugins = Vec::new();
         for (n, (id, version, caps, deps)) in entries.iter().enumerate() {
             let caps = caps.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",");

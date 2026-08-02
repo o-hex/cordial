@@ -1,6 +1,10 @@
 {
   "id": "flag-inspector",
   "name": "Flag Inspector",
+  "version": "1.0.0",
   "entry": "main.ts",
-  "capabilities": ["flags.read", "log"]
+  "capabilities": [
+    "flags.read",
+    "log"
+  ]
 }

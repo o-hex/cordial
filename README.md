@@ -97,7 +97,7 @@ built cannot.
 If you want an executor, this is the wrong project, and pull requests adding one
 will be declined.
 
-## Status: early. You can sign in and reach the app; the input is wrong.
+## Status: early, but playable. Sign in, load a game, move around.
 
 | | |
 |---|---|
@@ -107,32 +107,43 @@ will be declined.
 | Renders — Vulkan on both backends | ✅ |
 | Networking / HTTPS | ✅ |
 | **Signing in** | ✅ **via Quick Sign-in**, which is a code flow and needs no typing |
-| Typing into text fields | ❌ characters reach the engine correctly and are not drawn until the field loses focus |
+| **Keyboard in an experience** | ✅ WASD, space, the lot |
 | Mouse: navigation, buttons, field focus | ✅ |
-| Mouse: turning the camera in an experience | ❌ |
-| Scroll wheel | ❌ `AXIS_VSCROLL`/`AXIS_HSCROLL` are never populated |
-| Keyboard in an experience | ❌ |
-| Staying signed in across a restart | ✅ cookies and the signed-in identity are restored; `Landing` becomes `Home` |
+| Mouse: turning the camera | ✅ right-drag; every button and a real delta reach the engine |
+| Scroll wheel | ✅ |
+| Frame rate | ✅ a flat 60 on MAILBOX, where FIFO gave a variable 35–50 |
+| Feral GameMode | ✅ registered while the client runs |
+| Typing into text fields | ❌ characters reach the engine and are not drawn until the field loses focus |
+| Pointer capture in first person | ❌ Roblox is never told it may capture, so the cursor walks off the window |
+| Staying signed in across a restart | ✅ cookies and identity kept in the **desktop keyring**, not a file |
 | Loading into an experience | ✅ world, avatar and UI render, signed in |
 | **Two accounts at once** | ✅ two profiles, two instances, side by side — see below |
 | Window — libadwaita header bar, engine as a subsurface | ✅ |
 | Launching from the shell | ✅ finds a build, or explains how to get one |
 | Choosing a profile | ✅ a chooser above the Launch button; creates one, and shows a profile another window holds as unavailable |
-| Audio | ❌ OpenSL ES reports failure honestly; a PipeWire backend exists but nothing reaches it before sign-in |
+| Audio | 🟡 the PipeWire backend is real and compiled at last; no sound observed yet |
 | Web views (Marketplace, Profile, Communities…) | ❌ the surface is mapped; `openNativeOverlay` now reports instead of silently swallowing |
 | Clean shutdown | ✅ full pause/stop/destroy sequence, observed in the engine's own log |
-| Plugins | 🟡 host, capability broker and per-profile settings built; Settings lists what is installed with its grants and an on/off switch; not yet wired to the running client |
+| Plugins | 🟡 host, broker, per-profile grants and settings, an on/off switch, and a registry with hardened unpacking; no marketplace yet |
 
-Measured with `vkQueuePresentKHR`: 547, 548 and 550 presents over 25 s across
-three runs — it renders continuously rather than on demand.
+Frame rate measured with pointer motion driven for the whole run, because
+presents drop to exactly 1/s when nothing is happening and every earlier figure
+in this repository was that idle throttle integrated: a flat 60.0 on MAILBOX
+against a variable 35–50 on FIFO, four runs of 120 s.
 
-**The blocker is playing, not reaching.** You can sign in, stay signed in, and
-load into an experience — the world, your avatar and the game's UI all render.
-What does not work is controlling it: most keys do nothing, the scroll wheel is
-unwired, and Roblox is never told it may capture the pointer, so first-person
-cameras are unusable. Why keys mostly fail is genuinely not yet known; four
-plausible explanations have been measured and disproved, and the instrument that
-would settle it was itself silent when the native is unregistered.
+**What is left is polish and two real gaps.** Text fields take the characters
+and do not draw them until focus leaves, because on Android a transparent
+`EditText` draws a focused box and there is none here. And Roblox is never told
+it may capture the pointer, so in first person the cursor walks off the window —
+the native that says so is exported and has never been called.
+
+**The keyboard took a week and the answer was one number.**
+`nativePassKeyEvent` wants Linux evdev codes; it was being handed Android
+keycodes. Exactly one key worked — `D`, because `AKEYCODE_D` and `KEY_D` are
+both 32 — and Alt made the character jump, because `AKEYCODE_ALT_LEFT` is 57 and
+so is `KEY_SPACE`. Four theories were measured and disproved first, every one of
+them assuming a number was wrong somewhere. The numbers were fine; the
+vocabulary was.
 
 **Two accounts at once, and it was not built as a feature.** A profile is
 storage and an instance is a window ([ADR-012](docs/adr/ADR-012-profiles-and-instances.md)),
@@ -142,14 +153,13 @@ session, settings and plugin grants. On Windows this traditionally needed a
 second desktop session. Each instance is a whole engine, so budget around 1.5 GB
 of memory apiece.
 
-**Do not install this expecting to play Roblox.** Install it if you want to work
-on it.
+**Install it expecting rough edges.** It plays; it is not finished.
 
 ## Install
 
-> Cordial is **not** ready to play Roblox on. You can sign in and load into an
-> experience, but you cannot usefully control it yet — see the status table.
-> Install it if you want to work on it.
+> Cordial is early. You can sign in, load a game and play it with a keyboard and
+> mouse — but text fields do not draw what you type, first person cannot capture
+> the pointer, and there is no sound yet. See the status table.
 
 ### 1. What you need
 

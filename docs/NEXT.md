@@ -185,6 +185,72 @@ screen-locked for the remainder of it). Do the interactive test — click a
 field on either backend, type, screenshot — before trusting this as the fix
 rather than as a well-motivated, resolves-cleanly, unverified-live change.
 
+### Why the text is invisible while you type: Android draws it with a real widget
+
+Established 2026-08-02, and it reframes this whole section. The engine is not
+failing to receive the text and there is no message that makes it render.
+
+**The symptom.** Typing into a focused box shows nothing and draws no caret. On
+blur the full, correct string appears at once.
+
+**What that rules in.** Cordial sends *nothing* at blur — `nativePassText` is off
+by default and `hideKeyboard` only marks the box blurred. So the correct string
+that appears on blur can only have arrived through the per-keystroke
+`syncTextboxTextAndCursorPosition2` calls. The engine held it the whole time and
+withheld the *drawing*, deliberately.
+
+**Why.** On Android the editing-time display is not the engine's job. It belongs
+to a real `android.widget.EditText` laid over the GL surface:
+
+```text
+Lcom/roblox/client/RbxKeyboard; -> Lq/l; -> Landroid/widget/EditText;
+```
+
+Verified from the dex `class_def` superclass chain. `RbxKeyboard` carries
+`getCurrentTextBox()J`/`setCurrentTextBox(J)` — the same handle `showKeyboard`
+passes — plus `i(NativeTextBoxInfo, String)`, `l(NativeTextBoxInfo)`,
+`setManualFocusRelease(Z)`, `onSelectionChanged`, `onKeyPreIme`, `autofill`, an
+inner `TextWatcher` and an `OnEditorActionListener`. In
+`res/layout/activity_game.xml` it is a sibling of the GL surface's container,
+`background=@android:color/transparent`, `visibility=gone`, `match_parent` —
+a transparent editor revealed over the surface on demand.
+
+That is what `NativeTextBoxInfo`'s fields are *for*. `x, y, width, height,
+fontSize, font, textColor, xAlignment, yAlignment, multiline, textWrapped`
+are not IME hints; they are how to style a widget so it looks exactly like the
+Roblox box underneath it. Only `textInputType` and `returnKeyType` configure an
+IME. And the engine pushes text *out* during editing —
+`onLuaTextBoxChangedCallback(String)` and the no-argument
+`onLuaTextBoxPropertyChangedCallback()`, whose only sensible response is to
+re-read that geometry. A "properties changed" callback is only needed if Java is
+displaying the box. **Both are unimplemented in Cordial**
+(`docs/analysis/unresolved-java.md` §2c).
+
+So the shadow buffer was never the problem, and deleting it was never going to
+help: **the missing piece is a widget, not a message.** Cordial has to draw the
+editing text itself, positioned and styled from those 14 fields, which
+`NativeTextBoxInfo::init` (`native/android_classes.cpp:220`) currently accepts
+and discards.
+
+**There is already an instrument for this and nobody was reading it.**
+`FLog::NativeInput` and `FLog::DataModelBindings` are on by default and narrate
+the path in Cordial's own engine log, no `flags.json` needed:
+
+```text
+onTextBoxFocused: 0x7f366c4d0080
+handleTextBoxFocused_AndroidLayer_:
+```
+
+in `~/.local/share/cordial/instances/default/data/files/appData/logs/*_Player_*.log`.
+Note the engine's own name for it: `_AndroidLayer_`.
+
+**Not yet confirmed**, and the one experiment that would settle it: focus a box
+that already contains text and type *nothing*. If the existing text vanishes on
+focus alone, the engine stops drawing focused boxes and the diagnosis holds. If
+it stays, the diagnosis is wrong and the gap is that `sync` never reaches the
+rendered property — chase `onLuaTextBoxChangedCallback` instead. That needs a
+keystroke, which no Wayland-safe automation here can supply.
+
 ### The capture does not cover text entry. Do not grep it for this
 
 Checked exhaustively on 2026-08-02, because the repo's one rule sends everyone

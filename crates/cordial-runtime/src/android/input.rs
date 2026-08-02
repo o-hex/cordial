@@ -238,13 +238,31 @@ pub fn report_keyboard_state(current_geometry: (i32, i32)) {
         }
         *seen = Some(generation);
     }
-    let visible = cordial_linker_sys::game_activity::focused_textbox().is_some();
+    // The dex declares this as `updateKeyboardSize(Z, I, I, I, I)`, and the
+    // real-Android capture pins the argument order and the resting value. Its
+    // Java-side layout callback logs, twice, at surface bring-up:
+    //
+    //     rbx.glview.layout: onUpdateKeyboardSize() v:false x:0 y:999 w:2491 h:0
+    //
+    // So it is (visible, x, y, width, height), and the keyboard-hidden baseline
+    // the real client reports is *not* an empty rectangle: it is visible=false
+    // with the box still pinned to the bottom edge of the UI space, full width,
+    // zero height. Cordial's rectangle was already that shape; only the boolean
+    // was wrong. It used to send `visible=true` with a zero height, which claims
+    // a soft keyboard is on screen and simultaneously that it covers nothing,
+    // and that was measured to bounce focus continuously.
+    //
+    // A desktop genuinely has no soft keyboard, so the resting baseline is the
+    // truthful report here as well as the observed one, and it does not become
+    // less true when a box takes focus. Do not "fix" this by zeroing x/y/w
+    // as well: an all-zero rectangle is a third value nothing has ever been
+    // seen to send. `INFERRED` only in that the capture shows the app's own
+    // Java callback rather than the JNI call it feeds; the shape is observed,
+    // the 1:1 with the native call is not.
     let (w, h) = current_geometry;
-    // Zero height: no soft keyboard occupies the screen here, and a real height
-    // would make the engine shift its layout up to avoid nothing.
-    let r = cordial_linker_sys::game_activity::update_keyboard_size(f, visible, 0, h, w, 0);
+    let r = cordial_linker_sys::game_activity::update_keyboard_size(f, false, 0, h, w, 0);
     if trace_text() {
-        eprintln!("[cordial] updateKeyboardSize(visible={visible}, w={w}, h=0) -> {r:?}");
+        eprintln!("[cordial] updateKeyboardSize(visible=false, x=0, y={h}, w={w}, h=0) -> {r:?}");
     }
 }
 
@@ -365,8 +383,12 @@ fn no_agdk_touch() -> bool {
 ///
 /// It is off rather than deleted because the engine plainly wants *something*
 /// to acknowledge a keyboard; the fault is in the arguments or the moment, not
-/// in the call existing. `CORDIAL_KEYBOARD_REPORT=1` turns it back on for
-/// anyone testing a different shape. See `docs/NEXT.md` §1.
+/// in the call existing. The arguments have since been corrected against the
+/// real-Android capture — see `report_keyboard_state`, which now sends the
+/// baseline that capture actually shows — but it stays off by default because
+/// the corrected form has never been driven through a live typing session, and
+/// the failure it caused took a keystroke to observe. `CORDIAL_KEYBOARD_REPORT=1`
+/// turns it on, which is also the control for testing it. See `docs/NEXT.md` §1.
 fn keyboard_report_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CORDIAL_KEYBOARD_REPORT").is_some())

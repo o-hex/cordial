@@ -42,8 +42,15 @@ pub const APP_ID: &str = "Cordial";
 /// run time and an even poorer place to report it wrongly, so it now reports
 /// nothing about graphics at all; `CORDIAL_COUNT_GL=1` answers the question
 /// the backend suffix was trying to answer, and answers it with counts.
+/// The version is what `git describe` says, not what `Cargo.toml` says — see
+/// `build.rs`. On a tag that is the tag alone; off one it carries the distance
+/// and the hash so a bug report identifies a commit rather than a range of
+/// dozens; and with uncommitted changes it ends in `-dirty`, which is the case
+/// that matters most here. A binary built from a working tree several agents
+/// were editing looked exactly like a committed one, and an afternoon went into
+/// a regression nobody could attribute to a tree.
 pub fn title() -> String {
-    format!("Cordial {}", env!("CARGO_PKG_VERSION"))
+    format!("Cordial {}", env!("CORDIAL_BUILD_VERSION"))
 }
 
 /// How much of a monitor to leave for whatever else is on it.

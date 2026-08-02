@@ -185,6 +185,46 @@ screen-locked for the remainder of it). Do the interactive test — click a
 field on either backend, type, screenshot — before trusting this as the fix
 rather than as a well-motivated, resolves-cleanly, unverified-live change.
 
+### The capture does not cover text entry. Do not grep it for this
+
+Checked exhaustively on 2026-08-02, because the repo's one rule sends everyone
+here first. `docs/traces/` holds one capture — `waydroid-roblox-startup.log.gz`,
+2432 lines — and the session that produced it **never touched a TextBox**. It
+launches `ActivitySplash`, reaches the Lua home screen, and is backgrounded
+without interaction.
+
+Hits across the whole capture, case-insensitive: `syncTextboxTextAndCursorPosition`
+0, `nativePassText` 0, `nativePassKeyEvent` 0, `nativeGetTextBoxInfo` 0,
+`nativeReturnPressed` 0, `NativeTextBoxInfo` 0, `TextBox` 0, `InputConnection` 0,
+`InputMethodManager` 0, `restartInput` 0, `setImeEditorInfoFields` 0,
+`setSoftKeyboardActive` 0. `showKeyboard`'s two hits are both inside the flag
+name `EnableTextInputRestoreOnShowKeyboard`, not a call.
+
+So for text entry the trace is not a lookup, and the rule's protection does not
+apply — which is exactly when this project has historically gone wrong. **The fix
+is another capture, not another theory:** the same `adb logcat` procedure in
+`docs/traces/README.md`, driven into the home screen's search box (reachable
+without a login), typing a few characters and blurring. `rbx.glview.layout`
+already logs at verbosity V, so a keyboard-visible `onUpdateKeyboardSize()` would
+appear the moment the IME opens.
+
+**What the capture does establish**, twice, at surface bring-up (lines 1113 and
+1263, immediately after the `SurfaceView` resize and before `surfaceCreated`):
+
+```text
+rbx.glview.layout: [a.e()-51]: onUpdateKeyboardSize() v:false x:0 y:999 w:2491 h:0
+```
+
+That confirms `updateKeyboardSize(Z,I,I,I,I)` is `(visible, x, y, width, height)`,
+and that the real client's keyboard-hidden baseline is `visible=false` with a
+**real** rectangle — full UI width, zero height, at the bottom. Not an empty one.
+`INFERRED`, and flagged by the agent that found it: that line is the app's own
+Java-side layout callback, and a 1:1 correspondence with the JNI call was not
+established.
+
+The capture never shows `updateKeyboardSize` with `visible=true`, so it cannot
+say what rectangle the engine gets when an IME is actually up.
+
 ## 1a. The Wayland backend was blank — two independent bugs, both fixed
 
 `CORDIAL_WAYLAND=1` produced a window present in the dock and alt-tab, titled

@@ -92,7 +92,7 @@ build, which was not investigated.
 
 ## 4a. The GL stack is confirmed working
 
-`cordial-load --gl-probe` brings up a GLES2 context through the symbol table
+`cordial-run --gl-probe` brings up a GLES2 context through the symbol table
 Roblox will be handed — not by calling `libEGL` directly — clears to a known
 colour and reads the pixel back:
 
@@ -114,7 +114,7 @@ surfaces are a path the engine itself takes.
 
 ## 4b. And into a real window
 
-`cordial-load --window 3` opens an X11 window, creates an EGL surface on it with
+`cordial-run --window 3` opens an X11 window, creates an EGL surface on it with
 `eglCreateWindowSurface`, and renders an animated clear at 60 fps with real
 buffer swaps. `ANativeWindow_*` is implemented over that window — nine of the ten
 entry points, all resolving to the window the engine will actually draw into.

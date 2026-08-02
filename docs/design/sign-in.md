@@ -608,7 +608,7 @@ disassembly-derived conclusions is trying to prevent — the fix was to notice
 the run wasn't testing what it claimed to, not to trust the first "no
 effect" result.
 
-**Control, then bisection**, each a full `cordial-load --run 25` under
+**Control, then bisection**, each a full `cordial-run --run 25` under
 `CORDIAL_MONITOR=1`, reading `[sign-in probe]` from stdout:
 
 | `~/.config/cordial/flags.json` | `nativeIsLuaLoginEnabled()` |

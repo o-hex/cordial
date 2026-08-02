@@ -53,7 +53,7 @@ client *args:
     set -euo pipefail
     set -- {{ args }}
     apk="" lib="" run="600" extra=()
-    # `--apk` and `--lib-dir` are spelled the way cordial-load spells them: this
+    # `--apk` and `--lib-dir` are spelled the way cordial-run spells them: this
     # recipe exists to stop people assembling that command by hand, not to teach
     # a second vocabulary for it. Anything unrecognised passes straight through,
     # so --dump-classes and friends still work.
@@ -109,7 +109,7 @@ client *args:
     # A long default timer on purpose: a run that ends on its own while somebody
     # is still reading the screen looks exactly like a crash, and that has
     # already cost one debugging session here.
-    exec ./target/release/cordial-load \
+    exec ./target/release/cordial-run \
         --lib-dir "$lib" --apk "$apk" \
         --host-libc --game-activity --run "$run" ${extra+"${extra[@]}"}
 

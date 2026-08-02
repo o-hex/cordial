@@ -138,7 +138,7 @@ Both must pass. Run them; do not assume.
 Running the client needs an APK the user supplies — Cordial ships none:
 
 ```bash
-cargo run --release --bin cordial-load -- \
+cargo run --release --bin cordial-run -- \
   --lib-dir /path/to/lib/x86_64 --apk /path/to/base.apk \
   --host-libc --game-activity --run 30
 ```

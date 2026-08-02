@@ -6,12 +6,19 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "cordial-load"
+name = "cordial-run"
 path = "src/bin/load.rs"
 
 [dependencies]
 cordial-linker-sys = { path = "../cordial-linker-sys" }
 cordial-plugins = { path = "../cordial-plugins" }
+# The window. ADR-011 makes it GTK4/libadwaita and says of the shell's window
+# and the engine's host window that they "are the same window"; the engine's
+# `wl_surface` is a subsurface of the one `cordial_shell::host_window` builds,
+# and a Wayland subsurface must share a connection — and therefore a process —
+# with its parent. ADR-002 already accepted core taking a GTK dependency; this
+# is where the runtime takes it too.
+cordial-shell = { path = "../cordial-shell" }
 ureq = "3.3.0"
 # The client-settings document is JSON and user flag overrides have to be merged
 # into it correctly. A textual splice on a 1.2 MB document is not correctness.

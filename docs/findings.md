@@ -264,7 +264,7 @@ Stated plainly, so nothing here reads as more settled than it is.
 
 ## 8. Phase 1 progress — the engine loads
 
-`cordial-load` maps Roblox's `libroblox.so` with the AOSP bionic linker, resolves
+`cordial-run` maps Roblox's `libroblox.so` with the AOSP bionic linker, resolves
 every relocation, and runs all of its static constructors to completion in ~35 ms.
 105.6 MB of code, `JNI_OnLoad` resolved, **zero stubs called**, exit 0.
 
@@ -301,7 +301,7 @@ silent abort costs more time than the wrapper costs anything.
 
 ### 8.2 JNI_OnLoad — reached, and it marks the Phase 2 boundary
 
-With `libjnivm` standing up a `JavaVM`, `cordial-load --jni-onload` calls Roblox's
+With `libjnivm` standing up a `JavaVM`, `cordial-run --jni-onload` calls Roblox's
 `JNI_OnLoad`. It does not return. Two worker threads — neither the calling thread —
 immediately call back through the JNI invocation interface with a **null**
 `JavaVM`, and libjnivm throws.

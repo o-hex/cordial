@@ -175,7 +175,7 @@ cargo build --release
 ### 3. Run it
 
 ```bash
-cargo run --release --bin cordial-load -- \
+cargo run --release --bin cordial-run -- \
   --lib-dir /path/to/lib/x86_64 --apk /path/to/base.apk \
   --host-libc --game-activity --run 30
 ```
@@ -196,12 +196,12 @@ page at about 27 fps. `--run` is how many seconds to stay up.
 | `CORDIAL_COUNT_GL=1` | report graphics calls on exit |
 
 ```bash
-CORDIAL_MONITOR=1 CORDIAL_FULLSCREEN=1 cargo run --release --bin cordial-load -- \
+CORDIAL_MONITOR=1 CORDIAL_FULLSCREEN=1 cargo run --release --bin cordial-run -- \
   --lib-dir /path/to/lib/x86_64 --apk /path/to/base.apk \
   --host-libc --game-activity --run 30
 ```
 
-`cordial-load --help` lists the rest.
+`cordial-run --help` lists the rest.
 
 ### Changing FastFlags
 
@@ -257,7 +257,7 @@ which is what Roblox treats as a cheap handset:
 
 ```bash
 CORDIAL_MONITOR=1 CORDIAL_RESOLUTION=1920x1200 CORDIAL_DPI_SCALE=1.75 \
-cargo run --release --bin cordial-load -- \
+cargo run --release --bin cordial-run -- \
   --lib-dir /path/to/lib/x86_64 --apk /path/to/base.apk \
   --host-libc --game-activity --run 30
 ```

@@ -30,6 +30,7 @@ use crate::launch;
 use crate::profile_switcher;
 use crate::settings;
 use crate::shell_config::ShellConfig;
+use crate::updater;
 use cordial_shell::host_window::HostWindow;
 use cordial_shell::profile;
 
@@ -134,6 +135,14 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     // what makes the window keep `app` alive and quit with it.
     window.set_application(Some(app));
 
+    // Immediately left of Settings, which is what packing it second at the end
+    // produces, and always present. A control that comes and goes is hard to
+    // find at the moment you want it and moves everything beside it when it
+    // arrives — and this one answers "which Roblox build am I on", which is
+    // worth a button whether or not anything newer exists.
+    let update_button = updater::header_button(&window, config.clone(), config_path.clone());
+    host.header().pack_end(&update_button);
+
     let flags_path = Rc::new(flags_file::user_flags_path());
 
     // An action rather than only a button handler, because the header bar is no
@@ -178,6 +187,41 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     GtkWindowExt::set_focus(&window, Some(&chooser_widget));
 
     window.present();
+    open_on_start(&window, &update_button);
+}
+
+/// `CORDIAL_SHELL_PRESENT=settings,update` opens those windows at startup.
+///
+/// A test seam, and it exists because there is no other way to photograph these
+/// windows. AGENTS.md forbids synthesising input at the compositor — it lands on
+/// whatever has focus, which is the developer's session, and it has hijacked a
+/// cursor here once — and Wayland has no window-targeted injection to fall back
+/// on, so "click Settings and take a screenshot" is not an available sentence.
+/// Asking the shell to open its own window is, and it goes through exactly the
+/// same action and the same button handler a click does rather than a second
+/// construction path that could differ from the real one.
+///
+/// Same shape as `CORDIAL_SHELL_RUN_SECONDS` above: an environment variable that
+/// nothing sets in normal use, doing something a person could do by hand.
+fn open_on_start(window: &adw::Window, update_button: &gtk::Button) {
+    let Some(want) = std::env::var("CORDIAL_SHELL_PRESENT").ok().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let window = window.clone();
+    let update_button = update_button.clone();
+    // After a beat, so the main window is mapped and photographable underneath
+    // whatever this opens on top of it.
+    glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+        for one in want.split(',').map(str::trim) {
+            match one {
+                "settings" => {
+                    let _ = window.activate_action("win.settings", None);
+                }
+                "update" => update_button.emit_clicked(),
+                other => println!("  shell: CORDIAL_SHELL_PRESENT does not know {other:?}"),
+            }
+        }
+    });
 }
 
 /// The whole of what pressing Roblox does.

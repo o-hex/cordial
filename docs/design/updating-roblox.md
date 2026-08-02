@@ -1,9 +1,15 @@
 # Updating the Roblox build
 
-**Status:** implemented in `crates/cordial-update`, except the header-bar button
-and the two dropdowns, which are still to be built in the shell. The decision it
-was waiting on is [ADR-015](../adr/ADR-015-fetching-the-roblox-build.md), and it
-is accepted.
+**Status:** implemented. `crates/cordial-update` is the logic and
+`crates/cordial-shell/src/updater.rs` is the header-bar button and the settings,
+built 2026-08-03. The decision it was waiting on is
+[ADR-015](../adr/ADR-015-fetching-the-roblox-build.md), and it is accepted.
+
+**The settings are one dropdown and two switches, not two dropdowns.** This
+document argued for two dropdowns and the argument is kept below, along with
+what happened to it: the owner specified the other shape, twice, and the
+contradiction that argument warned about is now something the settings page says
+out loud rather than something the types forbid.
 
 **Three things in this design turned out not to be true when the code was
 pointed at Roblox**, and all three are corrected in place below rather than left
@@ -29,46 +35,97 @@ A single button in the shell's header bar, immediately left of Settings. It is
 
 | state | icon | what clicking it does |
 |---|---|---|
-| up to date | download | the current version, its changelog, and that there is nothing newer |
+| nothing newer known | download | which build is installed, its changelog, and what is and is not knowable about whether it is current |
 | update available | download, with attention styling | the new version's changelog, and an **Update** button |
-| checking disabled | refresh (circular arrow) | checks once, now; if that finds an update the button becomes the row above |
+| manual, nothing checked yet | refresh (circular arrow) | checks once, now; if that finds an update the button becomes the row above |
+
+**All three are built, and the middle one is harder to reach than it reads.**
+"Update available" is a comparison, and Cordial has only one of its two operands
+for most people: the newest engine major comes from the release notes, which
+work, and the installed version comes from `cache::recorded_version`, which is
+`None` unless Cordial fetched the build itself. So the ordinary state is the
+first row, and its dialog says *whether this build is current cannot be
+established* rather than "up to date" — the endpoint that would settle it
+answers 500, and rounding that to "you are current" is the exact failure this
+document exists to prevent.
+
+The download icon is `system-software-install-symbolic` rather than
+`software-update-available-symbolic`. The second is the icon that *means* an
+update is waiting, and wearing it in all three states would be the attention
+styling drawn instead of written.
 
 **Always present, rather than appearing when an update exists.** A control that
 comes and goes is hard to find at the moment you want it, and it moves
 everything beside it when it arrives. The cost of keeping it is one icon; the
 cost of hiding it is that nobody can answer "what version am I on" without
 finding a menu. Showing the current version and its changelog is useful on its
-own, which is why the up-to-date state is not a dead end.
+own, which is why the first state is not a dead end.
 
-The disabled state deliberately still offers a manual check. Turning off
-automatic checking is a statement about background network use, not a refusal to
-ever know.
+The *Manual* state deliberately still offers a check — opening the window is one.
+Turning off automatic checking is a statement about background network use, not a
+refusal to ever know.
 
 ## Settings
 
-**Automatic updates** — one dropdown:
+**Auto update** — one dropdown:
 
-- *Download in the background* — fetch when one appears, subject to the network
-  setting below.
-- *Ask first* — check, then raise the button's attention state and wait.
-- *Never check* — no background request of any kind. The header-bar button
-  becomes the manual refresh described above.
+- *Update in background* — check, and fetch what it finds, subject to the two
+  switches below.
+- *Ask* — check, and when Cordial starts with an update waiting, **open the
+  changelog with an Update button on it**. A dialog rather than a badge: the
+  point of asking is that somebody is asked, and a quiet state change is what the
+  other two modes already leave behind.
+- *Manual* — no request of any kind until the header-bar button is pressed, at
+  which point it checks once.
 
-**Download over** — one dropdown:
+**Download on Wi-Fi** and **Download on metered connection** — one switch each.
+Wi-Fi on and metered off is the default.
 
-- *Any connection*
-- *Unmetered connections only* (default)
+### Why the third option is called Manual
 
-Two dropdowns rather than a mode plus two independent toggles. Three controls
-that can each be set independently produce combinations with no defined meaning
-— "update in the background, but never download" is a setting that has to either
-lie or explain itself, and a settings page that can express a contradiction will
-eventually be asked to honour one.
+Not *Disabled*, and the word is the setting's meaning. It turns off every
+automatic behaviour — no background check, no dialog on launch, no download —
+and it does not turn the feature off, because the button still checks on demand.
+This document already says why in its own words: turning off automatic checking
+is a statement about background network use, not a refusal to ever know.
+*Disabled* contradicts that sentence; *Manual* states it.
 
-`cordial_update::settings` is the pair, with no GTK in it: two enums, and one
-total function from a settings pair and a connection to what should happen.
-`every_setting_pair_has_exactly_one_plan` is the test that would have to be told
-what a third control meant.
+### The two-dropdown argument, and what happened to it
+
+This section used to specify a second dropdown — *Download over: any connection
+/ unmetered connections only* — and argued for it like this, which is kept
+because it was not wrong:
+
+> Two dropdowns rather than a mode plus two independent toggles. Three controls
+> that can each be set independently produce combinations with no defined meaning
+> — "update in the background, but never download" is a setting that has to
+> either lie or explain itself, and a settings page that can express a
+> contradiction will eventually be asked to honour one.
+
+**The owner specified the dropdown-plus-two-switches shape, twice, and it is
+their call.** The contradiction is real and reachable: both switches off with
+*Update in background* selected can never download anything. What the argument
+above was actually objecting to is a page that expresses a contradiction
+*silently*, so the contradiction is named instead —
+`cordial_update::settings::NEVER_DOWNLOADS` is the sentence, the settings page
+shows it as a warning row that appears exactly when both switches are off, and
+`may_download` gives the same words back when a download is held.
+
+`UpdateSettings::plan` is still total, which is the property the two-dropdown
+shape was chosen for: every combination of the three controls and each of
+NetworkManager's four answers maps to exactly one `Plan`, and
+`every_setting_combination_has_exactly_one_plan` is the test that would have to
+be told what a fourth control meant.
+
+### Wi-Fi is not something Cordial can see
+
+There is no radio in any of this. NetworkManager's `Metered` property is the only
+question asked, and it is about who pays for the bytes rather than about the link
+layer. *Download on Wi-Fi* therefore governs every connection that is not
+metered, a wired desktop included, and *Download on metered connection* governs
+the rest; between them they cover everything, which is what makes "both off" mean
+"never". The switch's own row carries that sentence, because the alternative is
+somebody unplugging an ethernet cable to find out.
 
 ## Metered connections
 
@@ -91,12 +148,15 @@ u 4
 ```
 
 Four is `GUESS_NO`. So on that machine — a perfectly ordinary one, nothing
-unusual about its connection — the default pair of settings does **not**
-background-download. It checks, finds an update, and waits to be asked, saying
-which of the four answers it got. That is the rule doing exactly what it says
-and it is the safe direction, but anyone who reads "unmetered connections only"
-as "on by default for most people" will be wrong, and the header-bar button has
-to make the waiting state legible rather than looking like nothing happened.
+unusual about its connection — the default settings do **not**
+background-download. A guess is metered, so it is *Download on metered
+connection* that governs an ordinary LAN, and that switch is off by default. It
+checks, and waits to be asked, saying which of the four answers it got. That is
+the rule doing exactly what it says and it is the safe direction, but anyone who
+reads "Download on Wi-Fi, on" as "downloads for most people" will be wrong. The
+dialog's connection row is where that is made legible: it prints
+`Metered::describe` and then names which of the two switches is the one
+governing this connection.
 
 Whether `NO` is a high enough bar is a fair thing to argue about — the
 alternative is treating `GUESS_NO` as unmetered and `GUESS_YES` as metered,
@@ -314,15 +374,35 @@ an ADR that says plainly what this does and does not do: fetches at the user's
 request, verifies what it got, never modifies it, never serves it to anyone
 else. So the answer exists before the question is asked.
 
-## What is still to build
+## What the shell half turned out to be
 
-The shell half, which is deliberately not in this crate: the header-bar button
-with its three states, and the two `AdwComboRow`s.
-`cordial_update::settings::{Automatic, DownloadOver}` expose `index`/`from_index`
-for exactly that binding, the same seam `shell_config::AppearanceScheme` already
-uses.
+`crates/cordial-shell/src/updater.rs`. The button, its three states, the dialog
+behind it, and the settings group on the Roblox page.
+`cordial_update::settings::Automatic` exposes `index`/`from_index` for the
+dropdown, the same seam `shell_config::AppearanceScheme` already uses; the two
+switches are plain booleans on `ShellConfig` and `updater::update_settings` puts
+all three back together for `UpdateSettings::plan`.
 
-And the check has to run **after the window is up**, on a thread of its own. That
-is the one part of this design that is a hard requirement rather than a
-preference, and it is the easiest to get wrong by calling `version::check` from
-`activate` because it is one line.
+The check runs **after the window is up**, on a thread of its own, and that is
+the one part of this design that is a hard requirement rather than a preference.
+It is a `std::thread::spawn` whose answer is collected by a `glib` timeout
+polling an `mpsc` receiver: a GTK widget is not `Send`, so the answer has to be
+picked up on the thread that owns the widgets whatever carries it, and this crate
+gains no async runtime for one request.
+
+Three things the shell half added that this document had not anticipated:
+
+**The Update button has to be honest, and there is nothing for it to do.** It
+appears only in the update-available state, and what it opens says where the
+build comes from — Google Play, the Amazon Appstore — and offers the file picker.
+It never implies a fetch, because there is none to perform.
+
+**Opening the window is itself a check**, in every mode. That is what makes the
+refresh icon in *Manual* do what it draws, and it means there is no "not checked"
+state inside the dialog: that state lives on the button.
+
+**`CORDIAL_SHELL_PRESENT=settings,update` opens those windows at startup.** A
+test seam, and it exists because AGENTS.md forbids synthesising input at the
+compositor and Wayland has no window-targeted injection, so "click the button and
+photograph the result" is not an available sentence. It goes through the same
+action and the same button handler a click does.

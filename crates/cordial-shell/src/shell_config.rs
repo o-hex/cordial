@@ -188,6 +188,22 @@ pub struct ShellConfig {
     /// population this default hurts. `false` here becomes `CORDIAL_GAMEMODE=0`
     /// on the client, which is also the control for measuring what it does.
     pub gamemode: bool,
+    /// What Cordial does about a new Roblox build without being asked, and over
+    /// which connections it may fetch one.
+    ///
+    /// Two fields rather than one `UpdateSettings`, because they are two rows in
+    /// two places: the dropdown and the pair of switches sit in the same group
+    /// but nothing else in this file nests, and a settings document is read by
+    /// people as often as by serde. `updater::update_settings` puts them back
+    /// together for `cordial_update::settings::UpdateSettings::plan`, which is
+    /// the only thing that wants them as a pair.
+    ///
+    /// Neither governs anything today and the settings page says so: Roblox
+    /// publishes no Android build to download, so there is nothing for the plan
+    /// to act on. They are stored anyway, because the choice is the user's to
+    /// make before the day it matters rather than after it.
+    pub automatic_updates: cordial_update::settings::Automatic,
+    pub download_on: cordial_update::settings::DownloadOn,
     /// Show MangoHUD's frame rate and frame time overlay over the client.
     ///
     /// Default off, unlike `gamemode`, and for a reason that is not timidity:
@@ -205,6 +221,8 @@ impl Default for ShellConfig {
             appearance: AppearanceScheme::default(),
             roblox: crate::install::RobloxInstall::default(),
             profile: DEFAULT_PROFILE.to_string(),
+            automatic_updates: cordial_update::settings::Automatic::default(),
+            download_on: cordial_update::settings::DownloadOn::default(),
             gamemode: true,
             mangohud: false,
         }
@@ -297,6 +315,42 @@ mod tests {
         // applies to them: everybody's shell.json predates them.
         assert!(config.gamemode, "an older config must still get GameMode's default");
         assert!(!config.mangohud);
+    }
+
+    #[test]
+    fn the_update_settings_round_trip() {
+        // Same shape as `a_saved_choice_round_trips`, for the same reason: a
+        // control that accepts a choice and does not keep it is worse than one
+        // that refuses, because the user finds out a launch later.
+        use cordial_update::settings::{Automatic, DownloadOn};
+        let p = scratch("updates.json");
+        save(
+            &p,
+            &ShellConfig {
+                automatic_updates: Automatic::Manual,
+                download_on: DownloadOn { wifi: false, metered: true },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let back = load(&p);
+        assert_eq!(back.automatic_updates, Automatic::Manual);
+        assert!(!back.download_on.wifi);
+        assert!(back.download_on.metered);
+    }
+
+    #[test]
+    fn a_config_written_before_the_update_settings_existed_gets_their_defaults() {
+        // Everybody's shell.json predates these three controls, and a launcher
+        // that refuses to start over a field it has just invented is a worse
+        // failure than any it exists to report.
+        use cordial_update::settings::Automatic;
+        let p = scratch("pre-updates.json");
+        std::fs::write(&p, r#"{"appearance":"dark","profile":"default"}"#).unwrap();
+        let config = load(&p);
+        assert_eq!(config.automatic_updates, Automatic::Background);
+        assert!(config.download_on.wifi);
+        assert!(!config.download_on.metered, "a data allowance is not the default to spend");
     }
 
     #[test]

@@ -88,8 +88,10 @@ mode this project keeps writing down.
 - **Never redistributes.** No mirror, no cache anyone else can read, no
   re-upload, no torrent, no "here is a copy" in an issue.
 - **Never fetches unasked in the sense that matters.** Checking is a version
-  query; downloading is governed by settings the user sets, defaulting to
-  unmetered connections only.
+  query; downloading is governed by settings the user sets — *Auto update*, and
+  a switch each for Wi-Fi and metered connections, with the metered one off by
+  default. Both of NetworkManager's guesses count as metered, so an ordinary
+  desktop takes the metered switch's branch and waits to be asked.
 - **Never pretends to be the official client.** Cordial identifies itself as
   Cordial and reports the platform truthfully (`Linux`, which is the engine's
   own vocabulary).

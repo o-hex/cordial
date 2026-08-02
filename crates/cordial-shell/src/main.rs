@@ -24,6 +24,7 @@ mod launch;
 mod profile_switcher;
 mod settings;
 mod shell_config;
+mod updater;
 mod window;
 
 use libadwaita::prelude::*;

@@ -272,6 +272,12 @@ fn build_roblox_page(
     group.add(&lib_row);
     page.add(&group);
 
+    // On this page rather than a page of its own: what they govern is the build
+    // the two rows above point at, and a settings window that answers "where is
+    // Roblox" in one tab and "when does Roblox change" in another makes somebody
+    // find both to understand either.
+    page.add(&crate::updater::build_update_group(config.clone(), config_path.clone()));
+
     // The profile used to be a third row here, a text entry, and it is
     // deliberately not replaced by anything. It lives in the header bar now —
     // see `profile_switcher.rs` — because choosing one is a thing done on the
@@ -285,7 +291,7 @@ fn build_roblox_page(
 ///
 /// `GtkFileDialog` rather than `GtkFileChooserNative`: the latter is deprecated
 /// as of GTK 4.10, which is this project's floor anyway.
-fn choose_file(
+pub(crate) fn choose_file(
     parent: &gtk::Window,
     title: &str,
     directory: bool,

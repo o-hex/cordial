@@ -387,7 +387,29 @@ impl HostWindow {
         self.window.queue_draw();
     }
 
-    /// TEMPORARY INSTRUMENTATION -- not for commit.
+    /// Fullscreen the window from code, so the configure path can be exercised
+    /// without a click.
+    ///
+    /// **This said "TEMPORARY INSTRUMENTATION -- not for commit" for several
+    /// releases while being committed**, on the one window definition ADR-011
+    /// makes shared between the shell and the runtime. It is not temporary, and
+    /// a doc comment lying about its own status costs more than no comment: the
+    /// next person to read it either deletes something load-bearing or learns
+    /// to disregard the markers that do mean it.
+    ///
+    /// Why it cannot be replaced by clicking the real control. Fullscreening is
+    /// how `dispatch_configure` and the swapchain recreate behind it get
+    /// exercised, and a test cannot press Cordial's own fullscreen button:
+    /// every compositor-level injection route — `XTestFake*`, `ydotool`,
+    /// `wlr-virtual-keyboard`, the RemoteDesktop portal — lands on whatever has
+    /// focus, which is the developer's session, and has already hijacked their
+    /// cursor once mid-session. ADR-011 is Wayland, which has no
+    /// window-targeted injection to fall back on. Asking GTK directly is what
+    /// remains.
+    ///
+    /// Reached through `android::wayland::instr_set_fullscreen`, from
+    /// `looper::pump`'s `CORDIAL_SCRIPT` timeline and from the probes under
+    /// `crates/cordial-runtime/examples`.
     pub fn set_fullscreen(&self, on: bool) {
         if on {
             self.window.fullscreen();

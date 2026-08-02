@@ -307,40 +307,8 @@ fn profile_busy(
     name: &str,
     holder: Option<profile::Holder>,
 ) {
-    // One profile opens in one client at a time, and the reason is the same in
-    // every branch below, so it is written once.
-    const WHY: &str = "A profile opens in one client at a time. Roblox keeps its session and \
-                       its storage in there, and two clients writing to it at once corrupts \
-                       both.";
-
     let ours = holder.as_ref().filter(|h| h.is_cordial()).cloned();
-    let body = match (&holder, &ours) {
-        (_, Some(h)) => {
-            let started = h
-                .running_for_text()
-                .map(|t| format!(", running for {t}"))
-                .unwrap_or_default();
-            format!(
-                "Cordial is already running on this profile as process {}{started}.\n\n{WHY}\n\n\
-                 If you cannot find a Cordial window anywhere, that is expected rather than \
-                 strange. Closing the Roblox window does not end the client yet, so one left \
-                 over from an earlier session keeps running — and keeps this profile — until \
-                 its own timer runs out. Closing it here is safe.",
-                h.pid
-            )
-        }
-        (Some(h), None) => format!(
-            "Process {} has this profile's lock file open, and it is not a Cordial client:\n\n\
-             {}\n\n{WHY}\n\nCordial will not close a process it did not start. Close it \
-             yourself, or launch against a different profile.",
-            h.pid, h.command
-        ),
-        (None, None) => format!(
-            "{WHY}\n\nCordial could not tell which process is holding it. That usually means \
-             the other client belongs to a different user account, or is running inside a \
-             container this one cannot see into. Launch against a different profile."
-        ),
-    };
+    let body = busy_body(holder.as_ref());
 
     let dialog = adw::MessageDialog::builder()
         .transient_for(parent)
@@ -377,6 +345,46 @@ fn profile_busy(
         _ => {}
     });
     dialog.present();
+}
+
+/// What the refusal says, given who is holding the profile.
+///
+/// Pulled out of the dialog and made pure so the wording can be pinned by
+/// tests. These three paragraphs are the entire recovery path for somebody who
+/// cannot find a window to close, and the previous version of this text was
+/// wrong in a way nobody noticed for months — a widget that has to be built and
+/// clicked to inspect is a widget whose text drifts.
+fn busy_body(holder: Option<&profile::Holder>) -> String {
+    // The reason is the same in every branch, so it is written once.
+    const WHY: &str = "A profile opens in one client at a time. Roblox keeps its session and \
+                       its storage in there, and two clients writing to it at once corrupts \
+                       both.";
+
+    match holder {
+        Some(h) if h.is_cordial() => {
+            let started =
+                h.running_for_text().map(|t| format!(", running for {t}")).unwrap_or_default();
+            format!(
+                "Cordial is already running on this profile as process {}{started}.\n\n{WHY}\n\n\
+                 If you cannot find a Cordial window anywhere, that is expected rather than \
+                 strange. Closing the Roblox window does not end the client yet, so one left \
+                 over from an earlier session keeps running — and keeps this profile — until \
+                 its own timer runs out. Closing it here is safe.",
+                h.pid
+            )
+        }
+        Some(h) => format!(
+            "Process {} has this profile's lock file open, and it is not a Cordial client:\n\n\
+             {}\n\n{WHY}\n\nCordial will not close a process it did not start. Close it \
+             yourself, or launch against a different profile.",
+            h.pid, h.command
+        ),
+        None => format!(
+            "{WHY}\n\nCordial could not tell which process is holding it. That usually means \
+             the other client belongs to a different user account, or is running inside a \
+             container this one cannot see into. Launch against a different profile."
+        ),
+    }
 }
 
 /// Stop the client holding a profile, then launch once it is actually gone.
@@ -443,4 +451,53 @@ pub fn alert(parent: &gtk::Window, heading: &str, body: &str) {
         .build();
     dialog.add_response("ok", "Close");
     dialog.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn holder(command: &str) -> profile::Holder {
+        profile::Holder {
+            pid: 649889,
+            command: command.into(),
+            running_for: Some(Duration::from_secs(31 * 60)),
+        }
+    }
+
+    #[test]
+    fn the_no_window_case_is_explained_rather_than_left_a_mystery() {
+        // The sentence this pins is the whole point of the dialog. Somebody
+        // hunting for a Cordial window that does not exist needs to be told
+        // that is expected, and told which process to close instead -- the old
+        // text sent them looking for a window and had nothing else to offer.
+        let body = busy_body(Some(&holder("/app/bin/cordial-run --profile default")));
+        assert!(body.contains("process 649889"), "{body}");
+        assert!(body.contains("running for 31 minutes"), "{body}");
+        assert!(body.contains("cannot find a Cordial window"), "{body}");
+        assert!(!body.contains("close the window that already has it"), "{body}");
+    }
+
+    #[test]
+    fn a_stranger_holding_the_lock_is_named_but_not_offered_up_for_killing() {
+        // is_cordial gates the "Close It and Launch" response, so the body for
+        // a process Cordial did not start must not imply it can be closed from
+        // here. It says what has the file open and stops.
+        let body = busy_body(Some(&holder("/usr/bin/grep -r something")));
+        assert!(body.contains("not a Cordial client"), "{body}");
+        assert!(body.contains("/usr/bin/grep"), "{body}");
+        assert!(body.contains("will not close a process it did not start"), "{body}");
+    }
+
+    #[test]
+    fn an_unidentifiable_holder_says_so_instead_of_inventing_one() {
+        // `holder_of` returns None for "could not tell", never for "nobody
+        // holds it" -- the flock already proved somebody does. The body has to
+        // preserve that distinction or it becomes a message claiming the
+        // profile is both taken and free.
+        let body = busy_body(None);
+        assert!(body.contains("could not tell which process"), "{body}");
+        assert!(!body.contains("process 649889"), "{body}");
+    }
 }

@@ -11,6 +11,12 @@
 //! glibc disagree on `struct stat`, `pthread_mutex_t`, `DIR`, `FILE` and
 //! `sigset_t`, so passthrough would silently corrupt rather than work. Closing
 //! that gap is what a bionic shim is for; see docs/base-evaluation.md §4.
+//!
+//! That is a default for the *library*, not a verdict on every symbol in it. An
+//! individual entry point whose arguments are laid out identically in both
+//! libcs can be answered from the host safely, and five of them are: see
+//! `bionic::pthread`'s `once` for the ABI comparison that has to be done, per
+//! symbol and measured, before adding a sixth.
 
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_void, CString};
@@ -391,5 +397,34 @@ mod tests {
     fn plain_libc_is_generic() {
         assert!(matches!(classify("memcpy"), Class::Generic));
         assert!(matches!(classify("pthread_create"), Class::Generic));
+    }
+
+    /// `pthread_once` and thread-specific data must resolve without
+    /// `--host-libc`, which is the whole point of implementing them: as stubs
+    /// they returned a success the caller could not survive, and the run died
+    /// with a SIGSEGV bearing no relation to the call. `build(false)` is the
+    /// bare `--lib-dir` configuration.
+    #[test]
+    fn thread_local_storage_resolves_without_host_libc() {
+        let table = build(false);
+        let libc = table.libraries.get("libc.so").expect("libc.so registered");
+        for symbol in [
+            "pthread_once",
+            "pthread_key_create",
+            "pthread_key_delete",
+            "pthread_getspecific",
+            "pthread_setspecific",
+        ] {
+            let entry = libc
+                .iter()
+                .find(|e| e.symbol == symbol)
+                .unwrap_or_else(|| panic!("{symbol} is not in the table at all"));
+            assert_eq!(
+                entry.source,
+                Source::Cordial,
+                "{symbol} fell back to a {} — a stub for it returns a lie",
+                entry.source.label()
+            );
+        }
     }
 }

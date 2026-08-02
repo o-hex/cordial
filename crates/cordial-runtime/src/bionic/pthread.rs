@@ -1,32 +1,50 @@
-//! bionic synchronisation primitives whose layout differs from glibc's.
+//! bionic's pthread surface, answered here rather than by a host library or a
+//! stub.
 //!
-//! Most of bionic's pthread types happen to match glibc on x86-64 and can be
-//! passed straight through:
+//! Two opposite reasons to be in this file. A type whose layout differs between
+//! the libcs is *wrapped*: the bionic-sized object becomes a handle and the real
+//! glibc object lives on the heap behind it. A type that is laid out the same is
+//! *forwarded* straight to the host — those entry points are here only because
+//! the alternative was a generated stub, and for `pthread_once` and
+//! thread-specific data a stub is fatal.
+//!
+//! Sizes in bytes, measured rather than read off. One probe translation unit
+//! declaring `char sz_x[sizeof(x)];` per type, compiled twice and the symbol
+//! sizes read back with `nm -S`: once against this tree's
+//! `third_party/mcpelauncher-linker/bionic/libc/include` at
+//! `-target x86_64-linux-android -D__ANDROID_API__=33`, once against the host's
+//! glibc (2.43 when this was written).
 //!
 //! | type                  | bionic | glibc | |
 //! |-----------------------|-------:|------:|-|
 //! | `pthread_mutex_t`     |     40 |    40 | passthrough |
 //! | `pthread_rwlock_t`    |     56 |    56 | passthrough |
 //! | `pthread_attr_t`      |     56 |    56 | passthrough — layouts differ, but Roblox only ever hands the struct back to us |
-//! | `pthread_once_t`      |      4 |     4 | passthrough |
-//! | `pthread_key_t`       |      4 |     4 | passthrough |
-//! | **`pthread_cond_t`**  | **32** |**48** | **wrapped** |
+//! | `pthread_once_t`      |      4 |     4 | forwarded |
+//! | `pthread_key_t`       |      4 |     4 | forwarded |
+//! | `pthread_cond_t`      |     48 |    48 | wrapped, on a size that was wrong — see below |
 //! | **`sem_t`**           | **16** |**32** | **wrapped** |
 //!
-//! The two mismatches are not cosmetic. `pthread_cond_init` on a bionic-sized
-//! condition variable writes 16 bytes past the end of the object, and Roblox
-//! initialises condition variables during static construction — so the damage
-//! lands early, in whatever happens to be adjacent, and surfaces much later as
-//! an allocator aborting on a corrupted size. That is exactly the failure this
-//! module exists to prevent.
+//! `sem_t` is a real mismatch: glibc's `sem_init` writes 32 bytes into a
+//! 16-byte object, so the 16 bytes after it belong to whatever was adjacent.
+//! The wrapper is what stops that.
 //!
-//! The technique is the usual one: treat the bionic-sized object as a handle,
-//! and keep the real glibc object on the heap behind a pointer stored inside it.
-//! Initialisation is lazy because bionic's `PTHREAD_COND_INITIALIZER` is all
-//! zeroes, so a statically-initialised condition variable can reach `wait`
-//! without `init` ever being called.
+//! **The `pthread_cond_t` row used to read 32 against 48, and it was wrong.**
+//! 32 bytes is `pthread_barrier_t`, which is `int64_t __private[4]`;
+//! `pthread_cond_t` is `int32_t __private[12]`, a few declarations further down
+//! the same header, and comes to 48 on LP64 — the same as glibc's. The commit that
+//! introduced this module recorded the overrun as one of three ABI divergences
+//! found, and the measurement above says there was no overrun to find. The
+//! wrapper stays for now: it is harmless either way, since it uses only the
+//! first 16 bytes of the caller's object as a handle, and taking it out changes
+//! what runs at every `pthread_cond_wait` in the engine — a behaviour change
+//! that wants its own measurement rather than a free ride on this one.
+//!
+//! Initialisation of a wrapper is lazy because bionic's
+//! `PTHREAD_COND_INITIALIZER` is all zeroes, so a statically-initialised
+//! condition variable can reach `wait` without `init` ever being called.
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Marks a wrapper whose backing object exists. Arbitrary, but distinctive in a
@@ -36,7 +54,8 @@ const READY: u64 = 0xC0D1A1_C0FFEE;
 const UNINIT: u64 = 0;
 const INITIALISING: u64 = 1;
 
-/// bionic's `pthread_cond_t`: `int64_t __private[4]`.
+/// An overlay on the first 32 bytes of bionic's 48-byte `pthread_cond_t`. The
+/// remaining 16 are never touched; only `state` and `real` are ours.
 #[repr(C)]
 struct BionicCond {
     state: AtomicU64,
@@ -288,6 +307,110 @@ sem_op!(semaphore_post, sem_post);
 sem_op!(semaphore_wait, sem_wait);
 sem_op!(semaphore_trywait, sem_trywait);
 
+// ------------------------------------------------- once, and thread-local keys
+
+// glibc's. Renamed so the forwarding wrappers below can carry bionic's names.
+extern "C" {
+    #[link_name = "pthread_once"]
+    fn host_pthread_once(control: *mut c_int, init_routine: Option<extern "C" fn()>) -> c_int;
+    #[link_name = "pthread_key_create"]
+    fn host_pthread_key_create(
+        key: *mut c_uint,
+        destructor: Option<extern "C" fn(*mut c_void)>,
+    ) -> c_int;
+    #[link_name = "pthread_key_delete"]
+    fn host_pthread_key_delete(key: c_uint) -> c_int;
+    #[link_name = "pthread_getspecific"]
+    fn host_pthread_getspecific(key: c_uint) -> *mut c_void;
+    #[link_name = "pthread_setspecific"]
+    fn host_pthread_setspecific(key: c_uint, value: *const c_void) -> c_int;
+}
+
+/// `pthread_once`, forwarded to the host's.
+///
+/// These five were generated stubs until now, and a generated stub returns 0.
+/// For most symbols that is a harmless placeholder; for these it is the lie
+/// AGENTS.md forbids, in its worst form — the caller is told it *succeeded*.
+/// `pthread_once` returning 0 means "your initialiser ran", so whatever it was
+/// meant to set up is uninitialised and the next access faults with no visible
+/// relationship to this call; `pthread_getspecific` returning 0 is a NULL the
+/// caller dereferences on the next line. `cordial-run --lib-dir DIR` without
+/// `--host-libc` segfaulted at exit 139 with `[stub] pthread_once` and
+/// `[stub] pthread_getspecific` as the last two lines before the core dump.
+///
+/// Compiling bionic's own implementations instead is right for exactly one of
+/// the five, which is why none of them does it. `pthread_key.cpp` reaches
+/// thread-specific data through `__get_bionic_tls()`, which is
+/// `__get_tls()[TLS_SLOT_BIONIC_TLS]` — a pointer to bionic's own thread
+/// structure, hanging off the thread pointer of a thread bionic created. Every
+/// thread in this process belongs to the host's libc, so that slot holds
+/// whatever glibc keeps at that offset and the load reads the wrong memory.
+/// That is worse than the stub it replaced, because it would appear to work.
+/// `pthread_once.cpp` is the exception — a compare-exchange loop on the
+/// caller's own `int` plus a futex, touching no thread structure at all — so it
+/// could be ported standalone. Forwarding costs less and behaves the same.
+///
+/// Forwarding is safe *here* for a reason that does not generalise, and reading
+/// it as a general licence is how `struct stat` and `sigset_t` would get passed
+/// through next. It is safe only where the argument is laid out identically in
+/// both libcs. `pthread_once_t` is `int` in both, 4 bytes against 4, and both
+/// spell `PTHREAD_ONCE_INIT` as 0 — so a bionic once-control that was
+/// statically initialised and never passed to bionic's implementation already
+/// *is* a valid glibc one. `pthread_key_t` is 4 bytes in both and is opaque to
+/// the caller. Compare `sem_t` at the top of this file, 16 against 32, where
+/// the same forwarding would write past the end of the object.
+///
+/// One difference forwarding does not hide, and it is **INFERRED** — nothing
+/// has been observed depending on it. bionic sets `KEY_VALID_FLAG`, bit 31, in
+/// every key it hands out, so a bionic key is always a negative `int`; glibc's
+/// are small non-negative ones and the first is 0. Code that treats key 0 as
+/// "no key allocated" would be wrong here in a way it never was on Android.
+pub extern "C" fn once(control: *mut c_int, init_routine: Option<extern "C" fn()>) -> c_int {
+    if control.is_null() {
+        return libc_einval();
+    }
+    // SAFETY: `control` points at 4 bytes in both libcs, and a bionic
+    // once-control that has never been passed to bionic's implementation holds
+    // a state glibc's understands. `init_routine` is a plain `void (*)(void)`.
+    unsafe { host_pthread_once(control, init_routine) }
+}
+
+/// `pthread_key_create`. bionic's `pthread_key_t` is signed, glibc's is not,
+/// hence the local rather than a cast of the caller's pointer — and nothing is
+/// written back unless the host says it succeeded, which is bionic's contract.
+pub extern "C" fn key_create(
+    key: *mut c_int,
+    destructor: Option<extern "C" fn(*mut c_void)>,
+) -> c_int {
+    if key.is_null() {
+        return libc_einval();
+    }
+    let mut host_key: c_uint = 0;
+    // SAFETY: `host_key` is a live 4-byte slot; the destructor is passed through
+    // untouched and glibc calls it on the same thread bionic would have.
+    let rc = unsafe { host_pthread_key_create(&mut host_key, destructor) };
+    if rc == 0 {
+        // SAFETY: the caller's `pthread_key_t*`, 4 bytes in both libcs.
+        unsafe { *key = host_key as c_int };
+    }
+    rc
+}
+
+pub extern "C" fn key_delete(key: c_int) -> c_int {
+    // SAFETY: a key is an opaque scalar; an invalid one is rejected by glibc.
+    unsafe { host_pthread_key_delete(key as c_uint) }
+}
+
+pub extern "C" fn getspecific(key: c_int) -> *mut c_void {
+    // SAFETY: as above. A key never created returns null, as bionic's does.
+    unsafe { host_pthread_getspecific(key as c_uint) }
+}
+
+pub extern "C" fn setspecific(key: c_int, value: *const c_void) -> c_int {
+    // SAFETY: as above. `value` is stored, never dereferenced.
+    unsafe { host_pthread_setspecific(key as c_uint, value) }
+}
+
 fn libc_einval() -> c_int {
     22 // EINVAL, identical in both libcs
 }
@@ -311,6 +434,14 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
         f!("sem_post", semaphore_post),
         f!("sem_wait", semaphore_wait),
         f!("sem_trywait", semaphore_trywait),
+        // Forwarded, not wrapped. These are here so `--lib-dir` alone does not
+        // need `--host-libc` for them; see `once` for why forwarding is right
+        // for these five and wrong for the two above.
+        f!("pthread_once", once),
+        f!("pthread_key_create", key_create),
+        f!("pthread_key_delete", key_delete),
+        f!("pthread_getspecific", getspecific),
+        f!("pthread_setspecific", setspecific),
     ]
 }
 
@@ -319,9 +450,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wrapper_sizes_match_bionic() {
-        // The whole point: these must be the *bionic* sizes, not glibc's.
-        assert_eq!(std::mem::size_of::<BionicCond>(), 32);
+    fn wrappers_fit_inside_the_bionic_objects() {
+        // A wrapper is an overlay on storage the caller allocated to bionic's
+        // size, so it must never be larger than bionic's type. `sem_t` is 16
+        // and the overlay uses all of it; `pthread_cond_t` is 48 and the
+        // overlay uses the first 32.
+        assert!(std::mem::size_of::<BionicCond>() <= 48);
         assert_eq!(std::mem::size_of::<BionicSem>(), 16);
     }
 
@@ -348,6 +482,63 @@ mod tests {
         // Destroyed wrappers return to the zero state, so they can be reused.
         assert_eq!(cond_init(cond, std::ptr::null()), 0);
         assert_eq!(cond_destroy(cond), 0);
+    }
+
+    #[test]
+    fn once_runs_the_initialiser_exactly_once() {
+        static RUNS: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn init() {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+        }
+        // bionic's PTHREAD_ONCE_INIT is 0, and so is glibc's. A control that
+        // was only ever statically initialised is valid for both.
+        let mut control: c_int = 0;
+        assert_eq!(once(&mut control, Some(init)), 0);
+        assert_eq!(once(&mut control, Some(init)), 0);
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1);
+
+        // The control, not the routine, is what remembers. A second control
+        // runs it again — otherwise the count above proves nothing.
+        let mut second: c_int = 0;
+        assert_eq!(once(&mut second, Some(init)), 0);
+        assert_eq!(RUNS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn thread_specific_data_round_trips() {
+        let mut key: c_int = -1;
+        assert_eq!(key_create(&mut key, None), 0);
+        // A key with nothing stored reads as null, which is what the caller
+        // that used to get a stubbed 0 was entitled to expect.
+        assert!(getspecific(key).is_null());
+        let value = 0xC0FFEEusize as *const c_void;
+        assert_eq!(setspecific(key, value), 0);
+        assert_eq!(getspecific(key), value as *mut c_void);
+        assert_eq!(key_delete(key), 0);
+    }
+
+    #[test]
+    fn thread_specific_data_is_per_thread() {
+        // The property bionic's own implementation would have got wrong here:
+        // it reads the slot table hanging off the thread pointer, which for a
+        // host-created thread is glibc's.
+        let mut key: c_int = -1;
+        assert_eq!(key_create(&mut key, None), 0);
+        assert_eq!(setspecific(key, 1 as *const c_void), 0);
+
+        let elsewhere = key;
+        let seen = std::thread::spawn(move || getspecific(elsewhere) as usize)
+            .join()
+            .unwrap();
+        assert_eq!(seen, 0, "a fresh thread must not see this thread's value");
+        assert_eq!(getspecific(key) as usize, 1);
+        assert_eq!(key_delete(key), 0);
+    }
+
+    #[test]
+    fn null_arguments_are_refused_rather_than_dereferenced() {
+        assert_eq!(once(std::ptr::null_mut(), None), libc_einval());
+        assert_eq!(key_create(std::ptr::null_mut(), None), libc_einval());
     }
 
     #[test]

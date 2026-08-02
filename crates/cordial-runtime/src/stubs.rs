@@ -52,38 +52,47 @@ pub fn hit(index: usize) -> i64 {
         report();
         std::process::abort();
     }
-    if is_fatal(SYMBOLS[index].0) {
-        fatal(SYMBOLS[index].0);
+    if let Some(why) = is_fatal(SYMBOLS[index].0) {
+        fatal(SYMBOLS[index].0, why);
     }
     0
 }
 
 /// Symbols where returning `0` is not a harmless placeholder but a lie the
-/// caller cannot survive.
+/// caller cannot survive, each with the sentence a person hitting it should
+/// read.
 ///
 /// Every stub returns `0`, which is right for most of them: a counter nobody
-/// reads, a capability query answered "no". For these it is fatal, and in the
-/// worst way — the caller is *told it succeeded* and proceeds.
+/// reads, a capability query answered "no". For an entry here it is fatal, and
+/// in the worst way — the caller is *told it succeeded* and proceeds.
 ///
-/// `pthread_once` returning 0 means "your initialiser ran". It did not, so
-/// whatever it was meant to set up is uninitialised and the next access is a
-/// null dereference somewhere with no visible relationship to this call.
-/// `pthread_getspecific` returning 0 is a NULL the caller dereferences at once.
+/// **The list is empty, and that does not mean the danger is gone.** It held
+/// `pthread_once`, `pthread_getspecific`, `pthread_setspecific`,
+/// `pthread_key_create` and `pthread_key_delete` until those five were
+/// implemented in `bionic::pthread`; they are resolved now, never reach a stub,
+/// and an entry for a symbol that cannot be hit is a comment that lies.
 ///
-/// This is precisely the failure AGENTS.md's "never make a stub lie" is about,
-/// and it was found the expensive way: `cordial-run --lib-dir DIR` without
-/// `--host-libc` segfaulted at exit 139 with `[stub] pthread_once` and
-/// `[stub] pthread_getspecific` as the last two lines before the core dump.
-/// Nobody reading a SIGSEGV would connect it to a stub returning success.
-fn is_fatal(symbol: &str) -> bool {
-    matches!(
-        symbol,
-        "pthread_once"
-            | "pthread_getspecific"
-            | "pthread_setspecific"
-            | "pthread_key_create"
-            | "pthread_key_delete"
-    )
+/// Nothing replaced them, deliberately. `--lib-dir` without `--host-libc` still
+/// ends in SIGSEGV, now further into the engine's static initialisers, with
+/// `__cxa_atexit` the last stub reported before the core dump — but *which*
+/// stub is the one it cannot survive has not been established, and the obvious
+/// guess is wrong: `memset` is stubbed in that configuration and the same run
+/// carried on through five more first-hit stubs after calling it. Do not add a
+/// symbol here on the strength of it looking dangerous. Add it when a run shows
+/// the process dying on it.
+///
+/// The underlying problem is larger than this list. Bare `--lib-dir` stubs 358
+/// libc symbols, `memset` and `pthread_mutex_lock` among them; it is a
+/// diagnostic configuration that produces a prioritised work queue, not one the
+/// engine can run in. What closes it is a real bionic shim, not more entries
+/// here.
+const FATAL: &[(&str, &str)] = &[];
+
+fn is_fatal(symbol: &str) -> Option<&'static str> {
+    FATAL
+        .iter()
+        .find(|(name, _)| *name == symbol)
+        .map(|(_, why)| *why)
 }
 
 /// Say what happened and stop, rather than returning a lie and crashing later.
@@ -91,13 +100,10 @@ fn is_fatal(symbol: &str) -> bool {
 /// A named exit beats a SIGSEGV by the whole distance between "this symbol is
 /// not implemented, here is the switch that resolves it" and a core dump three
 /// frames into someone else's thread-local teardown.
-fn fatal(symbol: &str) -> ! {
+fn fatal(symbol: &str, why: &str) -> ! {
     eprintln!();
     eprintln!("[stub] {symbol} is not implemented, and returning a placeholder would crash.");
-    eprintln!(
-        "       It is thread-local storage: answering 0 tells the caller its \
-         initialiser ran when it did not."
-    );
+    eprintln!("       {why}");
     eprintln!("       Pass --host-libc to resolve libc from the host, which is what the");
     eprintln!("       --game-activity path does and why that path does not hit this.");
     report();

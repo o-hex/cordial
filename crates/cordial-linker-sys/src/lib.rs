@@ -923,6 +923,7 @@ pub mod game_activity {
         fn cordial_textbox_handle() -> i64;
         fn cordial_textbox_generation() -> c_int;
         fn cordial_textbox_text(buf: *mut c_char, n: c_int) -> c_int;
+        fn cordial_textbox_info(out: *mut RawTextBoxInfo) -> c_int;
         fn cordial_game_activity_window_focus(
             handle: i64,
             focused: c_int,
@@ -1019,6 +1020,75 @@ pub mod game_activity {
     pub fn textbox_generation() -> u32 {
         // SAFETY: a plain atomic load on the C++ side.
         unsafe { cordial_textbox_generation() as u32 }
+    }
+
+    /// The spec for the editor that has to be drawn over the focused text box,
+    /// as the engine handed it to `showKeyboard`.
+    ///
+    /// Layout must match `CordialTextBoxInfo` in `native/android_classes.cpp`
+    /// field-for-field — this is a `#[repr(C)]` mirror, not a coincidence.
+    ///
+    /// The fourteen values are `NativeTextBoxInfo`'s constructor arguments,
+    /// `(FFFFFZIIIIIIZZ)`. Slots that have been identified by watching real
+    /// boxes on the Login screen carry a name; the rest keep their slot number,
+    /// because the APK's declarations give the class's field list sorted by
+    /// name and never say which order the constructor takes them in. The long
+    /// comment on `CordialTextBoxInfo` in `native/android_classes.cpp` has the
+    /// captured numbers and the argument from each of them; read it before
+    /// renaming anything here.
+    ///
+    /// Do not assume a numbered slot means what the field list's reading order
+    /// would suggest. That guess put `textColor` at slot 7 and it is at slot 8.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct RawTextBoxInfo {
+        /// Left edge in surface pixels. Observed 470 for two boxes on a
+        /// 1280-wide surface, one of them 340 wide, and 470 = (1280-340)/2.
+        pub x: f32,
+        /// Top edge in surface pixels; the coordinate that differed between two
+        /// vertically stacked login fields.
+        pub y: f32,
+        pub width: f32,
+        /// `INFERRED`. Observed 22 against a `font_size` of 16, and a 22px line
+        /// box holding 16pt text is a text field where the reverse is not
+        /// anything. Slots 3 and 4 are the two floats no observation has yet
+        /// told apart.
+        pub height: f32,
+        /// `INFERRED`; see [`RawTextBoxInfo::height`].
+        pub font_size: f32,
+        pub z5: i32,
+        pub i6: i32,
+        pub i7: i32,
+        /// Packed ARGB. Observed `0xffd5d5dd` on both login boxes, which is
+        /// what identified this slot: nothing else in the class is a colour.
+        pub text_color: i32,
+        pub i9: i32,
+        /// One of the two ints that varied between the two login boxes; the
+        /// other is [`RawTextBoxInfo::i11`]. Consistent with `textInputType`
+        /// and `returnKeyType` in some order, `INFERRED` and not yet worth a
+        /// name.
+        pub i10: i32,
+        /// See [`RawTextBoxInfo::i10`].
+        pub i11: i32,
+        /// Observed 1 on two single-line login fields, so this is *not*
+        /// `multiline` — that is slot 5 or slot 13. Settling which wants a box
+        /// that genuinely differs, such as an in-experience chat entry.
+        pub z12: i32,
+        pub z13: i32,
+    }
+
+    /// The focused box's spec, or `None` when nothing is focused or the engine
+    /// gave Cordial no `NativeTextBoxInfo` for it.
+    ///
+    /// `None` is not a zeroed box. A caller must not fall back to drawing an
+    /// editor at the origin: an editor in the wrong place reads as a layout bug
+    /// and hides the fact that the value never arrived.
+    pub fn focused_textbox_info() -> Option<RawTextBoxInfo> {
+        let mut info = RawTextBoxInfo::default();
+        // SAFETY: `info` is a live, fully initialised mirror of the C++ struct
+        // and outlives the call, which only copies into it.
+        let known = unsafe { cordial_textbox_info(&mut info as *mut RawTextBoxInfo) };
+        if known == 0 { None } else { Some(info) }
     }
 
     /// The focused box's contents, as the engine reported them at focus time.
@@ -1223,6 +1293,89 @@ pub mod game_activity {
         // SAFETY: `start`/`end` are live out-parameters for the call.
         unsafe { cordial_ime_state_selection(&mut start, &mut end) };
         (start, end)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        extern "C" {
+            fn cordial_textbox_focused(
+                handle: i64,
+                text: *const c_char,
+                info: *const RawTextBoxInfo,
+            );
+            fn cordial_textbox_blurred();
+            #[allow(clippy::too_many_arguments)]
+            fn cordial_textbox_test_focus(
+                handle: i64, text: *const c_char,
+                f0: f32, f1: f32, f2: f32, f3: f32, f4: f32, z5: c_int,
+                i6: c_int, i7: c_int, i8: c_int, i9: c_int, i10: c_int, i11: c_int,
+                z12: c_int, z13: c_int,
+            );
+        }
+
+        /// The fourteen values arriving in the slots they were sent to, with
+        /// C++ naming the members on its side and Rust naming them again on
+        /// this one. That is what makes the two layouts have to agree: a test
+        /// that handed a Rust-built struct to `cordial_textbox_focused` and
+        /// read it back passes with the mirror shifted by a field, because
+        /// nothing between the two ever looks inside.
+        ///
+        /// Every value is distinct so a drift of one slot cannot land on an
+        /// equal number and go unseen.
+        ///
+        /// This says nothing about which slot means what — that is the engine's
+        /// to answer, not this crate's.
+        ///
+        /// One test rather than several: the focused box is process-wide state,
+        /// and the test harness runs tests on threads, so two of these would
+        /// race each other into an intermittent failure of exactly the kind
+        /// this repository has already spent time chasing.
+        #[test]
+        fn textbox_info_arrives_slot_for_slot() {
+            let text = CString::new("hello").expect("no interior NUL");
+            // SAFETY: `text` outlives the call, which only reads it.
+            unsafe {
+                cordial_textbox_test_focus(
+                    42, text.as_ptr(),
+                    1.5, 2.5, 3.5, 4.5, 5.5, 1,
+                    6, 7, 8, 9, 10, 11,
+                    0, 1,
+                )
+            };
+
+            assert_eq!(focused_textbox(), Some(42));
+            assert_eq!(
+                focused_textbox_info(),
+                Some(RawTextBoxInfo {
+                    x: 1.5, y: 2.5, width: 3.5, height: 4.5, font_size: 5.5,
+                    z5: 1,
+                    i6: 6, i7: 7, text_color: 8, i9: 9, i10: 10, i11: 11,
+                    z12: 0, z13: 1,
+                })
+            );
+
+            // SAFETY: no arguments; clears the global the assertions above set.
+            unsafe { cordial_textbox_blurred() };
+            assert_eq!(focused_textbox(), None);
+            // Blur has to drop the spec too, or a caller keeps an editor up
+            // over a box that no longer has focus.
+            assert_eq!(focused_textbox_info(), None);
+
+            // A focus the engine supplied no spec for reports none rather than
+            // a zeroed box, and does not resurrect the previous box's numbers.
+            // Nothing has run `NativeTextBoxInfo.<init>` in this process, so
+            // the last-built fallback is empty too.
+            // SAFETY: `text` outlives the call; a null spec is the documented
+            // "the engine gave us nothing" case.
+            unsafe { cordial_textbox_focused(7, text.as_ptr(), std::ptr::null()) };
+            assert_eq!(focused_textbox(), Some(7));
+            assert_eq!(focused_textbox_info(), None);
+
+            // SAFETY: no arguments.
+            unsafe { cordial_textbox_blurred() };
+        }
     }
 }
 

@@ -140,6 +140,17 @@ for it to refuse to cache/download anything even if flags succeeded.
 
 ### 2c. `com/roblox/engine/jni/NativeGLJavaInterface` — extra callbacks, pre-registered, not yet fired
 
+**Correction, and one of these turned out not to be idle.** `onDataModelNotificationCallback`,
+`onAppBridgeNotification` and `getWebViewUserAgent` are now hooked in
+`native/android_classes.cpp`; they are the engine's whole web-view surface on the transport this
+build uses, and `docs/analysis/webview-surface.md` is the map. The claim below that none of these
+shows a call this run was true of the run it describes and is **wrong in general**:
+`onDataModelNotificationCallback` fires three times before the landing page on every run — measured
+on three consecutive 40-second runs, `APP_READY` with `PlatformAccountRouter`, `Startup` and
+`Landing`. It only looked idle because nothing was hooked to notice.
+
+The rest of the table stands.
+
 `native/android_classes.cpp` implements this class already (see `observed-java-surface.md`), but
 Roblox's `JNI_OnLoad` looks up *every* static native-facing method on it up front, and these are not
 hooked:
@@ -147,14 +158,14 @@ hooked:
 | Method | Signature |
 |---|---|
 | `gameLoadedCallback` | `(J)V` |
-| `onDataModelNotificationCallback` | `(Ljava/lang/String;Ljava/lang/String;)V` |
+| `onDataModelNotificationCallback` | `(Ljava/lang/String;Ljava/lang/String;)V` — hooked since |
 | `onLuaTextBoxChangedCallback` | `(Ljava/lang/String;)V` |
 | `onLuaTextBoxPropertyChangedCallback` | `()V` |
-| `onAppBridgeNotification` | `(Ljava/lang/String;Ljava/lang/String;)V` |
+| `onAppBridgeNotification` | `(Ljava/lang/String;Ljava/lang/String;)V` — hooked since |
 | `onExtendedAnalyticsRecvCallback` | `([BI)V` |
 | `saveImageToAlbum` | `(Ljava/lang/String;)V` |
 | `onVrSessionStateUpdate` | `(I)V` |
-| `getWebViewUserAgent` | `()V` |
+| `getWebViewUserAgent` | `()V` — hooked since |
 | `getMobileAdvertisingId` | `()V` |
 | `promptNativePurchaseWithPaymentSessionId` | `(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V` (and a 2-arg overload) |
 

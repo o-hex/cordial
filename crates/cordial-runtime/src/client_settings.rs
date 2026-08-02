@@ -233,11 +233,11 @@ mod tests {
     }
 
     /// Exercises `load_base` rather than `load` on purpose. `load` merges the
-    /// user's own overrides from `~/.config/cordial/flags.json`, so going
-    /// through it would make this test read the developer's real home directory
-    /// and fail for anyone who has that file — which is exactly what it did
-    /// once one existed. The behaviour under test is path-versus-network, and
-    /// that is `load_base`.
+    /// user's own overrides — since ADR-013 that is `<profile>/flags.json`, and
+    /// before it `~/.config/cordial/flags.json` — so going through it would
+    /// make this test read the developer's real profile and fail for anyone who
+    /// has overrides, which is exactly what it did once one existed. The
+    /// behaviour under test is path-versus-network, and that is `load_base`.
     #[test]
     fn an_explicit_path_bypasses_the_network() {
         let dir = std::env::temp_dir().join("cordial-cs-test");

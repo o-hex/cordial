@@ -71,13 +71,28 @@ pub fn plugin_root() -> PathBuf {
         })
 }
 
+/// Whether a string may be used as a plugin id.
+///
+/// An id names directories — the plugin's own installed directory, and the one
+/// its settings live in inside a profile — and it is the key the broker, the
+/// event registry and the grants file all index by. Keeping it to boring
+/// characters is the whole reason `<profile>/plugins/<id>/settings.json` cannot
+/// be talked into being somewhere else: `..`, `/` and a leading `/` all fail
+/// here, so nothing downstream has to sanitise a path it was handed.
+///
+/// One definition on purpose. `settings.rs` calls this rather than writing a
+/// second copy, because two path checks guarding one directory is the pair that
+/// drifts and only one of them gets fixed.
+pub fn is_valid_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 pub fn parse(text: &str, dir: &Path) -> Result<Plugin, String> {
     let manifest: Manifest = serde_json::from_str(text).map_err(|e| e.to_string())?;
     if manifest.id.is_empty() {
         return Err("id must not be empty".into());
     }
-    // The id names a directory and appears in log lines; keep it boring.
-    if !manifest.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !is_valid_id(&manifest.id) {
         return Err(format!(
             "id {:?} may only contain letters, digits, dashes and underscores",
             manifest.id
@@ -196,6 +211,18 @@ mod tests {
         assert!(parse(r#"{"id":"../evil","entry":"m.ts"}"#, &dir()).is_err());
         assert!(parse(r#"{"id":"","entry":"m.ts"}"#, &dir()).is_err());
         assert!(parse(r#"{"id":"ok-name_1","entry":"m.ts"}"#, &dir()).is_ok());
+    }
+
+    #[test]
+    fn an_id_can_never_be_a_path() {
+        // `settings.rs` joins an id onto a profile directory, so this check is
+        // load-bearing beyond tidiness: every one of these would escape the
+        // plugin's own namespace if it were ever accepted as an id.
+        for bad in ["..", ".", "../other", "a/b", "/etc", "a.b", ""] {
+            assert!(!is_valid_id(bad), "{bad:?} must not be a usable plugin id");
+        }
+        assert!(is_valid_id("flag-inspector"));
+        assert!(is_valid_id("ok-name_1"));
     }
 
     #[test]

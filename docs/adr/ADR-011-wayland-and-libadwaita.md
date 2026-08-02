@@ -36,6 +36,17 @@ gets Linux phones and CJK input for the same work, rather than hand-rolling an
 input method against raw X keysyms. That was already the plan; Wayland is where
 the plan is expressible.
 
+*Still open, and not settled by the subsurface work below.* Cordial's own
+`zwp_text_input_v3` client has a live bug — `interface 'zwp_text_input_v3' has
+no event 8`, which freezes the landing page — and it was neither fixed nor
+removed when the window changed hands to GTK. Removing it was considered and
+rejected: it would only have been right if GTK were taking the IME over, and
+the evidence for the widget-overlay theory that implied has weakened (Sober
+shows typed text live with no toolkit in its engine process at all). One thing
+was established: bringing GTK into the process does *not* create a second
+text-input object, because GDK creates one only when a GTK text widget takes
+focus and this window has none.
+
 **The background behind the canvas.** While the engine catches up, whatever is
 behind its canvas is visible. It should be the desktop's own background colour,
 following light and dark mode, rather than a flash of white. That is a themed
@@ -56,13 +67,72 @@ It also settles the light/dark question without a portal round-trip of Cordial's
 own: `AdwStyleManager` already tracks `org.freedesktop.appearance color-scheme`
 and updates live when the user switches.
 
+## How the engine's surface attaches to that window
+
+Decided and implemented 2026-08-02. "The engine renders into a Wayland surface
+belonging to it" was true of the intent and false of the code: the engine owned
+a bare `xdg_toplevel` of its own, so the engine's canvas *was* the whole window
+and there was no titlebar, because there was no libadwaita window for one to
+belong to.
+
+**The engine's `wl_surface` is a `wl_subsurface` of the GTK toplevel.** Three
+things follow from that and none of them is optional.
+
+**One connection, therefore one process.** Wayland object ids are scoped to the
+connection that created them, so a subsurface cannot parent to a surface on
+another connection — and a connection cannot be shared between processes. GTK
+opens the connection; `wayland.rs` takes `gdk_wayland_display_get_wl_display`
+rather than calling `wl_display_connect`, and Mesa is handed the same pointer it
+already was. So `cordial-load` links GTK4 and libadwaita. ADR-002 accepted core
+taking a GTK dependency; this is the runtime taking it too, and it is not
+avoidable by any amount of process separation. Sober's shape — a GTK process
+beside a toolkit-free engine process — is a different arrangement that buys
+different things; it cannot produce one window with the engine inside it.
+
+**The window definition is shared, not duplicated.** `cordial-shell` becomes a
+library as well as a binary, and `cordial_shell::host_window` is the one place
+the `AdwWindow`/`AdwToolbarView`/`AdwHeaderBar` are built. The shell binary puts
+the chooser in the content slot; the runtime puts the engine's subsurface over
+it. This ADR's "that shell and this window are the same window" was an intention
+until now.
+
+**`set_desync` is load-bearing.** A subsurface is created *synchronised*: its
+commits do not take effect until the parent commits. GTK commits when it draws,
+which for an idle window is never, so without `wl_subsurface.set_desync` the
+engine presents into a surface nobody ever latches. Conversely
+`wl_subsurface.set_position` *is* latched on the parent's commit, so moving the
+canvas requires asking GTK to repaint.
+
+**Measured:** the client reaches `APP_READY (Landing)` on three consecutive
+25-second runs with 547-550 `vkQueuePresentKHR` calls each, and a screenshot
+shows the libadwaita header bar above Roblox's landing page. `WAYLAND_DEBUG=1`
+confirms `get_subsurface`, `set_desync`, `set_position(25, 71)` and
+`xdg_toplevel.set_app_id("Cordial")` on the wire.
+
+**Not verified:** anything needing a keystroke or a drag — window resize with
+the engine live, and text entry. See `docs/NEXT.md` §1a.
+
+**A trap that cost an hour, recorded so it costs nobody else one.** GTK will
+not open a Wayland display if `GDK_BACKEND` names something else, *even when*
+`gdk_set_allowed_backends("wayland")` has been called: the two are separate
+filters and their intersection was empty. The symptom is `gtk_init_check`
+returning false with nothing printed, which surfaces as "no window" and no
+further explanation. This developer's ordinary GNOME session exports
+`GDK_BACKEND=x11`. `host_window::init_wayland` sets both.
+
 ## Consequences
 
 **Accepted:** a native Wayland backend is substantially more code than the X11
-one — registry binding, `xdg_shell`, `wl_seat` input with xkbcommon keymaps,
+one — registry binding, `wl_seat` input with xkbcommon keymaps,
 `wl_egl_window` for EGL, and `VK_KHR_wayland_surface` in place of
 `VK_KHR_xlib_surface` in the Vulkan interposition. The X11 backend reached a
 first frame sooner and that was worth having; it is not worth keeping two.
+
+*Corrected:* this list used to include `xdg_shell`, hand-marshalled because no
+protocol XML was available to generate from. GTK owns the toplevel now, so that
+code is gone and with it two of the three crashes this file's history records.
+`text-input-unstable-v3` is still hand-written and still the one interface whose
+event table is Cordial's assertion rather than libwayland's.
 
 **Accepted, with a hard trigger:** the existing X11 code stays only until the
 Wayland path runs the sign-in flow end to end, and **is deleted in that same

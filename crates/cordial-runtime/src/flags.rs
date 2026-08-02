@@ -14,13 +14,27 @@
 //! recording where every effective value came from.
 //!
 //! ```text
-//! ~/.config/cordial/flags.json                        user      (wins)
+//! <profile>/flags.json                                user      (wins)
 //! ~/.local/share/cordial/plugins/<id>/flags.json      plugin
 //! the client-settings document from Roblox            base
 //! ```
 //!
 //! **The user always wins.** An explicit setting is the one thing that must not
 //! be overridable by software the user installed to do something else.
+//!
+//! **The user's file is per profile** (ADR-013). It used to be one file at
+//! `~/.config/cordial/flags.json` for the whole machine, which meant a flag set
+//! while debugging something on a test account was silently still set on the
+//! account someone actually plays — and flags are exactly the setting people
+//! change temporarily and forget. `migrate_legacy_user_file` moves an existing
+//! one in rather than leaving it to be ignored, because a launch that quietly
+//! stopped honouring overrides is indistinguishable from the overrides never
+//! having worked.
+//!
+//! A plugin's own `flags.json` stays beside its installed code, which is global
+//! — a plugin is installed once. That is a real asymmetry and it is recorded in
+//! ADR-013's open question, because an installed plugin currently contributes
+//! its flags in every profile whether or not it was granted anything there.
 //!
 //! **Plugin-against-plugin conflicts are reported, not resolved.** Two plugins
 //! wanting the same flag set differently is a real disagreement, and picking one
@@ -130,11 +144,66 @@ pub fn resolve(layers: Vec<Layer>) -> BTreeMap<String, Resolved> {
     out
 }
 
-/// The user's overrides file.
-pub fn user_path() -> PathBuf {
+/// The user's overrides file, inside `profile_dir`.
+///
+/// `CORDIAL_FLAGS` still overrides it outright, which is how a one-off
+/// experiment points at a file of its own. That override is global by nature —
+/// it makes one file serve every profile — so it is a development switch, not a
+/// supported arrangement.
+pub fn user_path_in(profile_dir: &Path) -> PathBuf {
     std::env::var_os("CORDIAL_FLAGS")
         .map(PathBuf::from)
-        .unwrap_or_else(|| config_dir().join("cordial/flags.json"))
+        .unwrap_or_else(|| profile_dir.join("flags.json"))
+}
+
+/// The user's overrides file for the profile this instance is running.
+pub fn user_path() -> PathBuf {
+    user_path_in(&crate::profile::active())
+}
+
+/// Where the user's overrides lived before they were per profile.
+pub fn legacy_user_path() -> PathBuf {
+    config_dir().join("cordial/flags.json")
+}
+
+/// Move a pre-existing global overrides file into `profile_dir`, once.
+///
+/// Same guard and the same reasoning as `profile::migrate_legacy_layout` and
+/// `cordial_plugins::grants::migrate_legacy_into`: only when the old file
+/// exists and the new one does not, so it can never overwrite overrides already
+/// made in this profile. Moved rather than copied, and into whichever profile
+/// first goes looking, because there is no record of which profile a global
+/// file was meant for — it was meant for all of them, which is the thing being
+/// fixed. In practice that is `default`, where ADR-012's migration lands
+/// existing storage.
+pub fn migrate_legacy_user_file(profile_dir: &Path) -> Option<PathBuf> {
+    let legacy = legacy_user_path();
+    let target = user_path_in(profile_dir);
+    if !legacy.is_file() || target.exists() {
+        return None;
+    }
+    std::fs::create_dir_all(profile_dir).ok()?;
+    match std::fs::rename(&legacy, &target) {
+        Ok(()) => {
+            println!(
+                "  flags: moved {} to {} (ADR-013)",
+                legacy.display(),
+                target.display()
+            );
+            Some(target)
+        }
+        // A cross-device rename is the plausible failure. Leaving the old file
+        // alone and saying so beats a half-written overrides document, which
+        // would be reported as invalid JSON and ignored entirely.
+        Err(e) => {
+            println!(
+                "  flags: could not move {} to {} ({e}); the old location is untouched",
+                legacy.display(),
+                target.display()
+            );
+            None
+        }
+    }
 }
 
 /// The directory each plugin's own overrides live under, one subdirectory per
@@ -163,6 +232,17 @@ fn data_dir() -> PathBuf {
 /// Every layer, in precedence order: plugins first (alphabetically, so the
 /// outcome does not depend on directory iteration order), then the user.
 pub fn collect() -> Vec<Layer> {
+    // The move happens here because this is the one path every reader of the
+    // user's overrides goes through, and the runtime has no single startup hook
+    // that a launcher-started client and a hand-started one both pass. Once per
+    // process: `collect` runs again for every `flags.list` a plugin makes, and
+    // re-stating a file that has already moved on each of those is noise in a
+    // log people read.
+    static MIGRATED: std::sync::Once = std::sync::Once::new();
+    MIGRATED.call_once(|| {
+        migrate_legacy_user_file(&crate::profile::active());
+    });
+
     let mut layers = Vec::new();
 
     let mut ids: Vec<String> = std::fs::read_dir(plugin_dir())
@@ -262,5 +342,74 @@ mod tests {
         let r = resolve(vec![layer(Source::User, &[("FFlagY", "true")])]);
         assert!(r["FFlagY"].overridden.is_empty());
         assert_eq!(r["FFlagY"].source, Source::User);
+    }
+
+    /// `XDG_CONFIG_HOME` and `CORDIAL_FLAGS` are process-wide, and cargo runs
+    /// these in parallel threads of one process. Same reasoning as
+    /// `profile`'s own test mutex, which records that the unserialised version
+    /// passed anyway on its first run.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn scratch(tag: &str) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("cordial-flags-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::remove_var("CORDIAL_FLAGS");
+        std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+        (root, guard)
+    }
+
+    #[test]
+    fn one_profiles_overrides_are_not_another_profiles() {
+        // A flag set while debugging on a test account used to be set on the
+        // account someone plays, because there was one file for the machine.
+        let (root, _g) = scratch("isolation");
+        let alt = root.join("profiles/alt");
+        let main = root.join("profiles/main");
+        std::fs::create_dir_all(&alt).unwrap();
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::write(user_path_in(&alt), r#"{"DFFlagDebugSomething":"true"}"#).unwrap();
+
+        assert!(read_layer(&user_path_in(&alt), Source::User).is_some());
+        assert!(
+            read_layer(&user_path_in(&main), Source::User).is_none(),
+            "an override made in another profile must not apply here"
+        );
+    }
+
+    #[test]
+    fn a_pre_existing_global_overrides_file_is_moved_into_the_profile() {
+        // Leaving it to be ignored would look exactly like overrides never
+        // having worked, which is a bug report about the wrong thing.
+        let (root, _g) = scratch("migrate");
+        let profile = root.join("profiles/default");
+        std::fs::create_dir_all(&profile).unwrap();
+        let legacy = legacy_user_path();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, r#"{"FIntTaskSchedulerAutoThreadLimit":"8"}"#).unwrap();
+
+        let moved = migrate_legacy_user_file(&profile).expect("the legacy file should have moved");
+        assert_eq!(moved, user_path_in(&profile));
+        assert!(!legacy.exists(), "the old file should be gone, not copied");
+        let layer = read_layer(&moved, Source::User).expect("the moved file should read");
+        assert_eq!(layer.values["FIntTaskSchedulerAutoThreadLimit"], "8");
+    }
+
+    #[test]
+    fn migration_never_overwrites_overrides_this_profile_already_has() {
+        let (root, _g) = scratch("migrate-existing");
+        let profile = root.join("profiles/alt");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(user_path_in(&profile), r#"{"FIntQ":"1"}"#).unwrap();
+
+        let legacy = legacy_user_path();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, r#"{"FIntQ":"2"}"#).unwrap();
+
+        assert!(migrate_legacy_user_file(&profile).is_none());
+        let layer = read_layer(&user_path_in(&profile), Source::User).unwrap();
+        assert_eq!(layer.values["FIntQ"], "1", "the profile's own file must win");
+        assert!(legacy.exists(), "and the old file is left untouched");
     }
 }

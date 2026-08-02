@@ -14,12 +14,23 @@
 //! cookie store, and Roblox's storage is not built for it. The failure does not
 //! look like "you did something unsupported"; it looks like Cordial corrupting a
 //! login.
+//!
+//! A profile now holds configuration as well as storage — the user's
+//! `flags.json`, `plugin-grants.json`, and `plugins/<id>/settings.json` for
+//! each plugin that keeps anything. See
+//! [ADR-013](../../../docs/adr/ADR-013-per-profile-configuration.md), which
+//! extends ADR-012 and records why grants in particular had to stop being
+//! global: a plugin approved in a throwaway profile was silently approved in
+//! the profile someone plays on. Only the profile *directory* is decided here;
+//! what goes in it is resolved by `flags.rs` and by `cordial_plugins`, both of
+//! which take the directory rather than looking it up for themselves.
 
 use std::ffi::c_int;
 use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
@@ -42,6 +53,55 @@ pub fn root() -> PathBuf {
                 .unwrap_or_else(std::env::temp_dir)
                 .join("cordial/profiles")
         })
+}
+
+/// The profile an instance runs when it was told nothing else.
+///
+/// Not arbitrary: `migrate_legacy_layout` lands pre-existing storage here, so
+/// picking any other name would present as being logged out.
+pub const DEFAULT_NAME: &str = "default";
+
+/// The profile this instance is running, once something has said which.
+///
+/// One process runs one profile for its whole life — that is ADR-012's
+/// definition of an instance, and the `flock` in [`acquire`] is what makes it
+/// true rather than a convention — so this is a fact about the process and is
+/// recorded once as one.
+static ACTIVE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record which profile this instance runs.
+///
+/// **The profile arrives as a command-line argument, and everything else lives
+/// underneath it.** Flag overrides, plugin grants and each plugin's settings
+/// are all resolved from this one directory, so a second argument naming any
+/// of them would be a second source of truth for something already decided.
+/// Settings in particular must not be passed in on the command line: they are
+/// read from the profile while the client runs, and the `DFFlag`/`DFInt`/
+/// `DFString` families exist precisely so that a value can change mid-session
+/// (ADR-005). An argument is fixed at exec and could never express that.
+///
+/// Refuses a second, different answer rather than taking it. Changing profile
+/// under a running engine would mean two `appData` directories in one session,
+/// which is the corruption ADR-012's lock exists to prevent — arriving by a
+/// different door.
+pub fn set_active(dir: PathBuf) -> Result<(), String> {
+    match ACTIVE.set(dir.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) if ACTIVE.get() == Some(&dir) => Ok(()),
+        Err(_) => Err(format!(
+            "this instance already runs {}; a profile cannot be changed while the client is up",
+            ACTIVE.get().expect("set failed, so it is set").display()
+        )),
+    }
+}
+
+/// The profile directory everything else in this process hangs off.
+///
+/// Falls back to [`DEFAULT_NAME`] for a `cordial-run` started by hand, which
+/// has been told no profile and must not therefore write somewhere new — that
+/// would look exactly like being logged out.
+pub fn active() -> PathBuf {
+    ACTIVE.get().cloned().unwrap_or_else(|| root().join(DEFAULT_NAME))
 }
 
 /// A profile name that cannot escape the profile root.
@@ -270,6 +330,35 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0, "profile must not be group- or world-accessible");
+    }
+
+    #[test]
+    fn the_active_profile_is_decided_once_and_defaults_to_the_migrated_one() {
+        // One test rather than three, because `ACTIVE` is a `OnceLock` and the
+        // fallback can only be observed before anything has set it. Written as
+        // a sequence for that reason, not for brevity.
+        let (_root, _g) = scratch("active");
+        assert_eq!(
+            active(),
+            root().join(DEFAULT_NAME),
+            "a client told nothing must use the profile the migration lands storage in, \
+             or a hand-started run presents as being logged out"
+        );
+
+        let chosen = dir("alt_account").unwrap();
+        set_active(chosen.clone()).unwrap();
+        assert_eq!(active(), chosen);
+
+        // Saying yes to the same answer twice is not a conflict; the launcher
+        // and the client both resolving the same argument is ordinary.
+        assert!(set_active(chosen.clone()).is_ok());
+
+        // A different answer is. Two profiles in one session means two appData
+        // directories, which is the corruption the lock exists to prevent
+        // arriving by another door.
+        let refused = set_active(dir("main").unwrap());
+        assert!(refused.is_err(), "a second, different profile must be refused");
+        assert_eq!(active(), chosen, "and the first answer must still stand");
     }
 
     #[test]

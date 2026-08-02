@@ -6,6 +6,10 @@
 //! by process rather than by a restricted in-process API, and
 //! [ADR-005](../../../docs/adr/ADR-005-flag-service.md) for why flag writes are
 //! split across two capabilities.
+//!
+//! What a plugin is allowed to do, and anything it remembers, belong to the
+//! profile rather than to the machine — see
+//! [ADR-013](../../../docs/adr/ADR-013-per-profile-configuration.md).
 
 pub mod broker;
 pub mod capability;
@@ -16,4 +20,5 @@ pub mod manifest;
 pub mod notify;
 pub mod presence;
 pub mod protocol;
+pub mod settings;
 pub mod urlopen;

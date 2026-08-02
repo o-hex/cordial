@@ -34,24 +34,164 @@
 //
 // Written from the engine's thread inside `showKeyboard`, read from the input
 // thread when a key is dispatched, so it is guarded rather than plain.
+
+/// The `NativeTextBoxInfo` the engine built for the box it is focusing, in the
+/// order its constructor takes its arguments: `(FFFFFZIIIIIIZZ)`.
+///
+/// This is a widget spec, and Cordial needs it because on Android the engine
+/// does not draw a focused TextBox's contents at all — the platform does.
+/// Established from the APK's own declarations: `com.roblox.client.RbxKeyboard`
+/// extends `q.l` extends `android.widget.EditText`, and
+/// `res/layout/activity_game.xml` declares one over the GL surface with
+/// `background=@android:color/transparent` and `visibility=gone`. Android
+/// raises a real, invisible text editor on top of the game and lets it paint
+/// the characters.
+///
+/// The fourteen values were previously accepted and dropped, on the reasoning
+/// that a desktop has no on-screen keyboard so none of this applies. That
+/// mistook "no soft keyboard" for "no editor": there is still nothing drawing
+/// the text, which is why a focused box stays blank while typing even though
+/// the keystrokes now reach the engine.
+///
+/// Several slots are still named for their position rather than their meaning,
+/// because the APK does not say which is which and only some of them have been
+/// pinned down by running the thing.
+///
+/// The dex gives the class's fourteen fields — `x y width height fontSize` (F),
+/// `textWrapped multiline manualFocusRelease` (Z), and `font textColor
+/// textInputType returnKeyType xAlignment yAlignment` (I) — but `field_ids` is
+/// sorted by name, so that is the *set* of fields and not the order the
+/// constructor takes them. Parameter names are stripped from the debug info and
+/// the class carries no annotations, so nothing declared in the APK settles it.
+/// All the declarations settle is the grouping: slots 0-4 are the five floats,
+/// 5, 12 and 13 the three booleans, 6-11 the six ints.
+///
+/// The rest came from `CORDIAL_TRACE_TEXT=1` on the Login screen at 1280x720,
+/// where two boxes were focused in turn:
+///
+///     x=470 y=297 w=340 h=22 fontSize=16 z5=0 i6=0 i7=1 textColor=0xffd5d5dd
+///                                        i9=46 i10=7  i11=3 z12=1 z13=0
+///     x=470 y=363 w=304 h=22 fontSize=16 z5=0 i6=0 i7=1 textColor=0xffd5d5dd
+///                                        i9=46 i10=5  i11=1 z12=1 z13=0
+///
+/// which establishes:
+///
+/// Slots 0-2 are x, y and width. 470 is exactly (1280-340)/2, and the two boxes
+/// share slot 0 while differing in slot 1, which is a vertical stack. Read the
+/// other way round the two boxes would be 66px apart horizontally and 340px
+/// wide, overlapping each other and running off the surface.
+///
+/// Slot 8 is textColor: 0xffd5d5dd is an opaque light grey, and nothing else in
+/// this class is a packed ARGB word. This is where the obvious guess at the
+/// order — the field list read straight off in alphabetical-ish reading order,
+/// which puts textColor at slot 7 — is wrong. It was worth not shipping.
+///
+/// Slots 3 and 4 are height and fontSize in that order, which is not proven but
+/// is the only reading that is not absurd: a 22px line box holding 16pt text is
+/// a text field, a 16px box holding 22pt text is not. INFERRED.
+///
+/// Slots 6, 7, 9, 10 and 11 hold 0, 1, 46, and a pair that differs per box.
+/// Consistent with xAlignment=Left, yAlignment=Centre, a font id, then
+/// textInputType and returnKeyType — the second box being the one below a
+/// username field, slot 11 going 3 to 1 the way Next then Done would. Every
+/// word of that is INFERRED; what is observed is only that 10 and 11 are the
+/// ints that vary between two boxes and the other four do not.
+///
+/// Slot 12 is not multiline. Both boxes are single-line login fields and both
+/// report 1 there, so multiline is slot 5 or slot 13. Which, and which of the
+/// remaining two is textWrapped and which manualFocusRelease, wants a box that
+/// actually differs — an in-experience chat entry rather than a login form.
+///
+/// When a slot is settled, rename it here and in `RawTextBoxInfo` in
+/// `crates/cordial-linker-sys/src/lib.rs` together. A wrong name would be worse
+/// than no name, because it would be believed.
+struct CordialTextBoxInfo {
+    float x, y, width, height, font_size;
+    // The three `Z` slots are widened to `int` rather than kept as `jboolean`.
+    // This struct is mirrored field-for-field on the Rust side, and a one-byte
+    // member sitting between four-byte ones is padding waiting to be got wrong.
+    int z5;
+    int i6, i7;
+    int text_color;
+    int i9, i10, i11;
+    int z12, z13;
+};
+
 namespace {
 std::atomic<long long> g_textbox_handle{0};
 std::mutex g_textbox_mutex;
 std::string g_textbox_text;
+/// The focused box's spec, and whether one was ever supplied. Guarded by
+/// `g_textbox_mutex` alongside the text, which it always arrives with.
+CordialTextBoxInfo g_textbox_info{};
+bool g_textbox_info_known = false;
+/// The most recently constructed `NativeTextBoxInfo`, kept because the engine
+/// builds the object and hands it to `showKeyboard` as a separate step, and it
+/// is only at `showKeyboard` that Cordial learns a box has focus. Also the
+/// fallback for the object arriving null there, which would otherwise lose the
+/// spec silently — the trace says which of the two supplied it.
+CordialTextBoxInfo g_textbox_last_built{};
+bool g_textbox_last_built_known = false;
 /// Bumped on every focus change so the input side can tell "same box, keep
 /// editing" from "new box, reseed the buffer" without comparing handles — a
 /// handle can be reused after a box is destroyed.
 std::atomic<unsigned> g_textbox_generation{0};
+
+/// Every slot, named where a name has been earned and numbered where it has
+/// not. `textColor` is printed in hex because that is the form in which it
+/// identified itself as a colour at all.
+void trace_textbox_info(const char* source, const CordialTextBoxInfo& i) {
+    fprintf(stderr,
+            "[cordial] textbox spec from %s x=%g y=%g w=%g h=%g fontSize=%g "
+            "z5=%d i6=%d i7=%d textColor=%#x i9=%d i10=%d i11=%d z12=%d z13=%d\n",
+            source, static_cast<double>(i.x), static_cast<double>(i.y),
+            static_cast<double>(i.width), static_cast<double>(i.height),
+            static_cast<double>(i.font_size), i.z5, i.i6, i.i7,
+            static_cast<unsigned>(i.text_color), i.i9, i.i10, i.i11, i.z12, i.z13);
+}
 } // namespace
 
-extern "C" void cordial_textbox_focused(long long handle, const char* text) {
-    if (getenv("CORDIAL_TRACE_TEXT")) {
+extern "C" void cordial_textbox_last_built(const CordialTextBoxInfo* info) {
+    if (!info) return;
+    std::lock_guard<std::mutex> lock(g_textbox_mutex);
+    g_textbox_last_built = *info;
+    g_textbox_last_built_known = true;
+}
+
+extern "C" void cordial_textbox_focused(long long handle, const char* text,
+                                        const CordialTextBoxInfo* info) {
+    const bool trace = getenv("CORDIAL_TRACE_TEXT") != nullptr;
+    if (trace) {
         fprintf(stderr, "[cordial] textbox focused handle=%lld current=%zu bytes\n",
                 handle, text ? strlen(text) : 0);
     }
     {
         std::lock_guard<std::mutex> lock(g_textbox_mutex);
         g_textbox_text = text ? text : "";
+        const char* source = nullptr;
+        if (info) {
+            g_textbox_info = *info;
+            g_textbox_info_known = true;
+            source = "showKeyboard";
+        } else if (g_textbox_last_built_known) {
+            g_textbox_info = g_textbox_last_built;
+            g_textbox_info_known = true;
+            source = "last <init>";
+        } else {
+            // Neither path produced one. Keeping the previous box's numbers
+            // would be worse than admitting the gap: an editor styled from a
+            // stale spec sits in the wrong place and looks like a layout bug
+            // rather than a missing value.
+            g_textbox_info = CordialTextBoxInfo{};
+            g_textbox_info_known = false;
+        }
+        if (trace) {
+            if (source) {
+                trace_textbox_info(source, g_textbox_info);
+            } else {
+                fprintf(stderr, "[cordial] textbox spec unavailable\n");
+            }
+        }
     }
     g_textbox_handle.store(handle, std::memory_order_release);
     g_textbox_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -60,6 +200,12 @@ extern "C" void cordial_textbox_focused(long long handle, const char* text) {
 extern "C" void cordial_textbox_blurred() {
     if (getenv("CORDIAL_TRACE_TEXT")) {
         fprintf(stderr, "[cordial] textbox blurred\n");
+    }
+    {
+        // The spec goes with the focus. A caller that kept drawing an editor
+        // from the last known geometry would leave one over an unfocused box.
+        std::lock_guard<std::mutex> lock(g_textbox_mutex);
+        g_textbox_info_known = false;
     }
     g_textbox_handle.store(0, std::memory_order_release);
     g_textbox_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -73,6 +219,50 @@ extern "C" long long cordial_textbox_handle() {
 
 extern "C" unsigned cordial_textbox_generation() {
     return g_textbox_generation.load(std::memory_order_acquire);
+}
+
+/// Copy the focused box's spec into `*out`. Returns 1 when one is known, 0
+/// otherwise — and 0 has to mean "do not style anything from this", because
+/// `*out` is left untouched rather than zeroed. A box at (0, 0) sized 0x0 is
+/// indistinguishable from a box Cordial was never told about, and only one of
+/// those is worth drawing an editor for.
+extern "C" int cordial_textbox_info(CordialTextBoxInfo* out) {
+    if (!out) return 0;
+    std::lock_guard<std::mutex> lock(g_textbox_mutex);
+    if (!g_textbox_info_known) return 0;
+    *out = g_textbox_info;
+    return 1;
+}
+
+/// Test seam: publish a focused box built here, from the fourteen values in
+/// the order `NativeTextBoxInfo.<init>` takes them.
+///
+/// It exists because the obvious test — hand a Rust-built struct to
+/// `cordial_textbox_focused` and read it back — proves only that `memcpy`
+/// works. That version was written first and passed with the Rust mirror
+/// deliberately shifted by one field, which is precisely the bug it was meant
+/// to catch. Naming the members on this side and naming them again on the
+/// other is what makes the two layouts have to agree.
+extern "C" void cordial_textbox_test_focus(long long handle, const char* text,
+                                           float s0, float s1, float s2, float s3,
+                                           float s4, int s5, int s6, int s7, int s8,
+                                           int s9, int s10, int s11, int s12, int s13) {
+    CordialTextBoxInfo info{};
+    info.x = s0;
+    info.y = s1;
+    info.width = s2;
+    info.height = s3;
+    info.font_size = s4;
+    info.z5 = s5;
+    info.i6 = s6;
+    info.i7 = s7;
+    info.text_color = s8;
+    info.i9 = s9;
+    info.i10 = s10;
+    info.i11 = s11;
+    info.z12 = s12;
+    info.z13 = s13;
+    cordial_textbox_focused(handle, text, &info);
 }
 
 /// Copy the focused box's current contents into `buf`. Returns the number of
@@ -198,11 +388,19 @@ public:
 
 /// `com.roblox.engine.jni.model.NativeTextBoxInfo`
 ///
-/// The text-box state the on-screen keyboard would have edited. Desktop input
-/// never needs it, but it has to exist as a type for the `showKeyboard`
-/// descriptor to match.
+/// The spec for the editor Android lays over the focused text box. See
+/// `CordialTextBoxInfo` at the top of this file for what the fourteen values
+/// are, what is established about their order and what is not, and why an
+/// editor is needed on a machine with no on-screen keyboard.
 class NativeTextBoxInfo : public Object {
 public:
+    /// The values this object was constructed with. Held per-object because
+    /// `showKeyboard` is handed the object itself, so reading them back off it
+    /// is exact where the process-wide "most recently built" slot is only a
+    /// good guess about which box the engine meant.
+    CordialTextBoxInfo spec{};
+    bool spec_known = false;
+
     // The engine constructs one of these and hands it to `showKeyboard`. With no
     // constructor registered, libjnivm logged
     //
@@ -213,14 +411,26 @@ public:
     // every later JNI call on the thread then trips over, which is a plausible
     // way for text entry to be wedged well after the call that caused it.
     //
-    // The descriptor is (FFFFFZIIIIIIZZ) — five floats for the box's rectangle
-    // and font metrics, then flags and counts. The fields are not interpreted
-    // here: Cordial has no on-screen keyboard to lay out, so what matters is
-    // that a real object exists and the call resolves.
+    // Every argument used to be discarded here. Resolving the call was only
+    // half of it: these are the numbers that say where the box is on screen and
+    // what its text should look like, and without them Cordial has nothing to
+    // position or style an editor from.
     static std::shared_ptr<NativeTextBoxInfo> init(
-        ENV*, Class*, jfloat, jfloat, jfloat, jfloat, jfloat, jboolean, jint, jint,
-        jint, jint, jint, jint, jboolean, jboolean) {
-        return std::make_shared<NativeTextBoxInfo>();
+        ENV*, Class*, jfloat f0, jfloat f1, jfloat f2, jfloat f3, jfloat f4,
+        jboolean z5, jint i6, jint i7, jint i8, jint i9, jint i10, jint i11,
+        jboolean z12, jboolean z13) {
+        auto o = std::make_shared<NativeTextBoxInfo>();
+        // Positional on purpose: these are the constructor's slots, and only
+        // some of them have earned a name. See `CordialTextBoxInfo`.
+        o->spec = CordialTextBoxInfo{
+            f0, f1, f2, f3, f4,
+            z5 ? 1 : 0,
+            i6, i7, i8, i9, i10, i11,
+            z12 ? 1 : 0, z13 ? 1 : 0,
+        };
+        o->spec_known = true;
+        cordial_textbox_last_built(&o->spec);
+        return o;
     }
 
     static void Register(ENV* env) {
@@ -263,9 +473,17 @@ public:
     // matches hooks on the descriptor derived from the C++ types, so `byte[]` has
     // to be an Array<jbyte> and the last argument the real class — Object would
     // produce Ljava/lang/Object; and silently never match.
+    //
+    // The `NativeTextBoxInfo` is the fourth thing this call carries and the
+    // reason the other half of text entry can work at all: it says where the
+    // box is and how its text is drawn. Android uses it to place a real
+    // `EditText` over the GL surface, because the engine does not paint a
+    // focused box's contents itself. Cordial dropped it, which is why typing
+    // into a box that is genuinely receiving the keystrokes still shows
+    // nothing.
     static void showKeyboard(ENV*, Class*, jlong handle, jboolean,
                              std::shared_ptr<jnivm::Array<jbyte>> current,
-                             std::shared_ptr<NativeTextBoxInfo>) {
+                             std::shared_ptr<NativeTextBoxInfo> info) {
         std::string text;
         if (current) {
             for (jsize i = 0; i < current->getSize(); i++) {
@@ -274,7 +492,13 @@ public:
                 text.push_back(static_cast<char>(b));
             }
         }
-        cordial_textbox_focused(handle, text.c_str());
+        // Straight off the object when it arrives, since that is the box the
+        // engine actually named. A null falls back to the last one constructed
+        // rather than to nothing, because an unmatched hook here would look
+        // exactly like a box with no spec.
+        const CordialTextBoxInfo* spec =
+            (info && info->spec_known) ? &info->spec : nullptr;
+        cordial_textbox_focused(handle, text.c_str(), spec);
     }
     static void hideKeyboard(ENV*, Class*) { cordial_textbox_blurred(); }
 
@@ -312,8 +536,84 @@ public:
     static void onLuaTextBoxPropertyChangedCallback(ENV*, Class*) {}
     static void listenToMotionEvents(ENV*, Class*, std::shared_ptr<String>) {}
     static void screenOrientationChanged(ENV*, Class*, jint) {}
-    static void openNativeOverlay(ENV*, Class*, std::shared_ptr<String>,
-                                  std::shared_ptr<String>) {}
+
+    // ------------------------------------------------------------ web views
+    //
+    // Marketplace, Profile, Friends, Communities, Create, the blog, gift cards
+    // and most link-opening are web content on Android, not engine-rendered UI,
+    // and these three calls are the whole of how the engine asks for them on the
+    // transport this build uses. See docs/analysis/webview-surface.md for how
+    // that was established, and in particular for why `android.webkit.WebView`
+    // is *not* the boundary to implement: the engine never touches it, because
+    // driving a `WebView` is Roblox's own Java code's job and Cordial stands in
+    // for that code rather than running it.
+    //
+    // All three report rather than return, because none of them can be answered
+    // honestly yet. `openNativeOverlay` used to be an empty body, which is the
+    // failure this section exists to correct: a request to show a web page
+    // vanished with no trace anywhere, so "Marketplace does nothing" looked
+    // identical to "Marketplace was never asked for". Those need to be
+    // distinguishable before anyone can work on either.
+
+    /// Urls on this boundary can carry a single-use authentication ticket in
+    /// their query string, and the session's own `.ROBLOSECURITY` travels the
+    /// adjacent cookie path. Diagnostics print scheme, host and path and stop
+    /// there; a truncation would still leak the front of a token.
+    static std::string url_without_query(const std::string& url) {
+        auto cut = url.find_first_of("?#");
+        if (cut == std::string::npos) return url;
+        std::string out = url.substr(0, cut);
+        out += (url[cut] == '?') ? "?<query elided>" : "#<fragment elided>";
+        return out;
+    }
+
+    /// The engine asking the platform to put a web page on screen: url, title.
+    /// Corresponds to `BrowserService::openNativeOverlay` on the engine side,
+    /// which logs the same two arguments as `openWebView_`.
+    static void openNativeOverlay(ENV*, Class*, std::shared_ptr<String> url,
+                                  std::shared_ptr<String> title) {
+        fprintf(stderr,
+                "[roblox] web view requested, and Cordial has none: %s (title: %s)\n",
+                url ? url_without_query(*url).c_str() : "(null)",
+                title ? title->c_str() : "");
+    }
+
+    /// `(String type, String data)` on both. The app bridge and the DataModel
+    /// notification channel are how the engine tells the platform that app
+    /// state changed — `APP_READY`, `PURCHASE_ROBUX` and the rest — and on
+    /// Android some of those are what send the user to a web page.
+    ///
+    /// Left as reports rather than acted on: which type maps to which
+    /// destination lives in Roblox's Java, and is not established here.
+    /// Resolving them is worth doing on its own account, because an unresolved
+    /// JNI call leaves a pending exception that the next JNI call on the same
+    /// thread trips over, which surfaces far away from the cause.
+    static void onAppBridgeNotification(ENV*, Class*, std::shared_ptr<String> type,
+                                        std::shared_ptr<String> data) {
+        fprintf(stderr, "[roblox] app bridge: %s %s\n",
+                type ? type->c_str() : "(null)", data ? data->c_str() : "");
+    }
+    static void onDataModelNotificationCallback(ENV*, Class*, std::shared_ptr<String> type,
+                                                std::shared_ptr<String> data) {
+        fprintf(stderr, "[roblox] datamodel notification: %s %s\n",
+                type ? type->c_str() : "(null)", data ? data->c_str() : "");
+    }
+
+    /// Not a getter despite the name — it returns void because it is a request,
+    /// and the platform is expected to answer later by calling
+    /// `NativeGLInterface.setWebviewUserAgent(String)`, which `libroblox.so`
+    /// exports.
+    ///
+    /// Deliberately unanswered. The truthful answer is the user agent of the web
+    /// view that will show the page, and there is no web view, so any string put
+    /// here would be a claim about a browser that does not exist — telling the
+    /// engine one thing and Roblox's servers another the moment one does. The
+    /// engine carries on with the agent `InitParams.userAgent` already gave it.
+    static void getWebViewUserAgent(ENV*, Class*) {
+        fprintf(stderr,
+                "[roblox] web view user agent requested; unanswered, because "
+                "there is no web view to ask (see docs/analysis/webview-surface.md)\n");
+    }
 
     static void Register(ENV* env) {
         env->GetClass<NativeGLJavaInterface>("com/roblox/engine/jni/NativeGLJavaInterface");
@@ -335,6 +635,11 @@ public:
         c->Hook(env, "screenOrientationChanged",
                 &NativeGLJavaInterface::screenOrientationChanged);
         c->Hook(env, "openNativeOverlay", &NativeGLJavaInterface::openNativeOverlay);
+        c->Hook(env, "onAppBridgeNotification",
+                &NativeGLJavaInterface::onAppBridgeNotification);
+        c->Hook(env, "onDataModelNotificationCallback",
+                &NativeGLJavaInterface::onDataModelNotificationCallback);
+        c->Hook(env, "getWebViewUserAgent", &NativeGLJavaInterface::getWebViewUserAgent);
     }
 };
 

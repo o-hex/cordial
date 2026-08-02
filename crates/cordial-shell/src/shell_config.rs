@@ -73,15 +73,34 @@ impl Default for AppearanceScheme {
     }
 }
 
+/// The profile a launch runs against when nobody has chosen otherwise.
+///
+/// ADR-012's migration lands the pre-existing storage at `profiles/default`, so
+/// this name is not arbitrary — picking anything else would present as being
+/// logged out.
+pub const DEFAULT_PROFILE: &str = "default";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellConfig {
     pub appearance: AppearanceScheme,
+    /// Where the Roblox build is, when the user has pinned it. Empty is the
+    /// normal state and means "look every time" — see `install::locate`, which
+    /// explains why a remembered answer is the wrong thing to store here.
+    pub roblox: crate::install::RobloxInstall,
+    /// Which profile an instance started from this shell runs. ADR-012: a
+    /// profile is storage, an instance is a window, and one profile is held by
+    /// at most one instance.
+    pub profile: String,
 }
 
 impl Default for ShellConfig {
     fn default() -> Self {
-        Self { appearance: AppearanceScheme::default() }
+        Self {
+            appearance: AppearanceScheme::default(),
+            roblox: crate::install::RobloxInstall::default(),
+            profile: DEFAULT_PROFILE.to_string(),
+        }
     }
 }
 
@@ -150,8 +169,37 @@ mod tests {
     #[test]
     fn a_saved_choice_round_trips() {
         let p = scratch("roundtrip.json");
-        save(&p, &ShellConfig { appearance: AppearanceScheme::Dark }).unwrap();
+        save(&p, &ShellConfig { appearance: AppearanceScheme::Dark, ..Default::default() }).unwrap();
         assert_eq!(load(&p).appearance, AppearanceScheme::Dark);
+    }
+
+    #[test]
+    fn a_config_written_before_the_roblox_fields_existed_still_loads() {
+        // `#[serde(default)]` is what makes this true, and it is worth a test
+        // rather than a note: everyone who has run this shell already has a
+        // shell.json holding nothing but `appearance`, and a launcher that
+        // refuses to start over a missing field it invented is a worse failure
+        // than any of the ones it is meant to report.
+        let p = scratch("older-schema.json");
+        std::fs::write(&p, r#"{"appearance":"dark"}"#).unwrap();
+        let config = load(&p);
+        assert_eq!(config.appearance, AppearanceScheme::Dark);
+        assert_eq!(config.profile, DEFAULT_PROFILE);
+        assert_eq!(config.roblox, crate::install::RobloxInstall::default());
+    }
+
+    #[test]
+    fn the_roblox_paths_round_trip() {
+        let p = scratch("roblox.json");
+        let mut config = ShellConfig::default();
+        config.roblox.apk = Some(PathBuf::from("/somewhere/base.apk"));
+        config.roblox.lib_dir = Some(PathBuf::from("/somewhere/lib/x86_64"));
+        config.profile = "alt_account".into();
+        save(&p, &config).unwrap();
+        let back = load(&p);
+        assert_eq!(back.roblox.apk, config.roblox.apk);
+        assert_eq!(back.roblox.lib_dir, config.roblox.lib_dir);
+        assert_eq!(back.profile, "alt_account");
     }
 
     #[test]

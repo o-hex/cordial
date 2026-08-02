@@ -492,7 +492,7 @@ fn main() -> ExitCode {
                     // The bridge sequence, without a handle and without AGDK.
                     let (rw, rh) = requested_resolution();
                     match cordial_runtime::android::open_window(
-                        rw, rh, &cordial_runtime::window_title("OpenGL ES"),
+                        rw, rh, &cordial_shell::host_window::title(),
                     ) {
                         Err(e) => println!("  no window: {e}"),
                         Ok(w) => {
@@ -643,7 +643,7 @@ fn main() -> ExitCode {
                                 // callbacks arrive.
                                 let (rw, rh) = requested_resolution();
                                 match cordial_runtime::android::open_window(
-                                    rw, rh, &cordial_runtime::window_title("OpenGL ES"),
+                                    rw, rh, &cordial_shell::host_window::title(),
                                 ) {
                                     Err(e) => println!("  no window: {e}"),
                                     Ok(w) => {

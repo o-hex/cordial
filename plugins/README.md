@@ -13,7 +13,8 @@ discovers them under `~/.local/share/cordial/plugins/`.
 ```
 
 `capabilities` is what the plugin **requests**. What it actually gets is what you
-approved in `~/.config/cordial/plugin-grants.json`:
+approved, in the profile you approved it in —
+`~/.local/share/cordial/profiles/<profile>/plugin-grants.json`:
 
 ```json
 { "flag-inspector": ["flags.read", "log"] }
@@ -22,6 +23,14 @@ approved in `~/.config/cordial/plugin-grants.json`:
 Default deny — a plugin missing from that file gets nothing, and a capability it
 asked for but you did not grant is refused at the point of use, by name, so the
 author can tell "not allowed" from "broken".
+
+**Grants are per profile, and that is deliberate.** Approving a plugin in a
+profile you made to try something out does not approve it in the profile you
+actually play on. The plugin is installed once for the machine; what it is
+allowed to do is decided per account. An existing
+`~/.config/cordial/plugin-grants.json` from before this changed is moved into the
+first profile that looks for one, and every other profile starts at default deny
+— see [ADR-013](../docs/adr/ADR-013-per-profile-configuration.md).
 
 ## What a plugin cannot do
 
@@ -68,6 +77,41 @@ To keep that rare, the common effects are already brokered — `presence.set`,
 here, open an issue: a broker is a payload type and an effect, so adding one is a
 small change rather than a redesign. If a proposed broker *cannot* be small, that
 usually means the capability is too broad and wants splitting.
+
+## Settings: Cordial keeps them, your plugin never touches the file
+
+A plugin runs with no file access, so it has nowhere of its own to remember
+anything. `settings.read` and `settings.write` give it one without giving it a
+path: Cordial owns `<profile>/plugins/<your-id>/settings.json` and your plugin
+exchanges a JSON document.
+
+The document arrives unasked, in the handshake, so the usual case costs no round
+trip:
+
+```ts
+// A push has no id; the handshake is the one with this event name.
+if (msg.id === undefined && msg.event === "cordial/init") {
+  const settings = msg.payload.settings;   // your document, {} if you have none,
+                                           // null if you were not granted settings.read
+}
+
+await call("settings.set", { settings: { panel: "flags", opened: 4 } });
+const mine = await call("settings.get");   // takes no arguments — see below
+```
+
+`settings.set` replaces the whole document rather than merging, so you can remove
+a key you have stopped using. It must be a JSON object, and it is capped at a
+megabyte: this is configuration, not a data store.
+
+**Scoped to your own id, structurally.** Neither call takes a plugin id, because
+Cordial already knows which process is on the other end of the pipe. Naming
+another plugin in your params is not an error and is not honoured — you get your
+own document. There is no field to set to somebody else's name, which is the same
+defence `events.declare` uses for namespaces.
+
+They are two capabilities, not one, for the reason `events.declare` and
+`events.publish` are two: a plugin that only reads its configuration should not
+have to be trusted to rewrite it.
 
 ## Plugins may declare their own events
 

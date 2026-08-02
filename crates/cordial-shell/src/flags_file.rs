@@ -11,13 +11,21 @@
 //!
 //! The renderer preference is the only General-page row backed by this,
 //! because it is the only one with somewhere real to land: `flags.json` is
-//! read by `cordial-load` regardless of which process wrote it. Window
+//! read by `cordial-run` regardless of which process wrote it. Window
 //! placement and resolution (`CORDIAL_MONITOR`, `CORDIAL_RESOLUTION`,
-//! `CORDIAL_FULLSCREEN`, `CORDIAL_WINDOW_POS`) are read from `cordial-load`'s
-//! own process environment, not a file, and this standalone shell does not
-//! launch that process yet — there is nothing for a setting to write to, so
-//! none of those are exposed in the settings window. A switch that changes
-//! nothing is worse than no switch.
+//! `CORDIAL_FULLSCREEN`, `CORDIAL_WINDOW_POS`) are read from `cordial-run`'s
+//! own process environment rather than from a file.
+//!
+//! *Corrected:* the reason given here used to be that the shell does not
+//! launch that process, so there was nothing for such a setting to write to.
+//! It does now — see `launch.rs`, which spawns it and sets the environment it
+//! runs with — so that argument no longer holds and the honest one is
+//! narrower: those four are worth exposing and nobody has, and two of them
+//! (`CORDIAL_MONITOR`, `CORDIAL_FULLSCREEN`) are read only by the X11 backend
+//! and do nothing on the Wayland one the launcher now asks for. Adding a row
+//! for a variable that silently does nothing would be the switch-that-changes-
+//! nothing this paragraph warns about, so the warning stands and the reason
+//! has moved.
 
 use std::path::{Path, PathBuf};
 

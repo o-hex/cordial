@@ -251,6 +251,26 @@ it stays, the diagnosis is wrong and the gap is that `sync` never reaches the
 rendered property — chase `onLuaTextBoxChangedCallback` instead. That needs a
 keystroke, which no Wayland-safe automation here can supply.
 
+**Counter-evidence, raised 2026-08-02, and it is strong.** Sober shows typed
+text live, as you type — and Sober's engine process links raw EGL/GLESv2 with
+its own Wayland client and no toolkit at all. Its GTK4/libadwaita/WebKitGTK
+usage is in a separate binary for web views, so there is nothing over its
+surface that could be drawing that text. If the engine could only ever be drawn
+into by an overlay editor, Sober could not do what it demonstrably does. So the
+engine *can* draw a focused `TextBox` itself, and the section above is at best
+incomplete.
+
+The likelier mechanism, and it is testable: on Android, touching a field does
+not raise the soft keyboard when a hardware keyboard is attached, and with no
+soft keyboard up the engine draws its own text and its own caret. What tells it
+which case it is in is `updateKeyboardSize` — which Cordial has never once
+reported correctly *while someone typed*, because the call is gated off behind
+`CORDIAL_KEYBOARD_REPORT=1` after an earlier, wrong version of it
+(`visible=true` with zero height) bounced focus. **Run that experiment before
+building anything shaped like an overlay editor.** It costs one launch:
+`CORDIAL_KEYBOARD_REPORT=1 CORDIAL_TRACE_TEXT=1`, click a field, type. Do not
+treat "the missing piece is a widget" as established while it is untested.
+
 ### The capture does not cover text entry. Do not grep it for this
 
 Checked exhaustively on 2026-08-02, because the repo's one rule sends everyone
@@ -395,6 +415,81 @@ not yet independently confirmed".
 **Do not re-run:** blaming `Invalid currentExtent -1x-1` in FLog by itself —
 see above, it is not diagnostic on its own. Do not re-add the "swap listener
 after `WINDOW` exists" pattern for `xdg_surface` — see bug 2.
+
+### 1a (cont.) The window is a libadwaita window now, and the engine sits inside it
+
+Landed 2026-08-02. The engine's `wl_surface` was its own `xdg_toplevel`, which
+is why there was no titlebar: the canvas *was* the window. It is now a
+`wl_subsurface` of a GTK4/libadwaita toplevel built by
+`cordial_shell::host_window` — the same definition the shell binary uses — and
+positioned over that window's content area.
+
+**Verified by running:** three consecutive 25-second launches reach
+`APP_READY (Landing)` with 547, 548 and 550 `vkQueuePresentKHR` calls, no crash;
+a screenshot shows the libadwaita header bar above Roblox's landing page, which
+the same session's pre-change binary does not have. `WAYLAND_DEBUG=1` shows
+`wl_subcompositor.get_subsurface`, `wl_subsurface.set_desync`,
+`set_position(25, 71)` and `xdg_toplevel.set_app_id("Cordial")` on the wire —
+the app_id had previously only ever been checked by a unit test against the
+desktop entry, never observed.
+
+**Resize was verified, and not by dragging.** A temporary local patch (not
+committed) called `gtk_window_set_default_size` from a timer at 10s and 16s into
+a run, 1280x721 -> 700x460 -> 1500x900. Both took effect with the engine live:
+screenshots show Roblox's landing page re-laid out at each size under the header
+bar, the run reached `Landing` and presented 553 frames, and nothing crashed.
+That exercises the same path a compositor-driven resize takes — content
+allocation changes, `sync_canvas_geometry` moves and resizes the subsurface,
+`surface_resized` reaches the engine, Mesa rebuilds the swapchain — with a
+different trigger. Dragging the window edge by hand is still untested, because
+there is no Wayland-safe way to do it from automation.
+
+**What still needs a human, with the exact commands.** Both need a keystroke or
+a click, which nothing here may synthesise (see AGENTS.md).
+
+```bash
+# 1. Does the engine draw its own text when no soft keyboard is reported?
+#    The experiment §1's correction above asks for. Click a field, type "abc".
+CORDIAL_KEYBOARD_REPORT=1 CORDIAL_TRACE_TEXT=1 CORDIAL_WAYLAND=1 \
+  ./target/release/cordial-load --lib-dir <lib> --apk <apk> \
+  --host-libc --game-activity --run 120
+
+# 2. Does the zwp_text_input_v3 "has no event 8" freeze still happen, and on
+#    which object? Click into a field; WAYLAND_DEBUG prints every event with
+#    its object id, so the id that receives opcode 8 can be matched against
+#    what created it earlier in the same log.
+WAYLAND_DEBUG=1 CORDIAL_WAYLAND=1 ./target/release/cordial-load ... 2>&1 \
+  | tee /tmp/ti.log; grep -n "text_input\|no event" /tmp/ti.log
+```
+
+The second one is the only way anyone has to diagnose that bug rather than
+guess at it, and this change did not touch it.
+
+**Three things worth knowing before touching this code.**
+
+`wl_subsurface.set_desync` is mandatory — a subsurface starts synchronised and
+its commits then wait for the parent's, and GTK only commits when it draws, so
+an idle window would show one engine frame per accidental repaint.
+
+GTK will not open a Wayland display if `GDK_BACKEND` names something else, even
+after `gdk_set_allowed_backends("wayland")`; the two are separate filters and
+their intersection was empty. It fails silently — `gtk_init_check` returns false
+and prints nothing. This session's GNOME desktop exports `GDK_BACKEND=x11`, so
+this is not a hypothetical.
+
+Cordial's `wl_pointer` is now a second pointer object on the same seat as GDK's,
+so it sees enters and clicks aimed at the header bar. `POINTER_ON_CANVAS` filters
+them; without it the engine reacts to a click on the close button and the cursor
+vanishes over the titlebar.
+
+**`wl_keyboard` focus is unchanged in effect and stricter in code.** The fix that
+stopped Cordial seeing keystrokes typed into other windows — `KEYBOARD_FOCUSED`,
+set on `enter` and cleared on `leave`, checked before any key is processed —
+still gates every key. `keyboard_enter` now additionally requires the entered
+surface to be *this window's* toplevel rather than any surface of the client,
+which only narrows what counts as focus. The behaviour was not re-tested against
+a real keystroke, because that needs a human; the code path is a strict subset of
+the one that was tested.
 
 **Now that Wayland presents frames, [ADR-011](adr/ADR-011-wayland-and-libadwaita.md)'s
 removal trigger is close but not met.** The ADR is explicit that `window.rs`

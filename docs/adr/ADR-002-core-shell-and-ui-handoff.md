@@ -130,6 +130,19 @@ otherwise assume it is planned.
   test for admitting anything else to core is whether its absence leaves the user unable
   to recover.
 - Core acquires a GTK dependency it would otherwise have deferred to Phase 4. Accepted.
+- *Extended 2026-08-02:* **the runtime acquires it too, and not by choice.**
+  [ADR-011](ADR-011-wayland-and-libadwaita.md) makes the engine's `wl_surface` a
+  subsurface of this window, and a Wayland subsurface must share a connection —
+  therefore a process — with its parent. So `cordial-shell` is now a library as well
+  as a binary: `cordial_shell::host_window` builds the window, the shell binary puts
+  the chooser in its content slot, and `cordial-runtime` puts the engine's canvas
+  there instead. "That shell and this window are the same window" is now one
+  definition rather than two that resemble each other.
+- What that does **not** yet do is join the two processes. `cordial-shell` and
+  `cordial-load` still each build their own instance of that window, and the T1→T3
+  handoff below remains unspecified and unimplemented. Sharing the definition is
+  what makes the handoff expressible later — the header bar, theming and app_id no
+  longer differ between the two — not a claim that it exists.
 - The plugin host must tolerate being started before it is needed and never being used —
   if the user launches and quits, a warm host is discarded. Cheap.
 - There must be a handoff protocol: core paints, plugin takes over, and the seam must not

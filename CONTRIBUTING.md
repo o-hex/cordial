@@ -175,6 +175,15 @@ detects it with `pkg-config` at configure time and prints which way it went.
 Without it the build still succeeds; `slCreateEngine` just reports failure, as
 it did before audio existed here.
 
+`webkitgtk6.0-devel` (`libwebkitgtk-6.0-dev` on Debian/Ubuntu) will be needed by
+whoever picks up the web view — Marketplace, Profile, Communities and most
+link-opening are web content, and none of it works today. Nothing in the tree
+requires it yet, so its absence breaks nothing; note that the *runtime* library
+often ships already while the development package does not, which makes
+`pkg-config --modversion webkitgtk-6.0` the check that matters rather than
+`ldconfig -p`. `docs/analysis/webview-surface.md` maps what would sit on top of
+it.
+
 Before opening a pull request:
 
 - `cargo test --release` passes

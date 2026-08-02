@@ -75,6 +75,8 @@ pub fn required_capability(method: &str) -> Option<Capability> {
         "notify.send" => Capability::NotifySend,
         "url.open" => Capability::UrlOpen,
         "assets.override" => Capability::AssetsOverride,
+        "settings.get" => Capability::SettingsRead,
+        "settings.set" => Capability::SettingsWrite,
         "events.declare" => Capability::EventsDeclare,
         "events.publish" => Capability::EventsPublish,
         "events.subscribe" => Capability::EventsSubscribe,
@@ -135,6 +137,18 @@ mod tests {
         // granted something unrelated should not incidentally be able to
         // shadow Roblox's own files.
         assert_eq!(required_capability("assets.override"), Some(Capability::AssetsOverride));
+    }
+
+    #[test]
+    fn reading_a_plugins_own_settings_is_a_different_capability_from_rewriting_them() {
+        // The same split as flags.read against flags.write, and it has to be
+        // real at the method mapping and not only in the enum: a plugin
+        // granted settings.read that could reach settings.set would be able to
+        // discard configuration a user spent time on, from a grant that reads
+        // like permission to remember a window size.
+        assert_eq!(required_capability("settings.get"), Some(Capability::SettingsRead));
+        assert_eq!(required_capability("settings.set"), Some(Capability::SettingsWrite));
+        assert_ne!(required_capability("settings.get"), required_capability("settings.set"));
     }
 
     #[test]

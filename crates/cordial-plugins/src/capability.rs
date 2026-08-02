@@ -69,6 +69,27 @@ pub enum Capability {
     /// original asset resolve again with nothing to clean up, because nothing
     /// was ever overwritten to begin with.
     AssetsOverride,
+    /// Read the plugin's own settings document.
+    ///
+    /// A plugin has nowhere of its own to keep anything — it runs with no file
+    /// access at all — so before this existed it could not remember a single
+    /// thing between launches, and the only way to give it one would have been
+    /// a path or a descriptor. ADR-007 rules both out, so Cordial holds the
+    /// file and the plugin exchanges a document: the effect, never the channel,
+    /// exactly as `PresenceSet` owns Discord's socket.
+    ///
+    /// Scoped to the plugin's own id, which Cordial takes from its record of
+    /// which process is on the other end of the pipe rather than from the
+    /// request. A field a plugin can set is a field it can set to somebody
+    /// else's name, which is why the event registry does not accept one either.
+    SettingsRead,
+    /// Replace the plugin's own settings document.
+    ///
+    /// Split from `SettingsRead` for the reason `EventsDeclare` is split from
+    /// `EventsPublish`: a plugin that only reads its configuration should not
+    /// have to be trusted to rewrite it. A user approving "remember which
+    /// panel I had open" has not thereby approved "discard everything I set".
+    SettingsWrite,
     /// Register event types under the plugin's own namespace. See ADR-006.
     ///
     /// Separate from `EventsPublish` on purpose: declaring is what makes a
@@ -105,6 +126,8 @@ impl Capability {
             Capability::NotifySend => "notify.send",
             Capability::UrlOpen => "url.open",
             Capability::AssetsOverride => "assets.override",
+            Capability::SettingsRead => "settings.read",
+            Capability::SettingsWrite => "settings.write",
             Capability::EventsDeclare => "events.declare",
             Capability::EventsPublish => "events.publish",
             Capability::EventsSubscribe => "events.subscribe",
@@ -122,6 +145,8 @@ impl Capability {
             "notify.send" => Capability::NotifySend,
             "url.open" => Capability::UrlOpen,
             "assets.override" => Capability::AssetsOverride,
+            "settings.read" => Capability::SettingsRead,
+            "settings.write" => Capability::SettingsWrite,
             "events.declare" => Capability::EventsDeclare,
             "events.publish" => Capability::EventsPublish,
             "events.subscribe" => Capability::EventsSubscribe,
@@ -142,6 +167,8 @@ impl Capability {
             Capability::NotifySend,
             Capability::UrlOpen,
             Capability::AssetsOverride,
+            Capability::SettingsRead,
+            Capability::SettingsWrite,
             Capability::EventsDeclare,
             Capability::EventsPublish,
             Capability::EventsSubscribe,
@@ -152,5 +179,34 @@ impl Capability {
 impl fmt::Display for Capability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn every_capability_round_trips_through_its_wire_name() {
+        // `name`, `parse` and `all` are three hand-maintained lists of one
+        // thing. A variant added to two of them and missed in the third fails
+        // quietly: a grants file naming it would be refused as unknown, and the
+        // user would be told they granted something that does not exist.
+        for c in Capability::all() {
+            assert_eq!(Capability::parse(c.name()), Some(*c), "{c} does not parse back");
+        }
+        let names: BTreeSet<&str> = Capability::all().iter().map(|c| c.name()).collect();
+        assert_eq!(names.len(), Capability::all().len(), "two capabilities share a wire name");
+    }
+
+    #[test]
+    fn reading_settings_is_not_writing_them() {
+        // Split for the same reason declare and publish are split. A copied
+        // arm returning the other's name here would make a grant of
+        // settings.read parse as settings.write and silently widen it.
+        assert_eq!(Capability::parse("settings.read"), Some(Capability::SettingsRead));
+        assert_eq!(Capability::parse("settings.write"), Some(Capability::SettingsWrite));
+        assert_ne!(Capability::SettingsRead, Capability::SettingsWrite);
     }
 }

@@ -1,6 +1,7 @@
 # ADR-012: A profile is storage; an instance is a window
 
 **Status:** accepted
+**Extended by:** [ADR-013](ADR-013-per-profile-configuration.md)
 **Related:** [ADR-002](ADR-002-core-shell-and-ui-handoff.md), [ADR-005](ADR-005-flag-service.md), [ADR-006](ADR-006-plugin-events-and-first-party.md)
 
 ## Decision
@@ -15,6 +16,13 @@ Two words, kept distinct, because conflating them designs the wrong thing:
 An instance *runs* a profile. Profiles live at
 `$XDG_DATA_HOME/cordial/profiles/<name>/`, and **a profile may be held by at most
 one instance at a time**, enforced by an advisory lock rather than by convention.
+
+The "plugin set and flag overrides" half of that definition was aspirational
+when this was written: only storage actually moved, and grants and flags stayed
+global for several months afterwards.
+[ADR-013](ADR-013-per-profile-configuration.md) finishes it and records why the
+grants file in particular could not stay global — an approval given in a
+throwaway profile was silently in force in the profile someone plays on.
 
 Multiple instances is launching the process more than once, each against a
 different profile.

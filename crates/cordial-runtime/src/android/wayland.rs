@@ -6,77 +6,87 @@
 //! with no display at all; this file follows the same rule for
 //! `libwayland-client.so.0`, `libwayland-egl.so.1` and `libxkbcommon.so.0`.
 //!
-//! ## Why the protocol is hand-marshalled rather than generated
+//! ## One hand-written protocol table is left, and that is one too many
 //!
-//! `wayland-scanner` turns a protocol XML file into a `wl_interface` table per
-//! interface — the ABI `wl_proxy_marshal_flags` needs to know how many
-//! arguments a request takes and of what type. The core protocol's tables
-//! (`wl_compositor_interface`, `wl_surface_interface`, `wl_seat_interface`,
-//! `wl_pointer_interface`, `wl_keyboard_interface`, `wl_registry_interface`,
-//! `wl_display_interface`) are compiled into `libwayland-client.so` itself and
-//! exported as data symbols — `dlsym` reaches them the same way it reaches
-//! `XOpenDisplay` in `window.rs`. `xdg-shell` and `text-input-unstable-v3` are
-//! not core protocol, so nothing exports their tables; every Wayland client
-//! that speaks them normally compiles a copy of `wayland-scanner`'s generated
-//! C from the protocol XML. No `wayland-protocols` package is available in
-//! this build environment (checked: `wayland-scanner` is present,
-//! `xdg-shell.xml`/`text-input-unstable-v3.xml` are not), and pinning a
-//! network fetch of a `.xml` file into the build is worse than the
-//! alternative here: these two protocols are small, unversioned-since-
-//! introduction, and their wire shape has been stable for years, so the
-//! tables below are written out by hand rather than generated. Each request
-//! signature is checked against what is actually marshalled at its call
-//! site; get either one wrong and `wl_proxy_marshal_flags` reads the wrong
-//! number or type of variadic arguments and corrupts the wire, which is
-//! exactly the risk a generator exists to remove — so treat any protocol
-//! surface added here with the same suspicion a hand-transcribed struct
-//! layout gets anywhere else in this tree.
+//! `wl_proxy_marshal_flags` needs a `wl_interface` table to know how many
+//! arguments a request takes and of what type, and the core protocol's tables
+//! are compiled into `libwayland-client.so` and exported as data symbols —
+//! `dlsym` reaches them the same way it reaches `XOpenDisplay` in `window.rs`.
 //!
-//! One simplification is deliberate, not an oversight: every message's
-//! `types` array (the per-argument interface pointers `wl_interface` tables
-//! carry) is filled with nulls throughout. `wl_proxy_marshal_flags` gets the
-//! *new* object's interface from the explicit `interface` parameter passed at
-//! the call site, not from the static table — `types[]` is read for two
-//! things only, debug-printing under `WAYLAND_DEBUG` and auto-creating a
-//! client-side proxy for an incoming event argument of type `new_id`. None of
-//! the custom interfaces below has an event with a `new_id` argument (checked
-//! against each table when it was written), so the only cost of the null
-//! fill is that `WAYLAND_DEBUG=1` prints interface names as `(nil)` for these
-//! messages instead of their real name — a debugging convenience, not a
-//! functional gap.
+//! This file used to hand-write two protocols that nothing exports, because no
+//! `wayland-protocols` XML was available to generate from. `xdg_shell` is now
+//! gone: GTK owns the `xdg_toplevel`, and the subsurface role this file uses
+//! instead is core protocol. `text-input-unstable-v3` is still hand-written,
+//! and is the one interface below whose event count is this file's assertion
+//! rather than the library's — see the note on its live bug further down, and
+//! notice that the failure mode it shows is precisely the failure mode a
+//! hand-written table has.
 //!
-//! ## Why the IME is a bridge, not an input method
+//! **Do not add another.** A signature that is wrong by one argument makes
+//! `wl_proxy_marshal_flags` read the wrong number or type of variadic
+//! arguments and corrupts the wire, and this file's comments record a crash of
+//! exactly that family. If a further protocol is genuinely needed
+//! here, generate it — or take it from GTK, which is in the process now.
 //!
-//! Cordial must not become an input method. `zwp_text_input_v3` exists so the
-//! compositor can route composition to whatever the user already runs — ibus,
-//! fcitx, squeekboard — and Cordial's only job is translating between that and
-//! Android's `showKeyboard`/`syncTextboxTextAndCursorPosition2` contract
-//! `input.rs` already answers. See `docs/NEXT.md` §1 for why hand-rolling an
-//! input method was abandoned, and `AGENTS.md`'s rule against reasoning from a
-//! competitor's binary for why Sober's proof-of-concept (autocorrect and
-//! prediction working through ibus typing-booster) is cited as evidence the
-//! approach works, not as something inspected to build this.
+//! ## The engine's surface is a subsurface, not a toplevel
 //!
-//! **Preedit and committed text are tracked as separate state deliberately.**
-//! A predictive/autocorrecting engine's suggestions arrive as
-//! `preedit_string`, not `commit_string` — only pressing space or a
-//! suggestion actually commits — so a bridge that only handles
-//! `commit_string` looks correct for plain English (where most engines don't
-//! bother composing) and silently drops every suggestion an engine that does
-//! compose offers. `WaylandWindow::preedit` holds the composing string;
-//! `input::edit_text_buffer`'s `TextField` holds only what has actually been
-//! committed. What is sent to the engine on every `done` is the two spliced
-//! together at the caret — never the composing text alone, and never without
-//! it while composition is live.
+//! This file used to give the engine an `xdg_toplevel` of its own, which made
+//! the engine's canvas *the whole window*: no titlebar, no client-side
+//! decorations, and nowhere to put anything of Cordial's beside the canvas.
+//! ADR-011 already said the window is GTK4 + libadwaita and that the shell's
+//! window and this one "are the same window"; a bare toplevel here was the
+//! part that had not caught up.
 //!
-//! **The protocol is double-buffered.** `enter`/`leave`/`preedit_string`/
-//! `commit_string`/`delete_surrounding_text` only describe a pending change;
-//! nothing is applied until `done`. `ImeState::pending` accumulates one
-//! group's worth of these and `apply_done` is the only place any of it
-//! reaches `input::edit_text_buffer` or the composing string — applying each
-//! event as it arrives is the documented classic bug and would mean, for
-//! instance, a `delete_surrounding_text` landing before the `commit_string`
-//! it was meant to pair with actually exists in the buffer yet.
+//! So GTK owns the toplevel now — [`cordial_shell::host_window`], the same
+//! definition the shell binary uses — and the engine's `wl_surface` is a
+//! `wl_subsurface` of it, positioned over the window's content area.
+//! Consequences worth knowing before changing anything here:
+//!
+//! GTK's `wl_display` is the *only* connection in the process. Wayland object
+//! ids are scoped to the connection that made them, so a subsurface cannot
+//! parent to a surface on another one; `open` takes GDK's display rather than
+//! calling `wl_display_connect`, and Mesa is handed the same pointer (see
+//! `egl_get_display`, whose comment on the second-connection hazard now
+//! applies to GDK's connection rather than to one of this file's own).
+//!
+//! `wl_subsurface.set_desync` is not optional. A subsurface starts
+//! *synchronised*, meaning its commits do not take effect until the parent
+//! commits — the engine would present frames that appear only when GTK
+//! happened to repaint, which for a static window is never.
+//!
+//! `set_position` is the mirror image: it *is* latched on the parent's commit,
+//! so moving the canvas needs GTK to repaint afterwards
+//! (`HostWindow::queue_commit`).
+//!
+//! Input is filtered by surface. Cordial's `wl_pointer` is a second pointer
+//! object on the same seat as GDK's, so it sees `enter` for the header bar
+//! too; forwarding those to the engine would have it react to clicks on the
+//! window controls. `pointer_enter` records which surface the pointer is on
+//! and nothing is delivered unless it is the engine's.
+//!
+//! ## The `zwp_text_input_v3` client is untouched, and still has a live bug
+//!
+//! Recorded here rather than left to be rediscovered. `interface
+//! 'zwp_text_input_v3' has no event 8` appears at runtime and freezes the
+//! landing page. `zwp_text_input_v3` has six events, 0 to 5; event 8 exists in
+//! `zwp_text_input_v2`. An opcode past the end of an interface's event table
+//! is the same shape of fault as the crash recorded on [`PointerListener`]
+//! further down this file, which was a table disagreeing with what the
+//! compositor actually sends.
+//!
+//! It was **not** fixed here, and it was not reproduced here either: it needs
+//! a click into a text field, and this change was made in an environment with
+//! no way to click. Do not read the surrounding work as having addressed it.
+//!
+//! One thing this change *did* establish about it, from `WAYLAND_DEBUG=1`:
+//! bringing GTK into the process does not add a second text-input object.
+//! There is exactly one `get_text_input` on the connection and it is this
+//! file's, because GDK creates its own only when a GTK text widget takes
+//! focus, and this window has none. That stops being true the moment anything
+//! focusable-and-editable is added to the window — two `zwp_text_input_v3`
+//! objects on one seat from one client would be a new and much harder bug, and
+//! whoever adds an editor widget here has to resolve which of the two speaks
+//! for Cordial before doing it.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
@@ -84,10 +94,35 @@ use std::sync::{Mutex, OnceLock};
 
 // ------------------------------------------------------------- wire layout
 //
-// `struct wl_interface`/`struct wl_message`, from `wayland-util.h`. Layout is
-// part of libwayland-client's stable ABI — every language binding for Wayland
-// depends on it not changing, which is exactly why hand-writing these tables
-// (see the module doc) is a bounded risk rather than an open-ended one.
+// `struct wl_interface`, from `wayland-util.h`. Only the type is needed now,
+// as the parameter `wl_proxy_marshal_flags` takes and the type of the tables
+// `dlsym` hands back; nothing here declares one. Its layout is part of
+// libwayland-client's stable ABI — every language binding for Wayland depends
+// on it not changing.
+
+#[repr(C)]
+struct WlInterface {
+    name: *const c_char,
+    version: c_int,
+    method_count: c_int,
+    methods: *const WlMessage,
+    event_count: c_int,
+    events: *const WlMessage,
+}
+// SAFETY: as `WlMessage` below.
+unsafe impl Sync for WlInterface {}
+
+
+// ------------------------------------------------- hand-written wire layout
+//
+// `struct wl_message`/the null `types` array, from `wayland-util.h`. Needed
+// only by the two `zwp_text_input` tables below — every other interface this
+// file uses comes out of `libwayland-client.so` itself. `wl_proxy_marshal_
+// flags` gets a *new* object's interface from the explicit `interface`
+// parameter at the call site rather than from `types[]`, which is read only
+// for `WAYLAND_DEBUG` printing and for auto-creating a proxy for an incoming
+// `new_id` event argument — `zwp_text_input_v3` has no such event, so the
+// null fill costs a `(nil)` in debug output and nothing else.
 
 #[repr(C)]
 struct WlMessage {
@@ -101,218 +136,10 @@ struct WlMessage {
 unsafe impl Sync for WlMessage {}
 
 #[repr(C)]
-struct WlInterface {
-    name: *const c_char,
-    version: c_int,
-    method_count: c_int,
-    methods: *const WlMessage,
-    event_count: c_int,
-    events: *const WlMessage,
-}
-// SAFETY: as `WlMessage` above.
-unsafe impl Sync for WlInterface {}
-
-/// Every hand-written message's `types` array — see the module doc for why
-/// null throughout is correct here rather than a shortcut. Sized to 8, well
-/// above the widest signature below (`xdg_toplevel.show_window_menu`, 4
-/// arguments).
-#[repr(C)]
 struct NullTypes([*const WlInterface; 8]);
 // SAFETY: all-null, never mutated.
 unsafe impl Sync for NullTypes {}
 static NO_TYPES: NullTypes = NullTypes([std::ptr::null(); 8]);
-
-// --------------------------------------------------------- xdg_wm_base (v1)
-//
-// Opcode numbers and signatures are xdg-shell's, stable since the protocol
-// left `unstable/` status. Only what Cordial actually drives is exercised;
-// `create_positioner`/`get_popup` keep their real opcode slots (2 and 2's
-// counterpart in `xdg_surface`) so a compositor speaking real xdg-shell never
-// disagrees with this table about which opcode means what, even though
-// Cordial never sends them.
-
-static XDG_WM_BASE_METHODS: [WlMessage; 4] = [
-    WlMessage { name: c"destroy".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
-    WlMessage {
-        name: c"create_positioner".as_ptr(),
-        signature: c"n".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"get_xdg_surface".as_ptr(),
-        signature: c"no".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage { name: c"pong".as_ptr(), signature: c"u".as_ptr(), types: NO_TYPES.0.as_ptr() },
-];
-static XDG_WM_BASE_EVENTS: [WlMessage; 1] =
-    [WlMessage { name: c"ping".as_ptr(), signature: c"u".as_ptr(), types: NO_TYPES.0.as_ptr() }];
-static XDG_WM_BASE_INTERFACE: WlInterface = WlInterface {
-    name: c"xdg_wm_base".as_ptr(),
-    version: 1,
-    method_count: 4,
-    methods: XDG_WM_BASE_METHODS.as_ptr(),
-    event_count: 1,
-    events: XDG_WM_BASE_EVENTS.as_ptr(),
-};
-
-// XDG_WM_BASE opcodes, named so call sites read as intent rather than magic
-// numbers.
-const XDG_WM_BASE_GET_XDG_SURFACE: u32 = 2;
-const XDG_WM_BASE_PONG: u32 = 3;
-
-// -------------------------------------------------------------- xdg_surface
-
-static XDG_SURFACE_METHODS: [WlMessage; 5] = [
-    WlMessage { name: c"destroy".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
-    WlMessage {
-        name: c"get_toplevel".as_ptr(),
-        signature: c"n".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"get_popup".as_ptr(),
-        signature: c"n?oo".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"set_window_geometry".as_ptr(),
-        signature: c"iiii".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"ack_configure".as_ptr(),
-        signature: c"u".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-];
-static XDG_SURFACE_EVENTS: [WlMessage; 1] =
-    [WlMessage { name: c"configure".as_ptr(), signature: c"u".as_ptr(), types: NO_TYPES.0.as_ptr() }];
-static XDG_SURFACE_INTERFACE: WlInterface = WlInterface {
-    name: c"xdg_surface".as_ptr(),
-    version: 1,
-    method_count: 5,
-    methods: XDG_SURFACE_METHODS.as_ptr(),
-    event_count: 1,
-    events: XDG_SURFACE_EVENTS.as_ptr(),
-};
-
-const XDG_SURFACE_GET_TOPLEVEL: u32 = 1;
-const XDG_SURFACE_ACK_CONFIGURE: u32 = 4;
-
-// ------------------------------------------------------------- xdg_toplevel
-//
-// Bound implicitly at the same version as `xdg_wm_base` (a toplevel's version
-// is `wl_proxy_get_version` of the surface it comes from, which comes from
-// `xdg_wm_base`), which this file binds at 1 — see `open`.
-//
-// All four events GNOME Shell's `xdg_toplevel` can send are declared here,
-// not only `configure`/`close`. An earlier version of this table left out
-// `configure_bounds` (v4) and `wm_capabilities` (v5) on the theory that
-// binding at version 1 stops a well-behaved compositor sending them — wrong,
-// measured the hard way: the Wayland backend segfaulted on the *second*
-// `xdg_toplevel` event Mutter ever sent, in `wl_closure_invoke` jumping to
-// address `0xe0`. That is what reading past the end of a too-short listener
-// array looks like — `dispatch_event` indexes `TOPLEVEL_LISTENER` by the
-// wire opcode with no bounds check of its own, so the *n*-th declared event
-// is a contract with the compositor, not a hint, and Mutter does send
-// `wm_capabilities` to a version-1 toplevel the moment it has real content to
-// show it around (which nothing did before the Vulkan `currentExtent` fix
-// nearby in `vulkan.rs` — that is why this was never hit until now). The
-// listener array in `TOPLEVEL_LISTENER` is exactly as long as this table's
-// `event_count`, so the two can never drift apart; both new handlers are
-// no-ops for the same reason `close` already was — nothing here currently
-// reads window bounds or reacts to capability changes.
-
-static XDG_TOPLEVEL_METHODS: [WlMessage; 14] = [
-    WlMessage { name: c"destroy".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
-    WlMessage {
-        name: c"set_parent".as_ptr(),
-        signature: c"?o".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage { name: c"set_title".as_ptr(), signature: c"s".as_ptr(), types: NO_TYPES.0.as_ptr() },
-    WlMessage {
-        name: c"set_app_id".as_ptr(),
-        signature: c"s".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"show_window_menu".as_ptr(),
-        signature: c"ouii".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage { name: c"move".as_ptr(), signature: c"ou".as_ptr(), types: NO_TYPES.0.as_ptr() },
-    WlMessage {
-        name: c"resize".as_ptr(),
-        signature: c"ouu".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"set_max_size".as_ptr(),
-        signature: c"ii".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"set_min_size".as_ptr(),
-        signature: c"ii".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"set_maximized".as_ptr(),
-        signature: c"".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"unset_maximized".as_ptr(),
-        signature: c"".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"set_fullscreen".as_ptr(),
-        signature: c"?o".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"unset_fullscreen".as_ptr(),
-        signature: c"".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"set_minimized".as_ptr(),
-        signature: c"".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-];
-static XDG_TOPLEVEL_EVENTS: [WlMessage; 4] = [
-    WlMessage {
-        name: c"configure".as_ptr(),
-        signature: c"iia".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage { name: c"close".as_ptr(), signature: c"".as_ptr(), types: NO_TYPES.0.as_ptr() },
-    WlMessage {
-        name: c"configure_bounds".as_ptr(),
-        signature: c"ii".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-    WlMessage {
-        name: c"wm_capabilities".as_ptr(),
-        signature: c"a".as_ptr(),
-        types: NO_TYPES.0.as_ptr(),
-    },
-];
-static XDG_TOPLEVEL_INTERFACE: WlInterface = WlInterface {
-    name: c"xdg_toplevel".as_ptr(),
-    version: 1,
-    method_count: 14,
-    methods: XDG_TOPLEVEL_METHODS.as_ptr(),
-    event_count: 4,
-    events: XDG_TOPLEVEL_EVENTS.as_ptr(),
-};
-
-const XDG_TOPLEVEL_SET_TITLE: u32 = 2;
-const XDG_TOPLEVEL_SET_APP_ID: u32 = 3;
 
 // ------------------------------------------------- zwp_text_input_manager_v3
 
@@ -403,6 +230,17 @@ const TEXT_INPUT_SET_CONTENT_TYPE: u32 = 5;
 const TEXT_INPUT_SET_CURSOR_RECTANGLE: u32 = 6;
 const TEXT_INPUT_COMMIT: u32 = 7;
 
+
+// ----------------------------------------------------- subsurface opcodes
+//
+// `wl_subcompositor`/`wl_subsurface` are core protocol, so their
+// `wl_interface` tables come out of `libwayland-client.so` itself like every
+// other interface this file touches — see `WlClient::load`. Only the opcode
+// numbers, fixed by `wayland.xml`, need naming.
+const WL_SUBCOMPOSITOR_GET_SUBSURFACE: u32 = 1;
+const WL_SUBSURFACE_SET_POSITION: u32 = 1;
+const WL_SUBSURFACE_SET_DESYNC: u32 = 5;
+
 // wl_compositor/wl_display/wl_registry/wl_seat/wl_pointer/wl_surface opcodes.
 // Their `wl_interface` tables come from the library itself (dlsym'd below),
 // so only the opcode numbers — fixed by `wayland.xml`, the core protocol —
@@ -432,7 +270,6 @@ type ProxyMarshalFlags = unsafe extern "C" fn(
 ) -> *mut c_void;
 
 struct WlClient {
-    connect: unsafe extern "C" fn(*const c_char) -> *mut c_void,
     get_fd: unsafe extern "C" fn(*mut c_void) -> c_int,
     flush: unsafe extern "C" fn(*mut c_void) -> c_int,
     dispatch_pending: unsafe extern "C" fn(*mut c_void) -> c_int,
@@ -445,6 +282,8 @@ struct WlClient {
 
     registry_interface: *const WlInterface,
     compositor_interface: *const WlInterface,
+    subcompositor_interface: *const WlInterface,
+    subsurface_interface: *const WlInterface,
     surface_interface: *const WlInterface,
     seat_interface: *const WlInterface,
     pointer_interface: *const WlInterface,
@@ -518,7 +357,10 @@ impl WlClient {
             }};
         }
         Ok(WlClient {
-            connect: sym!("wl_display_connect"),
+            // Deliberately no `wl_display_connect`: the one connection in this
+            // process is GTK's, and opening a second would give the engine a
+            // surface whose buffers can never be attached to the window's. See
+            // the module doc.
             get_fd: sym!("wl_display_get_fd"),
             flush: sym!("wl_display_flush"),
             dispatch_pending: sym!("wl_display_dispatch_pending"),
@@ -530,6 +372,8 @@ impl WlClient {
             add_listener: sym!("wl_proxy_add_listener"),
             registry_interface: sym!("wl_registry_interface"),
             compositor_interface: sym!("wl_compositor_interface"),
+            subcompositor_interface: sym!("wl_subcompositor_interface"),
+            subsurface_interface: sym!("wl_subsurface_interface"),
             surface_interface: sym!("wl_surface_interface"),
             seat_interface: sym!("wl_seat_interface"),
             pointer_interface: sym!("wl_pointer_interface"),
@@ -619,17 +463,21 @@ struct RegistryListener {
 
 // `wl_pointer_interface`/`wl_keyboard_interface` (below) are `dlsym`'d from
 // the host's real `libwayland-client.so`, not hand-written like the
-// `xdg_shell`/`text-input` tables elsewhere in this file — so their
-// `event_count` is whatever the *host's* library version really declares,
-// not whatever this file happens to have a listener field for.
-// `dispatch_event` indexes the listener array `wl_proxy_add_listener` was
-// given by the wire opcode with no bounds check of its own, so every one of
-// wl_seat's core-protocol interfaces needs its *complete, current* event set
-// declared here regardless of which `wl_seat` version this file requests —
-// see `XDG_TOPLEVEL_EVENTS`'s own comment for the exact crash (`wl_closure_
-// invoke` jumping to a small garbage address) this same mistake produces, and
-// why "the compositor won't send events past the version I bound" turned out
-// not to hold on GNOME Shell. `PointerListener` was previously missing
+// `text-input` tables above — so their `event_count` is whatever the *host's*
+// library version really declares, not whatever this file happens to have a
+// listener field for. `dispatch_event` indexes the listener array
+// `wl_proxy_add_listener` was given by the wire opcode with no bounds check of
+// its own, so every one of wl_seat's core-protocol interfaces needs its
+// *complete, current* event set declared here regardless of which `wl_seat`
+// version this file requests.
+//
+// The crash this prevents was measured, on a listener struct that is no longer
+// here to point at: the `xdg_toplevel` one, back when this file owned the
+// toplevel. It was two fields long against an interface Mutter sent a fifth
+// event on, and `wl_closure_invoke` jumped to address `0xe0` — a small garbage
+// address, which is what reading past the end of a listener array looks like.
+// The lesson outlived the code: "the compositor will not send events past the
+// version I bound" did not hold on GNOME Shell. `PointerListener` was previously missing
 // `frame`/`axis_source`/`axis_stop`/`axis_discrete`/`axis_value120`/
 // `axis_relative_direction` (added in `wl_pointer` v5, v5, v5, v5, v8, v9);
 // `KeyboardListener` below was missing `repeat_info` (`wl_keyboard` v4). Every
@@ -652,9 +500,8 @@ struct PointerListener {
 
 /// `struct wl_array` (`wayland-util.h`): `{ size_t size; size_t alloc; void
 /// *data; }`. Only the layout matters here — `wl_keyboard.enter`'s pressed-key
-/// array and `xdg_toplevel.configure`'s state array are both received and
-/// both ignored, since neither changes what Cordial does with a key or a
-/// resize.
+/// array is received and ignored, since it does not change what Cordial does
+/// with a key.
 #[repr(C)]
 struct WlArray {
     size: usize,
@@ -673,29 +520,6 @@ struct KeyboardListener {
 }
 
 #[repr(C)]
-struct WmBaseListener {
-    ping: unsafe extern "C" fn(*mut c_void, *mut c_void, u32),
-}
-
-#[repr(C)]
-struct XdgSurfaceListener {
-    configure: unsafe extern "C" fn(*mut c_void, *mut c_void, u32),
-}
-
-#[repr(C)]
-struct ToplevelListener {
-    configure: unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32, *const WlArray),
-    close: unsafe extern "C" fn(*mut c_void, *mut c_void),
-    // Order matches `XDG_TOPLEVEL_EVENTS` exactly — `dispatch_event` indexes
-    // this struct by wire opcode, so a listener struct shorter than the
-    // interface's declared `event_count` is read out of bounds the moment the
-    // compositor sends the (n+1)-th event type. See that table's own comment
-    // for what happened when this struct only had the first two fields.
-    configure_bounds: unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32),
-    wm_capabilities: unsafe extern "C" fn(*mut c_void, *mut c_void, *const WlArray),
-}
-
-#[repr(C)]
 struct TextInputListener {
     enter: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
     leave: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
@@ -706,20 +530,6 @@ struct TextInputListener {
 }
 
 // -------------------------------------------------------------------- state
-
-/// A pending `xdg_toplevel.configure` — width/height only; the state array is
-/// read but not acted on (maximised/fullscreen/activated are not surfaced
-/// anywhere Cordial currently uses them), and the serial to ack travels
-/// separately on `xdg_surface.configure` itself rather than through this
-/// struct. Applied atomically on that paired event, which is the entire
-/// reason ADR-011 gives for choosing Wayland over Xwayland in the first
-/// place: the compositor tells the client exactly when a resize's new size
-/// is final, rather than the client inferring it from a stream of
-/// `ConfigureNotify`.
-struct PendingConfigure {
-    width: i32,
-    height: i32,
-}
 
 struct Geometry {
     width: i32,
@@ -775,7 +585,6 @@ struct ImeState {
     /// keyboard is left to arrows, Enter and shortcuts.
     ime_producing: bool,
 }
-
 struct XkbState {
     xkb: Xkb,
     context: *mut c_void,
@@ -792,11 +601,27 @@ struct XkbState {
 unsafe impl Send for XkbState {}
 unsafe impl Sync for XkbState {}
 
+/// The GTK window the engine's surface hangs under.
+///
+/// GTK objects are `Rc`-refcounted, not atomically, so touching this from two
+/// threads corrupts a refcount rather than failing a lock. Everything that
+/// reaches it — `open`, `pump`, the geometry sync — runs on the thread that
+/// called `open`, which is the same thread `looper::pump` runs on, which is
+/// the thread Android calls the UI thread. Nothing else may touch it, and
+/// that is the whole justification for the `unsafe impl` below.
+struct HostWindowCell(cordial_shell::host_window::HostWindow);
+// SAFETY: see above — main-thread-only by construction, and only reachable
+// through `&WaylandWindow`, whose other users (Mesa's EGL/Vulkan paths, from
+// the engine's render thread) never call the methods that go through here.
+unsafe impl Send for HostWindowCell {}
+unsafe impl Sync for HostWindowCell {}
+
 pub struct WaylandWindow {
     wl: WlClient,
     egl: Option<WlEgl>,
     display: *mut c_void,
-    // Kept named and typed even though only `surface`/`text_input` are read
+    host: HostWindowCell,
+    // Kept named and typed even though only `surface`/`subsurface` are read
     // again after construction — the rest are still owned proxies for the
     // life of this one-window-per-process runtime (the same scope
     // `window.rs`'s `HostWindow` has), and naming them documents the object
@@ -804,11 +629,14 @@ pub struct WaylandWindow {
     // it go unrecorded because nothing currently reads it back.
     #[allow(dead_code)]
     compositor: *mut c_void,
+    #[allow(dead_code)]
+    subcompositor: *mut c_void,
     surface: *mut c_void,
-    #[allow(dead_code)]
-    xdg_surface: *mut c_void,
-    #[allow(dead_code)]
-    xdg_toplevel: *mut c_void,
+    subsurface: *mut c_void,
+    /// GTK's own toplevel `wl_surface` — the subsurface's parent, and the
+    /// surface `wl_keyboard`/`wl_pointer` report focus against for everything
+    /// that is not the canvas.
+    parent_surface: *mut c_void,
     #[allow(dead_code)]
     seat: *mut c_void,
     #[allow(dead_code)]
@@ -819,7 +647,11 @@ pub struct WaylandWindow {
     conn_fd: c_int,
 
     buffers: Mutex<Geometry>,
-    pending_configure: Mutex<Option<PendingConfigure>>,
+    /// Where the canvas currently sits inside the parent surface. Compared
+    /// against the content widget's allocation every pump so a resize or a
+    /// header-bar height change moves the subsurface exactly once, rather than
+    /// re-sending `set_position` on every tick.
+    placed_at: Mutex<(i32, i32)>,
     egl_window: Mutex<*mut c_void>,
 
     xkb: Mutex<Option<XkbState>>,
@@ -858,7 +690,7 @@ static WINDOW: OnceLock<WaylandWindow> = OnceLock::new();
 #[derive(Default)]
 struct Globals {
     compositor: Option<(u32, u32)>,
-    xdg_wm_base: Option<(u32, u32)>,
+    subcompositor: Option<(u32, u32)>,
     seat: Option<(u32, u32)>,
     text_input_manager: Option<(u32, u32)>,
 }
@@ -876,7 +708,7 @@ unsafe extern "C" fn registry_global(
     let iface = CStr::from_ptr(interface).to_string_lossy();
     match iface.as_ref() {
         "wl_compositor" => globals.compositor = Some((name, version)),
-        "xdg_wm_base" => globals.xdg_wm_base = Some((name, version)),
+        "wl_subcompositor" => globals.subcompositor = Some((name, version)),
         "wl_seat" => globals.seat = Some((name, version)),
         "zwp_text_input_manager_v3" => globals.text_input_manager = Some((name, version)),
         _ => {}
@@ -894,154 +726,37 @@ unsafe extern "C" fn registry_global_remove(_data: *mut c_void, _registry: *mut 
 static REGISTRY_LISTENER: RegistryListener =
     RegistryListener { global: registry_global, global_remove: registry_global_remove };
 
-unsafe extern "C" fn wm_base_ping(_data: *mut c_void, wm_base: *mut c_void, serial: u32) {
-    let Some(w) = current() else { return };
-    // SAFETY: `wm_base` is the same proxy this listener was registered
-    // against; `w.wl.marshal_flags`'s signature for `pong` is "u" — one
-    // trailing `u32` argument, exactly what is passed.
-    (w.wl.marshal_flags)(
-        wm_base,
-        XDG_WM_BASE_PONG,
-        std::ptr::null(),
-        1,
-        0,
-        serial,
-    );
-}
-static WM_BASE_LISTENER: WmBaseListener = WmBaseListener { ping: wm_base_ping };
-
-/// The very first `xdg_surface.configure`, received during `open()`'s initial
-/// handshake before `WINDOW` exists for `current()` to find. This one
-/// listener is registered exactly once and left alone for the life of the
-/// proxy — see this function's own branch below for why.
-static INITIAL_XDG_SURFACE_SERIAL: Mutex<Option<u32>> = Mutex::new(None);
-
-unsafe extern "C" fn xdg_surface_configure(data: *mut c_void, xdg_surface: *mut c_void, serial: u32) {
-    let Some(w) = current() else {
-        // Still inside `open()`'s initial handshake: there is no `WaylandWindow`
-        // yet to ack through or resize, only a serial for `open()` itself to
-        // read back out and ack once construction finishes. This one listener
-        // covers both phases *on purpose* — `wl_proxy_add_listener` was
-        // originally called a second time here, to swap in a steady-state
-        // listener once `WINDOW` existed, and that second call silently
-        // returns `-1` and changes nothing (confirmed: logged the return code
-        // directly, `-1` every time). The dangling stack listener from the
-        // first call — a local in `open()`, never actually replaced — stayed
-        // registered after `open()` returned and its stack frame was reused,
-        // so the *next* real `xdg_surface.configure` (any resize after the
-        // initial handshake) read whatever garbage now occupied that stack
-        // slot as a function pointer and jumped to it: `wl_closure_invoke`
-        // segfaulting at a small address (`0xe0`, i.e. some unrelated local's
-        // bytes misread as code). One listener, registered once, for the
-        // whole life of the proxy, is the fix — not a bigger one.
-        let _ = data;
-        *INITIAL_XDG_SURFACE_SERIAL.lock().unwrap_or_else(|e| e.into_inner()) = Some(serial);
-        return;
-    };
-    let (width, height) = {
-        let mut pending = w.pending_configure.lock().unwrap_or_else(|e| e.into_inner());
-        match pending.take() {
-            Some(p) => (p.width, p.height),
-            // A configure with nothing pending from `xdg_toplevel` (e.g. the
-            // compositor re-confirming state) — ack it and leave geometry
-            // alone.
-            None => {
-                let g = w.buffers.lock().unwrap_or_else(|e| e.into_inner());
-                (g.width, g.height)
-            }
-        }
-    };
-    let _ = data;
-    (w.wl.marshal_flags)(
-        xdg_surface,
-        XDG_SURFACE_ACK_CONFIGURE,
-        std::ptr::null(),
-        1,
-        0,
-        serial,
-    );
-    w.apply_resize(width, height);
-}
-static XDG_SURFACE_LISTENER: XdgSurfaceListener = XdgSurfaceListener { configure: xdg_surface_configure };
-
-unsafe extern "C" fn toplevel_configure(
-    data: *mut c_void,
-    _toplevel: *mut c_void,
-    width: i32,
-    height: i32,
-    _states: *const WlArray,
-) {
-    let Some(w) = current() else { return };
-    let _ = data;
-    // A zero dimension means "compositor has no opinion, you choose" (the
-    // documented meaning for the very first configure) — keep whatever
-    // Cordial already asked for rather than resizing to zero.
-    let current = w.buffers.lock().unwrap_or_else(|e| e.into_inner());
-    let width = if width > 0 { width } else { current.width };
-    let height = if height > 0 { height } else { current.height };
-    drop(current);
-    let mut pending = w.pending_configure.lock().unwrap_or_else(|e| e.into_inner());
-    *pending = Some(PendingConfigure { width, height });
-}
-
-unsafe extern "C" fn toplevel_close(_data: *mut c_void, _toplevel: *mut c_void) {
-    // Real close handling (quitting the process cleanly) is not implemented
-    // — the X11 backend has no equivalent either (there is no WM_DELETE_WINDOW
-    // handling in `window.rs`), so this is parity, not a regression, and is
-    // called out explicitly rather than left to be discovered as a silent gap.
-    super::trace(format_args!("wayland: xdg_toplevel.close received; not handled, window stays open"));
-}
-
-// `configure_bounds`/`wm_capabilities` (v4/v5 additions to `xdg_toplevel`) —
-// declared and dispatched to, per the table's own comment on why a listener
-// slot must exist for every event `XDG_TOPLEVEL_EVENTS` declares, but
-// genuine no-ops: nothing here currently constrains window size to the
-// compositor's suggested bounds or reacts to capability changes (fullscreen/
-// maximize/minimize support, which Cordial does not offer toggles for
-// regardless).
-unsafe extern "C" fn toplevel_configure_bounds(
-    _data: *mut c_void,
-    _toplevel: *mut c_void,
-    _width: i32,
-    _height: i32,
-) {
-}
-unsafe extern "C" fn toplevel_wm_capabilities(
-    _data: *mut c_void,
-    _toplevel: *mut c_void,
-    _capabilities: *const WlArray,
-) {
-}
-
-static TOPLEVEL_LISTENER: ToplevelListener = ToplevelListener {
-    configure: toplevel_configure,
-    close: toplevel_close,
-    configure_bounds: toplevel_configure_bounds,
-    wm_capabilities: toplevel_wm_capabilities,
-};
-
-/// `WM_CLASS`'s Wayland equivalent — must keep matching `StartupWMClass` in
-/// `packaging/org.cordial.Cordial.desktop`, same reasoning and the same test
-/// (see `tests::app_id_matches_the_desktop_entry`) as `window.rs`'s
-/// `WM_RES_CLASS`.
-const APP_ID: &str = "Cordial";
-
 pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWindow, String> {
     if let Some(w) = WINDOW.get() {
         return Ok(w);
     }
     let wl = WlClient::load()?;
 
-    // SAFETY: a null name means `$WAYLAND_DISPLAY`, per `wl_display_connect`'s
-    // documented contract.
-    let display = unsafe { (wl.connect)(std::ptr::null()) };
-    if display.is_null() {
-        return Err("no Wayland display (is WAYLAND_DISPLAY set?)".into());
-    }
+    // ---- the window itself. GTK opens the connection, owns the
+    // `xdg_toplevel`, draws the header bar and answers configure/ack; this
+    // file's job starts at the content area and stops there. See the module
+    // doc for why the engine's surface cannot live on a connection of its own.
+    cordial_shell::host_window::init_wayland()?;
+    let host = cordial_shell::host_window::HostWindow::with_canvas(title, width as i32, height as i32);
+    host.present();
+    host.wait_until_mapped(std::time::Duration::from_secs(5))?;
+
+    let display = host.wl_display().ok_or_else(|| {
+        "GTK's display is not a Wayland display (GDK_BACKEND?)".to_string()
+    })?;
+    let parent_surface =
+        host.wl_surface().ok_or_else(|| "GTK's window has no wl_surface".to_string())?;
+    let (cx, cy, cw, ch) =
+        host.content_rect().ok_or_else(|| "GTK's window has no content allocation".to_string())?;
 
     // ---- registry: walk every global, remembering the ones this backend
     // needs, then roundtrip so the walk is known to be complete before
     // anything tries to bind from it.
+    //
+    // This runs on GDK's connection and its default queue, so the roundtrip
+    // also dispatches whatever GTK had waiting. That is fine — it is the same
+    // thread GTK's main loop runs on — but it is why nothing here may assume
+    // it is the only code touching the connection.
     let registry = unsafe {
         (wl.marshal_flags)(
             display,
@@ -1070,8 +785,11 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     let Some((compositor_name, compositor_ver)) = globals.compositor else {
         return Err("compositor advertises no wl_compositor".into());
     };
-    let Some((wm_base_name, wm_base_ver)) = globals.xdg_wm_base else {
-        return Err("compositor advertises no xdg_wm_base (not a real desktop compositor?)".into());
+    let Some((subcompositor_name, subcompositor_ver)) = globals.subcompositor else {
+        // Every desktop compositor has one — it is core protocol, not an
+        // extension — but saying so plainly beats a null-pointer failure three
+        // calls later if one ever does not.
+        return Err("compositor advertises no wl_subcompositor; the engine's surface cannot be embedded".into());
     };
     let Some((seat_name, seat_ver)) = globals.seat else {
         return Err("compositor advertises no wl_seat".into());
@@ -1109,17 +827,22 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
 
     // SAFETY (this whole block): every proxy bound below comes from a global
     // this same roundtrip just confirmed exists, at a version clamped to
-    // what the compositor actually advertised.
+    // what the compositor actually advertised. Binding a global GTK has also
+    // bound is ordinary — a global may be bound any number of times, and the
+    // resulting objects are independent.
     let compositor = bind(compositor_name, 1, compositor_ver, unsafe { &*wl.compositor_interface }, "wl_compositor");
     if compositor.is_null() {
         return Err("binding wl_compositor failed".into());
     }
-    let wm_base = bind(wm_base_name, 1, wm_base_ver, &XDG_WM_BASE_INTERFACE, "xdg_wm_base");
-    if wm_base.is_null() {
-        return Err("binding xdg_wm_base failed".into());
-    }
-    unsafe {
-        (wl.add_listener)(wm_base, &WM_BASE_LISTENER as *const WmBaseListener as *const c_void, std::ptr::null_mut());
+    let subcompositor = bind(
+        subcompositor_name,
+        1,
+        subcompositor_ver,
+        unsafe { &*wl.subcompositor_interface },
+        "wl_subcompositor",
+    );
+    if subcompositor.is_null() {
+        return Err("binding wl_subcompositor failed".into());
     }
     let seat = bind(seat_name, 1, seat_ver, unsafe { &*wl.seat_interface }, "wl_seat");
     if seat.is_null() {
@@ -1131,10 +854,10 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         (!m.is_null()).then_some(m)
     });
 
-    // ---- surface + xdg_shell role, with the initial null-buffer commit and
-    // configure/ack round trip xdg-shell requires before any content may be
-    // attached (see the module doc on why the compositor decides the resize
-    // is atomic, not this code inferring it).
+    // ---- the canvas: a plain `wl_surface` given the subsurface role against
+    // GTK's toplevel. No `xdg_surface`, no configure handshake, no ack — a
+    // subsurface has no size of its own to negotiate, it is whatever its
+    // buffer is, wherever its parent says.
     let surface = unsafe {
         (wl.marshal_flags)(
             compositor,
@@ -1148,78 +871,45 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     if surface.is_null() {
         return Err("wl_compositor.create_surface failed".into());
     }
-    let xdg_surface = unsafe {
+    let subsurface = unsafe {
         (wl.marshal_flags)(
-            wm_base,
-            XDG_WM_BASE_GET_XDG_SURFACE,
-            &XDG_SURFACE_INTERFACE,
+            subcompositor,
+            WL_SUBCOMPOSITOR_GET_SUBSURFACE,
+            wl.subsurface_interface,
             1,
             0,
             std::ptr::null_mut::<c_void>(),
             surface,
+            parent_surface,
         )
     };
-    if xdg_surface.is_null() {
-        return Err("xdg_wm_base.get_xdg_surface failed".into());
+    if subsurface.is_null() {
+        return Err("wl_subcompositor.get_subsurface failed".into());
     }
-    let xdg_toplevel = unsafe {
-        (wl.marshal_flags)(
-            xdg_surface,
-            XDG_SURFACE_GET_TOPLEVEL,
-            &XDG_TOPLEVEL_INTERFACE,
-            1,
-            0,
-            std::ptr::null_mut::<c_void>(),
-        )
-    };
-    if xdg_toplevel.is_null() {
-        return Err("xdg_surface.get_toplevel failed".into());
-    }
-
-    let ascii_title: String = title.chars().map(|c| if c.is_ascii() { c } else { '-' }).collect();
-    let title_c = CString::new(ascii_title).unwrap_or_default();
-    let app_id_c = CString::new(APP_ID).unwrap();
     unsafe {
-        (wl.marshal_flags)(xdg_toplevel, XDG_TOPLEVEL_SET_TITLE, std::ptr::null(), 1, 0, title_c.as_ptr());
-        (wl.marshal_flags)(xdg_toplevel, XDG_TOPLEVEL_SET_APP_ID, std::ptr::null(), 1, 0, app_id_c.as_ptr());
-    }
-
-    // The initial null commit — no buffer attached — that triggers the first
-    // configure. `XDG_SURFACE_LISTENER` is registered here once, for the
-    // proxy's whole lifetime — see `xdg_surface_configure`'s own comment for
-    // why a second `wl_proxy_add_listener` call to swap in a "steady-state"
-    // listener, once `WINDOW` existed, was a real crash (`wl_proxy_add_listener`
-    // returns `-1` and changes nothing on a proxy that already has one) and not
-    // just an unnecessary one. The initial serial is read back out of
-    // `INITIAL_XDG_SURFACE_SERIAL`, which that same unified listener writes to
-    // whenever `current()` is still `None`.
-    unsafe {
-        (wl.add_listener)(
-            xdg_surface,
-            &XDG_SURFACE_LISTENER as *const XdgSurfaceListener as *const c_void,
-            std::ptr::null_mut(),
-        );
+        // Desync is what makes the engine's own commits take effect when the
+        // engine makes them. A subsurface is created *synchronised*, meaning
+        // every commit waits for the parent's — and GTK commits only when it
+        // repaints, which for a window nobody is touching is never. Leave this
+        // out and the canvas shows one frame per accidental GTK redraw.
+        (wl.marshal_flags)(subsurface, WL_SUBSURFACE_SET_DESYNC, std::ptr::null(), 1, 0);
+        (wl.marshal_flags)(subsurface, WL_SUBSURFACE_SET_POSITION, std::ptr::null(), 1, 0, cx, cy);
         (wl.marshal_flags)(surface, WL_SURFACE_COMMIT, std::ptr::null(), 1, 0);
-        if (wl.roundtrip)(display) < 0 {
-            return Err("wl_display_roundtrip failed waiting for the initial configure".into());
-        }
-        let Some(serial) =
-            INITIAL_XDG_SURFACE_SERIAL.lock().unwrap_or_else(|e| e.into_inner()).take()
-        else {
-            return Err("compositor never sent the initial xdg_surface.configure".into());
-        };
-        (wl.marshal_flags)(xdg_surface, XDG_SURFACE_ACK_CONFIGURE, std::ptr::null(), 1, 0, serial);
-        (wl.add_listener)(
-            xdg_toplevel,
-            &TOPLEVEL_LISTENER as *const ToplevelListener as *const c_void,
-            std::ptr::null_mut(),
-        );
     }
+    // `set_position` is latched on the *parent's* next commit, so the canvas
+    // sits at (0,0) — under the header bar — until GTK draws again.
+    host.queue_commit();
+    host.pump();
 
-    println!("[android] wayland: surface acked, {width}x{height}, app_id={APP_ID:?}");
+    println!("[android] wayland: canvas {cw}x{ch} at ({cx},{cy}) as a subsurface of the libadwaita window");
 
-    // ---- wl_seat: pointer + keyboard, and hide the host cursor over the
-    // window the way `window.rs` hides the X11 one.
+    // ---- wl_seat: pointer + keyboard. Cordial takes input from the seat
+    // directly rather than through GTK, because what the engine wants is
+    // Android `MotionEvent`/`KeyEvent` shapes and GTK's controllers would only
+    // be a second translation of the same evdev data. GDK has its own pointer
+    // and keyboard on this seat; both clients see every event, and
+    // `pointer_enter` below is what keeps this one from acting on the ones
+    // aimed at the header bar.
     let pointer = unsafe {
         (wl.marshal_flags)(seat, WL_SEAT_GET_POINTER, wl.pointer_interface, 1, 0, std::ptr::null_mut::<c_void>())
     };
@@ -1264,17 +954,19 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         wl,
         egl,
         display,
+        host: HostWindowCell(host),
         compositor,
+        subcompositor,
         surface,
-        xdg_surface,
-        xdg_toplevel,
+        subsurface,
+        parent_surface,
         seat,
         pointer,
         keyboard,
         text_input: text_input.unwrap_or(std::ptr::null_mut()),
         conn_fd,
-        buffers: Mutex::new(Geometry { width: width as i32, height: height as i32, format: super::window::WINDOW_FORMAT_RGBA_8888 }),
-        pending_configure: Mutex::new(None),
+        buffers: Mutex::new(Geometry { width: cw, height: ch, format: super::window::WINDOW_FORMAT_RGBA_8888 }),
+        placed_at: Mutex::new((cx, cy)),
         egl_window: Mutex::new(std::ptr::null_mut()),
         xkb: Mutex::new(None),
         pointer_pos: Mutex::new((0.0, 0.0)),
@@ -1318,10 +1010,14 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
 }
 
 impl WaylandWindow {
-    /// A resize the compositor has confirmed as final (paired
-    /// `xdg_toplevel.configure` + `xdg_surface.configure`/ack). Resizes the
-    /// EGL window if one exists and tells the engine, mirroring
-    /// `window.rs::dispatch_configure`.
+    /// A resize GTK has already settled.
+    ///
+    /// The configure/ack handshake ADR-011 chose Wayland *for* still happens;
+    /// it just happens in GTK now, which is the point of handing it the
+    /// toplevel. By the time the content widget's allocation changes, the
+    /// compositor and GTK have agreed on the new size, so this is the
+    /// downstream half only: resize the EGL window if one exists, and tell the
+    /// engine. Mirrors `window.rs::dispatch_configure`.
     fn apply_resize(&self, width: i32, height: i32) {
         if width <= 0 || height <= 0 {
             return;
@@ -1348,6 +1044,43 @@ impl WaylandWindow {
                 super::trace(format_args!("wayland: surface resize failed: {e}"));
             }
         }
+    }
+
+    /// Keep the canvas over the window's content area.
+    ///
+    /// GTK owns the layout, so this reads the content widget's allocation
+    /// rather than tracking a configure sequence of its own — the header bar's
+    /// height, the window's CSD inset and every resize all arrive through the
+    /// same one number pair. Called every pump; both halves are no-ops unless
+    /// something actually moved, because `set_position` costs a parent repaint
+    /// and `apply_resize` costs the engine a surface-changed callback.
+    fn sync_canvas_geometry(&self) {
+        let Some((x, y, w, h)) = self.host.0.content_rect() else { return };
+        let moved = {
+            let mut placed = self.placed_at.lock().unwrap_or_else(|e| e.into_inner());
+            let moved = *placed != (x, y);
+            *placed = (x, y);
+            moved
+        };
+        if moved {
+            // SAFETY: `self.subsurface` is a live proxy for the process's
+            // lifetime and `set_position`'s signature is "ii".
+            unsafe {
+                (self.wl.marshal_flags)(
+                    self.subsurface,
+                    WL_SUBSURFACE_SET_POSITION,
+                    std::ptr::null(),
+                    1,
+                    0,
+                    x,
+                    y,
+                );
+            }
+            // Latched on the parent's commit, not ours — see `HostWindow::
+            // queue_commit`.
+            self.host.0.queue_commit();
+        }
+        self.apply_resize(w, h);
     }
 
     pub fn geometry(&self) -> (i32, i32, i32) {
@@ -1479,21 +1212,46 @@ impl WaylandWindow {
     }
 }
 
+/// Whether the pointer is currently over the engine's canvas rather than over
+/// the rest of the window.
+///
+/// Cordial's `wl_pointer` is a second pointer object on the seat GDK also has
+/// one on, so the compositor delivers *every* enter, motion and button to both
+/// — including the ones aimed at the header bar and the window controls. The
+/// engine used to own the whole toplevel and there was nothing else for a
+/// click to mean; now there is. Without this the engine reacts to a click on
+/// the close button, and the cursor vanishes over the titlebar because
+/// `hide_pointer` fired for it.
+static POINTER_ON_CANVAS: AtomicBool = AtomicBool::new(false);
+
 unsafe extern "C" fn pointer_enter(
     _data: *mut c_void,
     pointer: *mut c_void,
     serial: u32,
-    _surface: *mut c_void,
+    surface: *mut c_void,
     x: i32,
     y: i32,
 ) {
-    if let Some(w) = current() {
-        w.hide_pointer(pointer, serial);
-        w.dispatch_pointer_motion(fixed_to_f32(x), fixed_to_f32(y));
+    let Some(w) = current() else { return };
+    let ours = std::ptr::eq(surface, w.surface);
+    POINTER_ON_CANVAS.store(ours, Ordering::Release);
+    if !ours {
+        return;
     }
+    w.hide_pointer(pointer, serial);
+    // Subsurface coordinates are relative to the subsurface, so these are
+    // already canvas-local — no offset for the header bar has to be
+    // subtracted anywhere, which is the main practical reason to let the
+    // compositor do this rather than translating window coordinates by hand.
+    w.dispatch_pointer_motion(fixed_to_f32(x), fixed_to_f32(y));
 }
-unsafe extern "C" fn pointer_leave(_data: *mut c_void, _pointer: *mut c_void, _serial: u32, _surface: *mut c_void) {}
+unsafe extern "C" fn pointer_leave(_data: *mut c_void, _pointer: *mut c_void, _serial: u32, _surface: *mut c_void) {
+    POINTER_ON_CANVAS.store(false, Ordering::Release);
+}
 unsafe extern "C" fn pointer_motion(_data: *mut c_void, _pointer: *mut c_void, _time: u32, x: i32, y: i32) {
+    if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+        return;
+    }
     if let Some(w) = current() {
         w.dispatch_pointer_motion(fixed_to_f32(x), fixed_to_f32(y));
     }
@@ -1506,6 +1264,9 @@ unsafe extern "C" fn pointer_button(
     button: u32,
     state: u32,
 ) {
+    if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+        return;
+    }
     let Some(w) = current() else { return };
     let Some(android_button) = linux_button_to_android(button) else { return };
     w.dispatch_pointer_button(android_button, state == 1);
@@ -1640,10 +1401,20 @@ unsafe extern "C" fn keyboard_enter(
     _data: *mut c_void,
     _kb: *mut c_void,
     _serial: u32,
-    _surface: *mut c_void,
+    surface: *mut c_void,
     _keys: *const WlArray,
 ) {
-    KEYBOARD_FOCUSED.store(true, Ordering::Release);
+    // Keyboard focus lands on the *toplevel*, never on the subsurface — a
+    // subsurface has no keyboard focus of its own in the protocol — so the
+    // surface named here is GTK's, not the canvas. Checking it anyway rather
+    // than accepting any surface, because this client now owns more than one
+    // window's worth of surfaces (GTK's dialogs, its cursor surfaces) and
+    // "some surface of ours has focus" is not the same claim as "the window
+    // the engine is in has focus".
+    let Some(w) = current() else { return };
+    if std::ptr::eq(surface, w.parent_surface) {
+        KEYBOARD_FOCUSED.store(true, Ordering::Release);
+    }
 }
 /// Whether the compositor currently gives this surface keyboard focus.
 ///
@@ -1873,40 +1644,6 @@ impl WaylandWindow {
     /// engine — the one place both the hardware-key path and the IME `done`
     /// path funnel through, so they cannot disagree about how a live preedit
     /// is displayed.
-    /// Hide the host cursor over this surface.
-    ///
-    /// `wl_pointer.set_cursor` takes the serial of the `wl_pointer.enter` it is
-    /// answering, and a compositor ignores the request with any other value —
-    /// which is why doing this once at setup with a serial of `0`, as this
-    /// previously did, silently did nothing and left two cursors on screen.
-    ///
-    /// It also has to be repeated on *every* enter: the cursor a client sets
-    /// applies to that enter only, and reverts as soon as the pointer leaves
-    /// and returns. A null surface is the protocol's way of saying "no cursor
-    /// at all", which is what Roblox wants because it draws its own.
-    ///
-    /// `CORDIAL_SHOW_CURSOR=1` restores the host cursor for debugging input.
-    fn hide_pointer(&self, pointer: *mut c_void, serial: u32) {
-        if pointer.is_null() || std::env::var_os("CORDIAL_SHOW_CURSOR").is_some() {
-            return;
-        }
-        // SAFETY: `pointer` is the live `wl_pointer` this event arrived on, and
-        // the argument list matches `set_cursor`'s `uoii` signature.
-        unsafe {
-            (self.wl.marshal_flags)(
-                pointer,
-                WL_POINTER_SET_CURSOR,
-                std::ptr::null(),
-                1,
-                0,
-                serial,
-                std::ptr::null_mut::<c_void>(),
-                0i32,
-                0i32,
-            );
-        }
-    }
-
     fn send_current_text(&self, which: i64) {
         let (committed, caret) = super::input::text_buffer_snapshot();
         let preedit = self.ime.lock().unwrap_or_else(|e| e.into_inner()).preedit.clone();
@@ -2010,8 +1747,16 @@ impl WaylandWindow {
     /// used instead: it is where the user just clicked to focus the field,
     /// which is inside or very close to it in practice. That is a stand-in
     /// for real field geometry, not a claim of pixel accuracy.
+    ///
+    /// The offset is not decoration. `set_cursor_rectangle` is in the
+    /// coordinate space of the surface the text input is *entered* on, and
+    /// that is GTK's toplevel — a subsurface never takes keyboard focus, so it
+    /// is never the entered surface. The pointer position this reads is
+    /// canvas-local. Sending it unadjusted would put the candidate window a
+    /// header bar and a drop shadow away from where the user is typing.
     fn send_cursor_rectangle(&self) {
         let (x, y) = *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (ox, oy) = *self.placed_at.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             (self.wl.marshal_flags)(
                 self.text_input,
@@ -2019,8 +1764,8 @@ impl WaylandWindow {
                 std::ptr::null(),
                 1,
                 0,
-                x as i32,
-                y as i32,
+                x as i32 + ox,
+                y as i32 + oy,
                 100i32,
                 24i32,
             );
@@ -2160,6 +1905,50 @@ static TEXT_INPUT_LISTENER: TextInputListener = TextInputListener {
     done: ti_done,
 };
 
+
+// --------------------------------------------------------- pointer cursor
+
+impl WaylandWindow {
+    /// Hide the host cursor over the canvas.
+    ///
+    /// `wl_pointer.set_cursor` takes the serial of the `wl_pointer.enter` it is
+    /// answering, and a compositor ignores the request with any other value —
+    /// which is why doing this once at setup with a serial of `0`, as this
+    /// previously did, silently did nothing and left two cursors on screen.
+    ///
+    /// It also has to be repeated on *every* enter: the cursor a client sets
+    /// applies to that enter only, and reverts as soon as the pointer leaves
+    /// and returns. A null surface is the protocol's way of saying "no cursor
+    /// at all", which is what Roblox wants because it draws its own.
+    ///
+    /// Only for enters onto the engine's own surface. Calling this for the
+    /// header bar would take the pointer away from the window controls, which
+    /// GTK is drawing hover states for and the user is trying to click.
+    ///
+    /// `CORDIAL_SHOW_CURSOR=1` restores the host cursor for debugging input.
+    fn hide_pointer(&self, pointer: *mut c_void, serial: u32) {
+        if pointer.is_null() || std::env::var_os("CORDIAL_SHOW_CURSOR").is_some() {
+            return;
+        }
+        // SAFETY: `pointer` is the live `wl_pointer` this event arrived on, and
+        // the argument list matches `set_cursor`'s `uoii` signature.
+        unsafe {
+            (self.wl.marshal_flags)(
+                pointer,
+                WL_POINTER_SET_CURSOR,
+                std::ptr::null(),
+                1,
+                0,
+                serial,
+                std::ptr::null_mut::<c_void>(),
+                0i32,
+                0i32,
+            );
+        }
+    }
+
+}
+
 // -------------------------------------------------------------------- pump
 //
 // Mirrors `window.rs`'s X11 pump: must never block, since it runs inside
@@ -2188,6 +1977,20 @@ impl WaylandWindow {
 
         let (gw, gh, _) = self.geometry();
         super::input::report_keyboard_state((gw, gh));
+
+        // GTK's main loop does not get a thread of its own. It is iterated
+        // here, on the thread that ran `gtk_init`, from inside the engine's
+        // own message pump — which is what makes the header bar's buttons,
+        // hover states and the compositor's resize handshake work at all,
+        // since nothing else in this process ever runs a `GMainLoop`.
+        //
+        // The cost is that GTK's responsiveness is bounded by how often
+        // `looper::pump` comes round, currently every 50ms or immediately on
+        // any traffic on the display connection — and the display connection
+        // is exactly where a click on the header bar arrives, so the idle case
+        // is the only one that waits.
+        self.host.0.pump();
+        self.sync_canvas_geometry();
         self.sync_ime_focus();
 
         // The documented thread-safe idiom for a `wl_display` connection that
@@ -2199,6 +2002,13 @@ impl WaylandWindow {
         // the right to be the next reader; if something else already holds
         // that reservation, back off to dispatching whatever is already
         // queued rather than contending for the socket.
+        //
+        // GDK is now a third party to the same connection — it owns it — and
+        // uses this same idiom from its own `GSource`. That is why this stays
+        // exactly as it was rather than being replaced by "let GTK do the
+        // reading": the reservation is what makes two readers safe, and
+        // `self.host.0.pump()` above having just run means the usual outcome
+        // here is a `prepare_read` that succeeds with nothing left to read.
         //
         // SAFETY: `self.display` is live for the process's lifetime.
         if unsafe { (self.wl.prepare_read)(self.display) } != 0 {
@@ -2430,19 +2240,10 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn app_id_matches_the_desktop_entry() {
-        // Same reasoning and the same kind of check as `window.rs`'s
-        // `wm_class_matches_the_desktop_entry` — see ADR-009. `xdg_toplevel`'s
-        // app_id is the Wayland equivalent of X11's WM_CLASS for exactly the
-        // same taskbar/portal-picker/capture-tool matching purpose.
-        let desktop = include_str!("../../../../packaging/org.cordial.Cordial.desktop");
-        let declared = desktop
-            .lines()
-            .find_map(|l| l.strip_prefix("StartupWMClass="))
-            .expect("desktop entry declares StartupWMClass");
-        assert_eq!(declared.trim(), APP_ID);
-    }
+    // The `app_id_matches_the_desktop_entry` test that lived here moved to
+    // `cordial_shell::host_window`, which is what sets the app_id now that GTK
+    // owns the toplevel. Same test, same ADR-009 reason; it has to sit beside
+    // the constant that actually reaches the wire or it pins nothing.
 
     #[test]
     fn no_preedit_leaves_committed_text_untouched() {

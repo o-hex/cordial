@@ -18,6 +18,9 @@
 
 mod chooser;
 mod flags_file;
+mod install;
+mod instructions;
+mod launch;
 mod settings;
 mod shell_config;
 mod window;
@@ -35,6 +38,12 @@ const APP_ID: &str = "org.cordial.Cordial";
 fn main() -> libadwaita::glib::ExitCode {
     let app = libadwaita::Application::builder().application_id(APP_ID).build();
     app.connect_activate(|app| {
+        // Before anything can be launched, because the launcher points the
+        // engine at a profile directory and the storage that has a login in it
+        // is still at the pre-ADR-012 path. Skipped when there is nothing to
+        // move, which is every run after the first.
+        cordial_shell::profile::migrate_legacy_layout();
+
         let config_path = Rc::new(shell_config::path());
         let config = Rc::new(RefCell::new(shell_config::load(&config_path)));
 

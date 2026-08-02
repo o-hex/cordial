@@ -57,7 +57,12 @@ const pending = new Map<number, (r: any) => void>();
       // reading those replies, so it would deadlock against itself on the
       // first lifecycle event.
       if (msg.id === undefined) {
-        onLifecycleEvent(msg.event);
+        // `cordial/init` is the handshake every plugin is sent before it has
+        // asked for anything, carrying whatever settings it had saved. This
+        // plugin keeps nothing, so it only has to not mistake the handshake
+        // for a lifecycle event — which it did, and reported as an
+        // unrecognised event, until this line existed.
+        if (msg.event !== "cordial/init") onLifecycleEvent(msg.event);
       } else {
         pending.get(msg.id)?.(msg);
         pending.delete(msg.id);

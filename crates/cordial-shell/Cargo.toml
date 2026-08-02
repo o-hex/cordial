@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+name = "cordial_shell"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cordial-shell"
 path = "src/main.rs"
@@ -14,10 +18,26 @@ path = "src/main.rs"
 cordial-plugins = { path = "../cordial-plugins" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-gtk4 = "0.11"
+# `v4_10` for `GtkFileDialog`, which the settings window uses to pick the APK
+# and the engine directory. GTK 4.10 is this project's floor already, and the
+# alternative — `GtkFileChooserNative` — is deprecated as of that same version.
+gtk4 = { version = "0.11", features = ["v4_10"] }
+# Getting `libroblox.so` out of the APK. On a split build it is inside
+# `split_config.x86_64.apk` rather than `base.apk`, so the shell has to open a
+# zip to set a user up rather than telling them to run `unzip` first. Same
+# version and the same minimal feature set `cordial-runtime` already pins, so
+# this adds an edge to an already-resolved dependency rather than a new one.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # v1_4 is the floor, not the ceiling: AdwToolbarView and AdwSwitchRow both
 # landed in libadwaita 1.4, and every other widget used here predates that.
 # The system library only has to be 1.4 or newer; it does not have to match
 # this feature exactly, gtk-rs feature flags just gate which of the safe
 # wrapper's functions get compiled in.
 libadwaita = { version = "0.9", features = ["v1_4"] }
+# `gdk_wayland_surface_get_wl_surface`/`gdk_wayland_display_get_wl_display`,
+# which is all `host_window` wants from it — the raw pointers the runtime's
+# hand-marshalled Wayland code needs to parent the engine's surface to this
+# window. Deliberately without the `wayland_crate` feature: that would pull in
+# a second, typed Wayland binding alongside the one `cordial-runtime` already
+# hand-rolls, and the two would then disagree about who owns a proxy.
+gdk4-wayland = "0.11"

@@ -43,6 +43,10 @@ function call(method: string, params: unknown = {}): Promise<any> {
 }
 
 function onPush(push: { event: string; payload: unknown }) {
+  // `cordial/init` is the handshake every plugin receives before it has asked
+  // for anything, not an event anyone published. Ignored here so this fixture
+  // stays about events; `settings.ts` is the one that checks the handshake.
+  if (push.event === "cordial/init") return;
   call("log.write", { message: `push: ${push.event} ${JSON.stringify(push.payload)}` });
 }
 

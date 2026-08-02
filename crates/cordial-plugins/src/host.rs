@@ -15,10 +15,11 @@ use crate::capability::Capability;
 use crate::events::EventRegistry;
 use crate::presence::{DiscordPresence, PresencePayload};
 use crate::protocol::{required_capability, Push, Request, Response};
+use crate::settings::{self, Store};
 use crate::{notify, urlopen};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 pub struct Plugin {
@@ -111,7 +112,7 @@ pub fn authorise(broker: &mut Broker, plugin: &str, req: &Request) -> Result<(),
 /// two together.
 ///
 /// `Session` only ever answers the methods it has a real broker for —
-/// `presence.*`, `notify.send`, `url.open`, `events.*`, and the
+/// `presence.*`, `notify.send`, `url.open`, `settings.*`, `events.*`, and the
 /// `lifecycle.subscribe` acknowledgement paired with `push_lifecycle` below.
 /// Everything else (`flags.*`, `log.write`, `assets.override`) is still only
 /// `authorise`d here; a caller that wants those served has to do it itself,
@@ -124,6 +125,11 @@ pub struct Session {
     pub events: EventRegistry,
     presence: DiscordPresence,
     plugins: BTreeMap<String, Plugin>,
+    /// Where every plugin's settings live, which is a property of the profile
+    /// this instance is running rather than of the process. `None` is honest
+    /// about a session with no profile behind it — `settings.*` then fails and
+    /// says why, instead of reporting a save that went nowhere.
+    settings: Option<Store>,
 }
 
 impl Session {
@@ -133,13 +139,34 @@ impl Session {
             events: EventRegistry::new(),
             presence: DiscordPresence::new(),
             plugins: BTreeMap::new(),
+            settings: None,
         }
+    }
+
+    /// A session running `profile_dir`, so plugins have somewhere to keep
+    /// their settings. Everything else about a session is per process; this is
+    /// the one thing that belongs to the profile.
+    pub fn with_profile(profile_dir: impl Into<PathBuf>) -> Self {
+        Session { settings: Some(Store::new(profile_dir)), ..Session::new() }
     }
 
     /// Adopt a spawned plugin so it can receive pushes — lifecycle events and
     /// other plugins' published events — in addition to answering its own
     /// requests through [`Session::handle`].
-    pub fn add_plugin(&mut self, plugin: Plugin) {
+    ///
+    /// The plugin's first line is the handshake, carrying whatever it had
+    /// saved. That is what keeps the common case — read your configuration,
+    /// then start — free of a round trip a plugin would otherwise have to make
+    /// before it could do anything. Grants must therefore be in place before
+    /// this is called; adopting first and granting afterwards would hand a
+    /// plugin a handshake saying it holds nothing.
+    pub fn add_plugin(&mut self, mut plugin: Plugin) {
+        let granted = self.broker.granted(&plugin.id);
+        let push = settings::init_push(self.settings.as_ref(), &plugin.id, &granted);
+        // Best effort, like every other push: a plugin that has already died
+        // is not a reason to fail adopting it, and the write error would only
+        // repeat what the next read of its stdout is about to say.
+        let _ = plugin.push(&push);
         self.plugins.insert(plugin.id.clone(), plugin);
     }
 
@@ -212,6 +239,13 @@ impl Session {
                 },
                 None => Response::Error { id: req.id, message: "events.declare needs a name".into() },
             },
+            // `plugin_id` is this session's own record of which process is on
+            // the other end of the pipe, and it is the only id `serve` is
+            // given — a plugin naming another one in its params reads and
+            // writes its own document. See settings.rs.
+            "settings.get" | "settings.set" => {
+                settings::serve(self.settings.as_ref(), plugin_id, req)
+            }
             "events.publish" => self.publish(plugin_id, req),
             "events.subscribe" => match req.params.get("type").and_then(|v| v.as_str()) {
                 Some(event_type) => match self.events.subscribe(plugin_id, event_type) {
@@ -371,6 +405,70 @@ mod tests {
         session.broker.grant("p", [Capability::LifecycleRead]);
         let res = session.handle("p", &call("lifecycle.subscribe", serde_json::Value::Null));
         assert!(matches!(res, Response::Ok { .. }), "{res:?}");
+    }
+
+    #[test]
+    fn session_keeps_one_plugins_settings_out_of_anothers_reach() {
+        // The escape this is guarding is not hypothetical: a settings API that
+        // took the plugin id as a parameter is the obvious way to write one,
+        // and it would have let any plugin holding settings.read address every
+        // other plugin's document. `handle` passes its own record of who is
+        // calling and nothing else, so the request below reads `thief`'s own
+        // settings however it words the question. Remove that and `secret`
+        // appears in the result.
+        let dir = std::env::temp_dir().join("cordial-session-settings-namespace");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = Session::with_profile(&dir);
+        session.broker.grant("victim", [Capability::SettingsWrite]);
+        session.broker.grant("thief", [Capability::SettingsRead]);
+
+        let stored = session.handle(
+            "victim",
+            &call("settings.set", serde_json::json!({"settings": {"secret": "cookie"}})),
+        );
+        assert!(matches!(stored, Response::Ok { .. }), "{stored:?}");
+
+        let res = session.handle(
+            "thief",
+            &call("settings.get", serde_json::json!({"plugin": "victim"})),
+        );
+        match res {
+            Response::Ok { result, .. } => {
+                assert!(result.get("secret").is_none(), "read another plugin's settings: {result}");
+                assert_eq!(result, serde_json::json!({}), "thief has saved nothing of its own");
+            }
+            other => panic!("expected the caller's own settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reading_settings_does_not_carry_permission_to_replace_them() {
+        let dir = std::env::temp_dir().join("cordial-session-settings-readonly");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = Session::with_profile(&dir);
+        session.broker.grant("reader", [Capability::SettingsRead]);
+        let res = session
+            .handle("reader", &call("settings.set", serde_json::json!({"settings": {"a": 1}})));
+        match res {
+            Response::Denied { capability, .. } => assert_eq!(capability, "settings.write"),
+            other => panic!("expected a denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_session_with_no_profile_refuses_settings_rather_than_dropping_them() {
+        // `Session::new` has nowhere to put a document. Answering Ok would
+        // tell the plugin the user's choice was saved when it went nowhere.
+        let mut session = Session::new();
+        session.broker.grant("themer", [Capability::SettingsWrite]);
+        let res = session
+            .handle("themer", &call("settings.set", serde_json::json!({"settings": {}})));
+        match res {
+            Response::Error { message, .. } => assert!(message.contains("profile"), "{message}"),
+            other => panic!("expected an explicit failure, got {other:?}"),
+        }
     }
 
     #[test]

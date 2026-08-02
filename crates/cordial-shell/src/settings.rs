@@ -7,15 +7,22 @@
 //! the offending one off, plus enough of Cordial's own appearance and
 //! graphics preference to be usable, without a terminal.
 //!
-//! `AdwPreferencesWindow` with several `AdwPreferencesPage`s — Appearance,
-//! General, Plugins — each becomes its own tab/sidebar entry for free; that
-//! is libadwaita's own page-switcher, not something built here.
+//! `AdwPreferencesWindow` with several `AdwPreferencesPage`s — Roblox,
+//! Appearance, General, Plugins — each becomes its own tab/sidebar entry for
+//! free; that is libadwaita's own page-switcher, not something built here.
+//!
+//! The Roblox page is newer than the argument above and is here for a different
+//! reason: nothing in Cordial used to record where a Roblox build lived, so the
+//! chooser had no target and the only way to run the client was a hand-typed
+//! command line. That is configuration rather than a fallback, and it belongs
+//! in the shell because the shell is what has to work when nothing else does.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use libadwaita as adw;
+use libadwaita::glib;
 use libadwaita::gtk;
 use libadwaita::prelude::*;
 
@@ -23,7 +30,8 @@ use cordial_plugins::capability::Capability;
 use cordial_plugins::manifest::{self, Plugin};
 
 use crate::flags_file::{self, RENDERER_BACKEND_FLAG};
-use crate::shell_config::{AppearanceScheme, ShellConfig};
+use crate::install;
+use crate::shell_config::{self, AppearanceScheme, ShellConfig};
 
 /// A plugin as this settings surface cares about it.
 ///
@@ -154,10 +162,225 @@ fn build_appearance_page(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathB
     page
 }
 
+/// Save, and say so on stderr rather than swallowing the error.
+///
+/// A settings window that accepts a choice and silently fails to keep it is the
+/// worst of the three possible behaviours, because the user finds out one
+/// launch later and blames the launch.
+fn persist(config: &Rc<RefCell<ShellConfig>>, path: &Rc<PathBuf>) {
+    if let Err(e) = shell_config::save(path, &config.borrow()) {
+        eprintln!("shell: could not save {}: {e}", path.display());
+    }
+}
+
+/// One row showing a path Cordial is using, where it came from, and how to
+/// change it.
+///
+/// The provenance line is not decoration. The build usually comes from another
+/// application's private directory (Sober's), and a user who does not know that
+/// has no way to understand why deleting Sober broke Cordial. ADR-002's rule
+/// about not silently depending on something applies to a path exactly as much
+/// as to a capability.
+fn path_row(
+    title: &str,
+    effective: Option<(PathBuf, String)>,
+    chosen: bool,
+    on_choose: impl Fn() + 'static,
+    on_clear: impl Fn() + 'static,
+) -> adw::ActionRow {
+    let subtitle = match &effective {
+        Some((path, origin)) => format!("{}\n{origin}", path.display()),
+        None => "Not found. Press Roblox in the launcher for how to get one.".to_string(),
+    };
+    let row = adw::ActionRow::builder().title(title).subtitle(subtitle).build();
+    row.set_subtitle_lines(3);
+
+    if chosen {
+        let clear = gtk::Button::from_icon_name("edit-clear-symbolic");
+        clear.set_tooltip_text(Some("Forget this and look again on the next launch"));
+        clear.set_valign(gtk::Align::Center);
+        clear.add_css_class("flat");
+        clear.connect_clicked(move |_| on_clear());
+        row.add_suffix(&clear);
+    }
+
+    let choose = gtk::Button::with_label("Choose…");
+    choose.set_valign(gtk::Align::Center);
+    choose.connect_clicked(move |_| on_choose());
+    row.add_suffix(&choose);
+    row
+}
+
+/// "Roblox" — where the build is, and which profile an instance runs.
+///
+/// The whole reason `cordial-shell` could not launch anything: nothing
+/// persisted where a Roblox build lived, so the only route to a running client
+/// was a hand-typed command line. Both rows here are *overrides* — left empty,
+/// which is the normal state, `install::locate` looks for a build every time,
+/// because a remembered "yes it is installed" goes stale the moment somebody
+/// moves it.
+fn build_roblox_page(
+    parent: &impl IsA<gtk::Window>,
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+) -> adw::PreferencesPage {
+    let page =
+        adw::PreferencesPage::builder().title("Roblox").icon_name("applications-games-symbolic").build();
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Roblox build")
+        .description(
+            "Cordial ships no Roblox code and never will, so it needs a build you already \
+             have. Leave these empty and it finds one on its own; choose a file to pin it.",
+        )
+        .build();
+
+    let apk = install::effective_apk(&config.borrow().roblox)
+        .map(|(path, origin)| (path, origin.describe().to_string()));
+    let apk_chosen = config.borrow().roblox.apk.is_some();
+
+    let window = parent.as_ref().clone();
+    let apk_row = {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        let window = window.clone();
+        let cleared = config.clone();
+        let cleared_path = config_path.clone();
+        path_row(
+            "APK",
+            apk,
+            apk_chosen,
+            move || {
+                let config = config.clone();
+                let config_path = config_path.clone();
+                choose_file(&window, "Choose the Roblox APK", false, move |path| {
+                    config.borrow_mut().roblox.apk = Some(path);
+                    persist(&config, &config_path);
+                });
+            },
+            move || {
+                cleared.borrow_mut().roblox.apk = None;
+                persist(&cleared, &cleared_path);
+            },
+        )
+    };
+    group.add(&apk_row);
+
+    // Shown separately from the APK because it usually is separate: on a split
+    // build `libroblox.so` is inside `split_config.x86_64.apk`, not `base.apk`,
+    // and Cordial extracts it into its own cache rather than writing into
+    // whichever application's directory the APK came from.
+    let lib = config.borrow().roblox.lib_dir.clone().map(|p| (p, "Chosen in Settings".to_string())).or_else(
+        || {
+            let cache = install::engine_cache();
+            cache
+                .join(install::LIBRARY)
+                .is_file()
+                .then(|| (cache, "Extracted by Cordial from the APK".to_string()))
+        },
+    );
+    let lib_chosen = config.borrow().roblox.lib_dir.is_some();
+
+    let lib_row = {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        let window = window.clone();
+        let cleared = config.clone();
+        let cleared_path = config_path.clone();
+        path_row(
+            "Engine directory",
+            lib,
+            lib_chosen,
+            move || {
+                let config = config.clone();
+                let config_path = config_path.clone();
+                choose_file(&window, "Choose the directory holding libroblox.so", true, move |path| {
+                    config.borrow_mut().roblox.lib_dir = Some(path);
+                    persist(&config, &config_path);
+                });
+            },
+            move || {
+                cleared.borrow_mut().roblox.lib_dir = None;
+                persist(&cleared, &cleared_path);
+            },
+        )
+    };
+    group.add(&lib_row);
+    page.add(&group);
+
+    let profiles = adw::PreferencesGroup::builder()
+        .title("Profile")
+        .description(
+            "One account's Roblox storage: its session, its settings, its logs. A profile is \
+             held by one window at a time, so launching a second one against the same profile \
+             is refused rather than allowed to corrupt it (ADR-012).",
+        )
+        .build();
+
+    let row = adw::EntryRow::builder().title("Profile").text(config.borrow().profile.clone()).build();
+    let existing = cordial_shell::profile::list();
+    if !existing.is_empty() {
+        // Not a combo box: a text entry is also how a *new* profile is made,
+        // and a switcher that cannot create one leaves the only route to a
+        // second account outside the interface.
+        row.set_tooltip_text(Some(&format!("Profiles that exist: {}", existing.join(", "))));
+    }
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        row.connect_changed(move |row| {
+            let name = row.text().to_string();
+            // Invalid names are refused at the point of typing rather than at
+            // the point of launching, because `profile::dir` refuses anything
+            // that could escape the profile root and a launch is a long way
+            // from the field that caused it.
+            if cordial_shell::profile::is_valid_name(&name) {
+                row.remove_css_class("error");
+                config.borrow_mut().profile = name;
+                persist(&config, &config_path);
+            } else {
+                row.add_css_class("error");
+            }
+        });
+    }
+    profiles.add(&row);
+    page.add(&profiles);
+
+    page
+}
+
+/// A file or folder picker, portal-backed under Flatpak.
+///
+/// `GtkFileDialog` rather than `GtkFileChooserNative`: the latter is deprecated
+/// as of GTK 4.10, which is this project's floor anyway.
+fn choose_file(
+    parent: &gtk::Window,
+    title: &str,
+    directory: bool,
+    on_chosen: impl Fn(PathBuf) + 'static,
+) {
+    let dialog = gtk::FileDialog::builder().title(title).modal(true).build();
+    let handle = move |result: Result<gtk::gio::File, glib::Error>| {
+        // A dismissed dialog arrives here as an error, and it is the common
+        // case rather than a fault — reporting it would mean an error message
+        // every time somebody changes their mind.
+        if let Ok(file) = result {
+            if let Some(path) = file.path() {
+                on_chosen(path);
+            }
+        }
+    };
+    if directory {
+        dialog.select_folder(Some(parent), gtk::gio::Cancellable::NONE, handle);
+    } else {
+        dialog.open(Some(parent), gtk::gio::Cancellable::NONE, handle);
+    }
+}
+
 /// "General" — ordinary client settings. Only the renderer preference is
 /// wired to anything real; see `flags_file.rs` for why resolution and
 /// monitor placement are not offered here despite being genuine
-/// `cordial-load` options in their own right.
+/// `cordial-run` options in their own right.
 fn build_general_page(flags_path: Rc<PathBuf>) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder().title("General").icon_name("preferences-other-symbolic").build();
 
@@ -247,6 +470,10 @@ pub fn build_preferences_window(
         .search_enabled(false)
         .build();
 
+    // First, because it is the one that has to be right before anything else
+    // in this window matters: without a build there is nothing to launch, and
+    // a renderer preference for a client that cannot start is decoration.
+    window.add(&build_roblox_page(&window, config.clone(), config_path.clone()));
     window.add(&build_appearance_page(config, config_path));
     window.add(&build_general_page(flags_path));
     window.add(&build_plugins_page(registry));

@@ -5,6 +5,14 @@
 //! this is the first thing anyone launching Cordial sees, and getting the
 //! chrome (row hover states, focus rings, spacing against the header bar) to
 //! merely *look* like libadwaita by hand would be more work than using it.
+//!
+//! **One entry, and it works.** There used to be two, and the second — Roblox
+//! Studio — did nothing when pressed, because ADR-002 puts Studio out of scope
+//! for this runtime. A row that looks live and is not is the interface version
+//! of a stub returning success, so it is gone rather than disabled. The
+//! `EntrySource` seam below stays: it is where plugin-contributed entries will
+//! arrive over `cap:core.launcher.register` once there is a plugin host to ask,
+//! and core still resolves and launches the target itself.
 
 use libadwaita as adw;
 use libadwaita::gtk;
@@ -12,11 +20,9 @@ use libadwaita::prelude::*;
 
 /// One entry in the chooser.
 ///
-/// Once the plugin host is wired in, entries arrive over
-/// `cap:core.launcher.register` (ADR-002, "the plugin declares *what*, core
-/// decides *how*") and core resolves and launches the target itself — a
-/// plugin never holds a spawn primitive. This struct is the shape both sides
-/// will agree on; it does not know or care where it came from.
+/// The shape both sides will agree on once entries arrive from the plugin host
+/// (ADR-002, "the plugin declares *what*, core decides *how*"). It does not
+/// know or care where it came from.
 pub struct Entry {
     pub id: String,
     pub title: String,
@@ -24,65 +30,48 @@ pub struct Entry {
     pub icon_name: Option<String>,
 }
 
-/// Where the chooser gets its entries. The only thing this crate depends on;
-/// swap `PlaceholderSource` for whatever reads the plugin host's registered
-/// entries later and nothing below this trait has to change.
+/// Where the chooser gets its entries.
 pub trait EntrySource {
     fn entries(&self) -> Vec<Entry>;
 }
 
-/// Stand-in entries. There is no plugin host in this standalone binary, so
-/// these are fixed rather than discovered — enough to exercise the populated
-/// chooser; `empty()` exists to exercise the other branch, the
-/// `AdwStatusPage` a fresh install with nothing registered would actually see.
-pub struct PlaceholderSource {
-    entries: Vec<(String, String, Option<String>, Option<String>)>,
-}
+/// The one thing this shell knows how to start.
+pub const ROBLOX: &str = "roblox";
 
-impl PlaceholderSource {
-    pub fn demo() -> Self {
-        Self {
-            entries: vec![
-                (
-                    "roblox".into(),
-                    "Roblox".into(),
-                    Some("Continue as the last signed-in account".into()),
-                    Some("applications-games-symbolic".into()),
-                ),
-                (
-                    "studio".into(),
-                    "Roblox Studio".into(),
-                    Some("Not this runtime — opens via an existing Vinegar install (ADR-002)".into()),
-                    Some("applications-engineering-symbolic".into()),
-                ),
-            ],
-        }
-    }
+/// Core's own entry: the Roblox client, launched by `launch::spawn`.
+pub struct CordialSource;
 
-    #[allow(dead_code)] // exercised from tests, kept for anyone wiring up an empty-state screenshot by hand
-    pub fn empty() -> Self {
-        Self { entries: Vec::new() }
-    }
-}
-
-impl EntrySource for PlaceholderSource {
+impl EntrySource for CordialSource {
     fn entries(&self) -> Vec<Entry> {
-        self.entries
-            .iter()
-            .map(|(id, title, subtitle, icon_name)| Entry {
-                id: id.clone(),
-                title: title.clone(),
-                subtitle: subtitle.clone(),
-                icon_name: icon_name.clone(),
-            })
-            .collect()
+        vec![Entry {
+            id: ROBLOX.into(),
+            title: "Roblox".into(),
+            subtitle: Some("Start the client".into()),
+            icon_name: Some("applications-games-symbolic".into()),
+        }]
+    }
+}
+
+/// Nothing to launch. Kept because the `AdwStatusPage` branch below is what a
+/// shell with no entries at all would paint, and losing the only caller of it
+/// would leave that branch unexercised.
+#[allow(dead_code)] // exercised from tests, and by anyone taking an empty-state screenshot by hand
+pub struct EmptySource;
+
+impl EntrySource for EmptySource {
+    fn entries(&self) -> Vec<Entry> {
+        Vec::new()
     }
 }
 
 /// Builds the chooser: an `AdwStatusPage` when there is nothing to launch,
 /// otherwise an `AdwPreferencesGroup` of action rows, one per entry, clamped
 /// to a readable width rather than stretched edge to edge.
-pub fn build(source: &dyn EntrySource) -> gtk::Widget {
+///
+/// `on_activate` is ADR-002's T2 — the user picking an entry. It is handed the
+/// entry's id and nothing else; deciding what that id means, and refusing it if
+/// it means nothing, is core's job and lives in `window.rs`.
+pub fn build(source: &dyn EntrySource, on_activate: impl Fn(&str) + Clone + 'static) -> gtk::Widget {
     let entries = source.entries();
 
     if entries.is_empty() {
@@ -109,14 +98,9 @@ pub fn build(source: &dyn EntrySource) -> gtk::Widget {
         }
         row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
 
-        // T2 is the user picking an entry; what happens next belongs to core
-        // resolving and launching the target (or, before that plumbing
-        // exists, to the plugin host taking over). Neither is wired into this
-        // standalone binary, so this only proves the row itself is live.
         let id = entry.id.clone();
-        row.connect_activated(move |_| {
-            println!("chooser: {id:?} activated — no launch target wired into the standalone shell yet");
-        });
+        let on_activate = on_activate.clone();
+        row.connect_activated(move |_| on_activate(&id));
 
         group.add(&row);
     }

@@ -206,8 +206,8 @@ CORDIAL_MONITOR=1 CORDIAL_FULLSCREEN=1 cargo run --release --bin cordial-run -- 
 ### Changing FastFlags
 
 Roblox is configured by FastFlags, and Cordial lets you override any of them.
-Create `~/.config/cordial/flags.json` (or point `CORDIAL_FLAGS` at another file)
-with a flat object:
+Create `~/.local/share/cordial/profiles/<profile>/flags.json` (or point
+`CORDIAL_FLAGS` at another file) with a flat object:
 
 ```json
 {
@@ -233,10 +233,15 @@ cannot change a startup flag, whatever it writes.
 Flags come from more than one place, and each source owns its own file:
 
 ```text
-~/.config/cordial/flags.json                     user    (always wins)
+<profile>/flags.json                             user    (always wins)
 ~/.local/share/cordial/plugins/<id>/flags.json   plugin
 the client-settings document from Roblox         base
 ```
+
+Your overrides live in the profile, so a flag you set while testing something on
+one account is not silently still set on the account you play. A file left at
+the old `~/.config/cordial/flags.json` is moved into the first profile that goes
+looking for one — see [ADR-013](docs/adr/ADR-013-per-profile-configuration.md).
 
 A plugin never writes to your file. That keeps three things true: a plugin
 cannot silently overwrite a value you chose, removing a plugin removes its
@@ -295,6 +300,7 @@ Start with [`docs/NEXT.md`](docs/NEXT.md). The rest is reference.
 | [`docs/adr/ADR-008-plugins-are-typescript-on-deno.md`](docs/adr/ADR-008-plugins-are-typescript-on-deno.md) | Why plugins are TypeScript rather than Lua, and what a Deno start actually costs |
 | [`docs/adr/ADR-009-capture-yes-overlay-injection-no.md`](docs/adr/ADR-009-capture-yes-overlay-injection-no.md) | Recording Cordial is supported; loading an overlay into it is not |
 | [`docs/adr/ADR-012-profiles-and-instances.md`](docs/adr/ADR-012-profiles-and-instances.md) | A profile is storage, an instance is a window, and why one profile takes a lock |
+| [`docs/adr/ADR-013-per-profile-configuration.md`](docs/adr/ADR-013-per-profile-configuration.md) | Flags, grants and plugin settings belong to the profile; plugin code belongs to the machine |
 | [`docs/adr/ADR-010-plugin-asset-overlays.md`](docs/adr/ADR-010-plugin-asset-overlays.md) | Why plugins may now overlay Roblox's assets, non-destructively |
 | [`docs/design/instances-and-launch.md`](docs/design/instances-and-launch.md) | Multi-instance, multi-account, and `roblox://` |
 | [`plugins/README.md`](plugins/README.md) | Writing a plugin, and what a plugin cannot do |

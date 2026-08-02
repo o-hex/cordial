@@ -148,6 +148,39 @@ for path-taking libc calls, `--dump-classes <file>` for the Java surface Roblox
 asked for. **`CORDIAL_TRACE=1` aborts the engine** — it wraps variadic functions
 ABI-unsafely. Do not reach for it.
 
+## Do not use present counts as a frame rate
+
+`vkQueuePresentKHR` counts over a wall-clock window were this project's fps
+metric, and they measure the wrong thing. **Presents run at about 60 a second
+for thirteen seconds and then drop to exactly 1.0 a second**, identically on X11
+and Wayland — an idle throttle, not a frame rate. Synthetic pointer motion holds
+50–60 for a whole 240-second run and toggling it flips the rate both ways. Every
+count recorded here before 2026-08-02 is that curve integrated, and several were
+quoted as evidence.
+
+If you need a frame rate, **drive input for the whole measurement** and report
+the rate with the input rate beside it. With input flowing the number is a hard
+FIFO vsync lock to the output's refresh — 60.0 Hz gives 60, a 50 Hz monitor
+gives 49.4 even in fullscreen at four times the pixels.
+
+**Do not measure timing under `WAYLAND_DEBUG=1`.** It changes what it measures.
+Three findings taken that way — a 12.6 s pump stall, presents at 0–3/s with
+input flowing, and 20–25 fps in fullscreen — all vanished on an untraced repeat
+minutes later.
+
+## Say which build you are talking about
+
+The window title is `git describe --tags --always --dirty` with the leading `v`
+stripped, stamped at compile time by `crates/cordial-shell/build.rs`. A release
+reads `Cordial 0.2.0`; a development build reads `Cordial 0.2.0-14-g8db7100` and
+still sorts, which a bare hash does not.
+
+**`-dirty` means the binary was built from a tree with uncommitted changes.**
+Quote the full string in any report. A build made from a working tree several
+agents were editing is otherwise indistinguishable from a committed one, which
+cost an afternoon of chasing an input regression nobody could attribute to a
+tree.
+
 ## Two practical cautions
 
 **Never synthesise input with `XTestFake*`, `ydotool`, `wlr-virtual-keyboard`,

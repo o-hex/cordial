@@ -546,9 +546,12 @@ void trace_identity(const char* field) {
 /// "Never make a stub lie" cuts both ways here. `Windows` would be a lie.
 /// `Android`, which is what Cordial answered until now, is *also* a lie: the
 /// host is a desktop Linux machine with a keyboard and a mouse and no
-/// touchscreen, which is already what `PlatformParams` says through
-/// `isKeyboardDevice`, `isMouseDevice` and `isTouchDevice`. Answering `Android`
-/// beside those three contradicted them.
+/// touchscreen. The engine is already told the last of those through
+/// `PlatformParams.isTouchDevice`, and it does read that one — measured, twice
+/// per cold start — so answering `Android` here contradicted a value the engine
+/// had taken from us. (`isKeyboardDevice` and `isMouseDevice` sit beside it and
+/// are never read at all; see `native/init_params.cpp`'s header. Do not reach
+/// for those two.)
 ///
 /// **What this is not.** It has not been established that this is what makes the
 /// client behave as a mobile one; see docs/analysis/platform-identity.md for

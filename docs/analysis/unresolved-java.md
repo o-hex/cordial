@@ -128,6 +128,27 @@ handed it. This was **verified** (the null-jobject code path in libjnivm) but **
 because no getter-level fix to `InitParams`/`PlatformParams` will matter until this receiver is
 understood.
 
+> **Correction, measured since: the conclusion in the paragraph above no longer holds, and the
+> advice it gives is wrong.** The bring-up moved to `nativeAppBridgeV2InitWithParams`, and on that
+> path the parameter objects *are* read off the instances Cordial constructs. Registering the fields
+> as getter functions and logging each call (`CORDIAL_TRACE_PARAM_READS=1`, `native/init_params.cpp`)
+> shows, on one cold start:
+>
+> ```text
+> [cordial] param read: DeviceParams.osVersion
+> [cordial] param read: DeviceParams.deviceName
+> [cordial] param read: PlatformParams.dpiScale
+> [cordial] param read: PlatformParams.isTouchDevice
+> ```
+>
+> — with a live receiver each time, returning Cordial's own values, and with the engine echoing the
+> control straight back out as `[FLog::Graphics] Vulkan Android Device: Cordial` in the same run. So
+> getter-level work on `InitParams`/`PlatformParams` does reach the engine and is worth doing.
+>
+> The same measurement produced a *different* and worse surprise, which is recorded in
+> [platform-identity.md](platform-identity.md) §2e: `isKeyboardDevice` and `isMouseDevice` are never
+> read at all.
+
 ### 2b. `com/roblox/client/LocalStorageManager`
 
 | Method | Signature | Called? | Correct return |

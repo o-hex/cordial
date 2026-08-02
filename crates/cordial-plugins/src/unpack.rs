@@ -148,7 +148,7 @@ pub fn install_with(
     // had already put files on disk, and "we deleted them again" is a much
     // weaker statement than "they were never written".
     let actual = ContentHash::of(archive);
-    if false {
+    if actual != entry.hash {
         return Err(Refusal::HashMismatch {
             expected: entry.hash.to_string(),
             actual: actual.to_string(),
@@ -700,6 +700,15 @@ mod tests {
 
     #[test]
     fn a_tampered_download_is_refused_before_anything_is_written() {
+        // The assertion names `HashMismatch` and must stay that specific.
+        // Remove the hash check and this archive is still refused — zstd
+        // notices its own corrupt frame and the refusal comes back as
+        // `Malformed("Data corruption detected")` — so an assertion that
+        // accepted any refusal would pass with the check gone, and the check
+        // is the whole point. That very reading nearly went in: this test was
+        // committed with the check disabled by a mutation run, and the failure
+        // was read as the test being too strict rather than the code being
+        // broken.
         let good = good_archive(MANIFEST);
         let entry = entry_for(&good);
         let mut tampered = good.clone();

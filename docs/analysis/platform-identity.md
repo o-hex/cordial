@@ -29,9 +29,10 @@ So the choice is between three answers, and only one of them is true:
 * `Windows` would be a lie, and the sort that invites the service to route the
   client down a path built for a client that does not exist here.
 * `Android` is *also* a lie. The host is a desktop Linux machine with a keyboard
-  and a mouse and no touchscreen — which is already what Cordial says through
-  `PlatformParams.isKeyboardDevice`, `isMouseDevice` and `isTouchDevice`, and has
-  said for some time. Answering `Android` beside those three contradicted them.
+  and a mouse and no touchscreen. Cordial already tells the engine the last of
+  those three through `PlatformParams.isTouchDevice`, and the engine reads it
+  (§2e) — so answering `Android` contradicted a value the engine had actually
+  taken from us.
 * `Linux` is what the machine is, said in a word the engine already knows.
 
 AGENTS.md's rule that a stub must never lie is what decides this, and it decides
@@ -122,7 +123,59 @@ on a class whose other members are all account fields. Both readings point the
 same way for the value — a Linux desktop's platform name is Linux either way —
 but which of the two it is has **not** been established.
 
-### 2e. Things that look like the platform decision and are not
+### 2e. `isKeyboardDevice` and `isMouseDevice` are never read
+
+This was the premise the whole task started from — "the peripherals are already
+described as desktop and the client still behaves as mobile, so something else
+carries the platform identity". Half of that premise is false, and it was worth
+one launch to find out.
+
+Registered as getter functions rather than plain field hooks, so that each read
+is observable (`CORDIAL_TRACE_PARAM_READS=1`), one cold start gives:
+
+| Field | Times read |
+|---|---|
+| `DeviceParams.osVersion` | 1 |
+| `DeviceParams.deviceName` | 1 |
+| `PlatformParams.dpiScale` | 3 |
+| `PlatformParams.isTouchDevice` | 2 |
+| **`PlatformParams.isKeyboardDevice`** | **0** |
+| **`PlatformParams.isMouseDevice`** | **0** |
+
+The reads land at the same app-bridge boundaries `getPlatformName` does —
+`dpiScale` and `isTouchDevice` inside `nativeAppBridgeSetInitParams` and
+`nativeAppBridgeV2Init`, `dpiScale` again inside
+`nativeAppBridgeV2StartAppWithParams`.
+
+**The control is inside the same run and it fired.** `DeviceParams.deviceName`'s
+getter was called, and the engine then printed the value it was given:
+
+```text
+[FLog::Graphics] Vulkan Android Device: Cordial
+```
+
+So the probe was working, the receiver was live, and Cordial's own values were
+what came back. `isKeyboardDevice` and `isMouseDevice` staying at zero is a
+result, not a broken instrument.
+
+Two things follow, and the second is the important one:
+
+* Setting those two fields to the desktop answer has never told the engine
+  anything. `native/init_params.cpp`'s own header claimed all three "decide which
+  input scheme and which UI layout the engine picks"; that claim is now corrected
+  in place, and so is the stale null-receiver note in
+  [unresolved-java.md](unresolved-java.md).
+* The engine **is** told there is no touchscreen — `isTouchDevice=false`, read
+  twice — and behaves as a mobile client anyway. So the mobile input scheme is
+  not the touch flag either. Whatever tells this engine "there is a keyboard and
+  a mouse here", it is neither of the two fields named for it nor the one that is
+  actually read.
+
+That is what makes `getPlatformName` the remaining candidate rather than a
+speculative one: it is the only platform-shaped value in this surface that the
+engine both asks for and Cordial can choose.
+
+### 2f. Things that look like the platform decision and are not
 
 Two of the most visible "Roblox thinks you're mobile" symptoms are properties of
 the APK's *content*, and no platform string can move them:

@@ -8,9 +8,21 @@
 // `InitParams`, `DeviceParams` and `PlatformParams` are plain field-carrying
 // classes and libjnivm binds field hooks by name and descriptor.
 //
-// `PlatformParams` is also where spec §4.2's "Roblox thinks you're mobile" is
-// really answered: `isKeyboardDevice`, `isMouseDevice` and `isTouchDevice` decide
-// which input scheme and which UI layout the engine picks.
+// **This file used to claim that `PlatformParams` is where spec §4.2's "Roblox
+// thinks you're mobile" is really answered — that `isKeyboardDevice`,
+// `isMouseDevice` and `isTouchDevice` decide which input scheme and which UI
+// layout the engine picks. Two thirds of that is false.** Measured with
+// `CORDIAL_TRACE_PARAM_READS=1` on a cold start: the engine reads `isTouchDevice`
+// twice and `dpiScale` three times, and reads `isKeyboardDevice` and
+// `isMouseDevice` **not once**. Setting those two to the desktop answer has
+// therefore never told the engine anything. The control in the same run is
+// `DeviceParams.deviceName`, whose getter fired and whose value came back out of
+// the engine as `[FLog::Graphics] Vulkan Android Device: Cordial`, so the probe
+// was working when the two peripheral fields stayed silent.
+//
+// What that leaves: the engine is told there is no touchscreen, and behaves as a
+// mobile client anyway. Whatever carries "there is a keyboard and a mouse here",
+// it is not this object. See docs/analysis/platform-identity.md.
 
 #include <jnivm.h>
 
@@ -531,6 +543,38 @@ public:
     }
 };
 
+/// `CORDIAL_TRACE_PARAM_READS=1`: name each `PlatformParams` and `DeviceParams`
+/// field the engine actually reads off Cordial's own object.
+///
+/// This exists to settle a premise the whole "Roblox thinks you're mobile" line
+/// of work rests on. `isKeyboardDevice`, `isMouseDevice` and `isTouchDevice`
+/// have been set to the desktop answer for some time and the client still
+/// behaves as a mobile one, which has two completely different explanations:
+/// the engine reads them and ignores them, or the engine never reads them at
+/// all. `docs/analysis/unresolved-java.md` records a live observation of the
+/// second — `platformParams`, `dpiScale` and `isTouchDevice` being reached
+/// through `GetObjectClass(null)`, so against class `Invalid` rather than
+/// against the object Cordial handed over — and nothing has re-checked it since
+/// the bring-up moved to `nativeAppBridgeV2InitWithParams`.
+///
+/// `DeviceParams` is the control, and it is a real one rather than a hopeful
+/// one: `deviceName` is known to arrive, because the engine echoes it into
+/// `[FLog::Graphics] Vulkan Android Device: Cordial` on every run. So a trace
+/// where the `DeviceParams` getters fire and the `PlatformParams` getters do
+/// not is not a broken probe — it is the answer.
+///
+/// Off by default and registered as *getter functions* only when on, so the
+/// ordinary client keeps the plain field hooks it has always had and the probe
+/// cannot change what it is measuring.
+static bool trace_param_reads() {
+    static const bool on = getenv("CORDIAL_TRACE_PARAM_READS") != nullptr;
+    return on;
+}
+
+static void note_param_read(const char* klass, const char* field) {
+    fprintf(stderr, "[cordial] param read: %s.%s\n", klass, field);
+}
+
 /// `com.roblox.engine.jni.model.DeviceParams`
 class DeviceParams : public Object {
 public:
@@ -586,6 +630,32 @@ public:
     static void Register(ENV* env) {
         env->GetClass<DeviceParams>("com/roblox/engine/jni/model/DeviceParams");
         auto c = env->GetClass("com/roblox/engine/jni/model/DeviceParams");
+        if (trace_param_reads()) {
+            // The control. `deviceName` is the one parameter field with a
+            // standing, independent proof that it reaches the engine — it comes
+            // back out in `[FLog::Graphics] Vulkan Android Device: Cordial` —
+            // so if this getter does not fire either, the probe is broken and
+            // the run says nothing about PlatformParams.
+            c->HookInstanceGetterFunction(env, "deviceName",
+                                          [](Object* o) -> std::shared_ptr<String> {
+                note_param_read("DeviceParams", "deviceName");
+                return o ? static_cast<DeviceParams*>(o)->deviceName : nullptr;
+            });
+            c->HookInstanceGetterFunction(env, "osVersion",
+                                          [](Object* o) -> std::shared_ptr<String> {
+                note_param_read("DeviceParams", "osVersion");
+                return o ? static_cast<DeviceParams*>(o)->osVersion : nullptr;
+            });
+#define F(name) c->HookInstance(env, #name, &DeviceParams::name)
+            F(appBuildVariant); F(appVersion); F(country); F(deviceSku);
+            F(displayResolution); F(manufacturer); F(networkType);
+            F(socModel); F(testDeviceName); F(cpu64Bit); F(isChrome); F(isLowRamDevice);
+            F(deviceTotalMemoryMB); F(displayPhysicalWidthPixels); F(displayPhysicalHeightPixels);
+            F(largeMemoryClass); F(memoryClass);
+            F(lowMemoryKillerBackgroundAppThreshold); F(lowMemoryKillerForegroundAppThreshold);
+#undef F
+            return;
+        }
 #define F(name) c->HookInstance(env, #name, &DeviceParams::name)
         F(appBuildVariant); F(appVersion); F(country); F(deviceName); F(deviceSku);
         F(displayResolution); F(manufacturer); F(networkType); F(osVersion);
@@ -611,9 +681,13 @@ public:
     static std::shared_ptr<PlatformParams> Create(ENV* env, const char* assets, int width, int height) {
         auto p = std::make_shared<PlatformParams>();
         p->assetFolderPath = S(assets);
-        // This is the desktop answer, and it is the point: keyboard and mouse
-        // present, touch absent. It decides the input scheme and the UI layout
-        // the engine chooses, which is what §4.2 is actually about.
+        // The desktop answer, and only one third of it is load-bearing.
+        // `isTouchDevice` is read — twice per cold start, measured — so the
+        // engine genuinely is told this machine has no touchscreen.
+        // `isKeyboardDevice` and `isMouseDevice` are **never read at all**, so
+        // they are documentation rather than configuration: true is what is
+        // honest about the host, and the engine has never asked. Do not reach
+        // for these two when input misbehaves; they cannot be the cause.
         p->isKeyboardDevice = true;
         p->isMouseDevice = true;
         p->isTouchDevice = false;
@@ -649,6 +723,34 @@ public:
     static void Register(ENV* env) {
         env->GetClass<PlatformParams>("com/roblox/engine/jni/model/PlatformParams");
         auto c = env->GetClass("com/roblox/engine/jni/model/PlatformParams");
+        if (trace_param_reads()) {
+            // Same values, read through a function so the read itself is
+            // observable. The three peripheral booleans are the ones the
+            // question is about; dpiScale rides along because it is the one
+            // PlatformParams field with an independent report of having reached
+            // the engine (docs/NEXT.md's density work), so it doubles as a
+            // second control inside this same object.
+            c->HookInstanceGetterFunction(env, "isKeyboardDevice", [](Object* o) -> jboolean {
+                note_param_read("PlatformParams", "isKeyboardDevice");
+                return o ? static_cast<PlatformParams*>(o)->isKeyboardDevice : JNI_FALSE;
+            });
+            c->HookInstanceGetterFunction(env, "isMouseDevice", [](Object* o) -> jboolean {
+                note_param_read("PlatformParams", "isMouseDevice");
+                return o ? static_cast<PlatformParams*>(o)->isMouseDevice : JNI_FALSE;
+            });
+            c->HookInstanceGetterFunction(env, "isTouchDevice", [](Object* o) -> jboolean {
+                note_param_read("PlatformParams", "isTouchDevice");
+                return o ? static_cast<PlatformParams*>(o)->isTouchDevice : JNI_FALSE;
+            });
+            c->HookInstanceGetterFunction(env, "dpiScale", [](Object* o) -> jfloat {
+                note_param_read("PlatformParams", "dpiScale");
+                return o ? static_cast<PlatformParams*>(o)->dpiScale : 1.0f;
+            });
+#define F(name) c->HookInstance(env, #name, &PlatformParams::name)
+            F(assetFolderPath); F(viewportWidthMm); F(viewportHeightMm);
+#undef F
+            return;
+        }
 #define F(name) c->HookInstance(env, #name, &PlatformParams::name)
         F(assetFolderPath); F(dpiScale); F(isKeyboardDevice); F(isMouseDevice);
         F(isTouchDevice); F(viewportWidthMm); F(viewportHeightMm);

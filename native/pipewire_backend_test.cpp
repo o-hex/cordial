@@ -120,6 +120,33 @@ void multiple_buffers_are_drained_in_order_within_one_fill() {
     std::printf("ok: multiple_buffers_are_drained_in_order_within_one_fill\n");
 }
 
+// The privacy rule, checked the only way it can be checked without a session:
+// by construction. A `CaptureStream` that has not been opened must hold no
+// PipeWire resource, and the process-wide count of open capture streams must
+// still be zero after one has been built and destroyed. This does not prove
+// the live case — `pw-top` and the desktop's microphone indicator do that, and
+// the report accompanying this change carries that evidence — but it does pin
+// the invariant that the live case rests on, and it will fail loudly if
+// someone later moves the `open()` call into the constructor.
+void a_capture_stream_holds_nothing_until_it_is_opened() {
+    assert(cordial::audio::active_capture_streams() == 0);
+    {
+        cordial::audio::CaptureStream capture;
+        assert(!capture.is_open());
+        assert(cordial::audio::active_capture_streams() == 0);
+
+        // A read from a stream that was never opened returns no samples
+        // rather than blocking for some that will never arrive, and must not
+        // open anything in order to answer.
+        uint8_t buf[64];
+        std::memset(buf, 0xAA, sizeof(buf));
+        assert(capture.read(buf, sizeof(buf)) == 0);
+        assert(cordial::audio::active_capture_streams() == 0);
+    }
+    assert(cordial::audio::active_capture_streams() == 0);
+    std::printf("ok: a_capture_stream_holds_nothing_until_it_is_opened\n");
+}
+
 } // namespace
 
 int main() {
@@ -128,6 +155,7 @@ int main() {
     a_short_queue_fills_what_it_has_and_pads_the_rest_with_silence();
     a_partially_consumed_buffer_is_not_dropped_early();
     multiple_buffers_are_drained_in_order_within_one_fill();
+    a_capture_stream_holds_nothing_until_it_is_opened();
     std::printf("all pipewire_backend fill_pcm checks passed\n");
     return 0;
 }

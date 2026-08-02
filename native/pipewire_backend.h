@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <string>
 #include <vector>
 
 namespace cordial::audio {
@@ -25,6 +26,66 @@ namespace cordial::audio {
 /// not running) — because the caller's response is the same for all three:
 /// report failure rather than hand back an engine with no audio behind it.
 bool pipewire_available();
+
+/// One PipeWire node that carries audio, as the registry describes it.
+///
+/// Everything here is copied verbatim out of the node's global properties
+/// rather than interpreted: the caller that wants an
+/// `android.media.AudioDeviceInfo.TYPE_*` out of it is `audio_classes.cpp`,
+/// and Android's vocabulary belongs in the file that speaks Android. What
+/// this file is responsible for is that each string is what PipeWire
+/// actually said, so that a wrong guess upstream is a wrong guess about
+/// honest data rather than a guess compounded on a guess.
+struct DeviceInfo {
+    /// The PipeWire global id, used unchanged as `AudioDeviceInfo.getId()`.
+    /// Android only requires that ids be unique among the devices reported
+    /// at the same moment and stable while a device stays connected, which
+    /// is exactly what a PipeWire global id already is — so there is no
+    /// mapping table here to drift out of step with the session.
+    uint32_t id = 0;
+    /// `node.name`: the stable routing target (`alsa_output.pci-...`), which
+    /// is what a stream sets `PW_KEY_TARGET_OBJECT` to. Not shown to a user.
+    std::string node_name;
+    /// `node.description`: what the user's own volume control calls this
+    /// device, and therefore what `getProductName()` must return if the
+    /// device picker is to be recognisable.
+    std::string description;
+    /// `node.nick`, when set — the short form ("Speaker", "HDMI 1").
+    std::string nick;
+    /// `object.path` ("alsa:acp:sofhdadsp:3:playback", "bluez5:..."), whose
+    /// prefix names the backing API. The most reliable single signal for the
+    /// Android device type, because it comes from the SPA plugin that
+    /// created the node rather than from a name someone can rename.
+    std::string object_path;
+    /// `media.class` was `Audio/Source` rather than `Audio/Sink`; i.e. this
+    /// device records. Maps straight onto `AudioDeviceInfo.isSource()`.
+    bool is_source = false;
+    /// This node is the one the `default` metadata's `default.audio.sink` /
+    /// `default.audio.source` key names — the device the user's desktop
+    /// sends audio to when nothing has asked for anything else.
+    bool is_default = false;
+};
+
+/// Every audio sink and source the session currently has, defaults marked.
+///
+/// **This opens no stream of any kind.** Listing a microphone is not using
+/// one, and the whole privacy gate in `audio_classes.cpp` rests on that
+/// distinction holding here: this walks the registry, reads properties, and
+/// disconnects the registry listener again. A capture stream exists only
+/// after `CaptureStream::open`, which nothing on the enumeration path calls.
+///
+/// Returns empty when no session is reachable, which the caller must report
+/// as "no devices" rather than substituting a plausible-looking one.
+std::vector<DeviceInfo> enumerate_devices();
+
+/// How many `CaptureStream`s currently hold an open `pw_stream`.
+///
+/// Exists so the privacy requirement can be *checked* rather than asserted:
+/// `audio_classes.cpp` logs this when the engine stops recording, and the
+/// test binary reads it to prove enumeration left it at zero. `pw-top` and
+/// the desktop's own microphone indicator are the independent checks; this
+/// is the one Cordial can make about itself.
+uint32_t active_capture_streams();
 
 /// One playback stream, backed by one `pw_stream`. `opensles.cpp` owns one of
 /// these per realized `AudioPlayer` object.
@@ -89,6 +150,59 @@ public:
         uint32_t index; ///< buffers enqueued since the last `open`/`clear` (mirrors `.index`)
     };
     QueueState state() const;
+
+private:
+    struct Impl;
+    Impl* impl_;
+};
+
+/// One capture stream, backed by one `pw_stream` in the input direction.
+///
+/// The lifetime rule is the point of this class and is not negotiable: an
+/// instance holds no PipeWire resource at all until `open()`, and holds none
+/// again the moment `close()` returns. There is no paused state and no muted
+/// state, because neither of those puts the desktop's microphone indicator
+/// out and neither of those stops another application seeing Cordial holding
+/// the capture device. A recording that has stopped must be indistinguishable
+/// from a Cordial that never recorded, and the only way to be
+/// indistinguishable is to actually not be there.
+///
+/// That is why the read side is a ring buffer owned by this object rather
+/// than a borrowed-pointer arrangement like `PlaybackStream`'s: the caller
+/// (`android.media.AudioRecord.read`) polls on its own thread whenever it
+/// likes, including not at all, and none of that may keep the stream alive a
+/// moment longer than the engine asked for.
+class CaptureStream {
+public:
+    CaptureStream();
+    ~CaptureStream();
+
+    CaptureStream(const CaptureStream&) = delete;
+    CaptureStream& operator=(const CaptureStream&) = delete;
+
+    /// Creates and connects a `pw_stream` capturing S16 PCM at `rate_hz` and
+    /// `channels`, from `target_node_name` if it is non-empty and from
+    /// whatever PipeWire calls the default source otherwise.
+    ///
+    /// **This is the only function in Cordial that opens the microphone.**
+    /// Every caller of it must be on a path the engine explicitly asked to
+    /// record on; see `audio_classes.cpp`, where the only call sites are
+    /// `AudioRecord.startRecording` and `WebRtcAudioRecord.startRecording`.
+    bool open(uint32_t rate_hz, uint32_t channels, const std::string& target_node_name);
+
+    /// Destroys the underlying `pw_stream` and drops every buffered sample.
+    /// Idempotent, so the double-stop that a `stop()` followed by a
+    /// `release()` produces costs nothing and is not an error.
+    void close();
+
+    bool is_open() const;
+
+    /// Copies up to `size` bytes of captured interleaved S16 PCM into `dst`,
+    /// returning how many bytes were written. Returns 0 rather than blocking
+    /// when the stream is closed or nothing has arrived yet: a recorder that
+    /// blocks forever on a device that will never produce samples is the
+    /// failure mode this whole file exists to avoid.
+    uint32_t read(void* dst, uint32_t size);
 
 private:
     struct Impl;

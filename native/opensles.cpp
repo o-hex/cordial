@@ -28,11 +28,23 @@
 // otherwise would only move that failure somewhere less legible. See
 // `pipewire_backend.cpp` for how "unreachable" is decided.
 //
-// Recording (`SL_IID_RECORD`, Roblox's voice chat) stays unimplemented on
-// purpose: `SLEngineItf::CreateAudioRecorder` reports failure rather than
-// handing back a recorder that never delivers a buffer. Capturing the host's
-// microphone into Roblox is a real feature with real privacy implications
-// and is out of scope here — this is audio *out*.
+// Recording (`SL_IID_RECORD`) stays unimplemented on purpose, and now for a
+// sharper reason than when this comment was first written. It is not that
+// capturing the microphone is out of scope — `audio_classes.cpp` implements
+// that path, gated so that no PipeWire capture stream exists unless Roblox has
+// asked to record. It is that Roblox's Android build does not record through
+// OpenSL ES at all: it records through
+// `org.webrtc.voiceengine.WebRtcAudioRecord`, which wraps
+// `android.media.AudioRecord`, and the shipping dex declares exactly that
+// surface. So `CreateAudioRecorder` continues to report failure, because
+// implementing it would add a second way to open the microphone that nothing
+// asks for, and one door is easier to keep shut than two.
+//
+// Device *enumeration* is likewise not here. Roblox reads
+// `AudioManager.getDevices(int)` and `android.media.AudioDeviceInfo`, which are
+// Java; `SLOutputMixItf::GetDestinationOutputDeviceIDs` below reports zero
+// devices and that remains correct — the OpenSL routing surface is genuinely
+// not where Android's device list comes from. See `audio_classes.cpp`.
 //
 // The vtable layouts, struct definitions and every numeric constant below
 // come from Khronos's OpenSL ES 1.0.1 header and AOSP's Android extension
@@ -924,10 +936,11 @@ SLresult engine_CreateAudioPlayer(SLEngineItf, SLObjectItf* pPlayer, SLDataSourc
 
 SLresult engine_CreateAudioRecorder(SLEngineItf, SLObjectItf* pRecorder, SLDataSource*, SLDataSink*,
                                      SLuint32, const SLInterfaceID*, const SLboolean*) {
-    // Deliberately unimplemented — see the file header. Failing recorder
-    // creation cleanly means Roblox's voice chat finds out immediately that
-    // there is no capture device, rather than getting a recorder object
-    // that silently never delivers a buffer.
+    // Deliberately unimplemented — see the file header. This is not the path
+    // Roblox records through (that is `WebRtcAudioRecord`, in
+    // `audio_classes.cpp`), so failing cleanly here closes a door nothing
+    // knocks on rather than removing a capability. A recorder object that
+    // silently never delivered a buffer would be the worse answer either way.
     if (pRecorder) *pRecorder = nullptr;
     return SL_RESULT_FEATURE_UNSUPPORTED;
 }

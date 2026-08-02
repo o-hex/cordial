@@ -38,6 +38,7 @@
 #include <spa/param/props.h>
 #include <spa/utils/result.h>
 #include <pipewire/pipewire.h>
+#include <pipewire/extensions/metadata.h>
 
 #include <dlfcn.h>
 
@@ -48,6 +49,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace cordial::audio {
@@ -92,6 +94,14 @@ struct Library {
     int (*stream_queue_buffer)(pw_stream*, pw_buffer*);
     int (*stream_set_active)(pw_stream*, bool);
     int (*stream_update_params)(pw_stream*, const spa_pod**, uint32_t);
+
+    // Device enumeration only. The registry and metadata objects it walks are
+    // reached through `pw_core_get_registry` / `pw_registry_bind`, which are
+    // static inline (see the file header on the third category), but the
+    // proxies they hand back are real objects that need a real, exported
+    // destructor — and enumeration runs every time Roblox asks for the device
+    // list, so leaking one per call would be a leak per device-picker open.
+    void (*proxy_destroy)(pw_proxy*);
 };
 
 Library g_lib{};
@@ -135,6 +145,7 @@ bool load_library() {
         {"pw_stream_queue_buffer", reinterpret_cast<void**>(&g_lib.stream_queue_buffer)},
         {"pw_stream_set_active", reinterpret_cast<void**>(&g_lib.stream_set_active)},
         {"pw_stream_update_params", reinterpret_cast<void**>(&g_lib.stream_update_params)},
+        {"pw_proxy_destroy", reinterpret_cast<void**>(&g_lib.proxy_destroy)},
     };
     for (const Entry& e : entries) {
         *e.slot = dlsym(handle, e.name);
@@ -157,11 +168,45 @@ bool load_library() {
 /// only ever creates one OpenSL engine. Never torn down: it lives exactly as
 /// long as `cordial_liblog`'s other process-lifetime state (bionic's TLS,
 /// the linker's loaded-library table) does.
+///
+/// The core listener and its round-trip state are *members* rather than the
+/// locals they used to be, and that is a correctness fix, not tidying.
+/// `pw_core_add_listener` links the `spa_hook` it is given into a list the
+/// core keeps and dereferences on every later core event; the previous
+/// revision passed a hook that lived on `connect_session`'s stack and never
+/// removed it, so the list held a pointer into a frame that had returned.
+/// Nothing had noticed because nothing ever issued a second `pw_core_sync` —
+/// device enumeration is the first thing to do so, and it turned a latent
+/// dangling pointer into one that would actually be called.
 struct Session {
-    pw_thread_loop* loop;
-    pw_context* context;
-    pw_core* core;
+    pw_thread_loop* loop = nullptr;
+    pw_context* context = nullptr;
+    pw_core* core = nullptr;
+
+    spa_hook core_listener{};
+    int pending_seq = -1;
+    bool sync_done = false;
+    bool sync_failed = false;
 };
+
+/// Blocks until the server has answered a `pw_core_sync`, i.e. until every
+/// request issued before it has been processed and every event it produced
+/// has been delivered. Must be called with `loop` locked.
+///
+/// Three seconds, matching `connect_session`: a session that cannot answer a
+/// local socket round trip in that time is not one worth making Roblox wait
+/// on. False means the answer never came, and every caller treats that as
+/// "report what was gathered so far" rather than retrying — a wedged daemon
+/// does not become unwedged by being asked twice.
+bool round_trip(Session* s) {
+    s->sync_done = false;
+    s->sync_failed = false;
+    s->pending_seq = pw_core_sync(s->core, PW_ID_CORE, 0);
+    while (!s->sync_done && !s->sync_failed) {
+        if (g_lib.thread_loop_timed_wait(s->loop, 3) != 0) break;
+    }
+    return s->sync_done;
+}
 
 /// Connects and round-trips once. A `pw_context_connect` that returns a
 /// non-null `pw_core` only proves a socket was opened — a stale
@@ -212,64 +257,62 @@ Session* connect_session() {
         return nullptr;
     }
 
-    struct SyncState {
-        pw_thread_loop* loop;
-        int pending_seq = -1;
-        bool done = false;
-        bool failed = false;
-    } sync{loop};
+    // Built before the listener is registered, and never freed, because the
+    // core keeps a pointer to `session->core_listener` for as long as the
+    // connection lives. See the Session comment on why that used to be a
+    // stack local and why it must not be.
+    auto* session = new Session();
+    session->loop = loop;
+    session->context = context;
+    session->core = core;
 
-    pw_core_events core_events{};
-    core_events.version = PW_VERSION_CORE_EVENTS;
-    core_events.done = [](void* data, uint32_t id, int seq) {
-        auto* s = static_cast<SyncState*>(data);
-        if (id == PW_ID_CORE && seq == s->pending_seq) {
-            s->done = true;
+    static pw_core_events core_events = [] {
+        pw_core_events e{};
+        e.version = PW_VERSION_CORE_EVENTS;
+        e.done = [](void* data, uint32_t id, int seq) {
+            auto* s = static_cast<Session*>(data);
+            if (id == PW_ID_CORE && seq == s->pending_seq) {
+                s->sync_done = true;
+                g_lib.thread_loop_signal(s->loop, false);
+            }
+        };
+        e.error = [](void* data, uint32_t id, int, int res, const char* message) {
+            auto* s = static_cast<Session*>(data);
+            std::fprintf(stderr,
+                "E/Cordial-OpenSLES         PipeWire core reported an error "
+                "(id=%u res=%d %s).\n", id, res, message ? message : "");
+            s->sync_failed = true;
             g_lib.thread_loop_signal(s->loop, false);
-        }
-    };
-    core_events.error = [](void* data, uint32_t id, int seq, int res, const char* message) {
-        auto* s = static_cast<SyncState*>(data);
-        std::fprintf(stderr,
-            "E/Cordial-OpenSLES         PipeWire core reported an error before the "
-            "connection was confirmed (id=%u res=%d %s); no audio output.\n",
-            id, res, message ? message : "");
-        s->failed = true;
-        g_lib.thread_loop_signal(s->loop, false);
-    };
+        };
+        return e;
+    }();
+    pw_core_add_listener(core, &session->core_listener, &core_events, session);
 
-    spa_hook core_listener{};
-    pw_core_add_listener(core, &core_listener, &core_events, &sync);
-    sync.pending_seq = pw_core_sync(core, PW_ID_CORE, 0);
-
-    // Three seconds is generous for a round trip over a local Unix socket;
-    // a session that cannot answer that quickly is not one worth Roblox
-    // waiting on either, so this fails the same way a missing library does.
-    while (!sync.done && !sync.failed) {
-        if (g_lib.thread_loop_timed_wait(loop, 3) != 0) break;
-    }
+    bool reachable = round_trip(session);
 
     g_lib.thread_loop_unlock(loop);
 
-    if (!sync.done) {
-        if (!sync.failed) {
+    if (!reachable) {
+        if (!session->sync_failed) {
             std::fprintf(stderr,
                 "E/Cordial-OpenSLES         PipeWire did not answer within 3s; treating "
                 "the session as unreachable. No audio output.\n");
         }
         g_lib.thread_loop_lock(loop);
+        spa_hook_remove(&session->core_listener);
         g_lib.core_disconnect(core);
         g_lib.context_destroy(context);
         g_lib.thread_loop_unlock(loop);
         g_lib.thread_loop_stop(loop);
         g_lib.thread_loop_destroy(loop);
+        delete session;
         return nullptr;
     }
 
     std::fprintf(stderr,
         "I/Cordial-OpenSLES         PipeWire session confirmed reachable; OpenSL ES "
         "audio players will play through it.\n");
-    return new Session{loop, context, core};
+    return session;
 }
 
 Session* get_session() {
@@ -466,6 +509,394 @@ struct PlaybackStream::Impl {
         return e;
     }
 };
+
+// ------------------------------------------------------- device enumeration
+
+namespace {
+
+/// Pulls the `"name"` string out of a `default` metadata value, which
+/// WirePlumber writes as the JSON object `{"name":"alsa_output.pci-..."}`.
+///
+/// Deliberately a scan for one key rather than a JSON parser. SPA ships one
+/// (`spa/utils/json.h`) but its API has moved between the versions this file
+/// has to compile against, and the alternative — vendoring a parser to read a
+/// single string out of a document PipeWire itself generates from a fixed
+/// template — is a great deal of surface for no additional truth. An
+/// unrecognised shape returns empty, which the caller reads as "no default
+/// known" and reports no default at all; that is the honest degradation, and
+/// it is visible (no device is marked default) rather than silent.
+std::string metadata_value_name(const char* value) {
+    if (!value) return {};
+    const std::string v(value);
+    const std::string key = "\"name\"";
+    size_t k = v.find(key);
+    if (k == std::string::npos) return {};
+    size_t colon = v.find(':', k + key.size());
+    if (colon == std::string::npos) return {};
+    size_t open_quote = v.find('"', colon + 1);
+    if (open_quote == std::string::npos) return {};
+    size_t close_quote = v.find('"', open_quote + 1);
+    if (close_quote == std::string::npos) return {};
+    return v.substr(open_quote + 1, close_quote - open_quote - 1);
+}
+
+const char* dict_get(const spa_dict* props, const char* key) {
+    if (!props) return nullptr;
+    const char* v = spa_dict_lookup(props, key);
+    return v;
+}
+
+/// What one registry walk collected. Lives on the enumerating thread's stack
+/// with the loop locked throughout, so no lock of its own: PipeWire delivers
+/// every event below on the loop thread, and the loop thread is blocked
+/// inside `round_trip` waiting for us for the whole time these fire.
+struct RegistryScan {
+    std::vector<DeviceInfo> devices;
+    uint32_t default_metadata_id = SPA_ID_INVALID;
+    std::string default_sink;
+    std::string default_source;
+};
+
+} // namespace
+
+std::vector<DeviceInfo> enumerate_devices() {
+    Session* session = get_session();
+    if (!session) return {};
+
+    RegistryScan scan;
+
+    g_lib.thread_loop_lock(session->loop);
+
+    pw_registry* registry = pw_core_get_registry(session->core, PW_VERSION_REGISTRY, 0);
+    if (!registry) {
+        g_lib.thread_loop_unlock(session->loop);
+        std::fprintf(stderr,
+            "E/Cordial-OpenSLES         pw_core_get_registry failed; reporting no audio "
+            "devices rather than a guess at what is attached.\n");
+        return {};
+    }
+
+    pw_registry_events registry_events{};
+    registry_events.version = PW_VERSION_REGISTRY_EVENTS;
+    registry_events.global = [](void* data, uint32_t id, uint32_t, const char* type, uint32_t,
+                                 const spa_dict* props) {
+        auto* s = static_cast<RegistryScan*>(data);
+
+        if (type && std::strcmp(type, PW_TYPE_INTERFACE_Metadata) == 0) {
+            const char* name = dict_get(props, PW_KEY_METADATA_NAME);
+            // There are several metadata objects in a session ("settings",
+            // "sm-settings", ...); only the one literally called "default"
+            // carries default.audio.sink/source.
+            if (name && std::strcmp(name, "default") == 0) s->default_metadata_id = id;
+            return;
+        }
+        if (!type || std::strcmp(type, PW_TYPE_INTERFACE_Node) != 0) return;
+
+        const char* media_class = dict_get(props, PW_KEY_MEDIA_CLASS);
+        if (!media_class) return;
+        const bool sink = std::strcmp(media_class, "Audio/Sink") == 0;
+        const bool source = std::strcmp(media_class, "Audio/Source") == 0;
+        // Audio/Duplex, Audio/Source/Virtual, Stream/Output/Audio and the rest
+        // are deliberately not reported. A monitor or another application's
+        // playback stream is not a device the user would recognise in a picker,
+        // and Roblox offering to record from Cordial's own output would be a
+        // surprising thing to hand someone.
+        if (!sink && !source) return;
+
+        DeviceInfo d;
+        d.id = id;
+        d.is_source = source;
+        if (const char* v = dict_get(props, PW_KEY_NODE_NAME)) d.node_name = v;
+        if (const char* v = dict_get(props, PW_KEY_NODE_DESCRIPTION)) d.description = v;
+        if (const char* v = dict_get(props, PW_KEY_NODE_NICK)) d.nick = v;
+        if (const char* v = dict_get(props, PW_KEY_OBJECT_PATH)) d.object_path = v;
+        s->devices.push_back(std::move(d));
+    };
+
+    spa_hook registry_listener{};
+    pw_registry_add_listener(registry, &registry_listener, &registry_events, &scan);
+
+    // The registry replays every existing global before answering the sync,
+    // so one round trip is the whole current session — no polling, and no
+    // arbitrary sleep hoping the list has settled.
+    const bool listed = round_trip(session);
+
+    // Defaults live in a separate object that has to be bound before it will
+    // say anything, which is why this is a second round trip rather than more
+    // of the first: the metadata global's id is only known once the registry
+    // has announced it above.
+    pw_proxy* metadata_proxy = nullptr;
+    spa_hook metadata_listener{};
+    if (listed && scan.default_metadata_id != SPA_ID_INVALID) {
+        metadata_proxy = static_cast<pw_proxy*>(pw_registry_bind(
+            registry, scan.default_metadata_id, PW_TYPE_INTERFACE_Metadata, PW_VERSION_METADATA, 0));
+        if (metadata_proxy) {
+            pw_metadata_events metadata_events{};
+            metadata_events.version = PW_VERSION_METADATA_EVENTS;
+            metadata_events.property = [](void* data, uint32_t subject, const char* key,
+                                           const char*, const char* value) -> int {
+                auto* s = static_cast<RegistryScan*>(data);
+                if (subject != PW_ID_CORE || !key) return 0;
+                if (std::strcmp(key, "default.audio.sink") == 0) {
+                    s->default_sink = metadata_value_name(value);
+                } else if (std::strcmp(key, "default.audio.source") == 0) {
+                    s->default_source = metadata_value_name(value);
+                }
+                return 0;
+            };
+            pw_metadata_add_listener(reinterpret_cast<pw_metadata*>(metadata_proxy),
+                                     &metadata_listener, &metadata_events, &scan);
+            round_trip(session);
+        }
+    }
+
+    if (metadata_proxy) {
+        spa_hook_remove(&metadata_listener);
+        g_lib.proxy_destroy(metadata_proxy);
+    }
+    spa_hook_remove(&registry_listener);
+    g_lib.proxy_destroy(reinterpret_cast<pw_proxy*>(registry));
+
+    g_lib.thread_loop_unlock(session->loop);
+
+    if (!listed) {
+        std::fprintf(stderr,
+            "E/Cordial-OpenSLES         PipeWire did not finish listing its devices; "
+            "reporting the %zu found so far rather than a fabricated list.\n",
+            scan.devices.size());
+    }
+
+    for (DeviceInfo& d : scan.devices) {
+        d.is_default = d.is_source ? (!scan.default_source.empty() && d.node_name == scan.default_source)
+                                    : (!scan.default_sink.empty() && d.node_name == scan.default_sink);
+    }
+    return scan.devices;
+}
+
+// ---------------------------------------------------------- CaptureStream
+
+namespace {
+
+/// Every capture stream currently holding a `pw_stream`. The privacy rule
+/// this file is written around is "zero unless Roblox asked to record", and
+/// a rule nobody can read the current value of is a rule nobody can check.
+std::atomic<uint32_t> g_open_capture_streams{0};
+
+} // namespace
+
+uint32_t active_capture_streams() { return g_open_capture_streams.load(); }
+
+struct CaptureStream::Impl {
+    pw_stream* stream = nullptr;
+    uint32_t bytes_per_frame = 0;
+
+    mutable std::mutex mutex;
+    // A plain byte queue rather than a borrowed-pointer list like the
+    // playback side: capture is the other way round — PipeWire owns the
+    // memory the samples arrive in and reuses it the moment `process`
+    // returns, so anything we intend the reader to see later has to be
+    // copied out here, not referenced.
+    std::deque<uint8_t> buffered;
+    size_t max_buffered = 0;
+    uint64_t dropped_bytes = 0;
+
+    static void on_process(void* data) { static_cast<Impl*>(data)->process(); }
+
+    static void on_state_changed(void*, pw_stream_state, pw_stream_state state, const char* error) {
+        if (state == PW_STREAM_STATE_ERROR) {
+            std::fprintf(stderr,
+                "E/Cordial-OpenSLES         PipeWire capture stream entered the error state "
+                "(%s); recording will deliver no samples.\n", error ? error : "no reason given");
+        }
+    }
+
+    void process() {
+        pw_buffer* b = g_lib.stream_dequeue_buffer(stream);
+        if (!b) return;
+        spa_buffer* buf = b->buffer;
+        const auto* src = static_cast<const uint8_t*>(buf->datas[0].data);
+        if (src) {
+            const uint32_t offset = buf->datas[0].chunk->offset;
+            const uint32_t size = buf->datas[0].chunk->size;
+            std::lock_guard<std::mutex> lock(mutex);
+            for (uint32_t i = 0; i < size; ++i) buffered.push_back(src[offset + i]);
+            // A reader that has stopped calling `read` must not turn into
+            // unbounded memory growth for as long as the stream stays open.
+            // Dropping the oldest samples is the right end to drop from: what
+            // a late reader wants is the most recent audio, and voice chat has
+            // no use for a second-old backlog it would only have to skip.
+            while (buffered.size() > max_buffered) {
+                buffered.pop_front();
+                ++dropped_bytes;
+            }
+        }
+        g_lib.stream_queue_buffer(stream, b);
+    }
+
+    static const pw_stream_events& events() {
+        static const pw_stream_events e = [] {
+            pw_stream_events ev{};
+            ev.version = PW_VERSION_STREAM_EVENTS;
+            ev.state_changed = &Impl::on_state_changed;
+            ev.process = &Impl::on_process;
+            return ev;
+        }();
+        return e;
+    }
+};
+
+CaptureStream::CaptureStream() : impl_(new Impl()) {}
+
+CaptureStream::~CaptureStream() {
+    close();
+    delete impl_;
+}
+
+bool CaptureStream::open(uint32_t rate_hz, uint32_t channels, const std::string& target_node_name) {
+    if (impl_->stream) return true;
+
+    Session* session = get_session();
+    if (!session) return false;
+    if (channels == 0 || channels > SPA_AUDIO_MAX_CHANNELS || rate_hz == 0) {
+        std::fprintf(stderr,
+            "E/Cordial-OpenSLES         refusing to open a capture stream at %u Hz / %u "
+            "channels; nothing will be recorded.\n", rate_hz, channels);
+        return false;
+    }
+
+    impl_->bytes_per_frame = channels * 2; // S16 only; see the format param below
+    // Half a second. Long enough to absorb a reader that misses its slot
+    // while the graph re-negotiates, short enough that the samples a reader
+    // eventually sees are still worth hearing.
+    impl_->max_buffered = static_cast<size_t>(impl_->bytes_per_frame) * rate_hz / 2;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->buffered.clear();
+        impl_->dropped_bytes = 0;
+    }
+
+    static std::atomic<uint32_t> next_id{0};
+    char name[64];
+    std::snprintf(name, sizeof name, "cordial-audiorecord-%u", next_id.fetch_add(1));
+
+    g_lib.thread_loop_lock(session->loop);
+
+    // PW_KEY_MEDIA_ROLE "Communication" is not decoration: it is what tells
+    // the session manager this is a voice stream, which is what makes the
+    // desktop's own microphone indicator light up and name Cordial. Being
+    // conspicuous while recording is the other half of the promise not to
+    // record when unasked.
+    pw_properties* props =
+        target_node_name.empty()
+            ? g_lib.properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture",
+                                   PW_KEY_MEDIA_ROLE, "Communication", PW_KEY_APP_NAME, "Cordial",
+                                   PW_KEY_NODE_NAME, name, PW_KEY_NODE_DESCRIPTION,
+                                   "Cordial (Roblox voice chat)", nullptr)
+            : g_lib.properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture",
+                                   PW_KEY_MEDIA_ROLE, "Communication", PW_KEY_APP_NAME, "Cordial",
+                                   PW_KEY_NODE_NAME, name, PW_KEY_NODE_DESCRIPTION,
+                                   "Cordial (Roblox voice chat)", PW_KEY_TARGET_OBJECT,
+                                   target_node_name.c_str(), nullptr);
+
+    impl_->stream = g_lib.stream_new_simple(g_lib.thread_loop_get_loop(session->loop), name, props,
+                                             &Impl::events(), impl_);
+    if (!impl_->stream) {
+        g_lib.thread_loop_unlock(session->loop);
+        std::fprintf(stderr,
+            "E/Cordial-OpenSLES         pw_stream_new_simple failed for capture; nothing "
+            "will be recorded.\n");
+        return false;
+    }
+
+    uint8_t pod_buffer[1024];
+    spa_pod_builder builder = SPA_POD_BUILDER_INIT(pod_buffer, sizeof pod_buffer);
+    spa_audio_info_raw info{};
+    // S16 native-endian, because that is the only thing either caller wants:
+    // android.media.AudioRecord's ENCODING_PCM_16BIT and WebRTC's voice
+    // engine both deal exclusively in signed 16-bit interleaved frames.
+    info.format = SPA_AUDIO_FORMAT_S16;
+    info.channels = channels;
+    info.rate = rate_hz;
+    if (channels == 1) {
+        info.position[0] = SPA_AUDIO_CHANNEL_MONO;
+    } else if (channels == 2) {
+        info.position[0] = SPA_AUDIO_CHANNEL_FL;
+        info.position[1] = SPA_AUDIO_CHANNEL_FR;
+    } else {
+        info.flags |= SPA_AUDIO_FLAG_UNPOSITIONED;
+    }
+
+    const spa_pod* params[1];
+    params[0] = spa_format_audio_raw_build(&builder, SPA_PARAM_EnumFormat, &info);
+
+    // Connected active, unlike playback: there is no separate "start" step on
+    // this path. `open` is only ever reached from the engine asking to record,
+    // so an inactive capture stream would be a microphone held open doing
+    // nothing — precisely the state this class exists to make impossible.
+    int rc = g_lib.stream_connect(
+        impl_->stream, SPA_DIRECTION_INPUT, PW_ID_ANY,
+        static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS),
+        params, 1);
+
+    g_lib.thread_loop_unlock(session->loop);
+
+    if (rc < 0) {
+        std::fprintf(stderr,
+            "E/Cordial-OpenSLES         pw_stream_connect failed for capture (%s); nothing "
+            "will be recorded.\n", spa_strerror(rc));
+        g_lib.thread_loop_lock(session->loop);
+        g_lib.stream_destroy(impl_->stream);
+        g_lib.thread_loop_unlock(session->loop);
+        impl_->stream = nullptr;
+        return false;
+    }
+
+    g_open_capture_streams.fetch_add(1);
+    std::fprintf(stderr,
+        "I/Cordial-OpenSLES         microphone opened: %u Hz, %u channel(s), source '%s'. "
+        "%u capture stream(s) now open.\n",
+        rate_hz, channels, target_node_name.empty() ? "(PipeWire default)" : target_node_name.c_str(),
+        g_open_capture_streams.load());
+    return true;
+}
+
+void CaptureStream::close() {
+    if (!impl_ || !impl_->stream) return;
+    Session* session = get_session();
+    if (session) {
+        g_lib.thread_loop_lock(session->loop);
+        // Destroyed, not deactivated. `pw_stream_set_active(false)` leaves the
+        // node in the graph, which leaves the desktop's microphone indicator
+        // lit and leaves every other application seeing Cordial holding the
+        // capture device. Nothing short of destroying the stream makes a
+        // stopped recording indistinguishable from one that never started.
+        g_lib.stream_destroy(impl_->stream);
+        g_lib.thread_loop_unlock(session->loop);
+    }
+    impl_->stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->buffered.clear();
+    }
+    uint32_t remaining = g_open_capture_streams.fetch_sub(1) - 1;
+    std::fprintf(stderr,
+        "I/Cordial-OpenSLES         microphone closed; %u capture stream(s) now open.\n",
+        remaining);
+}
+
+bool CaptureStream::is_open() const { return impl_ && impl_->stream != nullptr; }
+
+uint32_t CaptureStream::read(void* dst, uint32_t size) {
+    if (!impl_ || !dst || size == 0) return 0;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    uint32_t n = static_cast<uint32_t>(impl_->buffered.size() < size ? impl_->buffered.size() : size);
+    auto* out = static_cast<uint8_t*>(dst);
+    for (uint32_t i = 0; i < n; ++i) {
+        out[i] = impl_->buffered.front();
+        impl_->buffered.pop_front();
+    }
+    return n;
+}
 
 // --------------------------------------------------------------- interface
 
@@ -670,6 +1101,24 @@ bool pipewire_available() {
     (void)warned;
     return false;
 }
+
+/// No session, so no devices. Empty rather than one invented "Default"
+/// entry: a device picker listing something that cannot play is worse than
+/// one that is honestly empty, because only the empty one sends the user
+/// looking for the real problem.
+std::vector<DeviceInfo> enumerate_devices() { return {}; }
+
+uint32_t active_capture_streams() { return 0; }
+
+struct CaptureStream::Impl {};
+
+CaptureStream::CaptureStream() : impl_(nullptr) {}
+CaptureStream::~CaptureStream() {}
+
+bool CaptureStream::open(uint32_t, uint32_t, const std::string&) { return false; }
+void CaptureStream::close() {}
+bool CaptureStream::is_open() const { return false; }
+uint32_t CaptureStream::read(void*, uint32_t) { return 0; }
 
 struct PlaybackStream::Impl {};
 

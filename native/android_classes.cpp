@@ -872,6 +872,15 @@ namespace cordial {
 void register_cookie_classes(jnivm::ENV* env);
 }
 
+// Defined in audio_classes.cpp. Separate for the usual reason and one specific
+// one: that file's header states the rule that no PipeWire capture stream may
+// exist while Roblox is not recording, and that rule has to be the first thing
+// anyone editing the microphone path reads rather than a paragraph buried in
+// this file's preamble.
+namespace cordial {
+void register_audio_classes(jnivm::ENV* env);
+}
+
 extern "C" void cordial_register_android_classes(void* env_ptr) {
     auto* env = static_cast<jnivm::ENV*>(env_ptr);
     if (!env) {
@@ -889,6 +898,7 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
     cordial::MediaCodecInfoUtils::Register(env);
     cordial::register_accessibility_classes(env);
     cordial::register_cookie_classes(env);
+    cordial::register_audio_classes(env);
     if (getenv("CORDIAL_JNI_TRACE")) {
         fprintf(stderr, "[classes] Cordial's Java side registered\n");
     }

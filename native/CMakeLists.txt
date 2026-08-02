@@ -26,7 +26,52 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mcpelauncher-linker
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
   pkg_check_modules(PIPEWIRE QUIET libpipewire-0.3)
+  pkg_check_modules(SPA QUIET libspa-0.2)
 endif()
+
+# pkg-config saying "not found" is not the same as the headers being absent,
+# and believing it cost this project every sample of audio it has ever tried to
+# play. On the machine this was found on, `pkg-config` first on PATH is
+# Homebrew's pkgconf, whose compiled-in `pc_path` is its own three Cellar
+# directories and does not include `/usr/lib64/pkgconfig` — so
+# `pkg_check_modules` reported libpipewire-0.3 missing on a host with
+# pipewire-devel 1.6.8 installed, headers, daemon and all. The build then did
+# exactly what it was told to: compiled the `#else` branch of
+# pipewire_backend.cpp, and `slCreateEngine` reported
+# SL_RESULT_FEATURE_UNSUPPORTED for reasons that had nothing to do with audio.
+# Nothing announced this; the status message below is the only place it was
+# ever visible, and it scrolls past inside a cargo build.
+#
+# So do not take pkg-config's word for it. Only headers are wanted here — the
+# library is dlopen'd, never linked (see pipewire_backend.cpp) — and headers
+# are something CMake can look for directly. `find_path` searches the platform
+# include directories no matter what any one pkg-config binary believes its
+# search path to be, which makes this fallback strictly more reliable than the
+# thing it backs up rather than merely a second guess at it.
+if(NOT PIPEWIRE_FOUND)
+  find_path(PIPEWIRE_FALLBACK_INCLUDE_DIR pipewire/pipewire.h
+            PATH_SUFFIXES pipewire-0.3)
+  find_path(SPA_FALLBACK_INCLUDE_DIR spa/param/audio/format-utils.h
+            PATH_SUFFIXES spa-0.2)
+  if(PIPEWIRE_FALLBACK_INCLUDE_DIR AND SPA_FALLBACK_INCLUDE_DIR)
+    set(PIPEWIRE_FOUND TRUE)
+    set(PIPEWIRE_INCLUDE_DIRS ${PIPEWIRE_FALLBACK_INCLUDE_DIR} ${SPA_FALLBACK_INCLUDE_DIR})
+    set(PIPEWIRE_VERSION "(version unknown: found by header search, not pkg-config)")
+    message(STATUS "OpenSL ES audio: pkg-config did not find libpipewire-0.3, but its "
+                    "headers are present at ${PIPEWIRE_FALLBACK_INCLUDE_DIR} and "
+                    "${SPA_FALLBACK_INCLUDE_DIR}. Using those. If this is a surprise, the "
+                    "usual cause is a pkg-config earlier on PATH whose pc_path excludes the "
+                    "system one -- check `pkg-config --variable pc_path pkg-config`.")
+  endif()
+endif()
+
+# spa-0.2 ships its own .pc and lives in its own include directory; when
+# pkg-config *did* answer for libpipewire-0.3 it will not have mentioned SPA,
+# and every format-negotiation header this backend includes is SPA's.
+if(PIPEWIRE_FOUND AND SPA_INCLUDE_DIRS)
+  list(APPEND PIPEWIRE_INCLUDE_DIRS ${SPA_INCLUDE_DIRS})
+endif()
+
 if(PIPEWIRE_FOUND)
   message(STATUS "OpenSL ES audio: pipewire-devel ${PIPEWIRE_VERSION} found; "
                   "libpipewire-0.3 will be dlopen'd at run time, not linked.")
@@ -112,7 +157,12 @@ set(JNIVM_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libjnivm
                  ${CMAKE_CURRENT_BINARY_DIR}/libjnivm EXCLUDE_FROM_ALL)
 
-add_library(cordial_jni_shim STATIC jni_shim.cpp android_classes.cpp game_activity.cpp init_params.cpp accessibility.cpp cookies.cpp)
+# audio_classes.cpp needs no PipeWire headers and so is compiled
+# unconditionally: pipewire_backend.h deliberately carries no PipeWire types
+# (see its own header comment), so the Java audio surface builds identically
+# either way and reports an honestly empty device list on a tree that has no
+# backend behind it.
+add_library(cordial_jni_shim STATIC jni_shim.cpp android_classes.cpp game_activity.cpp init_params.cpp accessibility.cpp cookies.cpp audio_classes.cpp)
 target_link_libraries(cordial_jni_shim PUBLIC jnivm)
 
 install(TARGETS cordial_jni_shim jnivm ARCHIVE DESTINATION lib)

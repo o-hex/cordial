@@ -608,6 +608,31 @@ The OpenSL ES backend over PipeWire works in a standalone harness and has never
 been seen carrying a single sample through the real client. The reason is not a
 bug in it.
 
+> **Correction (audio device work).** The paragraph above was right about
+> laziness and wrong to stop there, because it was written without checking
+> whether the backend was in the binary at all. It was not. `pkg-config` first
+> on `PATH` on the development machine is Homebrew's `pkgconf`, whose
+> compiled-in `pc_path` is its own Cellar directories and excludes
+> `/usr/lib64/pkgconfig`, so `pkg_check_modules(PIPEWIRE ...)` reported
+> libpipewire-0.3 missing on a host with pipewire-devel 1.6.8 installed.
+> `CMakeCache.txt` recorded `PIPEWIRE_FOUND:INTERNAL=` and
+> `cordial_liblog.dir/flags.make` recorded an empty `CXX_DEFINES`: every
+> release build had compiled the `#else` branch of `pipewire_backend.cpp`, and
+> `slCreateEngine` had been reporting `SL_RESULT_FEATURE_UNSUPPORTED` for a
+> reason that had nothing to do with audio. `cordial_pipewire_backend_test` had
+> never run either, for the same reason. `native/CMakeLists.txt` now falls back
+> to `find_path` for the headers — the only thing that is wanted, since the
+> library is dlopen'd — and the build reports
+> `-DCORDIAL_HAVE_PIPEWIRE=1`.
+>
+> **The conclusion below still holds after that fix, and was re-measured.**
+> Three 30-second runs to the Landing screen with the backend genuinely
+> compiled in produced no `slCreateEngine` call at all (the backend prints
+> `PipeWire session confirmed reachable` on its first use; it never appeared),
+> so audio initialisation really is lazy and really does need something past
+> sign-in. What changed is that this is now a statement about Roblox rather
+> than, unknowingly, a statement about the build.
+
 **Roblox makes exactly one `dlopen` in a 75-second run to the Landing screen:**
 
 ```text

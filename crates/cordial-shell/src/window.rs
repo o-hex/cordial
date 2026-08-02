@@ -66,7 +66,21 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
             }
         })
     };
-    toasts.set_child(Some(&chooser_widget));
+
+    // Directly above the Launch group, and that position is the whole argument:
+    // the profile is a launch parameter — which of these do I start — rather
+    // than an ambient identity, so it belongs beside the button it governs. It
+    // was an avatar in the top-right corner first; see `profile_switcher.rs` for
+    // why that was a browser convention borrowed into an application that is not
+    // one. Clamped to the same width as the chooser so the two line up.
+    let profile_row = profile_switcher::build(config.clone(), config_path.clone());
+    let profile_clamp = adw::Clamp::builder().maximum_size(480).child(&profile_row).build();
+    profile_clamp.set_margin_top(12);
+
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    page.append(&profile_clamp);
+    page.append(&chooser_widget);
+    toasts.set_child(Some(&page));
 
     // --- seam for the engine's surface -----------------------------------
     // This window is the same definition `cordial-runtime` builds to host the
@@ -86,15 +100,6 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     // -----------------------------------------------------------------------
     let host = HostWindow::new(&cordial_shell::host_window::title(), 720, 480, &toasts);
 
-    // Packed first, so it is the rightmost thing in the header bar. An avatar
-    // is what libadwaita offers for representing a user and a `GtkMenuButton`
-    // opening a popover is an ordinary GNOME header bar, so this fights nothing;
-    // Fractal switches accounts the same way. What it is *not* is an account
-    // switcher — ADR-012 is explicit that this selects a directory, does not
-    // authenticate, and must not imply that it does.
-    let switcher = profile_switcher::build(config.clone(), config_path.clone());
-    host.header().pack_end(&switcher);
-
     let settings_button = gtk::Button::from_icon_name("preferences-system-symbolic");
     settings_button.set_tooltip_text(Some("Settings"));
     host.header().pack_end(&settings_button);
@@ -105,11 +110,6 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     // what makes the window keep `app` alive and quit with it.
     window.set_application(Some(app));
 
-    // Demo data now; see settings.rs for what backs this once the plugin host
-    // can actually answer "what's installed". Rc so every click on the
-    // settings button reopens against the same (in-memory) state rather than
-    // resetting it.
-    let registry: Rc<dyn settings::PluginRegistry> = settings::DemoRegistry::installed();
     let flags_path = Rc::new(flags_file::user_flags_path());
 
     // An action rather than only a button handler, because the header bar is no
@@ -122,20 +122,21 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     settings_action.connect_activate(move |_, _| {
         settings::build_preferences_window(
             &window_for_settings,
-            registry.clone(),
             config.clone(),
             config_path.clone(),
             flags_path.clone(),
         )
         .present();
     });
-    // The same arrangement for the switcher, and for the same reason: a launch
-    // refused because the profile is busy has to be able to open the thing that
-    // chooses another one, and that is now the header bar's popover rather than
-    // a settings page.
+    // The same arrangement for the profile row: a launch refused because the
+    // profile is busy has to be able to reach the control that chooses another
+    // one. It is in this window rather than behind a button now, so the action
+    // only has to move the focus there.
     let profile_action = gtk::gio::SimpleAction::new("profile", None);
-    let switcher_for_action = switcher.clone();
-    profile_action.connect_activate(move |_, _| switcher_for_action.popup());
+    let profile_row_for_action = profile_row.clone();
+    profile_action.connect_activate(move |_, _| {
+        profile_row_for_action.grab_focus();
+    });
 
     let actions = gtk::gio::SimpleActionGroup::new();
     actions.add_action(&settings_action);
@@ -144,7 +145,6 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     settings_button.set_action_name(Some("win.settings"));
 
     window.present();
-
 }
 
 /// The whole of what pressing Roblox does.
@@ -246,9 +246,9 @@ fn run_seconds_override() -> Option<u64> {
 /// double-clicking the launcher — so the dialog names the profile, says what is
 /// true, and offers the only action that helps: choosing a different one.
 ///
-/// It used to point at a text field in Settings. It now opens the header bar's
-/// switcher, which is the same door the avatar is, and which already shows the
-/// profile this dialog is about as unavailable.
+/// It used to point at a text field in Settings. It now moves the focus to the
+/// profile row above the Launch button, which already shows the profile this
+/// dialog is about as unavailable.
 fn profile_busy(parent: &gtk::Window, name: &str) {
     let dialog = adw::MessageDialog::builder()
         .transient_for(parent)

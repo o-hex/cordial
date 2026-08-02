@@ -69,6 +69,11 @@ env:
                                      CORDIAL_FULLSCREEN overrides it
   CORDIAL_DPI_SCALE=<f>              UI density Roblox lays out against.
                                      1.0 is a low-density phone; try 1.5-2
+  CORDIAL_PLATFORM_NAME=<name>       what Cordial answers when the engine asks
+                                     which platform it is on. Defaults to Linux,
+                                     one of the engine's own Enum.Platform
+                                     names; =Android is the control run. See
+                                     docs/analysis/platform-identity.md
   CORDIAL_WHEEL_SCALE=<f>            scroll wheel detents per notch (default 1);
                                      negative inverts the direction
   CORDIAL_TRACE_WHEEL=1              log every wheel event and the arguments
@@ -1336,7 +1341,7 @@ fn main() -> ExitCode {
                                                     let n = cordial_runtime::cookies::restore(f);
                                                     println!(
                                                         "  [cookies] restored {n} domain(s) from {}",
-                                                        cordial_runtime::cookies::path().display()
+                                                        cordial_runtime::cookies::where_kept()
                                                     );
                                                     // Whether the two natives
                                                     // agree on what a domain is,

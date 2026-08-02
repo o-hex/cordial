@@ -13,6 +13,7 @@
 
 pub mod broker;
 pub mod capability;
+pub mod enablement;
 pub mod events;
 pub mod grants;
 pub mod host;
@@ -20,5 +21,8 @@ pub mod manifest;
 pub mod notify;
 pub mod presence;
 pub mod protocol;
+pub mod registry;
+pub mod resolve;
 pub mod settings;
+pub mod unpack;
 pub mod urlopen;

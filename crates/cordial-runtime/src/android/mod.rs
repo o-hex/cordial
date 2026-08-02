@@ -133,6 +133,14 @@ pub fn connection_fd() -> Option<c_int> {
     }
 }
 
+/// TEMPORARY INSTRUMENTATION -- not for commit.
+pub fn backend_instr_geometry() -> String {
+    match backend() {
+        Backend::Wayland => wayland::instr_geometry(),
+        Backend::X11 => "x11".to_string(),
+    }
+}
+
 /// Drain and deliver whatever host input is queued, for the active backend.
 pub fn pump_input_events(handle: i64) {
     match backend() {

@@ -26,100 +26,63 @@ use libadwaita::glib;
 use libadwaita::gtk;
 use libadwaita::prelude::*;
 
+use std::collections::BTreeSet;
+
 use cordial_plugins::capability::Capability;
+use cordial_plugins::enablement;
+use cordial_plugins::grants;
 use cordial_plugins::manifest::{self, Plugin};
 
 use crate::flags_file::{self, RENDERER_BACKEND_FLAG};
 use crate::install;
 use crate::shell_config::{self, AppearanceScheme, ShellConfig};
 
-/// A plugin as this settings surface cares about it.
+/// What a plugin asks for, and what this profile has actually given it.
 ///
-/// `cordial_plugins::manifest::Plugin` is what a plugin *requests*; whether
-/// it is currently enabled is a registry concern, not something the manifest
-/// carries, so it lives here rather than being added to a crate we were told
-/// not to touch.
-pub struct PluginState {
-    pub plugin: Plugin,
-    pub enabled: bool,
-}
-
-/// Where the settings window gets its plugin list, and where a toggle lands.
+/// Both halves are read from disk every time the page is built. There used to be
+/// a `DemoRegistry` here instead: three hand-written manifests, including one
+/// claiming `assets.override` and one claiming `presence.set`, parsed against a
+/// directory spelled `/nonexistent/demo-plugin-dir`. It rendered on a screen
+/// whose entire job is telling somebody what has been granted what, on a machine
+/// where `~/.local/share/cordial/plugins` is empty. ADR-003's default-deny means
+/// nothing if the surface that displays it is fiction, and "this plugin may
+/// change your assets and talk to Discord for you" is not a sentence to invent.
 ///
-/// The real implementation reads `manifest::discover(manifest::plugin_root())`
-/// for the list and, for `set_enabled(_, false)`, most likely clears that
-/// plugin's entry from `grants::path()` — a plugin holding no granted
-/// capabilities is already inert, which sidesteps needing a second on/off
-/// concept alongside the grants file. `DemoRegistry` below is a placeholder
-/// standing in for that until the plugin host exists to ask.
-pub trait PluginRegistry {
-    fn list(&self) -> Vec<PluginState>;
-    fn set_enabled(&self, id: &str, enabled: bool);
-}
-
-/// In-memory stand-in for the plugin registry.
+/// Three states, kept apart because somebody debugging a plugin that is doing
+/// nothing has to be able to tell which one they are in.
 ///
-/// The manifests are real `cordial_plugins::manifest::parse` output, not
-/// hand-built structs, so this exercises the actual parser and capability
-/// names rather than a shape that merely looks similar.
-pub struct DemoRegistry {
-    plugins: RefCell<Vec<PluginState>>,
-}
-
-impl DemoRegistry {
-    pub fn installed() -> Rc<Self> {
-        // Not a real plugin directory — nothing here is ever read from disk —
-        // but manifest::parse still wants a `dir` to resolve `entry` against.
-        let dir = std::path::PathBuf::from("/nonexistent/demo-plugin-dir");
-        let plugin = |json: &str| -> Plugin {
-            manifest::parse(json, &dir).expect("demo manifest is well-formed; covered by cordial-plugins' own tests")
-        };
-        let plugins = vec![
-            PluginState {
-                plugin: plugin(
-                    r#"{"id":"presence-rpc","name":"Discord Presence","entry":"main.ts","capabilities":["lifecycle.read","presence.set"]}"#,
-                ),
-                enabled: true,
-            },
-            PluginState {
-                plugin: plugin(
-                    r#"{"id":"fps-tweaks","name":"FPS Tweaks","entry":"main.ts","capabilities":["flags.read","flags.write"]}"#,
-                ),
-                enabled: true,
-            },
-            PluginState {
-                plugin: plugin(
-                    r#"{"id":"asset-overlay-demo","name":"Asset Overlay Demo","entry":"main.ts","capabilities":["assets.override"]}"#,
-                ),
-                enabled: false,
-            },
-        ];
-        Rc::new(Self { plugins: RefCell::new(plugins) })
-    }
-}
-
-impl PluginRegistry for DemoRegistry {
-    fn list(&self) -> Vec<PluginState> {
-        self.plugins
-            .borrow()
-            .iter()
-            .map(|s| PluginState { plugin: s.plugin.clone(), enabled: s.enabled })
-            .collect()
-    }
-
-    fn set_enabled(&self, id: &str, enabled: bool) {
-        if let Some(state) = self.plugins.borrow_mut().iter_mut().find(|s| s.plugin.manifest.id == id) {
-            state.enabled = enabled;
-        }
-    }
-}
-
-fn capability_summary(plugin: &Plugin) -> String {
-    if plugin.requested.is_empty() {
-        return "Requests no capabilities".to_string();
-    }
-    let names: Vec<&str> = plugin.requested.iter().copied().map(Capability::name).collect();
-    format!("Requests: {}", names.join(", "))
+/// *Enabled and granted something* is the one that runs. *Enabled and granted
+/// nothing* also does not run, and collapsing it into "off" would hide the only
+/// thing that would fix it — nobody has approved anything yet, which is where
+/// ADR-003's default deny leaves every freshly installed plugin. *Disabled* does
+/// not run whatever its grants say, and its grants are still shown, because they
+/// are still there: turning something off does not cost the approvals.
+pub fn capability_summary(
+    plugin: &Plugin,
+    granted: Option<&BTreeSet<Capability>>,
+    enabled: bool,
+) -> String {
+    let names = |set: &BTreeSet<Capability>| -> String {
+        set.iter().copied().map(Capability::name).collect::<Vec<_>>().join(", ")
+    };
+    let requests = if plugin.requested.is_empty() {
+        "Requests no capabilities".to_string()
+    } else {
+        format!("Requests: {}", names(&plugin.requested))
+    };
+    let has_grants = granted.is_some_and(|g| !g.is_empty());
+    let grants_line = if has_grants {
+        format!("Granted: {}", names(granted.expect("has_grants implies Some")))
+    } else {
+        "Granted: nothing".to_string()
+    };
+    let state = match (enabled, has_grants) {
+        (false, true) => "Off. Its grants are kept, so turning it back on costs no approvals",
+        (false, false) => "Off",
+        (true, true) => "On",
+        (true, false) => "On, but nothing is approved yet, so it will not do anything",
+    };
+    format!("{requests}\n{grants_line}\n{state}")
 }
 
 /// "Appearance" — Cordial's own theme preference, independent of anything
@@ -384,35 +347,113 @@ fn build_general_page(flags_path: Rc<PathBuf>) -> adw::PreferencesPage {
     page
 }
 
-/// "Plugins" — the escape hatch ADR-002 actually asks for.
-fn build_plugins_page(registry: Rc<dyn PluginRegistry>) -> adw::PreferencesPage {
+/// "Plugins" — what is installed, and what this profile has granted it.
+///
+/// Read from `manifest::discover` and from the selected profile's own grants
+/// file, both at the moment the window is built. Grants stopped being global in
+/// ADR-013 precisely because an approval given in a throwaway profile was
+/// silently in force in the profile someone plays on, so a page that showed one
+/// set for all profiles would be displaying the bug that change removed.
+///
+/// **The switch writes to disk, and is not the grants file.** It used to write
+/// to an in-memory list nothing ever read, so pressing it changed nothing
+/// anywhere — a control that reports success and does not act, which is the
+/// shape AGENTS.md rules out for stubs and is no better in an interface. It now
+/// goes through `cordial_plugins::enablement`, which keeps the answer in the
+/// profile beside the grants and deliberately apart from them: disabling must
+/// not revoke, or turning something back on would cost every approval already
+/// given, and the cheaper response to that price is to leave a suspect plugin
+/// enabled.
+///
+/// **It takes effect at the next launch, and the page says so.** Nothing here
+/// can stop a plugin that is already running: the plugin host is not wired to a
+/// running client at all yet, and the shell is a separate process from the
+/// instance in any case. A toggle that looked immediate and was not is exactly
+/// the small lie this project keeps writing ADRs about, so the wording is the
+/// weaker claim.
+fn build_plugins_page(config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Plugins")
+        .name("plugins")
         .icon_name("application-x-addon-symbolic")
         .build();
 
+    let root = manifest::plugin_root();
+    let plugins = manifest::discover(&root);
+
+    if plugins.is_empty() {
+        let status = adw::StatusPage::builder()
+            .icon_name("application-x-addon-symbolic")
+            .title("No plugins installed")
+            .description(format!(
+                "Cordial looks for one directory per plugin, each with a plugin.json, in\n{}",
+                root.display()
+            ))
+            .build();
+        // An `AdwStatusPage` is not a preferences row, so it needs a group to
+        // live in; without one `AdwPreferencesPage` has nothing to add it to.
+        let group = adw::PreferencesGroup::new();
+        group.add(&status);
+        page.add(&group);
+        return page;
+    }
+
+    let profile_name = config.borrow().profile.clone();
+    // A profile whose name will not resolve has no grants and no enablement
+    // file to read, and the page still has to render. `None` here means every
+    // row shows "granted nothing", which is what such a profile would in fact
+    // give a plugin.
+    let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
+    let granted = profile_dir
+        .as_ref()
+        .map(|dir| grants::load(&grants::path_in(dir)))
+        .unwrap_or_default();
+
     let group = adw::PreferencesGroup::builder()
         .title("Installed plugins")
-        .description("Turning a plugin off here is the escape hatch ADR-002 asks for: it stays installed, it just stops running.")
+        .description(format!(
+            "Grants and this switch both belong to the profile rather than to the machine \
+             (ADR-013); these are {profile_name}'s. Turning one off keeps its grants, and \
+             takes effect the next time the client starts."
+        ))
         .build();
 
-    for state in registry.list() {
-        let title = if state.plugin.manifest.name.is_empty() {
-            state.plugin.manifest.id.clone()
+    for plugin in &plugins {
+        let title = if plugin.manifest.name.is_empty() {
+            plugin.manifest.id.clone()
         } else {
-            state.plugin.manifest.name.clone()
+            plugin.manifest.name.clone()
         };
+        let id = plugin.manifest.id.clone();
+        let enabled = profile_dir.as_ref().is_none_or(|dir| enablement::is_enabled(dir, &id));
 
         let row = adw::SwitchRow::builder()
             .title(title)
-            .subtitle(capability_summary(&state.plugin))
-            .active(state.enabled)
+            .subtitle(capability_summary(plugin, granted.get(&id), enabled))
+            .active(enabled)
             .build();
+        row.set_subtitle_lines(4);
 
-        let registry = registry.clone();
-        let id = state.plugin.manifest.id.clone();
+        // The subtitle carries the state, so it has to be rewritten when the
+        // state changes; a row that says "Off" while its switch says on is
+        // worse than a row that says nothing.
+        let plugin = plugin.clone();
+        let granted_here = granted.get(&id).cloned();
+        let dir = profile_dir.clone();
         row.connect_active_notify(move |row| {
-            registry.set_enabled(&id, row.is_active());
+            let on = row.is_active();
+            if let Some(dir) = &dir {
+                if let Err(e) = enablement::set_enabled(dir, &id, on) {
+                    // Reported rather than swallowed, and the row is put back to
+                    // what is actually on disk: a switch that stays where the
+                    // user left it while the file says otherwise is a lie the
+                    // user has no way to see.
+                    eprintln!("shell: could not record that {id} is {}: {e}", if on { "on" } else { "off" });
+                    row.set_active(!on);
+                    return;
+                }
+            }
+            row.set_subtitle(&capability_summary(&plugin, granted_here.as_ref(), on));
         });
 
         group.add(&row);
@@ -426,7 +467,6 @@ fn build_plugins_page(registry: Rc<dyn PluginRegistry>) -> adw::PreferencesPage 
 /// `AdwPreferencesPage` each.
 pub fn build_preferences_window(
     parent: &impl IsA<gtk::Window>,
-    registry: Rc<dyn PluginRegistry>,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
     flags_path: Rc<PathBuf>,
@@ -442,9 +482,63 @@ pub fn build_preferences_window(
     // in this window matters: without a build there is nothing to launch, and
     // a renderer preference for a client that cannot start is decoration.
     window.add(&build_roblox_page(&window, config.clone(), config_path.clone()));
-    window.add(&build_appearance_page(config, config_path));
+    window.add(&build_appearance_page(config.clone(), config_path));
     window.add(&build_general_page(flags_path));
-    window.add(&build_plugins_page(registry));
+    window.add(&build_plugins_page(config));
 
     window
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manifest built for this test and nowhere near the UI. The distinction
+    /// matters here more than it usually would: a fixture that could reach the
+    /// plugins page is how that page came to be listing software nobody had
+    /// installed, requesting capabilities nobody had granted.
+    fn fixture(json: &str) -> Plugin {
+        manifest::parse(json, std::path::Path::new("/fixture")).expect("well-formed test manifest")
+    }
+
+    fn granted(names: &[&str]) -> BTreeSet<Capability> {
+        names.iter().map(|n| Capability::parse(n).expect("a real capability name")).collect()
+    }
+
+    #[test]
+    fn a_plugin_with_nothing_approved_is_not_described_as_off() {
+        // The state the owner asked not to be collapsed into "off": installed,
+        // switched on, and inert because ADR-003 starts everything at nothing.
+        // A user in this state has to be told to approve something, not to
+        // toggle a switch that is already where they want it.
+        let plugin = fixture(r#"{"id":"p","name":"P","entry":"main.ts","capabilities":["flags.read"]}"#);
+        let summary = capability_summary(&plugin, None, true);
+        assert!(summary.contains("Granted: nothing"), "{summary}");
+        assert!(summary.contains("nothing is approved yet"), "{summary}");
+        assert!(!summary.contains("Off"), "an unapproved plugin must not read as switched off: {summary}");
+    }
+
+    #[test]
+    fn a_disabled_plugin_still_shows_the_grants_it_keeps() {
+        // Turning something off must not look like it revoked anything,
+        // because it does not: that is the whole reason enablement is a
+        // separate file from grants.
+        let plugin = fixture(r#"{"id":"p","name":"P","entry":"main.ts","capabilities":["flags.read"]}"#);
+        let summary = capability_summary(&plugin, Some(&granted(&["flags.read"])), false);
+        assert!(summary.contains("Granted: flags.read"), "{summary}");
+        assert!(summary.contains("costs no approvals"), "{summary}");
+    }
+
+    #[test]
+    fn a_requested_capability_that_was_not_granted_is_not_shown_as_granted() {
+        // The security-relevant half. Requested and granted are different
+        // lists, and a summary that blurred them would say a plugin may do
+        // something nobody approved.
+        let plugin =
+            fixture(r#"{"id":"p","name":"P","entry":"main.ts","capabilities":["flags.read","log"]}"#);
+        let summary = capability_summary(&plugin, Some(&granted(&["log"])), true);
+        assert!(summary.contains("Requests: flags.read, log"), "{summary}");
+        assert!(summary.contains("Granted: log"), "{summary}");
+        assert!(!summary.contains("Granted: flags.read"), "{summary}");
+    }
 }

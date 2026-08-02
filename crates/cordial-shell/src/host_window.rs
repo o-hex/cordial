@@ -380,6 +380,14 @@ impl HostWindow {
         self.window.queue_draw();
     }
 
+    /// TEMPORARY INSTRUMENTATION -- not for commit.
+    pub fn set_fullscreen(&self, on: bool) {
+        if on {
+            self.window.fullscreen();
+        } else {
+            self.window.unfullscreen();
+        }
+    }
 }
 
 /// A first guess at the header bar's height, used only to pick the window's

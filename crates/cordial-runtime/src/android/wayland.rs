@@ -774,6 +774,8 @@ unsafe impl Send for WaylandWindow {}
 unsafe impl Sync for WaylandWindow {}
 
 static WINDOW: OnceLock<WaylandWindow> = OnceLock::new();
+/// TEMPORARY INSTRUMENTATION -- not for commit.
+static INSTRUMENTED: OnceLock<bool> = OnceLock::new();
 
 // -------------------------------------------------------------- construction
 
@@ -1183,6 +1185,8 @@ impl WaylandWindow {
             moved
         };
         if moved {
+            INSTR_SET_POSITIONS.fetch_add(1, Ordering::Relaxed);
+            INSTR_QUEUE_COMMITS.fetch_add(1, Ordering::Relaxed);
             // SAFETY: `self.subsurface` is a live proxy for the process's
             // lifetime and `set_position`'s signature is "ii".
             unsafe {
@@ -2173,9 +2177,86 @@ extern "C" {
     fn poll(fds: *mut c_void, nfds: u64, timeout_ms: c_int) -> c_int;
 }
 
+// TEMPORARY INSTRUMENTATION -- not for commit. See the session notes.
+static INSTR_PUMPS: AtomicI64 = AtomicI64::new(0);
+static INSTR_SET_POSITIONS: AtomicI64 = AtomicI64::new(0);
+static INSTR_QUEUE_COMMITS: AtomicI64 = AtomicI64::new(0);
+
+pub fn instr_geometry() -> String {
+    let Some(w) = current() else { return "no-wayland-window".into() };
+    format!(
+        "rect={:?} placed={:?} setpos={} qcommit={}",
+        w.host.0.content_rect(),
+        *w.placed_at.lock().unwrap_or_else(|e| e.into_inner()),
+        INSTR_SET_POSITIONS.load(Ordering::Relaxed),
+        INSTR_QUEUE_COMMITS.load(Ordering::Relaxed),
+    )
+}
+
+#[allow(dead_code)]
+fn instr_tick(w: &WaylandWindow) {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static LAST: Mutex<Option<(std::time::Instant, u64, u64, i64)>> = Mutex::new(None);
+    let start = *START.get_or_init(std::time::Instant::now);
+    let now = std::time::Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let (t0, p0, q0, i0) = *last.get_or_insert((now, 0, 0, 0));
+    if now.duration_since(t0).as_millis() < 1000 {
+        return;
+    }
+    let p = super::glcount::QUEUE_PRESENT.load(Ordering::Relaxed);
+    let q = super::looper::POLLS.load(Ordering::Relaxed);
+    let i = INSTR_PUMPS.load(Ordering::Relaxed);
+    let dt = now.duration_since(t0).as_secs_f64();
+    eprintln!(
+        "[instr] t={:5.1}s presents/s={:6.1} looperpolls/s={:9.0} pumps/s={:8.0} rect={:?} placed={:?} setpos={} qcommit={}",
+        now.duration_since(start).as_secs_f64(),
+        (p - p0) as f64 / dt,
+        (q - q0) as f64 / dt,
+        (i - i0) as f64 / dt,
+        w.host.0.content_rect(),
+        *w.placed_at.lock().unwrap_or_else(|e| e.into_inner()),
+        INSTR_SET_POSITIONS.load(Ordering::Relaxed),
+        INSTR_QUEUE_COMMITS.load(Ordering::Relaxed),
+    );
+    *last = Some((now, p, q, i));
+}
+
+/// Drive fullscreen from a timer, so the transition can be observed without a
+/// click. `CORDIAL_FS_TEST=<enter>,<leave>` in seconds.
+fn instr_fullscreen(w: &WaylandWindow) {
+    use std::sync::OnceLock;
+    static SCHEDULE: OnceLock<Option<(f64, f64)>> = OnceLock::new();
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static DONE: Mutex<(bool, bool)> = Mutex::new((false, false));
+    let sched = *SCHEDULE.get_or_init(|| {
+        let v = std::env::var("CORDIAL_FS_TEST").ok()?;
+        let (a, b) = v.split_once(',')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    });
+    let Some((enter, leave)) = sched else { return };
+    let start = *START.get_or_init(std::time::Instant::now);
+    let t = start.elapsed().as_secs_f64();
+    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+    if !done.0 && t >= enter {
+        done.0 = true;
+        eprintln!("[instr] t={t:5.1}s gtk_window_fullscreen()");
+        w.host.0.set_fullscreen(true);
+    }
+    if !done.1 && t >= leave {
+        done.1 = true;
+        eprintln!("[instr] t={t:5.1}s gtk_window_unfullscreen()");
+        w.host.0.set_fullscreen(false);
+    }
+}
+
 impl WaylandWindow {
     fn pump(&self, handle: i64) {
         self.active_handle.store(handle, Ordering::Relaxed);
+        if INSTRUMENTED.get_or_init(|| std::env::var_os("CORDIAL_INSTR").is_some()) == &true {
+            instr_fullscreen(self);
+        }
 
         let (gw, gh, _) = self.geometry();
         super::input::report_keyboard_state((gw, gh));

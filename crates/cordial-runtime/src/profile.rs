@@ -16,12 +16,14 @@
 //! login.
 //!
 //! A profile now holds configuration as well as storage — the user's
-//! `flags.json`, `plugin-grants.json`, `plugins/<id>/settings.json` for each
-//! plugin that keeps anything, and, since the engine turned out never to write
-//! its cookies anywhere, the session itself: `cookies` at `0600`
-//! (`cookies.rs`), and beside it `identity` at `0600` (`identity.rs`), which
-//! holds the account's user id and username because the cookie alone leaves the
-//! client on the landing page. See
+//! `flags.json`, `plugin-grants.json`, and `plugins/<id>/settings.json` for
+//! each plugin that keeps anything. It briefly held the session too, once the
+//! engine turned out never to write its cookies anywhere: `cookies` and
+//! `identity`, both `0600`. Those moved to the desktop secret service
+//! (`secrets.rs`, and ADR-012's second correction) and land here only on a
+//! machine that has none. The directory still *keys* them — an item is found by
+//! this path — so what a profile is has not changed, only where the bytes are.
+//! See
 //! [ADR-013](../../../docs/adr/ADR-013-per-profile-configuration.md), which
 //! extends ADR-012 and records why grants in particular had to stop being
 //! global: a plugin approved in a throwaway profile was silently approved in
@@ -202,11 +204,20 @@ pub fn acquire(name: &str) -> Result<Lock, String> {
 /// so it *is* the custodian of a session token. See `cookies.rs` and ADR-012,
 /// which records the reversal rather than quietly dropping the old reasoning.
 ///
-/// The keyring is still rejected, but for the reason that survives: the token
-/// has to be handed to the engine in plaintext on every launch, so a keyring
-/// would encrypt it only while nothing is using it, in exchange for an unlock
-/// prompt on every start. Permissions defend against the case that is actually
-/// reachable, and the store itself is `0600` inside this `0700` directory.
+/// **And the paragraph that replaced it was wrong in its turn.** It said the
+/// keyring was "still rejected... the token has to be handed to the engine in
+/// plaintext on every launch, so a keyring would encrypt it only while nothing
+/// is using it, in exchange for an unlock prompt on every start". A token in
+/// the clear inside a running process is not a token in the clear on disk for
+/// ever, and there is no prompt: `org.freedesktop.secrets` answers on this
+/// platform and its default collection is unlocked by the session login. The
+/// session and the identity now live in the Secret Service — see
+/// [`crate::secrets`], and ADR-012's second correction, which names the
+/// objection as mine.
+///
+/// This mode still matters, and for more than the fallback. The profile holds
+/// `flags.json`, `plugin-grants.json` and Roblox's own `appData`, and the
+/// `0600` store is still what a machine with no secret service falls back to.
 ///
 /// Best-effort: a filesystem without Unix permissions is not a reason to refuse
 /// to launch, and the failure is reported by the launch continuing rather than
@@ -343,10 +354,13 @@ mod tests {
 
     #[test]
     fn a_profile_is_not_readable_by_other_users() {
-        // Roblox keeps its session cookie in here. create_dir_all applies the
-        // umask, which on a normal desktop gives 0755 — another account on the
-        // machine could take the session. This is the whole of Cordial's
-        // credential protection, so it is worth a test.
+        // create_dir_all applies the umask, which on a normal desktop gives
+        // 0755 — another account on the machine could read everything in here.
+        // This comment used to end "this is the whole of Cordial's credential
+        // protection", which was true and is the reason it no longer is: the
+        // session moved to the secret service. The mode still matters for the
+        // flag overrides, the plugin grants, Roblox's own appData, and for the
+        // fallback store on a machine with no service.
         let (_root, _g) = scratch("perms");
         let lock = acquire("default").unwrap();
         let mode = std::fs::metadata(lock.profile_dir())

@@ -116,11 +116,11 @@ will be declined.
 | **Two accounts at once** | ✅ two profiles, two instances, side by side — see below |
 | Window — libadwaita header bar, engine as a subsurface | ✅ |
 | Launching from the shell | ✅ finds a build, or explains how to get one |
-| Choosing a profile | 🟡 a text field in Settings; a proper switcher is next |
+| Choosing a profile | ✅ a chooser above the Launch button; creates one, and shows a profile another window holds as unavailable |
 | Audio | ❌ OpenSL ES reports failure honestly; a PipeWire backend exists but nothing reaches it before sign-in |
 | Web views (Marketplace, Profile, Communities…) | ❌ the surface is mapped; `openNativeOverlay` now reports instead of silently swallowing |
 | Clean shutdown | ✅ full pause/stop/destroy sequence, observed in the engine's own log |
-| Plugins | 🟡 host, capability broker and per-profile settings built; not yet wired to the running client |
+| Plugins | 🟡 host, capability broker and per-profile settings built; Settings lists what is installed with its grants and an on/off switch; not yet wired to the running client |
 
 Measured with `vkQueuePresentKHR`: 547, 548 and 550 presents over 25 s across
 three runs — it renders continuously rather than on demand.

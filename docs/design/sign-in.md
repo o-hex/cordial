@@ -905,7 +905,8 @@ entry point and is not needed here.
 
 **Verified, over five consecutive runs plus a disabled control:** a jar read out
 of the engine, converted, written to `<profile>/cookies` at `0600` by temporary
-file and rename, restored on the next launch, and confirmed present by reading
+file and rename — which is where it went then and is now only the fallback; see
+§10 — restored on the next launch, and confirmed present by reading
 the engine's jar back afterwards. With `CORDIAL_SKIP_COOKIES=1` — same binary,
 same profile — nothing is restored, nothing is saved, and the store is byte-for-byte
 untouched.
@@ -1065,7 +1066,8 @@ The control is the same binary and the same profile with one environment
 variable different, matching `CORDIAL_SKIP_COOKIES`.
 
 **Verified, on the store itself:** written `0600` by temporary file and rename
-through the same writer as the cookie store; a missing, malformed or
+through the same writer as the cookie store — still one writer, and since §10
+one that is reached only where there is no secret service; a missing, malformed or
 future-schema file reads as an ordinary signed-out launch rather than a failure
 to start; a zero user id or an empty username is refused rather than persisted,
 because zero is exactly what the mirrors said before any of this existed.
@@ -1096,3 +1098,85 @@ because zero is exactly what the mirrors said before any of this existed.
   logged-out run asks for `rbxthumb://type=AvatarHeadShot&id=` with an empty
   id, and a restored one fetches a real `tr.rbxcdn.com/…-AvatarHeadshot-…`
   thumbnail.
+
+---
+
+## 10. Implemented: the session no longer sits on disk in plaintext
+
+§8 and §9 both end by saying, as a verified good property, that the store is
+written "`0600` by temporary file and rename". That was accurate and it was not
+the question anybody should have been satisfied by. The project owner asked it
+in five words — *"fix the plain text cookies; who does that?"* — and they were
+right: `<profile>/cookies` held a live `.ROBLOSECURITY`, which is a bearer token
+and whole-account access, and `0600` stops another Unix account and nothing
+else. A backup, a sync client, a container mount, a second application running
+as the same user, or somebody reading over a shoulder all get there.
+
+Both stores now go into the desktop Secret Service. Nothing above about the
+*format* changes: the same body that used to be the file's contents is the
+item's value, which is what makes the migration a move rather than a
+re-derivation.
+
+### 10.1 The argument that had kept it on disk, and why it failed
+
+Recorded here as well as in ADR-012 because this document is where it was
+relied on. The objection was mine, in two halves.
+
+*A keyring adds an unlock prompt to every launch.* False on this platform.
+**[verified: live bus]** `org.freedesktop.secrets` answers
+`org.freedesktop.DBus.Peer.Ping`; `Service.Collections` lists `login` and
+`session`; both report `Locked = false` with nothing typed, because the login
+keyring is unlocked by the session's own login. Sober links `libsecret-1.so.0`
+and exposes `use_libsecret`, which settles that this is ordinary.
+
+*It protects against nothing extra, because the token is handed to the engine in
+plaintext regardless.* The premise is true and the conclusion does not follow.
+In-process plaintext for the life of a run is not on-disk plaintext for ever,
+and every threat in the list above is a read of the file by something acting as
+the user — which is precisely what `0600` permits.
+
+### 10.2 What it talks to, and what it refuses to do **[verified: cordial]**
+
+`org.freedesktop.secrets` is the interface; `gnome-keyring-daemon` implements it
+on GNOME, KWallet and KeePassXC elsewhere, and libsecret is one client for it.
+`crates/cordial-runtime/src/secrets.rs` speaks the interface over `zbus`, which
+this crate already depends on and which `android::accessibility` already uses
+the same way for `org.a11y.atspi`.
+
+An item is keyed by four attributes — `xdg:schema=org.cordial.Session`,
+`application=cordial`, `store=cookies|identity`, and `profile=<absolute profile
+path>`. The path rather than the profile *name*, because every agent and test in
+this repository runs under its own `XDG_DATA_HOME` and every one of those roots
+has a profile called `default`.
+
+The hard constraint is the owner's, and it governs the whole module: **a stored
+session is a convenience and never a prerequisite** — users cannot play Roblox
+if they have not unlocked their keyring. So the collection's `Locked` property
+is read and `Unlock` is **never** called; every call is bounded by a timeout on
+a thread of its own, because `zbus`'s blocking API has none and a save runs on
+the looper thread; and missing, locked, dismissed and unusable all resolve to
+the same thing, which is nothing saved, one line in the log, and a client on the
+landing page.
+
+### 10.3 Measured, 2026-08-02, on a scratch profile with a fabricated token
+
+Four machines' worth of answers, driven through `cookies::load` rather than
+through the module's internals. `records` is what the launch would restore.
+
+| Machine | Store | Result |
+|---|---|---|
+| service present, default setting | `Keyring` | 146 bytes adopted, `records=1`, plaintext file gone |
+| `CORDIAL_SECRET_STORE=file` | `File` | `records=1`, file present, and the line says plaintext |
+| no session bus, default setting | `File` | `records=1`, warned, named the file, named the way to refuse it |
+| no session bus, `CORDIAL_SECRET_STORE=keyring` | `None` | `records=0`, nothing saved, the plaintext file named and ignored rather than used or deleted |
+
+The item's presence was confirmed with `secret-tool search application cordial`
+filtered to its attributes, and its size separately as a byte count. **No test,
+run or log in this work handled a real session**, and nothing anywhere prints a
+value.
+
+**[inferred]** That a *locked but present* collection takes the same path as an
+absent one. Both collections on the machine this was written on are unlocked,
+and locking one to find out would have locked the owner's real keyring. What is
+measured is that the `Locked` read returns without a prompt, and that every
+downstream consequence of it saying "locked" degrades rather than fails.

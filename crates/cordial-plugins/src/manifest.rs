@@ -6,8 +6,10 @@
 //! {
 //!   "id": "fps-tweaks",
 //!   "name": "FPS Tweaks",
+//!   "version": "1.2.0",
 //!   "entry": "main.ts",
-//!   "capabilities": ["flags.read", "flags.write"]
+//!   "capabilities": ["flags.read", "flags.write"],
+//!   "dependencies": { "cordial-multi-instance": "^1.0.0" }
 //! }
 //! ```
 //!
@@ -20,10 +22,19 @@
 //! quietly. Skipping would mean a plugin built against a newer Cordial appears
 //! to install correctly and then behaves strangely, which is a much worse
 //! failure than refusing to load it.
+//!
+//! **`dependencies` names other Cordial plugins and nothing else.** It is not
+//! npm's field under another roof: a plugin written in TypeScript may well need
+//! both a Cordial plugin and a JavaScript package, and one key cannot honestly
+//! carry both. A `deno.json` beside this file is the JS runtime's business and
+//! Cordial neither reads nor validates it. See
+//! [ADR-014](../../../docs/adr/ADR-014-plugin-registry-and-unpacking.md).
 
 use crate::capability::Capability;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +45,100 @@ pub struct Manifest {
     pub entry: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// A semantic version, `major.minor.patch`.
+    ///
+    /// Optional, and deliberately so. Every plugin installed before versions
+    /// existed has no such key, and making it required would have made
+    /// [`discover`] refuse all of them at once — which presents to a user as
+    /// every plugin they had silently vanishing, with the directories still
+    /// sitting there looking correct. An unversioned plugin still loads; it
+    /// simply cannot be published to an index or depended upon, and the
+    /// resolver says so by name rather than guessing a version for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Other **Cordial plugins** this one needs, by id, each with a
+    /// requirement. Never npm packages; see the module note.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dependencies: BTreeMap<String, String>,
+}
+
+/// A version requirement on another plugin, with the operator spelled out.
+///
+/// Exactly two forms are accepted: `=1.2.0` for that version and nothing else,
+/// and `^1.2.0` for anything compatible with it. A bare `1.2.0` is refused
+/// rather than assigned a meaning, because the two ecosystems a plugin author
+/// is most likely to have come from disagree about what it means — npm reads it
+/// as exact, Cargo reads it as caret — and a requirement that means opposite
+/// things to the author and to the resolver is worse than one that will not
+/// parse. The error names both forms so the fix is to type one character.
+///
+/// Matching is delegated to `semver::VersionReq` rather than reimplemented,
+/// including its rule that a requirement without a pre-release does not match a
+/// pre-release version. Working out what `^0.2.3` means is exactly the sort of
+/// thing to take from a crate that has already been argued about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement {
+    text: String,
+    req: VersionReq,
+}
+
+impl Requirement {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let rest = text
+            .strip_prefix('^')
+            .or_else(|| text.strip_prefix('='))
+            .ok_or_else(|| {
+                format!(
+                    "{text:?} does not say which versions it means; write \"={text}\" for that \
+                     version exactly, or \"^{text}\" for versions compatible with it"
+                )
+            })?;
+        // Insisting the remainder is a whole version is what rules out `^1.2`,
+        // `>=1.0` and comma-separated lists in one place. The requirement
+        // language is small on purpose: every operator in it is an operator a
+        // user has to understand before they can tell what an install will do.
+        Version::parse(rest)
+            .map_err(|e| format!("{text:?} is not a version requirement ({e})"))?;
+        let req = VersionReq::parse(text)
+            .map_err(|e| format!("{text:?} is not a version requirement ({e})"))?;
+        Ok(Requirement { text: text.to_string(), req })
+    }
+
+    pub fn matches(&self, version: &Version) -> bool {
+        self.req.matches(version)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl fmt::Display for Requirement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// One entry of a manifest's `dependencies`, parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
+    pub id: String,
+    pub req: Requirement,
+}
+
+impl Dependency {
+    pub fn new(id: &str, req: &str) -> Result<Self, String> {
+        if !is_valid_id(id) {
+            return Err(format!("{id:?} is not a usable plugin id, so nothing can depend on it"));
+        }
+        Ok(Dependency { id: id.to_string(), req: Requirement::parse(req).map_err(|e| format!("dependency on {id:?}: {e}"))? })
+    }
+}
+
+impl fmt::Display for Dependency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.id, self.req)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +146,11 @@ pub struct Plugin {
     pub manifest: Manifest,
     pub dir: PathBuf,
     pub requested: BTreeSet<Capability>,
+    /// The parsed `version`, absent for a plugin that declares none.
+    pub version: Option<Version>,
+    /// The parsed `dependencies`, in id order so an install plan built from
+    /// two runs of the same manifest is the same plan.
+    pub dependencies: Vec<Dependency>,
 }
 
 impl Plugin {
@@ -107,7 +217,20 @@ pub fn parse(text: &str, dir: &Path) -> Result<Plugin, String> {
             None => return Err(format!("unknown capability {name:?}")),
         }
     }
-    Ok(Plugin { manifest, dir: dir.to_path_buf(), requested })
+    let version = match &manifest.version {
+        Some(v) => Some(
+            Version::parse(v).map_err(|e| format!("version {v:?} is not a semantic version ({e})"))?,
+        ),
+        None => None,
+    };
+    // `BTreeMap` iterates in key order, so the dependency list is sorted
+    // without sorting it — which is what makes two runs of the resolver over
+    // the same manifest produce the same install order.
+    let mut dependencies = Vec::new();
+    for (id, req) in &manifest.dependencies {
+        dependencies.push(Dependency::new(id, req)?);
+    }
+    Ok(Plugin { manifest, dir: dir.to_path_buf(), requested, version, dependencies })
 }
 
 /// Every plugin under `root`, one subdirectory each.
@@ -124,13 +247,31 @@ pub fn parse(text: &str, dir: &Path) -> Result<Plugin, String> {
 /// manifest is — first one in the sorted directory listing wins, which keeps
 /// discovery deterministic rather than dependent on filesystem enumeration
 /// order.
+///
+/// **A directory whose name begins with `.` is not a plugin and is not looked
+/// at.** `unpack` builds an install in a dot-prefixed sibling of the finished
+/// directory and renames it into place only once it is whole, and the whole
+/// point of that is defeated if discovery can see the half-written copy: an
+/// interrupted install would leave a directory holding a real `plugin.json` and
+/// a truncated entry module, and Cordial would load it. `is_valid_id` already
+/// refuses a `.`, so no directory skipped here could ever have been a plugin
+/// under its own name.
 pub fn discover(root: &Path) -> Vec<Plugin> {
     let mut found = Vec::new();
     let mut seen_ids = BTreeSet::new();
     let Ok(entries) = std::fs::read_dir(root) else {
         return found;
     };
-    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| {
+            !p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'))
+        })
+        .collect();
     dirs.sort();
 
     for dir in dirs {
@@ -259,6 +400,99 @@ mod tests {
         // "zzz-second", so its request set (log only) is the one that wins.
         assert!(found[0].requested.contains(&Capability::Log));
         assert!(!found[0].requested.contains(&Capability::FlagsWrite));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_version_and_dependencies_parse() {
+        let p = parse(
+            r#"{"id":"a","entry":"m.ts","version":"1.2.3",
+                "dependencies":{"b":"^1.0.0","c":"=2.0.0"}}"#,
+            &dir(),
+        )
+        .unwrap();
+        assert_eq!(p.version.unwrap(), Version::new(1, 2, 3));
+        assert_eq!(p.dependencies.len(), 2);
+        assert_eq!(p.dependencies[0].id, "b");
+        assert!(p.dependencies[0].req.matches(&Version::new(1, 4, 0)));
+        assert!(!p.dependencies[0].req.matches(&Version::new(2, 0, 0)));
+        assert!(p.dependencies[1].req.matches(&Version::new(2, 0, 0)));
+        assert!(!p.dependencies[1].req.matches(&Version::new(2, 0, 1)));
+    }
+
+    #[test]
+    fn a_bare_version_requirement_is_refused_rather_than_guessed() {
+        // npm reads "1.2.0" as exact and Cargo reads it as caret. Picking
+        // either silently means an author from the other ecosystem writes a
+        // requirement that means the opposite of what they intended, and
+        // nothing ever tells them.
+        let e = parse(
+            r#"{"id":"a","entry":"m.ts","dependencies":{"b":"1.2.0"}}"#,
+            &dir(),
+        )
+        .unwrap_err();
+        assert!(e.contains("=1.2.0") && e.contains("^1.2.0"), "{e}");
+    }
+
+    #[test]
+    fn a_requirement_language_larger_than_two_operators_is_refused() {
+        for bad in [">=1.0.0", "~1.2.0", "*", "^1.2", "^1.0.0, <2.0.0", "latest"] {
+            let text = format!(
+                r#"{{"id":"a","entry":"m.ts","dependencies":{{"b":{}}}}}"#,
+                serde_json::to_string(bad).unwrap()
+            );
+            assert!(parse(&text, &dir()).is_err(), "{bad:?} should not be a requirement");
+        }
+    }
+
+    #[test]
+    fn a_dependency_id_is_held_to_the_same_rules_as_a_plugin_id() {
+        // A dependency id becomes a directory name at install time, by way of
+        // the index. Checking it here means the resolver never carries a
+        // string that `plugin_root().join(id)` could not safely take.
+        assert!(parse(
+            r#"{"id":"a","entry":"m.ts","dependencies":{"../evil":"^1.0.0"}}"#,
+            &dir()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_plugin_without_a_version_still_loads() {
+        // Every plugin installed before versions existed has no such key.
+        // Refusing them would present as every plugin the user had silently
+        // vanishing, which is a far worse failure than one that cannot be
+        // published to an index.
+        let p = parse(r#"{"id":"old","entry":"m.ts"}"#, &dir()).unwrap();
+        assert!(p.version.is_none());
+        assert!(p.dependencies.is_empty());
+    }
+
+    #[test]
+    fn a_staging_directory_is_not_discovered_as_a_plugin() {
+        // `unpack` builds an install in a dot-prefixed sibling and renames it
+        // into place whole. Delete the dot-prefix filter in `discover` and an
+        // interrupted install becomes a loadable plugin with a truncated entry
+        // module — which is the exact failure staging exists to prevent.
+        let root = std::env::temp_dir().join("cordial-manifest-staging-test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".half-written-1234")).unwrap();
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(
+            root.join(".half-written-1234/plugin.json"),
+            r#"{"id":"half-written","entry":"main.ts","capabilities":["log"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("real/plugin.json"),
+            r#"{"id":"real","entry":"main.ts","capabilities":["log"]}"#,
+        )
+        .unwrap();
+
+        let found = discover(&root);
+        assert_eq!(found.len(), 1, "only the finished plugin should be found");
+        assert_eq!(found[0].manifest.id, "real");
 
         std::fs::remove_dir_all(&root).unwrap();
     }

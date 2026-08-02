@@ -186,7 +186,32 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
     let watching = game_activity_handle.is_some()
         && super::connection_fd().is_some_and(watch_input_fd);
 
+    // TEMPORARY INSTRUMENTATION -- not for commit.
+    let instr = std::env::var_os("CORDIAL_INSTR").is_some();
+    let start = std::time::Instant::now();
+    let mut tick = start;
+    let (mut p0, mut q0, mut i0) = (0u64, 0u64, 0u64);
+    let mut iters: u64 = 0;
+
     while std::time::Instant::now() < deadline {
+        iters += 1;
+        if instr && tick.elapsed() >= std::time::Duration::from_secs(1) {
+            let dt = tick.elapsed().as_secs_f64();
+            tick = std::time::Instant::now();
+            let p = super::glcount::QUEUE_PRESENT.load(Ordering::Relaxed);
+            let q = POLLS.load(Ordering::Relaxed);
+            eprintln!(
+                "[instr] t={:5.1}s presents/s={:6.1} looperpolls/s={:9.0} pumps/s={:6.0} {}",
+                start.elapsed().as_secs_f64(),
+                (p - p0) as f64 / dt,
+                (q - q0) as f64 / dt,
+                (iters - i0) as f64 / dt,
+                super::backend_instr_geometry(),
+            );
+            p0 = p;
+            q0 = q;
+            i0 = iters;
+        }
         if let Some(handle) = game_activity_handle {
             super::pump_input_events(handle);
         }

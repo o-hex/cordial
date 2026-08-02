@@ -44,17 +44,21 @@
 //! **Privacy.** A username and a user id identify a real person, so nothing here
 //! prints either at any verbosity. [`Identity`]'s `Debug` reports lengths;
 //! reaching a value takes a named accessor, and the only callers are the write
-//! to disk and the hand-off to the mirrors. The store sits beside the cookie
-//! store, `0600` inside the profile's `0700`, written by
-//! [`crate::cookies::write_private`] rather than by a second copy of the same
-//! care.
+//! to the store and the hand-off to the mirrors. The store itself is
+//! [`crate::secrets`], the same one the cookie goes into: an item in
+//! `org.freedesktop.secrets` keyed by profile path, falling back to the old
+//! `0600` file with a warning where there is no secret service. It used to be
+//! that file unconditionally, and ADR-012 records why that was wrong and whose
+//! argument made it so.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// The file inside the profile. No extension, for the same reason the cookie
+use crate::secrets::{self, Kind, Store};
+
+/// What the store is called. No extension, for the same reason the cookie
 /// store has none: it is not a document anybody should open.
-const FILE: &str = "identity";
+const KIND: Kind = Kind::Identity;
 
 /// Bumped if the field set ever stops being what the engine's own notification
 /// carries. A store from a future version is refused rather than half-read,
@@ -134,9 +138,17 @@ pub fn enabled() -> bool {
     std::env::var_os("CORDIAL_SKIP_IDENTITY").is_none()
 }
 
-/// Where the store lives for the profile this instance runs.
+/// Where the store would live as a file, for the profile this instance runs.
+///
+/// Kept because a `Store::File` fallback still puts one there. Use
+/// [`where_kept`] for anything a person reads.
 pub fn path() -> PathBuf {
-    crate::profile::active().join(FILE)
+    crate::profile::active().join(KIND.name())
+}
+
+/// Where this instance is actually keeping the identity, in words.
+pub fn where_kept() -> String {
+    secrets::where_kept(secrets::active(), &crate::profile::active(), KIND)
 }
 
 /// Pull an identity out of the engine's field names.
@@ -195,7 +207,13 @@ pub fn parse(data: &str) -> Option<Identity> {
 /// a damaged identity file would turn "you were logged out" into "the client
 /// will not open", which is strictly worse.
 pub fn load(dir: &Path) -> Option<Identity> {
-    let text = std::fs::read_to_string(dir.join(FILE)).ok()?;
+    load_from(secrets::active(), dir)
+}
+
+/// The same, against a named store rather than this instance's, so the tests
+/// can exercise the parser without reaching into anybody's keyring.
+fn load_from(store: Store, dir: &Path) -> Option<Identity> {
+    let text = secrets::load(store, dir, KIND)?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     if v.get("schema").and_then(|s| s.as_u64()) != Some(SCHEMA) {
         return None;
@@ -203,14 +221,20 @@ pub fn load(dir: &Path) -> Option<Identity> {
     from_fields(&v)
 }
 
-/// Write the store, `0600`, atomically. See [`crate::cookies::write_private`].
+/// Write the store. See [`crate::secrets`] for where it ends up.
 pub fn save(dir: &Path, id: &Identity) -> std::io::Result<()> {
+    save_to(secrets::active(), dir, id)
+}
+
+fn save_to(store: Store, dir: &Path, id: &Identity) -> std::io::Result<()> {
     let body = serde_json::json!({
         "schema": SCHEMA,
-        // Not decoration: this file is a live account identity in a directory
-        // people copy around, and the one thing that stops it being pasted into
-        // an issue is somebody reading this line first.
-        "warning": "a live Roblox identity; keep this file at 0600 and out of any bug report",
+        // Not decoration: this is a live account identity, and where it falls
+        // back to a file it lands in a directory people copy around. The one
+        // thing that stops it being pasted into an issue is somebody reading
+        // this line first. It used to say "keep this file at 0600", which is
+        // advice that only means anything in one of the two places it can be.
+        "warning": "a live Roblox identity; treat it as personal data and keep it out of any bug report",
         "userId": id.user_id,
         "username": id.username,
         "displayName": id.display_name,
@@ -219,18 +243,22 @@ pub fn save(dir: &Path, id: &Identity) -> std::io::Result<()> {
         "hasRobloxSubscription": id.has_subscription,
         "countryCode": id.country_code,
     });
-    crate::cookies::write_private(dir, FILE, &format!("{body}\n"))
+    secrets::save(store, dir, KIND, &format!("{body}\n"))
 }
 
 /// Remove the store.
 ///
-/// `NotFound` is success: there was nothing signed in, which is the state this
-/// is trying to reach.
+/// Absent is success: there was nothing signed in, which is the state this is
+/// trying to reach. [`crate::secrets::erase`] removes the item *and* any
+/// plaintext file left over from a machine that once had no secret service, and
+/// it overwrites that file before unlinking it — an identity nobody signed out
+/// of is the failure `observe_logout` exists to prevent.
 pub fn erase(dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(dir.join(FILE)) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
+    erase_from(secrets::active(), dir)
+}
+
+fn erase_from(store: Store, dir: &Path) -> std::io::Result<()> {
+    secrets::erase(store, dir, KIND)
 }
 
 /// Push an identity into the mirrors `native/android_classes.cpp` answers from.
@@ -288,10 +316,13 @@ pub extern "C" fn observe_login(data: *const std::ffi::c_char) {
     match save(&dir, &id) {
         Ok(()) => println!(
             "  [identity] signed in; saved to {} (username {} bytes)",
-            dir.join(FILE).display(),
+            where_kept(),
             id.username().len()
         ),
-        Err(e) => eprintln!("[identity] could not save to {}: {e}", dir.display()),
+        // Named at the moment it happens rather than left to be discovered next
+        // launch: "you are still signed out tomorrow" is a surprise, and this
+        // is the only place that knows why.
+        Err(e) => eprintln!("[identity] the identity was not saved: {e}"),
     }
 }
 
@@ -312,7 +343,7 @@ pub extern "C" fn observe_logout() {
     match erase(&dir) {
         Ok(()) if had => println!("  [identity] signed out; the saved identity is gone"),
         Ok(()) => {}
-        Err(e) => eprintln!("[identity] could not remove {}: {e}", path().display()),
+        Err(e) => eprintln!("[identity] could not remove the saved identity: {e}"),
     }
 }
 
@@ -338,7 +369,7 @@ pub fn restore() -> bool {
     publish(&id);
     println!(
         "  [identity] restored a signed-in user from {} (username {} bytes)",
-        dir.join(FILE).display(),
+        where_kept(),
         id.username().len()
     );
     if let Ok(mut current) = CURRENT.lock() {
@@ -393,6 +424,26 @@ pub fn listen() {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The name the file store uses, for the tests that look at the file.
+    const FILE: &str = KIND.name();
+
+    /// Pinned to the file store rather than run against whatever
+    /// `secrets::active()` resolves to on this machine — a unit test that
+    /// reached into a developer's real keyring would behave differently on the
+    /// one machine where behaviour matters, and would leave rows in it. The
+    /// keyring path is tested as itself, in `secrets.rs`.
+    fn save(dir: &Path, id: &Identity) -> std::io::Result<()> {
+        save_to(Store::File, dir, id)
+    }
+
+    fn load(dir: &Path) -> Option<Identity> {
+        load_from(Store::File, dir)
+    }
+
+    fn erase(dir: &Path) -> std::io::Result<()> {
+        erase_from(Store::File, dir)
+    }
 
     /// A payload of the shape the engine sends, with values that belong to
     /// nobody. **No real account's fields appear in this file or any other**,

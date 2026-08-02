@@ -36,12 +36,22 @@
 //! what cookies are held. [`crate::identity`] is the other half, and neither
 //! half alone signs anybody in.
 //!
-//! **Where it goes, and why not the keyring.** The profile directory, which is
-//! already `0700` and already holds everything else about that account, with
-//! the file itself at `0600`. A keyring adds an unlock prompt to every launch
-//! and protects against nothing extra here, because the token has to be handed
-//! to the engine in plaintext on every start regardless — so the window it
-//! would encrypt is the window in which the file is not being read anyway.
+//! **Where it goes: the desktop secret service, and the paragraph that used to
+//! stand here was wrong.** It said a keyring "adds an unlock prompt to every
+//! launch and protects against nothing extra here, because the token has to be
+//! handed to the engine in plaintext on every start regardless". The second
+//! half is true and does not lead where it was taken: a token in the clear
+//! inside a running process is not a token in the clear on disk for ever, and
+//! it is the disk copy a backup, a sync client or a second application running
+//! as the same user actually reaches. The first half was false on this
+//! platform — `org.freedesktop.secrets` answers, and its default collection is
+//! unlocked by the session login without anything being typed.
+//!
+//! So the store is [`crate::secrets`], which puts both this and
+//! [`crate::identity`] into `org.freedesktop.secrets` keyed by profile path,
+//! falls back to the old `0600` file with a warning where there is no service,
+//! and never blocks a launch or raises a prompt to do it. ADR-012 records the
+//! reversal and names the mistaken objection as mine.
 //!
 //! **Two things about the engine's contract that were measured here and are
 //! not what the design document assumed**, both of which produced a working
@@ -69,19 +79,23 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use crate::secrets::{self, Kind, Store};
+
 pub use cordial_linker_sys::game_activity::Jar;
 
-/// The file inside the profile. No extension: it is not a document anybody
-/// should open, and `.txt` invites exactly that.
-const FILE: &str = "cookies";
+/// What the store is called: a file name under [`Store::File`], and the `store`
+/// attribute under [`Store::Keyring`]. No extension: it is not a document
+/// anybody should open, and `.txt` invites exactly that.
+const KIND: Kind = Kind::Cookies;
 
-const HEADER: &str = "# cordial cookie store v1 -- a live Roblox session. Keep this file at 0600.";
+/// Says what the body is to whoever is looking at it, wherever it ended up.
+/// It used to end "Keep this file at 0600", which is advice that only means
+/// anything in one of the two places this can now live.
+const HEADER: &str = "# cordial cookie store v1 -- a live Roblox session. Treat it as a password.";
 
 /// Domains asked for even before anything has been observed.
 ///
@@ -121,9 +135,18 @@ pub fn enabled() -> bool {
     std::env::var_os("CORDIAL_SKIP_COOKIES").is_none()
 }
 
-/// Where the store lives for the profile this instance runs.
+/// Where the store would live as a file, for the profile this instance runs.
+///
+/// Kept because a `Store::File` fallback still puts one there and people need
+/// to be able to find it. It is no longer where the session normally is; use
+/// [`where_kept`] for anything the user reads.
 pub fn path() -> PathBuf {
-    crate::profile::active().join(FILE)
+    crate::profile::active().join(KIND.name())
+}
+
+/// Where this instance is actually keeping the session, in words.
+pub fn where_kept() -> String {
+    secrets::where_kept(secrets::active(), &crate::profile::active(), KIND)
 }
 
 /// The sink `native/cookies.cpp` calls with each host whose cookies changed.
@@ -270,7 +293,17 @@ fn unescape(v: &str) -> String {
 /// saved", which is the honest answer and the one that presents as a normal
 /// signed-out launch rather than as a failure to start.
 pub fn load(dir: &Path) -> Vec<(String, Jar)> {
-    let Ok(text) = std::fs::read_to_string(dir.join(FILE)) else {
+    load_from(secrets::active(), dir)
+}
+
+/// The same, against a named store rather than this instance's.
+///
+/// Split out so the tests can exercise the parser against a file without
+/// reaching into anybody's keyring, and so a keyring round trip can be tested
+/// as itself. The public entry point above is the only thing that consults the
+/// process-wide choice.
+fn load_from(store: Store, dir: &Path) -> Vec<(String, Jar)> {
+    let Some(text) = secrets::load(store, dir, KIND) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -311,46 +344,18 @@ pub fn load(dir: &Path) -> Vec<(String, Jar)> {
     out
 }
 
-/// Write a file in a profile at `0600`, atomically.
+/// Write the store. See [`crate::secrets`] for where it ends up.
 ///
-/// Temp file plus rename rather than truncate-and-write. An interrupted write
-/// to the real path would leave a jar cut off mid-value, and half a cookie
-/// still parses as a cookie — the engine would take it on the next launch and
-/// fail authentication for a reason with no visible relationship to a power
-/// cut. `rename` within a directory is atomic, so a reader sees the old file or
-/// the new one.
-///
-/// The mode is set on the temp file *before* anything is written to it, not
-/// after: a `0644` window with a live session in it is still a window, and it
-/// is the one an attacker with a loop would use.
-///
-/// **Shared with [`crate::identity`] rather than copied into it.** The identity
-/// store beside this one holds a username and a user id for the same account,
-/// and a second writer would be a second chance to get the mode or the rename
-/// wrong — including later, when only one of the two gets a fix. Every property
-/// this function has is a property that store needs too.
-pub(crate) fn write_private(dir: &Path, name: &str, body: &str) -> std::io::Result<()> {
-    let final_path = dir.join(name);
-    let tmp = dir.join(format!("{name}.new"));
-
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    // `mode` only applies when the call creates the file, so a leftover temp
-    // from an interrupted run would keep whatever mode it had.
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    f.write_all(body.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-
-    std::fs::rename(&tmp, &final_path)
+/// The single writer this used to be — `write_private`, the `0600` temp file
+/// plus rename that [`crate::identity`] shares rather than copies — moved into
+/// `secrets.rs` when the file stopped being the only place a session can live.
+/// It is still the only thing in Cordial that writes one to disk; there is
+/// still no second writer to get the mode or the rename wrong.
+pub fn save(dir: &Path, records: &[(String, Jar)]) -> std::io::Result<()> {
+    save_to(secrets::active(), dir, records)
 }
 
-/// Write the store, at `0600`, atomically. See [`write_private`].
-pub fn save(dir: &Path, records: &[(String, Jar)]) -> std::io::Result<()> {
+fn save_to(store: Store, dir: &Path, records: &[(String, Jar)]) -> std::io::Result<()> {
     let mut body = String::new();
     writeln!(body, "{HEADER}").expect("writing to a String cannot fail");
     for (host, jar) in records {
@@ -364,7 +369,7 @@ pub fn save(dir: &Path, records: &[(String, Jar)]) -> std::io::Result<()> {
         }
         writeln!(body, "{host}\t{}", escape(jar.expose())).expect("writing to a String cannot fail");
     }
-    write_private(dir, FILE, &body)
+    secrets::save(store, dir, KIND, &body)
 }
 
 /// How often the jar is written out even if nothing has announced a change.
@@ -489,10 +494,14 @@ pub fn flush(reason: &str) {
             println!(
                 "  [cookies] {reason}: saved {} domain(s), {bytes} bytes to {}",
                 records.len(),
-                dir.join(FILE).display()
+                where_kept()
             );
         }
-        Err(e) => eprintln!("[cookies] could not save to {}: {e}", dir.display()),
+        // Said out loud, every time, rather than counted and reported at exit.
+        // A session that was not stored is something the user has to hear about
+        // while they can still do something about it; the alternative is them
+        // assuming they are signed in and finding out at the next launch.
+        Err(e) => eprintln!("[cookies] the session was not saved: {e}"),
     }
 }
 
@@ -640,12 +649,31 @@ pub fn restore(set_native: *mut std::ffi::c_void) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The name the file store uses, for the tests that look at the file.
+    const FILE: &str = KIND.name();
 
     fn scratch(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("cordial-cookie-test-{tag}"));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Everything below is about the *format* — escaping, the stale-format
+    /// rejection, one record per line — so it is pinned to the file store
+    /// rather than run against whatever `secrets::active()` resolves to on the
+    /// machine the tests happen to be on. A unit test that reached into a
+    /// developer's real keyring would behave differently on the one machine
+    /// where behaviour matters, and would leave rows in it afterwards. The
+    /// keyring path is tested as itself, in `secrets.rs`.
+    fn save(dir: &Path, records: &[(String, Jar)]) -> std::io::Result<()> {
+        save_to(Store::File, dir, records)
+    }
+
+    fn load(dir: &Path) -> Vec<(String, Jar)> {
+        load_from(Store::File, dir)
     }
 
     #[test]

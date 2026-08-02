@@ -539,11 +539,36 @@ page:
 Gdk-Message: 14:10:43.968: Error 71 (Protocol error) dispatching to Wayland display.
 ```
 
-**Not reproduced**, and this section does not claim to have fixed it. Five
-logged-out runs against the real APK on this compositor — two before any change
-(120s and 180s) and three after (180s each) — all reached `APP_READY (Landing)`
-and none produced a protocol error. Reproducing it needs a signed-in account,
-which is §2's problem.
+**Correction: it does happen logged out, and the unmuting worked.** The
+paragraph that used to stand here said reproducing it needed a signed-in
+account. It does not. One run in eight, logged out, 22-second runs on this
+compositor, immediately after `app ready: Landing`:
+
+```text
+[roblox] datamodel notification: APP_READY Landing
+[roblox] app ready: Landing
+[stub] ZSTD_trace_compress_begin
+[wayland] wp_commit_timer_v1#105: error 1: Commit already has timestamp
+
+Gdk-Message: 16:04:10.242: Error 71 (Protocol error) dispatching to Wayland display.
+```
+
+So the object and the reason are now on the record: `wp_commit_timer_v1`
+error 1, which is `commit_timer_v1.error.timestamp_exists` — a second
+`set_timestamp` on a surface that already had one before its next commit. That
+is `wp_commit_timing_v1`, GTK's frame-timing protocol, on a surface GTK owns.
+
+**`INFERRED`, and the obvious next thing to test:** Cordial commits the *parent*
+toplevel itself (`host.queue_commit`, to latch the subsurface's
+`set_position`), and GTK also drives that same surface through its frame clock.
+Two clients of one surface, one of which schedules timestamps, is the shape the
+error describes. Nobody has tested it — the way to would be a control run with
+`queue_commit` suppressed, checking whether the error stops and whether the
+canvas then sits under the header bar as it did before that call existed.
+
+Five earlier logged-out runs (two at 120s and 180s before any change, three at
+180s after) reached `APP_READY (Landing)` with no protocol error, which is
+consistent with roughly one in eight rather than with "does not happen".
 
 ### Why that line was the whole of the evidence, and why it will not be again
 
@@ -976,6 +1001,36 @@ Each was tested and each cost time. The evidence is the point.
 - Not a `pthread_mutex_t`/`pthread_attr_t` ABI mismatch.
 - Not a `malloc`/`free`/`operator new` mismatch directly — none of those are
   undefined symbols in `libroblox.so` at all.
+
+**`onKeyDownNative` is registered, and the code it receives is an Android
+keycode**
+
+Worth stating because the opposite was a live theory: only the D key appears to
+work in an experience, and evdev `KEY_D` and `AKEYCODE_D` are both 32 — they
+collide at exactly one letter, so a raw evdev code reaching something that
+wanted an Android one would look precisely like that. It is not happening at
+this layer. Measured, with `CORDIAL_ANDROID_TRACE=1` on two consecutive runs:
+
+```text
+[android] onKeyDownNative(code=31) -> true      <- C, evdev KEY_C is 46
+[android] onKeyDownNative(code=40) -> true      <- I, evdev KEY_I is 23
+[android] onKeyDownNative(code=37) -> true      <- H, evdev KEY_H is 35
+[android] nativePassKeyEvent(down=true, keyCode=51, modifiers=0x0) -> Ok(())
+```
+
+So the AGDK native is in the natives table, it returns `true`, the codes are
+`AKEYCODE_*`, and `NativeGLInterface.nativePassKeyEvent` resolves and returns
+cleanly on the same keystroke. Whatever makes only D work in an experience is
+downstream of both, or is not about keycodes at all. `nativePassKeyEvent` is now
+traced under `CORDIAL_ANDROID_TRACE=1`, which it never was before — every
+keyboard investigation until now read only the AGDK half.
+
+The reason none of this was visible before: `deliver_key`/`deliver_touch`
+answered "the native is not registered" with silence, so a trace run that
+printed nothing was indistinguishable from a trace run whose events were all
+dropped. They now say so by name, at the first drop and then at each power of
+ten — once would be indistinguishable from the normal startup race against
+`initializeNativeCode`, and per event would bury the log.
 
 **Resizing the window reflows the interface into many small items — and density
 is not the fix**

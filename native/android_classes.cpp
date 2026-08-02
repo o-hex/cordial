@@ -534,6 +534,47 @@ void trace_identity(const char* field) {
             identity_known() ? "signed in" : "nobody");
 }
 
+/// What Cordial answers when the engine asks which platform it is running on.
+///
+/// `Linux` is one of the engine's *own* platform names, not a word invented
+/// here: `Android`, `AndroidTV`, `Linux`, `MetaOS`, `SteamOS`, `Windows` and
+/// `XBoxOne` are the standalone platform tokens in libroblox.so's string table,
+/// and they are `Enum.Platform` values. So this is not passing Cordial off as
+/// something else — it is telling the truth in the vocabulary the engine
+/// already has, on a machine that genuinely is Linux.
+///
+/// "Never make a stub lie" cuts both ways here. `Windows` would be a lie.
+/// `Android`, which is what Cordial answered until now, is *also* a lie: the
+/// host is a desktop Linux machine with a keyboard and a mouse and no
+/// touchscreen, which is already what `PlatformParams` says through
+/// `isKeyboardDevice`, `isMouseDevice` and `isTouchDevice`. Answering `Android`
+/// beside those three contradicted them.
+///
+/// **What this is not.** It has not been established that this is what makes the
+/// client behave as a mobile one; see docs/analysis/platform-identity.md for
+/// what was measured and what was not. It is defensible as the truthful answer
+/// on its own, independently of what it fixes.
+///
+/// It is also not settled whether `getPlatformName` means "the platform this
+/// client runs on" or "the platform this *user* is on", the console-gamertag
+/// sense that `FFlagAddPlatformNameToProfileHeader` and
+/// `DFFlagConsumePlatformNameOverAlternateName` both read as. The two senses
+/// give the same answer on a Linux desktop, which is why the value stands either
+/// way — but do not build anything on the assumption that this is
+/// `Enum.Platform` until someone has printed `UserInputService:GetPlatform()`
+/// inside a running experience.
+///
+/// `CORDIAL_PLATFORM_NAME=<name>` overrides it, which is also the control: a
+/// run with `CORDIAL_PLATFORM_NAME=Android` is the pre-change client in the same
+/// session and the same binary, differing in exactly this string.
+const char* platform_name() {
+    static const std::string v = [] {
+        const char* e = getenv("CORDIAL_PLATFORM_NAME");
+        return (e && *e) ? std::string(e) : std::string("Linux");
+    }();
+    return v.c_str();
+}
+
 /// `com.roblox.engine.jni.NativeGLJavaInterface`
 ///
 /// The engine's main line back into Java: device parameters, keyboard, screen
@@ -883,10 +924,8 @@ public:
         return str("");
     }
     static std::shared_ptr<String> getPlatformName(ENV*, Class*) {
-        // Roblox's own name for the platform family, not Cordial's. The engine
-        // branches on this for input handling and store behaviour, and it only
-        // knows the values its own builds ship with.
-        return str("Android");
+        trace_identity("getPlatformName");
+        return str(platform_name());
     }
     static std::shared_ptr<String> getTheme(ENV*, Class*) { return str("Dark"); }
 

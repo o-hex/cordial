@@ -1,31 +1,41 @@
 //! Choosing the profile the next instance runs.
 //!
-//! An `AdwAvatar` in the shell's header bar, opening a popover over
+//! An `AdwComboRow` sitting directly above the Launch group, listing
 //! [`profile::list`]. ADR-012 makes a profile a directory and an instance a
 //! window; this is where one is picked for the other.
 //!
-//! **It is in the shell because it cannot be in a client.** A running client
-//! cannot change profile: `cordial_runtime::profile::set_active` refuses a
-//! second, different directory outright — "a profile cannot be changed while
-//! the client is up" — the `flock` is held for the lifetime of that process,
-//! and the engine's storage root is resolved before the first frame. A
-//! switcher in the engine's window would therefore be a control that cannot do
-//! what it looks like it does, which is the interface version of the stub that
-//! reports success AGENTS.md rules out. In the shell it decides what the *next*
-//! launch runs, and that is a thing it can actually do. Running a second
-//! profile alongside the first is the same gesture: pick another one and press
-//! Roblox, which is all "two accounts at once" has ever been.
+//! **Why here and not the header bar.** The first version of this was an
+//! `AdwAvatar` in the top right opening a popover, and it was wrong in a way
+//! worth writing down rather than quietly replacing. An avatar in that corner is
+//! a *browser* convention — Chrome and Firefox put the profile there — and
+//! GNOME's HIG has no profile-switcher pattern at all. Fractal is the one
+//! libadwaita precedent and Fractal is an account-centric application, where
+//! your identity is the ambient context of everything on screen. Cordial's shell
+//! is a launcher, and the profile is a launch parameter: *which of these do I
+//! start*. Putting it in the far corner opposite the thing it governs separates
+//! the choice from the launch it applies to, which is what made it uncomfortable
+//! to look at. It is a row above the button now.
 //!
-//! There used to be a text entry for this in Settings and it is gone rather
-//! than kept beside this. Two ways to set one value drift, and the one that
-//! drifts is the one nobody is looking at.
+//! **Why it is in the shell and not in a client.** A running client cannot
+//! change profile: `cordial_runtime::profile::set_active` refuses a second,
+//! different directory outright — "a profile cannot be changed while the client
+//! is up" — the `flock` is held for the lifetime of that process, and the
+//! engine's storage root is resolved before the first frame. A switcher in the
+//! engine's window would be a control that cannot do what it looks like it does,
+//! which is the interface version of the stub that reports success AGENTS.md
+//! rules out. Here it decides what the *next* launch runs, and running a second
+//! profile beside the first is the same gesture: pick another and press Roblox,
+//! which is all "two accounts at once" has ever been.
+//!
+//! There used to be a text entry for this in Settings and it is gone rather than
+//! kept beside this. Two ways to set one value drift, and the one that drifts is
+//! the one nobody is looking at.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use libadwaita as adw;
-use libadwaita::glib;
 use libadwaita::gtk;
 use libadwaita::prelude::*;
 
@@ -33,9 +43,11 @@ use crate::settings::persist;
 use crate::shell_config::ShellConfig;
 use cordial_shell::profile;
 
-/// Header-bar avatars are drawn at 24px across GNOME; matching it is what keeps
-/// the header bar from growing a row taller than every other application's.
-const HEADER_AVATAR: i32 = 24;
+/// How wide a profile name is allowed to make the row, in characters.
+/// `profile::is_valid_name` allows 64, which is far past what fits;
+/// `fdsafdsagfdsgfdgfdgfd` is on this developer's disk right now and without a
+/// cap a `GtkLabel` asks for its whole natural width and stretches the window.
+const NAME_WIDTH: i32 = 24;
 
 /// Whether a profile can be handed to a new instance.
 ///
@@ -43,14 +55,14 @@ const HEADER_AVATAR: i32 = 24;
 /// liveness check of this module's own. The `flock` is the only thing that
 /// actually decides, so a second opinion — a PID file, a scan of `/proc` — could
 /// disagree with it, and the disagreement the user would meet is the worst
-/// direction: a row offered as free, pressed, and then refused by `try_launch`
-/// a moment later for a reason the popover had just said did not apply.
+/// direction: an entry offered as free, chosen, and then refused by `try_launch`
+/// for a reason the list had just said did not apply.
 ///
 /// The cost is honest and small. The probe really does hold each profile's lock
-/// for as long as it takes to release it, so a launch racing the popover being
-/// opened could be refused when it would otherwise have been allowed. That is
-/// the same refusal a second launch produces, it names the profile, and pressing
-/// again succeeds — which is a better failure than marks that are guesswork.
+/// for as long as it takes to release it, so a launch racing this list being
+/// drawn could be refused when it would otherwise have been allowed. That is the
+/// same refusal a second launch produces, it names the profile, and trying again
+/// succeeds — a better failure than marks that are guesswork.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Availability {
     Free,
@@ -68,8 +80,8 @@ fn availability(name: &str) -> Availability {
         Ok(claim) => {
             // Released immediately and explicitly. The launcher hands its claim
             // to the client it spawns; this one belongs to nobody, and holding
-            // it a line longer than needed would mean the switcher itself was
-            // the instance keeping a profile busy.
+            // it a line longer than needed would mean the chooser itself was the
+            // instance keeping a profile busy.
             drop(claim);
             Availability::Free
         }
@@ -111,31 +123,34 @@ pub fn check_name(name: &str, existing: &[String]) -> NameCheck {
     }
 }
 
-/// The names the popover offers.
+/// The names the row offers: exactly the profiles that exist, and deliberately
+/// nothing else.
 ///
-/// The profiles on disk, plus the chosen one when it has never been launched and
-/// so has no directory yet. Without that second half the current profile would
-/// be the one entry missing from a list of profiles, on exactly the fresh
-/// install where it is the only one there is.
-fn offered(current: &str, mut existing: Vec<String>) -> Vec<String> {
-    if !existing.iter().any(|e| e == current) {
-        existing.push(current.to_string());
-        existing.sort();
-    }
-    existing
+/// This is a thin wrapper on purpose. An earlier version also synthesised the
+/// chosen profile when that had never been launched and so had no directory yet,
+/// on the argument that a list which omits the selected entry looks broken. That
+/// was wrong, and it is the kind of wrong this project cares about: a profile
+/// *is* a signed-in session, so a launcher that lists one which does not exist
+/// is claiming an account that was never there. Nothing here seeds, suggests or
+/// pre-creates a profile, and the test below is what keeps it that way.
+fn offered() -> Vec<String> {
+    profile::list()
 }
 
-/// The config, where it is saved, and the header-bar widgets that have to show
-/// the answer. Cloned into every popover row, which is why the button is held
-/// weakly: the button owns the popover, the popover owns the row, and a strong
-/// reference back would be a cycle that GTK's refcounting cannot break — one
-/// leaked popover per time the avatar is pressed.
+/// The config, the file it is saved to, and the widgets showing the answer.
 #[derive(Clone)]
 struct Switcher {
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
-    avatar: adw::Avatar,
-    button: glib::WeakRef<gtk::MenuButton>,
+    row: adw::ComboRow,
+    model: gtk::StringList,
+    /// Set while [`Switcher::refresh`] is rewriting the model, because
+    /// `set_selected` emits the same notification a user's choice does. Without
+    /// it, repopulating the list writes whatever happens to be at the selected
+    /// index back into the config — including nothing at all when the list is
+    /// empty, which would replace a perfectly good profile name with an empty
+    /// string on the first launch of a fresh install.
+    updating: Rc<Cell<bool>>,
 }
 
 impl Switcher {
@@ -148,174 +163,181 @@ impl Switcher {
     fn choose(&self, name: &str) {
         self.config.borrow_mut().profile = name.to_string();
         persist(&self.config, &self.config_path);
-        self.show(name);
+        self.describe();
     }
 
-    fn show(&self, name: &str) {
-        self.avatar.set_text(Some(name));
-        if let Some(button) = self.button.upgrade() {
-            // The avatar draws initials and nothing else, so the whole of the
-            // name has to be somewhere a pointer or a screen reader can reach
-            // it. ADR-012 is deliberate that this selects a directory and knows
-            // nothing about accounts, and the wording follows it.
-            button.set_tooltip_text(Some(&format!("Profile: {name}")));
+    /// Rebuild the list from disk and reselect the chosen profile.
+    ///
+    /// Called when the row is built and after a profile is created, rather than
+    /// held as state: a profile can appear or disappear from under this window
+    /// at any time, and a list assembled once is confidently wrong by the second
+    /// launch.
+    fn refresh(&self) {
+        let names = offered();
+        let current = self.current();
+        self.updating.set(true);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.model.splice(0, self.model.n_items(), &refs);
+        match names.iter().position(|n| *n == current) {
+            Some(index) => self.row.set_selected(index as u32),
+            // Nothing to point at. `GTK_INVALID_LIST_POSITION` is how a
+            // `GtkSelectionModel` says "no selection", and it is the honest
+            // answer when the chosen profile has never been created.
+            None => self.row.set_selected(gtk::INVALID_LIST_POSITION),
         }
+        self.updating.set(false);
+        self.describe();
+    }
+
+    /// Say what the launch will actually do, underneath the row.
+    ///
+    /// Three cases, and the third is the one that needs saying. A profile is
+    /// created by the launch that first needs it, so on a fresh install the list
+    /// is empty while `ShellConfig.profile` still names something — and a row
+    /// that showed nothing at all there would be hiding what pressing Roblox is
+    /// about to do. Naming the behaviour is not the same as listing a profile
+    /// that does not exist.
+    fn describe(&self) {
+        let name = self.current();
+        let subtitle = if !offered().iter().any(|n| *n == name) {
+            format!("{name} will be created when you launch")
+        } else {
+            match availability(&name) {
+                Availability::Free => "One account's Roblox storage, held by one window at a time".to_string(),
+                Availability::Running => {
+                    format!("{name} is open in another window; launching it again will be refused")
+                }
+                Availability::Unusable(message) => message,
+            }
+        };
+        self.row.set_subtitle(&subtitle);
     }
 }
 
-/// The header-bar control.
-///
-/// `set_create_popup_func` rather than a popover built once: whether a profile
-/// is running changes underneath this window every time a client starts or
-/// exits, and a list assembled at startup would be confidently wrong by the
-/// second launch.
-pub fn build(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> gtk::MenuButton {
-    let avatar = adw::Avatar::new(HEADER_AVATAR, Some(&config.borrow().profile), true);
-    let button = gtk::MenuButton::builder().child(&avatar).build();
+/// The profile chooser, as a group ready to sit above the Launch group.
+pub fn build(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> adw::PreferencesGroup {
+    let model = gtk::StringList::new(&[]);
+    let row = adw::ComboRow::builder().title("Profile").model(&model).build();
+    row.set_subtitle_lines(2);
+    row.set_list_factory(Some(&list_factory()));
 
-    let switcher =
-        Switcher { config, config_path, avatar, button: button.downgrade() };
-    switcher.show(&switcher.current());
+    let switcher = Switcher {
+        config,
+        config_path,
+        row: row.clone(),
+        model,
+        updating: Rc::new(Cell::new(false)),
+    };
 
-    button.set_create_popup_func({
+    {
         let switcher = switcher.clone();
-        move |button| button.set_popover(Some(&popover(&switcher)))
-    });
-
-    // TEMPORARY: screenshot harness. Removed before this change is finished.
-    if let Ok(demo) = std::env::var("CORDIAL_SHELL_DEMO") {
-        let s = switcher.clone();
-        let b = button.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || match demo.as_str()
-        {
-            "popover" => b.popup(),
-            "create" => {
-                if let Some(window) = b.root().and_downcast::<gtk::Window>() {
-                    create(&window, &s);
-                }
+        row.connect_selected_notify(move |row| {
+            if switcher.updating.get() {
+                return;
             }
-            _ => {}
+            if let Some(name) = switcher.model.string(row.selected()) {
+                switcher.choose(&name);
+            }
         });
     }
 
-    button
-}
-
-fn popover(switcher: &Switcher) -> gtk::Popover {
-    let current = switcher.current();
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 3);
-    list.set_size_request(240, -1);
-
-    let heading = gtk::Label::new(Some("Profile"));
-    heading.set_xalign(0.0);
-    heading.add_css_class("heading");
-    heading.set_margin_start(6);
-    heading.set_margin_bottom(3);
-    list.append(&heading);
-
-    let existing = profile::list();
-    for name in offered(&current, existing.clone()) {
-        // Only what is on disk can be held by anything, and probing a name that
-        // is not there would create the directory as a side effect of opening a
-        // menu.
-        let state = if existing.iter().any(|e| *e == name) {
-            availability(&name)
-        } else {
-            Availability::Free
-        };
-        list.append(&row(switcher, &name, name == current, state));
-    }
-
-    let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
-    separator.set_margin_top(3);
-    separator.set_margin_bottom(3);
-    list.append(&separator);
-
-    let content = adw::ButtonContent::builder().icon_name("list-add-symbolic").label("New profile…").build();
-    content.set_halign(gtk::Align::Start);
-    let new = gtk::Button::builder().child(&content).css_classes(["flat"]).build();
+    // A suffix button rather than a final "New profile…" entry in the list.
+    // An action pretending to be a value has to be un-selected again the moment
+    // it is chosen, and the reverting is visible: the row briefly reads "New
+    // profile…" as though that were the profile you are about to launch.
+    let new = gtk::Button::from_icon_name("list-add-symbolic");
+    new.set_tooltip_text(Some("New profile…"));
+    new.set_valign(gtk::Align::Center);
+    new.add_css_class("flat");
     {
         let switcher = switcher.clone();
         new.connect_clicked(move |button| {
-            let window = button.root().and_downcast::<gtk::Window>();
-            popdown(&switcher);
-            if let Some(window) = window {
+            if let Some(window) = button.root().and_downcast::<gtk::Window>() {
                 create(&window, &switcher);
             }
         });
     }
-    list.append(&new);
+    row.add_suffix(&new);
 
-    // Bounded rather than left to grow: nothing stops someone having twenty
-    // profiles, and a popover taller than the monitor is clipped by the
-    // compositor rather than scrolled by GTK.
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&list)
-        .propagate_natural_height(true)
-        .propagate_natural_width(true)
-        .max_content_height(360)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .build();
+    switcher.refresh();
 
-    gtk::Popover::builder().child(&scroller).build()
+    let group = adw::PreferencesGroup::new();
+    group.add(&row);
+
+    group
 }
 
-fn row(switcher: &Switcher, name: &str, current: bool, state: Availability) -> gtk::Button {
-    let line = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    line.append(&adw::Avatar::new(HEADER_AVATAR, Some(name), true));
+/// How one profile is drawn inside the dropdown.
+///
+/// The factory exists for one reason: `GtkListItem` carries `selectable` and
+/// `activatable`, and that is the only mechanism in this widget that can show a
+/// profile as unavailable rather than offering it and refusing afterwards. A
+/// plain `GtkStringList` with the default rendering has no way to say "not this
+/// one".
+///
+/// Availability is asked at bind time rather than when the list was built, so
+/// what the dropdown shows is what was true when it was opened.
+fn list_factory() -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
 
-    let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    labels.set_hexpand(true);
-    labels.set_valign(gtk::Align::Center);
-    let title = gtk::Label::new(Some(name));
-    title.set_xalign(0.0);
-    title.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    labels.append(&title);
-
-    let note = match &state {
-        Availability::Free => None,
-        Availability::Running => Some("Open in another window".to_string()),
-        Availability::Unusable(message) => Some(message.clone()),
-    };
-    if let Some(note) = &note {
-        let subtitle = gtk::Label::new(Some(note));
-        subtitle.set_xalign(0.0);
-        subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        subtitle.add_css_class("caption");
-        subtitle.add_css_class("dim-label");
-        labels.append(&subtitle);
-    }
-    line.append(&labels);
-
-    if current {
-        line.append(&gtk::Image::from_icon_name("object-select-symbolic"));
-    }
-
-    let button = gtk::Button::builder().child(&line).css_classes(["flat"]).build();
-
-    // Shown and refused here rather than offered and refused at launch. ADR-012's
-    // lock is what decides either way; the difference is whether the user finds
-    // out before or after pressing Roblox.
-    if !matches!(state, Availability::Free) {
-        button.set_sensitive(false);
-        if let Some(note) = note {
-            button.set_tooltip_text(Some(&note));
-        }
-    }
-
-    let switcher = switcher.clone();
-    let name = name.to_string();
-    button.connect_clicked(move |_| {
-        switcher.choose(&name);
-        popdown(&switcher);
+    factory.connect_setup(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
+        let line = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let name = gtk::Label::new(None);
+        name.set_xalign(0.0);
+        name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        // Ellipsising alone does nothing: a `GtkLabel` still asks for its whole
+        // natural width and the popup grows to give it. Capping the character
+        // count is what bounds that request.
+        name.set_max_width_chars(NAME_WIDTH);
+        let note = gtk::Label::new(None);
+        note.set_xalign(0.0);
+        note.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        note.set_max_width_chars(NAME_WIDTH);
+        note.add_css_class("caption");
+        note.add_css_class("dim-label");
+        line.append(&name);
+        line.append(&note);
+        item.set_child(Some(&line));
     });
-    button
-}
 
-fn popdown(switcher: &Switcher) {
-    if let Some(button) = switcher.button.upgrade() {
-        button.popdown();
-    }
+    factory.connect_bind(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
+        let Some(line) = item.child().and_downcast::<gtk::Box>() else { return };
+        let Some(name_label) = line.first_child().and_downcast::<gtk::Label>() else { return };
+        let Some(note_label) = line.last_child().and_downcast::<gtk::Label>() else { return };
+        let name = item
+            .item()
+            .and_downcast::<gtk::StringObject>()
+            .map(|s| s.string().to_string())
+            .unwrap_or_default();
+
+        name_label.set_text(&name);
+        match availability(&name) {
+            Availability::Free => {
+                item.set_selectable(true);
+                item.set_activatable(true);
+                line.set_sensitive(true);
+                note_label.set_visible(false);
+            }
+            Availability::Running => {
+                item.set_selectable(false);
+                item.set_activatable(false);
+                line.set_sensitive(false);
+                note_label.set_text("Open in another window");
+                note_label.set_visible(true);
+            }
+            Availability::Unusable(message) => {
+                item.set_selectable(false);
+                item.set_activatable(false);
+                line.set_sensitive(false);
+                note_label.set_text(&message);
+                note_label.set_visible(true);
+            }
+        }
+    });
+
+    factory
 }
 
 /// Make a profile, or say why not.
@@ -367,7 +389,7 @@ fn create(parent: &gtk::Window, switcher: &Switcher) {
         let hint = hint.clone();
         entry.connect_changed(move |entry| {
             let name = entry.text().to_string();
-            match check_name(&name, &profile::list()) {
+            match check_name(&name, &offered()) {
                 NameCheck::Empty => {
                     entry.remove_css_class("error");
                     hint.set_text("");
@@ -394,15 +416,24 @@ fn create(parent: &gtk::Window, switcher: &Switcher) {
 
     let switcher = switcher.clone();
     let parent = parent.clone();
-    dialog.connect_response(None, move |dialog, response| {
+    // The entry itself is captured, rather than found again from the dialog's
+    // widget tree when Create is pressed. The tree walk was written first, on
+    // the argument that reaching the live widget cannot disagree with a stale
+    // copy — but a captured `AdwEntryRow` *is* the live widget, and the walk
+    // silently returned nothing: pressing Create reported `"" is not a usable
+    // profile name` for a perfectly good one. Found by pressing the button,
+    // which is the only way it could have been.
+    let typed = entry.clone();
+    dialog.connect_response(None, move |_, response| {
         if response != "create" {
             return;
         }
-        let name = typed_name(dialog);
+        let name = typed.text().to_string();
         match profile::acquire(&name) {
             Ok(claim) => {
                 drop(claim);
                 switcher.choose(&name);
+                switcher.refresh();
             }
             // Both remaining cases already have a sentence written for them on
             // `profile::Error`, and this is not the place to write a second one.
@@ -411,40 +442,6 @@ fn create(parent: &gtk::Window, switcher: &Switcher) {
     });
 
     dialog.present();
-}
-
-/// Read the name back out of the dialog's own widget tree.
-///
-/// The entry is reachable from the dialog rather than captured, so that the
-/// value acted on is the one the dialog is showing at the moment Create is
-/// pressed — a captured clone and a validated string are two things that can
-/// disagree, and the one that would win is the one nobody validated.
-fn typed_name(dialog: &adw::MessageDialog) -> String {
-    dialog
-        .extra_child()
-        .and_downcast::<gtk::Box>()
-        .and_then(|body| body.first_child())
-        .and_downcast::<adw::PreferencesGroup>()
-        .and_then(|group| find_entry_row(group.upcast()))
-        .map(|row| row.text().to_string())
-        .unwrap_or_default()
-}
-
-/// `AdwPreferencesGroup` wraps its rows in boxes and a list box of its own, so
-/// the entry is several levels down and the depth is libadwaita's business
-/// rather than something to hard-code.
-fn find_entry_row(widget: gtk::Widget) -> Option<adw::EntryRow> {
-    if let Ok(row) = widget.clone().downcast::<adw::EntryRow>() {
-        return Some(row);
-    }
-    let mut child = widget.first_child();
-    while let Some(current) = child {
-        if let Some(found) = find_entry_row(current.clone()) {
-            return Some(found);
-        }
-        child = current.next_sibling();
-    }
-    None
 }
 
 #[cfg(test)]
@@ -470,8 +467,8 @@ mod tests {
     #[test]
     fn a_running_profile_is_shown_as_unavailable_rather_than_offered() {
         // The whole reason the probe is `acquire` and not a check of this
-        // module's own: what the popover says has to be what the launch will
-        // do, and only the lock knows that.
+        // module's own: what the list says has to be what the launch will do,
+        // and only the lock knows that.
         let (_root, _g) = scratch("running");
         let held = profile::acquire("main").expect("a fresh profile is free");
         assert_eq!(availability("main"), Availability::Running);
@@ -482,8 +479,8 @@ mod tests {
     #[test]
     fn probing_does_not_leave_the_profile_held() {
         // The hazard in answering the question by taking the lock. If the probe
-        // kept it, opening the menu would make every profile in it unlaunchable
-        // — the switcher would be the instance holding them.
+        // kept it, opening the dropdown would make every profile in it
+        // unlaunchable — the chooser would be the instance holding them.
         let (_root, _g) = scratch("release");
         assert_eq!(availability("main"), Availability::Free);
         profile::acquire("main").expect("the probe must have let go again");
@@ -501,6 +498,32 @@ mod tests {
     }
 
     #[test]
+    fn every_profile_the_list_offers_is_one_the_create_dialog_would_accept() {
+        // The trap this rules out: a name that can exist on disk but cannot be
+        // typed. Both ends go through `profile::is_valid_name` — `list` filters
+        // on it and `dir` refuses on it — so they agree by construction, and
+        // this is here so that loosening one without the other fails loudly.
+        //
+        // It is not hypothetical. `default.testruns` is in this developer's own
+        // profile root, a dot is not in the allowed set, and the consequence is
+        // that the directory is invisible to `list` as well as untypeable —
+        // consistent, and worth knowing, which is why the case is written down
+        // rather than assumed.
+        let (root, _g) = scratch("agree");
+        for name in ["default", "alt_account-2", "default.testruns", "fdsafdsagfdsgfdgfdgfd"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let listed = offered();
+        assert!(!listed.iter().any(|n| n == "default.testruns"), "a dot is not a usable name: {listed:?}");
+        for name in &listed {
+            assert!(
+                !matches!(check_name(name, &[]), NameCheck::Invalid(_)),
+                "{name} is offered by the list but refused by the create dialog"
+            );
+        }
+    }
+
+    #[test]
     fn nothing_typed_is_not_an_error_and_is_not_creatable_either() {
         let (_root, _g) = scratch("empty");
         assert_eq!(check_name("", &[]), NameCheck::Empty);
@@ -515,17 +538,20 @@ mod tests {
     }
 
     #[test]
-    fn the_chosen_profile_is_offered_even_before_it_has_a_directory() {
-        // The fresh-install case. `ShellConfig` defaults to `default` and
-        // nothing has created it yet, so `profile::list` is empty and a popover
-        // built from that alone would offer no profiles at all while claiming
-        // one was selected.
-        assert_eq!(offered("default", Vec::new()), vec!["default".to_string()]);
-        assert_eq!(
-            offered("default", vec!["alt".to_string()]),
-            vec!["alt".to_string(), "default".to_string()]
-        );
-        // And it must not appear twice once it does exist.
-        assert_eq!(offered("default", vec!["default".to_string()]), vec!["default".to_string()]);
+    fn the_list_offers_no_profile_that_does_not_exist() {
+        // The regression this exists for. A profile is a signed-in session, so
+        // an entry for one that is not on disk is a launcher claiming an account
+        // the user does not have — and the first version of this module did
+        // exactly that, synthesising the chosen profile so that a fresh install
+        // would not show an empty list. An empty list is the correct answer to
+        // an empty profile root.
+        let (root, _g) = scratch("nothing");
+        assert!(offered().is_empty(), "an empty profile root must offer nothing at all");
+
+        // And exactly what is there once something is, in `profile::list`'s own
+        // order, with nothing added on either side.
+        std::fs::create_dir_all(root.join("main")).unwrap();
+        std::fs::create_dir_all(root.join("alt")).unwrap();
+        assert_eq!(offered(), vec!["alt".to_string(), "main".to_string()]);
     }
 }

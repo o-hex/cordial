@@ -52,18 +52,6 @@ impl EntrySource for CordialSource {
     }
 }
 
-/// Nothing to launch. Kept because the `AdwStatusPage` branch below is what a
-/// shell with no entries at all would paint, and losing the only caller of it
-/// would leave that branch unexercised.
-#[allow(dead_code)] // exercised from tests, and by anyone taking an empty-state screenshot by hand
-pub struct EmptySource;
-
-impl EntrySource for EmptySource {
-    fn entries(&self) -> Vec<Entry> {
-        Vec::new()
-    }
-}
-
 /// Builds the chooser: an `AdwStatusPage` when there is nothing to launch,
 /// otherwise an `AdwPreferencesGroup` of action rows, one per entry, clamped
 /// to a readable width rather than stretched edge to edge.
@@ -74,6 +62,11 @@ impl EntrySource for EmptySource {
 pub fn build(source: &dyn EntrySource, on_activate: impl Fn(&str) + Clone + 'static) -> gtk::Widget {
     let entries = source.entries();
 
+    // Reachable from any source that returns nothing, which is what a
+    // plugin-contributed set will be before a plugin host exists. There was an
+    // `EmptySource` here to exercise it, whose comment claimed it was covered by
+    // tests; this file has no tests, so it was an unused stand-in with a comment
+    // that lied about it, and both are gone.
     if entries.is_empty() {
         let status = adw::StatusPage::builder()
             .icon_name("applications-games-symbolic")

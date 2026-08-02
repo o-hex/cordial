@@ -5,6 +5,7 @@ members = [
     "crates/cordial-runtime",
     "crates/cordial-plugins",
     "crates/cordial-shell",
+    "crates/cordial-update",
 ]
 
 [workspace.package]

@@ -24,6 +24,15 @@
 //! A stored "yes, it is installed" goes stale the moment the user deletes the
 //! build or Sober replaces it, and a launcher that then fails with a path
 //! error is worse than one that simply looks again.
+//!
+//! And the extracted engine is **stamped with the APK it came from**. Presence
+//! alone was the whole test until now, which meant a new Roblox build left the
+//! *old* engine in the cache and Cordial ran it against the new APK's assets —
+//! a silent version mismatch, and worse than the cold start the cache exists to
+//! avoid, because nothing about it presents as a caching problem. `justfile`'s
+//! `client` recipe had the same bug and had it fixed; this had not.
+//! [`cordial_update::cache`] owns the stamp and writes the same string that
+//! recipe writes, so the two never make each other re-extract 115 MB.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -183,13 +192,39 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
         }
     }
 
+    // The cache is the only location here whose contents Cordial put there, so
+    // it is the only one it can vouch for — and it only vouches for it against
+    // the APK it was extracted from. An unstamped cache counts as stale, which
+    // re-extracts once for everyone upgrading past this change: 0.6 s, once,
+    // and the right answer for a directory nobody can attribute.
+    //
+    // The stale engine is deliberately *not* deleted first. Extraction writes a
+    // temporary and renames over it, so there is nothing to clear, and deleting
+    // up front would leave a user with no engine at all if the extraction then
+    // failed.
     let cache = engine_cache();
-    if cache.join(LIBRARY).is_file() {
+    let stale = cache.join(LIBRARY).is_file() && !cordial_update::cache::is_current(&cache, &apk);
+    if stale {
+        println!(
+            "  shell: {} was extracted from a different {}; re-extracting",
+            cache.display(),
+            apk.display()
+        );
+    } else if cache.join(LIBRARY).is_file() {
         return Ok(Build { apk, lib_dir: cache });
     }
 
     match extract_engine(&apk, &cache) {
         Ok(from) => {
+            // Stamped only once the engine is on disk. A stamp written first
+            // and an extraction that then failed would claim a cache that is
+            // not there, which is the same class of lie in the other direction.
+            if let Err(e) = cordial_update::cache::write_stamp(&cache, &apk) {
+                // Not fatal: an unstamped cache re-extracts next launch, which
+                // is slow rather than wrong. Said out loud so a cache that
+                // re-extracts every time has an explanation somewhere.
+                println!("  shell: extracted {LIBRARY} but could not stamp the cache: {e}");
+            }
             println!("  shell: extracted {LIBRARY} from {} into {}", from.display(), cache.display());
             Ok(Build { apk, lib_dir: cache })
         }
@@ -337,6 +372,85 @@ mod tests {
             Err(NotFound::Unusable(msg)) => assert!(msg.contains("Settings"), "{msg}"),
             other => panic!("expected a usable message, got {other:?}"),
         }
+    }
+
+    /// An APK-shaped zip whose engine is `engine`.
+    fn apk_holding(engine: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file(LIBRARY_IN_APK, zip::write::SimpleFileOptions::default()).unwrap();
+        w.write_all(engine).unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn a_new_roblox_build_re_extracts_rather_than_running_the_old_engine() {
+        // The defect this fixes, end to end. Presence alone was the whole test,
+        // so a new build left the OLD engine in the cache and Cordial ran it
+        // against the new APK's assets — a version mismatch with nothing in it
+        // that looks like a caching problem. Delete the `is_current` call in
+        // `locate` and the second assertion below fails.
+        //
+        // `XDG_CACHE_HOME` is process-wide, hence the same guard the two
+        // `CORDIAL_APK` tests take.
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(APK_OVERRIDE);
+        let dir = scratch("restamp");
+        let cache_home = dir.join("cache");
+        let previous = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", &cache_home);
+
+        let apk = dir.join("base.apk");
+        std::fs::write(&apk, apk_holding(b"the old engine")).unwrap();
+        let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
+
+        let first = locate(&install).unwrap();
+        assert_eq!(std::fs::read(first.lib_dir.join(LIBRARY)).unwrap(), b"the old engine");
+
+        // A new Roblox build lands at the same path, which is exactly what
+        // Sober updating does.
+        std::fs::write(&apk, apk_holding(b"the new engine, which is longer")).unwrap();
+        let second = locate(&install).unwrap();
+        let got = std::fs::read(second.lib_dir.join(LIBRARY)).unwrap();
+
+        match previous {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        assert_eq!(
+            got, b"the new engine, which is longer",
+            "the cache must follow the APK it was extracted from"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_apk_does_not_re_extract() {
+        // The control for the test above. Re-extracting every launch would be
+        // 115 MB of pointless work and would make the fix indistinguishable
+        // from having no cache at all.
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(APK_OVERRIDE);
+        let dir = scratch("unchanged");
+        let cache_home = dir.join("cache");
+        let previous = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", &cache_home);
+
+        let apk = dir.join("base.apk");
+        std::fs::write(&apk, apk_holding(b"the engine")).unwrap();
+        let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
+
+        let build = locate(&install).unwrap();
+        // Something no extraction would ever produce, so its survival is proof
+        // the second call did not extract.
+        std::fs::write(build.lib_dir.join(LIBRARY), b"left alone").unwrap();
+        let again = locate(&install).unwrap();
+        let got = std::fs::read(again.lib_dir.join(LIBRARY)).unwrap();
+
+        match previous {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        assert_eq!(got, b"left alone", "an unchanged APK must not re-extract");
     }
 
     #[test]

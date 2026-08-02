@@ -302,6 +302,7 @@ dependencies = [
  "cordial-linker-sys",
  "cordial-plugins",
  "cordial-shell",
+ "gtk4",
  "serde_json",
  "ureq",
  "zbus",
@@ -313,11 +314,24 @@ name = "cordial-shell"
 version = "0.3.0"
 dependencies = [
  "cordial-plugins",
+ "cordial-update",
  "gdk4-wayland",
  "gtk4",
  "libadwaita",
  "serde",
  "serde_json",
+ "zip",
+]
+
+[[package]]
+name = "cordial-update"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "ureq",
+ "zbus",
  "zip",
 ]
 

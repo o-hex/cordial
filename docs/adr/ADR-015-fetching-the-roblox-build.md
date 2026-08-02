@@ -36,9 +36,42 @@ tell people to install Sober — a different Roblox client — in order to obtai
 file, and then not use it. That is a dependency on an unrelated project for a
 step Cordial could do itself, and it is the weakest part of getting started.
 
-**Nothing about it is unusual.** Sober fetches the same build from the same
-place, in the open, and has not been troubled for it. The file is free, public,
-unmodified, and useless without a Roblox account.
+**~~Nothing about it is unusual.~~ Sober fetches the same build from the same
+place, in the open, and has not been troubled for it.** This sentence was
+wrong and is left visible rather than deleted, because it was load-bearing in
+the original argument and somebody who read that argument deserves to see what
+happened to it.
+
+Sober does **not** fetch from Roblox. Its own `notice.txt` and `privacy.txt`
+describe connecting to Google Play, through VinegarHQ's servers, which hand
+back a Play download link. VinegarHQ's deployment tracker `custard` — their one
+open-source component that touches Android — asks
+`clientsettings.roblox.com/v2/client-version/` for `WindowsPlayer` and
+`WindowsStudio64` only, and learns the Android version by watching
+`com.roblox.client` on Aptoide, a third-party mirror. The project that would
+most like that endpoint to answer for Android does not ask it.
+
+**Roblox publishes no Android artefact at all.** Measured, with a control:
+
+    setup.rbxcdn.com/DeployHistory.txt          200, 7210 lines, no android/apk
+    setup.rbxcdn.com/android/DeployHistory.txt  403 AccessDenied
+    clientsettingscdn…/client-version/AndroidApp 500
+
+`roblox.com/download` answers 200 and links Google Play and the Amazon Appstore
+for Android — and no file. Three places an artefact would surface, absent from
+all three.
+
+The decision below is unchanged by this, because nothing in it turned on what
+Sober does; the *argument* leaned on Sober and the argument was wrong. What
+changes is the practical consequence: **there is presently nothing to fetch.**
+`Source::official()` is a refusal that names Google Play and the Amazon
+Appstore, so a user learns where the build lives rather than that Cordial is
+broken, and `CORDIAL_ROBLOX_APK_URL` lets them point Cordial at a file they
+obtained themselves. Aptoide is deliberately not wired: it is a third-party
+mirror offering only a hash it supplied itself, which is the weakest form of
+verification available and worse than none, because it looks like verification.
+Google Play is not wired either — it would require the user's Google
+credentials, which this project will not handle.
 
 **A stale client is not a working client.** Roblox refuses old builds
 server-side, so "update" is not a convenience feature. A client that cannot

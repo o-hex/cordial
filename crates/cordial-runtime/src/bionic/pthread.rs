@@ -32,13 +32,13 @@
 //! **The `pthread_cond_t` row used to read 32 against 48, and it was wrong.**
 //! 32 bytes is `pthread_barrier_t`, which is `int64_t __private[4]`;
 //! `pthread_cond_t` is `int32_t __private[12]`, a few declarations further down
-//! the same header, and comes to 48 on LP64 — the same as glibc's. The commit that
-//! introduced this module recorded the overrun as one of three ABI divergences
-//! found, and the measurement above says there was no overrun to find. The
-//! wrapper stays for now: it is harmless either way, since it uses only the
-//! first 16 bytes of the caller's object as a handle, and taking it out changes
-//! what runs at every `pthread_cond_wait` in the engine — a behaviour change
-//! that wants its own measurement rather than a free ride on this one.
+//! the same header, and comes to 48 on LP64 — the same as glibc's. The commit
+//! that introduced this module recorded the overrun as one of three ABI
+//! divergences found, and the measurement above says there was no overrun to
+//! find. The wrapper stays for now: it is harmless either way, since it only
+//! ever writes the first 16 bytes of the caller's object, and taking it out
+//! changes what runs at every `pthread_cond_wait` in the engine — a behaviour
+//! change that wants its own measurement rather than a free ride on this one.
 //!
 //! Initialisation of a wrapper is lazy because bionic's
 //! `PTHREAD_COND_INITIALIZER` is all zeroes, so a statically-initialised

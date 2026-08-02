@@ -1451,6 +1451,48 @@ disabled-by-default mechanism for it in the tree.
   engine" that survived several experiments. Use a flag with an observable
   behavioural effect, and run a control.
 
+**`--lib-dir` without `--host-libc`, and the five pthread symbols**
+
+`pthread_once`, `pthread_key_create`, `pthread_key_delete`,
+`pthread_getspecific` and `pthread_setspecific` are implemented, so nothing
+needs `--host-libc` for them. They are thin forwards to the host's libc, which
+is safe *for these* because the types involved are laid out identically:
+`pthread_once_t` and `pthread_key_t` are both 4 bytes in both libcs and both
+spell `PTHREAD_ONCE_INIT` as 0, measured off this tree's bionic headers rather
+than assumed. Compiling bionic's own `pthread_key.cpp` instead would have been
+worse than the stub it replaced, because it reads thread-specific data out of
+`__get_tls()[TLS_SLOT_BIONIC_TLS]` — bionic's thread structure, and every thread
+in this process belongs to the host's libc, so it would have appeared to work.
+
+**That does not make bare `--lib-dir` a working configuration, and nothing short
+of a real libc shim will.** It stubs 358 libc symbols, `memset`,
+`pthread_mutex_lock` and `newlocale` among them. Measured after the change: the
+load runs further into the engine's static initialisers and ends in SIGSEGV with
+`__cxa_atexit` the last stub reported, where before it exited 1 on the
+fatal-stub guard at `pthread_once`. Which stub it now cannot survive is *not*
+established — `memset` is the obvious guess and the same run disproves it, since
+it called `memset` and carried on through five more first-hit stubs. The fatal
+list in `stubs.rs` is empty as a result. Put a symbol in it when a run shows the
+process dying on that symbol, not because it looks dangerous.
+
+`--host-libc` and `--game-activity` were checked in the same session and are
+unaffected: exit 0 with `=== no stubs were called ===`, and `app ready: Landing`
+with two ZSTD trace stubs in a 10-second run.
+
+**Corrected on the way: `pthread_cond_t` is the same size in both libcs.** The
+commit that introduced `bionic::pthread` recorded "pthread_cond_t is 32 bytes in
+bionic, 48 in glibc" as one of three ABI divergences found, and the module's
+doc-comment table repeated it. It is wrong. 32 bytes is `pthread_barrier_t`,
+`int64_t __private[4]`; `pthread_cond_t` is `int32_t __private[12]` and comes to
+48 on LP64, the same as glibc's. Measured by compiling one probe translation
+unit twice — `char sz_x[sizeof(x)];` per type, sizes read back with `nm -S` —
+once against `third_party/mcpelauncher-linker/bionic/libc/include` at
+`-target x86_64-linux-android`, once against the host's glibc. `sem_t` at 16
+against 32 is a real mismatch and its wrapper is load-bearing; the condition
+variable wrapper is not, and was written for an overrun that could not happen.
+It is left in place because removing it changes what runs at every
+`pthread_cond_wait` in the engine, which wants its own measurement.
+
 ## 5. System time equals user time — and it is almost all the engine's
 
 A 30s run spends about as long in the kernel as in userland (17.3s user, 16.8s

@@ -5,16 +5,30 @@
 # Run Roblox on Linux natively — Plugins, all yours. (Please don't DMCA take down this hobby project)
 
 > [!IMPORTANT]
-> **This project is looking for a maintainer.** Its original author has stepped
-> away, and the honest thing is to say so at the top rather than let anyone
-> discover it after investing a weekend.
+> **This project is dormant and looking for a maintainer.** Its author has
+> stepped back for a while and intends to return to hand it over rather than to
+> resume work on it. Saying so at the top is fairer than letting anyone discover
+> it after investing a weekend.
 >
 > It is not abandoned mid-collapse — it works. You can sign in, stay signed in,
-> load a game, move around, turn the camera and hear sound. What it lacks is
-> somebody to own it. [**docs/HANDOVER.md**](docs/HANDOVER.md) is written for
-> exactly that person: every open thread with what is genuinely known about it,
-> which claims are `INFERRED` and why, and the measurement traps that have
-> already cost people afternoons.
+> load a game, move around, turn the camera and hear sound.
+> [**docs/HANDOVER.md**](docs/HANDOVER.md) is written for whoever takes it on:
+> every open thread with what is genuinely known about it, which claims are
+> `INFERRED` and why, and the measurement traps that have already cost people
+> afternoons.
+>
+> **If you fork this, please open a pull request as well.** Not instead — as
+> well. Run your fork, ship it, do what you like with it; the licence is GPL-3.0
+> and that is the point. But a change that exists only in a fork is a change
+> that has to be archaeology later, and a change that exists as a PR can be
+> merged in ten minutes by whoever picks this up.
+>
+> Pull requests opened during the dormant period **will** be read when a
+> maintainer is assigned. They will sit for a while first, and that is worth
+> knowing before you spend an evening — but they are not going into a void, and
+> the queue is the first thing a new maintainer inherits. Keeping your branch
+> rebased on `main` is the single most useful thing you can do to make that
+> merge cheap.
 >
 > If you want to start smaller, the [good first
 > issues](https://github.com/luohoa97/cordial/labels/good%20first%20issue) are

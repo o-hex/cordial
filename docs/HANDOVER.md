@@ -7,6 +7,28 @@ and that are not obvious from reading the tree.
 Start with [AGENTS.md](../AGENTS.md). It is short, it is the contract, and every
 rule in it was bought with a wasted afternoon.
 
+## If you forked this
+
+Open a pull request too. Not instead — as well.
+
+Forking is fine and the licence exists to make it fine. What costs everybody is
+**divergence**, and divergence is not measured in commits. Ten small fixes
+cherry-pick in an afternoon, because the commit messages here say what was
+measured and are still legible a year later. One fork that restructured a
+subsystem to fix something its own way is not mergeable at all, and at that
+point that fork is the real project and this one is a museum.
+
+So the ask is narrow: whatever you are doing in your fork, also put it up as a
+PR, and keep the branch rebased on `main`. That turns "somebody has to
+reconstruct what you did" into "somebody clicks merge".
+
+The queue will sit for a while. The author has stepped back and intends to come
+back to hand the project over rather than to resume it, so PRs opened now are
+read when that happens rather than next week. That is a real cost to you and it
+is stated plainly rather than dressed up — but the queue is the first thing a
+new maintainer inherits, and a PR in it is worth far more than a commit in a
+fork nobody knows about.
+
 ## Where this stands
 
 Cordial loads Roblox's official Android x86-64 `libroblox.so` natively on Linux

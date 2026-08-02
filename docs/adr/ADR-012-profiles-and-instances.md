@@ -160,6 +160,28 @@ Users wanting encryption at rest should still use full-disk encryption or
 
 ## Consequences
 
+**Demonstrated, 2026-08-02:** two accounts signed in at once, in two windows,
+side by side. Two profiles, two instances, two sessions, each with its own
+cookies, identity, flag overrides and plugin grants. Nobody built this — it is
+what the decision above produces: the `flock` stops one profile being opened
+twice and says nothing at all about opening a *different* one. On Windows the
+same thing has traditionally meant a second desktop session.
+
+Three things follow that the decision did not consider:
+
+- **Cost.** Each instance is a whole engine — around 1.5 GB resident, plus a
+  task-scheduler pool sized to the core count. Two is comfortable on a 16 GB
+  machine; four is not, and this project has already watched that machine swap.
+- **Not tested, only observed.** Nobody has checked what happens when two
+  instances write plugin state concurrently, or whether the *shared* plugin code
+  directory leaks anything between profiles. Installed code is global by
+  design; only grants and settings are per profile.
+- **Describe it as profiles, not as multi-account.** The capability is
+  identical either way, but this project has no arrangement with Roblox and
+  tells contributors to keep test accounts on a separate IP. "Isolated profiles,
+  each with its own session" is what it is; the other phrasing invites a reading
+  the project has been careful not to earn.
+
 **Accepted:** the storage path changes, and existing users have a session under
 `instances/default`. The change must *move* that directory rather than start
 fresh, because a silent reset presents as being logged out for no reason — which

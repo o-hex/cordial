@@ -111,9 +111,12 @@ will be declined.
 | Mouse: turning the camera in an experience | ❌ |
 | Scroll wheel | ❌ `AXIS_VSCROLL`/`AXIS_HSCROLL` are never populated |
 | Keyboard in an experience | ❌ |
-| Staying signed in across a restart | ❌ the engine never writes its cookies to disk, and nothing else does either |
+| Staying signed in across a restart | ✅ cookies and the signed-in identity are restored; `Landing` becomes `Home` |
+| Loading into an experience | ✅ world, avatar and UI render, signed in |
+| **Two accounts at once** | ✅ two profiles, two instances, side by side — see below |
 | Window — libadwaita header bar, engine as a subsurface | ✅ |
 | Launching from the shell | ✅ finds a build, or explains how to get one |
+| Choosing a profile | 🟡 a text field in Settings; a proper switcher is next |
 | Audio | ❌ OpenSL ES reports failure honestly; a PipeWire backend exists but nothing reaches it before sign-in |
 | Web views (Marketplace, Profile, Communities…) | ❌ the surface is mapped; `openNativeOverlay` now reports instead of silently swallowing |
 | Clean shutdown | ✅ full pause/stop/destroy sequence, observed in the engine's own log |
@@ -122,20 +125,30 @@ will be declined.
 Measured with `vkQueuePresentKHR`: 547, 548 and 550 presents over 25 s across
 three runs — it renders continuously rather than on demand.
 
-**The blocker is no longer sign-in, it is input.** Roblox queries
-`android.view.InputDevice` to decide what hardware exists and Cordial does not
-implement it, so the client cannot tell that a keyboard or a mouse is present.
-Sessions are the other half: the engine hands its cookies to the platform and
-never persists them itself, which on Android is the Java side's job and here is
-nobody's, so every launch starts logged out.
+**The blocker is playing, not reaching.** You can sign in, stay signed in, and
+load into an experience — the world, your avatar and the game's UI all render.
+What does not work is controlling it: most keys do nothing, the scroll wheel is
+unwired, and Roblox is never told it may capture the pointer, so first-person
+cameras are unusable. Why keys mostly fail is genuinely not yet known; four
+plausible explanations have been measured and disproved, and the instrument that
+would settle it was itself silent when the native is unregistered.
+
+**Two accounts at once, and it was not built as a feature.** A profile is
+storage and an instance is a window ([ADR-012](docs/adr/ADR-012-profiles-and-instances.md)),
+with an `flock` so one profile cannot be opened twice — which leaves nothing
+stopping two *different* profiles running side by side, each with its own
+session, settings and plugin grants. On Windows this traditionally needed a
+second desktop session. Each instance is a whole engine, so budget around 1.5 GB
+of memory apiece.
 
 **Do not install this expecting to play Roblox.** Install it if you want to work
 on it.
 
 ## Install
 
-> Cordial is **not** ready to play Roblox on. Install it if you want to work on
-> it, or to watch it come up. You cannot sign in yet.
+> Cordial is **not** ready to play Roblox on. You can sign in and load into an
+> experience, but you cannot usefully control it yet — see the status table.
+> Install it if you want to work on it.
 
 ### 1. What you need
 

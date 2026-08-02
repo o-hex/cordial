@@ -31,19 +31,33 @@ use crate::shell_config;
 /// `/app/bin/cordial-shell` beside `/app/bin/cordial-run` in the package.
 const LOADER: &str = "cordial-run";
 
-/// How long the client is allowed to run.
+/// How long the client is allowed to run. **Zero means no timer.**
 ///
-/// `cordial-run` has no run-until-the-window-closes mode: `--run` is a hard
-/// timer and the looper pumps until it expires, so some number has to be
-/// chosen here. A day is far past any real session and well short of "never",
-/// which matters because the profile claim is released when this process exits
-/// — a client left running forever is a profile that can never be opened again
-/// without finding and killing it.
+/// This was 86400 — a day — and the comment here used to explain why, ending
+/// "closing the engine's window does not end the process today. Until
+/// `cordial-run` grows a close path, quitting means the timer or the task
+/// manager." It has grown one, so the timer goes.
 ///
-/// The consequence worth knowing, and it is a real one: closing the engine's
-/// window does not end the process today. Until `cordial-run` grows a close
-/// path, quitting means the timer or the task manager.
-const DEFAULT_RUN_SECONDS: u64 = 86_400;
+/// The day was never a session length. It was a backstop against a client
+/// outliving its window and keeping a profile nobody could reopen, and it did
+/// not even work: the launcher quitting is the *ordinary* case under ADR-012,
+/// so a closed window routinely left a client reparented to `systemd --user`
+/// holding a profile for the rest of the day. That happened on this
+/// developer's machine — a client 31 minutes into 86400 seconds with nothing
+/// on screen to close, and no launch possible until it was killed by hand.
+///
+/// A timer was the wrong shape for the problem. Somebody playing for an
+/// afternoon should not be interrupted, and somebody who closed the window an
+/// hour ago should not still be holding the profile; one number cannot satisfy
+/// both. `cordial-run` now ends on its window closing, on `SIGTERM` and
+/// `SIGINT`, and on `--run` when one is passed — three entry points into one
+/// shutdown, and the `flock` is released by the process exiting however it
+/// exits.
+///
+/// `--run` is unchanged and still the backstop for headless runs, CI, and
+/// agents, where a client that never ends is exactly the hazard above. It is
+/// opt-in now rather than the default.
+const DEFAULT_RUN_SECONDS: u64 = 0;
 
 /// Where `cordial-run` is.
 ///
@@ -345,6 +359,18 @@ mod tests {
         assert!(line.contains("--lib-dir /home/a/.cache/cordial/lib/x86_64"), "{line}");
         assert!(line.contains("--apk /home/a/base.apk"), "{line}");
         assert!(line.contains("--run 600"), "{line}");
+    }
+
+    #[test]
+    fn a_launch_from_the_shell_carries_no_timer() {
+        // The whole point of the close path, pinned where a well-meaning
+        // change would undo it. Somebody looking at `--run 0` without the
+        // history sees a placeholder and puts a "sensible" number back; what
+        // they would actually be restoring is a session that ends mid-game and
+        // a client that outlives its window, which is what a day of timer
+        // produced here for months. `cordial-run` reads zero as no timer and
+        // ends on the window closing, on SIGTERM and on SIGINT instead.
+        assert_eq!(DEFAULT_RUN_SECONDS, 0, "the launcher must not impose a session length");
     }
 
     #[test]

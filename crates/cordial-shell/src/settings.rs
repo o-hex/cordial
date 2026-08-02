@@ -167,7 +167,7 @@ fn build_appearance_page(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathB
 /// A settings window that accepts a choice and silently fails to keep it is the
 /// worst of the three possible behaviours, because the user finds out one
 /// launch later and blames the launch.
-fn persist(config: &Rc<RefCell<ShellConfig>>, path: &Rc<PathBuf>) {
+pub fn persist(config: &Rc<RefCell<ShellConfig>>, path: &Rc<PathBuf>) {
     if let Err(e) = shell_config::save(path, &config.borrow()) {
         eprintln!("shell: could not save {}: {e}", path.display());
     }
@@ -211,7 +211,7 @@ fn path_row(
     row
 }
 
-/// "Roblox" — where the build is, and which profile an instance runs.
+/// "Roblox" — where the build is.
 ///
 /// The whole reason `cordial-shell` could not launch anything: nothing
 /// persisted where a Roblox build lived, so the only route to a running client
@@ -308,44 +308,12 @@ fn build_roblox_page(
     group.add(&lib_row);
     page.add(&group);
 
-    let profiles = adw::PreferencesGroup::builder()
-        .title("Profile")
-        .description(
-            "One account's Roblox storage: its session, its settings, its logs. A profile is \
-             held by one window at a time, so launching a second one against the same profile \
-             is refused rather than allowed to corrupt it (ADR-012).",
-        )
-        .build();
-
-    let row = adw::EntryRow::builder().title("Profile").text(config.borrow().profile.clone()).build();
-    let existing = cordial_shell::profile::list();
-    if !existing.is_empty() {
-        // Not a combo box: a text entry is also how a *new* profile is made,
-        // and a switcher that cannot create one leaves the only route to a
-        // second account outside the interface.
-        row.set_tooltip_text(Some(&format!("Profiles that exist: {}", existing.join(", "))));
-    }
-    {
-        let config = config.clone();
-        let config_path = config_path.clone();
-        row.connect_changed(move |row| {
-            let name = row.text().to_string();
-            // Invalid names are refused at the point of typing rather than at
-            // the point of launching, because `profile::dir` refuses anything
-            // that could escape the profile root and a launch is a long way
-            // from the field that caused it.
-            if cordial_shell::profile::is_valid_name(&name) {
-                row.remove_css_class("error");
-                config.borrow_mut().profile = name;
-                persist(&config, &config_path);
-            } else {
-                row.add_css_class("error");
-            }
-        });
-    }
-    profiles.add(&row);
-    page.add(&profiles);
-
+    // The profile used to be a third row here, a text entry, and it is
+    // deliberately not replaced by anything. It lives in the header bar now —
+    // see `profile_switcher.rs` — because choosing one is a thing done on the
+    // way to launching rather than a setting to go and find, and because two
+    // controls writing `ShellConfig.profile` would be two things to keep
+    // agreeing with each other.
     page
 }
 

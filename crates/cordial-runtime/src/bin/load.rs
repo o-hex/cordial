@@ -69,6 +69,10 @@ env:
                                      CORDIAL_FULLSCREEN overrides it
   CORDIAL_DPI_SCALE=<f>              UI density Roblox lays out against.
                                      1.0 is a low-density phone; try 1.5-2
+  CORDIAL_WHEEL_SCALE=<f>            scroll wheel detents per notch (default 1);
+                                     negative inverts the direction
+  CORDIAL_TRACE_WHEEL=1              log every wheel event and the arguments
+                                     nativePassMouseWheel received
   CORDIAL_SIGNIN_PROBE=1             ask the engine whether login is Lua-rendered
   CORDIAL_NO_VULKAN=1                make the host look like it has no Vulkan
                                      loader, forcing the GLES2/EGL fallback
@@ -1155,6 +1159,9 @@ fn main() -> ExitCode {
                                             let bt = lib.symbol(
                                                 "Java_com_roblox_engine_jni_NativeInputInterface_nativePassMouseButton",
                                             ).unwrap_or(std::ptr::null_mut());
+                                            let wh = lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeInputInterface_nativePassMouseWheel",
+                                            ).unwrap_or(std::ptr::null_mut());
                                             let ke = lib.symbol(
                                                 "Java_com_roblox_engine_jni_NativeGLInterface_nativePassKeyEvent",
                                             ).unwrap_or(std::ptr::null_mut());
@@ -1167,10 +1174,23 @@ fn main() -> ExitCode {
                                             let uk = lib.symbol(
                                                 "Java_com_roblox_engine_jni_NativeGLInterface_updateKeyboardSize",
                                             ).unwrap_or(std::ptr::null_mut());
-                                            cordial_runtime::android::input::set_input_natives(mv, bt, ke, tx, sy, uk);
+                                            cordial_runtime::android::input::set_input_natives(mv, bt, wh, ke, tx, sy, uk);
                                             if mv.is_null() || bt.is_null() {
                                                 println!("  input: NativeInputInterface not fully exported; UI input will not work");
                                             }
+                                            // Named separately from the pair
+                                            // above, because a build that
+                                            // exports move and button but not
+                                            // wheel has a working pointer and a
+                                            // dead scroll wheel — which is
+                                            // exactly the report this line was
+                                            // added chasing, and "UI input will
+                                            // not work" would be the wrong
+                                            // thing to print for it.
+                                            println!(
+                                                "  input: nativePassMouseWheel {}",
+                                                if wh.is_null() { "NOT exported; the scroll wheel will do nothing" } else { "resolved" }
+                                            );
                                         }
 
                                         // A read-only probe of the engine's own

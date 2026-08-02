@@ -751,15 +751,33 @@ use super::input::{
 };
 
 /// X11 numbers buttons 1/2/3 as left/middle/right; Android's bit assignment
-/// puts secondary (right) before tertiary (middle). Buttons 4/5 are X11's
-/// representation of the scroll wheel as button clicks — Android instead wants
-/// `ACTION_SCROLL` with an axis value, which this does not yet synthesise (see
-/// the report), so they are dropped rather than delivered as wrong clicks.
+/// puts secondary (right) before tertiary (middle). Buttons 4-7 are the wheel
+/// and are handled by [`x11_button_to_wheel`] instead — they must not fall
+/// through to here, because delivering a scroll as some button press is worse
+/// than dropping it.
 fn x11_button_to_android(button: c_uint) -> Option<i32> {
     match button {
         1 => Some(BUTTON_PRIMARY),
         2 => Some(BUTTON_TERTIARY),
         3 => Some(BUTTON_SECONDARY),
+        _ => None,
+    }
+}
+
+/// X11's representation of the wheel: four pseudo-buttons, one press-and-release
+/// pair per detent, in the order up/down/left/right.
+///
+/// Returns `(hscroll, vscroll)` in detents with Android's signs — positive
+/// away from the user, positive to the right — which is the unit
+/// [`super::input::wheel`] takes. One notch is exactly one here, with no
+/// conversion to guess at, which is the one thing X11 does better than
+/// `wl_pointer.axis`.
+fn x11_button_to_wheel(button: c_uint) -> Option<(f32, f32)> {
+    match button {
+        4 => Some((0.0, 1.0)),
+        5 => Some((0.0, -1.0)),
+        6 => Some((-1.0, 0.0)),
+        7 => Some((1.0, 0.0)),
         _ => None,
     }
 }
@@ -796,6 +814,17 @@ impl HostWindow {
     }
 
     fn dispatch_button(&self, handle: i64, ev: &XInputEvent, press: bool) {
+        // The wheel first. X11 sends a press *and* a release for every detent,
+        // and a wheel has no "released" state to report — sending both would
+        // scroll twice per notch, so the release half is discarded here rather
+        // than by the engine.
+        if let Some((hscroll, vscroll)) = x11_button_to_wheel(ev.detail) {
+            if press {
+                let now = self.now_ms();
+                super::input::wheel(handle, ev.x as f32, ev.y as f32, hscroll, vscroll, now);
+            }
+            return;
+        }
         let Some(android_button) = x11_button_to_android(ev.detail) else {
             return;
         };
@@ -1274,6 +1303,27 @@ mod tests {
         assert!(!is_final_expose(3));
         assert!(!is_final_expose(1));
         assert!(is_final_expose(0));
+    }
+
+    #[test]
+    fn the_wheel_pseudo_buttons_are_not_clicks() {
+        // X11 has no wheel; it has buttons 4-7. Letting them fall through to
+        // `x11_button_to_android` is how a scroll would arrive as some button
+        // press, and the two tables have to stay disjoint for that not to
+        // happen — hence both assertions, not just the wheel one.
+        for b in 4..=7 {
+            assert!(x11_button_to_wheel(b).is_some(), "button {b} is the wheel");
+            assert!(x11_button_to_android(b).is_none(), "button {b} must not also be a click");
+        }
+        for b in 1..=3 {
+            assert!(x11_button_to_wheel(b).is_none(), "button {b} is a click, not the wheel");
+        }
+        // Up is positive, matching MotionEvent.AXIS_VSCROLL, and one X11
+        // pseudo-button is exactly one detent — no conversion to get wrong.
+        assert_eq!(x11_button_to_wheel(4), Some((0.0, 1.0)));
+        assert_eq!(x11_button_to_wheel(5), Some((0.0, -1.0)));
+        assert_eq!(x11_button_to_wheel(6), Some((-1.0, 0.0)));
+        assert_eq!(x11_button_to_wheel(7), Some((1.0, 0.0)));
     }
 
     #[test]

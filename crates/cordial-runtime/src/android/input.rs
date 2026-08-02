@@ -53,6 +53,10 @@ pub const ACTION_MOVE: i32 = 2;
 pub const ACTION_HOVER_MOVE: i32 = 7;
 pub const ACTION_BUTTON_PRESS: i32 = 11;
 pub const ACTION_BUTTON_RELEASE: i32 = 12;
+/// `ACTION_SCROLL`. Not delivered by [`deliver_touch`] — a scroll carries no
+/// button state and no gesture start, so it has its own call; see
+/// [`deliver_scroll`].
+pub const ACTION_SCROLL: i32 = 8;
 
 // `android.view.KeyEvent.META_*`.
 pub const META_SHIFT_ON: i32 = 1;
@@ -112,6 +116,62 @@ pub fn keysym_to_android(keysym: c_ulong) -> Option<i32> {
     })
 }
 
+/// Say that a native the input path wanted is not there — at the first drop,
+/// and then at each power of ten.
+///
+/// "Not there" covers both ways it happens: an AGDK native that
+/// `initializeNativeCode` has not put in the natives table, and a
+/// `NativeInputInterface`/`NativeGLInterface` export the loader could not
+/// resolve. Both end the same way, with an input event going nowhere.
+///
+/// `Ok(None)` used to be silent everywhere in this file, on the grounds that a
+/// call arriving before `initializeNativeCode` has finished is a normal startup
+/// race. The cost of that silence was measured the hard way: a session run with
+/// `CORDIAL_ANDROID_TRACE=1`, pressing keys in an experience, printed no
+/// `onKeyDownNative` line at all — and "the trace said nothing" and "the engine
+/// never received the key" were the same observation, with no way to tell them
+/// apart without changing the code first.
+///
+/// Not once, and not per event. Once is indistinguishable from a startup race;
+/// per event would bury the log under one line per keystroke. At decade
+/// boundaries a race prints a single line and a native that never registers
+/// keeps coming back, which is the distinction that was missing.
+///
+/// Deliberately not behind `CORDIAL_ANDROID_TRACE`: input being dropped on the
+/// floor is not tracing, and the one run where it mattered had the flag on and
+/// still learned nothing.
+pub(crate) fn report_unregistered(name: &'static str) {
+    static DROPPED: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+    let n = {
+        let mut seen = DROPPED.lock().unwrap_or_else(|e| e.into_inner());
+        match seen.iter_mut().find(|(k, _)| *k == name) {
+            Some((_, count)) => {
+                *count += 1;
+                *count
+            }
+            None => {
+                seen.push((name, 1));
+                1
+            }
+        }
+    };
+    let decade = {
+        let mut d = 1u64;
+        while d < n {
+            d = d.saturating_mul(10);
+        }
+        d == n
+    };
+    if decade {
+        eprintln!(
+            "[android] {name} is not registered in the natives table (or was not \
+             resolved at load); {n} input event(s) dropped so far, reported at \
+             each power of ten. A single line early in startup is the normal \
+             race against initializeNativeCode; a line that keeps returning is not."
+        );
+    }
+}
+
 /// Deliver one AGDK touch event, the same `MotionEvent` synthesis both
 /// backends drive their pointer input through.
 #[allow(clippy::too_many_arguments)]
@@ -141,10 +201,25 @@ pub fn deliver_touch(
         Ok(Some(consumed)) => {
             super::trace(format_args!("onTouchEventNative(action={action}) -> {consumed}"))
         }
-        // Not registered yet — a normal race against initializeNativeCode
-        // early in startup.
-        Ok(None) => {}
+        Ok(None) => report_unregistered("onTouchEventNative"),
         Err(e) => super::trace(format_args!("onTouchEventNative(action={action}) failed: {e}")),
+    }
+}
+
+/// Deliver one AGDK wheel event as `ACTION_SCROLL` with the scroll axes filled.
+///
+/// Private, and reached only through [`wheel`], so that the sign and scale
+/// policy cannot be applied to one of the two wheel paths and not the other.
+fn deliver_scroll(handle: i64, x: f32, y: f32, hscroll: f32, vscroll: f32, event_time_ms: i64) {
+    if no_agdk_touch() {
+        return;
+    }
+    match cordial_linker_sys::game_activity::scroll(handle, x, y, hscroll, vscroll, event_time_ms) {
+        Ok(Some(consumed)) => super::trace(format_args!(
+            "onTouchEventNative(ACTION_SCROLL h={hscroll} v={vscroll}) -> {consumed}"
+        )),
+        Ok(None) => report_unregistered("onTouchEventNative"),
+        Err(e) => super::trace(format_args!("onTouchEventNative(ACTION_SCROLL) failed: {e}")),
     }
 }
 
@@ -175,7 +250,7 @@ pub fn deliver_key(
             super::trace(format_args!("onKey{}Native(code={key_code}) -> {consumed}",
                 if down { "Down" } else { "Up" }))
         }
-        Ok(None) => {}
+        Ok(None) => report_unregistered(if down { "onKeyDownNative" } else { "onKeyUpNative" }),
         Err(e) => super::trace(format_args!(
             "onKey{}Native(code={key_code}) failed: {e}",
             if down { "Down" } else { "Up" }
@@ -186,7 +261,7 @@ pub fn deliver_key(
 pub fn deliver_surface_redraw(handle: i64) {
     match cordial_linker_sys::game_activity::surface_redraw_needed(handle) {
         Ok(Some(())) => super::trace(format_args!("onSurfaceRedrawNeededNative")),
-        Ok(None) => {}
+        Ok(None) => report_unregistered("onSurfaceRedrawNeededNative"),
         Err(e) => super::trace(format_args!("onSurfaceRedrawNeededNative failed: {e}")),
     }
 }
@@ -203,6 +278,8 @@ static PASS_MOUSE_MOVE: std::sync::atomic::AtomicPtr<c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static PASS_MOUSE_BUTTON: std::sync::atomic::AtomicPtr<c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static PASS_MOUSE_WHEEL: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static PASS_KEY_EVENT: std::sync::atomic::AtomicPtr<c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static PASS_TEXT: std::sync::atomic::AtomicPtr<c_void> =
@@ -217,9 +294,11 @@ static UPDATE_KEYBOARD_SIZE: std::sync::atomic::AtomicPtr<c_void> =
 /// Focus generation the keyboard state was last reported for.
 static KEYBOARD_REPORTED: Mutex<Option<u32>> = Mutex::new(None);
 
+#[allow(clippy::too_many_arguments)]
 pub fn set_input_natives(
     mouse_move: *mut c_void,
     mouse_button: *mut c_void,
+    mouse_wheel: *mut c_void,
     key_event: *mut c_void,
     pass_text: *mut c_void,
     sync_textbox: *mut c_void,
@@ -227,6 +306,7 @@ pub fn set_input_natives(
 ) {
     PASS_MOUSE_MOVE.store(mouse_move, std::sync::atomic::Ordering::Relaxed);
     PASS_MOUSE_BUTTON.store(mouse_button, std::sync::atomic::Ordering::Relaxed);
+    PASS_MOUSE_WHEEL.store(mouse_wheel, std::sync::atomic::Ordering::Relaxed);
     PASS_KEY_EVENT.store(key_event, std::sync::atomic::Ordering::Relaxed);
     PASS_TEXT.store(pass_text, std::sync::atomic::Ordering::Relaxed);
     SYNC_TEXTBOX.store(sync_textbox, std::sync::atomic::Ordering::Relaxed);
@@ -286,11 +366,32 @@ pub fn report_keyboard_state(current_geometry: (i32, i32)) {
     }
 }
 
+/// `NativeGLInterface.nativePassKeyEvent(Z down, I keyCode, I modifiers, Z isRepeat)`.
+///
+/// Traced, because it had never once been observed. Every keyboard
+/// investigation here has read `onKeyDownNative` lines, and this is the *other*
+/// path a keystroke takes — the one the interface actually reads, by the same
+/// argument that made `nativePassMouseButton` rather than `onTouchEventNative`
+/// the thing that moves the UI. A path with no instrumentation cannot be ruled
+/// in or out, and both were being ruled on from the same silence.
+///
+/// `key_code` is an `android.view.KeyEvent.KEYCODE_*`, produced by
+/// [`keysym_to_android`]. It is emphatically *not* an evdev code, and the trace
+/// prints it so that a run can say which of the two the engine is being handed
+/// rather than a reader having to trust the call chain. The two numbering
+/// schemes agree at exactly one letter — evdev `KEY_D` and `AKEYCODE_D` are
+/// both 32 — so "only D works" is the signature of a raw evdev code reaching
+/// something that wanted an Android one, and one traced keystroke settles it.
 pub fn pass_key_event(down: bool, key_code: i32, modifiers: i32) {
     let f = PASS_KEY_EVENT.load(std::sync::atomic::Ordering::Relaxed);
-    if !f.is_null() {
-        let _ = cordial_linker_sys::game_activity::pass_key_event(f, down, key_code, modifiers, false);
+    if f.is_null() {
+        report_unregistered("nativePassKeyEvent");
+        return;
     }
+    let r = cordial_linker_sys::game_activity::pass_key_event(f, down, key_code, modifiers, false);
+    super::trace(format_args!(
+        "nativePassKeyEvent(down={down}, keyCode={key_code}, modifiers={modifiers:#x}) -> {r:?}"
+    ));
 }
 
 pub fn pass_text(which: i64, text: &str, cursor: i32) {
@@ -395,9 +496,11 @@ fn mouse_delta(x: f32, y: f32) -> (f32, f32) {
 pub fn pass_mouse_move(x: f32, y: f32) {
     let (dx, dy) = mouse_delta(x, y);
     let f = PASS_MOUSE_MOVE.load(std::sync::atomic::Ordering::Relaxed);
-    if !f.is_null() {
-        let _ = cordial_linker_sys::game_activity::pass_mouse_move(f, x, y, dx, dy);
+    if f.is_null() {
+        report_unregistered("nativePassMouseMove");
+        return;
     }
+    let _ = cordial_linker_sys::game_activity::pass_mouse_move(f, x, y, dx, dy);
 }
 
 /// `nativePassMouseButton(F x, F y, Z down, I button)`.
@@ -411,10 +514,94 @@ pub fn pass_mouse_move(x: f32, y: f32) {
 /// well the rest of the path works.
 pub fn pass_mouse_button(x: f32, y: f32, down: bool, android_button: i32) {
     let f = PASS_MOUSE_BUTTON.load(std::sync::atomic::Ordering::Relaxed);
-    if !f.is_null() {
-        let button = roblox_mouse_button(android_button);
-        let _ = cordial_linker_sys::game_activity::pass_mouse_button(f, x, y, down, button);
+    if f.is_null() {
+        report_unregistered("nativePassMouseButton");
+        return;
     }
+    let button = roblox_mouse_button(android_button);
+    let _ = cordial_linker_sys::game_activity::pass_mouse_button(f, x, y, down, button);
+}
+
+/// One wheel movement, through both input paths, in detents.
+///
+/// This is what both backends call, and it is the whole of the scroll wheel:
+/// `nativePassMouseWheel` is a real export that Cordial had never called once,
+/// which is why scrolling did nothing anywhere in the client. X11 dropped
+/// buttons 4-7 on the floor and Wayland's `wl_pointer.axis` handler was an
+/// empty function.
+///
+/// **The unit is the detent** — one notch of a mouse wheel is 1.0 — because
+/// that is the one unit both backends can produce honestly. X11 gives it for
+/// free (button 4 *is* one notch); Wayland reports a distance instead and
+/// `wayland.rs` converts. `MotionEvent.AXIS_VSCROLL` is documented in the same
+/// unit, and Roblox's own `MouseWheel` input reports ±1 per notch, so it is
+/// also the likeliest thing the third float wants.
+///
+/// Sign: positive is away from the user, and positive horizontal is to the
+/// right, which is what Android documents for the two scroll axes. Whether
+/// Roblox agrees is `INFERRED` — nothing readable declares it, and it is one
+/// scroll for a human to settle. `CORDIAL_WHEEL_SCALE` is that experiment
+/// without a rebuild: it multiplies both axes, so `-1` inverts and `3` makes
+/// each notch scroll three.
+///
+/// `nativePassMouseWheel` takes one float, not two, so horizontal scroll
+/// reaches only the AGDK path. `nativePassMousePan(FFFF)` is the plausible
+/// home for it and is not driven here, because "plausible" is how this file
+/// acquires bugs that take a session to find.
+pub fn wheel(handle: i64, x: f32, y: f32, hscroll: f32, vscroll: f32, event_time_ms: i64) {
+    let scale = wheel_scale();
+    let (h, v) = (hscroll * scale, vscroll * scale);
+    if handle != 0 {
+        deliver_scroll(handle, x, y, h, v, event_time_ms);
+    }
+    let f = PASS_MOUSE_WHEEL.load(std::sync::atomic::Ordering::Relaxed);
+    if f.is_null() {
+        report_unregistered("nativePassMouseWheel");
+    }
+    let passed = (!f.is_null()).then(|| cordial_linker_sys::game_activity::pass_mouse_wheel(f, x, y, v));
+    if trace_wheel() {
+        // The arguments as the engine receives them, and what the call
+        // answered. Which of the two paths ran matters as much as the numbers:
+        // "the wheel does nothing" has two quite different causes, and this
+        // line tells them apart without a debugger.
+        eprintln!(
+            "[cordial] nativePassMouseWheel(x={x}, y={y}, delta={v}) -> {passed:?}; \
+             AGDK ACTION_SCROLL h={h} v={v} handle={handle}"
+        );
+    }
+}
+
+/// `CORDIAL_WHEEL_SCALE=<f>`, applied to both scroll axes. Negative inverts.
+///
+/// A knob rather than a constant because neither the sign nor the size of a
+/// notch is declared anywhere Cordial can read, and both are a single scroll
+/// for a human to check. Rejected values fall back to 1.0 loudly: a silently
+/// ignored scale reads as "the wheel still does not work".
+fn wheel_scale() -> f32 {
+    static SCALE: OnceLock<f32> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        let Some(v) = std::env::var_os("CORDIAL_WHEEL_SCALE") else {
+            return 1.0;
+        };
+        match v.to_string_lossy().trim().parse::<f32>() {
+            Ok(f) if f.is_finite() && f != 0.0 => f,
+            _ => {
+                eprintln!(
+                    "[cordial] CORDIAL_WHEEL_SCALE={} is not a non-zero number; using 1.0",
+                    v.to_string_lossy()
+                );
+                1.0
+            }
+        }
+    })
+}
+
+/// `CORDIAL_TRACE_WHEEL=1`. Its own switch for the same reason
+/// `CORDIAL_TRACE_TEXT` has one: the question is what Cordial *sent*, and the
+/// general trace is documented as ABI-unsafe and aborts the engine.
+pub fn trace_wheel() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_TRACE_WHEEL").is_some())
 }
 
 /// `CORDIAL_TRACE_TEXT=1`. Text entry is the one path where the interesting

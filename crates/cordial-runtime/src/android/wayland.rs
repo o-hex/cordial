@@ -1331,7 +1331,53 @@ impl WaylandWindow {
         // path, and a right-button drag is how a mouse turns the camera.
         super::input::pass_mouse_button(x, y, press, android_button);
     }
+
+    /// One `wl_pointer.axis` event, converted to detents and handed to the
+    /// shared wheel path.
+    fn dispatch_pointer_axis(&self, axis: u32, value: f32) {
+        let Some((hscroll, vscroll)) = axis_to_notches(axis, value) else {
+            return;
+        };
+        let (x, y) = *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = self.active_handle.load(Ordering::Relaxed);
+        super::input::wheel(handle, x, y, hscroll, vscroll, self.now_ms());
+    }
 }
+
+/// `wl_pointer.axis`'s (axis, distance) as `(hscroll, vscroll)` in detents with
+/// Android's signs, or `None` for an axis this does not know.
+///
+/// Wayland's positive is down and to the right; Android's two scroll axes are
+/// positive *up* and to the right, so the vertical one is negated and the
+/// horizontal one is not. Getting that backwards is the "scrolling goes the
+/// wrong way" report, which is why the sign lives in its own tested function
+/// rather than inline in an event handler no test can reach.
+fn axis_to_notches(axis: u32, value: f32) -> Option<(f32, f32)> {
+    const AXIS_VERTICAL_SCROLL: u32 = 0;
+    const AXIS_HORIZONTAL_SCROLL: u32 = 1;
+    let notches = value / WHEEL_AXIS_STEP;
+    match axis {
+        AXIS_VERTICAL_SCROLL => Some((0.0, -notches)),
+        AXIS_HORIZONTAL_SCROLL => Some((notches, 0.0)),
+        _ => None,
+    }
+}
+
+/// How much `wl_pointer.axis` reports for one detent of a mouse wheel.
+///
+/// `INFERRED`, and the one number on the Wayland scroll path that is not read
+/// off the wire. `wl_pointer.axis` carries a distance in surface coordinates;
+/// the events that carry a *count* — `axis_discrete` (version 5) and
+/// `axis_value120` (version 8) — never arrive here, because `wl_seat` is bound
+/// at version 1 (see the `bind` call) and a child object's version is its
+/// parent's. Raising that would make this exact, and would also change what
+/// `wl_keyboard` sends, which is a separate change with its own testing.
+///
+/// 10.0 is what mutter and Weston both use as their axis step for a discrete
+/// wheel click. A compositor that disagrees makes every notch scroll by the
+/// wrong amount but still in the right direction, and `CORDIAL_WHEEL_SCALE`
+/// corrects it without a rebuild.
+const WHEEL_AXIS_STEP: f32 = 10.0;
 
 /// Whether the pointer is currently over the engine's canvas rather than over
 /// the rest of the window.
@@ -1397,13 +1443,21 @@ unsafe extern "C" fn pointer_button(
     let Some(android_button) = linux_button_to_android(button) else { return };
     w.dispatch_pointer_button(android_button, state == 1);
 }
-/// Scroll: not synthesised, the same gap `window.rs` documents for X11's
-/// button 4/5 — Android wants `ACTION_SCROLL` with an axis value, which
-/// nothing on either backend constructs yet.
-unsafe extern "C" fn pointer_axis(_data: *mut c_void, _pointer: *mut c_void, _time: u32, _axis: u32, _value: i32) {}
+/// The scroll wheel. Filtered by surface like every other pointer event: the
+/// header bar is GTK's, and a scroll over it is not the engine's to see.
+unsafe extern "C" fn pointer_axis(_data: *mut c_void, _pointer: *mut c_void, _time: u32, axis: u32, value: i32) {
+    if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(w) = current() {
+        w.dispatch_pointer_axis(axis, fixed_to_f32(value));
+    }
+}
 // `frame`/`axis_source`/`axis_stop`/`axis_discrete`/`axis_value120`/
 // `axis_relative_direction` — see `PointerListener`'s own comment for why
-// these slots must exist even though scroll is not implemented at all yet.
+// these slots must exist. They stay empty even now that scroll works: none of
+// them is delivered to a version 1 `wl_pointer`, so an implementation here
+// could never be tested and would be a claim rather than a result.
 unsafe extern "C" fn pointer_frame(_data: *mut c_void, _pointer: *mut c_void) {}
 unsafe extern "C" fn pointer_axis_source(_data: *mut c_void, _pointer: *mut c_void, _axis_source: u32) {}
 unsafe extern "C" fn pointer_axis_stop(_data: *mut c_void, _pointer: *mut c_void, _time: u32, _axis: u32) {}
@@ -2480,6 +2534,23 @@ mod tests {
             TEXT_INPUT_EVENTS.len() * std::mem::size_of::<*const c_void>(),
             "TextInputListener must be exactly one function pointer per declared event"
         );
+    }
+
+    #[test]
+    fn scrolling_down_reports_a_negative_vertical_notch() {
+        // Wayland's positive is down; Android's AXIS_VSCROLL positive is away
+        // from the user. A sign error here is not subtle to a person — the page
+        // goes the wrong way — but it is invisible to a build, so it is pinned.
+        let (h, v) = axis_to_notches(0, WHEEL_AXIS_STEP).expect("vertical axis is known");
+        assert_eq!((h, v), (0.0, -1.0));
+        let (h, v) = axis_to_notches(0, -WHEEL_AXIS_STEP).expect("vertical axis is known");
+        assert_eq!((h, v), (0.0, 1.0));
+        // Horizontal keeps Wayland's sign, because both call right positive.
+        let (h, v) = axis_to_notches(1, WHEEL_AXIS_STEP).expect("horizontal axis is known");
+        assert_eq!((h, v), (1.0, 0.0));
+        // A third axis is not a thing `wl_pointer` has; inventing a meaning for
+        // one would scroll on an event that said nothing about scrolling.
+        assert!(axis_to_notches(2, WHEEL_AXIS_STEP).is_none());
     }
 
     /// A `zwp_text_input_v3` is created by the manager and therefore *is*

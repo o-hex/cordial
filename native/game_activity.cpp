@@ -189,6 +189,12 @@ public:
     // isTouchDevice, because claiming to be a mouse in one place and a finger in
     // another is the kind of inconsistency an input stack is entitled to reject.
     jint toolType = cordial::input_is_touch() ? 1 : 3;
+    // The wheel, in detents: +1 is one notch away from the user (or one notch
+    // to the right), matching what `android.view.MotionEvent` documents for
+    // AXIS_VSCROLL/AXIS_HSCROLL. Zero on every event that is not ACTION_SCROLL,
+    // which is all of them except the ones `cordial_game_activity_scroll`
+    // makes.
+    jfloat vscroll = 0.0f, hscroll = 0.0f;
 
     jint getPointerId(ENV*, jint) { return 0; }
     jint getToolType(ENV*, jint) { return toolType; }
@@ -196,11 +202,20 @@ public:
     jfloat getRawY(ENV*, jint) { return y; }
     jfloat getXPrecision(ENV*) { return 1.0f; }
     jfloat getYPrecision(ENV*) { return 1.0f; }
-    // AMOTION_EVENT_AXIS_X = 0, AMOTION_EVENT_AXIS_Y = 1 — the only two axes
-    // AGDK enables by default (GameActivityEvents.cpp's `enabledAxes`).
+    // AMOTION_EVENT_AXIS_X = 0, AXIS_Y = 1, AXIS_VSCROLL = 9, AXIS_HSCROLL = 10.
+    //
+    // X and Y are the two AGDK enables by default (GameActivityEvents.cpp's
+    // `enabledAxes`); the scroll pair is only ever read if something raises
+    // that mask, and returning a real value costs nothing if nothing does.
+    // Populating them without also sending ACTION_SCROLL would be the useless
+    // half of the pair — an axis nothing asks about on an event that does not
+    // say a wheel moved — so the two landed together, and the scroll path in
+    // `cordial_game_activity_scroll` is the only thing that sets them.
     jfloat getAxisValue(ENV*, jint axis, jint) {
         if (axis == 0) return x;
         if (axis == 1) return y;
+        if (axis == 9) return vscroll;
+        if (axis == 10) return hscroll;
         return 0.0f;
     }
     jlong getHistoricalEventTime(ENV*, jint) { return eventTime; }
@@ -234,6 +249,28 @@ public:
         p->actionButton = actionButton;
         p->eventTime = eventTime;
         p->downTime = downTime;
+        to_jni(env, p);
+        return p;
+    }
+
+    /// A wheel event: ACTION_SCROLL with the two scroll axes filled in.
+    ///
+    /// Separate from `Create` rather than two more arguments on it, because a
+    /// scroll has no gesture behind it — no down time, no action button, and
+    /// no button state that means anything — and threading four zeros through
+    /// every existing call site to say so would make the common path harder to
+    /// read for the sake of the rare one.
+    static std::shared_ptr<MotionEvent> CreateScroll(ENV* env, jfloat x, jfloat y, jfloat hscroll,
+                                                     jfloat vscroll, jlong eventTime) {
+        auto p = std::make_shared<MotionEvent>();
+        p->x = x;
+        p->y = y;
+        // AMOTION_EVENT_ACTION_SCROLL.
+        p->action = 8;
+        p->hscroll = hscroll;
+        p->vscroll = vscroll;
+        p->eventTime = eventTime;
+        p->downTime = eventTime;
         to_jni(env, p);
         return p;
     }
@@ -1173,6 +1210,107 @@ int cordial_input_mouse_button(void* fn, float x, float y, int down, int button,
         auto cls = env->GetClass("com/roblox/engine/jni/NativeInputInterface");
         reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls), x, y,
                                    down ? JNI_TRUE : JNI_FALSE, button);
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// `NativeInputInterface.nativePassMouseWheel(F,F,F)`.
+///
+/// The wheel's counterpart to `cordial_input_mouse_button`, and the reason the
+/// scroll wheel did nothing at all: the export exists, the dex declares it, and
+/// nothing here had ever called it. The dex strips parameter names, so which
+/// float is which is not readable — but every `nativePassMouse*` in that class
+/// begins with the two that `nativePassMouseButton` uses for the cursor
+/// position, so `(x, y, delta)` is the shape, `INFERRED` from that family
+/// rather than from the one signature alone.
+///
+/// `delta` is in detents, positive away from the user. See
+/// `android::input::pass_mouse_wheel` for why that unit and that sign, and for
+/// the knob that flips it without a rebuild.
+int cordial_input_mouse_wheel(void* fn, float x, float y, float delta, char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jfloat, jfloat, jfloat);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or nativePassMouseWheel is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeInputInterface");
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls), x, y,
+                                   delta);
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// Deliver a wheel movement through AGDK's `onTouchEventNative` as ACTION_SCROLL.
+///
+/// The same both-pipes policy the button and move paths already follow: AGDK's
+/// contract is real and the engine consumes it, it is simply not what
+/// hit-tests the Lua UI. Unlike those two this one is unpacked by hand rather
+/// than sharing `cordial_game_activity_touch`, because a scroll carries no
+/// pressed button and no gesture start — see `MotionEvent::CreateScroll`.
+///
+/// Returns 0 / -1 / -2 exactly as `cordial_game_activity_touch` does.
+int cordial_game_activity_scroll(long handle, float x, float y, float hscroll, float vscroll,
+                                 long long event_time_ms, int* consumed, char* err,
+                                 size_t err_len) {
+    auto* env = cordial::process_env();
+    if (!env || handle == 0) {
+        snprintf(err, err_len, "no JavaVM, or no native handle");
+        return -1;
+    }
+    try {
+        JNIEnv* jni = env->GetJNIEnv();
+        auto cls = env->GetClass("com/google/androidgamesdk/GameActivity");
+        if (!cls) {
+            snprintf(err, err_len, "GameActivity class is not registered");
+            return -1;
+        }
+        void* fn;
+        {
+            std::lock_guard<std::mutex> lock(cls->mtx);
+            auto it = cls->natives.find("onTouchEventNative");
+            fn = it == cls->natives.end() ? nullptr : it->second;
+        }
+        if (!fn) {
+            return -2;
+        }
+
+        jni->PushLocalFrame(8);
+
+        auto jactivity = cordial::to_jni(env, cordial::shared_activity(env));
+        auto event = cordial::MotionEvent::CreateScroll(env, x, y, hscroll, vscroll,
+                                                        (jlong)event_time_ms);
+        auto jevent = cordial::to_jni(env, event);
+
+        using TouchFn = jboolean (*)(JNIEnv*, jobject, jlong, jobject, jint, jint, jint, jint,
+                                     jint, jlong, jlong, jint, jint, jint, jint, jint, jint,
+                                     jfloat, jfloat);
+        jboolean r = reinterpret_cast<TouchFn>(fn)(
+            jni, jactivity, (jlong)handle, jevent,
+            /*pointerCount=*/1, /*historySize=*/0, /*deviceId=*/event->deviceId,
+            /*source=*/event->source, /*action=*/event->action,
+            /*eventTime=*/(jlong)event_time_ms, /*downTime=*/(jlong)event_time_ms,
+            /*flags=*/0, /*metaState=*/0, /*actionButton=*/0,
+            /*buttonState=*/0, /*classification=*/0, /*edgeFlags=*/0,
+            /*precisionX=*/1.0f, /*precisionY=*/1.0f);
+
+        jni->PopLocalFrame(nullptr);
+        if (consumed) {
+            *consumed = r ? 1 : 0;
+        }
         return 0;
     } catch (const std::exception& e) {
         snprintf(err, err_len, "%s", e.what());

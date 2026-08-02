@@ -26,6 +26,7 @@ use crate::flags_file;
 use crate::install::{self, NotFound};
 use crate::instructions;
 use crate::launch;
+use crate::profile_switcher;
 use crate::settings;
 use crate::shell_config::ShellConfig;
 use cordial_shell::host_window::HostWindow;
@@ -85,6 +86,15 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     // -----------------------------------------------------------------------
     let host = HostWindow::new(&cordial_shell::host_window::title(), 720, 480, &toasts);
 
+    // Packed first, so it is the rightmost thing in the header bar. An avatar
+    // is what libadwaita offers for representing a user and a `GtkMenuButton`
+    // opening a popover is an ordinary GNOME header bar, so this fights nothing;
+    // Fractal switches accounts the same way. What it is *not* is an account
+    // switcher — ADR-012 is explicit that this selects a directory, does not
+    // authenticate, and must not imply that it does.
+    let switcher = profile_switcher::build(config.clone(), config_path.clone());
+    host.header().pack_end(&switcher);
+
     let settings_button = gtk::Button::from_icon_name("preferences-system-symbolic");
     settings_button.set_tooltip_text(Some("Settings"));
     host.header().pack_end(&settings_button);
@@ -119,8 +129,17 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
         )
         .present();
     });
+    // The same arrangement for the switcher, and for the same reason: a launch
+    // refused because the profile is busy has to be able to open the thing that
+    // chooses another one, and that is now the header bar's popover rather than
+    // a settings page.
+    let profile_action = gtk::gio::SimpleAction::new("profile", None);
+    let switcher_for_action = switcher.clone();
+    profile_action.connect_activate(move |_, _| switcher_for_action.popup());
+
     let actions = gtk::gio::SimpleActionGroup::new();
     actions.add_action(&settings_action);
+    actions.add_action(&profile_action);
     window.insert_action_group("win", Some(&actions));
     settings_button.set_action_name(Some("win.settings"));
 
@@ -227,9 +246,9 @@ fn run_seconds_override() -> Option<u64> {
 /// double-clicking the launcher — so the dialog names the profile, says what is
 /// true, and offers the only action that helps: choosing a different one.
 ///
-/// The Settings row it points at is a text entry today. When it becomes a
-/// dropdown over the existing profiles with a create action, this dialog does
-/// not change; it is already pointing at the right place.
+/// It used to point at a text field in Settings. It now opens the header bar's
+/// switcher, which is the same door the avatar is, and which already shows the
+/// profile this dialog is about as unavailable.
 fn profile_busy(parent: &gtk::Window, name: &str) {
     let dialog = adw::MessageDialog::builder()
         .transient_for(parent)
@@ -243,17 +262,17 @@ fn profile_busy(parent: &gtk::Window, name: &str) {
         )
         .build();
     dialog.add_response("close", "Close");
-    dialog.add_response("settings", "Choose a Profile");
-    dialog.set_response_appearance("settings", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("settings"));
+    dialog.add_response("profile", "Choose a Profile");
+    dialog.set_response_appearance("profile", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("profile"));
 
     let parent = parent.clone();
     dialog.connect_response(None, move |_, response| {
-        if response == "settings" {
-            // The settings button is the shell's own escape hatch and this is
+        if response == "profile" {
+            // The avatar in the header bar is the shell's switcher and this is
             // the same door; activating the window's action rather than
-            // rebuilding a preferences window here keeps one construction site.
-            let _ = parent.activate_action("win.settings", None);
+            // building a second chooser here keeps one construction site.
+            let _ = parent.activate_action("win.profile", None);
         }
     });
     dialog.present();
@@ -264,7 +283,7 @@ fn profile_busy(parent: &gtk::Window, name: &str) {
 /// A toast would be wrong for these: every one of them needs an action from the
 /// user, and a message that fades after four seconds is barely better than no
 /// message. The toast is for the good case.
-fn alert(parent: &gtk::Window, heading: &str, body: &str) {
+pub fn alert(parent: &gtk::Window, heading: &str, body: &str) {
     let dialog = adw::MessageDialog::builder()
         .transient_for(parent)
         .modal(true)

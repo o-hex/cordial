@@ -21,6 +21,7 @@ mod flags_file;
 mod install;
 mod instructions;
 mod launch;
+mod profile_switcher;
 mod settings;
 mod shell_config;
 mod window;

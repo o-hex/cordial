@@ -977,6 +977,52 @@ Each was tested and each cost time. The evidence is the point.
 - Not a `malloc`/`free`/`operator new` mismatch directly — none of those are
   undefined symbols in `libroblox.so` at all.
 
+**Resizing the window reflows the interface into many small items — and density
+is not the fix**
+
+Widening the window makes Roblox lay out more, smaller things: at roughly
+1330px the home feed shows four recommended tiles at a comfortable size, at
+2000px it shows six much smaller ones. The cause is understood. `DisplayMetrics`
+in `native/init_params.cpp` reports `density = 1.0`, `densityDpi = 160`, and
+Android's density is the scale against 160 dpi — so a 2000-pixel window is
+described to the engine as a 2000dp-wide screen, which is a tablet the size of a
+wall, and the client lays out for one. That is correct Android behaviour and the
+wrong thing for a desktop monitor.
+
+Correcting the density was tried and is **reverted**. Raising it (to the
+compositor's output scale times 1.5, feeding both `DisplayMetrics` and
+`PlatformParams.dpiScale` from one number) was measured by the owner in normal
+use as having "absolutely destroyed the DPI on roblox and it still didnt fix the
+resizing issue" — worse in the everyday case and no better in the case it was
+for. `CORDIAL_DPI_SCALE` remains what it was, an override that changes
+`PlatformParams.dpiScale` only.
+
+**The engine reads its density exactly once, and a resize does not make it read
+again.** Measured, not inferred: with a counter on every `DisplayMetrics`
+construction, one 46-second run printed
+
+```text
+[android] DisplayMetrics #1: 1280x720 density=1.000 densityDpi=160
+```
+
+from inside `initializeNativeCode` — before the host window exists — and printed
+nothing further, including across a live resize from 1280x721 to 2000x1100
+driven by `gtk_window_set_default_size` from a timer. `onSurfaceChangedNative`
+and `onContentRectChangedNative` are both re-driven on that resize, so the
+engine does learn the new size; it simply never re-reads the density. Anything
+that hopes to change density in response to a resize therefore cannot work
+through this object, and a version that appears to work is a version that is
+doing nothing. **`INFERRED`:** Android would deliver such a change as a
+configuration change, which nothing here drives; whether the engine would honour
+one is untested.
+
+Consequence for the ordering, if anyone does revisit this: the density has to be
+settled *before* `initializeNativeCode`, which is earlier than the host window
+exists and therefore earlier than the display can be asked about itself.
+
+Resizing is not currently a goal. Do not leave a partial or
+disabled-by-default mechanism for it in the tree.
+
 **Flags**
 - The flags verdict does not gate rendering. `onFlagsFailed` is a complaint, not
   a gate.

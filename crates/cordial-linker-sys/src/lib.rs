@@ -963,6 +963,17 @@ pub mod game_activity {
             err: *mut c_char,
             err_len: usize,
         ) -> c_int;
+        fn cordial_game_activity_scroll(
+            handle: i64,
+            x: f32,
+            y: f32,
+            hscroll: f32,
+            vscroll: f32,
+            event_time_ms: i64,
+            consumed: *mut c_int,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> c_int;
         fn cordial_game_activity_key(
             handle: i64,
             down: c_int,
@@ -1011,6 +1022,42 @@ pub mod game_activity {
                 action_button,
                 event_time_ms,
                 down_time_ms,
+                &mut consumed,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        match rc {
+            0 => Ok(Some(consumed != 0)),
+            -2 => Ok(None),
+            _ => Err(take_err(err)),
+        }
+    }
+
+    /// Deliver a wheel movement through `onTouchEventNative` as ACTION_SCROLL.
+    ///
+    /// `hscroll`/`vscroll` are detents, positive right and positive away from
+    /// the user, which is what `MotionEvent.AXIS_HSCROLL`/`AXIS_VSCROLL`
+    /// document. See `touch`'s doc comment for the `Ok(None)` convention.
+    pub fn scroll(
+        handle: i64,
+        x: f32,
+        y: f32,
+        hscroll: f32,
+        vscroll: f32,
+        event_time_ms: i64,
+    ) -> Result<Option<bool>, String> {
+        let mut err = vec![0u8; 512];
+        let mut consumed: c_int = 0;
+        // SAFETY: `handle` came from `initialize`; `err`/`consumed` are live.
+        let rc = unsafe {
+            cordial_game_activity_scroll(
+                handle,
+                x,
+                y,
+                hscroll,
+                vscroll,
+                event_time_ms,
                 &mut consumed,
                 err.as_mut_ptr() as *mut c_char,
                 err.len(),
@@ -1101,6 +1148,10 @@ pub mod game_activity {
         ) -> c_int;
         fn cordial_input_mouse_button(
             f: *mut c_void, x: f32, y: f32, down: c_int, button: c_int,
+            err: *mut c_char, n: usize,
+        ) -> c_int;
+        fn cordial_input_mouse_wheel(
+            f: *mut c_void, x: f32, y: f32, delta: f32,
             err: *mut c_char, n: usize,
         ) -> c_int;
         fn cordial_textbox_handle() -> i64;
@@ -1366,6 +1417,18 @@ pub mod game_activity {
                 native, x, y, if down { 1 } else { 0 }, button,
                 err.as_mut_ptr() as *mut c_char, err.len(),
             )
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
+    /// `NativeInputInterface.nativePassMouseWheel(F,F,F)` — the wheel's
+    /// equivalent of [`pass_mouse_button`], and the call Cordial had never
+    /// made. `delta` is in detents, positive away from the user.
+    pub fn pass_mouse_wheel(native: *mut c_void, x: f32, y: f32, delta: f32) -> Result<(), String> {
+        let mut err = vec![0u8; 512];
+        // SAFETY: as above.
+        let rc = unsafe {
+            cordial_input_mouse_wheel(native, x, y, delta, err.as_mut_ptr() as *mut c_char, err.len())
         };
         if rc == 0 { Ok(()) } else { Err(take_err(err)) }
     }

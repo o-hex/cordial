@@ -61,7 +61,7 @@ impl AppearanceScheme {
         let scheme = match self {
             AppearanceScheme::Light => libadwaita::ColorScheme::ForceLight,
             AppearanceScheme::Dark => libadwaita::ColorScheme::ForceDark,
-            AppearanceScheme::System => libadwaita::ColorScheme::Default,
+            AppearanceScheme::System => system_scheme(portal_colour_scheme()),
         };
         libadwaita::StyleManager::default().set_color_scheme(scheme);
     }
@@ -71,6 +71,91 @@ impl Default for AppearanceScheme {
     fn default() -> Self {
         AppearanceScheme::System
     }
+}
+
+/// How long to wait for the settings portal before deciding nobody is there.
+///
+/// ADR-002 budgets the shell's first paint in milliseconds and this call sits in
+/// front of it, so the number is a compromise rather than a safety margin: on a
+/// session with a portal the reply comes back in about a millisecond and this is
+/// never reached, and on one without it the bus refuses immediately rather than
+/// hanging. What it actually bounds is the case in between — a portal that is
+/// starting, or wedged — where half a second of default theming is a better
+/// outcome than a launcher that appears to have failed to start.
+const PORTAL_TIMEOUT_MS: i32 = 500;
+
+/// What `System` has to resolve to right now, given what the desktop said.
+///
+/// **A preference, not a correctness fix, and the branch looks wrong until you
+/// know why.** `ColorScheme::Default` is the value that means "follow the
+/// desktop", and it is what `System` should be whenever the desktop can be
+/// asked — someone on a light desktop must still get light, and `Default` is
+/// also what keeps the window tracking a change made while it is open, which is
+/// worth more than any startup decision taken once.
+///
+/// The single source libadwaita consults for that is the settings portal's
+/// `org.freedesktop.appearance color-scheme`. When nothing answers it, there is
+/// no preference to follow — but `Default` does not mean "unknown", it renders
+/// light, so an unreachable portal presents as a deliberate light theme. That is
+/// how the owner's launcher kept appearing in light on a `prefer-dark` desktop:
+/// a process without the session bus in its environment has no portal to ask,
+/// and light is what falls out. A game launcher guessing light when it has not
+/// been told is the worse guess, so the unknown case is dark.
+///
+/// The cost is stated rather than hidden: if the portal is unreachable *and*
+/// libadwaita's non-sandboxed GSettings fallback would have found a genuine
+/// light preference, this overrides it. That is accepted — the owner asked for
+/// dark as the answer to "we do not know", and the portal is what defines
+/// knowing here.
+fn system_scheme(portal: Option<u32>) -> libadwaita::ColorScheme {
+    match portal {
+        Some(_) => libadwaita::ColorScheme::Default,
+        None => libadwaita::ColorScheme::ForceDark,
+    }
+}
+
+/// The desktop's `org.freedesktop.appearance color-scheme`, asked for directly.
+///
+/// Only the *presence* of an answer is used — see [`system_scheme`] — so this
+/// deliberately does not interpret the value it returns. `ReadOne` first because
+/// it is what current portals implement, then `Read`, which older ones offer and
+/// which boxes the value one variant deeper; either shape is unwrapped by
+/// following `v` down until something that is not a variant comes out.
+///
+/// Through `gio` rather than `zbus`. `zbus` is a dependency of `cordial-runtime`
+/// and not of this crate, and the shell is already holding a GDBus connection
+/// through GTK — adding an async runtime to this crate to ask one question the
+/// toolkit can already ask would be the larger change.
+fn portal_colour_scheme() -> Option<u32> {
+    use libadwaita::gtk::gio;
+    use libadwaita::gtk::glib::prelude::*;
+
+    let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok()?;
+    let arguments = ("org.freedesktop.appearance", "color-scheme").to_variant();
+
+    for method in ["ReadOne", "Read"] {
+        let Ok(reply) = bus.call_sync(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings",
+            method,
+            Some(&arguments),
+            None,
+            gio::DBusCallFlags::NONE,
+            PORTAL_TIMEOUT_MS,
+            gio::Cancellable::NONE,
+        ) else {
+            continue;
+        };
+        let mut value = reply.child_value(0);
+        while let Some(inner) = value.as_variant() {
+            value = inner;
+        }
+        if let Some(scheme) = value.get::<u32>() {
+            return Some(scheme);
+        }
+    }
+    None
 }
 
 /// The profile a launch runs against when nobody has chosen otherwise.
@@ -238,6 +323,27 @@ mod tests {
         assert_eq!(back.roblox.apk, config.roblox.apk);
         assert_eq!(back.roblox.lib_dir, config.roblox.lib_dir);
         assert_eq!(back.profile, "alt_account");
+    }
+
+    #[test]
+    fn an_unanswered_portal_is_dark_rather_than_light() {
+        // The owner's report, in one assertion: their launcher kept opening in
+        // light on a `prefer-dark` desktop, because `ColorScheme::Default`
+        // renders light when nothing told it otherwise and a process without
+        // the session bus has nothing to ask. Unknown is dark now.
+        assert_eq!(system_scheme(None), libadwaita::ColorScheme::ForceDark);
+    }
+
+    #[test]
+    fn a_desktop_that_answers_is_still_followed_live() {
+        // The half that must not be lost in fixing the other one. `Default` is
+        // the only value that keeps tracking a change made while the window is
+        // open, and forcing dark on an answering desktop would take light away
+        // from somebody who chose it. The value itself is not inspected on
+        // purpose, so every answer maps the same way.
+        for reported in [0, 1, 2] {
+            assert_eq!(system_scheme(Some(reported)), libadwaita::ColorScheme::Default);
+        }
     }
 
     #[test]

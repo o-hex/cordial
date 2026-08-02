@@ -1,6 +1,6 @@
 //! Choosing the profile the next instance runs.
 //!
-//! An `AdwComboRow` sitting directly above the Launch group, listing
+//! An `AdwComboRow` sitting directly above the Launch button, listing
 //! [`profile::list`]. ADR-012 makes a profile a directory and an instance a
 //! window; this is where one is picked for the other.
 //!
@@ -85,7 +85,7 @@ fn availability(name: &str) -> Availability {
             drop(claim);
             Availability::Free
         }
-        Err(profile::Error::Busy(_)) => Availability::Running,
+        Err(profile::Error::Busy(..)) => Availability::Running,
         Err(profile::Error::Unusable(message)) => Availability::Unusable(message),
     }
 }
@@ -135,6 +135,37 @@ pub fn check_name(name: &str, existing: &[String]) -> NameCheck {
 /// pre-creates a profile, and the test below is what keeps it that way.
 fn offered() -> Vec<String> {
     profile::list()
+}
+
+/// What the row says beneath the name, given what is known about the profile.
+///
+/// **The ordinary case says nothing, and that is the change.** This used to read
+/// "One account's Roblox storage, held by one window at a time" whenever the
+/// selected profile was free — which is ADR-012's definition of the word rather
+/// than anything the person choosing needs. It was true of every entry in the
+/// list, so it distinguished nothing; it taught the data model to somebody who
+/// only wanted to press play; and a permanent two-line subtitle over a permanent
+/// group header is what made a launcher read as a settings page. An empty
+/// subtitle collapses the row to one line, which has the useful side effect that
+/// a line appearing at all is now the signal that something is worth reading.
+///
+/// The three that remain are each a fact about *this* profile that changes what
+/// pressing the button will do. `None` is the profile with no directory yet:
+/// deliberately not probed, because [`profile::acquire`] creates the directory
+/// on its way to the lock, so asking whether an uncreated profile is free would
+/// create it.
+fn subtitle(name: &str, availability: Option<&Availability>) -> String {
+    match availability {
+        None => format!("{name} will be created when you launch"),
+        Some(Availability::Free) => String::new(),
+        // Not "{name} is open in another window". The row's own value is showing
+        // that name a couple of centimetres to the right, so repeating it only
+        // cost width — and width is what this line has least of, sharing the row
+        // with the combo and the create button. Said in full it ellipsised
+        // before reaching "refused", which is the half that matters.
+        Some(Availability::Running) => "Open in another window; launching it again will be refused".into(),
+        Some(Availability::Unusable(message)) => message.clone(),
+    }
 }
 
 /// The config, the file it is saved to, and the widgets showing the answer.
@@ -189,36 +220,28 @@ impl Switcher {
         self.describe();
     }
 
-    /// Say what the launch will actually do, underneath the row.
-    ///
-    /// Three cases, and the third is the one that needs saying. A profile is
-    /// created by the launch that first needs it, so on a fresh install the list
-    /// is empty while `ShellConfig.profile` still names something — and a row
-    /// that showed nothing at all there would be hiding what pressing Roblox is
-    /// about to do. Naming the behaviour is not the same as listing a profile
-    /// that does not exist.
+    /// Say what the launch will actually do, underneath the row. The wording,
+    /// and why the ordinary case says nothing at all, is on [`subtitle`].
     fn describe(&self) {
         let name = self.current();
-        let subtitle = if !offered().iter().any(|n| *n == name) {
-            format!("{name} will be created when you launch")
-        } else {
-            match availability(&name) {
-                Availability::Free => "One account's Roblox storage, held by one window at a time".to_string(),
-                Availability::Running => {
-                    format!("{name} is open in another window; launching it again will be refused")
-                }
-                Availability::Unusable(message) => message,
-            }
-        };
-        self.row.set_subtitle(&subtitle);
+        // Probed only once the profile is known to exist, and that order is not
+        // incidental: `profile::acquire` creates the directory on its way to the
+        // lock, so asking whether a not-yet-created profile is free would create
+        // it — a launcher conjuring an account out of drawing its own subtitle.
+        let availability = offered().iter().any(|n| *n == name).then(|| availability(&name));
+        self.row.set_subtitle(&subtitle(&name, availability.as_ref()));
     }
 }
 
-/// The profile chooser, as a group ready to sit above the Launch group.
+/// The profile chooser, as a group ready to sit above the Launch button.
 pub fn build(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> adw::PreferencesGroup {
     let model = gtk::StringList::new(&[]);
     let row = adw::ComboRow::builder().title("Profile").model(&model).build();
-    row.set_subtitle_lines(2);
+    // Three rather than two, and only the `Unusable` case will ever want the
+    // third: it carries whatever the operating system said about the directory,
+    // which is not a sentence written here and cannot be budgeted for. The
+    // ordinary row has no subtitle at all and stays one line high.
+    row.set_subtitle_lines(3);
     row.set_list_factory(Some(&list_factory()));
 
     let switcher = Switcher {
@@ -521,6 +544,29 @@ mod tests {
                 "{name} is offered by the list but refused by the create dialog"
             );
         }
+    }
+
+    #[test]
+    fn a_profile_that_is_free_has_nothing_to_say_about_itself() {
+        // The regression this is here to stop, because it is the sort of line
+        // that gets pasted back by somebody who thinks a blank subtitle is an
+        // oversight. It read "One account's Roblox storage, held by one window
+        // at a time" — ADR-012's definition of the word, true of every entry in
+        // the list, and the largest single reason a launcher looked like a
+        // settings page.
+        assert_eq!(subtitle("default", Some(&Availability::Free)), "");
+    }
+
+    #[test]
+    fn the_cases_that_change_what_the_button_does_all_still_say_so() {
+        // Dropping the definition must not drop the three that are worth
+        // reading. Each of these changes what pressing Roblox will do.
+        assert!(subtitle("alt", None).contains("will be created"), "an uncreated profile has to say so");
+        let running = subtitle("alt", Some(&Availability::Running));
+        assert!(running.contains("another window") && running.contains("refused"), "{running}");
+        // Verbatim, for the same reason `check_name` quotes `profile::dir`: the
+        // sentence a user meets is the one the operating system produced.
+        assert_eq!(subtitle("alt", Some(&Availability::Unusable("permission denied".into()))), "permission denied");
     }
 
     #[test]

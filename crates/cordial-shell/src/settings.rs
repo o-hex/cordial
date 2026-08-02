@@ -98,8 +98,9 @@ fn build_appearance_page(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathB
         .title("Theme")
         .description(
             "This is Cordial's own preference, not the desktop's. System follows \
-             org.freedesktop.appearance and updates live; Light and Dark stay fixed \
-             regardless of what the desktop is doing.",
+             org.freedesktop.appearance and updates live, and falls back to dark when \
+             nothing answers for it; Light and Dark stay fixed regardless of what the \
+             desktop is doing.",
         )
         .build();
 

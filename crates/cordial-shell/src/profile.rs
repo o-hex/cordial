@@ -37,7 +37,13 @@ extern "C" {
     // fixed-arity declaration is what makes `CORDIAL_TRACE=1` abort the engine,
     // and the lesson is cheap enough to apply to a two-line `fcntl` call.
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    fn kill(pid: c_int, sig: c_int) -> c_int;
 }
+
+/// `SIGTERM`, and `ESRCH` for the process having already gone. Both are stable
+/// across every Linux ABI Cordial runs on.
+const SIGTERM: c_int = 15;
+const ESRCH: c_int = 3;
 
 /// `LOCK_EX | LOCK_NB` from `sys/file.h`. Non-blocking on purpose: a second
 /// launch should say so immediately rather than hang waiting for the first to
@@ -166,9 +172,147 @@ pub fn acquire(name: &str) -> Result<Claim, Error> {
 
     // SAFETY: `file` is open for the duration of the call and outlives it.
     if unsafe { flock(file.as_raw_fd(), LOCK_EX_NB) } != 0 {
-        return Err(Error::Busy(name.to_string()));
+        return Err(Error::Busy(name.to_string(), holder_of(&lock_path)));
     }
     Ok(Claim { file, dir })
+}
+
+/// The process holding a profile's lock.
+///
+/// Reported so a refusal can name something the user is able to act on.
+/// "Already open in another Cordial window" is accurate and useless when there
+/// is no window to find, and that is the case people actually meet — see
+/// [`holder_of`] for how one arises.
+#[derive(Debug, Clone)]
+pub struct Holder {
+    pub pid: u32,
+    /// `/proc/<pid>/cmdline`, NULs replaced with spaces. Empty if unreadable.
+    pub command: String,
+    /// How long it has been up, from the mtime of `/proc/<pid>`.
+    pub running_for: Option<std::time::Duration>,
+}
+
+impl Holder {
+    /// Whether this is one of ours, and so whether offering to close it is a
+    /// reasonable thing for an interface to do.
+    ///
+    /// Deliberately narrow. A button that terminates whichever process happens
+    /// to have a file open is a button that eventually terminates something
+    /// else, and recovering from that is worse than the problem it solves.
+    pub fn is_cordial(&self) -> bool {
+        self.command.contains("cordial-run")
+    }
+
+    /// Roughly how long it has been up, for a sentence rather than a log line.
+    pub fn running_for_text(&self) -> Option<String> {
+        let secs = self.running_for?.as_secs();
+        Some(match secs {
+            0..=90 => format!("{secs} seconds"),
+            91..=5400 => format!("{} minutes", (secs + 30) / 60),
+            _ => format!("{} hours", (secs + 1800) / 3600),
+        })
+    }
+
+    /// Whether this process is gone, so a caller can wait for the profile
+    /// rather than guess at how long a shutdown takes.
+    ///
+    /// Answered by the presence of `/proc/<pid>` rather than by re-taking the
+    /// lock. Re-taking it answers a subtly different question: the lock is free
+    /// the instant the descriptor closes, which is *before* the process has
+    /// finished exiting, so a relaunch keyed on that would start a new client
+    /// against a profile directory the old one is still unwinding through —
+    /// the two-writers case this whole module exists to prevent, reintroduced
+    /// by the recovery path.
+    pub fn has_exited(&self) -> bool {
+        !Path::new(&format!("/proc/{}", self.pid)).exists()
+    }
+
+    /// Ask this holder to stop, releasing the profile.
+    ///
+    /// `SIGTERM`, never `SIGKILL`. The engine is mid-session with Roblox's
+    /// storage open underneath it, and the whole reason this lock exists is
+    /// that half-written `appData` presents as a Cordial bug rather than as
+    /// unsupported use. A signal it can act on is the difference.
+    ///
+    /// Refuses anything that is not `cordial-run` even though every caller is
+    /// expected to check first. The check that matters is the one next to the
+    /// `kill`, because the one at the call site is the one a later refactor
+    /// moves away.
+    pub fn ask_to_stop(&self) -> Result<(), String> {
+        if !self.is_cordial() {
+            return Err(format!(
+                "process {} is not a Cordial client, so Cordial will not close it: {}",
+                self.pid, self.command
+            ));
+        }
+        // SAFETY: `kill` with a signal number is safe for any pid; the worst
+        // case is ESRCH, which is the process having exited already.
+        if unsafe { kill(self.pid as c_int, SIGTERM) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(ESRCH) {
+                return Ok(());
+            }
+            return Err(format!("could not close process {}: {e}", self.pid));
+        }
+        Ok(())
+    }
+}
+
+/// Which process has `path` open, if it can be told.
+///
+/// **`/proc/locks` is the obvious instrument and it is the wrong one.** Its PID
+/// column names the process that *acquired* the lock, and [`Claim::hand_to`]
+/// makes that the launcher — which then drops its handle and usually exits. On
+/// this developer's machine `/proc/locks` named PID 649439 as holding the
+/// default profile while the descriptor was held by 649889, and 649439 no
+/// longer existed. An implementation built on it would confidently report a
+/// dead process. Scanning `/proc/*/fd` finds whatever actually has the file
+/// open, which is the thing `flock` is tied to.
+///
+/// How a holder with no window arises, since that is the confusing case:
+/// `cordial-run` has no run-until-the-window-closes path yet, so `--run` is a
+/// hard timer and the launcher's default is a day. The launcher quitting is the
+/// *ordinary* case under ADR-012 — the instance holds the claim, not the shell
+/// — so a client routinely outlives the window that started it, gets reparented
+/// to `systemd --user`, and keeps the profile for the rest of its timer.
+///
+/// Best-effort by construction: another user's `/proc/<pid>/fd` is not
+/// readable, and a holder in a different mount namespace will not match.
+/// **`None` means "could not tell", never "nobody holds it"** — the `flock` has
+/// already established that somebody does, and a caller that reads `None` as
+/// "free" would be inventing an answer.
+fn holder_of(path: &Path) -> Option<Holder> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        // Our own descriptor is not open yet at the point `acquire` calls this,
+        // but a caller probing a profile it already holds would find itself and
+        // be told it is busy with no explanation. Cheaper to skip than explain.
+        if pid == std::process::id() {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue; // Another user's process, or one that exited mid-scan.
+        };
+        for fd in fds.flatten() {
+            if std::fs::read_link(fd.path()).ok().as_deref() != Some(target.as_path()) {
+                continue;
+            }
+            let command = std::fs::read(entry.path().join("cmdline"))
+                .map(|raw| {
+                    String::from_utf8_lossy(&raw).replace('\0', " ").trim().to_string()
+                })
+                .unwrap_or_default();
+            let running_for = std::fs::metadata(entry.path())
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|start| start.elapsed().ok());
+            return Some(Holder { pid, command, running_for });
+        }
+    }
+    None
 }
 
 /// Why a profile could not be claimed.
@@ -180,18 +324,25 @@ pub fn acquire(name: &str) -> Result<Claim, Error> {
 /// rather than an error to dismiss.
 #[derive(Debug)]
 pub enum Error {
-    Busy(String),
+    /// The profile, and whichever process holds it if that could be determined.
+    Busy(String, Option<Holder>),
     Unusable(String),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Busy(name) => write!(
-                f,
-                "profile {name:?} is already open in another Cordial window; \
-                 use a different profile, or close that one first"
-            ),
+            Error::Busy(name, holder) => {
+                write!(f, "profile {name:?} is already open in another Cordial client")?;
+                if let Some(holder) = holder {
+                    write!(f, " (process {}", holder.pid)?;
+                    if let Some(text) = holder.running_for_text() {
+                        write!(f, ", running for {text}")?;
+                    }
+                    write!(f, ")")?;
+                }
+                write!(f, "; use a different profile, or close that one first")
+            }
             Error::Unusable(message) => f.write_str(message),
         }
     }
@@ -329,7 +480,7 @@ mod tests {
         let (_root, _g) = scratch("held");
         let first = acquire("default").expect("first instance takes the profile");
         let second = acquire("default");
-        assert!(matches!(second, Err(Error::Busy(_))), "a second instance must be refused");
+        assert!(matches!(second, Err(Error::Busy(..))), "a second instance must be refused");
         assert!(second.unwrap_err().to_string().contains("already open"));
         drop(first);
     }
@@ -363,6 +514,44 @@ mod tests {
 
         let refused = acquire("default");
         assert!(refused.is_err(), "the spawned instance must still hold the profile");
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_refusal_names_the_process_actually_holding_the_profile() {
+        // The PID in that message is the entire recovery path for somebody who
+        // cannot find a window to close, so it has to be the process with the
+        // descriptor rather than the one that opened it. This is the same
+        // hand-off shape as the test above precisely because that is where the
+        // obvious implementation goes wrong: `/proc/locks` would name the
+        // launcher, which by this point in the scenario has let go.
+        let (_root, _g) = scratch("holder");
+        let claim = acquire("default").unwrap();
+
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        claim.hand_to(&mut command);
+        let mut child = command.spawn().expect("sleep is on PATH");
+        drop(claim);
+
+        let Err(Error::Busy(_, holder)) = acquire("default") else {
+            panic!("a held profile must be refused");
+        };
+        let holder = holder.expect("a holder in this process's own namespace is identifiable");
+        assert_eq!(holder.pid, child.id(), "the refusal must name the descriptor's owner");
+        assert!(holder.command.contains("sleep"), "{}", holder.command);
+
+        // And the guard that keeps the "Close It and Launch" button honest:
+        // `sleep` is not a client, so Cordial must neither offer to close it
+        // nor do so if asked. A button that signals whatever holds a file open
+        // is one that eventually signals something else.
+        assert!(!holder.is_cordial());
+        assert!(
+            holder.ask_to_stop().is_err(),
+            "Cordial must refuse to signal a process it did not start"
+        );
 
         let _ = child.kill();
         let _ = child.wait();

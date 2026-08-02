@@ -215,7 +215,7 @@ pub fn spawn(build: &Build, claim: Claim, run_seconds: Option<u64>) -> Result<In
             // MangoHUD tomorrow with the switch left where it was.
             None => println!(
                 "  shell: MangoHUD is switched on but its Vulkan layer is not installed; \
-                 the overlay will not appear. {MANGOHUD_INSTALL_HINT}"
+                 the overlay will not appear. {}", mangohud_install_hint()
             ),
         }
     }
@@ -240,15 +240,43 @@ pub fn spawn(build: &Build, claim: Claim, run_seconds: Option<u64>) -> Result<In
     Ok(Instance { child, command_line })
 }
 
+/// Whether this process is inside a Flatpak sandbox.
+///
+/// `/.flatpak-info` is the documented marker and is present in every sandbox
+/// regardless of how the application was started, which `FLATPAK_ID` is not —
+/// that one is absent when the entry point is `flatpak run --command=sh`.
+pub fn in_flatpak() -> bool {
+    Path::new("/.flatpak-info").exists()
+}
+
 /// What to tell somebody who wants MangoHUD and has not got it.
 ///
-/// Two package names because they install two different things and only one of
-/// them is right for how Cordial was installed: the distribution package puts
-/// the layer under `/usr/share`, and the Flatpak runtime extension puts it
-/// inside the sandbox where a host package would not be visible at all.
-pub const MANGOHUD_INSTALL_HINT: &str =
-    "Install it with your package manager (Fedora: dnf install mangohud, Arch: pacman -S mangohud), \
-     or for the Flatpak: flatpak install org.freedesktop.Platform.VulkanLayer.MangoHud";
+/// **The two packages are not alternatives, and offering them as a pair sent
+/// this developer to install the wrong one twice.** They install the same
+/// overlay in two places that cannot see each other, and which one is right is
+/// decided by how *Cordial* was installed, not by preference.
+///
+/// The Flatpak runtime extension's manifest declares
+/// `library_path: /usr/lib/extensions/vulkan/MangoHud/lib/.../libMangoHud.so`,
+/// which exists only inside a sandbox where the extension is mounted. Install
+/// it while running a host build and the result is silence: the layer is not on
+/// the host search path, and even if it were, the loader could not resolve the
+/// library it names. The earlier wording listed both with "or", which reads as
+/// two ways to accomplish one thing.
+///
+/// So the hint names one, and it is chosen rather than guessed.
+pub fn mangohud_install_hint() -> &'static str {
+    if in_flatpak() {
+        "Install the Flatpak runtime extension: flatpak install \
+         org.freedesktop.Platform.VulkanLayer.MangoHud — this build of Cordial runs inside a \
+         Flatpak sandbox, so a distribution package installed on the host will not be visible to it."
+    } else {
+        "Install it with your package manager (Fedora: dnf install mangohud, Arch: pacman -S \
+         mangohud). This build of Cordial runs on the host, so the Flatpak runtime extension \
+         org.freedesktop.Platform.VulkanLayer.MangoHud will not work for it — that layer's library \
+         path only exists inside a Flatpak sandbox."
+    }
+}
 
 /// Where MangoHUD's implicit layer manifest is, or `None` if it is not
 /// installed.
@@ -371,6 +399,25 @@ mod tests {
         // produced here for months. `cordial-run` reads zero as no timer and
         // ends on the window closing, on SIGTERM and on SIGINT instead.
         assert_eq!(DEFAULT_RUN_SECONDS, 0, "the launcher must not impose a session length");
+    }
+
+    #[test]
+    fn the_mangohud_hint_names_one_package_and_it_matches_how_cordial_was_installed() {
+        // The two packages install the same overlay into two places that cannot
+        // see each other, and the old hint listed both joined by "or". This
+        // developer followed it and installed the Flatpak runtime extension
+        // while running a host build -- twice -- and got silence, because that
+        // layer's manifest names a library under /usr/lib/extensions which only
+        // exists inside a sandbox.
+        let hint = mangohud_install_hint();
+        if in_flatpak() {
+            assert!(hint.contains("flatpak install"), "{hint}");
+            assert!(!hint.contains("dnf install"), "{hint}");
+        } else {
+            assert!(hint.contains("dnf install"), "{hint}");
+            // It may name the Flatpak extension, but only to rule it out.
+            assert!(hint.contains("will not work"), "{hint}");
+        }
     }
 
     #[test]

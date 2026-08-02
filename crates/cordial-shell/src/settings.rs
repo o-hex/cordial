@@ -370,7 +370,7 @@ fn build_performance_group(
             None => format!(
                 "Not available: MangoHUD's Vulkan layer is not installed on this machine, so \
                  turning this on would do nothing.\n{}",
-                crate::launch::MANGOHUD_INSTALL_HINT
+                crate::launch::mangohud_install_hint()
             ),
         })
         // A stale `true` in shell.json must not read as on when the layer has

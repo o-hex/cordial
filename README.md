@@ -102,6 +102,7 @@ will be declined.
 | | |
 |---|---|
 | Loads `libroblox.so` natively | ✅ |
+| Warm start | ✅ the engine is extracted once and reused; only a new Roblox build re-extracts |
 | App shell reaches `APP_READY (Landing)` | ✅ |
 | Renders — Vulkan on both backends | ✅ |
 | Networking / HTTPS | ✅ |

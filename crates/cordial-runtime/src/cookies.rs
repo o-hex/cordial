@@ -265,11 +265,42 @@ pub fn load(dir: &Path) -> Vec<(String, Jar)> {
     let Ok(text) = std::fs::read_to_string(dir.join(FILE)) else {
         return Vec::new();
     };
-    text.lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        .filter_map(|l| l.split_once('\t'))
-        .map(|(host, jar)| (host.to_string(), Jar::from_stored(unescape(jar))))
-        .collect()
+    let mut out = Vec::new();
+    let mut stale = 0;
+    for line in text.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let Some((host, jar)) = line.split_once('\t') else { continue };
+        let jar = unescape(jar);
+        // Reject a record that is not in the form the engine will take back.
+        //
+        // This is not defensive programming, it is a bug that reached a real
+        // account. Before `to_settable` existed the store held the engine's own
+        // Netscape output, and `nativeSetMultipleCookies` accepts that and
+        // discards it — so a session restored from such a file reported five
+        // domains restored and left the engine holding nothing. It reproduces
+        // exactly: plant a Netscape-form store and every domain says "wrote 6
+        // cookie(s) but the engine holds 0".
+        //
+        // Detected by shape rather than by a version number in the header,
+        // because the header did say v1 the whole time and the format changed
+        // underneath it. A settable jar is `name=value` pairs: it has an `=`
+        // and cannot contain a tab.
+        if jar.contains('\t') || !jar.contains('=') {
+            stale += 1;
+            continue;
+        }
+        out.push((host.to_string(), Jar::from_stored(jar)));
+    }
+    if stale > 0 {
+        println!(
+            "  [cookies] discarded {stale} record(s) in an old on-disk format; \
+             they would have been accepted by the engine and silently ignored. \
+             Signing in again will write the store in the current format."
+        );
+    }
+    out
 }
 
 /// Write the store, at `0600`, atomically.
@@ -522,6 +553,21 @@ pub fn restore(set_native: *mut std::ffi::c_void) -> usize {
     }
     let dir = crate::profile::active();
     let records = load(&dir);
+
+    // Every host in the store is a host worth asking about at save time.
+    //
+    // Without this the save only ever pulls `SEED_HOSTS` plus whatever the
+    // engine's callback happened to report, so a domain that reached the store
+    // once — `friends.roblox.com`, say — is restored, never re-pulled, and
+    // dropped from the file at the next save. Observed doing exactly that: five
+    // domains in, four out, on every launch. A session decaying by one domain
+    // at a time is the kind of fault that gets blamed on Roblox.
+    if let Ok(mut set) = OBSERVED.lock() {
+        for (host, _) in &records {
+            set.insert(host.clone());
+        }
+    }
+
     let mut restored = 0;
     for (host, jar) in &records {
         match cordial_linker_sys::game_activity::call_static_strings(
@@ -634,23 +680,23 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_separated_jar_survives_the_file() {
-        // The bug this test exists for, and it shipped once. The engine does
-        // not return `name=value; name=value`: `nativeGetCookiesForDomain`
-        // hands back Netscape `cookies.txt` records, six tabs each, run
-        // together with no newlines — measured with `CORDIAL_COOKIE_PROBE=1`.
-        // The first store wrote `host<TAB>jar` and skipped any record holding a
-        // tab, so it wrote a file containing only its own header and reported
-        // that it had saved four domains.
-        let dir = scratch("tabs");
-        let jar = ".roblox.com\tTRUE\t/\tTRUE\t0\t.ROBLOSECURITY\txyz";
+    fn one_record_per_line_whatever_the_jar_contains() {
+        // This test used to assert that a tab-separated Netscape jar survived
+        // the file, which was right when the store held the engine's raw output
+        // and became wrong the moment `to_settable` landed — the store holds the
+        // settable form now, and `load` rejects anything else on purpose. Kept,
+        // rewritten, because the property it was really guarding still matters:
+        // whatever a value contains, the writer must not turn one record into
+        // two.
+        let dir = scratch("layout");
+        let jar = ".ROBLOSECURITY=a-value-with-a-\\-backslash; other=1";
         save(&dir, &[("roblox.com".into(), Jar::from_stored(jar.into()))]).unwrap();
 
         let raw = std::fs::read_to_string(dir.join(FILE)).unwrap();
         assert_eq!(raw.lines().count(), 2, "header plus exactly one record: {raw:?}");
 
         let read = load(&dir);
-        assert_eq!(read.len(), 1, "the record must not be dropped for holding a tab");
+        assert_eq!(read.len(), 1);
         assert_eq!(read[0].1.expose(), jar, "and it must come back byte for byte");
     }
 
@@ -668,6 +714,29 @@ mod tests {
         ] {
             assert_eq!(unescape(&escape(original)), original, "on {original:?}");
         }
+    }
+
+    #[test]
+    fn a_store_in_the_pre_conversion_format_is_discarded_not_replayed() {
+        // This one reached a real account. Before `to_settable` existed the
+        // store held the engine's own Netscape output; `nativeSetMultipleCookies`
+        // accepts that and discards it, so the restore reported five domains
+        // restored and left the engine holding nothing. Feeding it to the engine
+        // is strictly worse than treating the file as absent, because the user
+        // is signed out either way and only one of the two says why.
+        let dir = scratch("stale-format");
+        let netscape = "#HttpOnly_.roblox.com\tTRUE\t/\tFALSE\t0\t.ROBLOSECURITY\tvalue";
+        save(
+            &dir,
+            &[
+                ("roblox.com".into(), Jar::from_stored(netscape.into())),
+                ("apis.roblox.com".into(), Jar::from_stored("a=1; b=2".into())),
+            ],
+        )
+        .unwrap();
+        let read = load(&dir);
+        assert_eq!(read.len(), 1, "the Netscape-form record must not be replayed");
+        assert_eq!(read[0].0, "apis.roblox.com", "and the settable one must survive");
     }
 
     #[test]

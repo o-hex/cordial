@@ -27,6 +27,26 @@ use std::sync::{Mutex, OnceLock};
 pub const BUTTON_PRIMARY: i32 = 1;
 pub const BUTTON_SECONDARY: i32 = 2;
 pub const BUTTON_TERTIARY: i32 = 4;
+
+/// `nativePassMouseButton`'s own button index, which is not Android's bitmask.
+///
+/// Only one value here is established: 0 is the left button, because that is
+/// what Cordial has always sent and clicking Roblox's interface works. The
+/// other two are `INFERRED` from Roblox's own `Enum.UserInputType`, where
+/// `MouseButton1`/`2`/`3` are left/right/middle in that order — a zero-based
+/// index whose 0 is the left button is that enum minus one. The dex declares
+/// the parameter as a bare `I` and strips parameter names, so nothing readable
+/// settles it; a human with a mouse does, in one click.
+///
+/// Getting this wrong is not silent: the right button would act as some other
+/// button rather than doing nothing.
+pub fn roblox_mouse_button(android_button: i32) -> i32 {
+    match android_button {
+        BUTTON_SECONDARY => 1,
+        BUTTON_TERTIARY => 2,
+        _ => 0,
+    }
+}
 pub const ACTION_DOWN: i32 = 0;
 pub const ACTION_UP: i32 = 1;
 pub const ACTION_MOVE: i32 = 2;
@@ -334,18 +354,66 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
     }
 }
 
+/// Where the pointer was the last time one was reported, so the next report
+/// can carry how far it moved. `None` means "no previous position to subtract"
+/// — see [`reset_mouse_delta`].
+static MOUSE_LAST: Mutex<Option<(f32, f32)>> = Mutex::new(None);
+
+/// Forget the last reported pointer position, so the next move reports a zero
+/// delta rather than the distance from wherever the pointer was before.
+///
+/// Called when the pointer enters or leaves the canvas. Without it, a pointer
+/// that left at one edge and came back at the other would report the whole
+/// width of the window as a single movement — and a delta is what turns the
+/// camera, so that is not a cosmetic error but a view that snaps round.
+pub fn reset_mouse_delta() {
+    *MOUSE_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Split a new absolute position into itself and the movement since the last
+/// one. Separate from [`pass_mouse_move`] so the arithmetic — specifically the
+/// first-event case — is testable without a loaded engine.
+fn mouse_delta(x: f32, y: f32) -> (f32, f32) {
+    let mut last = MOUSE_LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let d = match *last {
+        Some((px, py)) => (x - px, y - py),
+        None => (0.0, 0.0),
+    };
+    *last = Some((x, y));
+    d
+}
+
+/// `nativePassMouseMove(F x, F y, F dx, F dy)`.
+///
+/// The last two arguments used to be sent as constant zeros, which is the
+/// likeliest reason the mouse would not turn the camera: an absolute position
+/// says where the cursor is, and a camera is rotated by how far it *moved*. The
+/// dex declares `(FFFF)V` and strips parameter names, so "the last two are the
+/// delta" is `INFERRED` — but it is the shape this file already assumed when it
+/// hardcoded zeros, and a real delta is strictly closer to the truth than a
+/// value that says the pointer never moves.
 pub fn pass_mouse_move(x: f32, y: f32) {
+    let (dx, dy) = mouse_delta(x, y);
     let f = PASS_MOUSE_MOVE.load(std::sync::atomic::Ordering::Relaxed);
     if !f.is_null() {
-        let _ = cordial_linker_sys::game_activity::pass_mouse_move(f, x, y, 0.0, 0.0);
+        let _ = cordial_linker_sys::game_activity::pass_mouse_move(f, x, y, dx, dy);
     }
 }
 
-pub fn pass_mouse_button(x: f32, y: f32, down: bool) {
+/// `nativePassMouseButton(F x, F y, Z down, I button)`.
+///
+/// `android_button` is the `MotionEvent.BUTTON_*` bit the backend decoded;
+/// [`roblox_mouse_button`] turns it into this interface's own index.
+///
+/// Only the primary button used to be delivered here at all, and always as
+/// index 0. Roblox turns the camera on a right-button drag, so a client that
+/// never reports a right button cannot turn its camera with the mouse however
+/// well the rest of the path works.
+pub fn pass_mouse_button(x: f32, y: f32, down: bool, android_button: i32) {
     let f = PASS_MOUSE_BUTTON.load(std::sync::atomic::Ordering::Relaxed);
     if !f.is_null() {
-        // Button 0 is the primary button in this interface's numbering.
-        let _ = cordial_linker_sys::game_activity::pass_mouse_button(f, x, y, down, 0);
+        let button = roblox_mouse_button(android_button);
+        let _ = cordial_linker_sys::game_activity::pass_mouse_button(f, x, y, down, button);
     }
 }
 
@@ -780,6 +848,37 @@ mod tests {
         // delete is therefore the correct, safe answer, not a bug.
         assert!(!f.delete_surrounding(1, 0));
         assert_eq!(f.text, "café");
+    }
+
+    #[test]
+    fn every_mouse_button_maps_to_its_own_index() {
+        // The bug this replaces was not a wrong index, it was no index at all:
+        // only the primary button was ever delivered, and always as 0. A test
+        // that the three are distinct is what stops a future edit collapsing
+        // them back into one.
+        assert_eq!(roblox_mouse_button(BUTTON_PRIMARY), 0);
+        assert_eq!(roblox_mouse_button(BUTTON_SECONDARY), 1);
+        assert_eq!(roblox_mouse_button(BUTTON_TERTIARY), 2);
+    }
+
+    #[test]
+    fn the_first_move_after_the_pointer_arrives_has_no_delta() {
+        // One test rather than several, because `mouse_delta` reads and writes
+        // a process-wide last-position and Rust runs tests in parallel threads
+        // — two tests sharing it would race and fail intermittently, which is
+        // worse than no test.
+        //
+        // The case that matters is the first one. A pointer that re-enters the
+        // canvas at the far side must not report the width of the window as a
+        // single movement: a delta is what turns the camera, so that would
+        // snap the view round rather than merely be slightly wrong.
+        reset_mouse_delta();
+        assert_eq!(mouse_delta(100.0, 50.0), (0.0, 0.0));
+        assert_eq!(mouse_delta(103.0, 47.0), (3.0, -3.0));
+        assert_eq!(mouse_delta(103.0, 47.0), (0.0, 0.0));
+        reset_mouse_delta();
+        assert_eq!(mouse_delta(900.0, 47.0), (0.0, 0.0));
+        reset_mouse_delta();
     }
 
     #[test]

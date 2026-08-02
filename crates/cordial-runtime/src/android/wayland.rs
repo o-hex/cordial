@@ -1206,9 +1206,10 @@ impl WaylandWindow {
             }
         }
 
-        if android_button == super::input::BUTTON_PRIMARY {
-            super::input::pass_mouse_button(x, y, press);
-        }
+        // Every button, not only the primary one. The gate that used to stand
+        // here dropped right and middle before they reached Roblox's own input
+        // path, and a right-button drag is how a mouse turns the camera.
+        super::input::pass_mouse_button(x, y, press, android_button);
     }
 }
 
@@ -1238,6 +1239,10 @@ unsafe extern "C" fn pointer_enter(
     if !ours {
         return;
     }
+    // Arriving somewhere is not moving there. `pass_mouse_move` reports how far
+    // the pointer travelled, and the distance from wherever it was when it last
+    // left the canvas is not a movement the user made.
+    super::input::reset_mouse_delta();
     w.hide_pointer(pointer, serial);
     // Subsurface coordinates are relative to the subsurface, so these are
     // already canvas-local — no offset for the header bar has to be
@@ -1247,6 +1252,7 @@ unsafe extern "C" fn pointer_enter(
 }
 unsafe extern "C" fn pointer_leave(_data: *mut c_void, _pointer: *mut c_void, _serial: u32, _surface: *mut c_void) {
     POINTER_ON_CANVAS.store(false, Ordering::Release);
+    super::input::reset_mouse_delta();
 }
 unsafe extern "C" fn pointer_motion(_data: *mut c_void, _pointer: *mut c_void, _time: u32, x: i32, y: i32) {
     if !POINTER_ON_CANVAS.load(Ordering::Acquire) {

@@ -824,10 +824,11 @@ impl HostWindow {
             deliver_touch(handle, ACTION_UP, x, y, buttons, 0, now, down_time);
         }
 
-        // The interface's own input path, alongside AGDK's.
-        if android_button == BUTTON_PRIMARY {
-            pass_mouse_button(x, y, press);
-        }
+        // The interface's own input path, alongside AGDK's — and every button,
+        // not only the primary one. The gate that used to stand here dropped
+        // right and middle before they reached Roblox at all, and a
+        // right-button drag is how a mouse turns the camera.
+        pass_mouse_button(x, y, press, android_button);
     }
 
     fn dispatch_motion(&self, handle: i64, ev: &XInputEvent) {

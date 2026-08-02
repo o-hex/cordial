@@ -527,7 +527,10 @@ pub fn pass_mouse_move(x: f32, y: f32) {
         report_unregistered("nativePassMouseMove");
         return;
     }
-    let _ = cordial_linker_sys::game_activity::pass_mouse_move(f, x, y, dx, dy);
+    let r = cordial_linker_sys::game_activity::pass_mouse_move(f, x, y, dx, dy);
+    if trace_mouse() {
+        eprintln!("[cordial] nativePassMouseMove(x={x}, y={y}, dx={dx}, dy={dy}) -> {r:?}");
+    }
 }
 
 /// `nativePassMouseButton(F x, F y, Z down, I button)`.
@@ -546,7 +549,13 @@ pub fn pass_mouse_button(x: f32, y: f32, down: bool, android_button: i32) {
         return;
     }
     let button = roblox_mouse_button(android_button);
-    let _ = cordial_linker_sys::game_activity::pass_mouse_button(f, x, y, down, button);
+    let r = cordial_linker_sys::game_activity::pass_mouse_button(f, x, y, down, button);
+    if trace_mouse() {
+        eprintln!(
+            "[cordial] nativePassMouseButton(x={x}, y={y}, down={down}, \
+             android={android_button}, roblox={button}) -> {r:?}"
+        );
+    }
 }
 
 /// One wheel movement, through both input paths, in detents.
@@ -626,6 +635,25 @@ fn wheel_scale() -> f32 {
 /// `CORDIAL_TRACE_WHEEL=1`. Its own switch for the same reason
 /// `CORDIAL_TRACE_TEXT` has one: the question is what Cordial *sent*, and the
 /// general trace is documented as ABI-unsafe and aborts the engine.
+/// `CORDIAL_TRACE_MOUSE=1` — every pointer call Cordial makes into the engine.
+///
+/// Added because hovering a game card shows a Play button on Sober and does not
+/// here, and nothing could say whether the hover events were arriving at all.
+/// `nativePassMouseMove` had never been traced, so "the engine ignores hover"
+/// and "the engine is never told about hover" looked identical from outside —
+/// the same ambiguity that made the keyboard take days, where four theories all
+/// assumed a delivery problem and the answer was an interpretation one.
+///
+/// Note the argument meaning of `nativePassMouseMove(FFFF)` is INFERRED as
+/// `(x, y, dx, dy)`. Four floats and no tell to disambiguate them, unlike
+/// `nativePassKeyEvent`, whose missing scan-code slot said what vocabulary it
+/// wanted once anyone read it. If hover events arrive and still do nothing, that
+/// inference is the first thing to doubt.
+pub fn trace_mouse() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_TRACE_MOUSE").is_some())
+}
+
 pub fn trace_wheel() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CORDIAL_TRACE_WHEEL").is_some())

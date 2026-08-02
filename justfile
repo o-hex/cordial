@@ -118,7 +118,7 @@ client *args:
     #!/usr/bin/env bash
     set -euo pipefail
     set -- {{ args }}
-    apk="" lib="" run="600" env=host extra=()
+    apk="" lib="" run="600" env=host x11=0 extra=()
     # `--apk` and `--lib-dir` are spelled the way cordial-run spells them: this
     # recipe exists to stop people assembling that command by hand, not to teach
     # a second vocabulary for it. Anything unrecognised passes straight through,
@@ -133,9 +133,18 @@ client *args:
             --run=*)     run="${1#*=}"; shift ;;
             --in)        env="${2:-}"; shift 2 ;;
             --in=*)      env="${1#*=}"; shift ;;
+            --x11)       x11=1; shift ;;
             *)           extra+=("$1"); shift ;;
         esac
     done
+    # Wayland unless asked otherwise, because ADR-011 makes it the target and the
+    # shell has always launched with it. This recipe did not, so `just dev` and
+    # `just client` ran DIFFERENT display backends, and every fix verified through
+    # one was being tested through the other. X11 is still reachable with --x11
+    # until ADR-011's removal trigger fires.
+    if [ "${x11:-0}" != 1 ]; then
+        export CORDIAL_WAYLAND=1
+    fi
     # Cordial ships no Roblox build. Sober downloads the same official Android
     # one this runtime loads, so checking there first means a debugging run needs
     # no arguments. The shell says all this properly to a user who has neither.

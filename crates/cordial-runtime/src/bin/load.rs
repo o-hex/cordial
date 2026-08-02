@@ -98,12 +98,36 @@ fn parse() -> Result<Options, String> {
         dump_classes: None,
         verbose: false,
     };
+    // Before anything can latch a profile. ADR-012's move used to be driven only
+    // from the shell's `main`, so a client started any other way — `just client`,
+    // or a hand-typed command — silently kept writing to the pre-ADR-012
+    // `instances/default` while a shell-started one used `profiles/default`.
+    // Signing in through one and restarting through the other then looked exactly
+    // like the session being dropped. This is a no-op once the move has happened.
+    cordial_runtime::profile::migrate_legacy_layout();
+
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--lib-dir" => opt.lib_dir = args.next().ok_or("--lib-dir needs a value")?,
             "--library" => opt.library = args.next().ok_or("--library needs a value")?,
             "--apk" => opt.apk = Some(args.next().ok_or("--apk needs a path")?),
+            // Which profile's storage this instance runs against. The profile is
+            // an argument and the settings inside it are not, deliberately: one
+            // value decides where everything else lives, and a setting passed on
+            // a command line cannot change while the client runs — which the
+            // dynamic DFFlag families exist precisely to do (ADR-013).
+            //
+            // This has to be resolved before anything reads the profile, because
+            // `profile::active()` latches on first use. Without it the client
+            // wrote to `instances/default` while a shell-started one wrote to
+            // `profiles/<name>`, and signing in through one and restarting
+            // through the other looked exactly like the session being lost.
+            "--profile" => {
+                let name = args.next().ok_or("--profile needs a name")?;
+                let dir = cordial_runtime::profile::dir(&name)?;
+                cordial_runtime::profile::set_active(dir)?;
+            }
             "--read-asset" => {
                 opt.read_asset = Some(args.next().ok_or("--read-asset needs a name")?)
             }
@@ -228,11 +252,11 @@ fn enter_run_dir(opt: &mut Options) {
         }
     }
 
-    let root = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("cordial/instances/default/run");
+    // The engine's working directory, inside whichever profile this instance was
+    // given. This used to compute `instances/default` by hand while the rest of
+    // the process had moved to `profiles/<name>`, which put the run directory and
+    // the data directory in different trees.
+    let root = cordial_runtime::profile::active().join("run");
     if let Err(e) = std::fs::create_dir_all(root.join("exe")) {
         println!("  could not create {}: {e}", root.display());
         return;
@@ -582,14 +606,13 @@ fn main() -> ExitCode {
                         // Android app's `files` and `cache` dirs always exist by
                         // the time any app code runs, so the engine is entitled
                         // to assume it.
+                        // `profile::active()` rather than a second hand-rolled
+                        // path: this used to compute `instances/default` here
+                        // while everything else in the process had moved to
+                        // `profiles/<name>`, so the engine's own storage ended up
+                        // in a directory nothing else looked at.
                         let root = std::env::var("CORDIAL_FILES_DIR").unwrap_or_else(|_| {
-                            format!(
-                                "{}/cordial/instances/default/data",
-                                std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!(
-                                    "{}/.local/share",
-                                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
-                                ))
-                            )
+                            format!("{}/data", cordial_runtime::profile::active().display())
                         });
                         let files = format!("{root}/files");
                         let cache = format!("{root}/cache");

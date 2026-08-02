@@ -173,7 +173,41 @@ Install `pipewire-devel` (`libpipewire-0.3-dev` on Debian/Ubuntu) before
 building if you want to work on OpenSL ES audio — `native/CMakeLists.txt`
 detects it with `pkg-config` at configure time and prints which way it went.
 Without it the build still succeeds; `slCreateEngine` just reports failure, as
-it did before audio existed here.
+it did before audio existed here. `webkitgtk6.0-devel` is the same shape for the
+web views.
+
+**That optionality is a trap worth naming.** Those two probes mean the tree
+compiles either way and quietly produces a different Cordial, so two people on
+the same commit can measure different binaries and neither can tell. In a
+project whose method is "verify by running", that costs more than a missing
+feature.
+
+### Or use the flake
+
+```bash
+nix develop      # or `direnv allow`, using the .envrc
+just check
+```
+
+`flake.nix` pins Clang, Rust, GTK4, libadwaita **and** both optional
+dependencies, so everyone builds the same thing. It prints the version of each
+on entry. It builds Cordial and nothing else: you still run the client on your
+own host with `just dev`, because the engine's behaviour depends on the real
+graphics stack, compositor and glibc — `--host-libc` makes that dependence
+explicit — and a hermetic runtime would be measuring something nobody ships.
+Users install the Flatpak; this is a contributor's shell.
+
+The per-distro lists above stay first-class. Most contributors do not have Nix
+and should not need it.
+
+**`INFERRED`, and stated plainly: the flake has not been built successfully by
+anyone yet.** It was written on a Fedora Silverblue host where `/nix` is part of
+the read-only ostree image and `nix-daemon` is disabled, so `nix flake check`
+fails with `Read-only file system` before evaluating anything. On such a host
+the store needs to be made writable first — the Determinate Systems installer
+handles ostree, or a systemd mount unit can bind a writable directory over
+`/nix`. If you are the first to run it and it works, say so and delete this
+paragraph.
 
 `webkitgtk6.0-devel` (`libwebkitgtk-6.0-dev` on Debian/Ubuntu) will be needed by
 whoever picks up the web view — Marketplace, Profile, Communities and most

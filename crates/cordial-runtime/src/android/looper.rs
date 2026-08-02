@@ -196,6 +196,12 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         );
+        // The engine's cookie jar is memory-only, so somebody has to write it
+        // down. Driven from here rather than from the engine's own `Set-Cookie`
+        // callback because that callback arrives on the engine's HTTP thread
+        // and reading the jar back from inside it would re-enter the engine on
+        // its own thread. Cheap when nothing has changed: one relaxed load.
+        crate::cookies::flush_if_dirty();
     }
 
     // Clean teardown, once the run ends. Cordial previously just fell through
@@ -203,6 +209,13 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
     // process being killed mid-frame as far as the engine is concerned — it
     // never got a chance to flush the flag cache and telemetry it writes to
     // disk on the way through this chain.
+    //
+    // The last cookie flush goes *before* that descent, not after: the jar
+    // lives in the engine, and after `terminateNativeCode` there is nothing
+    // left to read it out of. Unconditional rather than dirty-gated, because
+    // the engine only notifies on `Set-Cookie` and a session that was restored
+    // at startup and never changed would otherwise not be written back.
+    crate::cookies::flush("teardown");
     if let Some(handle) = game_activity_handle {
         teardown(handle);
     }

@@ -1,8 +1,15 @@
 # Sign-in — what it would actually take
 
-**Status: discovery only. Nothing here is implemented.** No credentials were
-used, entered, or created while writing this. This document exists to turn
-"there is no sign-in" from a known gap into a scoped, evidence-backed plan.
+**Status: §2 and §5 are implemented; the rest is still discovery.** The cookie
+persistence §5.2 proposed now exists (`crates/cordial-runtime/src/cookies.rs`,
+`native/cookies.cpp`), so a session survives a restart. **§8 records what that
+implementation measured, including two places where §5.2 was wrong** — read it
+before trusting §5.2's positions. Everything about *obtaining* a session (§3,
+§4) is unchanged and still discovery.
+
+No credentials were used, entered, or created while writing this document or
+implementing §8. This document exists to turn "there is no sign-in" from a known
+gap into a scoped, evidence-backed plan.
 
 **Related:** `docs/design/instances-and-launch.md` (a related, independently
 written and *not yet verified* theory about a `roblox://` ticket-launch path —
@@ -223,6 +230,16 @@ unsurprising). Treat `JNICookieManager` as dead code, not a second live
 contract — the three `NativeSettingsInterface` methods plus
 `JNICookieProtocol` are the live path.
 
+**Confirmed when §8 was implemented.** Both halves were re-checked
+independently: `readelf --dyn-syms` still shows all four
+`JNICookieManager_{getCookie,setCookie,setCookiesFromDisk,convertCookiesToNetscape}`
+exports, and plain `strings` over all three dex files still returns zero
+occurrences of the class name, while `JNICookieProtocol$OnSetCookieHandler`
+appears in `classes2.dex` exactly as this section describes. Nothing was built
+against `JNICookieManager`, and `setCookiesFromDisk` in particular — which is
+the one that sounds like the answer to this whole problem — has no caller and
+no disk file to read.
+
 ---
 
 ## 3. Is a WebView required?
@@ -432,6 +449,13 @@ NativeGLInterface.nativeAppBridgeV2StartAppWithParams                (~1116)
    (§2.1, previously undocumented) should be called in the same neighborhood
    — its exact required timing relative to the cookie call is **not verified**
    and would need to be checked against behaviour, not assumed.
+
+   > **Corrected by measurement — see §8.** The position named here is wrong.
+   > Called before `nativeAppBridgeSetInitParams` the native returns cleanly
+   > and stores nothing at all; the engine's cookie jar does not exist until
+   > `nativeAppBridgeV2InitWithParams` has built it. The *reasoning* was right
+   > and is preserved by the corrected position, which is immediately after
+   > that call and still before `StartLuaAppDM`.
 2. **Register a real `OnSetCookieHandler`** via
    `JNICookieProtocol.updateOnSetCookieHandler` (§2.2) so cookies the engine's
    own HTTP client subsequently receives (e.g. a session refresh) are
@@ -781,3 +805,107 @@ for.**
   most likely, federated/passkey login certainly), so it is not removed as a
   dependency of the project — but it is no longer required to render the
   first, most common screen a user would see.
+
+---
+
+## 8. Implemented: the session now survives a restart
+
+§5.2 was written as a plan conditioned on "having a real cookie to put in it".
+That condition was met — the owner signed in via Quick Sign-in — and the plan
+was implemented. Two of its five steps turned out to be wrong in ways that
+produced a working call and an empty jar, which is exactly the failure mode
+this document's own §7.2 methodology note warns about, so both are recorded
+here rather than only fixed in code.
+
+No account was created and no credentials were entered while establishing any
+of this. Every measurement below used a marker cookie with an obviously fake
+value, in a scratch profile under a scratch `XDG_DATA_HOME`.
+
+### 8.1 The problem was never a shutdown flush **[verified: measurement]**
+
+The engine **never writes its cookies to disk**. A complete
+`CORDIAL_TRACE_PATHS=1` inventory of every non-system file it opens contains no
+cookie jar and no credential store; `grep -rl ROBLOSECURITY` over real profile
+trees finds nothing. §2.2's three-way sync is the whole mechanism, and on
+Android the persistence leg is Java's — `OnSetCookieHandlerImpl` in the capture.
+Cordial has no Java side, so nothing persisted anything.
+
+This was controlled for rather than assumed: alternating killed and graceful
+runs, two passes, produced no file created or updated at shutdown that a killed
+run does not also produce. The graceful teardown descent (`looper.rs`) is real,
+works, and was never the missing piece.
+
+### 8.2 The natives do nothing until the app bridge exists **[verified: live run]**
+
+§5.2 step 1 says to call `nativeSetMultipleCookies` before
+`nativeAppBridgeSetInitParams`. `CORDIAL_COOKIE_PROBE=1` sets a marker cookie
+and reads it straight back at four points in the startup sequence:
+
+| Point in `load.rs` | marker read back |
+|---|---|
+| before `nativeAppBridgeSetInitParams` (§5.2's position) | **0 bytes** |
+| after `nativeAppBridgeSetInitParams` | **0 bytes** |
+| after `nativeAppBridgeV2InitWithParams` | **51 bytes** |
+| after `nativeAppBridgeStartLuaAppDM` | 51 bytes |
+| at teardown | 51 bytes |
+
+The call returns success at every one of these. Nothing distinguishes the two
+that do nothing from the three that work except reading the jar back, which is
+why the restore path now does exactly that on every launch. The restore was
+moved to immediately after `nativeAppBridgeV2InitWithParams`, which preserves
+§5.2's actual requirement — it is still before `StartLuaAppDM`, and so before
+the app shell issues its first `authenticated/*` request.
+
+### 8.3 The getter and the setter are not mirrors **[verified: live run]**
+
+`nativeSetMultipleCookies` takes `name=value` pairs, a `Cookie:` header.
+`nativeGetCookiesForDomain` does **not** return that shape. Feeding the getter's
+output straight back is accepted silently and leaves the engine holding nothing:
+51 bytes written, 0 bytes in the jar afterwards.
+
+The getter's format was established by planting two cookies of known name and
+value length and counting separators — never by printing a jar. Three cookies
+come back as nineteen tab-separated fields of widths
+`[21, 4, 1, 5, 1, 4, 27, 4, 1, 5, 1, 6, 29, 4, 1, 5, 1, 12, 1]`, which resolves
+uniquely to Netscape `cookies.txt` records —
+
+```text
+#HttpOnly_.roblox.com <TAB> TRUE <TAB> / <TAB> FALSE <TAB> 0 <TAB> NAME <TAB> VALUE
+```
+
+— joined by `"; "` rather than by a newline. The 21-wide field is
+`#HttpOnly_.roblox.com`; the `4/1/5/1` run is `TRUE`, `/`, `FALSE`, `0`; the 4-,
+6- and 12-wide fields are the three planted names; and the 27- and 29-wide
+fields are a value glued to the next record's domain across the two-character
+separator (4+2+21, 6+2+21). `cookies.rs`'s `to_settable` is the conversion, and
+the store holds the converted form so that a restore is a straight hand-over.
+
+This is also why `nativeGetCookiesInNetscapeFormat` exists as a separate
+entry point and is not needed here.
+
+### 8.4 What is verified, and what is not
+
+**Verified, over five consecutive runs plus a disabled control:** a jar read out
+of the engine, converted, written to `<profile>/cookies` at `0600` by temporary
+file and rename, restored on the next launch, and confirmed present by reading
+the engine's jar back afterwards. With `CORDIAL_SKIP_COOKIES=1` — same binary,
+same profile — nothing is restored, nothing is saved, and the store is byte-for-byte
+untouched.
+
+**INFERRED, and deliberately not depended on:** the `JNICookieProtocol`
+`OnSetCookieHandler` callback (§2.2, §5.2 step 2). It is registered, and
+`--dump-classes` shows the nested class and `onSetCookie` present where before
+this change no cookie class appeared at all. But it has **never been observed
+firing under Cordial**: over every run here the sink was called zero times,
+while the engine's own log showed it reaching the network and collecting the
+401s §1.3 documents. The capture's cookie traffic comes from requests Roblox's
+*Java* code issues, and Cordial runs no dex. The dump reports `onSetCookie`
+under two descriptors, so it does not settle which one the engine would resolve
+either. The session is therefore saved by reading the jar back on a thirty-second
+timer and at teardown, which needs no callback; if the callback does fire it
+only makes those saves prompt.
+
+**Still out of scope here:** §5.2 steps 3 and 4 (`StartAppParams` and
+`NativeUserJavaInterface`). §1.3's finding stands — those are presentation-layer
+mirrors, and the cookie is what unblocks `authenticated/*`. Whether they now
+need filling in is answerable only against a genuinely signed-in run.

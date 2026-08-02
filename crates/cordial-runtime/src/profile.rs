@@ -16,8 +16,10 @@
 //! login.
 //!
 //! A profile now holds configuration as well as storage — the user's
-//! `flags.json`, `plugin-grants.json`, and `plugins/<id>/settings.json` for
-//! each plugin that keeps anything. See
+//! `flags.json`, `plugin-grants.json`, `plugins/<id>/settings.json` for each
+//! plugin that keeps anything, and, since the engine turned out never to write
+//! its cookies anywhere, the session itself in `cookies` at `0600`
+//! (`cookies.rs`). See
 //! [ADR-013](../../../docs/adr/ADR-013-per-profile-configuration.md), which
 //! extends ADR-012 and records why grants in particular had to stop being
 //! global: a plugin approved in a throwaway profile was silently approved in
@@ -85,6 +87,16 @@ static ACTIVE: OnceLock<PathBuf> = OnceLock::new();
 /// which is the corruption ADR-012's lock exists to prevent — arriving by a
 /// different door.
 pub fn set_active(dir: PathBuf) -> Result<(), String> {
+    // Create and tighten here as well as in `acquire`, because they are not the
+    // same door. The launcher calls `acquire`, which does both; a hand-started
+    // `cordial-run --profile <name>` calls only this, and so ran against a
+    // directory `create_dir_all` had left at the umask's `0755`. That was
+    // survivable while the profile only held Roblox's own storage. It is not
+    // now that Cordial writes a session token into it — see `cookies.rs` and
+    // ADR-012 — so the mode is applied wherever a profile is chosen, not only
+    // where it is locked.
+    let _ = std::fs::create_dir_all(&dir);
+    restrict_to_owner(&dir);
     match ACTIVE.set(dir.clone()) {
         Ok(()) => Ok(()),
         Err(_) if ACTIVE.get() == Some(&dir) => Ok(()),
@@ -171,18 +183,28 @@ pub fn acquire(name: &str) -> Result<Lock, String> {
 
 /// Make a profile directory readable only by its owner.
 ///
-/// Roblox keeps its session cookie inside the profile, so the directory holds a
-/// live credential even though Cordial itself never reads or handles one.
-/// `create_dir_all` applies the process umask, which on a normal desktop yields
-/// `0755` — world-readable, so any other account on the machine can take the
-/// session.
+/// The profile holds a live session, so `create_dir_all` applying the process
+/// umask — `0755` on a normal desktop — would let any other account on the
+/// machine take it.
 ///
-/// This is deliberately the whole of Cordial's credential handling. Putting the
-/// cookie in a keyring was considered and rejected: the engine reads it from a
-/// file at startup, so it would have to be written back to disk before every
-/// launch and would be plaintext there for the entire session anyway, and doing
-/// so would make Cordial the custodian of a token it currently never touches.
-/// Correct permissions defend against the case that is actually reachable.
+/// **The paragraph that used to stand here was wrong, and the correction is the
+/// point of this comment.** It said Cordial "never reads or handles" a session
+/// token, that the engine reads its cookie from a file at startup, and rejected
+/// a keyring partly on that basis. The engine does no such thing: a complete
+/// `CORDIAL_TRACE_PATHS=1` inventory of every non-system file it opens contains
+/// no cookie jar, and `grep -rl ROBLOSECURITY` over a real profile tree finds
+/// nothing. The engine keeps its cookies in memory and expects the Java side of
+/// the app to persist them, which on Android it does and under Cordial nothing
+/// did — that is the whole of why signing in and restarting presented as being
+/// logged out. Cordial now reads the jar out of the engine and writes it here,
+/// so it *is* the custodian of a session token. See `cookies.rs` and ADR-012,
+/// which records the reversal rather than quietly dropping the old reasoning.
+///
+/// The keyring is still rejected, but for the reason that survives: the token
+/// has to be handed to the engine in plaintext on every launch, so a keyring
+/// would encrypt it only while nothing is using it, in exchange for an unlock
+/// prompt on every start. Permissions defend against the case that is actually
+/// reachable, and the store itself is `0600` inside this `0700` directory.
 ///
 /// Best-effort: a filesystem without Unix permissions is not a reason to refuse
 /// to launch, and the failure is reported by the launch continuing rather than

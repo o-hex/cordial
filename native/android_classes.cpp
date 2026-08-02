@@ -864,6 +864,14 @@ namespace cordial {
 void register_accessibility_classes(jnivm::ENV* env);
 }
 
+// Defined in cookies.cpp, and in its own file for the same reason: it answers
+// one surface (`com.roblox.universalapp.cookie.*`) whose header comment has to
+// carry the measurement that a session is not persisted anywhere on disk by
+// the engine itself, which is long and does not belong in this file's preamble.
+namespace cordial {
+void register_cookie_classes(jnivm::ENV* env);
+}
+
 extern "C" void cordial_register_android_classes(void* env_ptr) {
     auto* env = static_cast<jnivm::ENV*>(env_ptr);
     if (!env) {
@@ -880,6 +888,7 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
     cordial::VideoCodecCapability::Register(env);
     cordial::MediaCodecInfoUtils::Register(env);
     cordial::register_accessibility_classes(env);
+    cordial::register_cookie_classes(env);
     if (getenv("CORDIAL_JNI_TRACE")) {
         fprintf(stderr, "[classes] Cordial's Java side registered\n");
     }

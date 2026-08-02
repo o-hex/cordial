@@ -780,6 +780,81 @@ fn main() -> ExitCode {
                                             }
                                         }
 
+                                        // The cookie natives, resolved here
+                                        // and used later.
+                                        //
+                                        // The engine keeps its cookie jar in
+                                        // memory only — measured, not assumed:
+                                        // a full `CORDIAL_TRACE_PATHS=1`
+                                        // inventory of every file it opens has
+                                        // no cookie jar in it. On Android the
+                                        // Java side persists them and hands
+                                        // them back at startup, and Cordial has
+                                        // no Java side, which is the whole of
+                                        // why signing in and restarting
+                                        // presented as being logged out.
+                                        //
+                                        // The handler is registered *here*, as
+                                        // early as it resolves, because it only
+                                        // reports changes: one registered after
+                                        // a `Set-Cookie` has already been dealt
+                                        // with never hears about that cookie.
+                                        // Restoring has to wait, and the call
+                                        // that does it sits after the app
+                                        // bridge with the measurement that put
+                                        // it there.
+                                        if cordial_runtime::cookies::enabled() {
+                                            match lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetMultipleCookies",
+                                            ) {
+                                                None => println!(
+                                                    "  [cookies] nativeSetMultipleCookies not exported; a saved session cannot be restored"
+                                                ),
+                                                // SAFETY: the symbol resolved
+                                                // under its own name, so it is
+                                                // the static native this
+                                                // signature describes.
+                                                Some(f) => unsafe {
+                                                    cordial_runtime::cookies::set_push(f)
+                                                },
+                                            }
+                                            match lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeGetCookiesForDomain",
+                                            ) {
+                                                None => println!(
+                                                    "  [cookies] nativeGetCookiesForDomain not exported; a session cannot be saved"
+                                                ),
+                                                // SAFETY: as above.
+                                                Some(f) => unsafe {
+                                                    cordial_runtime::cookies::set_pull(f)
+                                                },
+                                            }
+
+                                            // The engine's own notification that
+                                            // its jar changed. Verified firing
+                                            // four times in the Waydroid capture
+                                            // on a logged-out start — the device
+                                            // and tracking cookies exercise the
+                                            // identical plumbing an auth cookie
+                                            // does.
+                                            match lib.symbol(
+                                                "Java_com_roblox_universalapp_cookie_JNICookieProtocol_updateOnSetCookieHandler",
+                                            ) {
+                                                None => println!(
+                                                    "  [cookies] updateOnSetCookieHandler not exported; cookie changes will not be noticed"
+                                                ),
+                                                Some(f) => match linker::game_activity::cookies_register_handler(
+                                                    f,
+                                                    cordial_runtime::cookies::observe_host,
+                                                ) {
+                                                    Ok(()) => println!("  [cookies] OnSetCookieHandler registered"),
+                                                    Err(e) => println!("  [cookies] updateOnSetCookieHandler failed: {e}"),
+                                                },
+                                            }
+                                        } else {
+                                            println!("  [cookies] persistence off (CORDIAL_SKIP_COOKIES)");
+                                        }
+
                                         let files = files.clone();
                                         let cache = cache.clone();
                                         let steps: Vec<(&str, Box<dyn Fn(*mut std::ffi::c_void) -> Result<(), String>>)> = vec![
@@ -1184,6 +1259,67 @@ fn main() -> ExitCode {
                                                 Err(e) => println!("  app bridge init failed: {e}"),
                                             }
                                         }
+
+                                        // The saved session goes back in here,
+                                        // and this position was measured rather
+                                        // than chosen.
+                                        //
+                                        // docs/design/sign-in.md §5.2 said to
+                                        // call `nativeSetMultipleCookies`
+                                        // before `nativeAppBridgeSetInitParams`,
+                                        // reasoning that the cookie must be in
+                                        // place before the engine starts hitting
+                                        // `authenticated/*`. The reasoning is
+                                        // right and the position was wrong:
+                                        // called that early the native returns
+                                        // cleanly and does nothing at all.
+                                        // `CORDIAL_COOKIE_PROBE=1` sets a marker
+                                        // and reads it straight back at four
+                                        // points in this sequence, and the
+                                        // answer is 0 bytes at startup, 0 after
+                                        // init params, and 51 from here onwards
+                                        // — the engine's cookie jar does not
+                                        // exist until `nativeAppBridgeV2InitWithParams`
+                                        // has built it. That document has been
+                                        // corrected.
+                                        //
+                                        // Still before `StartLuaAppDM` below,
+                                        // which is what actually sets the app
+                                        // shell running and produces the first
+                                        // `authenticated/*` request, so the
+                                        // ordering the design doc wanted is
+                                        // preserved.
+                                        if cordial_runtime::cookies::enabled() {
+                                            match lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetMultipleCookies",
+                                            ) {
+                                                None => {}
+                                                Some(f) => {
+                                                    let n = cordial_runtime::cookies::restore(f);
+                                                    println!(
+                                                        "  [cookies] restored {n} domain(s) from {}",
+                                                        cordial_runtime::cookies::path().display()
+                                                    );
+                                                    // Whether the two natives
+                                                    // agree on what a domain is,
+                                                    // and whether they are up
+                                                    // yet. Off by default: it
+                                                    // puts a marker cookie in
+                                                    // the engine's jar, which is
+                                                    // fine for a diagnostic run
+                                                    // and not for an ordinary
+                                                    // launch.
+                                                    if std::env::var_os("CORDIAL_COOKIE_PROBE").is_some() {
+                                                        if let Some(g) = lib.symbol(
+                                                            "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeGetCookiesForDomain",
+                                                        ) {
+                                                            cordial_runtime::cookies::probe(f, g, "restore");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         if std::env::var_os("CORDIAL_SKIP_LUA_DM").is_none() {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeStartLuaAppDM",

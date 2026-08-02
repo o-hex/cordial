@@ -413,6 +413,18 @@ pub mod game_activity {
             err: *mut c_char,
             n: usize,
         ) -> c_int;
+        fn cordial_cookies_set_host_sink(sink: Option<extern "C" fn(*const c_char)>);
+        fn cordial_cookies_register_handler(f: *mut c_void, err: *mut c_char, n: usize) -> c_int;
+        fn cordial_cookies_get_for_domain(
+            f: *mut c_void,
+            class_name: *const c_char,
+            domain: *const c_char,
+            out: *mut c_char,
+            out_len: usize,
+            needed: *mut usize,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
     }
 
     fn take_err(err: Vec<u8>) -> String {
@@ -499,6 +511,104 @@ pub mod game_activity {
             )
         };
         if rc == 0 { Ok(out != 0) } else { Err(take_err(err)) }
+    }
+
+    /// A cookie jar on its way between the engine and the profile directory.
+    ///
+    /// A newtype rather than a `String` because the difference matters exactly
+    /// once, in the diagnostic that gets added at three in the morning. The
+    /// value is a live session: printing it to a log, a trace or a panic
+    /// message hands somebody's account to whoever reads that log. `Debug`
+    /// therefore reports the length and nothing else, so the careless thing to
+    /// write is also the safe thing, and getting at the real bytes takes a
+    /// deliberate call to [`Jar::expose`].
+    pub struct Jar(String);
+
+    impl Jar {
+        /// The bytes, for handing back to the engine or writing to the profile.
+        /// Every caller of this is a place to check for a leak.
+        pub fn expose(&self) -> &str {
+            &self.0
+        }
+
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+
+        pub fn from_stored(value: String) -> Self {
+            Jar(value)
+        }
+    }
+
+    impl std::fmt::Debug for Jar {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Jar({} bytes)", self.0.len())
+        }
+    }
+
+    /// `JNICookieProtocol.updateOnSetCookieHandler` — hand the engine an object
+    /// to call when a response carries `Set-Cookie`.
+    ///
+    /// `sink` receives the *host* the cookies came from, never the cookies. See
+    /// `native/cookies.cpp` for why that split is where it is: the host is
+    /// extracted before anything else reads the URL, because the query string
+    /// of a Roblox URL can carry a one-time authentication ticket.
+    pub fn cookies_register_handler(
+        native: *mut c_void,
+        sink: extern "C" fn(*const c_char),
+    ) -> Result<(), String> {
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; `sink` is a plain
+        // `extern "C"` fn with static lifetime, and `err` outlives the call.
+        let rc = unsafe {
+            cordial_cookies_set_host_sink(Some(sink));
+            cordial_cookies_register_handler(native, err.as_mut_ptr() as *mut c_char, err.len())
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
+    /// `NativeSettingsInterface.nativeGetCookiesForDomain(String) -> String`.
+    ///
+    /// The buffer is large because the alternative is worse. A jar that does
+    /// not fit is reported as an error naming its size rather than truncated:
+    /// half a cookie still parses as a cookie, and the engine would accept it
+    /// on the next launch and fail authentication for a reason with no visible
+    /// relationship to a buffer.
+    pub fn cookies_for_domain(
+        native: *mut c_void,
+        class_name: &str,
+        domain: &str,
+    ) -> Result<Jar, String> {
+        let cls = CString::new(class_name).map_err(|e| e.to_string())?;
+        let dom = CString::new(domain).map_err(|e| e.to_string())?;
+        let mut out = vec![0u8; 256 * 1024];
+        let mut needed: usize = 0;
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; every buffer outlives
+        // the call, and the C side nul-terminates within `out_len`.
+        let rc = unsafe {
+            cordial_cookies_get_for_domain(
+                native,
+                cls.as_ptr(),
+                dom.as_ptr(),
+                out.as_mut_ptr() as *mut c_char,
+                out.len(),
+                &mut needed as *mut usize,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(take_err(err));
+        }
+        out.truncate(needed);
+        String::from_utf8(out)
+            .map(Jar)
+            .map_err(|_| "the engine's cookie jar was not UTF-8".to_string())
     }
 
     /// A static native taking `(boolean, String)` — `setTaskSchedulerBackgroundMode`.

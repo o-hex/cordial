@@ -72,6 +72,12 @@ Roblox to grant anything, which is also why it cannot be withdrawn.
 
 ## On credentials, and why they do not go in a keyring
 
+> **Superseded in part.** The first argument below rested on a factual claim
+> about the engine that turned out to be false, and the decision it supported —
+> that Cordial never handles a session token — has been reversed. The original
+> reasoning is kept in full, because the shape of the mistake is the useful
+> part; the correction follows it.
+
 Roblox keeps its session cookie inside the profile. The obvious suggestion is to
 put it in the desktop keyring instead, and it is a reasonable instinct, but it is
 rejected for three reasons.
@@ -99,6 +105,59 @@ Users wanting encryption at rest should use full-disk encryption or
 `systemd-homed`, which solve it properly and for everything rather than for one
 application's cookie.
 
+### Correction: Cordial is the custodian of the session token
+
+**The engine never writes its cookies to disk.** Both paragraphs above that
+describe it doing so — "the engine writes and reads its own session" and "the
+engine reads its cookie from a file at startup" — are wrong. A complete
+`CORDIAL_TRACE_PATHS=1` inventory of every non-system file the engine opens
+contains no cookie jar and no credential store of any kind, and
+`grep -rl ROBLOSECURITY` and `grep -rli set-cookie` over real profile trees find
+nothing. The engine holds its cookies in memory for the life of the process.
+
+On Android the **Java** side persists them. The Waydroid capture in
+`docs/traces/` shows `OnSetCookieHandlerImpl.b(): Updated WebViewCookieHandler
+with Cookies from URL ...` among nine cookie lines. Cordial has no Java side, so
+nothing persisted anything, and the symptom was the one this project keeps
+writing down: sign in, quit, restart the same profile, and you are on the
+landing page.
+
+This also disposes of the fix that suggests itself first. A shutdown hook cannot
+flush a file that is never written — controlled for directly, by alternating
+killed and graceful runs over two passes, which produced no file created or
+updated at shutdown that a killed run does not also produce. The graceful
+teardown descent is real and works and was never the missing piece.
+
+So Cordial now reads the jar out of the engine through
+`NativeSettingsInterface.nativeGetCookiesForDomain`, writes it into the profile,
+and hands it back on the next launch through `nativeSetMultipleCookies`. **That
+makes Cordial the custodian of a live session token, which the decision above
+explicitly set out to avoid.** The trade is accepted because the alternative is
+not "Cordial handles no credentials" but "Cordial cannot stay signed in", and
+the account switcher this ADR is mostly about is not worth much if every profile
+is signed out at every launch.
+
+**What protects it.** The store is a single file, `cookies`, inside the profile
+directory. It is `0600` and the directory is `0700`, applied wherever a profile
+is chosen rather than only where it is locked — a hand-started
+`cordial-run --profile <name>` previously got the umask's `0755`, which was
+survivable when the directory held only Roblox's storage and is not now. It is
+written to a temporary file and renamed, so an interrupted write cannot leave
+half a token that still parses. The value is carried in a type whose `Debug`
+prints its length, so that no diagnostic can print a session by accident, and
+nothing in the implementation logs, prints or traces a cookie value at any
+verbosity or behind any flag.
+
+**The keyring is still rejected, on the argument that survives.** Only the first
+of the three reasons above depended on the false premise. The second stands and
+is now the whole case: the token must be handed to the engine in plaintext on
+every launch, so a keyring would encrypt it only during the window in which
+nothing is reading it, in exchange for an unlock prompt on every start. The
+third stands unchanged and is what is actually implemented.
+
+Users wanting encryption at rest should still use full-disk encryption or
+`systemd-homed`.
+
 ## Consequences
 
 **Accepted:** the storage path changes, and existing users have a session under
@@ -113,9 +172,15 @@ plugins" is not a use case worth the cost of explaining which combinations are
 legal.
 
 **Accepted:** the account switcher is a profile switcher. It does not
-authenticate, hold credentials, or know anything about accounts — it selects a
-directory. Cordial never sees a password and never stores a session token itself;
-Roblox does that, inside the profile.
+authenticate or know anything about accounts — it selects a directory. Cordial
+never sees a password.
+
+> The rest of this point read "and never stores a session token itself; Roblox
+> does that, inside the profile." That is no longer true and was never true of
+> the engine: Cordial stores the session token, because nothing else does. See
+> the correction above. What is unchanged is the part that matters to this
+> ADR — the switcher still only selects a directory, and authentication still
+> happens in Roblox's own UI.
 
 **Accepted:** two windows on one account is not supported. It is a real thing
 people do while testing, but it requires duplicating a live session deliberately,

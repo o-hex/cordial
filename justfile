@@ -164,12 +164,25 @@ client *args:
         # split_config.<abi>.apk rather than base.apk, so try the APK given and
         # then its siblings instead of asserting which one holds it.
         cache="${XDG_CACHE_HOME:-$HOME/.cache}/cordial/lib/x86_64"
+        # Re-extract when the APK it came from has changed. Presence alone was
+        # the test until now, so installing a new Roblox build left the OLD
+        # engine cached and Cordial ran it against the new APK's assets --
+        # a silent version mismatch, which is worse than the cold start the
+        # cache exists to avoid. mtime on the extracted file cannot be used: zip
+        # preserves the stored timestamp, so it reads 1981.
+        stamp="$cache/.from"
+        want="$(stat -c '%s %Y %n' "$apk" 2>/dev/null)"
+        if [ -f "$cache/libroblox.so" ] && [ "$(cat "$stamp" 2>/dev/null)" != "$want" ]; then
+            echo "the APK changed since libroblox.so was extracted; re-extracting"
+            rm -f "$cache/libroblox.so"
+        fi
         if [ ! -f "$cache/libroblox.so" ]; then
             mkdir -p "$cache"
             for candidate in "$apk" "$(dirname "$apk")"/split_config*.apk; do
                 [ -f "$candidate" ] || continue
                 if unzip -o -j -q "$candidate" 'lib/x86_64/libroblox.so' -d "$cache" 2>/dev/null \
                    && [ -f "$cache/libroblox.so" ]; then
+                    printf '%s' "$want" > "$stamp"
                     echo "extracted libroblox.so from $(basename "$candidate") into $cache"
                     break
                 fi

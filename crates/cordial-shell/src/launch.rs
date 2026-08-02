@@ -20,6 +20,7 @@ use std::process::{Child, Command, Stdio};
 use cordial_shell::profile::Claim;
 
 use crate::install::Build;
+use crate::shell_config;
 
 /// The binary this shell starts.
 ///
@@ -157,6 +158,54 @@ pub fn spawn(build: &Build, claim: Claim, run_seconds: Option<u64>) -> Result<In
     // for nothing and X11 is used anyway.
     command.env("CORDIAL_WAYLAND", "1");
 
+    // Read from disk here rather than handed in, and that is a compromise
+    // worth naming: the caller in `window.rs` already holds a live
+    // `ShellConfig`, so this is a second read of the same thing. It is correct
+    // today only because the settings window persists every toggle the moment
+    // it is made, so the file is what the user last chose. Give this function a
+    // `&ShellConfig` the next time `window.rs` is open for editing.
+    let config = shell_config::load(&shell_config::path());
+
+    // Feral GameMode: performance governor, raised priority, GPU performance
+    // profile, screensaver inhibited, for as long as the client runs. The
+    // client asks for it over D-Bus itself and defaults to on, so the only
+    // thing to pass is a refusal — see `gamemode` in `cordial-run`'s
+    // `load.rs`, which also reports what came of it. A machine without
+    // gamemoded needs nothing here: the request fails and the launch carries
+    // on, which is the whole point of it being a request rather than a wrapper.
+    if !config.gamemode {
+        command.env("CORDIAL_GAMEMODE", "0");
+    }
+
+    // MangoHUD is a Vulkan implicit layer, so `MANGOHUD=1` on the client's
+    // environment is the entire mechanism — the loader finds the layer JSON on
+    // its own and inserts it. The layer has to actually be installed, and the
+    // switch is only offered when it is; see [`mangohud_layer`] for why that
+    // check is not optional here.
+    if config.mangohud {
+        match mangohud_layer() {
+            Some(layer) => {
+                command.env("MANGOHUD", "1");
+                // Frame rate, frame time graph and both loads — the four things
+                // the owner wanted and Roblox's own overlay does not give. Set
+                // rather than left to MangoHUD's default so that what the
+                // switch turns on is a known overlay rather than whatever
+                // happens to be in a config file somewhere.
+                command.env("MANGOHUD_CONFIG", "fps,frametime,frame_timing=1,cpu_stats,gpu_stats");
+                println!("  shell: MangoHUD on, via {}", layer.display());
+            }
+            // Reported rather than silently dropped. A switch that is on in the
+            // settings file and does nothing at launch is the same defect as a
+            // stub that returns success, and the settings page can only stop
+            // somebody turning it on today — not stop them uninstalling
+            // MangoHUD tomorrow with the switch left where it was.
+            None => println!(
+                "  shell: MangoHUD is switched on but its Vulkan layer is not installed; \
+                 the overlay will not appear. {MANGOHUD_INSTALL_HINT}"
+            ),
+        }
+    }
+
     // Inherited rather than captured, so that a shell started from a terminal
     // still narrates the load the way it always has. Nothing here parses it.
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -175,6 +224,86 @@ pub fn spawn(build: &Build, claim: Claim, run_seconds: Option<u64>) -> Result<In
     drop(claim);
 
     Ok(Instance { child, command_line })
+}
+
+/// What to tell somebody who wants MangoHUD and has not got it.
+///
+/// Two package names because they install two different things and only one of
+/// them is right for how Cordial was installed: the distribution package puts
+/// the layer under `/usr/share`, and the Flatpak runtime extension puts it
+/// inside the sandbox where a host package would not be visible at all.
+pub const MANGOHUD_INSTALL_HINT: &str =
+    "Install it with your package manager (Fedora: dnf install mangohud, Arch: pacman -S mangohud), \
+     or for the Flatpak: flatpak install org.freedesktop.Platform.VulkanLayer.MangoHud";
+
+/// Where MangoHUD's implicit layer manifest is, or `None` if it is not
+/// installed.
+///
+/// **This check exists because the alternative is a switch that appears to work
+/// and does nothing.** `MANGOHUD=1` is not an error when there is no MangoHUD;
+/// the Vulkan loader looks for an implicit layer, finds none, and the client
+/// starts perfectly normally with no overlay and nothing said. That is
+/// indistinguishable from a broken setting, and this project has already
+/// shipped a settings page describing software nobody had installed twice.
+///
+/// The layer, not the `mangohud` binary. The binary is a shell wrapper that
+/// exports this same variable; it is frequently absent on a Flatpak install
+/// where the layer is very much present, so looking for it would report the
+/// wrong answer in exactly the configuration Cordial ships in.
+///
+/// The directories are the Vulkan loader's own documented implicit-layer search
+/// path, plus the Flatpak extension mount point. Filenames are matched by
+/// prefix rather than listed — upstream ships `MangoHud.x86_64.json`,
+/// `MangoHud.x86.json` and plain `MangoHud.json` depending on version and
+/// architecture, and a fixed list would go stale silently.
+pub fn mangohud_layer() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
+        dirs.push(PathBuf::from(x).join("vulkan/implicit_layer.d"));
+    } else if let Some(h) = &home {
+        dirs.push(h.join(".local/share/vulkan/implicit_layer.d"));
+    }
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
+        dirs.push(PathBuf::from(x).join("vulkan/implicit_layer.d"));
+    } else if let Some(h) = &home {
+        dirs.push(h.join(".config/vulkan/implicit_layer.d"));
+    }
+    let data_dirs = std::env::var("XDG_DATA_DIRS")
+        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
+    for d in data_dirs.split(':').filter(|d| !d.is_empty()) {
+        dirs.push(PathBuf::from(d).join("vulkan/implicit_layer.d"));
+    }
+    dirs.push(PathBuf::from("/etc/vulkan/implicit_layer.d"));
+    // The Flatpak runtime extension, which mounts here rather than anywhere
+    // XDG_DATA_DIRS points at.
+    dirs.push(PathBuf::from(
+        "/usr/lib/extensions/vulkan/MangoHud/share/vulkan/implicit_layer.d",
+    ));
+
+    find_mangohud_layer_in(&dirs)
+}
+
+/// The scan, split from the search path so it can be tested against a directory
+/// built for the purpose rather than against whatever this machine happens to
+/// have installed. A test that asserted "MangoHUD is absent here" would pass for
+/// the wrong reason on the machine it was written on and fail on somebody
+/// else's.
+fn find_mangohud_layer_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_ascii_lowercase();
+            if name.starts_with("mangohud") && name.ends_with(".json") {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
 }
 
 fn describe(loader: &Path, lib_dir: &Path, apk: &Path, run: &str) -> String {
@@ -216,6 +345,36 @@ mod tests {
         assert!(line.contains("--lib-dir /home/a/.cache/cordial/lib/x86_64"), "{line}");
         assert!(line.contains("--apk /home/a/base.apk"), "{line}");
         assert!(line.contains("--run 600"), "{line}");
+    }
+
+    #[test]
+    fn the_mangohud_layer_is_found_by_prefix_and_not_by_an_exact_filename() {
+        // Upstream ships MangoHud.json, MangoHud.x86_64.json or
+        // MangoHud.x86.json depending on version and architecture. A hardcoded
+        // list would stop matching on some future rename and the only symptom
+        // would be a settings row that says MangoHUD is not installed on a
+        // machine where it is.
+        let root = std::env::temp_dir().join("cordial-mangohud-detect/implicit_layer.d");
+        let _ = std::fs::remove_dir_all(root.parent().expect("has a parent"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("VkLayer_MESA_device_select.json"), "{}").unwrap();
+
+        assert!(
+            find_mangohud_layer_in(&[root.clone()]).is_none(),
+            "an unrelated implicit layer must not read as MangoHUD"
+        );
+
+        std::fs::write(root.join("MangoHud.x86_64.json"), "{}").unwrap();
+        let found = find_mangohud_layer_in(&[root.clone()]).expect("the layer is there now");
+        assert!(found.ends_with("MangoHud.x86_64.json"), "{}", found.display());
+
+        // A directory that does not exist is the ordinary case rather than an
+        // error: most of the Vulkan loader's search path is absent on any given
+        // machine, and one missing entry must not stop the scan.
+        let missing = root.join("nowhere");
+        assert!(find_mangohud_layer_in(&[missing, root.clone()]).is_some());
+
+        let _ = std::fs::remove_dir_all(root.parent().expect("has a parent"));
     }
 
     /// Everything the chooser row does, minus the click.

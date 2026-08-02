@@ -83,6 +83,19 @@ env:
                                      loader, forcing the GLES2/EGL fallback
                                      path Roblox uses when dlopen(libvulkan)
                                      fails
+  CORDIAL_PRESENT_MODE=<m>           swapchain present mode: auto (the default;
+                                     MAILBOX when the driver advertises it),
+                                     off (forward the engine's own choice, which
+                                     is FIFO — this is the control for a frame
+                                     rate measurement), or one of mailbox,
+                                     immediate, fifo, fifo-relaxed. FIFO is the
+                                     only mode the spec guarantees, so anything
+                                     the driver does not advertise falls back to
+                                     what the engine asked for
+  CORDIAL_GAMEMODE=0                 do not ask Feral GameMode to raise the CPU
+                                     governor and priority for this process.
+                                     On by default; a machine without gamemoded
+                                     says so once and carries on
   CORDIAL_COUNT_GL=1                 count eglCreateWindowSurface/MakeCurrent/
                                      SwapBuffers/glClear/Draw*/CompileShader
                                      calls and report them after --run
@@ -390,6 +403,11 @@ fn main() -> ExitCode {
     // but every millisecond of head start narrows that race rather than
     // widening it.
     cordial_runtime::android::accessibility::start();
+
+    // Before the engine loads, so the governor is already up when the shader
+    // compiles and the asset cache warms — the part of a launch most obviously
+    // bound by a CPU that has not been asked to hurry yet.
+    gamemode::register();
 
     let table = symtab::build(opt.host_libc);
     let totals = table.totals();
@@ -1554,6 +1572,12 @@ fn main() -> ExitCode {
 
     stubs::report();
 
+    // Before `_exit`, which runs nothing. gamemoded would notice the process
+    // was gone on its own — it reaps clients whose pid has vanished — but that
+    // is a poll, so leaving it implicit means the governor stays raised for
+    // however long the sweep takes after a session ends.
+    gamemode::unregister();
+
     // Leave via _exit rather than returning.
     //
     // Roblox's static initialisers registered atexit handlers and DT_FINI_ARRAY
@@ -1571,4 +1595,100 @@ fn main() -> ExitCode {
 extern "C" {
     #[link_name = "_exit"]
     fn libc_exit(status: std::ffi::c_int) -> !;
+}
+
+/// Feral Interactive's GameMode, asked for over D-Bus.
+///
+/// GameMode is a request rather than a wrapper. There is nothing to link and
+/// nothing to `LD_PRELOAD`: `gamemoded` owns `com.feralinteractive.GameMode` on
+/// the session bus and takes `RegisterGame(i pid)` / `UnregisterGame(i pid)`.
+/// While a client is registered it puts the CPU governor in performance, raises
+/// the process's I/O and scheduling priority, puts the GPU in its performance
+/// profile and inhibits the screensaver. That last one is not a footnote for a
+/// game the user plays with a controller and does not touch the keyboard for.
+///
+/// **Absence is the ordinary case and must not fail a launch.** Most machines
+/// do not have gamemoded, and this is an optimisation rather than a dependency
+/// — a client that refused to start because a performance daemon was missing
+/// would be a far worse bug than the frame it was trying to save. Every failure
+/// here is reported in one line and stepped over.
+///
+/// On by default, which is what Sober does. `CORDIAL_GAMEMODE=0` turns it off,
+/// and that is the control: it is the only way to show, in the same session,
+/// that a timing difference came from this and not from something else.
+mod gamemode {
+    use std::sync::OnceLock;
+
+    const SERVICE: &str = "com.feralinteractive.GameMode";
+    const OBJECT: &str = "/com/feralinteractive/GameMode";
+
+    /// Held for the life of the process rather than opened per call. Not because
+    /// `RegisterGame` needs it — it registers a pid, and gamemoded watches that
+    /// pid rather than this connection — but because [`unregister`] runs during
+    /// teardown, and opening a bus connection is the wrong thing to be doing at
+    /// the point where the engine's own destructors are already known to be
+    /// unsafe to run.
+    static CONNECTION: OnceLock<Option<zbus::blocking::Connection>> = OnceLock::new();
+
+    /// Whether [`register`] actually got a yes, so [`unregister`] does not send
+    /// an `UnregisterGame` for a registration that never happened.
+    static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn enabled() -> bool {
+        !matches!(
+            std::env::var("CORDIAL_GAMEMODE").unwrap_or_default().trim(),
+            "0" | "off" | "false" | "no"
+        )
+    }
+
+    fn connection() -> Option<&'static zbus::blocking::Connection> {
+        CONNECTION.get_or_init(|| zbus::blocking::Connection::session().ok()).as_ref()
+    }
+
+    /// `RegisterGame`/`UnregisterGame` both answer `0` for success and a
+    /// negative number for a refusal, so the reply has to be read rather than
+    /// just checked for not being a D-Bus error — gamemoded returns `-1` for a
+    /// pid it will not accept and `-2` for one already registered, over a
+    /// perfectly successful method call.
+    fn call(method: &str) -> Result<i32, String> {
+        let conn = connection().ok_or_else(|| "no session bus".to_string())?;
+        let pid = std::process::id() as i32;
+        let reply = conn
+            .call_method(Some(SERVICE), OBJECT, Some(SERVICE), method, &(pid,))
+            .map_err(|e| e.to_string())?;
+        reply.body().deserialize::<i32>().map_err(|e| e.to_string())
+    }
+
+    pub fn register() {
+        if !enabled() {
+            println!("[gamemode] off (CORDIAL_GAMEMODE=0)");
+            return;
+        }
+        match call("RegisterGame") {
+            Ok(0) => {
+                REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "[gamemode] registered pid {}: performance governor, raised priority, \
+                     GPU performance profile, screensaver inhibited",
+                    std::process::id()
+                );
+            }
+            // Said plainly rather than folded into the error path below. A
+            // daemon that answered and declined is a different situation from
+            // one that is not there, and only the second is the ordinary case.
+            Ok(rc) => println!("[gamemode] gamemoded declined to register this process (rc {rc})"),
+            Err(e) => println!("[gamemode] not available, continuing without it: {e}"),
+        }
+    }
+
+    pub fn unregister() {
+        if !REGISTERED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        match call("UnregisterGame") {
+            Ok(0) => println!("[gamemode] unregistered"),
+            Ok(rc) => println!("[gamemode] UnregisterGame returned {rc}"),
+            Err(e) => println!("[gamemode] UnregisterGame failed: {e}"),
+        }
+    }
 }

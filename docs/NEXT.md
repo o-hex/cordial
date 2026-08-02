@@ -815,6 +815,149 @@ accounts for 20-60 of those per second, counted separately in the same runs, so
 the rest is an engine thread spinning. It costs a core and it was not
 investigated.
 
+## 1d(ii). The present mode was the ceiling. Asking for MAILBOX takes the landing page from ~36 to a flat 60
+
+§1d ended by saying the difference against Sober "is a swapchain present-mode
+difference; it lives in `vulkan.rs`, which this work did not touch". It does, and
+this is that work.
+
+**Cordial never requested a present mode at all.** Nothing in the tree mentioned
+one, so `VkSwapchainCreateInfoKHR::presentMode` was whatever the engine put
+there, and the engine puts `VK_PRESENT_MODE_FIFO_KHR` — the only mode the
+specification guarantees exists, and a vsync lock.
+`vulkan.rs` now interposes `vkCreateSwapchainKHR` and substitutes
+`VK_PRESENT_MODE_MAILBOX_KHR` when the driver advertises it, falling back to
+whatever the engine asked for when it does not.
+
+**Measured, with pointer motion delivered in-process at 100 Hz for the whole of
+every run**, `--run 120`, windowed at 1280x721 on Wayland, engine at the logged-out
+landing page, GameMode registered in all four runs. Build
+`v0.2.0-3-g1e1318a-dirty`. Outputs on this desk: eDP-1 1920x1200 at **59.88 Hz**
+and HDMI-1 3440x1440 at **49.96 Hz** (`xrandr`). Per-10-second present rate, the
+last 60 s of each run once it had settled:
+
+```text
+                          per-10s samples from t=30s on            120s total
+run 1  off  (FIFO)    41.1 37.4 37.5 37.5 37.5 37.5 35.3 35.0 35.0 36.1   4678
+run 3  off  (FIFO)    49.9 49.8 49.7 49.8 49.6 49.9 49.9 49.8 49.8 49.9   5886
+run 2  auto (MAILBOX) 60.0 60.0 60.0 60.0 60.0 60.0 60.0 60.0 60.0 60.0   7091
+run 4  auto (MAILBOX) 60.0 60.0 60.0 60.1 60.0 60.0 60.0 60.0 60.0 60.0   7091
+```
+
+The two MAILBOX runs returned the same 120-second total to the present: 7091.
+
+The control is the same binary in the same session with the substitution turned
+off, which is the only thing that makes this a result rather than a number. Both
+conditions were run twice, alternating, and GameMode was registered in all four.
+
+**FIFO is variable, MAILBOX is not.** The two controls disagree with each other —
+one settled on the 49.96 Hz refresh, the other on 35-37.5, and nothing was
+deliberately changed between them. Both are at or below refresh, which is what
+FIFO enforces. Every MAILBOX sample in two runs is 60.0 or 60.1. So the honest
+statement is a range against a constant: **FIFO 35-50, MAILBOX a flat 60**, and
+the floor moved further than the ceiling did.
+
+**This rules out "the engine simply cannot go faster."** The same engine, same
+1280x721, same session, goes from 35 to 60.0 on nothing but the present mode. The
+FIFO figure was never the engine running out of work.
+
+**One correction to §1d above.** It says the windowed rate "is the refresh rate of
+the output the window is on" and gives 49-60 for 1280x721. Run 3 reproduces that
+exactly; run 1 does not, sitting at 35-37.5 for six consecutive samples, below
+both of this desk's refresh rates. So the claim holds sometimes and is not the
+whole story. What produces 37.5 on a 49.96 Hz output was not chased, and the fix
+does not depend on the answer.
+
+**The 60.0 is almost certainly the engine's own cap and not a new ceiling.** It
+is 600 presents per 10 s, repeated, to the sample. Do not read it as "MAILBOX
+gives 60"; read it as "MAILBOX stops the display holding the engine below what it
+was already willing to do". A machine whose engine target is higher, or an
+experience with real scene load, will not necessarily see this shape.
+
+**The driver here advertises MAILBOX and FIFO and *not* IMMEDIATE**, printed by
+the substitution itself. That is the argument for asking rather than assuming:
+a client that had been written to force IMMEDIATE would have had to fall back on
+this very common Intel/Mesa configuration.
+
+`CORDIAL_PRESENT_MODE=off` is the documented control and stays supported.
+`auto` (the default) prefers MAILBOX only — not IMMEDIATE, which also uncaps the
+rate but tears.
+
+### Reproducing this
+
+The 100 Hz pointer motion came from a probe thread calling
+`input::pass_mouse_move` directly, added to `load.rs` for the measurement and
+**removed again before this landed** — `grep -rn perf_probe` finds nothing. It is
+half a screen of code to put back and nothing here depends on it being in the
+tree. Without it, keep a real pointer moving over the canvas for the whole run,
+which drives the same path:
+
+```bash
+XDG_DATA_HOME=~/.cache/cordial-perf CORDIAL_COUNT_GL=1 \
+  CORDIAL_PRESENT_MODE=off  just client --run 120     # control
+XDG_DATA_HOME=~/.cache/cordial-perf CORDIAL_COUNT_GL=1 \
+  CORDIAL_PRESENT_MODE=auto just client --run 120     # MAILBOX
+```
+
+`vkQueuePresentKHR` in the report at the end, divided by 120, is the rate — but
+**only if the pointer was moving the whole time**. Stop moving it and you are
+measuring the idle throttle again, which is the trap §1d exists to describe.
+
+## 1d(iii). GameMode is requested, and MangoHUD is a setting that knows when it is absent
+
+Two smaller pieces landed with the present mode.
+
+**Feral GameMode**, in `load.rs`. A D-Bus request rather than a wrapper: nothing
+is linked and `gamemoderun` is not involved. `RegisterGame(i pid)` on
+`com.feralinteractive.GameMode` before the engine loads,
+`UnregisterGame` before `_exit`. On by default, which is what Sober does;
+`CORDIAL_GAMEMODE=0` is the off switch and the control. All three paths were run
+on this machine and printed:
+
+```text
+[gamemode] registered pid 605422: performance governor, raised priority, ...
+[gamemode] off (CORDIAL_GAMEMODE=0)
+[gamemode] not available, continuing without it: no session bus
+```
+
+The third is the one that matters, and it was produced by pointing
+`DBUS_SESSION_BUS_ADDRESS` at a path that does not exist. **A missing gamemoded
+must never fail a launch** — most machines have none — and the run that produced
+that line went on to build its symbol table and load the engine exactly as the
+other two did.
+
+**MangoHUD**, in `launch.rs` and the Settings window. `MANGOHUD=1` on the client
+process is the whole mechanism, because MangoHUD is a Vulkan implicit layer. The
+work is not the switch, it is `launch::mangohud_layer`: **MangoHUD is not
+installed on this machine**, and `MANGOHUD=1` with no layer present is not an
+error — the client starts, no overlay appears, and nothing says why. So the
+layer is looked for across the Vulkan loader's own implicit-layer search path
+plus the Flatpak extension mount point, and when it is absent the Settings row
+is insensitive and names the packages to install instead of being a switch that
+appears to work. That defect has shipped on this page twice; this is the check
+that stops a third.
+
+## 1d(iv). What was considered from Lutris's list and rejected
+
+The request behind §1d(ii) and §1d(iii) was to look at what Lutris does. Most of
+it does not apply here, and recording that is half the value of this file:
+
+- **DXVK, VKD3D, esync, fsync, every `WINE*` variable** — there is no Wine and no
+  Direct3D anywhere in this project. Not applicable, not a judgement call.
+- **`DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD`, ICD selection** — hybrid-graphics
+  selection is a real feature for a two-GPU laptop. This machine has one GPU, an
+  Intel UHD (Raptor Lake-P), so **it cannot be tested here and must not ship
+  untested**. Worth a later task on hardware that has two.
+- **`mesa_glthread`** — GL only. The engine renders through Vulkan on this path
+  (the GLES counters read zero in every run above while `vkQueuePresentKHR` read
+  thousands), so it would do nothing. Rejected.
+- **Shader cache location and size** — genuinely plausible and *not done here*.
+  The engine already writes `shadercachevk.bin` into the profile, so the cache
+  exists and is per-profile; what is unmeasured is whether it is being evicted or
+  is too small, and a cache setting added without that measurement would be a
+  knob nobody could tell was working. Left as a real candidate with a real first
+  step: instrument whether the file is being rewritten between launches.
+
 ## 1e. Fullscreen moves the canvas through two wrong (position, size) pairings
 
 Driven in-process with `gtk_window_fullscreen` from a scripted timer — allowed,

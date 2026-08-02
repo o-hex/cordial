@@ -50,8 +50,15 @@
 //!   host loader must never be told to enable an extension it does not
 //!   implement.
 //!
-//! Everything else — `vkCreateDevice`, every `vkCmd*`, the whole per-frame
-//! surface. — is untouched: once a real `VkInstance` exists, forwarding
+//! * `vkCreateSwapchainKHR` — the engine never names a present mode it did not
+//!   have to name, and the one it names is `VK_PRESENT_MODE_FIFO_KHR`, which is
+//!   a hard vsync lock. [`vk_create_swapchain_khr`] offers
+//!   `VK_PRESENT_MODE_MAILBOX_KHR` instead when the driver advertises it. See
+//!   that function for the measurement and for why overriding what the engine
+//!   asked for is defensible here and would not be for most calls.
+//!
+//! Everything else — every `vkCmd*`, the whole per-frame surface — is
+//! untouched: once a real `VkInstance` exists, forwarding
 //! `vkGetInstanceProcAddr(instance, name)` to the host is correct for any name
 //! this module does not special-case, because the host's implementation *is* the
 //! implementation Cordial wants.
@@ -171,6 +178,57 @@ struct VkSurfaceCapabilitiesKHR {
     current_transform: i32,
     supported_composite_alpha: u32,
     supported_usage_flags: u32,
+}
+
+/// `VkSwapchainCreateInfoKHR`, read and — for one field — rewritten by
+/// [`vk_create_swapchain_khr`].
+///
+/// The two 64-bit handles are spelled `u64` rather than `*mut c_void` because
+/// that is what they are: `VkSurfaceKHR` and `VkSwapchainKHR` are
+/// non-dispatchable, which the specification defines as `uint64_t` on every
+/// platform. It makes no difference to the ABI — both occupy eight bytes here
+/// and travel in one register — but it does stop the compiler quietly agreeing
+/// that a surface handle is a pointer that could be dereferenced.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkSwapchainCreateInfoKHR {
+    s_type: i32,
+    p_next: *const c_void,
+    flags: u32,
+    surface: u64,
+    min_image_count: u32,
+    image_format: i32,
+    image_color_space: i32,
+    image_extent: VkExtent2D,
+    image_array_layers: u32,
+    image_usage: u32,
+    image_sharing_mode: i32,
+    queue_family_index_count: u32,
+    p_queue_family_indices: *const u32,
+    pre_transform: u32,
+    composite_alpha: u32,
+    present_mode: i32,
+    clipped: u32,
+    old_swapchain: u64,
+}
+
+/// `VkPresentModeKHR`. Only `FIFO` is guaranteed to exist — the specification
+/// requires every implementation to support it and requires nothing of the
+/// other three — which is why [`vk_create_swapchain_khr`] asks the driver what
+/// it has rather than assuming.
+const VK_PRESENT_MODE_IMMEDIATE_KHR: i32 = 0;
+const VK_PRESENT_MODE_MAILBOX_KHR: i32 = 1;
+const VK_PRESENT_MODE_FIFO_KHR: i32 = 2;
+const VK_PRESENT_MODE_FIFO_RELAXED_KHR: i32 = 3;
+
+fn present_mode_name(mode: i32) -> &'static str {
+    match mode {
+        VK_PRESENT_MODE_IMMEDIATE_KHR => "IMMEDIATE",
+        VK_PRESENT_MODE_MAILBOX_KHR => "MAILBOX",
+        VK_PRESENT_MODE_FIFO_KHR => "FIFO",
+        VK_PRESENT_MODE_FIFO_RELAXED_KHR => "FIFO_RELAXED",
+        _ => "unknown",
+    }
 }
 
 /// `VK_KHR_android_surface`'s spec version, per the Khronos extension registry.
@@ -355,6 +413,32 @@ extern "C" fn vk_get_instance_proc_addr(instance: *mut c_void, name: *const c_ch
             );
             vk_queue_present_khr as *const () as *mut c_void
         }
+        // Interposed for its *first argument* and nothing else. Asking the
+        // driver which present modes a surface supports needs a
+        // `VkPhysicalDevice`, and `vkCreateSwapchainKHR` is handed a
+        // `VkDevice`; this is the one call that sees both, so it is where the
+        // association is recorded. See [`vk_create_device`].
+        b"vkCreateDevice" => {
+            HOST_CREATE_DEVICE.store(
+                unsafe { (h.get_instance_proc_addr)(instance, name) } as usize,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            vk_create_device as *const () as *mut c_void
+        }
+        // A device-level command, normally fetched through
+        // `vkGetDeviceProcAddr` and peeled off there. It is answered here too
+        // because `vkGetInstanceProcAddr` is required to answer for device
+        // commands as well, and a client that used that route would otherwise
+        // get the host's unpatched entry point and silently stay on FIFO —
+        // which is exactly the class of "the switch appears to work and does
+        // nothing" this file already has one comment about.
+        b"vkCreateSwapchainKHR" => {
+            HOST_CREATE_SWAPCHAIN.store(
+                unsafe { (h.get_instance_proc_addr)(instance, name) } as usize,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            vk_create_swapchain_khr as *const () as *mut c_void
+        }
         // `vkGetPhysicalDeviceSurfaceCapabilitiesKHR`'s result is patched, not
         // just forwarded — see [`vk_get_physical_device_surface_capabilities_khr`]
         // for the failure this fixes. Measured, not guessed: instrumenting this
@@ -399,6 +483,11 @@ extern "C" fn vk_get_device_proc_addr(device: *mut c_void, name: *const c_char) 
             HOST_QUEUE_PRESENT.store(host(device, name) as usize, std::sync::atomic::Ordering::Relaxed);
             vk_queue_present_khr as *const () as *mut c_void
         }
+        b"vkCreateSwapchainKHR" => {
+            HOST_CREATE_SWAPCHAIN
+                .store(host(device, name) as usize, std::sync::atomic::Ordering::Relaxed);
+            vk_create_swapchain_khr as *const () as *mut c_void
+        }
         _ => host(device, name),
     }
 }
@@ -418,6 +507,251 @@ extern "C" fn vk_queue_present_khr(queue: *mut c_void, info: *const c_void) -> i
     // SAFETY: resolved from the host loader for exactly this name.
     let f: extern "C" fn(*mut c_void, *const c_void) -> i32 = unsafe { std::mem::transmute(f) };
     f(queue, info)
+}
+
+// ------------------------------------------------------------- present mode
+//
+// Cordial did not ask for a present mode until this existed, so the engine's
+// own choice stood, and the engine chooses `VK_PRESENT_MODE_FIFO_KHR` — the one
+// mode the specification guarantees, and a hard vsync lock. What that costs was
+// measured rather than assumed: with input driven continuously for the whole
+// window, presents come out equal to the output's refresh and stay there, 60.0
+// on a 59.88 Hz panel and 49.4 on a 49.96 Hz one, unchanged by fullscreen at
+// four times the pixels. Sober, on the same machine and the same APK, reports
+// above both, so the ceiling is FIFO and not the engine.
+//
+// Read AGENTS.md's "Do not use present counts as a frame rate" before repeating
+// any of that. Presents fall to exactly 1.0 a second after about thirteen idle
+// seconds, so a count taken over a window with no input flowing measures the
+// idle throttle and nothing else.
+
+/// The `VkInstance` this shim created, so instance-level commands can be
+/// resolved later — [`supported_present_modes`] needs
+/// `vkGetPhysicalDeviceSurfacePresentModesKHR`, which cannot be fetched with a
+/// null instance.
+static HOST_INSTANCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The `VkPhysicalDevice` the engine created its logical device from, recorded
+/// by [`vk_create_device`].
+///
+/// One slot, not a map. The engine creates exactly one logical device, and
+/// nothing in this runtime has ever seen it create a second; a map keyed by
+/// `VkDevice` would be more code defending against a case that would also need
+/// a second window to be worth anything. If a build ever does create two, the
+/// consequence is bounded — the present-mode query would be asked of the wrong
+/// physical device and would answer for a GPU that is not rendering, which
+/// shows up as MAILBOX being offered where it is not supported and
+/// `vkCreateSwapchainKHR` failing loudly rather than silently.
+static PHYSICAL_DEVICE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+static HOST_CREATE_DEVICE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `vkCreateDevice`, forwarded byte for byte after noting which physical device
+/// it was called against. Nothing else about it is touched, and deliberately so:
+/// `VkDeviceCreateInfo` carries queue priorities, enabled features and an
+/// extension list that this file has no business having an opinion about.
+extern "C" fn vk_create_device(
+    physical_device: *mut c_void,
+    create_info: *const c_void,
+    allocator: *const c_void,
+    device_out: *mut *mut c_void,
+) -> i32 {
+    let f = HOST_CREATE_DEVICE.load(std::sync::atomic::Ordering::Relaxed);
+    if f == 0 {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    PHYSICAL_DEVICE.store(physical_device as usize, std::sync::atomic::Ordering::Relaxed);
+    type Fn_ = extern "C" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> i32;
+    // SAFETY: resolved from the host loader for exactly this name, and called
+    // with the caller's own arguments unchanged.
+    let f: Fn_ = unsafe { std::mem::transmute(f) };
+    f(physical_device, create_info, allocator, device_out)
+}
+
+/// What `CORDIAL_PRESENT_MODE` asked for.
+#[derive(Clone, Copy)]
+enum PresentModeChoice {
+    /// Forward whatever the engine put in `VkSwapchainCreateInfoKHR`. This is
+    /// the control for a measurement: `CORDIAL_PRESENT_MODE=off` reproduces the
+    /// behaviour of every build before this code existed, in the same session,
+    /// which is what AGENTS.md asks a timing claim to come with.
+    Untouched,
+    /// The first of these the driver advertises for this surface wins;
+    /// if it advertises none of them, the engine's own choice stands.
+    Prefer(&'static [i32]),
+}
+
+/// `CORDIAL_PRESENT_MODE=off|auto|mailbox|immediate|fifo|fifo-relaxed`,
+/// unset meaning `auto`.
+///
+/// `auto` prefers MAILBOX alone and not IMMEDIATE. Both uncap the frame rate;
+/// only MAILBOX does it without tearing, because it replaces the queued image
+/// rather than scanning out mid-refresh. Somebody who wants the tearing one can
+/// name it, and then it is their choice rather than a default that quietly made
+/// the picture worse to make a number better.
+fn present_mode_choice() -> PresentModeChoice {
+    static CHOICE: OnceLock<PresentModeChoice> = OnceLock::new();
+    *CHOICE.get_or_init(|| {
+        let raw = std::env::var("CORDIAL_PRESENT_MODE").unwrap_or_default();
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => PresentModeChoice::Prefer(&[VK_PRESENT_MODE_MAILBOX_KHR]),
+            "off" | "engine" => PresentModeChoice::Untouched,
+            "mailbox" => PresentModeChoice::Prefer(&[VK_PRESENT_MODE_MAILBOX_KHR]),
+            "immediate" => PresentModeChoice::Prefer(&[VK_PRESENT_MODE_IMMEDIATE_KHR]),
+            "fifo" => PresentModeChoice::Prefer(&[VK_PRESENT_MODE_FIFO_KHR]),
+            "fifo-relaxed" | "fifo_relaxed" => {
+                PresentModeChoice::Prefer(&[VK_PRESENT_MODE_FIFO_RELAXED_KHR])
+            }
+            other => {
+                println!(
+                    "[android] vulkan: CORDIAL_PRESENT_MODE={other:?} is not one of \
+                     off/auto/mailbox/immediate/fifo/fifo-relaxed; using auto"
+                );
+                PresentModeChoice::Prefer(&[VK_PRESENT_MODE_MAILBOX_KHR])
+            }
+        }
+    })
+}
+
+/// What the driver says it can do with this surface, or `None` if the question
+/// could not be asked.
+///
+/// `None` is not "nothing is supported" — it means the query failed, and the
+/// caller leaves the engine's own present mode alone rather than substituting
+/// one on a guess. A shim that offered MAILBOX because it could not find out
+/// whether MAILBOX exists would be the stub-that-lies AGENTS.md rules out, one
+/// layer up.
+fn supported_present_modes(surface: u64) -> Option<Vec<i32>> {
+    let h = host()?;
+    let instance = HOST_INSTANCE.load(std::sync::atomic::Ordering::Relaxed);
+    let physical_device = PHYSICAL_DEVICE.load(std::sync::atomic::Ordering::Relaxed);
+    if instance == 0 || physical_device == 0 {
+        return None;
+    }
+    // SAFETY: `instance` is the real host `VkInstance` this shim created, and
+    // the name is the WSI extension's own documented export.
+    let f = unsafe {
+        (h.get_instance_proc_addr)(
+            instance as *mut c_void,
+            c"vkGetPhysicalDeviceSurfacePresentModesKHR".as_ptr(),
+        )
+    };
+    if f.is_null() {
+        return None;
+    }
+    type Fn_ = extern "C" fn(*mut c_void, u64, *mut u32, *mut i32) -> i32;
+    // SAFETY: resolved from the host loader for exactly this name.
+    let f: Fn_ = unsafe { std::mem::transmute(f) };
+
+    // The two-call idiom, the same one
+    // `vk_enumerate_instance_extension_properties` runs against the host above.
+    let mut count: u32 = 0;
+    if f(physical_device as *mut c_void, surface, &mut count, std::ptr::null_mut()) != VK_SUCCESS {
+        return None;
+    }
+    let mut modes = vec![0i32; count as usize];
+    if count > 0
+        && f(physical_device as *mut c_void, surface, &mut count, modes.as_mut_ptr()) != VK_SUCCESS
+    {
+        return None;
+    }
+    modes.truncate(count as usize);
+    Some(modes)
+}
+
+static HOST_CREATE_SWAPCHAIN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `vkCreateSwapchainKHR`, with `presentMode` substituted when the driver has
+/// something better than what the engine asked for.
+///
+/// **This overrides a choice the engine made explicitly, which is a decision
+/// and not a translation.** Everything else in this file substitutes one
+/// spelling of the same thing for another — an Android surface for a Wayland
+/// one, an extension name for the name the same capability has on desktop. This
+/// does not: FIFO is a mode the engine named, the driver implements, and would
+/// otherwise get. The argument for doing it anyway is that FIFO is also the
+/// mode a client picks when it cannot find out what else exists, which is the
+/// position Roblox's Android renderer is in — Android has had MAILBOX since
+/// Vulkan shipped, but a phone's power budget makes vsync-locked the right
+/// default there and a desktop's does not. The engine has no setting for this
+/// and no way to learn it is on a desktop, so the choice has to be made
+/// somewhere or not at all.
+///
+/// Reversible without recompiling, and the reversal is a supported
+/// configuration rather than a debugging leftover: `CORDIAL_PRESENT_MODE=off`
+/// forwards the engine's own choice untouched. The chosen mode is printed
+/// unconditionally for the same reason `backend()` prints which display backend
+/// it picked — "what did Cordial substitute" is exactly what a bug report about
+/// tearing or stutter needs, and a trace flag would hide it.
+///
+/// FIFO stays the fallback on every path through here, because FIFO is the only
+/// present mode the specification requires an implementation to support. A
+/// client that assumes MAILBOX exists works on Mesa and breaks on some drivers.
+extern "C" fn vk_create_swapchain_khr(
+    device: *mut c_void,
+    create_info: *const VkSwapchainCreateInfoKHR,
+    allocator: *const c_void,
+    swapchain_out: *mut u64,
+) -> i32 {
+    let f = HOST_CREATE_SWAPCHAIN.load(std::sync::atomic::Ordering::Relaxed);
+    if f == 0 {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    type Fn_ =
+        extern "C" fn(*mut c_void, *const VkSwapchainCreateInfoKHR, *const c_void, *mut u64) -> i32;
+    // SAFETY: resolved from the host loader for exactly this name.
+    let f: Fn_ = unsafe { std::mem::transmute(f) };
+
+    // SAFETY: `create_info` is the caller's own `VkSwapchainCreateInfoKHR`; a
+    // null one is the caller's bug, forwarded so the host reports it on its own
+    // terms rather than being masked here.
+    let Some(info) = (unsafe { create_info.as_ref() }) else {
+        return f(device, create_info, allocator, swapchain_out);
+    };
+    let asked = info.present_mode;
+
+    let PresentModeChoice::Prefer(preferences) = present_mode_choice() else {
+        println!(
+            "[android] vulkan: swapchain present mode {} (the engine's own choice; \
+             CORDIAL_PRESENT_MODE=off)",
+            present_mode_name(asked)
+        );
+        return f(device, create_info, allocator, swapchain_out);
+    };
+
+    let Some(supported) = supported_present_modes(info.surface) else {
+        println!(
+            "[android] vulkan: swapchain present mode {} (could not ask the driver what it \
+             supports, so the engine's own choice stands)",
+            present_mode_name(asked)
+        );
+        return f(device, create_info, allocator, swapchain_out);
+    };
+    let advertised: Vec<&str> = supported.iter().map(|&m| present_mode_name(m)).collect();
+
+    let chosen = preferences.iter().copied().find(|m| supported.contains(m)).unwrap_or(asked);
+    if chosen == asked {
+        println!(
+            "[android] vulkan: swapchain present mode {} (unchanged; driver offers {})",
+            present_mode_name(asked),
+            advertised.join(", ")
+        );
+        return f(device, create_info, allocator, swapchain_out);
+    }
+
+    println!(
+        "[android] vulkan: swapchain present mode {} -> {} (driver offers {})",
+        present_mode_name(asked),
+        present_mode_name(chosen),
+        advertised.join(", ")
+    );
+    let patched = VkSwapchainCreateInfoKHR { present_mode: chosen, ..*info };
+    // SAFETY: `patched` differs from the caller's struct in one scalar field
+    // and matches the host's layout exactly (see the module doc on Vulkan's ABI
+    // being the same struct on Android and desktop Linux); every pointer inside
+    // it is the caller's own and outlives this call.
+    f(device, &patched, allocator, swapchain_out)
 }
 
 static HOST_GET_SURFACE_CAPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -574,7 +908,19 @@ extern "C" fn vk_create_instance(
     };
     // SAFETY: `patched` matches the host's `VkInstanceCreateInfo` layout exactly
     // (see the module doc); `rewritten` outlives this call.
-    unsafe { (h.create_instance)(&patched, allocator, instance_out) }
+    let rc = unsafe { (h.create_instance)(&patched, allocator, instance_out) };
+
+    // Kept because instance-level commands cannot be reached without it:
+    // `vkGetInstanceProcAddr(NULL, ...)` only answers for the three global
+    // commands, and `supported_present_modes` needs one that is not among them.
+    if rc == VK_SUCCESS {
+        // SAFETY: `vkCreateInstance` returning `VK_SUCCESS` is its own contract
+        // that it wrote a valid handle through `instance_out`.
+        if let Some(&instance) = unsafe { instance_out.as_ref() } {
+            HOST_INSTANCE.store(instance as usize, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    rc
 }
 
 extern "C" fn vk_enumerate_instance_extension_properties(

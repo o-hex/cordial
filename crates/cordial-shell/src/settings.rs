@@ -308,11 +308,98 @@ fn choose_file(
     }
 }
 
+/// "Performance" — the two host-side switches, which are not engine flags.
+///
+/// Separate from the Graphics group above because they are a different kind of
+/// thing: the renderer preference is written into `flags.json` and read by the
+/// engine, whereas these two are environment the shell sets on the client
+/// process and neither of them is Roblox's business.
+///
+/// **The MangoHUD row is insensitive when MangoHUD is not installed, and says
+/// so.** That is the whole reason this function is longer than it looks like it
+/// should be. `MANGOHUD=1` with no layer installed is not an error — the client
+/// starts, nothing appears, and nothing anywhere says why — so a switch offered
+/// unconditionally would be a control that reports success and does not act.
+/// The plugins page in this same window exists in its current form because that
+/// exact defect shipped here twice.
+fn build_performance_group(
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Performance")
+        .description(
+            "Applied to the client process at launch rather than written into Roblox's own \
+             settings, so both take effect the next time you press Roblox.",
+        )
+        .build();
+
+    let gamemode = adw::SwitchRow::builder()
+        .title("Feral GameMode")
+        .subtitle(
+            "Asks gamemoded for the performance CPU governor, higher priority, the GPU's \
+             performance profile and no screensaver while you play. Does nothing at all if \
+             gamemoded is not installed; the client says which way it went.",
+        )
+        .active(config.borrow().gamemode)
+        .build();
+    gamemode.set_subtitle_lines(4);
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        gamemode.connect_active_notify(move |row| {
+            config.borrow_mut().gamemode = row.is_active();
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&gamemode);
+
+    let layer = crate::launch::mangohud_layer();
+    let mangohud = adw::SwitchRow::builder()
+        .title("MangoHUD overlay")
+        .subtitle(match &layer {
+            Some(path) => format!(
+                "Frame rate, frame times and CPU/GPU load, drawn over the game by MangoHUD's \
+                 Vulkan layer.\n{}",
+                path.display()
+            ),
+            // Named as the reason the switch is dead, with the fix. A row that
+            // was simply greyed out would leave somebody toggling it and
+            // wondering what they had done wrong.
+            None => format!(
+                "Not available: MangoHUD's Vulkan layer is not installed on this machine, so \
+                 turning this on would do nothing.\n{}",
+                crate::launch::MANGOHUD_INSTALL_HINT
+            ),
+        })
+        // A stale `true` in shell.json must not read as on when the layer has
+        // since been uninstalled, because at launch it would not be on.
+        .active(config.borrow().mangohud && layer.is_some())
+        .sensitive(layer.is_some())
+        .build();
+    mangohud.set_subtitle_lines(4);
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        mangohud.connect_active_notify(move |row| {
+            config.borrow_mut().mangohud = row.is_active();
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&mangohud);
+
+    group
+}
+
 /// "General" — ordinary client settings. Only the renderer preference is
 /// wired to anything real; see `flags_file.rs` for why resolution and
 /// monitor placement are not offered here despite being genuine
 /// `cordial-run` options in their own right.
-fn build_general_page(flags_path: Rc<PathBuf>) -> adw::PreferencesPage {
+fn build_general_page(
+    flags_path: Rc<PathBuf>,
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder().title("General").icon_name("preferences-other-symbolic").build();
 
     let group = adw::PreferencesGroup::builder()
@@ -344,6 +431,7 @@ fn build_general_page(flags_path: Rc<PathBuf>) -> adw::PreferencesPage {
 
     group.add(&row);
     page.add(&group);
+    page.add(&build_performance_group(config, config_path));
     page
 }
 
@@ -482,8 +570,8 @@ pub fn build_preferences_window(
     // in this window matters: without a build there is nothing to launch, and
     // a renderer preference for a client that cannot start is decoration.
     window.add(&build_roblox_page(&window, config.clone(), config_path.clone()));
-    window.add(&build_appearance_page(config.clone(), config_path));
-    window.add(&build_general_page(flags_path));
+    window.add(&build_appearance_page(config.clone(), config_path.clone()));
+    window.add(&build_general_page(flags_path, config.clone(), config_path));
     window.add(&build_plugins_page(config));
 
     window

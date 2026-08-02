@@ -92,6 +92,26 @@ pub struct ShellConfig {
     /// profile is storage, an instance is a window, and one profile is held by
     /// at most one instance.
     pub profile: String,
+    /// Ask Feral GameMode to raise the CPU governor, the process priority and
+    /// the GPU's performance profile while the client runs, and to hold the
+    /// screensaver off.
+    ///
+    /// Default on, which is what Sober does and what makes it worth having: a
+    /// performance setting nobody finds is a performance setting nobody gets.
+    /// It costs nothing on a machine without gamemoded — the request is a D-Bus
+    /// call that fails, the client says so once and carries on — so there is no
+    /// population this default hurts. `false` here becomes `CORDIAL_GAMEMODE=0`
+    /// on the client, which is also the control for measuring what it does.
+    pub gamemode: bool,
+    /// Show MangoHUD's frame rate and frame time overlay over the client.
+    ///
+    /// Default off, unlike `gamemode`, and for a reason that is not timidity:
+    /// this one is visible. It draws over the game whether or not the user
+    /// wanted it there, so it has to be asked for. It is also the setting most
+    /// likely to be switched on by somebody who has not got MangoHUD installed
+    /// — see `launch::mangohud_layer`, which is what stops that being a silent
+    /// no-op.
+    pub mangohud: bool,
 }
 
 impl Default for ShellConfig {
@@ -100,6 +120,8 @@ impl Default for ShellConfig {
             appearance: AppearanceScheme::default(),
             roblox: crate::install::RobloxInstall::default(),
             profile: DEFAULT_PROFILE.to_string(),
+            gamemode: true,
+            mangohud: false,
         }
     }
 }
@@ -186,6 +208,22 @@ mod tests {
         assert_eq!(config.appearance, AppearanceScheme::Dark);
         assert_eq!(config.profile, DEFAULT_PROFILE);
         assert_eq!(config.roblox, crate::install::RobloxInstall::default());
+        // The performance fields are newer still, and the same argument
+        // applies to them: everybody's shell.json predates them.
+        assert!(config.gamemode, "an older config must still get GameMode's default");
+        assert!(!config.mangohud);
+    }
+
+    #[test]
+    fn the_performance_switches_round_trip() {
+        // Both directions, because both defaults are worth being able to
+        // reverse and a setting that only saves the value it already had would
+        // pass a one-way test.
+        let p = scratch("performance.json");
+        save(&p, &ShellConfig { gamemode: false, mangohud: true, ..Default::default() }).unwrap();
+        let back = load(&p);
+        assert!(!back.gamemode);
+        assert!(back.mangohud);
     }
 
     #[test]

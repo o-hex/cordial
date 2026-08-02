@@ -923,7 +923,10 @@ impl HostWindow {
         // it. So this is now a branch rather than an exit.
         if let Some(keycode) = keysym_to_android(keysym) {
             deliver_key(handle, down, keycode, ev.detail as i32, meta, 0, unicode, now, now);
-            pass_key_event(down, keycode, meta);
+            // The evdev code, not the Android keycode. X11 keycodes are evdev
+            // offset by 8 -- XKB reserves the low 8 for historical reasons every
+            // consumer has to undo. See `pass_key_event`.
+            pass_key_event(down, ev.detail as i32 - 8, meta);
         } else {
             super::trace(format_args!("unmapped X11 keysym {keysym:#x}"));
         }

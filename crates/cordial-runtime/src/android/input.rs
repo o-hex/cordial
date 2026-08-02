@@ -385,10 +385,31 @@ pub fn report_keyboard_state(current_geometry: (i32, i32)) {
 /// schemes agree at exactly one letter — evdev `KEY_D` and `AKEYCODE_D` are
 /// both 32 — so "only D works" is the signature of a raw evdev code reaching
 /// something that wanted an Android one, and one traced keystroke settles it.
-pub fn pass_key_event(down: bool, key_code: i32, modifiers: i32) {
+/// `NativeInputInterface.nativePassKeyEvent(Z down, I code, I modifiers, Z repeat)`.
+///
+/// **`code` is a Linux evdev code, not an Android keycode**, and getting that
+/// backwards cost days. The symptom was that exactly one key worked — `D` — and
+/// that holding Alt made the character *jump*.
+///
+/// Both fall out of the same arithmetic. `AKEYCODE_D` is 32 and `KEY_D` is 32,
+/// so `D` worked by pure collision and hid the problem. `AKEYCODE_ALT_LEFT` is
+/// 57 and `KEY_SPACE` is 57, so Alt read as Space, and Space is jump. The rest
+/// simply landed on codes with no meaning: `W` went as `AKEYCODE_W` 51, which is
+/// `KEY_COMMA`; `A` as 29, which is `KEY_LEFTCTRL`; `S` as 47, which is `KEY_V`.
+///
+/// Four theories were measured and disproved before this, all of them assuming a
+/// number was wrong somewhere in a translation table. The number was fine. It
+/// was the *vocabulary* — every one of them took for granted that this native
+/// wanted what AGDK's `onKeyDownNative` wants, and it does not. Note the
+/// signature has no scan-code slot at all, which is the tell: a native that
+/// takes one code and no scan code is taking the platform's own.
+///
+/// `CORDIAL_KEY_ANDROID_CODES=1` restores the old behaviour as a control.
+pub fn pass_key_event(down: bool, evdev_code: i32, modifiers: i32) {
     if no_pass_key() {
         return;
     }
+    let key_code = evdev_code;
     let f = PASS_KEY_EVENT.load(std::sync::atomic::Ordering::Relaxed);
     if f.is_null() {
         report_unregistered("nativePassKeyEvent");

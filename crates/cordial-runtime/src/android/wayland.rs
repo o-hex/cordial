@@ -1748,7 +1748,9 @@ impl WaylandWindow {
             if handle != 0 {
                 super::input::deliver_key(handle, down, keycode, evdev_key as i32, meta, 0, unicode, now, now);
             }
-            super::input::pass_key_event(down, keycode, meta);
+            // The evdev code, not the Android keycode: this native speaks the
+            // platform's own vocabulary. See `pass_key_event`.
+            super::input::pass_key_event(down, evdev_key as i32, meta);
         } else {
             super::trace(format_args!("wayland: unmapped keysym {keysym:#x}"));
         }

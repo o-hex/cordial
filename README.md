@@ -208,6 +208,16 @@ list of build dependencies moved down to §3, where it belongs.
 
 ### 2. Install it
 
+> [!WARNING]
+> **The remote below does not exist yet.** The workflow that builds and
+> publishes it is written but has never run: GitHub Pages is not enabled on this
+> repository and nothing has been deployed, so `flatpak remote-add` against that
+> URL will fail today. Build from source — §3 — until this notice is removed.
+>
+> It is written out here rather than hidden because the commands are what they
+> will be, and because a project that documents an install route before it works
+> should say which half is true.
+
 ```bash
 flatpak remote-add --if-not-exists cordial \
     https://luohoa97.github.io/cordial/cordial.flatpakrepo

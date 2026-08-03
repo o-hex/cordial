@@ -376,8 +376,8 @@ else. So the answer exists before the question is asked.
 
 ## What the shell half turned out to be
 
-`crates/cordial-shell/src/updater.rs`. The button, its three states, the dialog
-behind it, and the settings group on the Roblox page.
+`crates/cordial-shell/src/updater.rs`. The button, its three states, the window
+behind it, and the Updates page in Settings.
 `cordial_update::settings::Automatic` exposes `index`/`from_index` for the
 dropdown, the same seam `shell_config::AppearanceScheme` already uses; the two
 switches are plain booleans on `ShellConfig` and `updater::update_settings` puts
@@ -393,16 +393,40 @@ gains no async runtime for one request.
 Three things the shell half added that this document had not anticipated:
 
 **The Update button has to be honest, and there is nothing for it to do.** It
-appears only in the update-available state, and what it opens says where the
-build comes from — Google Play, the Amazon Appstore — and offers the file picker.
-It never implies a fetch, because there is none to perform.
+is the one button in that window, labelled `Check` until an update is
+established and `Update…` once one is, and what `Update…` opens says where the
+build comes from — Google Play, the Amazon Appstore. It never implies a fetch,
+because there is none to perform, and it is not called `Download` for the same
+reason. The ellipsis is GNOME's convention for a control that opens something
+rather than doing it, which is exactly true here; it drops, and the label
+becomes `Download`, on the day there is a file to fetch.
 
 **Opening the window is itself a check**, in every mode. That is what makes the
 refresh icon in *Manual* do what it draws, and it means there is no "not checked"
 state inside the dialog: that state lives on the button.
 
-**`CORDIAL_SHELL_PRESENT=settings,update` opens those windows at startup.** A
+**`CORDIAL_SHELL_PRESENT=settings,settings=updates,update` opens those windows
+at startup**, `settings=<page>` on a named preferences page. A
 test seam, and it exists because AGENTS.md forbids synthesising input at the
 compositor and Wayland has no window-targeted injection, so "click the button and
 photograph the result" is not an available sentence. It goes through the same
 action and the same button handler a click does.
+
+## Two corrections, after the first version was used
+
+**The APK picker is gone from that window, and the settings left the Roblox
+page.** Both were in this document's plan and both were wrong in the same way.
+The picker made a second place to set one value — `profile_switcher.rs` already
+records what that costs, that two ways to set one value drift and the one that
+drifts is the one nobody is looking at — so it is on the Roblox page in Settings
+and nowhere else. The settings made that page answer *where is my build* and
+*when does Cordial look for a new one* in one scroll, six lines of description
+and a conditional warning row on top of the two path rows somebody opened it
+for; they are their own tab now, which libadwaita draws for free. What the
+header-bar button opens is three groups: the installed version, the changelog,
+and one button.
+
+**The installed version stays in that window**, and is the reason the button
+earns a permanent place in the header bar. Roblox publishes no Android
+artefact, so "nothing newer" is effectively always the answer; without the
+version, the common case is a changelog viewer with a dead button on it.

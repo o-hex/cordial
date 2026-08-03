@@ -117,7 +117,15 @@ impl Instance {
 /// `claim` is consumed and handed to the child: ADR-012's lock belongs to the
 /// instance, and the instance is the process being spawned here. See
 /// [`Claim::hand_to`].
-pub fn spawn(build: &Build, claim: Claim, run_seconds: Option<u64>) -> Result<Instance, String> {
+///
+/// `join_url` is a `roblox-player://` link the desktop handed the launcher,
+/// already checked by [`crate::deep_link::accept`].
+pub fn spawn(
+    build: &Build,
+    claim: Claim,
+    run_seconds: Option<u64>,
+    join_url: Option<&str>,
+) -> Result<Instance, String> {
     let loader = loader_path()?;
     let run = run_seconds.unwrap_or(DEFAULT_RUN_SECONDS).to_string();
 
@@ -160,6 +168,22 @@ pub fn spawn(build: &Build, claim: Claim, run_seconds: Option<u64>) -> Result<In
         .and_then(|n| n.to_str())
         .ok_or_else(|| "the profile directory has no usable name".to_string())?;
     command.arg("--profile").arg(profile_name);
+
+    // The deep link, if one is waiting. `--join-url` is the agreed contract with
+    // `cordial-runtime`, which owns everything past this point: what a Roblox
+    // launch payload means is the client's business and the launcher does not
+    // parse it.
+    //
+    // **`Command::arg` is why this is safe to pass on.** The string came from a
+    // browser acting on somebody's click, and it goes into the child's `argv`
+    // directly — there is no shell anywhere in this path to quote for, and
+    // nothing here interpolates it into a string or builds a path from it. The
+    // scheme and the length were checked in `deep_link`; the rest is carried
+    // untouched, because a launcher that rewrote the payload would be changing
+    // which game it was asked to join.
+    if let Some(url) = join_url {
+        command.arg("--join-url").arg(url);
+    }
 
     // ADR-011 makes Wayland the display backend and says X11 "is not developed
     // further", but `cordial-run` still defaults to X11 and takes Wayland only
@@ -226,7 +250,7 @@ pub fn spawn(build: &Build, claim: Claim, run_seconds: Option<u64>) -> Result<In
 
     claim.hand_to(&mut command);
 
-    let command_line = describe(&loader, &build.lib_dir, &build.apk, &run);
+    let command_line = describe(&loader, &build.lib_dir, &build.apk, &run, join_url);
     let child = command
         .spawn()
         .map_err(|e| format!("Could not start {}: {e}\n\n{command_line}", loader.display()))?;
@@ -348,9 +372,15 @@ fn find_mangohud_layer_in(dirs: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
-fn describe(loader: &Path, lib_dir: &Path, apk: &Path, run: &str) -> String {
+/// The command line quoted back when the client dies at once.
+///
+/// It carries `--join-url` when there was one, because a launch that fails only
+/// with a link on it is exactly the launch somebody needs to be able to repeat
+/// in a terminal.
+fn describe(loader: &Path, lib_dir: &Path, apk: &Path, run: &str, join_url: Option<&str>) -> String {
+    let join = join_url.map(|u| format!(" --join-url {u}")).unwrap_or_default();
     format!(
-        "{} --lib-dir {} --apk {} --host-libc --game-activity --run {run}",
+        "{} --lib-dir {} --apk {} --host-libc --game-activity --run {run}{join}",
         loader.display(),
         lib_dir.display(),
         apk.display()
@@ -383,10 +413,28 @@ mod tests {
             Path::new("/home/a/.cache/cordial/lib/x86_64"),
             Path::new("/home/a/base.apk"),
             "600",
+            None,
         );
         assert!(line.contains("--lib-dir /home/a/.cache/cordial/lib/x86_64"), "{line}");
         assert!(line.contains("--apk /home/a/base.apk"), "{line}");
         assert!(line.contains("--run 600"), "{line}");
+        assert!(!line.contains("--join-url"), "no link means no argument at all: {line}");
+    }
+
+    #[test]
+    fn a_queued_link_is_passed_as_join_url_and_shows_up_in_the_quoted_command() {
+        // The contract with `cordial-runtime`, which implements the other half.
+        // Spelled out in a test because it is a string in two crates: change it
+        // here and the client sees an argument it does not know, which is a
+        // launch that fails for a reason nothing on screen explains.
+        let line = describe(
+            Path::new("/app/bin/cordial-run"),
+            Path::new("/lib/x86_64"),
+            Path::new("/base.apk"),
+            "0",
+            Some("roblox-player://placeId=1818"),
+        );
+        assert!(line.contains("--join-url roblox-player://placeId=1818"), "{line}");
     }
 
     #[test]
@@ -505,7 +553,7 @@ mod tests {
 
         let claim = profile::acquire("e2e").expect("a fresh profile is free");
         let profile_dir = claim.profile_dir().to_path_buf();
-        let mut instance = spawn(&build, claim, Some(40)).expect("the client starts");
+        let mut instance = spawn(&build, claim, Some(40), None).expect("the client starts");
 
         // The lock has to have moved to the child. Checked while it is running,
         // because that is the only moment the answer can be wrong.

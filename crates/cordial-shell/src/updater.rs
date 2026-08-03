@@ -11,11 +11,27 @@
 //!
 //! So every control here stops short of claiming a download. The Update button
 //! exists, in the state that earns it, and what it opens says where the build
-//! comes from and offers the file picker — because a control that looked live
-//! and could never fire would be AGENTS.md's stub-that-lies wearing a widget:
-//! something proceeds on an answer that is not true, except here the something
-//! is a person. This project has already shipped a settings page describing
-//! plugins nobody had installed, twice.
+//! comes from — because a control that looked live and could never fire would be
+//! AGENTS.md's stub-that-lies wearing a widget: something proceeds on an answer
+//! that is not true, except here the something is a person. This project has
+//! already shipped a settings page describing plugins nobody had installed,
+//! twice.
+//!
+//! ## One question, one button, and no second APK picker
+//!
+//! The window behind the header-bar button offered the APK picker as well, and
+//! that picker is gone rather than kept in two places. `profile_switcher.rs`
+//! states the rule it broke: *two ways to set one value drift, and the one that
+//! drifts is the one nobody is looking at.* Choosing a build is configuration
+//! and lives on the Roblox page in Settings beside the engine directory it has
+//! to agree with; this window answers the one question a header-bar button can
+//! answer on its own — which build am I on, and has Roblox published a newer
+//! engine — and offers the single control that state earns.
+//!
+//! The settings themselves moved too, off the Roblox page and onto one of their
+//! own. That page was answering "where is the build" and "when does the build
+//! change" at once, which is six lines of description and a warning row on top
+//! of the two rows somebody opened it for.
 //!
 //! ## How "there is an update" is established without a version endpoint
 //!
@@ -65,8 +81,8 @@ use cordial_update::settings::{Automatic, DownloadOn, Plan, UpdateSettings, NEVE
 use cordial_update::version;
 use cordial_update::Unreachable;
 
-use crate::install::{self, Origin};
-use crate::settings::{choose_file, persist};
+use crate::install;
+use crate::settings::persist;
 use crate::shell_config::ShellConfig;
 
 /// The three states, and the icon each one wears.
@@ -125,10 +141,13 @@ impl Checked {
 }
 
 /// The header-bar button, wired to whatever the settings say about checking.
+///
+/// It takes no config path, unlike everything else in the shell that opens a
+/// window: nothing this button leads to writes a setting any more. The APK
+/// picker it used to carry is on the Roblox page in Settings and nowhere else.
 pub fn header_button(
     parent: &impl IsA<gtk::Window>,
     config: Rc<RefCell<ShellConfig>>,
-    config_path: Rc<PathBuf>,
 ) -> gtk::Button {
     let parent = parent.as_ref().clone();
     let button = gtk::Button::from_icon_name(DOWNLOAD_ICON);
@@ -145,7 +164,6 @@ pub fn header_button(
         let last = last.clone();
         let parent = parent.clone();
         let config = config.clone();
-        let config_path = config_path.clone();
         glib::timeout_add_local_once(AFTER_WINDOW, move || {
             let apk = install::effective_apk(&config.borrow().roblox).map(|(p, _)| p);
             check(apk, move |checked| {
@@ -187,7 +205,7 @@ pub fn header_button(
                 // button on it, on launch, and that dialog is the whole
                 // difference between the two settings.
                 if automatic == Automatic::Ask {
-                    present(&parent, config.clone(), config_path.clone(), last.clone(), button.clone());
+                    present(&parent, config.clone(), last.clone(), button.clone());
                 }
             });
         });
@@ -197,10 +215,9 @@ pub fn header_button(
         let last = last.clone();
         let parent = parent.clone();
         let config = config.clone();
-        let config_path = config_path.clone();
         let button_for_click = button.clone();
         button.connect_clicked(move |_| {
-            present(&parent, config.clone(), config_path.clone(), last.clone(), button_for_click.clone());
+            present(&parent, config.clone(), last.clone(), button_for_click.clone());
         });
     }
 
@@ -244,7 +261,7 @@ fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
     // `apk` is taken here rather than read on the worker so that nothing off the
     // main thread touches config the main thread owns.
     let _ = apk;
-    check_with(
+    on_worker(
         || {
             let metered = metered::current();
             let installed = cache::recorded_version(&install::engine_cache());
@@ -263,11 +280,16 @@ fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
 /// main context and asserts the answer arrives is the only thing that tells the
 /// difference between "the request is slow" and "the answer had nowhere to go",
 /// and the first version of this shipped looking exactly like the second.
-fn check_with(
-    work: impl FnOnce() -> Checked + Send + 'static,
-    then: impl Fn(Checked) + 'static,
+///
+/// Generic over what comes back because there are two of these now: the
+/// changelog request, and the NetworkManager property the Updates page shows.
+/// `metered::query` is a blocking D-Bus call with zbus's own timeout in front of
+/// it, so building a settings page must not be what waits on it.
+fn on_worker<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+    then: impl Fn(T) + 'static,
 ) {
-    let (tx, rx) = mpsc::channel::<Checked>();
+    let (tx, rx) = mpsc::channel::<T>();
     std::thread::spawn(move || {
         // The window may already be closed; nobody is owed this answer.
         let _ = tx.send(work());
@@ -290,108 +312,59 @@ pub fn update_settings(config: &ShellConfig) -> UpdateSettings {
     UpdateSettings { automatic: config.automatic_updates, download_on: config.download_on }
 }
 
-/// The dialog behind the button.
+/// The window behind the button: which build is here, what Roblox has published,
+/// and one control.
 ///
-/// One dialog for all three states, with the top group saying which. Three
-/// dialogs would be three places for the same sentence about where a build comes
+/// One window for all three states, with the top group saying which. Three
+/// windows would be three places for the same sentence about where a build comes
 /// from, and they would drift.
+///
+/// **Three groups and no fourth.** This had the APK picker, the extracted-engine
+/// cache row, the download source, the connection NetworkManager reported and
+/// the update settings on it as well, which made a header-bar button open a
+/// second settings window. The settings are a tab in the real one now, the
+/// picker is on the Roblox page, and what is left is the question the button can
+/// answer: which build am I on, and is there a newer engine.
 pub fn present(
     parent: &gtk::Window,
     config: Rc<RefCell<ShellConfig>>,
-    config_path: Rc<PathBuf>,
     last: Rc<RefCell<Option<Checked>>>,
     button: gtk::Button,
 ) {
     let automatic = config.borrow().automatic_updates;
     let page = adw::PreferencesPage::new();
 
-    // --- what is known, and what to do about it ----------------------------
+    // --- what is known, and the one thing to do about it -------------------
     let status_group = adw::PreferencesGroup::new();
     let status_row = adw::ActionRow::new();
     status_row.set_subtitle_lines(6);
     status_group.add(&status_row);
 
-    // Both suffixes are built once and shown by state, rather than rebuilt: a
-    // manual check has to be able to turn this dialog from one into the other
-    // while it is open, which is the state the design describes as the refresh
-    // button becoming the update button.
-    let update = gtk::Button::with_label("Update…");
-    update.add_css_class("suggested-action");
-    update.set_valign(gtk::Align::Center);
-    update.set_visible(false);
-    status_row.add_suffix(&update);
-
-    let check_now = gtk::Button::with_label("Check Now");
-    check_now.set_valign(gtk::Align::Center);
-    status_row.add_suffix(&check_now);
+    // One button, relabelled by state rather than two swapped by visibility. A
+    // manual check has to be able to turn this window from one state into the
+    // other while it is open — the design's "the refresh button becomes the
+    // update button" — and a single button that changes its word is that
+    // sentence taken literally.
+    let action = gtk::Button::with_label(CHECK);
+    action.set_valign(gtk::Align::Center);
+    status_row.add_suffix(&action);
     page.add(&status_group);
 
-    // --- what is installed -------------------------------------------------
+    // --- which build is here -----------------------------------------------
+    //
+    // Kept, and it is the reason this button is worth a permanent place in the
+    // header bar. Roblox publishes no Android artefact, so "nothing newer" is
+    // effectively always the answer; strip the installed version out and the
+    // common case is a changelog viewer with a dead button on it.
     let installed_group = adw::PreferencesGroup::builder()
         .title("Installed build")
-        .description(
-            "Cordial ships no Roblox code and never will, so this is a build you already have. \
-             Choosing a file here is the same setting as the APK row in Settings.",
-        )
+        .description(INSTALLED_DESCRIPTION)
         .build();
 
-    let apk_row = adw::ActionRow::builder().title("APK").build();
-    apk_row.set_subtitle_lines(3);
     let version_row = adw::ActionRow::builder().title("Roblox version").build();
     version_row.set_subtitle_lines(4);
-    let cache_row = adw::ActionRow::builder().title("Extracted engine").build();
-    cache_row.set_subtitle_lines(4);
-
-    let refresh_paths = {
-        let config = config.clone();
-        let apk_row = apk_row.clone();
-        let version_row = version_row.clone();
-        let cache_row = cache_row.clone();
-        // Recomputed rather than remembered, for the same reason `install::locate`
-        // looks every time: the APK can move, and a stale "yes it is there" is
-        // the sentence that sends somebody debugging the wrong thing.
-        Rc::new(move || {
-            let effective = install::effective_apk(&config.borrow().roblox);
-            let apk = effective.as_ref().map(|(path, _)| path.clone());
-            apk_row.set_subtitle(&apk_line(effective));
-            let engine_dir = install::engine_cache();
-            version_row.set_subtitle(&version_line(cache::recorded_version(&engine_dir)));
-            cache_row.set_subtitle(&cache_line(
-                engine_dir.join(install::LIBRARY).is_file(),
-                cache::stamp_of(&engine_dir),
-                apk.as_deref().is_some_and(|apk| cache::is_current(&engine_dir, apk)),
-            ));
-        })
-    };
-    refresh_paths();
-
-    let choose = gtk::Button::with_label("Choose…");
-    choose.set_valign(gtk::Align::Center);
-    {
-        // The same picker the Roblox settings page uses, called the same way. A
-        // second chooser of its own would be a second thing to keep agreeing
-        // with `RobloxInstall`, and the two would drift the first time one of
-        // them learned something about split APKs.
-        let parent = parent.clone();
-        let config = config.clone();
-        let config_path = config_path.clone();
-        let refresh_paths = refresh_paths.clone();
-        choose.connect_clicked(move |_| {
-            let config = config.clone();
-            let config_path = config_path.clone();
-            let refresh_paths = refresh_paths.clone();
-            choose_file(&parent, "Choose the Roblox APK", false, move |path| {
-                config.borrow_mut().roblox.apk = Some(path);
-                persist(&config, &config_path);
-                refresh_paths();
-            });
-        });
-    }
-    apk_row.add_suffix(&choose);
-
-    installed_group.add(&apk_row);
+    version_row.set_subtitle(&version_line(cache::recorded_version(&install::engine_cache())));
     installed_group.add(&version_row);
-    installed_group.add(&cache_row);
     page.add(&installed_group);
 
     // --- what Roblox has published ----------------------------------------
@@ -412,31 +385,17 @@ pub fn present(
     notes_group.add(&notes_row);
     page.add(&notes_group);
 
-    // --- where a newer one comes from --------------------------------------
-    let source_group =
-        adw::PreferencesGroup::builder().title("Getting a newer build").description(STORES).build();
-
-    let source_row = adw::ActionRow::builder()
-        .title("Download source")
-        .subtitle(source_line(&Source::configured()))
-        .build();
-    source_row.set_subtitle_lines(8);
-    source_group.add(&source_row);
-
-    let connection_row =
-        adw::ActionRow::builder().title("This connection").subtitle("Not checked").build();
-    connection_row.set_subtitle_lines(4);
-    source_group.add(&connection_row);
-    page.add(&source_group);
-
-    page.add(&build_update_group(config.clone(), config_path.clone()));
-
     let window = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
         .title("Roblox Build")
         .default_width(660)
-        .default_height(720)
+        // 720 while there were six groups here, three of which have gone
+        // elsewhere. Sized so the release notes are on screen rather than below
+        // the fold: they are the only thing left with any length to them, and a
+        // window whose third group has to be scrolled to is a window that looks
+        // like it has two.
+        .default_height(660)
         .build();
 
     // Everything the answer touches, in one closure, so a check started from
@@ -444,22 +403,34 @@ pub fn present(
     let paint = {
         let status_row = status_row.clone();
         let notes_row = notes_row.clone();
-        let connection_row = connection_row.clone();
+        let version_row = version_row.clone();
         let open = open.clone();
-        let update = update.clone();
-        let check_now = check_now.clone();
+        let action = action.clone();
         let button = button.clone();
         Rc::new(move |checked: &Option<Checked>| {
             let (title, subtitle) = status_lines(checked, automatic);
             status_row.set_title(&title);
             status_row.set_subtitle(&subtitle);
             let available = checked.as_ref().is_some_and(Checked::update_available);
-            update.set_visible(available);
-            check_now.set_sensitive(true);
+            action.set_label(action_label(checked));
+            action.set_sensitive(true);
+            // The attention the header-bar button wears, on the control that
+            // acts on it. Removed again in the other direction because a check
+            // can turn this window back into the nothing-newer state while it
+            // is open, and a suggested-action Check reads as an update waiting.
+            if available {
+                action.add_css_class("suggested-action");
+            } else {
+                action.remove_css_class("suggested-action");
+            }
 
             match checked {
                 Some(checked) => {
-                    connection_row.set_subtitle(&connection_line(checked.metered));
+                    // The same value the row was built with, once a check has
+                    // actually read it, so the window has one source for it
+                    // rather than a row that could disagree with the status
+                    // above it.
+                    version_row.set_subtitle(&version_line(checked.installed.clone()));
                     let (title, body) = release_lines(&checked.release);
                     notes_row.set_title(&title);
                     notes_row.set_subtitle(&body);
@@ -469,7 +440,6 @@ pub fn present(
                     }
                 }
                 None => {
-                    connection_row.set_subtitle("Asking NetworkManager…");
                     notes_row.set_title("Fetching…");
                     notes_row.set_subtitle("Roblox's release notes, from the DevForum.");
                     open.set_visible(false);
@@ -489,9 +459,9 @@ pub fn present(
         let paint = paint.clone();
         let config = config.clone();
         let status_row = status_row.clone();
-        let check_now = check_now.clone();
+        let action = action.clone();
         Rc::new(move || {
-            check_now.set_sensitive(false);
+            action.set_sensitive(false);
             status_row.set_title("Checking…");
             let apk = install::effective_apk(&config.borrow().roblox).map(|(p, _)| p);
             let last = last.clone();
@@ -503,8 +473,20 @@ pub fn present(
         })
     };
     {
+        // The whole of what the one button does, and which branch it takes is
+        // the state rather than a mode the user has to have selected. Check
+        // re-asks the DevForum; Update… opens what Cordial knows about getting
+        // a build it cannot fetch.
         let run_check = run_check.clone();
-        check_now.connect_clicked(move |_| run_check());
+        let last_for_click = last.clone();
+        let window_for_update = window.clone();
+        action.connect_clicked(move |_| {
+            if last_for_click.borrow().as_ref().is_some_and(Checked::update_available) {
+                update_dialog(&window_for_update);
+            } else {
+                run_check();
+            }
+        });
     }
     // Opening this window is a check in every mode, which is what makes the
     // refresh button in Manual do what its icon says. It costs a second request
@@ -515,54 +497,6 @@ pub fn present(
         run_check();
     }
 
-    {
-        // The Update button, and the one thing it must not do is imply a fetch.
-        // It reports what `Source::configured` decided — which today is a
-        // refusal naming Google Play and the Amazon Appstore — and hands over
-        // the file picker, which is the part that actually gets somebody a newer
-        // build.
-        let window_for_update = window.clone();
-        let config = config.clone();
-        let config_path = config_path.clone();
-        let refresh_paths = refresh_paths.clone();
-        update.connect_clicked(move |_| {
-            let dialog = adw::MessageDialog::builder()
-                .transient_for(&window_for_update)
-                .modal(true)
-                .heading("Cordial cannot download this build")
-                .body(update_body(&Source::configured()))
-                .build();
-            dialog.add_response("close", "Close");
-            dialog.add_response("choose", "Choose an APK…");
-            dialog.set_response_appearance("choose", adw::ResponseAppearance::Suggested);
-            dialog.set_default_response(Some("choose"));
-
-            let window_for_choose = window_for_update.clone();
-            let config = config.clone();
-            let config_path = config_path.clone();
-            let refresh_paths = refresh_paths.clone();
-            dialog.connect_response(None, move |_, response| {
-                if response != "choose" {
-                    return;
-                }
-                let config = config.clone();
-                let config_path = config_path.clone();
-                let refresh_paths = refresh_paths.clone();
-                choose_file(
-                    window_for_choose.upcast_ref::<gtk::Window>(),
-                    "Choose the Roblox APK",
-                    false,
-                    move |path| {
-                        config.borrow_mut().roblox.apk = Some(path);
-                        persist(&config, &config_path);
-                        refresh_paths();
-                    },
-                );
-            });
-            dialog.present();
-        });
-    }
-
     let header = adw::HeaderBar::new();
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
@@ -571,18 +505,130 @@ pub fn present(
     window.present();
 }
 
-/// The dropdown and the two switches, for the Roblox settings page.
+/// What the one button says before a check, and once one has landed.
+///
+/// **`Update…` and never `Download`.** There is nothing to download — Roblox
+/// publishes the Android build through Google Play and the Amazon Appstore and
+/// no file — and a button labelled Download that opens a panel saying so is the
+/// interface version of the stub that reports success. The ellipsis is load
+/// bearing rather than decoration: GNOME's convention is that `…` means *this
+/// opens something rather than doing it*, which is exactly what this button
+/// does. **The day `cordial_update::download::fetch` has a source to fetch from,
+/// the ellipsis drops and this becomes `Download`**, because then the button
+/// really would do the thing its label names.
+const UPDATE: &str = "Update…";
+
+/// The resting label. `Check` rather than `Check Now`, because the window it
+/// sits in is already the answer to "now".
+const CHECK: &str = "Check";
+
+fn action_label(checked: &Option<Checked>) -> &'static str {
+    match checked {
+        Some(checked) if checked.update_available() => UPDATE,
+        _ => CHECK,
+    }
+}
+
+/// What `Update…` opens, and the one thing it must not do is imply a fetch.
+///
+/// It reports what [`Source::configured`] decided — which today is a refusal
+/// naming Google Play and the Amazon Appstore — and stops there. It used to
+/// offer the APK picker as its suggested response, which made this the second
+/// place a build could be chosen; that is now the Roblox page in Settings, and
+/// the text says so rather than growing a shortcut back to it.
+fn update_dialog(parent: &adw::Window) {
+    let dialog = adw::MessageDialog::builder()
+        .transient_for(parent)
+        .modal(true)
+        .heading("Cordial cannot download this build")
+        .body(update_body(&Source::configured()))
+        .build();
+    dialog.add_response("close", "Close");
+    dialog.present();
+}
+
+/// "Updates" — a page of its own, and what it says about a download it cannot
+/// perform.
+///
+/// It was a group on the Roblox page, which left that page answering two
+/// questions at once: *where is the build* and *when does the build change*.
+/// Between them they put six lines of description, a dropdown, two switches and
+/// a conditional warning row on top of the two path rows somebody opens that
+/// page for. Splitting them costs one more tab in a window that gets its tabs
+/// from libadwaita for free.
+///
+/// `system-software-install-symbolic` rather than
+/// `software-update-available-symbolic` for the same reason the header-bar
+/// button wears it: the second icon *means* an update is waiting, and this page
+/// exists whether or not one is.
+pub fn build_update_page(
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("Updates")
+        // The name `open_on_start` addresses this page by. Without it
+        // libadwaita answers `settings=updates` with "Child name 'updates' not
+        // found in AdwViewStack" and shows the first page instead, which is a
+        // screenshot captioned as something it is not.
+        .name("updates")
+        .icon_name("system-software-install-symbolic")
+        .build();
+    page.add(&build_update_group(config, config_path));
+    page.add(&build_source_group());
+    page
+}
+
+/// Where a newer build comes from, and what this connection counts as.
+///
+/// Both rows were on the header-bar button's window, which is not where they
+/// belong: neither answers "which build am I on". They explain the two switches
+/// directly above them — an update that does not download because the desktop
+/// guesses metered is the confusion this row exists to pre-empt.
+fn build_source_group() -> adw::PreferencesGroup {
+    let group =
+        adw::PreferencesGroup::builder().title("Getting a newer build").description(STORES).build();
+
+    let source_row = adw::ActionRow::builder()
+        .title("Download source")
+        .subtitle(source_line(&Source::configured()))
+        .build();
+    source_row.set_subtitle_lines(8);
+    group.add(&source_row);
+
+    let connection_row =
+        adw::ActionRow::builder().title("This connection").subtitle("Asking NetworkManager…").build();
+    connection_row.set_subtitle_lines(4);
+    group.add(&connection_row);
+
+    // Off the GTK thread, because `metered::query` is a blocking D-Bus call with
+    // zbus's own timeout in front of it. A settings window that opened after a
+    // pause on a machine where NetworkManager is wedged would be this crate
+    // repeating the mistake the changelog check is already written to avoid.
+    {
+        let connection_row = connection_row.clone();
+        on_worker(metered::current, move |m| connection_row.set_subtitle(&connection_line(m)));
+    }
+
+    group
+}
+
+/// The dropdown and the two switches.
 ///
 /// `build_appearance_page`'s shape for the dropdown, to the letter: a
 /// `StringList` in the order the enum's `index` defines, `selected` from the
 /// saved value, and one `connect_selected_notify` that writes the config and
 /// persists it. The switches follow `build_performance_group`'s.
-pub fn build_update_group(
+fn build_update_group(
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
 ) -> adw::PreferencesGroup {
-    let group =
-        adw::PreferencesGroup::builder().title("Updates").description(SETTINGS_DESCRIPTION).build();
+    // Not "Updates" — the page is called that now, and a group repeating its own
+    // page's title is a heading that says nothing.
+    let group = adw::PreferencesGroup::builder()
+        .title("Automatic updates")
+        .description(SETTINGS_DESCRIPTION)
+        .build();
 
     // Order has to match Automatic::index/from_index; the labels come from the
     // enum so the wording lives in one file rather than two.
@@ -697,7 +743,15 @@ const STORES: &str =
      Play and the Amazon Appstore, and Roblox's own deployment CDN carries the Windows and Mac \
      clients only. So there is a file to obtain, and Cordial is not the thing that can fetch it \
      for you — it will not sign in to a store on your behalf, and it will not take the file from \
-     a mirror and call that Roblox. Obtain an APK and choose it above.";
+     a mirror and call that Roblox. Obtain an APK and choose it on the Roblox page.";
+
+/// Said on the installed-build group, where the picker used to be.
+///
+/// It names where the picker went. A group that lost its only control and says
+/// nothing about it reads as a control that failed to appear.
+const INSTALLED_DESCRIPTION: &str =
+    "Cordial ships no Roblox code and never will, so this is a build you already have. The APK \
+     is chosen on the Roblox page in Settings, which is the only place it is set.";
 
 /// The top row: which of the three states this is, and why.
 fn status_lines(checked: &Option<Checked>, automatic: Automatic) -> (String, String) {
@@ -765,20 +819,10 @@ fn update_body(configured: &Result<Source, Refusal>) -> String {
             "{URL_ENV} points Cordial at {}.\n\nDownloading from this window is not built: \
              nothing in the shell streams a file yet, and pretending otherwise with a progress \
              bar that never fills would be worse than saying so. Fetch it yourself and choose \
-             it here.",
+             it on the Roblox page in Settings.",
             source.url
         ),
         Err(refusal) => format!("{refusal}\n\n{STORES}"),
-    }
-}
-
-/// What the APK row says.
-fn apk_line(effective: Option<(PathBuf, Origin)>) -> String {
-    match effective {
-        Some((path, origin)) => format!("{}\n{}", path.display(), origin.describe()),
-        None => "No build found. Choose an APK, or press Roblox in the launcher for how to get \
-                 one."
-            .to_string(),
     }
 }
 
@@ -803,7 +847,12 @@ fn version_line(recorded: Option<String>) -> String {
 /// The stamp is shown verbatim because it is the thing that decides: `install`
 /// re-extracts when it stops matching, and somebody looking at a Cordial that
 /// re-extracts 115 MB every launch has no other way to see what it is comparing.
-fn cache_line(engine: bool, stamp: Option<String>, current: bool) -> String {
+///
+/// Said on the Roblox page's engine-directory row now rather than in the
+/// header-bar button's window. It followed the engine directory, which is what
+/// it is about; the alternative on offer was deleting it with the row it used to
+/// sit in, and this is the only place the re-extraction is visible at all.
+pub(crate) fn cache_line(engine: bool, stamp: Option<String>, current: bool) -> String {
     if !engine {
         return "None yet. Cordial takes lib/x86_64/libroblox.so out of the APK the first time \
                 you launch, into its own cache."
@@ -1019,10 +1068,48 @@ mod tests {
         let body = update_body(&Source::configured());
         assert!(body.contains("Google Play"), "{body}");
         assert!(body.contains("Amazon Appstore"), "{body}");
+        // And it points at the one place a build is chosen, rather than
+        // offering a second picker of its own.
+        assert!(body.contains("Roblox page"), "{body}");
 
         let hash = Sha256Hash::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap();
         let with_source = update_body(&Source::new("https://example.invalid/base.apk", hash));
         assert!(with_source.contains("not built"), "{with_source}");
+        assert!(with_source.contains("Roblox page in Settings"), "{with_source}");
+    }
+
+    #[test]
+    fn the_button_offers_to_check_until_an_update_is_established_and_never_says_download() {
+        // The label is the promise. Nothing can be downloaded — Roblox publishes
+        // no Android artefact — so a button that said Download would be
+        // AGENTS.md's stub-that-reports-success with a widget around it, and the
+        // panel behind it saying "get this from Google Play" would be the
+        // failure arriving somewhere unrelated to the cause.
+        assert_eq!(action_label(&None), "Check");
+        assert_eq!(action_label(&Some(checked(None, Some(732)))), "Check");
+        assert_eq!(action_label(&Some(checked(Some("0.732.23.7321040"), Some(732)))), "Check");
+
+        let available = checked(Some("0.700.1.7001000"), Some(732));
+        assert!(available.update_available());
+        assert_eq!(action_label(&Some(available)), "Update…");
+
+        for label in [CHECK, UPDATE] {
+            assert!(!label.contains("Download"), "{label}");
+        }
+        // The ellipsis is the GNOME convention for "opens something rather than
+        // doing it", and it is the difference between this button and a lie.
+        assert!(UPDATE.ends_with('…'), "{UPDATE}");
+    }
+
+    #[test]
+    fn the_installed_group_says_where_the_apk_is_chosen_now_that_it_is_not_chosen_here() {
+        // The picker was here and in Settings at once. `profile_switcher.rs`
+        // wrote down what that costs: two ways to set one value drift, and the
+        // one that drifts is the one nobody is looking at. What is left has to
+        // say where the other one is, or a group with no control in it reads as
+        // a control that failed to appear.
+        assert!(INSTALLED_DESCRIPTION.contains("Roblox page in Settings"), "{INSTALLED_DESCRIPTION}");
+        assert!(INSTALLED_DESCRIPTION.contains("only place"), "{INSTALLED_DESCRIPTION}");
     }
 
     #[test]
@@ -1030,17 +1117,6 @@ mod tests {
         assert!(STORES.contains("Google Play"), "{STORES}");
         assert!(STORES.contains("Amazon Appstore"), "{STORES}");
         assert!(STORES.contains("mirror"), "{STORES}");
-    }
-
-    #[test]
-    fn the_apk_row_says_where_the_build_came_from() {
-        // Provenance is not decoration: the build usually lives in another
-        // application's private directory, and somebody who does not know that
-        // cannot understand why removing Sober broke Cordial.
-        let line = apk_line(Some((PathBuf::from("/home/someone/base.apk"), Origin::Sober)));
-        assert!(line.contains("/home/someone/base.apk"), "{line}");
-        assert!(line.contains("org.vinegarhq.Sober"), "{line}");
-        assert!(apk_line(None).contains("Choose an APK"));
     }
 
     #[test]
@@ -1126,11 +1202,11 @@ mod tests {
         let context = glib::MainContext::default();
         let _guard = context.acquire().expect("the test thread can own the default context");
         let landed = Rc::new(Cell::new(false));
-        check_with(
+        on_worker(
             || checked(Some("0.700.1.7001000"), Some(732)),
             {
                 let landed = landed.clone();
-                move |checked| {
+                move |checked: Checked| {
                     assert!(checked.update_available());
                     landed.set(true);
                 }

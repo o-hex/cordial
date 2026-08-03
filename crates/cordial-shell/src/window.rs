@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::chooser;
+use crate::deep_link;
 use crate::flags_file;
 use crate::install::{self, NotFound};
 use crate::instructions;
@@ -34,6 +35,103 @@ use crate::updater;
 use cordial_shell::host_window::HostWindow;
 use cordial_shell::profile;
 
+/// A `roblox-player://` link the desktop handed over, held until the user
+/// presses Roblox.
+///
+/// **Deliberately not a launch.** A link could start the client outright, and
+/// that is what a browser handler usually does; here it would skip the two
+/// decisions the launcher exists to take — which profile, and against which
+/// build — and it would do it in response to a click in another application.
+/// So the link opens the launcher, the launcher says a join is waiting, and the
+/// user presses Roblox as they otherwise would.
+///
+/// The banner is not decoration either. A link that vanished into a variable
+/// would be indistinguishable from a link that was dropped, and "it ignored my
+/// click" is the report that follows.
+#[derive(Clone)]
+pub struct PendingJoin {
+    url: Rc<RefCell<Option<String>>>,
+    banner: adw::Banner,
+}
+
+impl PendingJoin {
+    fn new() -> Self {
+        let banner = adw::Banner::builder().revealed(false).button_label("Discard").build();
+        let url: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        {
+            // A queued join the user cannot get rid of is a trap: the next
+            // launch would carry a link they have changed their mind about, and
+            // the only way out would be closing the launcher.
+            let url = url.clone();
+            banner.connect_button_clicked(move |banner| {
+                *url.borrow_mut() = None;
+                banner.set_revealed(false);
+            });
+        }
+        PendingJoin { url, banner }
+    }
+
+    /// Show a link as waiting. Replaces whatever was queued: two links means the
+    /// second click is the one the user is looking at.
+    pub fn queue(&self, url: String) {
+        self.banner.set_title(&banner_line(&url));
+        self.banner.set_revealed(true);
+        *self.url.borrow_mut() = Some(url);
+    }
+
+    /// What the next launch should carry, without consuming it: a launch that
+    /// fails must leave the link where it was, or a busy profile would cost the
+    /// user the link as well as the launch.
+    fn peek(&self) -> Option<String> {
+        self.url.borrow().clone()
+    }
+
+    fn clear(&self) {
+        *self.url.borrow_mut() = None;
+        self.banner.set_revealed(false);
+    }
+
+    fn banner(&self) -> &adw::Banner {
+        &self.banner
+    }
+}
+
+/// What the banner says about a waiting link.
+///
+/// Pure, and separate from the widget, for the reason `busy_body` is: a string
+/// that can only be inspected by building a window and photographing it is a
+/// string that drifts. It also has one genuine hazard in it — `AdwBanner`'s
+/// title is Pango markup and this text came from a browser, so an unescaped `&`
+/// in a query string is enough to make GTK drop the label, and anything sharper
+/// is worse than that.
+fn banner_line(url: &str) -> String {
+    let shown = glib::markup_escape_text(&deep_link::summarise(url));
+    format!("Roblox link waiting: {shown} — press Roblox to join")
+}
+
+/// The running shell, for the handful of things that happen to it from outside.
+///
+/// `main.rs` holds one so that a second invocation carrying a link — which is
+/// what the desktop does when a browser opens `roblox-player://` while Cordial
+/// is up — reaches the window that already exists rather than starting another.
+pub struct Shell {
+    window: adw::Window,
+    join: PendingJoin,
+}
+
+impl Shell {
+    /// Bring the launcher forward and show the link as waiting.
+    pub fn queue_join(&self, url: String) {
+        self.join.queue(url);
+        self.window.present();
+    }
+
+    /// Bring the launcher forward, for a second invocation carrying nothing.
+    pub fn present(&self) {
+        self.window.present();
+    }
+}
+
 /// How long to wait before deciding a client that has already exited failed.
 ///
 /// `cordial-run` reaching its first frame takes seconds; failing at load takes
@@ -43,7 +141,11 @@ use cordial_shell::profile;
 /// whole change exists to remove.
 const EARLY_EXIT_CHECK: std::time::Duration = std::time::Duration::from_secs(3);
 
-pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) {
+pub fn build(
+    app: &adw::Application,
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+) -> Shell {
     // T1: the chooser core paints before the plugin host is up. One entry, and
     // it starts the client — see `chooser.rs` on why the second one went.
     let source = chooser::CordialSource;
@@ -52,13 +154,18 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     // activate handler reports through it.
     let toasts = adw::ToastOverlay::new();
 
+    // Empty and hidden until the desktop hands over a link, which on most runs
+    // is never; `AdwBanner` takes no space while it is not revealed.
+    let join = PendingJoin::new();
+
     let chooser_widget = {
         let toasts = toasts.clone();
         let config = config.clone();
+        let join = join.clone();
         chooser::build(&source, move |id| {
             let Some(window) = toasts.root().and_downcast::<gtk::Window>() else { return };
             match id {
-                chooser::ROBLOX => activate_roblox(&window, &toasts, &config),
+                chooser::ROBLOX => activate_roblox(&window, &toasts, &config, &join),
                 // Unreachable while there is one entry, and deliberately loud
                 // rather than ignored: the moment plugin-contributed entries
                 // exist, an id core does not know how to launch is a bug in the
@@ -96,7 +203,17 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     clamp.set_margin_bottom(24);
     clamp.set_margin_start(24);
     clamp.set_margin_end(24);
-    toasts.set_child(Some(&clamp));
+    clamp.set_vexpand(true);
+
+    // The banner sits above the centred column rather than inside it, so that a
+    // queued join reads as a message about the window instead of a third
+    // control in the composition. It expands nothing while it is hidden, which
+    // is why the launcher looks the same as it always did on every run where no
+    // link arrives.
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    body.append(join.banner());
+    body.append(&clamp);
+    toasts.set_child(Some(&body));
 
     // --- seam for the engine's surface -----------------------------------
     // This window is the same definition `cordial-runtime` builds to host the
@@ -140,7 +257,7 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     // find at the moment you want it and moves everything beside it when it
     // arrives — and this one answers "which Roblox build am I on", which is
     // worth a button whether or not anything newer exists.
-    let update_button = updater::header_button(&window, config.clone(), config_path.clone());
+    let update_button = updater::header_button(&window, config.clone());
     host.header().pack_end(&update_button);
 
     let flags_path = Rc::new(flags_file::user_flags_path());
@@ -150,16 +267,27 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     // open settings, and that offer must land on the same window this button
     // opens. `AdwWindow` is not a `GtkApplicationWindow` and so carries no
     // action map of its own, hence the explicit group.
-    let settings_action = gtk::gio::SimpleAction::new("settings", None);
+    //
+    // It takes a string, which is the name of the page to open on and is empty
+    // for "whichever libadwaita shows first". That parameter exists for the
+    // photograph seam below: Settings has five tabs now and only the first one
+    // can be seen without pressing something, which under ADR-011's Wayland is
+    // not a thing an agent may do — see `open_on_start`. It goes through the
+    // same action the button does rather than a second way in.
+    let settings_action =
+        gtk::gio::SimpleAction::new("settings", Some(glib::VariantTy::STRING));
     let window_for_settings = window.clone();
-    settings_action.connect_activate(move |_, _| {
-        settings::build_preferences_window(
+    settings_action.connect_activate(move |_, page| {
+        let settings = settings::build_preferences_window(
             &window_for_settings,
             config.clone(),
             config_path.clone(),
             flags_path.clone(),
-        )
-        .present();
+        );
+        if let Some(name) = page.and_then(|p| p.str()).filter(|n| !n.is_empty()) {
+            settings.set_visible_page_name(name);
+        }
+        settings.present();
     });
     // The same arrangement for the profile row: a launch refused because the
     // profile is busy has to be able to reach the control that chooses another
@@ -175,6 +303,13 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
     actions.add_action(&settings_action);
     actions.add_action(&profile_action);
     window.insert_action_group("win", Some(&actions));
+    // The target before the name, and in that order deliberately: GTK's action
+    // helper re-checks the pair every time either changes, and naming a
+    // string-taking action while the target is still unset logs "can't be
+    // activated due to parameter type mismatch" on every startup. The empty
+    // string is "open on whatever page libadwaita shows first", which is what a
+    // press of this button has always meant.
+    settings_button.set_action_target_value(Some(&"".to_variant()));
     settings_button.set_action_name(Some("win.settings"));
 
     // Focus starts on the thing the window is for, so that a keyboard launches
@@ -188,9 +323,11 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
 
     window.present();
     open_on_start(&window, &update_button);
+    Shell { window, join }
 }
 
-/// `CORDIAL_SHELL_PRESENT=settings,update` opens those windows at startup.
+/// `CORDIAL_SHELL_PRESENT=settings,settings=updates,update` opens those windows
+/// at startup.
 ///
 /// A test seam, and it exists because there is no other way to photograph these
 /// windows. AGENTS.md forbids synthesising input at the compositor — it lands on
@@ -200,6 +337,14 @@ pub fn build(app: &adw::Application, config: Rc<RefCell<ShellConfig>>, config_pa
 /// Asking the shell to open its own window is, and it goes through exactly the
 /// same action and the same button handler a click does rather than a second
 /// construction path that could differ from the real one.
+///
+/// **`settings=<page>` opens Settings on a named page**, which is the same
+/// problem one level down: the window has five tabs and a photograph of it shows
+/// one. The names are the `name` each `AdwPreferencesPage` is built with —
+/// `roblox`, `updates`, `appearance`, `general`, `plugins` — and an unknown one
+/// is libadwaita's warning to answer, not this function's, because a name that
+/// silently fell back to the first page would produce a screenshot captioned as
+/// something it is not.
 ///
 /// Same shape as `CORDIAL_SHELL_RUN_SECONDS` above: an environment variable that
 /// nothing sets in normal use, doing something a person could do by hand.
@@ -213,9 +358,12 @@ fn open_on_start(window: &adw::Window, update_button: &gtk::Button) {
     // whatever this opens on top of it.
     glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
         for one in want.split(',').map(str::trim) {
-            match one {
+            // `settings` and `settings=updates` are the same action with and
+            // without a page, so they are split rather than matched separately.
+            let (what, page) = one.split_once('=').unwrap_or((one, ""));
+            match what {
                 "settings" => {
-                    let _ = window.activate_action("win.settings", None);
+                    let _ = window.activate_action("win.settings", Some(&page.to_variant()));
                 }
                 "update" => update_button.emit_clicked(),
                 other => println!("  shell: CORDIAL_SHELL_PRESENT does not know {other:?}"),
@@ -230,19 +378,27 @@ fn open_on_start(window: &adw::Window, update_button: &gtk::Button) {
 /// the same thing rather than a second, similar-looking path — the failure that
 /// arrangement produces is a retry button that succeeds where the row does not,
 /// or the reverse, and neither is discoverable from the outside.
-fn activate_roblox(window: &gtk::Window, toasts: &adw::ToastOverlay, config: &Rc<RefCell<ShellConfig>>) {
-    match try_launch(window, toasts, config) {
+fn activate_roblox(
+    window: &gtk::Window,
+    toasts: &adw::ToastOverlay,
+    config: &Rc<RefCell<ShellConfig>>,
+    join: &PendingJoin,
+) {
+    match try_launch(window, toasts, config, join) {
         Outcome::Started => {}
         Outcome::Failed(message) => alert(window, "Roblox could not start", &message),
-        Outcome::ProfileBusy(name, holder) => profile_busy(window, toasts, config, &name, holder),
+        Outcome::ProfileBusy(name, holder) => {
+            profile_busy(window, toasts, config, join, &name, holder)
+        }
         Outcome::NoBuild => {
             let window = window.clone();
             let toasts = toasts.clone();
             let config = config.clone();
+            let join = join.clone();
             instructions::present(&window.clone(), move || {
                 // Returning whether it worked is what lets the instructions
                 // window stay up while the user is still following them.
-                matches!(try_launch(&window, &toasts, &config), Outcome::Started)
+                matches!(try_launch(&window, &toasts, &config, &join), Outcome::Started)
             });
         }
     }
@@ -263,7 +419,12 @@ enum Outcome {
     Failed(String),
 }
 
-fn try_launch(window: &gtk::Window, toasts: &adw::ToastOverlay, config: &Rc<RefCell<ShellConfig>>) -> Outcome {
+fn try_launch(
+    window: &gtk::Window,
+    toasts: &adw::ToastOverlay,
+    config: &Rc<RefCell<ShellConfig>>,
+    join: &PendingJoin,
+) -> Outcome {
     let (roblox, profile_name) = {
         let config = config.borrow();
         (config.roblox.clone(), config.profile.clone())
@@ -285,12 +446,20 @@ fn try_launch(window: &gtk::Window, toasts: &adw::ToastOverlay, config: &Rc<RefC
         Err(e) => return Outcome::Failed(e.to_string()),
     };
 
-    let mut instance = match launch::spawn(&build, claim, run_seconds_override()) {
+    // Read rather than taken: everything above this can still refuse, and a
+    // busy profile that also cost the user their link would be two failures for
+    // one press. It is cleared below, once there is a process holding it.
+    let url = join.peek();
+    let mut instance = match launch::spawn(&build, claim, run_seconds_override(), url.as_deref()) {
         Ok(instance) => instance,
         Err(message) => return Outcome::Failed(message),
     };
+    join.clear();
 
-    toasts.add_toast(adw::Toast::new(&format!("Starting Roblox on profile {profile_name}")));
+    toasts.add_toast(adw::Toast::new(&match url {
+        Some(_) => format!("Starting Roblox on profile {profile_name}, joining the link"),
+        None => format!("Starting Roblox on profile {profile_name}"),
+    }));
 
     // A client that is already gone a moment later never started. Checked
     // rather than assumed, because the shell may well have been started from a
@@ -348,6 +517,7 @@ fn profile_busy(
     parent: &gtk::Window,
     toasts: &adw::ToastOverlay,
     config: &Rc<RefCell<ShellConfig>>,
+    join: &PendingJoin,
     name: &str,
     holder: Option<profile::Holder>,
 ) {
@@ -374,6 +544,7 @@ fn profile_busy(
     let parent_window = parent.clone();
     let toasts = toasts.clone();
     let config = config.clone();
+    let join = join.clone();
     dialog.connect_response(None, move |_, response| match response {
         // The switcher is the combo row above the launch button; activating the
         // window's action rather than building a second chooser here keeps one
@@ -383,7 +554,13 @@ fn profile_busy(
         }
         "stop" => {
             if let Some(h) = ours.clone() {
-                close_then_launch(parent_window.clone(), toasts.clone(), config.clone(), h);
+                close_then_launch(
+                    parent_window.clone(),
+                    toasts.clone(),
+                    config.clone(),
+                    join.clone(),
+                    h,
+                );
             }
         }
         _ => {}
@@ -445,6 +622,7 @@ fn close_then_launch(
     window: gtk::Window,
     toasts: adw::ToastOverlay,
     config: Rc<RefCell<ShellConfig>>,
+    join: PendingJoin,
     holder: profile::Holder,
 ) {
     if let Err(message) = holder.ask_to_stop() {
@@ -454,7 +632,7 @@ fn close_then_launch(
     let waited = Cell::new(Duration::ZERO);
     glib::timeout_add_local(STOP_POLL, move || {
         if holder.has_exited() {
-            activate_roblox(&window, &toasts, &config);
+            activate_roblox(&window, &toasts, &config, &join);
             return glib::ControlFlow::Break;
         }
         waited.set(waited.get() + STOP_POLL);
@@ -532,6 +710,25 @@ mod tests {
         assert!(body.contains("not a Cordial client"), "{body}");
         assert!(body.contains("/usr/bin/grep"), "{body}");
         assert!(body.contains("will not close a process it did not start"), "{body}");
+    }
+
+    #[test]
+    fn the_waiting_link_is_shown_escaped_and_short() {
+        // Both hazards in one line of text. The `&` is not hypothetical —
+        // Roblox's own links join their fields with one — and an `AdwBanner`
+        // fed raw markup drops the label entirely, so the queued join would
+        // become a blank grey bar: the exact "it ignored my click" this banner
+        // exists to prevent, wearing the banner as a disguise.
+        let line = banner_line("roblox-player://placeId=1818&launchData=<x>");
+        assert!(line.contains("&amp;"), "{line}");
+        assert!(line.contains("&lt;x&gt;"), "{line}");
+        assert!(!line.contains("<x>"), "{line}");
+        assert!(line.contains("press Roblox"), "{line}");
+
+        // And it cannot stretch the window, whatever length Roblox's payload
+        // happens to be this year.
+        let long = banner_line(&format!("roblox-player://{}", "a".repeat(4000)));
+        assert!(long.chars().count() < 120, "{}", long.chars().count());
     }
 
     #[test]

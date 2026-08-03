@@ -7,7 +7,7 @@
 //! the offending one off, plus enough of Cordial's own appearance and
 //! graphics preference to be usable, without a terminal.
 //!
-//! `AdwPreferencesWindow` with several `AdwPreferencesPage`s — Roblox,
+//! `AdwPreferencesWindow` with several `AdwPreferencesPage`s — Roblox, Updates,
 //! Appearance, General, Plugins — each becomes its own tab/sidebar entry for
 //! free; that is libadwaita's own page-switcher, not something built here.
 //!
@@ -91,6 +91,7 @@ pub fn capability_summary(
 fn build_appearance_page(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Appearance")
+        .name("appearance")
         .icon_name("applications-graphics-symbolic")
         .build();
 
@@ -189,7 +190,11 @@ fn build_roblox_page(
     config_path: Rc<PathBuf>,
 ) -> adw::PreferencesPage {
     let page =
-        adw::PreferencesPage::builder().title("Roblox").icon_name("applications-games-symbolic").build();
+        adw::PreferencesPage::builder()
+            .title("Roblox")
+            .name("roblox")
+            .icon_name("applications-games-symbolic")
+            .build();
 
     let group = adw::PreferencesGroup::builder()
         .title("Roblox build")
@@ -234,13 +239,25 @@ fn build_roblox_page(
     // build `libroblox.so` is inside `split_config.x86_64.apk`, not `base.apk`,
     // and Cordial extracts it into its own cache rather than writing into
     // whichever application's directory the APK came from.
+    //
+    // The extracted case carries `updater::cache_line`, which says whether the
+    // engine still matches the APK above. That used to be a row in the
+    // header-bar button's window; it belongs here, beside the directory it is
+    // about, and it is the only place a Cordial that re-extracts 115 MB on every
+    // launch says what it is comparing.
     let lib = config.borrow().roblox.lib_dir.clone().map(|p| (p, "Chosen in Settings".to_string())).or_else(
         || {
             let cache = install::engine_cache();
-            cache
-                .join(install::LIBRARY)
-                .is_file()
-                .then(|| (cache, "Extracted by Cordial from the APK".to_string()))
+            if !cache.join(install::LIBRARY).is_file() {
+                return None;
+            }
+            let apk = install::effective_apk(&config.borrow().roblox).map(|(path, _)| path);
+            let line = crate::updater::cache_line(
+                true,
+                cordial_update::cache::stamp_of(&cache),
+                apk.as_deref().is_some_and(|apk| cordial_update::cache::is_current(&cache, apk)),
+            );
+            Some((cache, line))
         },
     );
     let lib_chosen = config.borrow().roblox.lib_dir.is_some();
@@ -272,11 +289,13 @@ fn build_roblox_page(
     group.add(&lib_row);
     page.add(&group);
 
-    // On this page rather than a page of its own: what they govern is the build
-    // the two rows above point at, and a settings window that answers "where is
-    // Roblox" in one tab and "when does Roblox change" in another makes somebody
-    // find both to understand either.
-    page.add(&crate::updater::build_update_group(config.clone(), config_path.clone()));
+    // The update settings were a group on this page, on the argument that they
+    // govern the build the two rows above point at. They are a page of their own
+    // now, and the argument did not survive what it produced: a dropdown, two
+    // switches, a conditional warning row and six lines of description sitting
+    // on top of the two path rows this page exists for, so that "where is my
+    // Roblox build" and "when does Cordial look for a new one" were answered by
+    // one scroll. Two questions, two tabs, and libadwaita draws the tab.
 
     // The profile used to be a third row here, a text entry, and it is
     // deliberately not replaced by anything. It lives in the header bar now —
@@ -407,7 +426,11 @@ fn build_general_page(
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
 ) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::builder().title("General").icon_name("preferences-other-symbolic").build();
+    let page = adw::PreferencesPage::builder()
+        .title("General")
+        .name("general")
+        .icon_name("preferences-other-symbolic")
+        .build();
 
     let group = adw::PreferencesGroup::builder()
         .title("Graphics")
@@ -571,12 +594,22 @@ pub fn build_preferences_window(
         .modal(true)
         .title("Settings")
         .search_enabled(false)
+        // Taller than libadwaita's default, which was chosen for the Roblox
+        // page's two rows and cut the Updates page off mid-switch: its warning
+        // row appears exactly when both download switches are off, and a
+        // warning below the fold is a warning nobody is shown. Only a default —
+        // the window resizes, and GTK clamps this to the work area on a screen
+        // that cannot hold it.
+        .default_width(640)
+        .default_height(720)
         .build();
 
     // First, because it is the one that has to be right before anything else
     // in this window matters: without a build there is nothing to launch, and
     // a renderer preference for a client that cannot start is decoration.
     window.add(&build_roblox_page(&window, config.clone(), config_path.clone()));
+    // Second, next to the page about the build it is about.
+    window.add(&crate::updater::build_update_page(config.clone(), config_path.clone()));
     window.add(&build_appearance_page(config.clone(), config_path.clone()));
     window.add(&build_general_page(flags_path, config.clone(), config_path));
     window.add(&build_plugins_page(config));

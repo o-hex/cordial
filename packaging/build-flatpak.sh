@@ -46,14 +46,13 @@ if (( ${#missing[@]} )); then
     flatpak install --user --noninteractive --or-update flathub "${missing[@]}"
 fi
 
-# The bionic linker and libjnivm are submodules; without them the build script
-# panics with a message about them, but only after flatpak-builder has copied
-# the whole tree in. Checking first is faster and clearer.
-if [[ ! -f "$root/third_party/mcpelauncher-linker/bionic/linker/linker.cpp" ]]; then
-    echo "error: submodules are not checked out — run:" >&2
-    echo "    git submodule update --init --recursive" >&2
-    exit 1
-fi
+# There used to be a check here that the submodules were checked out. It is
+# gone because it no longer describes what happens: the manifest pins
+# third_party/mcpelauncher-linker and third_party/libjnivm as `git` sources by
+# commit and skips them out of the `dir` source, so this build clones them at
+# those commits and ignores whatever is in the tree. A local edit to either
+# submodule will not appear in the Flatpak, which is the point — issue #3 — and
+# is worth knowing before spending an afternoon wondering why.
 
 echo "building $(basename "$manifest") ..."
 flatpak-builder \
@@ -62,6 +61,12 @@ flatpak-builder \
     --repo="$repo" \
     "$builddir" \
     "$manifest"
+
+# Without this the repository has objects and no summary, and installing from it
+# fails with "No remote refs found for '<path>'" — which reads like the path is
+# wrong, and it is not. It also builds the appstream branch that lets a software
+# centre list the app.
+flatpak build-update-repo "$repo"
 
 echo
 echo "built into $repo"

@@ -30,7 +30,12 @@ sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
   - org.freedesktop.Sdk.Extension.llvm20
-command: cordial-load
+# The shell, not the loader. The shell is what a user starts: it finds a Roblox
+# build, explains itself when there is not one, and launches `cordial-run`
+# beside itself. This said `cordial-load` until now, which was the loader's name
+# before 312451e renamed it to `cordial-run` — so the manifest named a binary
+# that no longer exists, `install` failed, and nothing here had been built since.
+command: cordial-shell
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
@@ -81,17 +86,36 @@ modules:
     buildsystem: simple
     build-options:
       build-args:
-        # Cargo fetches crates and the build pulls AOSP bionic as a submodule.
-        # A release manifest must vendor both and drop this — network access at
-        # build time makes the result unreproducible, and Flathub rejects it.
+        # Cargo still fetches crates, so the build still needs the network.
+        # The submodules no longer do — they are pinned as `git` sources below,
+        # which was half of issue #3 and the cheap half. Vendoring the crate
+        # graph is the other half and is still open.
+        #
+        # This is what keeps Cordial off Flathub, and that is a deliberate
+        # trade rather than an oversight: the remote is hosted from this
+        # repository's own GitHub Pages, which has no such rule. Anyone
+        # submitting to Flathub has to finish issue #3 first.
         - --share=network
     build-commands:
       - cargo build --release --offline || cargo build --release
-      - install -Dm755 target/release/cordial-load /app/bin/cordial-load
-      - install -Dm644 packaging/icons/org.cordial.Cordial.svg
+      # Both binaries, side by side. `launch.rs` looks for the loader as the
+      # sibling of `current_exe` and nowhere else — there is no baked-in
+      # /app/bin and no configurable path — so shipping the shell without
+      # `cordial-run` beside it gives a launcher whose Launch button cannot
+      # find anything to launch.
+      - install -Dm755 target/release/cordial-shell /app/bin/cordial-shell
+      - install -Dm755 target/release/cordial-run /app/bin/cordial-run
+      # The square icon, not packaging/icons/org.cordial.Cordial.svg, which is
+      # the 680x480 README banner. flatpak-validate-icon rejects a non-square
+      # icon and the export fails rather than warns.
+      - install -Dm644 packaging/icons/hicolor/scalable/apps/org.cordial.Cordial.svg
           /app/share/icons/hicolor/scalable/apps/org.cordial.Cordial.svg
       - install -Dm644 packaging/org.cordial.Cordial.desktop
           /app/share/applications/org.cordial.Cordial.desktop
+      # Without this the hosted remote installs but does not browse: a software
+      # centre lists the remote and finds nothing in it. See the file.
+      - install -Dm644 packaging/org.cordial.Cordial.metainfo.xml
+          /app/share/metainfo/org.cordial.Cordial.metainfo.xml
       # Licence and attribution. MIT requires its notice in "all copies or
       # substantial portions", and Apache-2.0 section 4(d) requires the NOTICE
       # file to travel with derivative works — both apply to a binary build, not
@@ -108,5 +132,30 @@ modules:
       - install -Dm644 third_party/libjnivm/LICENSE
           /app/share/licenses/cordial/libjnivm-MIT.txt
     sources:
+      # The working tree, minus the three directories that must not come from
+      # it. `target` is tens of gigabytes on a developer's machine and every
+      # byte of it gets copied into the build before anything is compiled; the
+      # two submodule paths are skipped so the `git` sources below own them
+      # instead of whatever happens to be checked out locally.
       - type: dir
         path: ..
+        skip:
+          - target
+          - third_party/libjnivm
+          - third_party/mcpelauncher-linker
+      # Pinned by commit rather than pulled by the build (issue #3). This is
+      # what makes the submodule half of the build reproducible, and it means
+      # a CI checkout does not need `--recursive`. Bump these together with
+      # `git submodule update --remote`, never separately: the commits here and
+      # the gitlink in the tree disagreeing is silent, and the Flatpak would
+      # then build from a different revision than a `cargo build` does.
+      - type: git
+        url: https://github.com/ChristopherHX/libjnivm
+        commit: f24b98c198fcc5c59a68d1efadd3f5791eb01c2e
+        dest: third_party/libjnivm
+      # Carries `bionic` and `core` as submodules of its own, which
+      # flatpak-builder clones with it.
+      - type: git
+        url: https://github.com/minecraft-linux/mcpelauncher-linker
+        commit: 1ac3ea6c1cf4f73a84d73f0bff510fba94a7d0f2
+        dest: third_party/mcpelauncher-linker

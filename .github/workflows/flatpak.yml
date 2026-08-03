@@ -1,0 +1,257 @@
+# Build the Flatpak and publish it as an OSTree remote on GitHub Pages, so that
+#
+#     flatpak remote-add --if-not-exists cordial \
+#         https://luohoa97.github.io/cordial/cordial.flatpakrepo
+#     flatpak install cordial org.cordial.Cordial
+#
+# installs Cordial without anyone building anything.
+#
+# INFERRED: none of this has been run on a GitHub runner. What *was* run, on a
+# Fedora workstation with flatpak 1.18.0, flatpak-builder 1.4.10 and libostree
+# 2026.2, is every flatpak/ostree step below against a stand-in app with the
+# real desktop file, icon and metainfo: export, `build-update-repo`, deleting
+# the `.Debug` ref, `--prune`, serving the result over a plain static HTTP
+# server, `remote-add` from the `.flatpakrepo`, `install`, and `run`. Signed and
+# unsigned were both exercised, and a signed remote definition pointed at an
+# unsigned repository was correctly refused. What is *not* verified is the
+# runner: apt package names, the disk budget, and whether Cordial itself
+# compiles inside the Flatpak SDK, which nobody has yet done on any machine.
+#
+# The site and the repository share one Pages deployment:
+#
+#     /                      site/ — the project's web page
+#     /cordial.flatpakrepo   the remote definition
+#     /repo/                 the OSTree repository
+#
+# A browser hitting the root has to get a web page, which is why the repository
+# is under /repo/ rather than at the root.
+#
+# Nothing deploys until the repository variable PUBLISH_PAGES is set to "true"
+# and Pages is switched to "GitHub Actions" in the repository settings. Until
+# then this builds and uploads an artifact and stops, which is deliberate: a
+# workflow that starts publishing a public remote the moment it lands is not a
+# thing to spring on anyone.
+
+name: Flatpak
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - '.github/workflows/flatpak.yml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One at a time. Two runs exporting into the same Pages deployment would race,
+# and cancelling a half-finished OSTree export is worse than queueing.
+concurrency:
+  group: flatpak-pages
+  cancel-in-progress: false
+
+# The published URL lives in packaging/cordial.flatpakrepo and is deliberately
+# not derived from github.repository here: the Url a user's flatpak remembers
+# must not change under them because the repository was renamed or forked.
+env:
+  APP_ID: org.cordial.Cordial
+  MANIFEST: packaging/org.cordial.Cordial.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # No submodules. The manifest pins third_party/libjnivm and
+      # third_party/mcpelauncher-linker as `git` sources by commit and skips
+      # them out of the `dir` source, so a recursive checkout would only be
+      # copied in and then thrown away.
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      # The runner ships with about 25 GB free and a lot of it is Android SDKs
+      # and dotnet nobody here needs. The Flatpak build carries the runtime, the
+      # SDK, two SDK extensions, a full cargo target directory and an OSTree
+      # repository at once. INFERRED that this is necessary — if the build has
+      # room to spare, delete this step rather than leaving a cargo-cult in it.
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Install flatpak
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder ostree
+          flatpak --version
+          flatpak-builder --version
+
+      # Read from the manifest rather than repeated here, so bumping the
+      # runtime is a one-line change in one file.
+      - name: Install the runtimes the manifest names
+        run: |
+          set -euo pipefail
+          v=$(sed -n "s/^runtime-version: *'\(.*\)'/\1/p" "$MANIFEST")
+          echo "runtime version: $v"
+          flatpak remote-add --user --if-not-exists flathub \
+              https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive flathub \
+              "org.freedesktop.Platform//$v" \
+              "org.freedesktop.Sdk//$v" \
+              "org.freedesktop.Sdk.Extension.rust-stable//$v" \
+              "org.freedesktop.Sdk.Extension.llvm20//$v"
+
+      # Crate downloads and the two pinned git clones, which are the same on
+      # every run until Cargo.lock or the manifest changes. Not the built
+      # objects — restoring a stale build cache is how a package ends up
+      # shipping a binary nobody can account for.
+      - name: Cache downloaded sources
+        uses: actions/cache@v4
+        with:
+          path: .flatpak-builder/downloads
+          key: flatpak-downloads-${{ hashFiles('Cargo.lock', 'packaging/org.cordial.Cordial.yml') }}
+          restore-keys: flatpak-downloads-
+
+      # Absent secret means an unsigned repository, and the README says so in
+      # those words. It does not mean a quietly unsigned one.
+      - name: Import the signing key
+        id: gpg
+        env:
+          KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          KEYID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEY:-}" ]; then
+            echo "no FLATPAK_GPG_PRIVATE_KEY secret; the repository will be unsigned"
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          home="$RUNNER_TEMP/gnupg"
+          mkdir -p "$home"
+          chmod 700 "$home"
+          printf '%s' "$KEY" | gpg --homedir "$home" --batch --import
+          if [ -z "${KEYID:-}" ]; then
+            echo "FLATPAK_GPG_PRIVATE_KEY is set but FLATPAK_GPG_KEY_ID is not" >&2
+            exit 1
+          fi
+          echo "signing=true" >> "$GITHUB_OUTPUT"
+          echo "gpghome=$home" >> "$GITHUB_OUTPUT"
+
+      - name: Build and export
+        run: |
+          set -euo pipefail
+          args=(--force-clean --user --disable-rofiles-fuse --repo=repo)
+          if [ "${{ steps.gpg.outputs.signing }}" = "true" ]; then
+            args+=(--gpg-homedir="${{ steps.gpg.outputs.gpghome }}"
+                   --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}")
+          fi
+          flatpak-builder "${args[@]}" build "$MANIFEST"
+
+      # `[profile.release] debug = true`, deliberately — the runtime is useless
+      # to debug without symbols. Measured on a local build: cordial-run is
+      # 178 MB unstripped against 9.5 MB stripped, cordial-shell 161 MB against
+      # 5.2 MB. flatpak-builder splits that into a .Debug extension, and
+      # publishing it would put roughly 325 MB of symbols into a Pages site with
+      # a 1 GB limit and a 100 MB per-file limit, to be downloaded by every user
+      # who never asked for them. The symbols stay in the build artefacts and in
+      # a local `packaging/build-flatpak.sh`; they do not go on the remote.
+      - name: Drop the debug extension from the published repository
+        run: |
+          set -euo pipefail
+          ostree --repo=repo refs
+          ostree --repo=repo refs --delete "runtime/$APP_ID.Debug/x86_64/master" || true
+
+      - name: Update the repository summary and appstream branch
+        run: |
+          set -euo pipefail
+          args=(--prune)
+          if [ "${{ steps.gpg.outputs.signing }}" = "true" ]; then
+            args+=(--gpg-homedir="${{ steps.gpg.outputs.gpghome }}"
+                   --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}")
+          fi
+          # Without this the repository has objects and no summary, and
+          # `flatpak install` answers "No remote refs found" — which reads like
+          # a bad URL and is not one. Static deltas are deliberately not
+          # generated: they make installs much faster and the repository much
+          # bigger, and size is the binding constraint on Pages.
+          flatpak build-update-repo "${args[@]}" repo
+          ostree --repo=repo refs
+
+      - name: Assemble the Pages tree
+        run: |
+          set -euo pipefail
+          mkdir -p pages
+          # The website, which lives in site/ and belongs to whoever writes it.
+          # Copied if it is there and skipped without complaint if it is not, so
+          # that this workflow and the site can land in either order.
+          if [ -d site ] && [ -n "$(ls -A site 2>/dev/null)" ]; then
+            cp -r site/. pages/
+          else
+            echo "site/ is absent or empty; publishing the remote without a landing page"
+          fi
+          mv repo pages/repo
+          # Belt and braces. deploy-pages serves the artifact verbatim and does
+          # not run Jekyll, but Jekyll skips paths beginning with _ or . and an
+          # OSTree repository is not worth betting on that staying true.
+          touch pages/.nojekyll
+
+          cp packaging/cordial.flatpakrepo pages/cordial.flatpakrepo
+          if [ "${{ steps.gpg.outputs.signing }}" = "true" ]; then
+            gpg --homedir "${{ steps.gpg.outputs.gpghome }}" \
+                --export "${{ secrets.FLATPAK_GPG_KEY_ID }}" > pages/cordial.gpg
+            printf 'GPGKey=%s\n' "$(base64 -w0 < pages/cordial.gpg)" \
+                >> pages/cordial.flatpakrepo
+          else
+            # An empty GPGKey is how a .flatpakrepo states "unsigned" in a form
+            # flatpak parses. Leaving the key out altogether says the same thing
+            # by accident, and the difference matters when someone is reading
+            # the file to decide whether to trust it.
+            printf 'GPGKey=\n' >> pages/cordial.flatpakrepo
+          fi
+
+      - name: Report the payload size
+        run: |
+          set -euo pipefail
+          du -sh pages pages/repo
+          echo "largest objects:"
+          find pages/repo -type f -printf '%s\t%p\n' | sort -rn | head -5
+          bytes=$(du -sb pages | cut -f1)
+          big=$(find pages -type f -size +99M | head -5)
+          if [ -n "$big" ]; then
+            echo "::error::files over GitHub Pages' 100 MB per-file limit:"
+            echo "$big"
+            exit 1
+          fi
+          # GitHub publishes 1 GB as the Pages site limit. Fail here rather than
+          # at deploy, where the message is much less obvious.
+          if [ "$bytes" -gt 966367641 ]; then
+            echo "::error::pages tree is $(du -sh pages | cut -f1), over the 1 GB Pages limit"
+            exit 1
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+
+  deploy:
+    needs: build
+    # Two gates on purpose. The ref gate keeps pull requests from publishing;
+    # the variable gate keeps *anything* from publishing until someone sets it,
+    # which is the point at which they have also turned Pages on.
+    if: >-
+      vars.PUBLISH_PAGES == 'true' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

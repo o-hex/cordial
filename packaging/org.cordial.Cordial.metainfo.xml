@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata, which exists so the hosted remote is browsable rather than
+  only installable. `flatpak build-update-repo` builds an `appstream2/<arch>`
+  branch out of whatever metainfo the refs carry; with no metainfo at all it
+  prints "No appstream data for app/org.cordial.Cordial/x86_64/master" and
+  writes an empty branch, and GNOME Software and Discover then show a remote
+  with nothing in it. Someone who has added the remote and cannot find Cordial
+  in their software centre has no way to tell that from a broken remote.
+
+  Keep <releases> in step with the workspace version in Cargo.toml. Nothing
+  enforces it; a stale version here is only visible in a software centre, which
+  is exactly where nobody building the package is looking.
+-->
+<component type="desktop-application">
+  <id>org.cordial.Cordial</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Cordial</name>
+  <summary>Run Roblox on Linux natively</summary>
+  <description>
+    <p>
+      Cordial loads Roblox's official Android x86-64 engine directly on Linux
+      through a purpose-built runtime: the AOSP bionic linker, a bionic/glibc
+      shim, a JNI VM in place of Android's, and a framework layer that answers
+      the client's calls. No emulator, no container, no virtual machine.
+    </p>
+    <p>
+      Plugins are ordinary programs in their own processes, and they are granted
+      named capabilities rather than access. There is no script execution, no
+      hooking and no memory access — those are absent from the API rather than
+      disabled, so there is no primitive to re-enable in a fork.
+    </p>
+    <p>
+      Cordial ships no Roblox code, APK or assets. You supply the Android client
+      yourself.
+    </p>
+    <p>
+      It is early. Signing in, loading an experience and playing it with keyboard
+      and mouse all work; text fields do not draw what you type, and the pointer
+      is not captured in first person. Install it expecting rough edges.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.cordial.Cordial.desktop</launchable>
+  <url type="homepage">https://luohoa97.github.io/cordial/</url>
+  <url type="bugtracker">https://github.com/luohoa97/cordial/issues</url>
+  <url type="vcs-browser">https://github.com/luohoa97/cordial</url>
+  <developer id="io.github.luohoa97">
+    <name>luohoa97</name>
+  </developer>
+  <categories>
+    <category>Game</category>
+  </categories>
+  <!--
+    Rated for what connecting to Roblox exposes you to, not for anything Cordial
+    itself contains: it is a client for a service with in-game chat and a signed-in
+    account. Omitting the block entirely would have a software centre report
+    Cordial as unrated, which is a weaker statement than the true one.
+  -->
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-info">moderate</content_attribute>
+  </content_rating>
+  <releases>
+    <release version="0.4.0" date="2026-08-03"/>
+  </releases>
+</component>

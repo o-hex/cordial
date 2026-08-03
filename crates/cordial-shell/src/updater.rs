@@ -77,7 +77,7 @@ use cordial_update::cache;
 use cordial_update::changelog::{self, Entry, Notes, Release};
 use cordial_update::download::{Refusal, Source, URL_ENV};
 use cordial_update::metered::{self, Metered};
-use cordial_update::settings::{Automatic, DownloadOn, Plan, UpdateSettings, NEVER_DOWNLOADS};
+use cordial_update::settings::{Automatic, DownloadOn, Plan, UpdateSettings};
 use cordial_update::version;
 use cordial_update::Unreachable;
 
@@ -818,21 +818,19 @@ fn build_update_group(
     }
     group.add(&automatic);
 
-    let wifi = adw::SwitchRow::builder()
-        .title("Download on Wi-Fi")
-        .subtitle(
-            "Cordial cannot see whether a link is wireless. It asks NetworkManager whether the \
-             connection is metered, and this switch governs every connection that is not — a \
-             wired desktop included.",
-        )
-        .active(config.borrow().download_on.wifi)
-        .build();
-    wifi.set_subtitle_lines(4);
-
+    // One switch, not two. **Download on Wi-Fi used to sit above this**, and its
+    // own subtitle admitted the problem: Cordial cannot see whether a link is
+    // wireless, so it asked NetworkManager the metered question and called the
+    // not-metered answer Wi-Fi. Two names for one bit — and a wired desktop was
+    // governed by the switch labelled Wi-Fi, which is where it stopped being a
+    // wording quibble. Nobody has a reason to turn Wi-Fi off while leaving
+    // metered on, so the question is asked once, in the direction people have an
+    // opinion about.
     let metered_row = adw::SwitchRow::builder()
         .title("Download on metered connection")
         .subtitle(
-            "Off by default. Only an explicit unmetered answer counts as unmetered: both of \
+            "Off by default, so downloads wait for a connection nobody is charging by the \
+             megabyte. Only an explicit unmetered answer counts as unmetered: both of \
              NetworkManager's guesses are treated as metered, and an ordinary desktop on a LAN \
              guesses, so this switch is reached more often than it looks.",
         )
@@ -840,41 +838,22 @@ fn build_update_group(
         .build();
     metered_row.set_subtitle_lines(4);
 
-    // The contradiction the design document warned two dropdowns would prevent.
-    // It is expressible now, so it is said out loud instead — the objection was
-    // to a settings page that can express a contradiction *silently*, and a row
-    // that appears exactly when both switches are off is the answer to it.
-    let warning = adw::ActionRow::builder().title("Nothing will download").subtitle(NEVER_DOWNLOADS).build();
-    warning.add_prefix(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
-    warning.add_css_class("warning");
-    warning.set_subtitle_lines(5);
-    warning.set_visible(config.borrow().download_on.never_downloads());
-
-    let restate = {
-        let warning = warning.clone();
-        let wifi = wifi.clone();
-        let metered_row = metered_row.clone();
+    // The warning row that used to appear when both switches were off has gone
+    // with the second switch. There is no longer a settings combination that
+    // downloads nothing ever — off means "wait for an unmetered link", not
+    // "never" — and the contradiction it existed to announce was an artefact of
+    // asking one question twice. `NEVER_DOWNLOADS` still says what off means and
+    // is still shown by the refusal a held download reports.
+    {
         let config = config.clone();
         let config_path = config_path.clone();
-        Rc::new(move || {
-            let on = DownloadOn { wifi: wifi.is_active(), metered: metered_row.is_active() };
-            config.borrow_mut().download_on = on;
+        metered_row.connect_active_notify(move |row| {
+            config.borrow_mut().download_on = DownloadOn { metered: row.is_active() };
             persist(&config, &config_path);
-            warning.set_visible(on.never_downloads());
-        })
-    };
-    {
-        let restate = restate.clone();
-        wifi.connect_active_notify(move |_| restate());
-    }
-    {
-        let restate = restate.clone();
-        metered_row.connect_active_notify(move |_| restate());
+        });
     }
 
-    group.add(&wifi);
     group.add(&metered_row);
-    group.add(&warning);
     group
 }
 
@@ -1429,18 +1408,24 @@ mod tests {
 
     #[test]
     fn the_shell_config_becomes_the_pair_the_update_crate_plans_from() {
-        // The seam between the three rows and `UpdateSettings::plan`. If these
-        // stopped agreeing, the settings page would be governing nothing and
-        // there would be nothing on screen to say so.
+        // The seam between the rows and `UpdateSettings::plan`. If these stopped
+        // agreeing, the settings page would be governing nothing and there would
+        // be nothing on screen to say so.
         use cordial_update::settings::Plan;
         let config = ShellConfig {
             automatic_updates: Automatic::Background,
-            download_on: DownloadOn { wifi: false, metered: false },
+            download_on: DownloadOn { metered: false },
             ..Default::default()
         };
-        match update_settings(&config).plan(Metered::No) {
-            Plan::CheckAndAsk { why: Some(why) } => assert_eq!(why, NEVER_DOWNLOADS),
-            other => panic!("both switches off must not plan a download: {other:?}"),
+        // The switch off and the link metered: held, with the reason.
+        match update_settings(&config).plan(Metered::GuessNo) {
+            Plan::CheckAndAsk { why: Some(why) } => {
+                assert!(why.contains("Download on metered connection"), "{why}");
+            }
+            other => panic!("a metered link with the switch off must not plan a download: {other:?}"),
         }
+        // The same settings on an unmetered link download, which is what stops
+        // "off" meaning "never" now that it is the only connection switch.
+        assert_eq!(update_settings(&config).plan(Metered::No), Plan::CheckAndDownload);
     }
 }

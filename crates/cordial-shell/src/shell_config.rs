@@ -328,14 +328,13 @@ mod tests {
             &p,
             &ShellConfig {
                 automatic_updates: Automatic::Manual,
-                download_on: DownloadOn { wifi: false, metered: true },
+                download_on: DownloadOn { metered: true },
                 ..Default::default()
             },
         )
         .unwrap();
         let back = load(&p);
         assert_eq!(back.automatic_updates, Automatic::Manual);
-        assert!(!back.download_on.wifi);
         assert!(back.download_on.metered);
     }
 
@@ -349,7 +348,6 @@ mod tests {
         std::fs::write(&p, r#"{"appearance":"dark","profile":"default"}"#).unwrap();
         let config = load(&p);
         assert_eq!(config.automatic_updates, Automatic::Background);
-        assert!(config.download_on.wifi);
         assert!(!config.download_on.metered, "a data allowance is not the default to spend");
     }
 

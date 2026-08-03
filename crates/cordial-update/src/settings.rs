@@ -1,47 +1,57 @@
-//! One dropdown and two toggles, and why it is no longer two dropdowns.
+//! One dropdown and one toggle, and why it is neither two dropdowns nor two
+//! toggles.
 //!
 //! **Auto update** — update in the background, ask, or manual. **Download on
-//! Wi-Fi** and **Download on metered connection** — one switch each.
+//! metered connection** — one switch.
 //!
-//! ## The two-dropdown shape this replaces, and why it went
+//! ## The two-dropdown shape this replaced, and why it went
 //!
 //! This module used to be two enums, and its header argued the case at length:
 //! three controls that can each be set on their own produce combinations with no
 //! defined meaning, and "update in the background, but never download" is a
 //! setting that has to either lie or explain itself. That reasoning is kept here
-//! rather than deleted, because it was not wrong and because the combination it
-//! warned about is now reachable: **both connection switches off, with Auto
-//! update on background, can never download anything.**
+//! rather than deleted, because it was not wrong — and because the shape that
+//! followed it, a dropdown and *two* switches, did make that contradiction
+//! reachable. Both connection switches off with Auto update on background could
+//! never download anything, so the module named the state, the settings page
+//! carried a warning row about it, and `may_download` reported it.
 //!
-//! The owner specified the dropdown-plus-two-toggles shape, twice, and it is
-//! their call. What the old argument was really objecting to was expressing a
-//! contradiction *silently*, so the contradiction is now something this module
-//! names — [`DownloadOn::never_downloads`] is the whole of it, the shell puts
-//! that sentence on the settings page as a warning, and
-//! [`UpdateSettings::may_download`] gives the same reason back when a download is
-//! held. A user who sets it that way is told what they have set. That is a
-//! different thing from a settings page that quietly means nothing.
+//! ## And why the second switch went too
 //!
-//! [`UpdateSettings::plan`] is still total, which is the property the old shape
-//! was chosen for: every combination of the three controls and every one of
-//! NetworkManager's four answers maps to exactly one [`Plan`], and
-//! `every_setting_combination_has_exactly_one_plan` is the test that would have
-//! to be told what a fourth control meant.
-//!
-//! ## Wi-Fi is not a thing Cordial can see, and the row says so
-//!
-//! There is no radio in this. `org.freedesktop.NetworkManager`'s `Metered`
+//! All of that machinery existed because one question was being asked twice.
+//! **There is no radio in this.** `org.freedesktop.NetworkManager`'s `Metered`
 //! property is the only question [`crate::metered`] asks, and it is a statement
-//! about who pays for the bytes rather than about the link layer. So *Download
-//! on Wi-Fi* governs the not-metered case and *Download on metered connection*
-//! governs the metered one; between them they cover every connection, which is
-//! exactly what makes "both off" mean "never".
+//! about who pays for the bytes rather than about the link layer. *Download on
+//! Wi-Fi* governed the not-metered answer and *Download on metered connection*
+//! governed the metered one — two names for one bit, with a switch labelled
+//! Wi-Fi that an ordinary wired desktop was also governed by. Its own row in the
+//! settings page had to explain that, which is a fair sign the label was wrong.
 //!
-//! A wired desktop therefore takes the Wi-Fi switch's branch. That is the right
-//! answer to the question the switch is really asking — may this download over a
-//! connection nobody is charging by the megabyte — and a poor reading of its
-//! name, so the shell's row carries the explanation rather than leaving somebody
-//! to find out by unplugging something.
+//! Nobody turns Wi-Fi off while leaving metered on. So the question is asked
+//! once, in the direction people have an opinion about: **may a download run
+//! when the connection is metered?** Off holds the download until an unmetered
+//! link turns up, which is what somebody on a data allowance wants; on stops the
+//! connection being consulted at all.
+//!
+//! With one switch there is no combination that refuses forever, so the warning
+//! row and [`DownloadOn::never_downloads`] are both gone. The contradiction the
+//! original two-dropdown argument warned about is unreachable again — not by
+//! forbidding it, but because it was an artefact of the duplicated question.
+//!
+//! [`UpdateSettings::plan`] is still total, which is the property every one of
+//! these shapes was chosen for: every combination of the controls and every one
+//! of NetworkManager's answers maps to exactly one [`Plan`], and
+//! `every_setting_combination_has_exactly_one_plan` is the test that would have
+//! to be told what a new control meant.
+//!
+//! ## A guess counts as metered
+//!
+//! NetworkManager answers with four values, two of which are guesses, and both
+//! guesses are treated as metered. An ordinary desktop on a LAN answers
+//! guess-no, so the default settings hold a download there — the switch is
+//! reached far more often than "am I on a hotspot" suggests. Reading a guess as
+//! cheap is how a data allowance pays for a 115 MB download nobody asked for,
+//! and the cost of being wrong the other way is a button press.
 //!
 //! Nothing here is GTK. The shell binds an `AdwComboRow` to [`Automatic::index`],
 //! the same seam `shell_config::AppearanceScheme` already uses, so the position
@@ -109,14 +119,22 @@ impl Automatic {
     }
 }
 
-/// Which connections a download may use. One switch each.
+/// Which connections a download may use. **One switch, not two.**
+///
+/// *Download on Wi-Fi* used to sit beside this one, and its own description gave
+/// the game away: Cordial cannot see whether a link is wireless, so it asked
+/// NetworkManager the metered question and called the not-metered answer Wi-Fi.
+/// That made the pair two names for one bit — a switch labelled Wi-Fi that a
+/// wired desktop was also governed by, and which nobody has a reason to turn off
+/// while leaving the metered one on.
+///
+/// So the question is asked once, in the direction people actually have an
+/// opinion about: **may a download run when the connection is metered?** Off
+/// means downloads wait for an unmetered link, which is what somebody on a data
+/// allowance wants. On means the connection is not consulted at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct DownloadOn {
-    /// *Download on Wi-Fi*, which is really "on a connection nobody is charging
-    /// by the megabyte" — see the module header. Only an explicit `NO` from
-    /// NetworkManager takes this branch; every guess is metered.
-    pub wifi: bool,
     /// *Download on metered connection.* Off by default: reading a guess as
     /// cheap is how somebody's data allowance pays for a 115 MB download they
     /// never asked for, and the cost of being wrong the other way is a button
@@ -126,29 +144,25 @@ pub struct DownloadOn {
 
 impl Default for DownloadOn {
     fn default() -> Self {
-        DownloadOn { wifi: true, metered: false }
+        DownloadOn { metered: false }
     }
 }
 
-/// The sentence the settings page shows when both switches are off.
+/// The sentence shown where a download is being held back by the connection.
 ///
 /// A constant rather than a formatted string, so the shell's warning row and the
 /// refusal a held download reports are demonstrably the same words.
+///
+/// It no longer describes a settings combination that never downloads, because
+/// there is no such combination any more: with one switch, off means "wait for
+/// an unmetered connection" rather than "never". That is the point of collapsing
+/// the pair — the state that had to be warned about was an artefact of asking
+/// one question twice.
 pub const NEVER_DOWNLOADS: &str =
-    "With both connection switches off, nothing is ever downloaded on its own, whatever Auto \
-     update is set to above — Wi-Fi and metered are every connection there is. Pressing Update \
-     yourself still works: these switches govern what happens without being asked.";
-
-impl DownloadOn {
-    /// Whether this pair rules out every connection.
-    ///
-    /// The contradiction the two-dropdown shape existed to make unexpressible.
-    /// It is expressible now, so it is named instead — expressing it is fine,
-    /// and expressing it silently is what the old design was objecting to.
-    pub fn never_downloads(self) -> bool {
-        !self.wifi && !self.metered
-    }
-}
+    "With Download on metered connection off, nothing is downloaded on its own while \
+     NetworkManager reports the link as metered — and every answer it is unsure about counts as \
+     metered. Pressing Update yourself still works: this switch governs what happens without \
+     being asked.";
 
 /// All three controls. Serialised into whatever document the shell keeps its own
 /// preferences in; nothing here reads or writes a file, because where Cordial's
@@ -199,19 +213,17 @@ impl UpdateSettings {
     /// on its own invites "no it isn't" — [`Metered::describe`] says which of
     /// NetworkManager's four answers it was.
     pub fn may_download(self, metered: Metered) -> Result<(), String> {
-        if self.download_on.never_downloads() {
-            return Err(NEVER_DOWNLOADS.to_string());
-        }
-        let allowed =
-            if metered.is_metered() { self.download_on.metered } else { self.download_on.wifi };
-        if allowed {
+        // An unmetered link is never in question: the only switch here is about
+        // spending a data allowance, and there is none to spend. This used to
+        // consult a second switch called Wi-Fi at this point, which is how a
+        // wired desktop with Wi-Fi turned off ended up refusing to download.
+        if !metered.is_metered() {
             return Ok(());
         }
-        Err(format!(
-            "{}, and {} is off",
-            metered.describe(),
-            if metered.is_metered() { "Download on metered connection" } else { "Download on Wi-Fi" }
-        ))
+        if self.download_on.metered {
+            return Ok(());
+        }
+        Err(format!("{}, and Download on metered connection is off", metered.describe()))
     }
 }
 
@@ -222,7 +234,6 @@ mod tests {
     #[test]
     fn the_defaults_are_the_ones_the_design_names() {
         let s = UpdateSettings::default();
-        assert!(s.download_on.wifi);
         assert!(!s.download_on.metered, "a data allowance is not the default to spend");
         assert_eq!(s.automatic, Automatic::Background);
     }
@@ -235,7 +246,7 @@ mod tests {
         // whole reason the option is not called Disabled.
         let s = UpdateSettings {
             automatic: Automatic::Manual,
-            download_on: DownloadOn { wifi: true, metered: true },
+            download_on: DownloadOn { metered: true },
         };
         assert_eq!(s.plan(Metered::No), Plan::DoNotCheck);
         assert_eq!(s.plan(Metered::Yes), Plan::DoNotCheck);
@@ -256,23 +267,28 @@ mod tests {
     }
 
     #[test]
-    fn both_switches_off_is_a_contradiction_that_is_stated_rather_than_hidden() {
-        // The combination the old two-dropdown shape existed to make
-        // unexpressible. It is expressible now, so the requirement moved: it has
-        // to be said out loud, in the same words, wherever it is met.
+    fn off_means_wait_for_an_unmetered_link_rather_than_never() {
+        // There used to be a second switch here, and a test pinning the
+        // combination that downloaded nothing ever. Both are gone: with one
+        // switch, off holds a download on a metered link and releases it on an
+        // unmetered one, so there is no settings state that refuses forever and
+        // no warning row to announce one.
         let s = UpdateSettings {
             automatic: Automatic::Background,
-            download_on: DownloadOn { wifi: false, metered: false },
+            download_on: DownloadOn { metered: false },
         };
-        assert!(s.download_on.never_downloads());
-        for metered in [Metered::No, Metered::Yes, Metered::GuessNo, Metered::Unknown] {
-            assert_eq!(s.may_download(metered), Err(NEVER_DOWNLOADS.to_string()));
-        }
-        assert!(NEVER_DOWNLOADS.contains("nothing is ever downloaded"), "{NEVER_DOWNLOADS}");
-        assert!(NEVER_DOWNLOADS.contains("whatever Auto update is set to"), "{NEVER_DOWNLOADS}");
-        // And it does not overstate itself: an Update the user presses is not
-        // what these switches are about, and saying otherwise would be a second
-        // wrong sentence rather than a fix for the first.
+        assert!(s.may_download(Metered::Yes).is_err());
+        assert!(s.may_download(Metered::GuessYes).is_err());
+        assert!(s.may_download(Metered::GuessNo).is_err(), "a guess is metered");
+        assert!(s.may_download(Metered::Unknown).is_err(), "unknown is metered");
+        // The one answer that releases it, and the reason the switch is not
+        // called Never.
+        assert_eq!(s.may_download(Metered::No), Ok(()));
+
+        assert!(NEVER_DOWNLOADS.contains("Download on metered connection"), "{NEVER_DOWNLOADS}");
+        // It does not overstate itself: an Update the user presses is not what
+        // this switch is about, and saying otherwise would be a second wrong
+        // sentence rather than a fix for the first.
         assert!(NEVER_DOWNLOADS.contains("Pressing Update yourself still works"), "{NEVER_DOWNLOADS}");
     }
 
@@ -282,28 +298,22 @@ mod tests {
     }
 
     #[test]
-    fn a_metered_connection_is_allowed_only_by_its_own_switch() {
-        // The switches are not interchangeable: turning Wi-Fi on must not pay
-        // for a hotspot, and turning metered on must not be needed for a LAN.
-        let hotspot_only =
-            UpdateSettings { automatic: Automatic::Background, download_on: DownloadOn { wifi: false, metered: true } };
-        assert_eq!(hotspot_only.plan(Metered::Yes), Plan::CheckAndDownload);
-        assert!(hotspot_only.may_download(Metered::No).is_err());
-
-        let both = UpdateSettings {
-            automatic: Automatic::Background,
-            download_on: DownloadOn { wifi: true, metered: true },
-        };
-        assert_eq!(both.plan(Metered::Yes), Plan::CheckAndDownload);
-        assert_eq!(both.plan(Metered::Unknown), Plan::CheckAndDownload);
+    fn turning_the_switch_on_stops_the_connection_being_consulted() {
+        let anywhere =
+            UpdateSettings { automatic: Automatic::Background, download_on: DownloadOn { metered: true } };
+        for metered in [Metered::No, Metered::Yes, Metered::GuessNo, Metered::GuessYes, Metered::Unknown] {
+            assert_eq!(anywhere.plan(metered), Plan::CheckAndDownload, "{metered:?}");
+        }
     }
 
     #[test]
-    fn a_guess_takes_the_metered_switch_rather_than_the_wifi_one() {
+    fn a_guess_is_metered_and_holds_the_download() {
         // The consequence nobody expects: an ordinary desktop on a LAN answers
         // guess-no, which is metered, so the default settings hold the download
         // there. Deleting this is how "guesses are metered" quietly becomes
-        // "guesses go the way they lean".
+        // "guesses go the way they lean". This is also why the Wi-Fi switch was
+        // a poor name for the other side of it -- that desktop is not on Wi-Fi
+        // and was governed by it anyway.
         let s = UpdateSettings::default();
         assert!(s.may_download(Metered::GuessNo).is_err());
     }
@@ -312,7 +322,7 @@ mod tests {
     fn asking_first_is_not_overridden_by_a_cheap_connection() {
         let s = UpdateSettings {
             automatic: Automatic::Ask,
-            download_on: DownloadOn { wifi: true, metered: true },
+            download_on: DownloadOn { metered: true },
         };
         assert_eq!(s.plan(Metered::No), Plan::CheckAndAsk { why: None });
     }
@@ -320,20 +330,18 @@ mod tests {
     #[test]
     fn every_setting_combination_has_exactly_one_plan() {
         // The property the old two-dropdown shape was chosen for, kept through
-        // the change to a dropdown and two switches. If a fourth control were
-        // ever added, this is the test that would have to be told what the new
-        // combinations mean.
+        // the change to a dropdown and two switches, and then to a dropdown and
+        // one. If a control were ever added back, this is the test that would
+        // have to be told what the new combinations mean.
         for automatic in [Automatic::Background, Automatic::Ask, Automatic::Manual] {
-            for wifi in [true, false] {
-                for metered_switch in [true, false] {
-                    for metered in [Metered::No, Metered::Yes, Metered::GuessNo, Metered::Unknown] {
-                        let s = UpdateSettings {
-                            automatic,
-                            download_on: DownloadOn { wifi, metered: metered_switch },
-                        };
-                        // Total: no panic, no "undefined" arm to fall into.
-                        let _ = s.plan(metered);
-                    }
+            for metered_switch in [true, false] {
+                for metered in
+                    [Metered::No, Metered::Yes, Metered::GuessNo, Metered::GuessYes, Metered::Unknown]
+                {
+                    let s =
+                        UpdateSettings { automatic, download_on: DownloadOn { metered: metered_switch } };
+                    // Total: no panic, no "undefined" arm to fall into.
+                    let _ = s.plan(metered);
                 }
             }
         }
@@ -360,7 +368,7 @@ mod tests {
     fn the_stored_form_survives_a_round_trip_and_an_absent_key() {
         let s = UpdateSettings {
             automatic: Automatic::Ask,
-            download_on: DownloadOn { wifi: false, metered: true },
+            download_on: DownloadOn { metered: true },
         };
         let text = serde_json::to_string(&s).unwrap();
         assert!(text.contains("\"ask\""), "{text}");

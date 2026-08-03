@@ -49,7 +49,10 @@ usage: cordial-load --lib-dir <dir> [options]
   --game-activity   implies --jni-onload; bring Roblox up and hand it a surface
   --join-url <url>  a roblox-player:// or roblox:// link from a browser click,
                     handed to the engine during bring-up. Rejected unless it is
-                    one of those two schemes, printable ASCII, and under 2 kB
+                    one of those two schemes, printable ASCII, and under 2 kB.
+                    A roblox-player: link in the desktop launcher's format is
+                    rewritten into the roblox:// form this engine matches; its
+                    one-time gameinfo ticket is dropped and never printed
   --run <secs>      how long to let Roblox run after handover (default 15).
                     0 means no timer: run until the window is closed or the
                     process is sent SIGTERM/SIGINT. Closing the window ends the
@@ -101,6 +104,12 @@ env:
   CORDIAL_DEEPLINK_PROBE=1           with --join-url, print the linking
                                      protocol's own message and field names,
                                      read out of the running engine
+  CORDIAL_DEEPLINK_NO_TRANSLATE=1    hand a roblox-player:// desktop link to the
+                                     engine as it arrived, instead of rewriting
+                                     it into the roblox:// form the engine's own
+                                     pattern matches. The control for the
+                                     translation; the engine does not act on the
+                                     untranslated link, which is the point
   CORDIAL_NO_VULKAN=1                make the host look like it has no Vulkan
                                      loader, forcing the GLES2/EGL fallback
                                      path Roblox uses when dlopen(libvulkan)

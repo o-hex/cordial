@@ -28,13 +28,26 @@
 //! publish suppressed, and `Game.launch` stays empty with
 //! `isColdStartDeeplinkToGame()` false at both sampling points.
 //!
-//! **What does not work, also measured.** A `roblox-player://` link produces no
-//! `Game.launch` at all. The engine's own pattern for a game link —
+//! **What the engine will not take, also measured.** A `roblox-player://` link
+//! produces no `Game.launch` at all. The engine's own pattern for a game link —
 //! `FStringGameLaunchLinkURL`, a client setting — admits `roblox://` and
 //! `robloxmobile://` and nothing else. That is the scheme roblox.com's desktop
-//! play button emits, so the handler Cordial is taking over from Sober will
-//! receive links this engine does not understand. Cordial says so on the way
-//! past rather than waiting for the silence to speak.
+//! play button emits, and Cordial is the registered handler for it, so a click
+//! on the web site arrives in a format this engine cannot read.
+//!
+//! **So it is translated.** [`translate`] takes the desktop launcher's format
+//! apart — a version, then `+`-separated `key:value` pairs — percent-decodes its
+//! `placelauncherurl`, and carries the `placeId` out of that launcher query into
+//! `roblox://experiences/start?placeId=<id>`, which is the exact string measured
+//! to work. `CORDIAL_DEEPLINK_NO_TRANSLATE=1` is the control. Nothing else is
+//! carried: the desktop link's `gameinfo` is a one-time ticket the desktop
+//! client redeems and the Android client has no use for, and a launcher query
+//! that names a *particular server* rather than an experience is refused
+//! outright rather than flattened into a join somewhere else.
+//!
+//! When the translation refuses, the behaviour is what it was before it existed:
+//! Cordial says which parameter stopped it and warns that the link is not going
+//! to reach an experience, rather than waiting for the silence to speak.
 //!
 //! **Not verified: an actual join.** Reaching `Game.launch` is the engine
 //! asking to launch an experience; whether it then joins one needs a signed-in
@@ -52,10 +65,11 @@
 //!
 //! **Its contents are not printed.** A `roblox://` link is almost entirely
 //! query, and a Roblox query can carry a private-server `accessCode` or
-//! `linkCode` — a capability, not a preference. Cordial elides web-view URLs'
-//! queries for exactly this reason (`native/android_classes.cpp`), so this
+//! `linkCode` — a capability, not a preference. The desktop form is worse: its
+//! `gameinfo` is a live one-time authentication ticket. Cordial elides web-view
+//! URLs' queries for exactly this reason (`native/android_classes.cpp`), so this
 //! module reports the scheme, the parameter *names*, and the length, and never
-//! a value.
+//! a value. [`JoinUrl::describe`] carries the scar of getting that wrong once.
 
 use cordial_linker_sys as linker;
 
@@ -136,21 +150,19 @@ impl JoinUrl {
     /// What is safe to print: the scheme, the parameter names, and the length.
     ///
     /// Never a parameter value. `accessCode` and `linkCode` are private-server
-    /// capabilities and `launchData` is arbitrary developer payload; a log line
-    /// that carried them would hand a shoulder-surfer or a pasted terminal
-    /// transcript a working join link.
+    /// capabilities, `launchData` is arbitrary developer payload, and the
+    /// desktop form's `gameinfo` is a one-time authentication ticket; a log line
+    /// that carried any of them would hand a shoulder-surfer or a pasted
+    /// terminal transcript a working credential.
+    ///
+    /// **This printed the ticket until 2026-08-03**, and it printed it under the
+    /// words "values not shown". The desktop form separates its parameters with
+    /// `+` and `:`, neither of which the old splitter knew about, so a whole
+    /// `roblox-player:1+launchmode:play+gameinfo:…` payload came out as a single
+    /// "parameter name". That is the exact link this module is for, so the bug
+    /// was live on the only input that carries a credential.
     pub fn describe(&self) -> String {
-        let query = self
-            .raw
-            .split_once(':')
-            .map(|(_, rest)| rest.trim_start_matches('/'))
-            .unwrap_or_default();
-        let mut names: Vec<&str> = query
-            .split(['&', '?'])
-            .filter_map(|p| p.split('=').next())
-            .filter(|p| !p.is_empty())
-            .collect();
-        names.dedup();
+        let names = self.parameter_names();
         if names.is_empty() {
             return format!("{}:// ({} bytes, no parameters)", self.scheme, self.raw.len());
         }
@@ -161,6 +173,89 @@ impl JoinUrl {
             self.raw.len()
         )
     }
+
+    /// The parameter names in this link, in the order they appear, and nothing
+    /// else.
+    ///
+    /// Fails closed in both directions. A token that carries no separator is
+    /// dropped rather than reported as a name, because in the desktop form a
+    /// separatorless token is either the leading version number or a fragment of
+    /// a value that happened to contain the separator this form splits on — and
+    /// `gameinfo` is the value most likely to. Anything that does not look like
+    /// an identifier is dropped for the same reason.
+    fn parameter_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = match self.desktop_payload() {
+            // `key:value` joined by `+`. The version number leads and carries no
+            // colon, so it drops out here without needing a special case.
+            Some(payload) => payload
+                .split('+')
+                .filter_map(|t| t.split_once(':').map(|(k, _)| k))
+                .filter(|k| is_identifier(k))
+                .collect(),
+            // `?a=1&b=2`, with the path before the first `?` carrying no `=` and
+            // so contributing nothing.
+            None => self
+                .payload()
+                .split(['&', '?'])
+                .filter_map(|t| t.split_once('=').map(|(k, _)| k))
+                .filter(|k| is_identifier(k))
+                .collect(),
+        };
+        names.dedup();
+        names
+    }
+
+    /// Everything after the scheme, with any leading slashes removed.
+    ///
+    /// The slashes are stripped rather than required because both shapes reach
+    /// here: `roblox://experiences/start?…` has two, the desktop form has none,
+    /// and a desktop link that has been through GIO has three — `GFile::uri`
+    /// turns `roblox-player:1+…` into `roblox-player:///1+…`, which
+    /// `cordial-shell`'s own tests pin down. The shell hands over `argv`
+    /// precisely so that does not happen, but a link typed by hand or produced
+    /// by some other launcher can still arrive reshaped.
+    fn payload(&self) -> &str {
+        self.raw
+            .split_once(':')
+            .map(|(_, rest)| rest.trim_start_matches('/'))
+            .unwrap_or_default()
+    }
+
+    /// The payload, when this link is in the desktop launcher's form.
+    ///
+    /// ```text
+    /// roblox-player:1+launchmode:play+gameinfo:<ticket>+placelauncherurl:<encoded>+…
+    /// ```
+    ///
+    /// A version number, then `+`-separated `key:value` pairs. Recognised by
+    /// that leading all-digits token rather than by the scheme alone, because
+    /// `roblox-player://placeId=1818` is also a link somebody can produce and it
+    /// is the query shape, not this one. Anything that does not match falls
+    /// through to the query shape, which is the safe direction: the query
+    /// splitter treats an unrecognised desktop payload as one nameless token and
+    /// prints nothing of it.
+    fn desktop_payload(&self) -> Option<&str> {
+        if self.scheme != "roblox-player" {
+            return None;
+        }
+        let payload = self.payload();
+        let (version, _) = payload.split_once('+')?;
+        let numbered = !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit());
+        numbered.then_some(payload)
+    }
+}
+
+/// Whether a name is safe to print as a parameter name.
+///
+/// The names in a link come from somebody else's web page, so "it appeared
+/// before a separator" is not by itself a reason to believe a string is a key.
+/// Requiring an identifier shape, and a short one, is what keeps a fragment of a
+/// value out of a log line if a value ever contains a separator this module
+/// splits on.
+fn is_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 40
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 impl std::fmt::Debug for JoinUrl {
@@ -216,6 +311,211 @@ pub fn validate(raw: &str) -> Result<JoinUrl, String> {
     })
 }
 
+/// Parameters in a `PlaceLauncher.ashx` query that choose a *particular server*
+/// rather than an experience.
+///
+/// Lower-cased, and compared lower-cased, because the desktop launcher's own
+/// keys are not consistently cased.
+///
+/// These are the reason [`translate`] can refuse. A private-server link, a
+/// reserved-server link and a "join this running game" link all name a place
+/// *and* one of these, so a translation that carried only the place id would
+/// produce a link that joins — into a different server from the one clicked.
+/// Refusing keeps the failure where somebody can see it, which is the same
+/// reasoning `native/opensles.cpp` applies to a stub that could lie.
+///
+/// The desktop launcher's `request` kind is deliberately not consulted. It would
+/// have to be enumerated from names nothing here has measured, and every kind
+/// worth refusing carries one of these or no `placeId` at all, so the parameters
+/// answer the question the request kind would have.
+const SERVER_SELECTING: [&str; 5] =
+    ["accesscode", "linkcode", "reservedserveraccesscode", "gameid", "jobid"];
+
+/// What [`translate`] made of the link.
+#[derive(Debug)]
+pub enum Translated {
+    /// Already in a form the engine's own pattern matches. Deliver it unchanged.
+    AsIs,
+    /// A desktop link, rewritten into the mobile form. `dropped` names the
+    /// launcher-URL parameters that were not carried, so that a link which
+    /// behaves differently from the click says which parameter explains it.
+    To { url: JoinUrl, dropped: Vec<String> },
+    /// A desktop link this will not translate, and why — in parameter names,
+    /// never values.
+    Refused(String),
+}
+
+/// Rewrite roblox.com's desktop launch link into the mobile one the engine
+/// matches, or say why not.
+///
+/// **The problem.** roblox.com's play button emits `roblox-player:`, in a format
+/// that is not a URL query at all:
+///
+/// ```text
+/// roblox-player:1+launchmode:play+gameinfo:<ticket>+placelauncherurl:<encoded>+launchtime:…
+/// ```
+///
+/// and the engine's own pattern for a game link — the client setting
+/// `FStringGameLaunchLinkURL` — admits `roblox://` and `robloxmobile://` and
+/// nothing else. Measured: that link produces no `Game.launch`. Cordial is now
+/// the registered handler for the scheme, so the click had to reach the engine
+/// or stop being claimed.
+///
+/// **What is carried, and what is not.** The `placelauncherurl` decodes to a
+/// `PlaceLauncher.ashx` request whose query names a `placeId`. That id, and only
+/// that id, is carried into `roblox://experiences/start?placeId=<id>` — the
+/// exact shape measured to produce a `Game.launch`. Everything else in the
+/// launcher query is named in the log and dropped; nothing is guessed at, and
+/// [`SERVER_SELECTING`] is the set whose presence stops the translation instead.
+///
+/// **`gameinfo` is deliberately dropped, and that is the open question.** It is
+/// a one-time authentication ticket the desktop client redeems, and the Android
+/// client this engine came from has no such thing — its authentication is the
+/// session the client already holds. So dropping it is consistent with what the
+/// engine is, and it is **not established** that a join succeeds without it,
+/// because verifying a join needs a signed-in account and none was used. What is
+/// established is that the translated link reaches the engine and the app shell
+/// asks for the place; see `docs/analysis/deep-links.md`.
+pub fn translate(url: &JoinUrl) -> Translated {
+    let Some(payload) = url.desktop_payload() else {
+        return Translated::AsIs;
+    };
+
+    let mut launch_mode = None;
+    let mut launcher = None;
+    for token in payload.split('+') {
+        // A token with no colon is the leading version number, or a fragment of
+        // a value that contained a `+`. Neither is a parameter, and guessing
+        // which is which is exactly what this must not do.
+        let Some((key, value)) = token.split_once(':') else {
+            continue;
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "launchmode" => launch_mode = Some(value),
+            "placelauncherurl" => launcher = Some(value),
+            _ => {}
+        }
+    }
+
+    // `play` is the only mode that means "join an experience". `app` opens the
+    // client and `edit` is Studio, and turning either into a join would send
+    // somebody somewhere they did not click. The value is not printed: it is
+    // short and harmless today, but this whole module's rule is that a value
+    // from a browser click does not reach a log line, and one exception is how
+    // the rule stops being one.
+    if let Some(mode) = launch_mode {
+        if !mode.eq_ignore_ascii_case("play") {
+            return Translated::Refused(
+                "this link's launchmode is not play, so it is not a request to join an experience"
+                    .into(),
+            );
+        }
+    }
+
+    let Some(launcher) = launcher else {
+        return Translated::Refused(
+            "this link carries no placelauncherurl, so there is no place id in it to translate"
+                .into(),
+        );
+    };
+    let launcher = match percent_decode(launcher) {
+        Ok(v) => v,
+        Err(e) => return Translated::Refused(format!("its placelauncherurl {e}")),
+    };
+
+    let query = launcher.split_once('?').map(|(_, q)| q).unwrap_or_default();
+    let mut place = None;
+    let mut blocking: Vec<&str> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let lower = key.to_ascii_lowercase();
+        if lower == "placeid" {
+            place = Some(value);
+        } else if let Some(known) = SERVER_SELECTING.iter().find(|s| **s == lower) {
+            // The canonical spelling rather than the one that arrived, so that
+            // the sentence a user reads is Cordial's and not a web page's.
+            blocking.push(known);
+        } else if is_identifier(key) {
+            dropped.push(key.to_string());
+        }
+    }
+
+    if !blocking.is_empty() {
+        return Translated::Refused(format!(
+            "its placelauncherurl carries {}, which picks a particular server rather than an \
+             experience; carrying only the place id would join a different game from the one \
+             clicked",
+            blocking.join(", ")
+        ));
+    }
+    let Some(place) = place else {
+        return Translated::Refused(
+            "its placelauncherurl names no placeId, so there is nothing to join".into(),
+        );
+    };
+    // Digits only, and short. This is what makes the line below safe to build by
+    // formatting: a place id that is anything other than a run of digits cannot
+    // reach the synthesised link, so nothing from the browser can add a
+    // parameter to it. Roblox's place ids are 64-bit, so 20 digits is every one
+    // that will ever exist and then some.
+    if place.is_empty() || place.len() > 20 || !place.bytes().all(|b| b.is_ascii_digit()) {
+        return Translated::Refused(
+            "its placelauncherurl's placeId is not a number, and Cordial will not invent one"
+                .into(),
+        );
+    }
+
+    // `roblox://experiences/start?placeId=<id>` rather than any of the shorter
+    // forms the engine's pattern also admits, because this is the exact string
+    // that was measured to produce a `Game.launch` naming the place.
+    match validate(&format!("roblox://experiences/start?placeId={place}")) {
+        Ok(url) => Translated::To { url, dropped },
+        // Unreachable as long as the digit check above holds, and reported
+        // rather than unwrapped because a panic here would be a browser click
+        // taking the client down.
+        Err(e) => Translated::Refused(format!(
+            "the link it translates to is not one Cordial takes: {e}"
+        )),
+    }
+}
+
+/// Undo the percent-encoding on a desktop link's `placelauncherurl`.
+///
+/// Hand-rolled rather than a dependency because it decodes one field, and strict
+/// rather than lenient because this arrives from a browser click: a malformed
+/// escape means the link is not the shape this claims to understand, and the
+/// honest answer to that is to refuse the translation rather than to salvage
+/// what parses. The decoded bytes are held to the same printable-ASCII rule
+/// [`validate`] applies to the link itself, with the space allowed because a
+/// launcher query can legitimately contain one once decoded.
+fn percent_decode(s: &str) -> Result<String, String> {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .ok_or_else(|| "ends in a percent escape that is cut short".to_string())?;
+        let byte = u8::from_str_radix(hex, 16)
+            .map_err(|_| "has a percent escape that is not two hexadecimal digits".to_string())?;
+        if !(0x20..=0x7e).contains(&byte) {
+            return Err("has a percent escape for a character that is not printable".into());
+        }
+        out.push(byte as char);
+        i += 3;
+    }
+    Ok(out)
+}
+
 /// What was *done* with the link at cold start.
 ///
 /// Deliberately not a verdict on whether the link worked. Nothing at this point
@@ -248,8 +548,46 @@ pub enum Outcome {
 /// Placed after `nativeAppBridgeV2InitWithParams` for the same reason the
 /// cookie restore is: the protocol machinery it talks to does not exist until
 /// that call has built it.
+///
+/// Everything below [`translate`] works on the translated link rather than the
+/// one that arrived, which is deliberate: a desktop link's `gameinfo` ticket
+/// then never crosses into the engine at all, and there is one link in play
+/// rather than two that could disagree about which place was clicked.
 pub fn deliver(lib: linker::Library, url: &JoinUrl) -> Outcome {
     println!("[deeplink] delivering {}", url.describe());
+
+    // `CORDIAL_DEEPLINK_NO_TRANSLATE=1` is the control for the translation, the
+    // way `CORDIAL_DEEPLINK_NO_PUBLISH=1` is the control for the publish: same
+    // link, same launch, the rewrite suppressed, and the desktop link goes to
+    // the engine as it arrived.
+    let translated = if std::env::var_os("CORDIAL_DEEPLINK_NO_TRANSLATE").is_some() {
+        println!("[deeplink] not translating (CORDIAL_DEEPLINK_NO_TRANSLATE)");
+        Translated::AsIs
+    } else {
+        translate(url)
+    };
+    let url = match &translated {
+        Translated::AsIs => url,
+        Translated::To { url: rewritten, dropped } => {
+            println!("[deeplink] translated the desktop link to {}", rewritten.describe());
+            if !dropped.is_empty() {
+                // Named rather than silently discarded. A link that joins the
+                // right place and behaves differently from the click is the
+                // failure this line exists to explain, and the parameter that
+                // explains it is always in this list.
+                println!(
+                    "[deeplink] its launcher URL also carried {}, which Cordial does not carry \
+                     across",
+                    dropped.join(", ")
+                );
+            }
+            rewritten
+        }
+        Translated::Refused(why) => {
+            println!("[deeplink] not translating this link: {why}");
+            url
+        }
+    };
 
     // Said up front rather than after thirty seconds of nothing happening.
     //
@@ -257,9 +595,9 @@ pub fn deliver(lib: linker::Library, url: &JoinUrl) -> Outcome {
     // the client setting `FStringGameLaunchLinkURL`, and that pattern admits
     // `roblox://` and `robloxmobile://` and no other scheme. Measured: the same
     // link published under `roblox-player://` produces no `Game.launch` at all,
-    // where under `roblox://` it produces one naming the place. This is the
-    // scheme roblox.com's own play button emits on desktop, so it is the case
-    // that matters most and the one Cordial cannot yet act on.
+    // where under `roblox://` it produces one naming the place. So reaching this
+    // with a `roblox-player://` link still in hand means the translation above
+    // declined it, and the click is not going to reach an experience.
     if url.scheme() == "roblox-player" {
         println!(
             "[deeplink] warning: this engine's own link pattern (FStringGameLaunchLinkURL) \
@@ -631,5 +969,207 @@ mod tests {
     #[test]
     fn a_backslash_cannot_escape_the_closing_quote() {
         assert_eq!(escape_json(r"a\"), r"a\\");
+    }
+
+    /// A desktop link of the shape roblox.com's play button emits, built here
+    /// rather than captured. `SYNTHETIC-NOT-A-TICKET` is not a ticket and 1818
+    /// belongs to nobody; no real link, ticket or account appears in this file
+    /// or anywhere else in this repository.
+    fn desktop(launcher_query: &str) -> String {
+        let encoded = launcher_query
+            .replace('%', "%25")
+            .replace(':', "%3A")
+            .replace('/', "%2F")
+            .replace('?', "%3F")
+            .replace('&', "%26")
+            .replace('=', "%3D");
+        format!(
+            "roblox-player:1+launchmode:play+gameinfo:SYNTHETIC-NOT-A-TICKET\
+             +placelauncherurl:{encoded}+launchtime:1754179200000+browsertrackerid:1\
+             +robloxLocale:en_us+gameLocale:en_us"
+        )
+    }
+
+    const LAUNCHER: &str =
+        "https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGame\
+         &browserTrackerId=1&placeId=1818&isPlayTogetherGame=false";
+
+    /// **The bug this fix exists for, as a test.** Until 2026-08-03 `describe`
+    /// split only on `&` and `?`, so a desktop payload — which uses `+` and `:`
+    /// — came back as one giant "parameter name" carrying the `gameinfo`
+    /// ticket, printed under the words "values not shown". The ticket is a live
+    /// credential and this is the only input that carries one.
+    #[test]
+    fn a_desktop_link_never_prints_its_ticket() {
+        let u = validate(&desktop(LAUNCHER)).unwrap();
+        for rendered in [u.describe(), format!("{u:?}")] {
+            assert!(!rendered.contains("SYNTHETIC"), "{rendered}");
+            assert!(!rendered.contains("1818"), "{rendered}");
+            assert!(!rendered.contains("assetgame"), "{rendered}");
+            assert!(rendered.contains("gameinfo"), "{rendered}");
+            assert!(rendered.contains("placelauncherurl"), "{rendered}");
+            assert!(rendered.contains("launchmode"), "{rendered}");
+        }
+    }
+
+    /// The desktop format splits on `+`, and a ticket is entitled to contain
+    /// one. A splitter that reported every `+`-separated token's leading text as
+    /// a parameter name would print a slice of the ticket; requiring a `:` and
+    /// an identifier shape is what stops it.
+    #[test]
+    fn a_plus_inside_a_ticket_does_not_become_a_parameter_name() {
+        let u = validate("roblox-player:1+gameinfo:AAAA+BBBB==+launchmode:play").unwrap();
+        let d = u.describe();
+        assert!(!d.contains("BBBB"), "{d}");
+        assert!(d.contains("gameinfo") && d.contains("launchmode"), "{d}");
+    }
+
+    #[test]
+    fn a_desktop_link_becomes_the_mobile_link_that_was_measured_to_work() {
+        match translate(&validate(&desktop(LAUNCHER)).unwrap()) {
+            Translated::To { url, dropped } => {
+                assert_eq!(url.expose(), "roblox://experiences/start?placeId=1818");
+                assert_eq!(url.scheme(), "roblox");
+                // Named, not silently swallowed. `placeId` is carried and so is
+                // absent from this list.
+                assert!(dropped.contains(&"request".to_string()), "{dropped:?}");
+                assert!(dropped.contains(&"browserTrackerId".to_string()), "{dropped:?}");
+                assert!(!dropped.contains(&"placeId".to_string()), "{dropped:?}");
+            }
+            other => panic!("a plain play link should translate: {other:?}"),
+        }
+    }
+
+    /// GIO turns `roblox-player:1+…` into `roblox-player:///1+…`, which
+    /// `cordial-shell`'s own tripwire pins down. The shell reads `argv` so that
+    /// does not happen, but a link from a hand-typed command or another launcher
+    /// can still arrive reshaped, and it is the same link.
+    #[test]
+    fn a_desktop_link_reshaped_into_a_url_still_translates() {
+        let reshaped = desktop(LAUNCHER).replacen("roblox-player:", "roblox-player:///", 1);
+        match translate(&validate(&reshaped).unwrap()) {
+            Translated::To { url, .. } => {
+                assert_eq!(url.expose(), "roblox://experiences/start?placeId=1818")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The honest refusal. A private-server link names a place *and* an access
+    /// code, so carrying only the place id would produce a link that joins —
+    /// into the public server, not the one that was clicked. That is worse than
+    /// not joining, which is the whole argument in AGENTS.md against a stub that
+    /// returns success.
+    #[test]
+    fn a_link_that_picks_a_particular_server_is_refused_by_name() {
+        for (query, named) in [
+            ("https://x/PlaceLauncher.ashx?placeId=1818&accessCode=abc", "accesscode"),
+            ("https://x/PlaceLauncher.ashx?placeId=1818&linkCode=abc", "linkcode"),
+            ("https://x/PlaceLauncher.ashx?placeId=1818&gameId=abc", "gameid"),
+            ("https://x/PlaceLauncher.ashx?placeId=1818&jobId=abc", "jobid"),
+            (
+                "https://x/PlaceLauncher.ashx?placeId=1818&reservedServerAccessCode=abc",
+                "reservedserveraccesscode",
+            ),
+        ] {
+            match translate(&validate(&desktop(query)).unwrap()) {
+                Translated::Refused(why) => {
+                    assert!(why.contains(named), "{why}");
+                    assert!(!why.contains("abc"), "the reason must not carry a value: {why}");
+                }
+                other => panic!("{query} should be refused: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_launcher_url_with_no_place_id_is_refused_rather_than_invented() {
+        // `RequestFollowUser` is the shape this catches without having to
+        // enumerate the launcher's request kinds: it names a user, not a place.
+        let l = "https://x/PlaceLauncher.ashx?request=RequestFollowUser&userId=1";
+        assert!(matches!(
+            translate(&validate(&desktop(l)).unwrap()),
+            Translated::Refused(_)
+        ));
+    }
+
+    /// The check that makes the synthesised link safe to build by formatting.
+    /// Without it a place id could carry `&` or a quote into a string that goes
+    /// on to become one field of a JSON payload inside the engine.
+    #[test]
+    fn a_place_id_that_is_not_a_number_is_refused() {
+        for bad in ["1818x", "1818%26accessCode%3Dabc", "", "9".repeat(21).as_str()] {
+            let l = format!("https://x/PlaceLauncher.ashx?placeId={bad}");
+            match translate(&validate(&desktop(&l)).unwrap()) {
+                Translated::Refused(_) => {}
+                other => panic!("placeId={bad:?} should be refused: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_link_that_is_not_asking_to_play_is_refused() {
+        let link = desktop(LAUNCHER).replace("launchmode:play", "launchmode:edit");
+        match translate(&validate(&link).unwrap()) {
+            Translated::Refused(why) => assert!(why.contains("launchmode"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_desktop_link_without_a_launcher_url_is_refused() {
+        let link = "roblox-player:1+launchmode:play+gameinfo:SYNTHETIC-NOT-A-TICKET";
+        match translate(&validate(link).unwrap()) {
+            Translated::Refused(why) => assert!(why.contains("placelauncherurl"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A link already in a form the engine matches is not touched. This is what
+    /// keeps the measured `roblox://` path exactly as it was.
+    #[test]
+    fn a_mobile_link_is_left_alone() {
+        for link in [
+            "roblox://experiences/start?placeId=1818",
+            // A `roblox-player://` link in the query shape rather than the
+            // desktop launcher's shape: not something to translate, and it still
+            // gets the warning it got before.
+            "roblox-player://placeId=1818",
+        ] {
+            assert!(matches!(translate(&validate(link).unwrap()), Translated::AsIs), "{link}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_percent_escape_refuses_rather_than_salvages() {
+        for launcher in ["https%3A%2F%2Fx%3FplaceId%3D1818%2", "https%3A%2Fx%3FplaceId%3D18%ZZ"] {
+            let link = format!("roblox-player:1+launchmode:play+placelauncherurl:{launcher}");
+            assert!(matches!(
+                translate(&validate(&link).unwrap()),
+                Translated::Refused(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn percent_decoding_is_exact() {
+        assert_eq!(percent_decode("a%3Db%26c").unwrap(), "a=b&c");
+        assert_eq!(percent_decode("%25").unwrap(), "%");
+        assert_eq!(percent_decode("plain").unwrap(), "plain");
+        // A decoded control character would be a newline in a log line or a NUL
+        // in a JNI string, and neither belongs in a link.
+        assert!(percent_decode("a%0Ab").is_err());
+        assert!(percent_decode("a%00b").is_err());
+    }
+
+    /// The translated link goes through the same gate as one that arrived, so
+    /// the JSON payload built from it is the same shape the measured run used.
+    #[test]
+    fn the_translated_link_survives_the_payload_builder() {
+        let Translated::To { url, .. } = translate(&validate(&desktop(LAUNCHER)).unwrap()) else {
+            panic!("should translate");
+        };
+        let payload = format!("{{\"url\":\"{}\"}}", escape_json(url.expose()));
+        assert_eq!(payload, r#"{"url":"roblox://experiences/start?placeId=1818"}"#);
     }
 }

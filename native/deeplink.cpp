@@ -35,6 +35,14 @@
 // scheme, length, and character set — and it is never used to build a path, a
 // command line, or a format string. Here it is one `String` argument handed to
 // one native.
+//
+// **It is also not necessarily the URL the browser produced.** roblox.com's
+// desktop play button emits `roblox-player:1+launchmode:play+gameinfo:<ticket>+…`,
+// which the engine's own link pattern does not match, so `deeplink.rs` rewrites
+// it into `roblox://experiences/start?placeId=<id>` and it is the rewrite that
+// arrives here. The one-time ticket in the original is dropped on Cordial's side
+// and never crosses into the engine, which is deliberate: this engine is the
+// Android client and has no such ticket to redeem.
 
 #include <jnivm.h>
 

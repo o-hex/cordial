@@ -9,6 +9,12 @@ on `--profile agent-deeplink`, none signed in. Sources: the shipping APK's dex
 `AndroidManifest.xml`, `docs/traces/waydroid-roblox-startup.log.gz`, Roblox's
 own `ClientSettings` document, and the engine itself.
 
+**Updated 2026-08-03** by a second session, build `0.3.0-21-gf70ee23-dirty`, five
+launches on `--profile agent-dl2`, again none signed in: §6 no longer ends at a
+warning. roblox.com's desktop link is now translated into the form §5 measured,
+and the translation has a control. §6.3 is a correction — the line Cordial
+printed on every desktop link carried the link's authentication ticket.
+
 **Bottom line up front.** The engine never asks anybody for a URL. The URL is
 delivered *to* it, and the delivery that works is a message-bus publish:
 
@@ -155,7 +161,7 @@ consults on Android between initialising the app bridge and starting the app
 shell, goes `false -> true` across the same delivery. It is a second, independent
 witness to the same event.
 
-## 6. What does not work: `roblox-player://`
+## 6. What the engine will not take: `roblox-player://`, and what is done about it
 
 The engine carries its own pattern for what a game link looks like, as the
 client setting `FStringGameLaunchLinkURL`:
@@ -171,18 +177,122 @@ client setting `FStringGameLaunchLinkURL`:
 and leaves the flag false.
 
 This matters more than it sounds. `roblox-player://` is what roblox.com's play
-button emits on desktop, in a different format again
-(`roblox-player:1+launchmode:play+gameinfo:<ticket>+placelauncherurl:<url>+…`),
-and it is the handler Cordial is taking over from Sober. **Taking that handler
-away from Sober without handling it is the failure this whole investigation was
-told to avoid**, so Cordial prints a warning naming the pattern when it is given
-one, rather than accepting the click and going quiet.
+button emits on desktop, in a different format again, and it is the handler
+Cordial is taking over from Sober. **Taking that handler away from Sober without
+handling it is the failure this whole investigation was told to avoid.**
 
-Translating the desktop format to `roblox://placeId=…` looks possible — the
-`placelauncherurl` parameter carries the place id — but the same link also
-carries a one-time `gameinfo` authentication ticket that the Android client does
-not use, and none of that has been tested. It is **not implemented**, and it is
-the obvious next piece of work.
+### 6.1 The translation, and that it works
+
+**Established by running on 2026-08-03, build `0.3.0-21-gf70ee23-dirty`** — a
+working tree, because this is the change that introduced the translation. Five
+launches, all `--profile agent-dl2`, none signed in, all with synthetic links.
+
+The desktop format is not a URL query. It is a version, then `+`-separated
+`key:value` pairs:
+
+```text
+roblox-player:1+launchmode:play+gameinfo:<ticket>+placelauncherurl:<percent-encoded>
+              +launchtime:…+browsertrackerid:…+robloxLocale:…+gameLocale:…
+```
+
+The `placelauncherurl` decodes to a `PlaceLauncher.ashx` request whose *query*
+names a `placeId`. `crates/cordial-runtime/src/deeplink.rs`'s `translate` takes
+that id and only that id into the mobile form measured in §5:
+
+```text
+[deeplink] delivering roblox-player:// with launchmode, gameinfo, placelauncherurl,
+    launchtime, browsertrackerid, robloxLocale, gameLocale (316 bytes; values not shown)
+[deeplink] translated the desktop link to roblox:// with placeId (39 bytes; values not shown)
+[deeplink] its launcher URL also carried request, browserTrackerId, isPlayTogetherGame,
+    which Cordial does not carry across
+...
+[roblox] app ready: PlatformAccountRouter
+[deeplink] (app ready) Game.launch is:
+  Some("{\"placeId\":1818,\"referralPage\":\"DeepLink\",\"joinAttemptId\":\"434c89f0-…\"}")
+[deeplink] the app shell asked to launch an experience; the link reached the engine
+```
+
+Reproduced on two runs (`joinAttemptId` differs; `placeId` and `referralPage` do
+not). **The control is `CORDIAL_DEEPLINK_NO_TRANSLATE=1`** — the identical
+desktop link, the identical launch, the rewrite suppressed and the desktop link
+handed to the engine as it arrived. Twice:
+
+```text
+[deeplink] not translating (CORDIAL_DEEPLINK_NO_TRANSLATE)
+[deeplink] warning: this engine's own link pattern (FStringGameLaunchLinkURL) matches
+    roblox:// and robloxmobile:// only, so a roblox-player:// link is not expected to
+    reach an experience
+[deeplink] (app ready) Game.launch is: None
+[deeplink] the app shell is up and nothing asked to launch an experience
+```
+
+So the rewrite, and nothing else in the launch, is what makes a desktop link
+reach the engine.
+
+### 6.2 What is deliberately not carried, and the objection that stands
+
+**`gameinfo` is dropped.** It is a one-time authentication ticket the *desktop*
+client redeems; this engine is the Android client, whose authentication is the
+session it already holds, and which has no such ticket in any link it accepts.
+Dropping it is consistent with what this engine is. **It is not established that
+a join succeeds without it**, because a join needs a signed-in account and none
+was used — see §7. What is established is that the app shell asks for the right
+place. The distance between those two is the same gap §7 already records for
+`roblox://`, and translating does not widen it.
+
+**A link that picks a particular server is refused rather than flattened.** A
+private-server, reserved-server or join-a-running-game link names a place *and*
+an `accessCode`, `linkCode`, `reservedServerAccessCode`, `gameId` or `jobId`.
+Carrying only the place id out of one of those would produce a link that joins —
+into a different server from the one clicked, which is worse than not joining, on
+the same argument AGENTS.md makes about a stub that returns success. Measured,
+with `accessCode` in the launcher query:
+
+```text
+[deeplink] not translating this link: its placelauncherurl carries accesscode, which
+    picks a particular server rather than an experience; carrying only the place id
+    would join a different game from the one clicked
+[deeplink] (app ready) Game.launch is: None
+```
+
+The launcher's own `request` kind is deliberately not consulted. It would have to
+be enumerated from names nothing here has measured, and every kind worth refusing
+carries one of those parameters or no `placeId` at all — `RequestFollowUser`
+names a user and is refused for having no place.
+
+Everything else in the launcher query is named in the log and dropped.
+`launchmode` must be `play`: `app` and `edit` are not requests to join anything.
+
+### 6.3 `describe` printed the ticket, and now does not
+
+**A correction to what this document and the code both implied.** `JoinUrl::describe`
+claimed to report parameter *names* and never values, and its own test asserted
+it. It split on `&` and `?` only — the query form's separators. The desktop form
+uses `+` and `:`, so the whole payload came back as a single "parameter name",
+and the line Cordial printed on every desktop link was:
+
+```text
+[deeplink] delivering roblox-player:// with 1+launchmode:play+gameinfo:<ticket>+…
+    (N bytes; values not shown)
+```
+
+The ticket, under the words "values not shown", on the only input that carries a
+credential. Observed by calling `describe` on a synthetic desktop link before
+anything was changed.
+
+It now parses whichever form the link is in, drops any token carrying no
+separator, and requires an identifier shape of anything it prints — a `+` inside
+a value cannot turn a slice of that value into a "name". Five full launch logs
+were grepped afterwards for the synthetic ticket, the launcher host and the
+encoded launcher URL: none appears in any of them, including the two control runs
+that hand the untranslated desktop link to the engine.
+
+**Still open, and outside this change's files:** `cordial-shell`'s
+`deep_link::summarise` truncates a link to 64 characters for the launcher banner,
+and `roblox-player:1+launchmode:play+gameinfo:` is 40 of them — so roughly the
+first two dozen characters of a real ticket would reach that banner. Not a whole
+credential, and not verified against a real link, but it is the same mistake in
+the other crate.
 
 ## 7. Verified, inferred, and not established
 
@@ -196,6 +306,14 @@ the obvious next piece of work.
   twice, with a suppressed-publish control that produces neither it nor the flag.
 - `isColdStartDeeplinkToGame()` moves false -> true across the same delivery.
 - `roblox-player://` produces neither.
+- A desktop `roblox-player:1+…+placelauncherurl:…` link, rewritten to
+  `roblox://experiences/start?placeId=<id>`, produces a `Game.launch` naming that
+  place — twice, with `CORDIAL_DEEPLINK_NO_TRANSLATE=1` as the control producing
+  neither, twice (§6.1).
+- A launcher query carrying `accessCode` is refused rather than translated, and
+  the refusal names the parameter and not its value (§6.2).
+- `JoinUrl::describe` printed the desktop form's `gameinfo` ticket before this
+  change and does not after (§6.3).
 
 **Inferred, not verified:**
 
@@ -215,8 +333,11 @@ the obvious next piece of work.
   every run here ends at `app ready: Landing`, which is where a signed-out
   client belongs. This is the single largest gap and it cannot be closed without
   an account.
-- What the desktop `roblox-player://` format would have to be translated into,
-  or whether translating it is sound (§6).
+- **Whether a translated desktop link joins without its `gameinfo` ticket.**
+  Same gap, and it is the honest objection to §6.1: the ticket is dropped on the
+  reasoning that this engine is the Android client and has none, which is an
+  argument and not a measurement. One signed-in launch closes it.
 - Whether `launchData`, `linkCode`, `accessCode` and the rest survive the trip.
   Only `placeId` was exercised; the engine's own pattern lists the others, so
-  they are expected to, which is not the same as having seen it.
+  they are expected to, which is not the same as having seen it. §6.2 refuses to
+  translate a desktop link that needs any of them for exactly that reason.

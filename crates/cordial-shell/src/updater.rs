@@ -85,15 +85,22 @@ use crate::install;
 use crate::settings::persist;
 use crate::shell_config::ShellConfig;
 
-/// The three states, and the icon each one wears.
+/// The icon the header-bar button wears, in every state.
 ///
-/// `system-software-install-symbolic` is the download icon here rather than
-/// `software-update-available-symbolic`, which is the icon that *means* an
-/// update is waiting. Wearing that permanently would be the attention state
-/// drawn instead of written, and it is the same icon `instructions.rs` already
-/// uses for the same subject: obtaining a Roblox build.
-const DOWNLOAD_ICON: &str = "system-software-install-symbolic";
-const REFRESH_ICON: &str = "view-refresh-symbolic";
+/// This was `system-software-install-symbolic` — the package — and the comment
+/// here argued against `software-update-available-symbolic` on the grounds that
+/// it is the icon which *means* an update is waiting, so wearing it permanently
+/// would be the attention state drawn rather than written. **That reasoning was
+/// overruled deliberately, and the record matters more than the argument.** The
+/// button is how you reach the changelog whether or not anything is waiting,
+/// and a package is not what that reads as.
+///
+/// Attention is still drawn rather than implied: it is the `suggested-action`
+/// class in [`dress`], which the icon no longer duplicates. So there is exactly
+/// one icon and no state in which the button changes shape under the reader —
+/// including Manual with nothing found, which used to swap in a refresh arrow
+/// and made the same button look like two different controls.
+const DOWNLOAD_ICON: &str = "software-update-available-symbolic";
 
 /// How long after the window is up before the check starts.
 ///
@@ -231,22 +238,18 @@ pub fn header_button(
 /// finds an update turns the refresh control into the update control, and a
 /// button that kept its arrow would be hiding the answer it just fetched.
 fn dress(button: &gtk::Button, last: &Option<Checked>, automatic: Automatic) {
-    let (icon, tooltip, attention) = match last {
-        Some(checked) if checked.update_available() => (
-            DOWNLOAD_ICON,
-            "Roblox has published a newer build",
-            true,
-        ),
-        Some(_) => (DOWNLOAD_ICON, "Roblox build", false),
-        // Nothing checked yet. In manual that is the resting state and the
-        // circular arrow is the offer; in the other two it is the second or so
-        // before the answer arrives, and the download icon is where it will stay.
-        None if automatic == Automatic::Manual => {
-            (REFRESH_ICON, "Check for a Roblox update", false)
-        }
-        None => (DOWNLOAD_ICON, "Roblox build", false),
+    // One icon in every state — see `DOWNLOAD_ICON`. Manual with nothing found
+    // used to wear a refresh arrow instead, which meant the same button in the
+    // same header bar was two different shapes depending on a setting the reader
+    // could not see from here. What Manual changes is the word on the button
+    // *inside* the window, which is where a mode belongs.
+    let (tooltip, attention) = match last {
+        Some(checked) if checked.update_available() => ("Roblox has published a newer build", true),
+        Some(_) => ("Roblox build", false),
+        None if automatic == Automatic::Manual => ("Check for a Roblox update", false),
+        None => ("Roblox build", false),
     };
-    button.set_icon_name(icon);
+    button.set_icon_name(DOWNLOAD_ICON);
     button.set_tooltip_text(Some(tooltip));
     if attention {
         button.add_css_class("suggested-action");
@@ -332,85 +335,120 @@ pub fn present(
     button: gtk::Button,
 ) {
     let automatic = config.borrow().automatic_updates;
-    let page = adw::PreferencesPage::new();
 
-    // --- what is known, and the one thing to do about it -------------------
-    let status_group = adw::PreferencesGroup::new();
-    let status_row = adw::ActionRow::new();
-    status_row.set_subtitle_lines(6);
-    status_group.add(&status_row);
+    // Two things in this window: the changelog, and the one control that acts
+    // on it. It used to open with three `PreferencesGroup`s — a status row, the
+    // installed build, then the notes last and below the fold. The changelog is
+    // the only reason anyone opens this, and it was the thing you had to scroll
+    // past two paragraphs of caveat to reach.
+    //
+    // The caveats did not become untrue, so they are not gone: the one that
+    // matters is a dim line above the button, and the rest is its tooltip. What
+    // went is the framing that gave a permanently-unavailable version number
+    // the same weight as the text people came to read.
+    let notes_title = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["title-1"])
+        .label("Fetching…")
+        .build();
+
+    // Selectable so a line can be quoted into an issue without a screenshot,
+    // and the full text rather than `summarise`'s eight lines: this pane has
+    // the whole window to fill and a scrollbar for the rest.
+    let notes_body = gtk::Label::builder()
+        .xalign(0.0)
+        .yalign(0.0)
+        .wrap(true)
+        .selectable(true)
+        .label("Roblox's release notes, from the DevForum.")
+        .build();
+
+    let notes_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    notes_box.set_margin_top(24);
+    notes_box.set_margin_bottom(12);
+    notes_box.set_margin_start(24);
+    notes_box.set_margin_end(24);
+    notes_box.append(&notes_title);
+    notes_box.append(&notes_body);
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&notes_box)
+        .build();
+
+    // The DevForum link, out of the notes row and into the header bar. It is a
+    // second way to read what is already on screen, which does not deserve to
+    // sit beside the button that does something.
+    let open = gtk::LinkButton::with_label("https://devforum.roblox.com/c/updates/release-notes", "Read");
+    open.set_visible(false);
 
     // One button, relabelled by state rather than two swapped by visibility. A
     // manual check has to be able to turn this window from one state into the
     // other while it is open — the design's "the refresh button becomes the
     // update button" — and a single button that changes its word is that
     // sentence taken literally.
-    let action = gtk::Button::with_label(CHECK);
-    action.set_valign(gtk::Align::Center);
-    status_row.add_suffix(&action);
-    page.add(&status_group);
-
-    // --- which build is here -----------------------------------------------
     //
-    // Kept, and it is the reason this button is worth a permanent place in the
-    // header bar. Roblox publishes no Android artefact, so "nothing newer" is
-    // effectively always the answer; strip the installed version out and the
-    // common case is a changelog viewer with a dead button on it.
-    let installed_group = adw::PreferencesGroup::builder()
-        .title("Installed build")
-        .description(INSTALLED_DESCRIPTION)
+    // It is not labelled `Install`, at any size. There is nothing here to
+    // install — Roblox publishes the Android build through Google Play and the
+    // Amazon Appstore and no file — so a full-width Install button would be the
+    // interface version of the stub that reports success. See `UPDATE`.
+    let action = gtk::Button::with_label(CHECK);
+    action.add_css_class("pill");
+    action.set_hexpand(true);
+    action.set_height_request(48);
+
+    // The caveat that used to be a whole group, reduced to its first line. It
+    // cannot be dropped: without it a window showing only a changelog and a
+    // button implies "up to date", which is the one thing this check is unable
+    // to establish for the Android build.
+    let status_line = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["dim-label", "caption"])
         .build();
 
-    let version_row = adw::ActionRow::builder().title("Roblox version").build();
-    version_row.set_subtitle_lines(4);
-    version_row.set_subtitle(&version_line(cache::recorded_version(&install::engine_cache())));
-    installed_group.add(&version_row);
-    page.add(&installed_group);
-
-    // --- what Roblox has published ----------------------------------------
-    let notes_group = adw::PreferencesGroup::builder()
-        .title("Roblox release notes")
-        .description(
-            "From Roblox's own DevForum. The number in the title is the engine major — the 732 \
-             in 0.732.23.7321040, and the same number the client reports about itself.",
-        )
-        .build();
-
-    let notes_row = adw::ActionRow::builder().title("Not checked").build();
-    notes_row.set_subtitle_lines(10);
-    let open = gtk::LinkButton::with_label("https://devforum.roblox.com/c/updates/release-notes", "Read");
-    open.set_valign(gtk::Align::Center);
-    open.set_visible(false);
-    notes_row.add_suffix(&open);
-    notes_group.add(&notes_row);
-    page.add(&notes_group);
+    let footer = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    footer.set_margin_top(12);
+    footer.set_margin_bottom(24);
+    footer.set_margin_start(24);
+    footer.set_margin_end(24);
+    footer.append(&status_line);
+    footer.append(&action);
 
     let window = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
         .title("Roblox Build")
         .default_width(660)
-        // 720 while there were six groups here, three of which have gone
-        // elsewhere. Sized so the release notes are on screen rather than below
-        // the fold: they are the only thing left with any length to them, and a
-        // window whose third group has to be scrolled to is a window that looks
-        // like it has two.
+        // 720 while there were six groups here, then 660 for three. Now there is
+        // one pane and one button, and the height is the changelog's: this is
+        // how much release note is worth having on screen before a scrollbar.
         .default_height(660)
         .build();
 
     // Everything the answer touches, in one closure, so a check started from
     // this dialog and one started at launch put the window into the same state.
     let paint = {
-        let status_row = status_row.clone();
-        let notes_row = notes_row.clone();
-        let version_row = version_row.clone();
+        let status_line = status_line.clone();
+        let notes_title = notes_title.clone();
+        let notes_body = notes_body.clone();
         let open = open.clone();
         let action = action.clone();
         let button = button.clone();
         Rc::new(move |checked: &Option<Checked>| {
+            // The headline of the caveat on screen, the whole of it on hover.
+            // The long form names the endpoint that answers 500 and why "up to
+            // date" would be a guess, which is worth keeping reachable and is
+            // not worth four lines above a changelog.
             let (title, subtitle) = status_lines(checked, automatic);
-            status_row.set_title(&title);
-            status_row.set_subtitle(&subtitle);
+            status_line.set_label(&title);
+            let installed = match checked {
+                Some(checked) => version_line(checked.installed.clone()),
+                None => version_line(cache::recorded_version(&install::engine_cache())),
+            };
+            action.set_tooltip_text(Some(&format!("{subtitle}\n\n{installed}\n\n{INSTALLED_DESCRIPTION}")));
             let available = checked.as_ref().is_some_and(Checked::update_available);
             action.set_label(action_label(checked));
             action.set_sensitive(true);
@@ -426,22 +464,17 @@ pub fn present(
 
             match checked {
                 Some(checked) => {
-                    // The same value the row was built with, once a check has
-                    // actually read it, so the window has one source for it
-                    // rather than a row that could disagree with the status
-                    // above it.
-                    version_row.set_subtitle(&version_line(checked.installed.clone()));
-                    let (title, body) = release_lines(&checked.release);
-                    notes_row.set_title(&title);
-                    notes_row.set_subtitle(&body);
+                    let (title, body) = release_lines_full(&checked.release);
+                    notes_title.set_label(&title);
+                    notes_body.set_label(&body);
                     if let Ok((release, _)) = &checked.release {
                         open.set_uri(&release.web_url());
                         open.set_visible(true);
                     }
                 }
                 None => {
-                    notes_row.set_title("Fetching…");
-                    notes_row.set_subtitle("Roblox's release notes, from the DevForum.");
+                    notes_title.set_label("Fetching…");
+                    notes_body.set_label("Roblox's release notes, from the DevForum.");
                     open.set_visible(false);
                 }
             }
@@ -458,11 +491,11 @@ pub fn present(
         let last = last.clone();
         let paint = paint.clone();
         let config = config.clone();
-        let status_row = status_row.clone();
+        let status_line = status_line.clone();
         let action = action.clone();
         Rc::new(move || {
             action.set_sensitive(false);
-            status_row.set_title("Checking…");
+            status_line.set_label("Checking…");
             let apk = install::effective_apk(&config.borrow().roblox).map(|(p, _)| p);
             let last = last.clone();
             let paint = paint.clone();
@@ -498,9 +531,14 @@ pub fn present(
     }
 
     let header = adw::HeaderBar::new();
+    header.pack_end(&open);
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&page));
+    toolbar.set_content(Some(&scroller));
+    // A bottom bar rather than the last child of the scrolled pane: the button
+    // has to stay put while a long changelog moves under it, or the control
+    // this window exists to offer scrolls off the bottom of it.
+    toolbar.add_bottom_bar(&footer);
     window.set_content(Some(&toolbar));
     window.present();
 }
@@ -905,17 +943,32 @@ fn source_line(configured: &Result<Source, Refusal>) -> String {
 }
 
 /// The release-notes row's title and subtitle.
+/// The same heading, and the release notes **whole**.
+///
+/// [`release_lines`] exists for anywhere the notes have to fit in a row; this
+/// window is a pane with a scrollbar, and truncating a changelog someone opened
+/// a window to read is the shape of bug that makes people go to the DevForum
+/// instead. The two share `heading` so they cannot title the same release
+/// differently.
+fn release_lines_full(release: &Result<(Release, Notes), Unreachable>) -> (String, String) {
+    match release {
+        Ok((release, notes)) => (heading(release, notes), notes.text().trim().to_string()),
+        Err(why) => ("Could not fetch the release notes".to_string(), why.to_string()),
+    }
+}
+
+fn heading(release: &Release, notes: &Notes) -> String {
+    let when = release.created_at.split('T').next().unwrap_or_default();
+    if when.is_empty() {
+        notes.title.clone()
+    } else {
+        format!("{} — {when}", notes.title)
+    }
+}
+
 fn release_lines(release: &Result<(Release, Notes), Unreachable>) -> (String, String) {
     match release {
-        Ok((release, notes)) => {
-            let when = release.created_at.split('T').next().unwrap_or_default();
-            let head = if when.is_empty() {
-                notes.title.clone()
-            } else {
-                format!("{} — {when}", notes.title)
-            };
-            (head, summarise(&notes.text()))
-        }
+        Ok((release, notes)) => (heading(release, notes), summarise(&notes.text())),
         Err(why) => ("Could not fetch the release notes".to_string(), why.to_string()),
     }
 }

@@ -212,6 +212,17 @@ pub struct ShellConfig {
     /// likely to be switched on by somebody who has not got MangoHUD installed
     /// — see `launch::mangohud_layer`, which is what stops that being a silent
     /// no-op.
+    /// Which graphics backend the client offers the engine.
+    ///
+    /// Stored as the same lowercase words `cordial_runtime::graphics::Backend`
+    /// parses, and passed to the client as `CORDIAL_GRAPHICS` rather than
+    /// written to a file: the backend has to be settled before the engine's
+    /// first `dlopen`, which is long before anything opens a profile.
+    ///
+    /// `"automatic"` is the default and is not merely "Vulkan by another name" —
+    /// it is the absence of a user opinion, which is what lets a plugin have
+    /// one. See `graphics::resolve`.
+    pub graphics: String,
     pub mangohud: bool,
 }
 
@@ -224,6 +235,7 @@ impl Default for ShellConfig {
             automatic_updates: cordial_update::settings::Automatic::default(),
             download_on: cordial_update::settings::DownloadOn::default(),
             gamemode: true,
+            graphics: "automatic".to_string(),
             mangohud: false,
         }
     }

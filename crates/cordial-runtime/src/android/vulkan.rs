@@ -298,7 +298,19 @@ fn load_host() -> Option<HostVulkan> {
     // own `dlopen` fails the same way it did before this module existed — a
     // clean, deliberate fall-through to GLES. Useful on its own (forcing the
     // fallback path to test it) independent of whatever bug prompted adding it.
+    //
+    // Kept as its own switch even though the Graphics setting now reaches the
+    // same state, because it is the control: it answers "is this the backend or
+    // the setting" without going near the resolution in `crate::graphics`.
     if std::env::var_os("CORDIAL_NO_VULKAN").is_some() {
+        return None;
+    }
+
+    // The Graphics setting, and the plugin layer behind it when the user left it
+    // on Automatic. `GlEs` withholds the loader by the same route the switch
+    // above takes — there is no separate GLES code path to select, because the
+    // engine already has one and picks it when Vulkan is not there.
+    if !crate::graphics::choice().backend.offers_vulkan() {
         return None;
     }
 

@@ -33,7 +33,6 @@ use cordial_plugins::enablement;
 use cordial_plugins::grants;
 use cordial_plugins::manifest::{self, Plugin};
 
-use crate::flags_file::{self, RENDERER_BACKEND_FLAG};
 use crate::install;
 use crate::shell_config::{self, AppearanceScheme, ShellConfig};
 
@@ -417,12 +416,14 @@ fn build_performance_group(
     group
 }
 
-/// "General" — ordinary client settings. Only the renderer preference is
-/// wired to anything real; see `flags_file.rs` for why resolution and
-/// monitor placement are not offered here despite being genuine
-/// `cordial-run` options in their own right.
+/// "General" — ordinary client settings.
+///
+/// Resolution and monitor placement are genuine `cordial-run` options and are
+/// still not offered here: `CORDIAL_MONITOR` and `CORDIAL_FULLSCREEN` are read
+/// only by the X11 backend and do nothing on the Wayland one the launcher asks
+/// for, so a row for either would be a control that changes nothing — which is
+/// exactly what the Renderer row turned out to be until this change.
 fn build_general_page(
-    flags_path: Rc<PathBuf>,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
 ) -> adw::PreferencesPage {
@@ -435,29 +436,52 @@ fn build_general_page(
     let group = adw::PreferencesGroup::builder()
         .title("Graphics")
         .description(
-            "Written to the flags.json cordial-runtime already treats as your own \
-             overrides — always wins over a plugin's, and needs a relaunch: FString \
-             flags are read once at startup.",
+            "Which backend the client offers the engine. Needs a relaunch: the choice is \
+             settled before Roblox loads its renderer.",
         )
         .build();
 
-    let current = flags_file::read_string_flag(&flags_path, RENDERER_BACKEND_FLAG);
-    let selected = if current.as_deref() == Some("Vulkan") { 1 } else { 0 };
-
-    let model = gtk::StringList::new(&["Automatic", "Vulkan"]);
+    // **Not backed by `FStringDebugGraphicsPreferredBackend` any more.** That
+    // flag was measured on 2026-08-03 and changes nothing: deliberate rubbish,
+    // five GLES spellings and the "confirmed" `"Vulkan"` all produced the same
+    // `pack vulkan_mobile`, because Vulkan is what the engine takes regardless.
+    // The row it backed looked like a setting and was one only by coincidence.
+    //
+    // What decides the backend is whether Cordial offers a Vulkan loader at all,
+    // since `libroblox.so` links none and `dlopen`s it. So this writes
+    // `shell.json` and `launch.rs` passes `CORDIAL_GRAPHICS`; the runtime's
+    // `graphics` module has the full measurement.
+    let model = gtk::StringList::new(&["Automatic", "Vulkan", "OpenGL ES"]);
+    let selected = match config.borrow().graphics.as_str() {
+        "vulkan" => 1,
+        "gles" => 2,
+        _ => 0,
+    };
     let row = adw::ComboRow::builder()
         .title("Renderer")
-        .subtitle("Automatic lets Roblox dlopen Vulkan and fall back to GLES2 itself")
+        .subtitle(
+            "Automatic lets Roblox take Vulkan and fall back to GLES3 itself, and is the only \
+             setting a plugin may override. Vulkan keeps that fallback. OpenGL ES withholds \
+             Vulkan, and has no fallback of its own.",
+        )
         .model(&model)
         .selected(selected)
         .build();
+    row.set_subtitle_lines(4);
 
-    row.connect_selected_notify(move |row| {
-        let value = if row.selected() == 1 { Some("Vulkan") } else { None };
-        if let Err(e) = flags_file::set_string_flag(&flags_path, RENDERER_BACKEND_FLAG, value) {
-            eprintln!("shell: could not update {}: {e}", flags_path.display());
-        }
-    });
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        row.connect_selected_notify(move |row| {
+            let value = match row.selected() {
+                1 => "vulkan",
+                2 => "gles",
+                _ => "automatic",
+            };
+            config.borrow_mut().graphics = value.to_string();
+            persist(&config, &config_path);
+        });
+    }
 
     group.add(&row);
     page.add(&group);
@@ -587,7 +611,6 @@ pub fn build_preferences_window(
     parent: &impl IsA<gtk::Window>,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
-    flags_path: Rc<PathBuf>,
 ) -> adw::PreferencesWindow {
     let window = adw::PreferencesWindow::builder()
         .transient_for(parent)
@@ -611,7 +634,7 @@ pub fn build_preferences_window(
     // Second, next to the page about the build it is about.
     window.add(&crate::updater::build_update_page(config.clone(), config_path.clone()));
     window.add(&build_appearance_page(config.clone(), config_path.clone()));
-    window.add(&build_general_page(flags_path, config.clone(), config_path));
+    window.add(&build_general_page(config.clone(), config_path));
     window.add(&build_plugins_page(config));
 
     window

@@ -24,7 +24,6 @@ use std::time::Duration;
 
 use crate::chooser;
 use crate::deep_link;
-use crate::flags_file;
 use crate::install::{self, NotFound};
 use crate::instructions;
 use crate::launch;
@@ -260,7 +259,6 @@ pub fn build(
     let update_button = updater::header_button(&window, config.clone());
     host.header().pack_end(&update_button);
 
-    let flags_path = Rc::new(flags_file::user_flags_path());
 
     // An action rather than only a button handler, because the header bar is no
     // longer the only way in: a launch refused for a busy profile offers to
@@ -282,7 +280,6 @@ pub fn build(
             &window_for_settings,
             config.clone(),
             config_path.clone(),
-            flags_path.clone(),
         );
         if let Some(name) = page.and_then(|p| p.str()).filter(|n| !n.is_empty()) {
             settings.set_visible_page_name(name);

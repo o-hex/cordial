@@ -380,6 +380,13 @@ fn main() -> ExitCode {
         }
     };
 
+    // Which backend, and who asked for it, before the engine has had a chance to
+    // `dlopen` anything. Said out loud on every run: the questions it answers are
+    // "why is this slow" and "why does this look different from yesterday", and
+    // those get asked from a support thread rather than from a terminal somebody
+    // is willing to re-run with a trace variable set.
+    cordial_runtime::graphics::report();
+
     // Before anything can resolve a path: Android's `/system`, served from a
     // directory Cordial builds out of the host's fonts. Roblox asks for
     // `/system/fonts/NotoSansCJK-Regular.ttc` during app startup and turns the

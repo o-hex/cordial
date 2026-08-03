@@ -215,6 +215,19 @@ pub fn spawn(
         command.env("CORDIAL_GAMEMODE", "0");
     }
 
+    // The Graphics row, and **only when it is not Automatic**. That is not a
+    // micro-optimisation: an absent variable is what tells the runtime the user
+    // has no opinion, which is the one state in which a plugin's request is
+    // allowed to count. Sending `automatic` explicitly would be the user
+    // silently outvoting every plugin while the row says Automatic.
+    //
+    // A variable rather than a file because the backend has to be settled before
+    // the engine's first `dlopen` of libvulkan, which is well before anything
+    // opens a profile. See `cordial_runtime::graphics`.
+    if config.graphics != "automatic" {
+        command.env("CORDIAL_GRAPHICS", &config.graphics);
+    }
+
     // MangoHUD is a Vulkan implicit layer, so `MANGOHUD=1` on the client's
     // environment is the entire mechanism — the loader finds the layer JSON on
     // its own and inserts it. The layer has to actually be installed, and the

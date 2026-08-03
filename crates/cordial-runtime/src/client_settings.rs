@@ -111,6 +111,17 @@ fn load_base(explicit: Option<&str>) -> Option<String> {
     }
 }
 
+/// Keys in the flag layers that belong to Cordial rather than to Roblox.
+///
+/// One prefix rather than a list, so a second Cordial-owned key does not need
+/// this file edited to stay out of the engine's settings.
+const CORDIAL_KEY_PREFIX: &str = "Cordial";
+
+/// Whether a resolved key is Roblox's to receive.
+fn is_roblox_flag(key: &str) -> bool {
+    !key.starts_with(CORDIAL_KEY_PREFIX)
+}
+
 /// Merge every layer of flag overrides into the settings document.
 ///
 /// The layering, precedence and provenance live in [`crate::flags`]; this only
@@ -128,8 +139,16 @@ fn apply_overrides(doc: String) -> String {
     if resolved.is_empty() {
         return doc;
     }
+    // Cordial's own keys ride the flag layering for its precedence and
+    // provenance, and are not Roblox flags — `CordialGraphicsBackend` asks
+    // Cordial whether to offer the engine a Vulkan loader, which is a question
+    // the engine has no idea it is being asked. Handing them over would put
+    // invented names in Roblox's settings document; the engine ignores what it
+    // does not know, but a flag it silently ignores is exactly the thing this
+    // project keeps mistaking for a flag that works.
     let overrides: serde_json::Map<String, serde_json::Value> = resolved
         .iter()
+        .filter(|(k, _)| is_roblox_flag(k))
         .map(|(k, r)| (k.clone(), serde_json::Value::String(r.value.clone())))
         .collect();
 
@@ -186,6 +205,21 @@ fn fetch() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cordial_owned_keys_do_not_reach_roblox_settings() {
+        // `CordialGraphicsBackend` asks Cordial whether to offer the engine a
+        // Vulkan loader, which is a question the engine has no idea it is being
+        // asked. It rides the flag layering for that machinery's precedence and
+        // provenance, not because it is a FastFlag.
+        assert!(!is_roblox_flag("CordialGraphicsBackend"));
+        assert!(!is_roblox_flag(crate::graphics::KEY));
+        // Roblox's own prefixes are untouched. `DFFlag...` matters most: it is
+        // the one this file has a measured control for.
+        for key in ["DFFlagRbxTransportUseRtcioRna", "FFlagDebugDisplayFPS", "FStringTest"] {
+            assert!(is_roblox_flag(key), "{key}");
+        }
+    }
     use super::*;
 
     fn map(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {

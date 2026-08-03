@@ -18,7 +18,6 @@
 
 mod chooser;
 mod deep_link;
-mod flags_file;
 mod install;
 mod instructions;
 mod launch;

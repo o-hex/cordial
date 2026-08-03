@@ -719,11 +719,24 @@ mod tests {
         // fed raw markup drops the label entirely, so the queued join would
         // become a blank grey bar: the exact "it ignored my click" this banner
         // exists to prevent, wearing the banner as a disguise.
+        // The banner no longer shows the payload at all -- see
+        // `deep_link::summarise`, which used to truncate to 64 characters and
+        // put 24 characters of a one-time auth ticket on screen. So the first
+        // thing to assert is absence.
         let line = banner_line("roblox-player://placeId=1818&launchData=<x>");
-        assert!(line.contains("&amp;"), "{line}");
-        assert!(line.contains("&lt;x&gt;"), "{line}");
-        assert!(!line.contains("<x>"), "{line}");
+        assert!(!line.contains("placeId"), "{line}");
+        assert!(!line.contains("launchData"), "{line}");
+        assert!(line.contains("roblox-player:"), "{line}");
         assert!(line.contains("press Roblox"), "{line}");
+
+        // The escaping stays even though nothing reaching it should now need
+        // escaping. It is one call, and the failure it prevents is total: an
+        // `AdwBanner` fed raw markup drops the label entirely, so the queued
+        // join becomes a blank grey bar -- the exact "it ignored my click" this
+        // banner exists to prevent, wearing the banner as a disguise. Belt and
+        // braces on a label built from attacker-influenced input is the correct
+        // amount of paranoia.
+        assert!(!banner_line("roblox-player://<b>x</b>").contains("<b>"));
 
         // And it cannot stretch the window, whatever length Roblox's payload
         // happens to be this year.

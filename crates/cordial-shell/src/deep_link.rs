@@ -119,16 +119,59 @@ pub fn accept(raw: &str) -> Result<String, Rejected> {
 /// waiting rather than apparently ignored. What it must not do is stretch the
 /// window to whatever length Roblox's payload happens to be this year.
 pub fn summarise(url: &str) -> String {
-    const KEEP: usize = 64;
-    match url.char_indices().nth(KEEP) {
-        Some((cut, _)) => format!("{}…", &url[..cut]),
-        None => url.to_string(),
+    // The scheme, and deliberately nothing after it.
+    //
+    // **This used to truncate to 64 characters and it leaked a credential.**
+    // `roblox-player:1+launchmode:play+gameinfo:` is forty of those, so a
+    // sixty-four character prefix put twenty-four characters of the one-time
+    // auth ticket into the banner on screen — and into anything that copied the
+    // banner text. The bound was chosen for how much would fit in a row, which
+    // is a layout question being asked to answer a disclosure one.
+    //
+    // Showing parameter *names* was the obvious repair and is still wrong here.
+    // It requires parsing a format Roblox owns and changes, in the crate whose
+    // stated rule is that the payload after the scheme belongs to the client;
+    // `cordial_runtime::deeplink` had exactly that fix and it took two attempts,
+    // because a `+` inside a ticket can turn a slice of the secret into
+    // something that looks like a name.
+    //
+    // So the banner says which kind of link is waiting and stops. Nobody
+    // deciding whether to press Roblox needs the payload, and a string that
+    // cannot contain a secret cannot leak one however the format moves.
+    match url.split_once(':') {
+        Some((scheme, _)) => format!("{scheme}:"),
+        None => String::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_banner_cannot_show_any_part_of_the_auth_ticket() {
+        // This is a regression test for a live credential leak that shipped.
+        // summarise() truncated to 64 characters, and
+        // `roblox-player:1+launchmode:play+gameinfo:` is 40 of them, so the
+        // banner displayed 24 characters of a one-time auth ticket -- under a
+        // doc comment claiming the payload was the client's business.
+        //
+        // The assertion is deliberately about the ticket rather than about the
+        // output format: a later change may well want a richer banner, and this
+        // must fail if that change reintroduces any of the secret.
+        let ticket = "SUPERSECRETTICKETVALUE0123456789ABCDEFGHIJKLMNOP";
+        let url = format!(
+            "roblox-player:1+launchmode:play+gameinfo:{ticket}+placelauncherurl:https%3A%2F%2Fx"
+        );
+        let shown = summarise(&url);
+        for n in [4, 8, 16] {
+            assert!(
+                !shown.contains(&ticket[..n]),
+                "summarise leaked {n} characters of the ticket: {shown}"
+            );
+        }
+        assert!(!shown.contains("placelauncherurl"), "{shown}");
+    }
 
     #[test]
     fn both_registered_schemes_are_taken_and_the_payload_is_left_alone() {
@@ -240,9 +283,8 @@ mod tests {
     fn the_banner_text_cannot_stretch_the_window() {
         let long = format!("roblox-player://{}", "a".repeat(500));
         let short = summarise(&long);
-        assert!(short.chars().count() <= 65, "{short}");
-        assert!(short.ends_with('…'), "{short}");
-        assert_eq!(summarise("roblox://home"), "roblox://home");
+        assert_eq!(short, "roblox-player:", "{short}");
+        assert_eq!(summarise("roblox://home"), "roblox:");
     }
 }
 

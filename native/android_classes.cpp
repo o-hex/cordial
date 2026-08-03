@@ -1108,6 +1108,16 @@ namespace cordial {
 void register_audio_classes(jnivm::ENV* env);
 }
 
+// Defined in clipboard.cpp. Separate because its header comment has to carry
+// the finding that `android.content.ClipboardManager` is not a class the engine
+// ever asks for — the framework-class inventory lists it because Roblox's own
+// Java uses it — and that copying out of an experience arrives as a message-bus
+// publish instead. That is the first thing anyone who goes looking for a
+// clipboard class needs to read, and it would be buried here.
+namespace cordial {
+void register_clipboard_classes(jnivm::ENV* env);
+}
+
 // -------------------------------------------------------- the identity, in and out
 //
 // Cordial's own boundary, not Roblox's: `crates/cordial-runtime/src/identity.rs`
@@ -1192,6 +1202,7 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
     cordial::register_accessibility_classes(env);
     cordial::register_cookie_classes(env);
     cordial::register_audio_classes(env);
+    cordial::register_clipboard_classes(env);
     if (getenv("CORDIAL_JNI_TRACE")) {
         fprintf(stderr, "[classes] Cordial's Java side registered\n");
     }

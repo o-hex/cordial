@@ -1429,7 +1429,26 @@ impl WaylandWindow {
     /// something actually moved, because `set_position` costs a parent repaint
     /// and `apply_resize` costs the engine a surface-changed callback.
     fn sync_canvas_geometry(&self) {
-        let Some((x, y, w, h)) = self.host.0.content_rect() else { return };
+        let Some((x, y, w, h)) = self.host.0.content_rect() else {
+            // Say so, once per run of them. `content_rect` returns `None` for a
+            // zero or negative allocation, and a compositor sending a 0x0
+            // configure — "you choose your own size", which is legal — would
+            // land here and leave the canvas at whatever it was, which is
+            // exactly the reported fullscreen symptom: content painted at the
+            // pre-fullscreen size in a fullscreen slot. Eight scripted
+            // transitions across two runs never produced one, so if a hand-made
+            // fullscreen does, this line is the difference and it is worth more
+            // than another round of theorising about which call was missed.
+            if !NO_CONTENT_RECT.swap(true, Ordering::Relaxed) {
+                println!("[android] wayland: no content rectangle to place the canvas by");
+            }
+            return;
+        };
+        // The other half of the same signal: a rectangle that came back after
+        // there was none, and the size it came back with.
+        if NO_CONTENT_RECT.swap(false, Ordering::Relaxed) {
+            println!("[android] wayland: content rectangle is back, {w}x{h} at ({x}, {y})");
+        }
         let moved = {
             let mut placed = self.placed_at.lock().unwrap_or_else(|e| e.into_inner());
             let moved = *placed != (x, y);
@@ -2361,10 +2380,13 @@ impl WaylandWindow {
         let now = self.now_ms();
 
         if super::input::trace_text() {
+            // A length, not the character. See `input::trace_text_contents`.
             eprintln!(
-                "[cordial] wayland key {} keysym={keysym:#x} text={:?} keycode={:?} focus={:?}",
+                "[cordial] wayland key {} keysym={keysym:#x} text={} keycode={:?} focus={:?}",
                 if down { "down" } else { "up" },
-                std::str::from_utf8(&text_buf[..text_len]).unwrap_or(""),
+                super::input::redacted(
+                    std::str::from_utf8(&text_buf[..text_len]).unwrap_or("")
+                ),
                 super::input::keysym_to_android(keysym),
                 cordial_linker_sys::game_activity::focused_textbox(),
             );
@@ -2385,6 +2407,19 @@ impl WaylandWindow {
             return;
         }
         let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else { return };
+
+        // Ctrl+V, before the character is read — see the same binding in
+        // `window.rs` for why there is no engine call behind this and why that
+        // is right: Cordial is the editor Android would have over the surface,
+        // so a paste is an insert on this path and not something the engine
+        // asks for. `paste_into_engine` reads the host selection through the
+        // same broker the copy direction uses.
+        if super::input::is_paste_shortcut(keysym, meta) {
+            if let Err(e) = super::clipboard::paste_into_engine(handle) {
+                super::trace(format_args!("wayland: clipboard paste failed: {e}"));
+            }
+            return;
+        }
 
         // `CORDIAL_NO_TEXT_BUFFER=1` sends key events only and never text.
         //
@@ -2826,6 +2861,10 @@ const POLLIN: i16 = 0x001;
 extern "C" {
     fn poll(fds: *mut c_void, nfds: u64, timeout_ms: c_int) -> c_int;
 }
+
+/// Whether the last `sync_canvas_geometry` had no content rectangle to work
+/// with — see the message it prints for why that state has its own line.
+static NO_CONTENT_RECT: AtomicBool = AtomicBool::new(false);
 
 // TEMPORARY INSTRUMENTATION -- not for commit. See the session notes.
 static INSTR_SET_POSITIONS: AtomicI64 = AtomicI64::new(0);

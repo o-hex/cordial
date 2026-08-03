@@ -162,7 +162,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libjnivm
 # (see its own header comment), so the Java audio surface builds identically
 # either way and reports an honestly empty device list on a tree that has no
 # backend behind it.
-add_library(cordial_jni_shim STATIC jni_shim.cpp android_classes.cpp game_activity.cpp init_params.cpp accessibility.cpp cookies.cpp audio_classes.cpp deeplink.cpp)
+add_library(cordial_jni_shim STATIC jni_shim.cpp android_classes.cpp game_activity.cpp init_params.cpp accessibility.cpp cookies.cpp audio_classes.cpp deeplink.cpp clipboard.cpp)
 target_link_libraries(cordial_jni_shim PUBLIC jnivm)
 
 install(TARGETS cordial_jni_shim jnivm ARCHIVE DESTINATION lib)

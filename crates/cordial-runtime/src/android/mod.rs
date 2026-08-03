@@ -14,6 +14,7 @@
 
 pub mod accessibility;
 pub mod asset;
+pub mod clipboard;
 pub mod config;
 pub mod gl;
 pub mod glcount;
@@ -143,8 +144,17 @@ pub fn backend_instr_geometry() -> String {
 
 /// TEMPORARY INSTRUMENTATION -- not for commit.
 pub fn backend_set_fullscreen(on: bool) {
-    if let Backend::Wayland = backend() {
-        wayland::instr_set_fullscreen(on);
+    match backend() {
+        Backend::Wayland => wayland::instr_set_fullscreen(on),
+        // X11 too, and only because a Wayland surface cannot be photographed
+        // on this desktop — see `window::HostWindow::set_fullscreen`. A
+        // fullscreen transition that can be seen on one backend is worth more
+        // than one that can only be counted on the other.
+        Backend::X11 => {
+            if let Some(w) = window::current() {
+                w.set_fullscreen(on);
+            }
+        }
     }
 }
 

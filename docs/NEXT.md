@@ -244,32 +244,149 @@ handleTextBoxFocused_AndroidLayer_:
 in `~/.local/share/cordial/instances/default/data/files/appData/logs/*_Player_*.log`.
 Note the engine's own name for it: `_AndroidLayer_`.
 
-**Not yet confirmed**, and the one experiment that would settle it: focus a box
-that already contains text and type *nothing*. If the existing text vanishes on
-focus alone, the engine stops drawing focused boxes and the diagnosis holds. If
-it stays, the diagnosis is wrong and the gap is that `sync` never reaches the
-rendered property — chase `onLuaTextBoxChangedCallback` instead. That needs a
-keystroke, which no Wayland-safe automation here can supply.
+### Confirmed 2026-08-03: a focused box does not draw its own text, and the keyboard report is not what decides it
 
-**Counter-evidence, raised 2026-08-02, and it is strong.** Sober shows typed
-text live, as you type — and Sober's engine process links raw EGL/GLESv2 with
-its own Wayland client and no toolkit at all. Its GTK4/libadwaita/WebKitGTK
+The experiment this section asked for has been run, three times, on the X11
+backend with `--profile agent-text`, build `0.3.0-21-gf70ee23-dirty`. It is no
+longer "not yet confirmed".
+
+**How it was driven, because that was the blocker for four separate
+investigations.** `CORDIAL_SCRIPT` now takes `click:640x308` and `type:abc`
+alongside `fullscreen`/`motion-on` — a click and a keystroke through Cordial's
+own input path (`input::script_click`/`script_type`), calling the same natives
+with the same arguments `window.rs`'s and `wayland.rs`'s own
+`dispatch_button`/`dispatch_key` call. Nothing goes near a compositor, so the
+rule that forbids `XTestFake*`/`ydotool`/`wlr-virtual-keyboard` is untouched:
+Cordial *is* the client and there was never anything to inject into. Every
+sentence in this file that ends "that needs a keystroke, which no Wayland-safe
+automation here can supply" is now wrong. The whole login-form sequence is one
+launch:
+
+```bash
+CORDIAL_TRACE_TEXT=1 CORDIAL_INSTR=1 \
+CORDIAL_SCRIPT=25:click:640x382,32:click:640x308,34:type:abc,40:click:640x374,48:click:640x308 \
+  just client --x11 --run 70
+```
+
+`--x11` because the window it makes is an ordinary X11 window, so
+`import -window <id>` photographs it. There is no equivalent on this GNOME
+Wayland session: `org.gnome.Shell.Screenshot` answers `AccessDenied` and `grim`
+is not a thing outside wlroots. That is a limitation of the *observation*, not
+of the backend under test — the engine renders into a Vulkan swapchain either
+way.
+
+**What it showed**, at 1280x720, clicking Sign In, then the username field:
+
+| t | what happened | what the window showed |
+|---|---|---|
+| 33 | box focused, empty | placeholder `Username/Email/Phone` |
+| 36 | `abc` typed, `sync=true` for each character | **nothing** — no text, no caret |
+| 44 | password field clicked, so the username box blurred | **`abc`** |
+| 52 | username box clicked again, nothing typed | **nothing** — `abc` gone again |
+
+At t=52 the engine's own trace reads `textbox focused handle=… current=3 bytes`,
+so the engine is holding `abc` and has been asked to draw a box it knows
+contains it. It draws an empty box. **The existing text vanishes on focus
+alone**, which is exactly the condition this section named for the widget
+diagnosis holding.
+
+Repeated with `xyz`, and the append case works too: refocusing the box that
+already held `xyz` and typing `d` gives `xyzd` on the next blur, so nothing is
+being lost — only withheld from the screen while the box has focus.
+
+**The `updateKeyboardSize` theory below is disproved, in the same session, with
+the control it asked for.** The run above with `CORDIAL_KEYBOARD_REPORT=1` —
+which now sends the corrected `visible=false, x=0, y=720, w=1280, h=0` baseline
+at every focus change, the shape the real-Android capture shows — is
+pixel-identical at every one of those four moments. The engine was told, truthfully
+and in the real client's own wording, that no soft keyboard is up, while a box
+had focus and text was arriving, and it still drew nothing.
+
+Two things worth keeping from that run: the corrected report **does not bounce
+focus** (the `visible=true` with zero height that did is long gone), and it
+changes nothing else either, so `CORDIAL_KEYBOARD_REPORT` stays off by default
+for want of a reason rather than for fear of it.
+
+**Where that leaves the Sober counter-evidence below: unverified, and nobody
+here has checked it.** The claim is second-hand — Sober shows typed text live —
+and the one Sober engine log on this machine
+(`~/.var/app/org.vinegarhq.Sober/data/sober/appData/logs/*_Player_*.log`) has
+zero hits for `TextBox` in 864 lines, so that session never focused a field and
+cannot corroborate anything. If somebody wants to settle it, that log is where
+the evidence would be: focus a box in Sober, type, and grep the log for
+`handleTextBoxFocused_AndroidLayer_`. If Sober's engine narrates the same
+`_AndroidLayer_` handover and still draws the text, the difference is in what
+Sober answers, and this section is wrong. Until then the measurement above
+stands and the second-hand claim does not.
+
+**What the overlay needs, and it is less than it sounds.** `showKeyboard` already
+hands over the box in window pixels, and Cordial already parses it —
+`CORDIAL_TRACE_TEXT=1` prints, for the username field of a 1280x720 login form:
+
+```text
+textbox spec from showKeyboard x=470 y=297 w=340 h=22 fontSize=16 textColor=0xffd5d7dd
+```
+
+Measured against the screenshot, that rectangle is the *text* area inside the
+rounded field (which spans roughly x 460..820, y 293..325), in the same
+coordinate space the click that focused it used, top-left origin. So the
+positioning half of an EditText-equivalent needs no new engine call at all: it
+needs a surface over the canvas — a `wl_subsurface` on Wayland — a font, and the
+buffer `input::text_buffer_snapshot` already keeps. Not attempted here, because
+a half-built one is worse than none.
+
+**A thing observed and not explained, so nobody reads past it:** the placeholder
+label hides when the text arrives in two of the three runs and stays visible in
+the third, with identical scripts. The placeholder is a separate label the Lua UI
+shows while `Text` is empty, so hiding it means the property really did change;
+staying visible in one run means either it did not, or the frame was stale.
+Presents sit at exactly 1.0/s here — the idle throttle (§1d) — and **typing does
+not lift it**, while a click does (6.9/s), so a frame is up to a second old and
+the engine is not redrawing on text arriving. That is a lead for whoever chases
+`onLuaTextBoxChangedCallback`, and it is not evidence of anything on its own.
+
+**Counter-evidence, raised 2026-08-02, and unverified — see above.** Sober shows
+typed text live, as you type — and Sober's engine process links raw EGL/GLESv2
+with its own Wayland client and no toolkit at all. Its GTK4/libadwaita/WebKitGTK
 usage is in a separate binary for web views, so there is nothing over its
 surface that could be drawing that text. If the engine could only ever be drawn
-into by an overlay editor, Sober could not do what it demonstrably does. So the
-engine *can* draw a focused `TextBox` itself, and the section above is at best
-incomplete.
+into by an overlay editor, Sober could not do what it demonstrably does.
 
-The likelier mechanism, and it is testable: on Android, touching a field does
-not raise the soft keyboard when a hardware keyboard is attached, and with no
-soft keyboard up the engine draws its own text and its own caret. What tells it
-which case it is in is `updateKeyboardSize` — which Cordial has never once
-reported correctly *while someone typed*, because the call is gated off behind
-`CORDIAL_KEYBOARD_REPORT=1` after an earlier, wrong version of it
-(`visible=true` with zero height) bounced focus. **Run that experiment before
-building anything shaped like an overlay editor.** It costs one launch:
-`CORDIAL_KEYBOARD_REPORT=1 CORDIAL_TRACE_TEXT=1`, click a field, type. Do not
-treat "the missing piece is a widget" as established while it is untested.
+The mechanism that suggested, and it is the one the measurement above kills: on
+Android, touching a field does not raise the soft keyboard when a hardware
+keyboard is attached, and with no soft keyboard up the engine would draw its own
+text and its own caret. What tells it which case it is in is `updateKeyboardSize`
+— which Cordial had never once reported correctly *while someone typed*. It has
+now, and the screen did not change.
+
+### Ctrl+V is bound, and `CORDIAL_TRACE_TEXT` no longer prints what you typed
+
+Two changes on the same path, 2026-08-03.
+
+**`CORDIAL_TRACE_TEXT=1` used to put the focused field's contents on the
+terminal** — once per keystroke from `pass_text`, and again per key from each
+backend's own trace line. The field anyone debugging this reaches for is
+Roblox's password box. It now prints a byte and character count and the caret,
+which answers every question the switch exists for, since the bug is that
+characters do not *paint* rather than that the wrong ones arrive.
+`CORDIAL_TRACE_TEXT_SHOW_PASSWORDS=1` prints the text, and is named so that
+nobody turns it on without deciding to. Verified in a live run: a paste of the
+developer's own clipboard through the focused box logged
+`text -> <26 bytes, 26 chars> caret=26` and nothing else.
+
+**Ctrl+V now pastes into the focused box**, in both backends, through
+`clipboard::paste_into_engine`. Note the shape, because it explains why there is
+no engine call to hunt for: on Android the `EditText` over the GL surface
+handles the paste itself and the engine only ever sees text arrive through
+`gametextinput`, so a paste is an insert on the same path a keystroke takes.
+Cordial is that editor. `input::is_paste_shortcut` is unit-tested (Ctrl+Shift+V
+is deliberately *not* paste — it means "without formatting" everywhere else),
+and `paste_into_engine` was measured by the work that added it. **`INFERRED`:**
+the two centimetres of wiring between them have never been crossed by a real
+Ctrl+V, because a real keystroke needs the developer's own keyboard and the
+scripted seam calls `paste_into_engine` directly. On the X11 backend it will
+fail honestly — GTK has no display open there, which is where the clipboard
+lives, and the trace says so.
 
 ### The capture does not cover text entry. Do not grep it for this
 
@@ -444,12 +561,15 @@ allocation changes, `sync_canvas_geometry` moves and resizes the subsurface,
 different trigger. Dragging the window edge by hand is still untested, because
 there is no Wayland-safe way to do it from automation.
 
-**What still needs a human, with the exact commands.** Both need a keystroke or
-a click, which nothing here may synthesise (see AGENTS.md).
+**Experiment 1 below is answered — no, it does not — and it did not need a
+human after all.** `CORDIAL_SCRIPT` clicks and types now, through Cordial's own
+input path and nowhere near a compositor; §1's 2026-08-03 correction has the
+measurement and the command. What is left here needs a click only in the sense
+that somebody has to be watching a Wayland session while it happens.
 
 ```bash
-# 1. Does the engine draw its own text when no soft keyboard is reported?
-#    The experiment §1's correction above asks for. Click a field, type "abc".
+# 1. ANSWERED, 2026-08-03: no. See §1. Kept for the shape of the command.
+#    Add CORDIAL_SCRIPT=…click:…,…type:… and it runs itself.
 CORDIAL_KEYBOARD_REPORT=1 CORDIAL_TRACE_TEXT=1 CORDIAL_WAYLAND=1 \
   ./target/release/cordial-run --lib-dir <lib> --apk <apk> \
   --host-libc --game-activity --run 120
@@ -1002,6 +1122,95 @@ compositor-driven fullscreen, and the owner's case may involve a different size
 or monitor. Anyone with a keyboard should check it by hand before this is called
 closed.
 
+### 1e (cont.) The swapchain *is* rebuilt at the fullscreen size. Measured 2026-08-03
+
+The standing lead was that the extent never changes: on Wayland the swapchain
+size does not come from the compositor at all —
+`vk_get_physical_device_surface_capabilities_khr` substitutes
+`wayland::current().geometry()` when Mesa reports the documented `0xFFFFFFFF`
+"you choose" — and that geometry is written only by `apply_resize`, which
+early-returns when the size is unchanged. If `apply_resize` never fired with the
+fullscreen size, every swapchain after the transition would be the old size,
+which is exactly the reported symptom.
+
+**It fires, every time.** Eight transitions across two 150-second runs, build
+`0.3.0-21-gf70ee23-dirty`, `--profile agent-text`, no `WAYLAND_DEBUG`:
+
+```text
+[instr] t= 40.0s script: fullscreen
+[instr] set_position(0, 46) size=1920x1154
+[instr] surface_resized -> 1920x1154
+[android] vulkan: reporting surface extent 1920x1154 to the engine
+[android] vulkan: vkCreateSwapchainKHR extent 1920x1154 (old swapchain recreated)
+```
+
+and the mirror image on the way back, `1280x721` in all four places. The
+per-second geometry line moves in the same tick — `rect=Some((0, 46, 1920,
+1154)) placed=(0, 46)` — so the content rectangle, the position, the engine's
+`surface_resized`, the extent Cordial reports to Vulkan and the extent the
+swapchain is built at are five numbers that all agree, in both directions,
+twice per run, in two runs.
+
+**It is not the idle throttle either.** One of the two runs fullscreens with
+input off: presents are at exactly 1.0/s going in, the transition itself draws a
+burst (4.9/s in that second), and the sequence above is identical. The engine
+does redraw at the new size without a mouse; it simply redraws once a second.
+
+**Nothing swallows `VK_ERROR_OUT_OF_DATE_KHR` or `VK_SUBOPTIMAL_KHR`, and the
+driver never sent one.** `vk_queue_present_khr` forwards the return value
+untouched and now also reports any non-success code, at the first of each and
+then at each power of ten. Across both runs and every transition: not one line.
+So "the engine ignored a suboptimal swapchain" and "Cordial ate the error" are
+both off the table — there was no error to ignore or eat.
+
+**So the three named suspects are all disproved and the bug is not reproducible
+from `gtk_window_fullscreen`.** What is left is the difference between that call
+and however the reporter fullscreens — and the one candidate with a mechanism is
+the 0x0 configure: `content_rect()` returns `None` for a zero allocation and
+`sync_canvas_geometry` used to return silently on it, which would leave the
+canvas at its old size in a new-sized slot and correct itself the moment a
+workspace switch forced a fresh allocation. That case now prints
+`wayland: no content rectangle to place the canvas by`, once per run of them,
+and the size it comes back with. **If the symptom is real, that line is the
+first thing to look for in the log**, and if it is absent the geometry path is
+not where the bug is.
+
+**Reproducing all of the above:**
+
+```bash
+CORDIAL_INSTR=1 CORDIAL_SCRIPT=20:motion-on,35:motion-off,40:fullscreen,\
+60:motion-on,75:motion-off,80:windowed,100:fullscreen,130:windowed \
+  just client --run 150
+```
+
+**New, and a real bug: the X11 backend segfaults on a fullscreen transition.**
+`backend_set_fullscreen` was Wayland-only, so nobody had ever driven one there;
+it now sends `_NET_WM_STATE_FULLSCREEN` on X11 too, purely so that a fullscreen
+transition can be *photographed* (see below). Two runs out of two, the client
+dies within a second of the transition, immediately after
+`vkCreateSwapchainKHR extent 1920x1163 (old swapchain recreated)`. The kernel
+names an engine thread and the same faulting offset both times:
+
+```text
+Main[538171]: segfault at 44 ip 0x7fbb4e9af4c1 ... +0x13a4c1 (a ~10 MB mapping, not libroblox)
+Main[546315]: segfault at 44 ip 0x7fc8cc90c4c1 ... +0x13a4c1
+```
+
+Deterministic, and inside a library about the size of a Mesa driver rather than
+inside the 115 MB engine. **`INFERRED`:** that this is the resize rather than
+fullscreen as such — nothing has ever resized an X11 Cordial window from
+automation either, so "X11 cannot survive a swapchain rebuild at a new size" and
+"X11 cannot survive fullscreen" are not yet distinguishable. Wayland does the
+same transition eight times without complaint.
+
+**Why X11 was dragged into this at all: you cannot photograph a Wayland surface
+on this desktop.** `org.gnome.Shell.Screenshot.Screenshot` and
+`ScreenshotWindow` both answer `AccessDenied`, `grim` is wlroots-only, and
+`import` cannot see a native Wayland surface — so on Wayland every claim in this
+section is a claim about numbers, not about pixels, and it is stated that way
+deliberately. `import -window` does work against the X11 backend, which is why
+this session's text-entry screenshots (§1) are all X11.
+
 **Tried and it did not help: `onSurfaceRedrawNeededNative` on a geometry
 change.** `window.rs` drives that native from the final X11 `Expose` and this
 backend drove it from nowhere at all, so the argument was that an idle engine has
@@ -1227,16 +1436,25 @@ the control: identical launch, publish suppressed, neither observable moves.
 `app ready: Landing`, because a signed-out client belongs there. Closing this
 needs §2 first, and then one signed-in launch with `--join-url`.
 
-*`roblox-player://` links do not reach an experience.* The engine's own pattern,
-the client setting `FStringGameLaunchLinkURL`, matches `roblox://` and
-`robloxmobile://` and no other scheme — measured, not read off the regex alone.
-That is the scheme roblox.com's desktop play button emits and the handler
-Cordial is taking from Sober, so registering it and doing nothing with it is
-worse than not registering it. Cordial warns when it is handed one. Translating
-the desktop format (`roblox-player:1+launchmode:play+gameinfo:<ticket>+…`) into
-an Android-shaped link is the obvious next step and is untested; the desktop
-format carries a one-time auth ticket the Android client does not use, so it is
-not a scheme swap.
+*`roblox-player://` links are translated, and the translation reaches the engine.*
+The engine's own pattern, the client setting `FStringGameLaunchLinkURL`, matches
+`roblox://` and `robloxmobile://` and no other scheme — measured, not read off
+the regex alone. That is the scheme roblox.com's desktop play button emits and
+the handler Cordial took from Sober, so Cordial now takes the desktop format
+(`roblox-player:1+launchmode:play+gameinfo:<ticket>+placelauncherurl:…`) apart,
+carries the `placeId` out of the decoded launcher URL into
+`roblox://experiences/start?placeId=<id>`, and publishes that. Measured twice
+with `CORDIAL_DEEPLINK_NO_TRANSLATE=1` as the control twice: with the rewrite the
+app shell answers `Game.launch` naming the place, without it nothing does
+(`docs/analysis/deep-links.md` §6.1).
+
+The one-time `gameinfo` ticket is dropped — this engine is the Android client and
+has no such ticket in any link it accepts — and **whether a join survives that is
+still unverified**, for the same reason nothing else about joining is: it needs a
+signed-in account. A desktop link that names a *particular server*
+(`accessCode`, `linkCode`, `reservedServerAccessCode`, `gameId`, `jobId`) is
+refused rather than translated, because a link that joins the wrong server is
+worse than one that does not join.
 
 `CORDIAL_DEEPLINK_PROBE=1` prints the linking protocol's own message and field
 names, read out of the running engine — that is how they were established, and
@@ -1619,6 +1837,18 @@ read fault counts taken on a thrashing machine as a property of the client.
     and `input::pass_text` are `pub`, and `wayland.rs`'s `dispatch_key` exercises
     the keysym translation above them. No compositor is involved and nothing can
     reach the developer's session.
+    - **There is now a seam for exactly this and it needs no code:**
+      `CORDIAL_INSTR=1 CORDIAL_SCRIPT=32:click:640x308,34:type:abc` clicks and
+      types on a timeline, through `input::script_click`/`script_type`, which
+      call the same natives with the same arguments as a real click and a real
+      keystroke. It answered the text-drawing question in §1 that four earlier
+      investigations recorded as unanswerable. Coordinates are separated by `x`,
+      because a comma already separates timeline entries.
+    - **Beware what else has focus.** A run under X11 owns the keyboard focus of
+      the developer's session while its window is up, so anything they type
+      lands in the field under test. One run here picked up a stray `5` that was
+      not in the script and it is visible in the screenshot — read the
+      `CORDIAL_TRACE_TEXT` log, not only the pixels.
   - **For another application, nest a compositor.** Run it under a headless
     `cage`/`weston` on its own `WAYLAND_DISPLAY`; a virtual-keyboard client bound
     to *that* compositor is global only within a compositor containing one
@@ -1707,10 +1937,19 @@ delivery, not the debugger. Recorded so nobody repeats the dead ends.
   name. The legitimate route is breakpointing `RegisterNatives`/`GetMethodID` and
   reading the `name`/`fnPtr` arguments off the call — recognising an unnamed
   function by its shape instead would be the forbidden move.
-- **The remaining blocker is a keystroke**, and per the input rule above that
-  means either a human typing while breakpoints are already planted, or a nested
+- **The remaining blocker was a keystroke**, and per the input rule above that
+  meant either a human typing while breakpoints are already planted, or a nested
   headless compositor. `ptrace_scope` is 0, so attaching works; that step was
-  simply never reached.
+  simply never reached. For *Cordial* that blocker is gone (`CORDIAL_SCRIPT`'s
+  `click:`/`type:`), but Sober is somebody else's window and the seam does not
+  reach it, so this paragraph still stands for Sober.
+- **A cheaper question first, and it needs no debugger.** Sober's engine writes
+  the same `appData/logs/*_Player_*.log` Cordial's does, and the engine narrates
+  `handleTextBoxFocused_AndroidLayer_` there at `FLog::NativeInput`. Focus a box
+  in Sober, type, and grep. If Sober's engine hands the box to the same Android
+  layer and still shows the text, §1's diagnosis is wrong; if it never reaches
+  that line, the difference is upstream of drawing entirely. The one Sober log on
+  this machine has zero `TextBox` hits, so nobody has checked.
 
 ---
 

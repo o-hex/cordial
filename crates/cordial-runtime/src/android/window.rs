@@ -604,6 +604,60 @@ impl HostWindow {
         (g.width, g.height, g.format)
     }
 
+    /// Ask the window manager to add or remove `_NET_WM_STATE_FULLSCREEN`, the
+    /// same message `open` sends when `--fullscreen` was asked for at startup.
+    ///
+    /// This exists for one reason and it is worth stating plainly: **the
+    /// fullscreen bug cannot be photographed on Wayland.** This GNOME session
+    /// refuses `org.gnome.Shell.Screenshot` and `ScreenshotWindow` with
+    /// `AccessDenied`, `grim` is wlroots-only, and `import` cannot see a native
+    /// Wayland surface. An X11 window can be photographed with
+    /// `import -window`, so the transition can at least be *looked at* on one
+    /// backend. It is not the same code path as the Wayland one — GTK and a
+    /// subsurface are not involved here — and a result from it says what the
+    /// engine does with a fullscreen-sized surface, not what
+    /// `sync_canvas_geometry` does.
+    pub fn set_fullscreen(&self, on: bool) {
+        let xlib = &self.xlib;
+        // SAFETY: `display`/`window` are this struct's own live handles, and
+        // the event is the same 96-byte `XClientMessageEvent` layout `open`
+        // builds by hand a few hundred lines above; see its comment for why the
+        // union is written out rather than declared.
+        unsafe {
+            let root = (xlib.default_root_window)(self.display);
+            let name = |s: &std::ffi::CStr| (xlib.intern_atom)(self.display, s.as_ptr(), 0);
+            let (state, fs) = (name(c"_NET_WM_STATE"), name(c"_NET_WM_STATE_FULLSCREEN"));
+            if state == 0 || fs == 0 {
+                return;
+            }
+            const REMOVE: c_long = 0;
+            const ADD: c_long = 1;
+            const CLIENT_MESSAGE: c_int = 33;
+            const SUBSTRUCTURE_REDIRECT: c_long = 1 << 20;
+            const SUBSTRUCTURE_NOTIFY: c_long = 1 << 19;
+            let mut msg = [0u8; 96];
+            let p = msg.as_mut_ptr();
+            *(p as *mut c_int) = CLIENT_MESSAGE;
+            *(p.add(8) as *mut c_ulong) = 1;
+            *(p.add(16) as *mut c_int) = 1;
+            *(p.add(24) as *mut usize) = self.display as usize;
+            *(p.add(32) as *mut Window) = self.window;
+            *(p.add(40) as *mut c_ulong) = state;
+            *(p.add(48) as *mut c_int) = 32;
+            for (i, v) in [if on { ADD } else { REMOVE }, fs as c_long, 0, 1, 0].iter().enumerate() {
+                *(p.add(56 + i * 8) as *mut c_long) = *v;
+            }
+            (xlib.send_event)(
+                self.display,
+                root,
+                0,
+                SUBSTRUCTURE_REDIRECT | SUBSTRUCTURE_NOTIFY,
+                msg.as_mut_ptr() as *mut c_void,
+            );
+            (xlib.flush)(self.display);
+        }
+    }
+
     pub fn close(&self) {
         // SAFETY: both handles came from this struct's own creation calls.
         unsafe {
@@ -901,10 +955,14 @@ impl HostWindow {
         let now = self.now_ms();
 
         if super::input::trace_text() {
+            // `text=` is a length unless `CORDIAL_TRACE_TEXT_SHOW_PASSWORDS=1`:
+            // one character at a time is still a password, printed slowly.
             eprintln!(
-                "[cordial] key {} keysym={keysym:#x} text={:?} keycode={:?} focus={:?}",
+                "[cordial] key {} keysym={keysym:#x} text={} keycode={:?} focus={:?}",
                 if down { "down" } else { "up" },
-                std::str::from_utf8(&text[..n.max(0) as usize]).unwrap_or(""),
+                super::input::redacted(
+                    std::str::from_utf8(&text[..n.max(0) as usize]).unwrap_or("")
+                ),
                 keysym_to_android(keysym),
                 cordial_linker_sys::game_activity::focused_textbox(),
             );
@@ -943,6 +1001,21 @@ impl HostWindow {
             let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else {
                 return;
             };
+            // Ctrl+V, before anything reads the character.
+            //
+            // There is no engine call to look for here and that is correct
+            // rather than missing: on Android the `EditText` over the GL
+            // surface handles the paste itself and the engine only ever sees
+            // text arrive through `gametextinput`. Cordial is that editor, so
+            // a paste is an insert through this same path — see
+            // `clipboard::paste_into_engine`, which does exactly what the loop
+            // below does with a typed character.
+            if super::input::is_paste_shortcut(keysym, meta) {
+                if let Err(e) = super::clipboard::paste_into_engine(handle) {
+                    super::trace(format_args!("clipboard paste failed: {e}"));
+                }
+                return;
+            }
             let typed = if n > 0 {
                 std::str::from_utf8(&text[..n as usize]).unwrap_or("")
             } else {

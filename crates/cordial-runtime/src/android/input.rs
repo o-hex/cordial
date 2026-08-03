@@ -552,9 +552,13 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
         }
     }
     if trace_text() {
+        // The size, not the text. See `trace_text_contents` — this line used to
+        // print a password in full on every keystroke of it.
         eprintln!(
-            "[cordial] text -> {text:?} caret={cursor} sync={} passText={}",
-            !sync.is_null(), !f.is_null()
+            "[cordial] text -> {} caret={cursor} sync={} passText={}",
+            redacted(text),
+            !sync.is_null(),
+            !f.is_null()
         );
     }
 }
@@ -818,10 +822,18 @@ fn no_pass_key() -> bool {
 /// to acknowledge a keyboard; the fault is in the arguments or the moment, not
 /// in the call existing. The arguments have since been corrected against the
 /// real-Android capture — see `report_keyboard_state`, which now sends the
-/// baseline that capture actually shows — but it stays off by default because
-/// the corrected form has never been driven through a live typing session, and
-/// the failure it caused took a keystroke to observe. `CORDIAL_KEYBOARD_REPORT=1`
-/// turns it on, which is also the control for testing it. See `docs/NEXT.md` §1.
+/// baseline that capture actually shows. `CORDIAL_KEYBOARD_REPORT=1` turns it
+/// on, which is also the control for testing it. See `docs/NEXT.md` §1.
+///
+/// **The reason it is still off has changed.** It used to be that the corrected
+/// form had never been driven through a live typing session. It has now
+/// (2026-08-03, X11, `CORDIAL_SCRIPT` clicking a login field and typing into
+/// it): the corrected report does *not* bounce focus, and it does not change
+/// anything else either — the engine draws a focused box's text neither with it
+/// nor without it, pixel-identical at every step of the same scripted sequence.
+/// So it stays off for want of a reason to turn it on rather than for fear of
+/// what it did, and turning it on is not a fix for text entry. Do not spend
+/// another session on that hypothesis; §1 has the screenshots.
 fn keyboard_report_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CORDIAL_KEYBOARD_REPORT").is_some())
@@ -830,6 +842,56 @@ fn keyboard_report_enabled() -> bool {
 pub fn trace_text() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CORDIAL_TRACE_TEXT").is_some())
+}
+
+/// `CORDIAL_TRACE_TEXT_SHOW_PASSWORDS=1` — print what was typed, not just how
+/// much of it.
+///
+/// **The name is the documentation.** The first field anyone debugging this
+/// reaches for is Roblox's password box, and `CORDIAL_TRACE_TEXT=1` used to put
+/// its contents on the terminal a character at a time and then again in full on
+/// every keystroke. Once Ctrl+V is bound it would also print whatever was on
+/// the clipboard, which is routinely a password out of a manager and routinely
+/// not even this user's. Two other places in this tree logged secrets the same
+/// way in the same week — the shell's banner printed a live auth ticket, and
+/// `deeplink::describe` printed a whole payload under the words "values not
+/// shown" — and both were fixed to names and byte counts.
+///
+/// Byte counts and caret positions answer every question this switch exists
+/// for. The bug it was written for is that characters do not *paint*, which a
+/// length answers as well as the text does; where the text itself genuinely
+/// matters — a mangled multi-byte character, say — this switch exists and says
+/// out loud what turning it on means.
+fn trace_text_contents() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_TRACE_TEXT_SHOW_PASSWORDS").is_some())
+}
+
+/// How to describe a piece of text in a trace line: its size, or — only when
+/// [`trace_text_contents`] is on — the text itself.
+pub fn redacted(text: &str) -> String {
+    if trace_text_contents() {
+        format!("{text:?}")
+    } else {
+        format!("<{} bytes, {} chars>", text.len(), text.chars().count())
+    }
+}
+
+/// Whether this key press is "paste".
+///
+/// Shared by both backends so the shortcut cannot end up meaning one thing on
+/// X11 and another on Wayland, and so the one subtlety in it is written down
+/// once: **Ctrl+Shift+V is not this**. That is "paste without formatting" in
+/// most of the desktop and it is also what a terminal uses for plain paste; a
+/// text field that treated the two as the same would be wrong in the case where
+/// the difference matters. Alt+V is not this either — that is a menu mnemonic.
+///
+/// `keysym` rather than an evdev code, because paste lives on whichever
+/// physical key the layout calls `v`, which is the whole point of a layout.
+/// Both `v` and `V` are accepted: Caps Lock does not turn paste off.
+pub fn is_paste_shortcut(keysym: c_ulong, meta: i32) -> bool {
+    let ctrl_only = meta & META_CTRL_ON != 0 && meta & (META_SHIFT_ON | META_ALT_ON) == 0;
+    ctrl_only && (keysym == 'v' as c_ulong || keysym == 'V' as c_ulong)
 }
 
 // ------------------------------------------------------------------ text entry
@@ -1102,9 +1164,143 @@ pub fn text_buffer_snapshot() -> (String, i32) {
     (buf.text.clone(), buf.caret as i32)
 }
 
+// ------------------------------------------------------------ scripted input
+//
+// A click and a keystroke Cordial delivers to itself, for the experiments the
+// text path cannot otherwise have.
+//
+// The rule against synthesising input (AGENTS.md, `docs/NEXT.md`'s "how to work
+// on this") is about the *compositor*: `XTestFake*`, `ydotool`,
+// `wlr-virtual-keyboard` and the RemoteDesktop portal all land on whatever has
+// focus, which is the developer's session. Nothing here goes near one. Cordial
+// is the client, so these call the same natives the backends' own
+// `dispatch_button`/`dispatch_key` call, with the same arguments, one layer
+// below the display server. The X11 keycode-to-keysym and the xkb translations
+// are the only thing they do not exercise, and those are established (see
+// `pass_key_event` on the evdev/AKEYCODE vocabulary that cost days).
+//
+// This exists because the last open question about text entry — does the engine
+// draw a focused box's own text — takes a keystroke to answer, and every
+// previous attempt stalled exactly there.
+
+/// The evdev code for an ASCII character, for [`script_type`]'s
+/// `nativePassKeyEvent` argument.
+///
+/// A separate table from [`keysym_to_android`] because the two want different
+/// vocabularies and conflating them is the bug documented at length on
+/// [`pass_key_event`]: the native takes the *platform's* code, and on Linux
+/// that is evdev's. Deliberately small — a scripted run types identifiers and
+/// digits, and a character with no entry is dropped rather than guessed at, so
+/// a missing one shows up as a missing character rather than as some other key.
+fn ascii_to_evdev(c: char) -> Option<i32> {
+    const LETTERS: [i32; 26] = [
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17,
+        45, 21, 44,
+    ];
+    Some(match c {
+        'a'..='z' => LETTERS[c as usize - 'a' as usize],
+        '1'..='9' => 2 + (c as i32 - '1' as i32),
+        '0' => 11,
+        ' ' => 57,
+        _ => return None,
+    })
+}
+
+/// One left click at a canvas position, as [`super::window::HostWindow`]'s
+/// `dispatch_button` delivers one: `ACTION_DOWN`/`ACTION_BUTTON_PRESS`, then
+/// the release pair, plus `nativePassMouseButton` on each half.
+pub fn script_click(handle: i64, x: f32, y: f32, now_ms: i64) {
+    // A hover first. Roblox's interface highlights on hover and hit-tests the
+    // press against where it believes the pointer is, and a press with no
+    // preceding motion is a shape a real mouse never produces.
+    deliver_touch(handle, ACTION_HOVER_MOVE, x, y, 0, 0, now_ms, 0);
+    pass_mouse_move(x, y);
+
+    deliver_touch(handle, ACTION_DOWN, x, y, BUTTON_PRIMARY, 0, now_ms, now_ms);
+    deliver_touch(handle, ACTION_BUTTON_PRESS, x, y, BUTTON_PRIMARY, BUTTON_PRIMARY, now_ms, now_ms);
+    pass_mouse_button(x, y, true, BUTTON_PRIMARY);
+
+    let up = now_ms + 40;
+    deliver_touch(handle, ACTION_BUTTON_RELEASE, x, y, 0, BUTTON_PRIMARY, up, now_ms);
+    deliver_touch(handle, ACTION_UP, x, y, 0, 0, up, now_ms);
+    pass_mouse_button(x, y, false, BUTTON_PRIMARY);
+}
+
+/// Type a string into whatever box the engine says has focus, one character at
+/// a time, down and up, through every path a real keystroke takes.
+///
+/// Returns how many characters were delivered to a focused box. Zero with a
+/// non-empty argument means no box had focus, which is a result rather than a
+/// failure — sending text with no focused box means sending it to handle 0 and
+/// the engine drops it in silence.
+pub fn script_type(handle: i64, text: &str, now_ms: i64) -> usize {
+    let mut delivered = 0;
+    for (i, c) in text.chars().enumerate() {
+        let keysym = c as c_ulong;
+        let evdev = ascii_to_evdev(c);
+        let t = now_ms + i as i64 * 60;
+        if let (Some(keycode), Some(evdev)) = (keysym_to_android(keysym), evdev) {
+            deliver_key(handle, true, keycode, evdev + 8, 0, 0, c as i32, t, t);
+            pass_key_event(true, evdev, 0);
+        }
+        let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else {
+            if trace_text() {
+                eprintln!("[cordial] script type: no focused textbox");
+            }
+            continue;
+        };
+        let mut buf = [0u8; 4];
+        if let Some((contents, caret)) = edit_text_buffer(Edit::Insert(c.encode_utf8(&mut buf))) {
+            let _ = cordial_linker_sys::game_activity::text_input(handle, &contents, caret, caret);
+            pass_text(which, &contents, caret);
+            delivered += 1;
+        }
+        if let (Some(keycode), Some(evdev)) = (keysym_to_android(keysym), evdev) {
+            deliver_key(handle, false, keycode, evdev + 8, 0, 0, c as i32, t + 30, t);
+            pass_key_event(false, evdev, 0);
+        }
+    }
+    delivered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_is_ctrl_v_and_not_its_neighbours() {
+        assert!(is_paste_shortcut('v' as c_ulong, META_CTRL_ON));
+        assert!(is_paste_shortcut('V' as c_ulong, META_CTRL_ON | META_CAPS_LOCK_ON));
+        // Ctrl+Shift+V is "paste without formatting" everywhere else, and a
+        // terminal's plain paste. Not the same key.
+        assert!(!is_paste_shortcut('v' as c_ulong, META_CTRL_ON | META_SHIFT_ON));
+        assert!(!is_paste_shortcut('v' as c_ulong, META_ALT_ON | META_CTRL_ON));
+        assert!(!is_paste_shortcut('v' as c_ulong, 0));
+        assert!(!is_paste_shortcut('c' as c_ulong, META_CTRL_ON));
+    }
+
+    #[test]
+    fn a_trace_line_does_not_carry_the_text_by_default() {
+        // The switch is read from the environment once per process, so this
+        // asserts the default shape rather than flipping it: a password must
+        // not be reconstructible from what this returns.
+        let line = redacted("hunter2");
+        assert!(!line.contains("hunter2"), "trace line leaked the text: {line}");
+        assert!(line.contains('7'), "trace line should still carry the size: {line}");
+    }
+
+    #[test]
+    fn evdev_codes_are_the_platforms_not_androids() {
+        // The one collision that hid the vocabulary bug for days: `d` is 32 in
+        // both numbering schemes. Every other letter must differ from its
+        // AKEYCODE, or this table has been filled in from the wrong one.
+        assert_eq!(ascii_to_evdev('d'), Some(32));
+        assert_eq!(ascii_to_evdev('a'), Some(30));
+        assert_eq!(keysym_to_android('a' as c_ulong), Some(29));
+        assert_eq!(ascii_to_evdev('w'), Some(17));
+        assert_eq!(ascii_to_evdev(' '), Some(57));
+        assert_eq!(ascii_to_evdev('@'), None);
+    }
 
     #[test]
     fn a_caret_edits_where_it_is_not_at_the_end() {

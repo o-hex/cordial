@@ -251,6 +251,11 @@ const VK_SUCCESS: i32 = 0;
 const VK_INCOMPLETE: i32 = 5;
 const VK_ERROR_INITIALIZATION_FAILED: i32 = -3;
 const VK_ERROR_EXTENSION_NOT_PRESENT: i32 = -7;
+/// The two the WSI returns when the swapchain no longer matches the surface —
+/// the driver's own way of saying "you are painting at the wrong size". See
+/// [`report_present_result`].
+const VK_SUBOPTIMAL_KHR: i32 = 1_000_001_003;
+const VK_ERROR_OUT_OF_DATE_KHR: i32 = -1_000_001_004;
 
 // -------------------------------------------------------------- host loading
 
@@ -506,7 +511,59 @@ extern "C" fn vk_queue_present_khr(queue: *mut c_void, info: *const c_void) -> i
     }
     // SAFETY: resolved from the host loader for exactly this name.
     let f: extern "C" fn(*mut c_void, *const c_void) -> i32 = unsafe { std::mem::transmute(f) };
-    f(queue, info)
+    let rc = f(queue, info);
+    if rc != VK_SUCCESS {
+        report_present_result(rc);
+    }
+    rc
+}
+
+/// Say when a present came back as anything other than `VK_SUCCESS`, at the
+/// first one of each code and then at each power of ten.
+///
+/// Cordial forwards this return value untouched and always has, so it is not
+/// swallowed here — but "not swallowed" and "acted on" are different claims and
+/// nothing could tell them apart from outside. `VK_SUBOPTIMAL_KHR` and
+/// `VK_ERROR_OUT_OF_DATE_KHR` are how the driver says the swapchain no longer
+/// matches the surface, which is exactly the shape of the fullscreen bug where
+/// the engine keeps painting at its old size in a new-sized slot: an engine
+/// that ignores them would look identical to a Cordial that ate them. Now the
+/// log says which.
+///
+/// Counted rather than printed per call for the reason `input::
+/// report_unregistered` gives: one line would be indistinguishable from a
+/// transient at a resize, and one per frame would bury the run.
+fn report_present_result(rc: i32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SUBOPTIMAL: AtomicU64 = AtomicU64::new(0);
+    static OUT_OF_DATE: AtomicU64 = AtomicU64::new(0);
+    static OTHER: AtomicU64 = AtomicU64::new(0);
+    let (counter, name) = match rc {
+        VK_SUBOPTIMAL_KHR => (&SUBOPTIMAL, "VK_SUBOPTIMAL_KHR"),
+        VK_ERROR_OUT_OF_DATE_KHR => (&OUT_OF_DATE, "VK_ERROR_OUT_OF_DATE_KHR"),
+        _ => (&OTHER, "a non-success code"),
+    };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if is_first_or_power_of_ten(n) {
+        println!("[android] vulkan: vkQueuePresentKHR returned {name} ({rc}), {n} so far");
+    }
+}
+
+/// Whether a count is the first or a power of ten, the reporting cadence this
+/// file and `input::report_unregistered` share.
+///
+/// A free function rather than a trait on `u64`: the trait bought nothing and
+/// put a method with a name like this on every integer in the module.
+fn is_first_or_power_of_ten(n: u64) -> bool {
+    let mut p = 1u64;
+    while p < n {
+        let next = p.saturating_mul(10);
+        if next == p {
+            return false;
+        }
+        p = next;
+    }
+    p == n
 }
 
 // ------------------------------------------------------------- present mode
@@ -709,6 +766,17 @@ extern "C" fn vk_create_swapchain_khr(
     let Some(info) = (unsafe { create_info.as_ref() }) else {
         return f(device, create_info, allocator, swapchain_out);
     };
+    // The extent, unconditionally and on the same argument the present mode is
+    // printed on: when the client is letterboxed on one side and clipped on the
+    // other, the first thing worth knowing is what size the swapchain it is
+    // painting into was built at, and whether it was ever built again. It is one
+    // line per swapchain, not per frame.
+    println!(
+        "[android] vulkan: vkCreateSwapchainKHR extent {}x{} (old swapchain {})",
+        info.image_extent.width,
+        info.image_extent.height,
+        if info.old_swapchain == 0 { "none" } else { "recreated" },
+    );
     let asked = info.present_mode;
 
     let PresentModeChoice::Prefer(preferences) = present_mode_choice() else {
@@ -841,6 +909,23 @@ extern "C" fn vk_get_physical_device_surface_capabilities_khr(
                  (0xFFFFFFFF), reporting the window's own {}x{}",
                 caps.current_extent.width, caps.current_extent.height,
             ));
+            // And once per *change*, unconditionally. The engine asks this
+            // several times a second, so a per-call line is unreadable and a
+            // trace flag hides the one thing a fullscreen report needs: the
+            // size Cordial claimed the surface was, at the moment it claimed
+            // it. On Wayland this substitution is the only source of that
+            // number — Mesa never supplies one — so if it never changes across
+            // a fullscreen transition, no swapchain the engine builds
+            // afterwards can be the right size.
+            let packed = ((caps.current_extent.width as u64) << 32)
+                | caps.current_extent.height as u64;
+            static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if LAST.swap(packed, std::sync::atomic::Ordering::Relaxed) != packed {
+                println!(
+                    "[android] vulkan: reporting surface extent {}x{} to the engine",
+                    caps.current_extent.width, caps.current_extent.height,
+                );
+            }
         }
     }
     rc

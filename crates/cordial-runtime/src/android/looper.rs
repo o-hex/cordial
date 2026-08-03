@@ -286,6 +286,16 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
     script.reverse();
     let mut motion = false;
 
+    // Subscribe to the engine's `setClipboardText` before the first tick.
+    //
+    // Here rather than in `load.rs` alongside the cookie and identity wiring
+    // because the message bus has to exist first, and by the time this function
+    // is reached the app bridge has started. Only when there is an engine to
+    // subscribe to: `pump` is also used by the GL probe, which has no bus.
+    if game_activity_handle.is_some() {
+        super::clipboard::arm();
+    }
+
     while deadline.is_none_or(|d| std::time::Instant::now() < d) {
         if let Some(why) = asked_to_stop() {
             println!("[android] ending the run: {why}");
@@ -307,6 +317,58 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                     // the process at t=10 whatever `--run` says, and with
                     // `CORDIAL_NO_CLOSE_EXIT=1` set it should not.
                     "close" => super::backend_close_window(),
+                    // `click:640x382` and `type:hello` — a click and a
+                    // keystroke through Cordial's own input path, which is what
+                    // makes the text-entry experiments runnable at all. Every
+                    // previous attempt at them stalled on "this needs a
+                    // keystroke and no Wayland-safe automation here can supply
+                    // one"; nothing about that rule was ever about Cordial's
+                    // own window, which is not a window anything has to be
+                    // injected into. See `input::script_click`.
+                    //
+                    // `x` separates the two coordinates rather than a comma
+                    // because a comma already separates entries in the
+                    // timeline, and `25:click:640,382` silently became a click
+                    // at (640, 0) — the engine drew its cursor at the top of
+                    // the window, which is how it was noticed.
+                    _ if action.starts_with("click:") => {
+                        if let Some(handle) = game_activity_handle {
+                            let mut it = action["click:".len()..].split(&[',', 'x'][..]);
+                            let x: f32 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
+                            let y: f32 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
+                            super::input::script_click(handle, x, y, (t * 1000.0) as i64);
+                        }
+                    }
+                    _ if action.starts_with("type:") => {
+                        if let Some(handle) = game_activity_handle {
+                            let text = &action["type:".len()..];
+                            let n = super::input::script_type(handle, text, (t * 1000.0) as i64);
+                            eprintln!("[instr] typed {n}/{} characters into a focused box", text.chars().count());
+                        }
+                    }
+                    // `paste` and `copy:some text` — the two halves of the
+                    // clipboard bridge, driven without a compositor and without
+                    // an account. `paste` is what Ctrl+V will call once a key
+                    // handler is bound to it; `copy:` publishes a
+                    // `setClipboardText` on the engine's own message bus, which
+                    // is the message a copy inside an experience sends. See
+                    // `super::clipboard`, and note what `publish_probe` does not
+                    // establish.
+                    "paste" => {
+                        if let Some(handle) = game_activity_handle {
+                            match super::clipboard::paste_into_engine(handle) {
+                                Ok(0) => eprintln!("[instr] paste: no box has focus"),
+                                Ok(n) => eprintln!("[instr] pasted {n} characters into a focused box"),
+                                Err(e) => eprintln!("[instr] paste failed: {e}"),
+                            }
+                        }
+                    }
+                    _ if action.starts_with("copy:") => {
+                        match super::clipboard::publish_probe(&action["copy:".len()..]) {
+                            Ok(()) => eprintln!("[instr] published a setClipboardText on the bus"),
+                            Err(e) => eprintln!("[instr] publishing setClipboardText failed: {e}"),
+                        }
+                    }
                     other => eprintln!("[instr] unknown script action {other}"),
                 }
             }
@@ -370,6 +432,12 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
         // callback would re-enter it. One acquire load when no link is waiting,
         // which is every ordinary launch.
         crate::deeplink::tick();
+
+        // Text the engine asked to have put on the clipboard, for the third
+        // time the same reason: the engine publishes on whichever thread the
+        // copy happened on, and GDK may only be touched from the thread that
+        // ran `gtk_init`, which is this one.
+        super::clipboard::pump_pending();
     }
 
     // Clean teardown, however the run ended — the timer expiring, the window

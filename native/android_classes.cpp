@@ -476,6 +476,14 @@ bool g_identity_subscription = false;
 // under it would deadlock the first time anybody signed in.
 std::atomic<void (*)(const char*)> g_identity_login_sink{nullptr};
 std::atomic<void (*)()> g_identity_logout_sink{nullptr};
+
+// `APP_READY`, for whoever needs to act the moment the Lua app shell is up.
+//
+// Deliberately only a notification: it fires on the engine's own thread from
+// inside the engine's own callback, so the one caller (`deeplink.rs`) sets a
+// flag here and does its work from the looper thread, which is the thread every
+// other native call in this process is made from.
+std::atomic<void (*)(const char*)> g_app_ready_sink{nullptr};
 } // namespace
 
 jlong identity_user_id() {
@@ -786,6 +794,12 @@ public:
         }
         fprintf(stderr, "[roblox] datamodel notification: %s %s\n",
                 type ? type->c_str() : "(null)", payload.c_str());
+
+        if (kind == "APP_READY") {
+            if (auto* sink = g_app_ready_sink.load(std::memory_order_acquire)) {
+                sink(payload.c_str());
+            }
+        }
     }
 
     /// Not a getter despite the name — it returns void because it is a request,
@@ -1149,6 +1163,15 @@ extern "C" void cordial_identity_set_sinks(void (*on_login)(const char*),
                                            void (*on_logout)()) {
     cordial::g_identity_login_sink.store(on_login, std::memory_order_release);
     cordial::g_identity_logout_sink.store(on_logout, std::memory_order_release);
+}
+
+/// Where `APP_READY` is reported, or null to stop reporting it.
+///
+/// Same split as the two above: registration is unconditional and the sink is
+/// what decides whether anything listens, so "nobody was listening" can never
+/// be mistaken for "the engine never called".
+extern "C" void cordial_app_ready_set_sink(void (*on_ready)(const char*)) {
+    cordial::g_app_ready_sink.store(on_ready, std::memory_order_release);
 }
 
 extern "C" void cordial_register_android_classes(void* env_ptr) {

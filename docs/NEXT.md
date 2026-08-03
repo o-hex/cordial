@@ -1189,6 +1189,59 @@ to. Note also that `SL_IID_RECORD` is among the referenced symbols and
 `native/opensles.cpp` deliberately refuses recorder creation: correct for now,
 and exactly what voice chat will need implemented later.
 
+## 2c. Deep links reach the engine. Whether they join needs an account
+
+`cordial-run --join-url <url>` takes a `roblox-player://` or `roblox://` link
+from a browser click and hands it to the engine.
+[`docs/analysis/deep-links.md`](analysis/deep-links.md) is the investigation and
+`crates/cordial-runtime/src/deeplink.rs` is the code.
+
+**The engine asks nobody for a URL.** No `Intent`, no `Uri`, no `getIntent` —
+checked in a full launch and in the Waydroid capture, where every `Intent` line
+belongs to Google Play services rather than to Roblox's process. The URL is
+delivered *to* the engine, which makes this Cordial's statement to make rather
+than a question to answer.
+
+**What works, measured twice with a control.** Publishing on the engine's own
+linking message during bring-up:
+
+```text
+MessageBus.publishRaw("Linking.detectURL", "{\"url\":\"roblox://…\"}")
+```
+
+makes the app shell answer, by the first `APP_READY`, with
+
+```text
+Game.launch  {"placeId":1818,"referralPage":"DeepLink","joinAttemptId":"fe7bec78-…"}
+```
+
+`placeId` and `referralPage` are the engine's words — Cordial passes the URL
+through as one opaque string and never parses it. `isColdStartDeeplinkToGame()`
+goes false -> true across the same delivery. `CORDIAL_DEEPLINK_NO_PUBLISH=1` is
+the control: identical launch, publish suppressed, neither observable moves.
+
+**Two things are not done, and the first is the important one.**
+
+*Whether it joins is unverified and cannot be verified without an account.*
+`Game.launch` is the app shell asking for an experience; every run here ends at
+`app ready: Landing`, because a signed-out client belongs there. Closing this
+needs §2 first, and then one signed-in launch with `--join-url`.
+
+*`roblox-player://` links do not reach an experience.* The engine's own pattern,
+the client setting `FStringGameLaunchLinkURL`, matches `roblox://` and
+`robloxmobile://` and no other scheme — measured, not read off the regex alone.
+That is the scheme roblox.com's desktop play button emits and the handler
+Cordial is taking from Sober, so registering it and doing nothing with it is
+worse than not registering it. Cordial warns when it is handed one. Translating
+the desktop format (`roblox-player:1+launchmode:play+gameinfo:<ticket>+…`) into
+an Android-shaped link is the obvious next step and is untested; the desktop
+format carries a one-time auth ticket the Android client does not use, so it is
+not a scheme swap.
+
+`CORDIAL_DEEPLINK_PROBE=1` prints the linking protocol's own message and field
+names, read out of the running engine — that is how they were established, and
+it is the cheap way to check whether a Roblox update renamed any of them.
+
 ## 3. Plugins: running, but with three methods
 
 `crates/cordial-plugins` has capabilities, a broker, manifests, user grants and a

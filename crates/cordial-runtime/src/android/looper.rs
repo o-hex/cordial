@@ -363,6 +363,13 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
         // and reading the jar back from inside it would re-enter the engine on
         // its own thread. Cheap when nothing has changed: one relaxed load.
         crate::cookies::flush_if_dirty();
+
+        // A deep link waiting for the app shell to exist, here for the same
+        // reason and on the same thread: `APP_READY` arrives on the engine's
+        // own thread, and publishing back into the engine from inside its own
+        // callback would re-enter it. One acquire load when no link is waiting,
+        // which is every ordinary launch.
+        crate::deeplink::tick();
     }
 
     // Clean teardown, however the run ended — the timer expiring, the window

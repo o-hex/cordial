@@ -438,6 +438,38 @@ pub mod game_activity {
             err: *mut c_char,
             n: usize,
         ) -> c_int;
+        fn cordial_deeplink_protocol_string(
+            f: *mut c_void,
+            class_name: *const c_char,
+            out: *mut c_char,
+            out_len: usize,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
+        fn cordial_deeplink_cold_start(
+            f: *mut c_void,
+            class_name: *const c_char,
+            url: *const c_char,
+            out_handled: *mut c_int,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
+        fn cordial_deeplink_protocol_init(
+            f: *mut c_void,
+            class_name: *const c_char,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
+        fn cordial_deeplink_string_ret_string(
+            f: *mut c_void,
+            class_name: *const c_char,
+            arg: *const c_char,
+            out: *mut c_char,
+            out_len: usize,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
+        fn cordial_app_ready_set_sink(on_ready: Option<extern "C" fn(*const c_char)>);
     }
 
     fn take_err(err: Vec<u8>) -> String {
@@ -524,6 +556,113 @@ pub mod game_activity {
             )
         };
         if rc == 0 { Ok(out != 0) } else { Err(take_err(err)) }
+    }
+
+    /// A static, zero-argument native returning `String`.
+    ///
+    /// `JNILinkingProtocol`'s message and field names are read this way — see
+    /// `native/deeplink.cpp`. Purely a read of a constant the engine already
+    /// holds; nothing is passed in.
+    pub fn call_static_ret_string(native: *mut c_void, class_name: &str) -> Result<String, String> {
+        let cls = CString::new(class_name).map_err(|e| e.to_string())?;
+        let mut out = vec![0u8; 512];
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; every buffer outlives the call.
+        let rc = unsafe {
+            cordial_deeplink_protocol_string(
+                native,
+                cls.as_ptr(),
+                out.as_mut_ptr() as *mut c_char,
+                out.len(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc == 0 { Ok(take_err(out)) } else { Err(take_err(err)) }
+    }
+
+    /// `maybeHandleColdStartProtocolLaunch(String) -> boolean`, on whichever of
+    /// `JNIBaseUrlProtocol` / `JNIWebLoginProtocol` is named.
+    ///
+    /// The returned boolean is the engine's own answer to "did I take this
+    /// URL", and it is the only honest signal Cordial has about a deep link.
+    pub fn cold_start_protocol_launch(
+        native: *mut c_void,
+        class_name: &str,
+        url: &str,
+    ) -> Result<bool, String> {
+        let cls = CString::new(class_name).map_err(|e| e.to_string())?;
+        let u = CString::new(url).map_err(|e| e.to_string())?;
+        let mut out: c_int = -1;
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; every buffer outlives the call.
+        let rc = unsafe {
+            cordial_deeplink_cold_start(
+                native,
+                cls.as_ptr(),
+                u.as_ptr(),
+                &mut out as *mut c_int,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc == 0 { Ok(out != 0) } else { Err(take_err(err)) }
+    }
+
+    /// `init(Context)` on one of the linking protocol classes.
+    pub fn protocol_init(native: *mut c_void, class_name: &str) -> Result<(), String> {
+        let cls = CString::new(class_name).map_err(|e| e.to_string())?;
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; `cls`/`err` outlive the call.
+        let rc = unsafe {
+            cordial_deeplink_protocol_init(
+                native,
+                cls.as_ptr(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
+    /// A static native taking one `String` and returning one —
+    /// `MessageBus.getLastRaw(String)`, which is how a publish is checked
+    /// rather than assumed.
+    pub fn call_static_string_ret_string(
+        native: *mut c_void,
+        class_name: &str,
+        arg: &str,
+    ) -> Result<String, String> {
+        let cls = CString::new(class_name).map_err(|e| e.to_string())?;
+        let a = CString::new(arg).map_err(|e| e.to_string())?;
+        // Generous, because a bus payload is JSON and truncation is reported as
+        // an error rather than silently returning a prefix that still parses.
+        let mut out = vec![0u8; 8192];
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; every buffer outlives the call.
+        let rc = unsafe {
+            cordial_deeplink_string_ret_string(
+                native,
+                cls.as_ptr(),
+                a.as_ptr(),
+                out.as_mut_ptr() as *mut c_char,
+                out.len(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc == 0 { Ok(take_err(out)) } else { Err(take_err(err)) }
+    }
+
+    /// Install the sink `APP_READY` is reported to, or clear it with `None`.
+    ///
+    /// The payload is the app-shell state the engine reached — `Landing`,
+    /// `Home` and so on. It is not personal data; the notification that is
+    /// (`DID_LOG_IN`) goes to a different sink and is elided there.
+    pub fn app_ready_set_sink(on_ready: Option<extern "C" fn(*const c_char)>) {
+        // SAFETY: the far side stores the pointer in an atomic and calls it
+        // from the engine's thread; a null clears it.
+        unsafe { cordial_app_ready_set_sink(on_ready) }
     }
 
     /// Hand the framework layer the identity its Java mirrors answer from.

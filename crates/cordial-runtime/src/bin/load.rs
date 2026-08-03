@@ -20,6 +20,7 @@ struct Options {
     gl_probe: bool,
     window_seconds: Option<u64>,
     game_activity: bool,
+    join_url: Option<cordial_runtime::deeplink::JoinUrl>,
     run_seconds: u64,
     host_libc: bool,
     jni_onload: bool,
@@ -46,6 +47,9 @@ usage: cordial-load --lib-dir <dir> [options]
   --host-libc       also resolve libc from the host (ABI-unsafe; diagnostic only)
   --jni-onload      stand up a JavaVM and call JNI_OnLoad
   --game-activity   implies --jni-onload; bring Roblox up and hand it a surface
+  --join-url <url>  a roblox-player:// or roblox:// link from a browser click,
+                    handed to the engine during bring-up. Rejected unless it is
+                    one of those two schemes, printable ASCII, and under 2 kB
   --run <secs>      how long to let Roblox run after handover (default 15).
                     0 means no timer: run until the window is closed or the
                     process is sent SIGTERM/SIGINT. Closing the window ends the
@@ -94,6 +98,9 @@ env:
                                      control for the close path. SIGTERM and
                                      --run are unaffected
   CORDIAL_SIGNIN_PROBE=1             ask the engine whether login is Lua-rendered
+  CORDIAL_DEEPLINK_PROBE=1           with --join-url, print the linking
+                                     protocol's own message and field names,
+                                     read out of the running engine
   CORDIAL_NO_VULKAN=1                make the host look like it has no Vulkan
                                      loader, forcing the GLES2/EGL fallback
                                      path Roblox uses when dlopen(libvulkan)
@@ -129,6 +136,7 @@ fn parse() -> Result<Options, String> {
         gl_probe: false,
         window_seconds: None,
         game_activity: false,
+        join_url: None,
         run_seconds: 15,
         host_libc: false,
         jni_onload: false,
@@ -192,6 +200,14 @@ fn parse() -> Result<Options, String> {
             "--game-activity" => {
                 opt.jni_onload = true;
                 opt.game_activity = true;
+            }
+            // The URL a browser click produced, forwarded by the shell. It is
+            // validated here, at the edge, rather than anywhere further in:
+            // this is the process boundary the value crosses, and a bad one
+            // should end the launch with a sentence rather than travel.
+            "--join-url" => {
+                let raw = args.next().ok_or("--join-url needs a URL")?;
+                opt.join_url = Some(cordial_runtime::deeplink::validate(&raw)?);
             }
             "--dump-classes" => {
                 opt.jni_onload = true;
@@ -1457,6 +1473,26 @@ fn main() -> ExitCode {
                                                     }
                                                 }
                                             }
+                                        }
+
+                                        // The deep link, if this launch is one.
+                                        //
+                                        // Here because these are the engine's
+                                        // *cold start* URL natives and this is
+                                        // the cold-start moment: after
+                                        // `nativeAppBridgeV2InitWithParams`,
+                                        // which is what builds the protocol
+                                        // machinery they talk to — the same
+                                        // ordering constraint the cookie
+                                        // restore above is placed by — and
+                                        // before `StartLuaAppDM`, which is
+                                        // where `ActivityNativeMain` consults
+                                        // `isColdStartDeeplinkToGame()` on
+                                        // Android.
+                                        if let Some(url) = &opt.join_url {
+                                            let outcome =
+                                                cordial_runtime::deeplink::deliver(lib, url);
+                                            println!("[deeplink] outcome: {outcome:?}");
                                         }
 
                                         if std::env::var_os("CORDIAL_SKIP_LUA_DM").is_none() {

@@ -11,7 +11,7 @@
 > it after investing a weekend.
 >
 > It is not abandoned mid-collapse — it works. You can sign in, stay signed in,
-> load a game, move around, turn the camera and hear sound.
+> load a game, move around and turn the camera.
 > [**docs/HANDOVER.md**](docs/HANDOVER.md) is written for whoever takes it on:
 > every open thread with what is genuinely known about it, which claims are
 > `INFERRED` and why, and the measurement traps that have already cost people
@@ -151,7 +151,7 @@ will be declined.
 | Window — libadwaita header bar, engine as a subsurface | ✅ |
 | Launching from the shell | ✅ finds a build, or explains how to get one |
 | Choosing a profile | ✅ a chooser above the Launch button; creates one, and shows a profile another window holds as unavailable |
-| Audio | 🟡 the PipeWire backend is real and compiled at last; no sound observed yet |
+| Audio | 🟡 sound leaves the OpenSL ES bridge into PipeWire, measured with a control; never yet verified inside an experience, and FMOD may take a Java path that bypasses it entirely |
 | Web views (Marketplace, Profile, Communities…) | ❌ the surface is mapped; `openNativeOverlay` now reports instead of silently swallowing |
 | Clean shutdown | ✅ full pause/stop/destroy sequence, observed in the engine's own log |
 | Plugins | 🟡 host, broker, per-profile grants and settings, an on/off switch, and a registry with hardened unpacking; no marketplace yet |
@@ -187,15 +187,63 @@ of memory apiece.
 
 ## Install
 
-> Cordial is early. You can sign in, load a game and play it with a keyboard and
-> mouse — but text fields do not draw what you type, first person cannot capture
-> the pointer, and there is no sound yet. See the status table.
+> Cordial is early. You can sign in, load an experience and play it with a
+> keyboard and mouse; text fields still do not draw what you type, and the
+> pointer is not captured in first person. The status table above says which
+> claims were measured and how — read it before you install.
 
 ### 1. What you need
 
 - x86-64 Linux
+- A Wayland session. X11 still starts, through Flatpak's fallback socket, but
+  [ADR-011](docs/adr/ADR-011-wayland-and-libadwaita.md) makes Wayland the
+  backend Cordial targets and says X11 is not developed further
+- Roblox's official Android client, which **you supply** — Cordial ships no
+  Roblox code, APK or assets and never will
+
+From an installed APK you need the `lib/x86_64/` objects and the base APK.
+
+Nothing else. The Flatpak carries the toolchain and the libraries with it; the
+list of build dependencies moved down to §3, where it belongs.
+
+### 2. Install it
+
+```bash
+flatpak remote-add --if-not-exists cordial \
+    https://luohoa97.github.io/cordial/cordial.flatpakrepo
+flatpak install cordial org.cordial.Cordial
+```
+
+Then launch Cordial from your desktop's application list, or:
+
+```bash
+flatpak run org.cordial.Cordial
+```
+
+`flatpak update` picks up new builds. Uninstall with
+`flatpak uninstall org.cordial.Cordial`, and
+`flatpak uninstall --delete-data org.cordial.Cordial` if you also want the
+profiles, the sign-in and the extracted Roblox build gone.
+
+**The remote is not signed.** There is no GPG key on it, so `flatpak install`
+verifies that the download matches the repository's own checksums and nothing
+beyond that. What it does not do is prove who built it: anyone who can write to
+the GitHub Pages site — including anyone who takes over the GitHub account, and
+GitHub itself — can serve a different package under the same name and your
+machine will install it without complaint. That is a weaker guarantee than
+Flathub's and you should know which one you are getting. Signing is wired up in
+[`.github/workflows/flatpak.yml`](.github/workflows/flatpak.yml) and switches on
+the day a maintainer adds a key; the commands above do not change when it does,
+but a remote added while it was unsigned stays unverified, so re-add it.
+
+If you would rather not extend that trust, §3 builds the same package from
+source and is the whole of the alternative.
+
+### 3. Build it from source instead
+
+Building needs rather more than running does:
+
 - **Clang** — AOSP bionic uses C11 `_Atomic` inside C++ headers and GCC rejects it
-- An X11 session (Wayland works through XWayland)
 - **GTK4 (≥ 4.10) and libadwaita (≥ 1.4)** development packages — the core shell
   in `crates/cordial-shell` is `AdwApplicationWindow`/`AdwToolbarView` end to
   end (see [ADR-002](docs/adr/ADR-002-core-shell-and-ui-handoff.md) and
@@ -210,23 +258,24 @@ of memory apiece.
   `libpipewire-0.3.so` itself is `dlopen`'d at run time, never linked, so a
   build made with the headers still runs — audio-less — on a machine that
   only has the runtime library, or neither.
-- Roblox's official Android client, which **you supply** — Cordial ships no
-  Roblox code, APK or assets and never will
 
-From an installed APK you need the `lib/x86_64/` objects and the base APK.
-
-### 2. Build it
-
-Flatpak is the intended way. There is no hosted remote yet, so it builds from
-source:
+To build the Flatpak yourself, which produces the same package the remote
+serves:
 
 ```bash
-git clone --recursive https://github.com/luohoa97/cordial
+git clone https://github.com/luohoa97/cordial
 cd cordial
 packaging/build-flatpak.sh --install
 ```
 
-For development, skip Flatpak and build the loader directly:
+That one needs no submodules: the manifest pins `third_party/libjnivm` and
+`third_party/mcpelauncher-linker` by commit and fetches them itself. It still
+wants the network for the crates, which is
+[issue #3](https://github.com/luohoa97/cordial/issues/3) and the reason Cordial
+is not on Flathub.
+
+For development, skip Flatpak and build the binaries directly. This one *does*
+want the submodules:
 
 ```bash
 git clone --recursive https://github.com/luohoa97/cordial
@@ -234,7 +283,17 @@ cd cordial
 cargo build --release
 ```
 
-### 3. Run it
+### 4. Run it
+
+From the package, the shell is what starts — it finds a Roblox build, or
+explains how to get one, and launches the engine for you:
+
+```bash
+flatpak run org.cordial.Cordial
+```
+
+From a source build, the loader can be run on its own, which is what a debugging
+session wants and nobody else does:
 
 ```bash
 cargo run --release --bin cordial-run -- \
@@ -245,7 +304,7 @@ cargo run --release --bin cordial-run -- \
 A window opens, the engine comes up, and it renders Roblox's logged-out landing
 page at about 27 fps. `--run` is how many seconds to stay up.
 
-### 4. Useful knobs
+### 5. Useful knobs
 
 | | |
 |---|---|
@@ -269,7 +328,11 @@ CORDIAL_MONITOR=1 CORDIAL_FULLSCREEN=1 cargo run --release --bin cordial-run -- 
 
 Roblox is configured by FastFlags, and Cordial lets you override any of them.
 Create `~/.local/share/cordial/profiles/<profile>/flags.json` (or point
-`CORDIAL_FLAGS` at another file) with a flat object:
+`CORDIAL_FLAGS` at another file) with a flat object. Installed as a Flatpak the
+sandbox moves `~/.local/share` to `~/.var/app/org.cordial.Cordial/data`, so the
+same file is `~/.var/app/org.cordial.Cordial/data/cordial/profiles/<profile>/flags.json`
+— `INFERRED` from how Flatpak remaps `XDG_DATA_HOME`, not yet checked against an
+installed package.
 
 ```json
 {
@@ -334,7 +397,7 @@ overrides) were tested and change nothing here, because they govern 3D scene
 rendering and the logged-out landing page is a 2D interface. Resolution and
 density are the levers that apply to it.
 
-### 5. When something goes wrong
+### 6. When something goes wrong
 
 **Read the engine's own log first.** Roblox writes it to
 `<files>/appData/logs/*.log` and it names subsystems, stages, paths and

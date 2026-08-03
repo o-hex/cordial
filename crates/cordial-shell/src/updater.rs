@@ -74,7 +74,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use cordial_update::cache;
-use cordial_update::changelog::{self, Notes, Release};
+use cordial_update::changelog::{self, Entry, Notes, Release};
 use cordial_update::download::{Refusal, Source, URL_ENV};
 use cordial_update::metered::{self, Metered};
 use cordial_update::settings::{Automatic, DownloadOn, Plan, UpdateSettings, NEVER_DOWNLOADS};
@@ -131,6 +131,14 @@ pub struct Checked {
     /// claiming to know it. `None` is the ordinary case.
     installed: Option<String>,
     release: Result<(Release, Notes), Unreachable>,
+    /// What actually changed, from the Creator Hub table.
+    ///
+    /// Separate from `release` and allowed to fail on its own: the DevForum
+    /// listing is what establishes the version number, and losing the changelog
+    /// must not take the version comparison down with it. `None` here means the
+    /// docs page did not answer, and the window falls back to the announcement
+    /// post rather than showing nothing.
+    entries: Option<Vec<Entry>>,
 }
 
 impl Checked {
@@ -292,7 +300,21 @@ fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
             let metered = metered::current();
             let installed = cache::recorded_version(&install::engine_cache());
             let release = changelog::latest().and_then(|r| changelog::notes(&r).map(|n| (r, n)));
-            Checked { metered, installed, release }
+            // Two requests rather than one, on the same worker: the DevForum
+            // gives the number, the Creator Hub gives the list. A failure here
+            // is recorded as `None` and nothing else changes, because the
+            // version comparison does not depend on it.
+            let entries = release
+                .as_ref()
+                .ok()
+                .and_then(|(r, _)| match changelog::docs_notes(r.major) {
+                    Ok(entries) => Some(entries),
+                    Err(why) => {
+                        println!("[update] the release-notes table did not answer: {why}");
+                        None
+                    }
+                });
+            Checked { metered, installed, release, entries }
         },
         then,
     )
@@ -369,31 +391,64 @@ pub fn present(
     // matters is a dim line above the button, and the rest is its tooltip. What
     // went is the framing that gave a permanently-unavailable version number
     // the same weight as the text people came to read.
+    // `title-2` rather than `title-1`: at this window's width a full release
+    // heading on one line is most of the card, and the larger size wrapped it
+    // across two before the notes had said anything.
     let notes_title = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
-        .css_classes(["title-1"])
+        .css_classes(["title-2"])
         .label("Fetching…")
         .build();
 
     // Selectable so a line can be quoted into an issue without a screenshot,
-    // and the full text rather than `summarise`'s eight lines: this pane has
-    // the whole window to fill and a scrollbar for the rest.
+    // and the full text rather than the eight lines a row used to allow.
+    // `use_markup` because `changelog::render_entries` returns Pango markup —
+    // bold headings, `<tt>` for the API names Roblox writes in code spans. It
+    // escapes everything it interpolates; see that function.
     let notes_body = gtk::Label::builder()
         .xalign(0.0)
         .yalign(0.0)
         .wrap(true)
         .selectable(true)
+        .use_markup(true)
         .label("Roblox's release notes, from the DevForum.")
         .build();
 
-    let notes_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    notes_box.set_margin_top(24);
-    notes_box.set_margin_bottom(12);
-    notes_box.set_margin_start(24);
-    notes_box.set_margin_end(24);
-    notes_box.append(&notes_title);
-    notes_box.append(&notes_body);
+    // A selectable `GtkLabel` takes focus when the window opens and selects its
+    // whole contents, so the changelog arrived highlighted end to end and had to
+    // be clicked off before it could be read. Selection is worth keeping — a
+    // line goes into an issue without a screenshot — so what moves is the focus:
+    // the button gets it, and the selection is cleared each time the text is
+    // replaced, since setting a label's text re-selects it all over again.
+    notes_body.set_can_focus(false);
+
+    // The notes sit in a `card`, which is libadwaita's own container for "this
+    // is one document" — the same shape a system updater puts its changelog in.
+    // Loose text on the window background left the release notes and the status
+    // caption looking like two halves of one column, when one is what Roblox
+    // published and the other is what Cordial can tell you about it.
+    //
+    // `card` draws the background and the rounded corner and no padding, so the
+    // inset is this inner box's margins.
+    let notes_inner = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    notes_inner.set_margin_top(16);
+    notes_inner.set_margin_bottom(16);
+    notes_inner.set_margin_start(16);
+    notes_inner.set_margin_end(16);
+    notes_inner.append(&notes_title);
+    notes_inner.append(&notes_body);
+
+    let notes_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    notes_card.add_css_class("card");
+    notes_card.append(&notes_inner);
+
+    let notes_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    notes_box.set_margin_top(18);
+    notes_box.set_margin_bottom(6);
+    notes_box.set_margin_start(18);
+    notes_box.set_margin_end(18);
+    notes_box.append(&notes_card);
 
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -434,9 +489,11 @@ pub fn present(
 
     let footer = gtk::Box::new(gtk::Orientation::Vertical, 12);
     footer.set_margin_top(12);
-    footer.set_margin_bottom(24);
-    footer.set_margin_start(24);
-    footer.set_margin_end(24);
+    footer.set_margin_bottom(18);
+    // Level with the card above it: a full-width button inset differently from
+    // the thing it sits under reads as belonging to a different window.
+    footer.set_margin_start(18);
+    footer.set_margin_end(18);
     footer.append(&status_line);
     footer.append(&action);
 
@@ -444,10 +501,14 @@ pub fn present(
         .transient_for(parent)
         .modal(true)
         .title("Roblox Build")
-        .default_width(660)
-        // 720 while there were six groups here, then 660 for three. Now there is
-        // one pane and one button, and the height is the changelog's: this is
-        // how much release note is worth having on screen before a scrollbar.
+        // 660 while this was three `PreferencesGroup`s that needed the room for
+        // their rows. A changelog is a column of prose, and 660 stretched its
+        // lines well past a comfortable measure while leaving the full-width
+        // button looking like a stretched bar with a word in the middle. This is
+        // roughly the same measure a system updater gives the same content.
+        .default_width(460)
+        // The height stayed: this is how much release note is worth having on
+        // screen before the scrollbar takes over.
         .default_height(660)
         .build();
 
@@ -461,17 +522,24 @@ pub fn present(
         let action = action.clone();
         let button = button.clone();
         Rc::new(move |checked: &Option<Checked>| {
-            // The headline of the caveat on screen, the whole of it on hover.
-            // The long form names the endpoint that answers 500 and why "up to
-            // date" would be a guess, which is worth keeping reachable and is
-            // not worth four lines above a changelog.
-            let (title, subtitle) = status_lines(checked, automatic);
-            status_line.set_label(&title);
+            // **Which build is here, not a verdict on it.** This line used to
+            // carry the outcome — "Up to date", or the longer "Whether this
+            // build is current cannot be established" — and a verdict is the one
+            // thing it is not entitled to give: Roblox serves no version for the
+            // Android build, so there is nothing to compare against. Saying so
+            // in four words above a changelog reads as a complaint, and saying
+            // "Up to date" instead would be a guess.
+            //
+            // So the line answers the question it can: which build you have. The
+            // reasoning behind the missing verdict is still one hover away on
+            // the button, where somebody who wants it will look for it.
+            let (_, subtitle) = status_lines(checked, automatic);
             let installed = match checked {
                 Some(checked) => version_line(checked.installed.clone()),
                 None => version_line(cache::recorded_version(&install::engine_cache())),
             };
-            action.set_tooltip_text(Some(&format!("{subtitle}\n\n{installed}\n\n{INSTALLED_DESCRIPTION}")));
+            status_line.set_label(&installed);
+            action.set_tooltip_text(Some(&format!("{subtitle}\n\n{INSTALLED_DESCRIPTION}")));
             let available = checked.as_ref().is_some_and(Checked::update_available);
             action.set_label(action_label(checked));
             action.set_sensitive(true);
@@ -487,9 +555,11 @@ pub fn present(
 
             match checked {
                 Some(checked) => {
-                    let (title, body) = release_lines_full(&checked.release);
+                    let (title, body) = release_lines_full(&checked.release, checked.entries.as_deref());
                     notes_title.set_label(&title);
-                    notes_body.set_label(&body);
+                    notes_body.set_markup(&body);
+                    // Setting the text of a selectable label selects all of it.
+                    notes_body.select_region(0, 0);
                     if let Ok((release, _)) = &checked.release {
                         open.set_uri(&release.web_url());
                         open.set_visible(true);
@@ -497,7 +567,8 @@ pub fn present(
                 }
                 None => {
                     notes_title.set_label("Fetching…");
-                    notes_body.set_label("Roblox's release notes, from the DevForum.");
+                    notes_body.set_text("Roblox's release notes, from the DevForum.");
+                    notes_body.select_region(0, 0);
                     open.set_visible(false);
                 }
             }
@@ -514,11 +585,13 @@ pub fn present(
         let last = last.clone();
         let paint = paint.clone();
         let config = config.clone();
-        let status_line = status_line.clone();
         let action = action.clone();
         Rc::new(move || {
+            // The progress goes on the control that started it, rather than on
+            // a line above it that then has to be put back. One thing changes,
+            // and it is the thing you just pressed.
             action.set_sensitive(false);
-            status_line.set_label("Checking…");
+            action.set_label(CHECKING);
             let apk = install::effective_apk(&config.borrow().roblox).map(|(p, _)| p);
             let last = last.clone();
             let paint = paint.clone();
@@ -563,6 +636,8 @@ pub fn present(
     // this window exists to offer scrolls off the bottom of it.
     toolbar.add_bottom_bar(&footer);
     window.set_content(Some(&toolbar));
+    // The button, not the changelog — see `notes_body.set_can_focus(false)`.
+    GtkWindowExt::set_focus(&window, Some(&action));
     window.present();
 }
 
@@ -590,6 +665,14 @@ const DOWNLOAD: &str = "Download";
 /// Android version number this can compare against, so "nothing newer" is the
 /// near-permanent answer and this is the near-permanent word on the button.
 const CHECK: &str = "Check for Updates";
+
+/// What the button says while the request is in flight.
+///
+/// On the button rather than on the line above it: the check is started by
+/// pressing this, so this is where somebody is already looking, and a status
+/// line that says "Checking…" and then has to be restored to something else is
+/// two states to keep in step instead of one.
+const CHECKING: &str = "Checking for Updates…";
 
 /// The word the button wears, decided by state rather than by the update mode.
 ///
@@ -993,9 +1076,22 @@ fn source_line(configured: &Result<Source, Refusal>) -> String {
 /// a window to read is the shape of bug that makes people go to the DevForum
 /// instead. The two share `heading` so they cannot title the same release
 /// differently.
-fn release_lines_full(release: &Result<(Release, Notes), Unreachable>) -> (String, String) {
+fn release_lines_full(
+    release: &Result<(Release, Notes), Unreachable>,
+    entries: Option<&[Entry]>,
+) -> (String, String) {
     match release {
-        Ok((release, notes)) => (heading(release, notes), notes.text().trim().to_string()),
+        // The Creator Hub table when it answered, the announcement post when it
+        // did not. The post is a covering note — "732 has landed, enjoy" and a
+        // set of links — so it is the fallback rather than the source; showing
+        // it and calling it a changelog was the bug this replaced.
+        Ok((release, notes)) => {
+            let body = match entries {
+                Some(entries) if !entries.is_empty() => changelog::render_entries(entries),
+                _ => notes.text().trim().to_string(),
+            };
+            (heading(release, notes), body)
+        }
         Err(why) => ("Could not fetch the release notes".to_string(), why.to_string()),
     }
 }
@@ -1048,6 +1144,11 @@ mod tests {
                     why: "no route to host".into(),
                 }),
             },
+            // The docs table is deliberately absent in these fixtures: every
+            // test here is about the version comparison or the button, and the
+            // fallback to the announcement post is the state that must keep
+            // working when the Creator Hub is unreachable.
+            entries: None,
         }
     }
 
@@ -1273,7 +1374,7 @@ mod tests {
 
     #[test]
     fn a_fetched_changelog_shows_its_title_date_and_opening() {
-        let (title, body) = release_lines_full(&Ok((release(732), notes(732))));
+        let (title, body) = release_lines_full(&Ok((release(732), notes(732))), None);
         assert_eq!(title, "Release Notes for 732 — 2026-07-29");
         assert!(body.starts_with("Hi all,"), "{body}");
     }
@@ -1289,7 +1390,7 @@ mod tests {
         let long: String = (0..200).map(|i| format!("line {i}\n")).collect();
         let mut release = notes(732);
         release.html = long.clone();
-        let (_, body) = release_lines_full(&Ok((self::release(732), release)));
+        let (_, body) = release_lines_full(&Ok((self::release(732), release)), None);
         assert!(body.contains("line 199"), "the last line was dropped");
         assert!(!body.ends_with('…'), "{body}");
     }

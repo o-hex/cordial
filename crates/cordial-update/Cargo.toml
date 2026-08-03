@@ -25,3 +25,4 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Same mechanism as GameMode and the Secret Service, and the same version
 # `cordial-plugins` and `cordial-runtime` already pin.
 zbus = { version = "5.18.0", features = ["blocking"] }
+pulldown-cmark = { version = "0.13.4", default-features = false }

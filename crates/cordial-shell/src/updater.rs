@@ -85,22 +85,27 @@ use crate::install;
 use crate::settings::persist;
 use crate::shell_config::ShellConfig;
 
-/// The icon the header-bar button wears, in every state.
+/// The resting icon: a build is a package, and most of the time there is
+/// nothing waiting.
 ///
-/// This was `system-software-install-symbolic` — the package — and the comment
-/// here argued against `software-update-available-symbolic` on the grounds that
-/// it is the icon which *means* an update is waiting, so wearing it permanently
-/// would be the attention state drawn rather than written. **That reasoning was
-/// overruled deliberately, and the record matters more than the argument.** The
-/// button is how you reach the changelog whether or not anything is waiting,
-/// and a package is not what that reads as.
+/// Worn whenever no update is known — which is Manual until somebody presses
+/// the button, every mode between launch and the answer arriving, and the
+/// ordinary steady state in all three. `system-software-install-symbolic`
+/// before, which is the same idea in the legacy icon set.
+const PACKAGE_ICON: &str = "package-x-generic-symbolic";
+
+/// The icon that *means* an update is waiting, worn only when one actually is.
 ///
-/// Attention is still drawn rather than implied: it is the `suggested-action`
-/// class in [`dress`], which the icon no longer duplicates. So there is exactly
-/// one icon and no state in which the button changes shape under the reader —
-/// including Manual with nothing found, which used to swap in a refresh arrow
-/// and made the same button look like two different controls.
-const DOWNLOAD_ICON: &str = "software-update-available-symbolic";
+/// This is the distinction the earlier version of this comment was reaching for
+/// and then applied to the wrong state: an arrow-in-a-star permanently on
+/// screen is the attention state drawn rather than written, but on a build that
+/// really has been superseded it is exactly the right icon. Swapping between
+/// the two is what makes the header bar answer "is there anything new" without
+/// being opened.
+///
+/// `suggested-action` still rides alongside it, so the difference is carried by
+/// colour as well as shape.
+const UPDATE_ICON: &str = "software-update-available-symbolic";
 
 /// How long after the window is up before the check starts.
 ///
@@ -157,7 +162,7 @@ pub fn header_button(
     config: Rc<RefCell<ShellConfig>>,
 ) -> gtk::Button {
     let parent = parent.as_ref().clone();
-    let button = gtk::Button::from_icon_name(DOWNLOAD_ICON);
+    let button = gtk::Button::from_icon_name(PACKAGE_ICON);
     let last: Rc<RefCell<Option<Checked>>> = Rc::new(RefCell::new(None));
 
     let automatic = config.borrow().automatic_updates;
@@ -237,19 +242,37 @@ pub fn header_button(
 /// genuinely changes shape when a check lands: the design says a check that
 /// finds an update turns the refresh control into the update control, and a
 /// button that kept its arrow would be hiding the answer it just fetched.
+/// Which icon, tooltip and attention state the knowledge earns.
+///
+/// Split out of [`dress`] because it is the part worth pinning and a
+/// `gtk::Button` cannot be constructed without `gtk::init`, so a test that
+/// reaches for one panics in the widget constructor rather than testing
+/// anything. Same arrangement, and the same reason, as `window::busy_body`.
+///
+/// Two icons and one rule: the arrow means an update is waiting, and nothing
+/// else does. Manual is deliberately not a case — a mode you cannot see from
+/// the header bar has no business changing what the header bar looks like, and
+/// Manual with nothing found is simply "no update known", the same as every
+/// other mode before its check lands. Press the button, let a check find
+/// something, and Manual gets the arrow like the rest. The refresh arrow this
+/// used to wear in Manual is gone for exactly that reason: it made one button
+/// two shapes depending on a setting elsewhere.
+fn dressing(last: &Option<Checked>, automatic: Automatic) -> (&'static str, &'static str, bool) {
+    match last {
+        Some(checked) if checked.update_available() => {
+            (UPDATE_ICON, "Roblox has published a newer build", true)
+        }
+        Some(_) => (PACKAGE_ICON, "Roblox build", false),
+        None if automatic == Automatic::Manual => {
+            (PACKAGE_ICON, "Check for a Roblox update", false)
+        }
+        None => (PACKAGE_ICON, "Roblox build", false),
+    }
+}
+
 fn dress(button: &gtk::Button, last: &Option<Checked>, automatic: Automatic) {
-    // One icon in every state — see `DOWNLOAD_ICON`. Manual with nothing found
-    // used to wear a refresh arrow instead, which meant the same button in the
-    // same header bar was two different shapes depending on a setting the reader
-    // could not see from here. What Manual changes is the word on the button
-    // *inside* the window, which is where a mode belongs.
-    let (tooltip, attention) = match last {
-        Some(checked) if checked.update_available() => ("Roblox has published a newer build", true),
-        Some(_) => ("Roblox build", false),
-        None if automatic == Automatic::Manual => ("Check for a Roblox update", false),
-        None => ("Roblox build", false),
-    };
-    button.set_icon_name(DOWNLOAD_ICON);
+    let (icon, tooltip, attention) = dressing(last, automatic);
+    button.set_icon_name(icon);
     button.set_tooltip_text(Some(tooltip));
     if attention {
         button.add_css_class("suggested-action");
@@ -545,24 +568,44 @@ pub fn present(
 
 /// What the one button says before a check, and once one has landed.
 ///
-/// **`Update…` and never `Download`.** There is nothing to download — Roblox
+/// **`Update…` and not `Download`, when there is nothing to download.** Roblox
 /// publishes the Android build through Google Play and the Amazon Appstore and
-/// no file — and a button labelled Download that opens a panel saying so is the
+/// no file, and a button labelled Download that opens a panel saying so is the
 /// interface version of the stub that reports success. The ellipsis is load
 /// bearing rather than decoration: GNOME's convention is that `…` means *this
 /// opens something rather than doing it*, which is exactly what this button
-/// does. **The day `cordial_update::download::fetch` has a source to fetch from,
-/// the ellipsis drops and this becomes `Download`**, because then the button
-/// really would do the thing its label names.
+/// does in that state.
 const UPDATE: &str = "Update…";
 
-/// The resting label. `Check` rather than `Check Now`, because the window it
-/// sits in is already the answer to "now".
-const CHECK: &str = "Check";
+/// The label the moment a fetch is genuinely possible — see [`DOWNLOAD`]'s
+/// condition in [`action_label`].
+///
+/// This is the state the `UPDATE` comment always described as the day the
+/// ellipsis drops. It arrives when `CORDIAL_UPDATE_URL` and its hash are set,
+/// because then [`Source::configured`] returns a source and the button really
+/// would do the thing its label names.
+const DOWNLOAD: &str = "Download";
 
+/// The resting label, in every mode including Automatic. Roblox publishes no
+/// Android version number this can compare against, so "nothing newer" is the
+/// near-permanent answer and this is the near-permanent word on the button.
+const CHECK: &str = "Check for Updates";
+
+/// The word the button wears, decided by state rather than by the update mode.
+///
+/// **`Download` is gated on a source existing, not on an update existing.** The
+/// two come apart in the ordinary case: Roblox can publish a newer engine that
+/// Cordial has no way to fetch, and labelling that Download would promise a file
+/// that never arrives.
 fn action_label(checked: &Option<Checked>) -> &'static str {
     match checked {
-        Some(checked) if checked.update_available() => UPDATE,
+        Some(checked) if checked.update_available() => {
+            if Source::configured().is_ok() {
+                DOWNLOAD
+            } else {
+                UPDATE
+            }
+        }
         _ => CHECK,
     }
 }
@@ -966,35 +1009,10 @@ fn heading(release: &Release, notes: &Notes) -> String {
     }
 }
 
-fn release_lines(release: &Result<(Release, Notes), Unreachable>) -> (String, String) {
-    match release {
-        Ok((release, notes)) => (heading(release, notes), summarise(&notes.text())),
-        Err(why) => ("Could not fetch the release notes".to_string(), why.to_string()),
-    }
-}
-
-/// How much of a set of release notes goes in a row.
-const SUMMARY_LINES: usize = 8;
-const SUMMARY_CHARS: usize = 600;
-
-/// The opening of the notes, and no more. The whole thing is a long document and
-/// a row is not where it gets read; the Read button is.
-fn summarise(text: &str) -> String {
-    let mut out = String::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()).take(SUMMARY_LINES) {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(line.trim());
-        if out.chars().count() >= SUMMARY_CHARS {
-            break;
-        }
-    }
-    match out.char_indices().nth(SUMMARY_CHARS) {
-        Some((cut, _)) => format!("{}…", out[..cut].trim_end()),
-        None => out,
-    }
-}
+// `release_lines` and `summarise` lived here, clipping the notes to eight lines
+// and 600 characters because they had to fit in an `AdwActionRow`. Nothing has
+// to fit in a row any more — the notes are the window — so they went rather than
+// stay as a second, shorter truth about the same release that no caller wanted.
 
 #[cfg(test)]
 mod tests {
@@ -1132,26 +1150,56 @@ mod tests {
     }
 
     #[test]
-    fn the_button_offers_to_check_until_an_update_is_established_and_never_says_download() {
-        // The label is the promise. Nothing can be downloaded — Roblox publishes
-        // no Android artefact — so a button that said Download would be
-        // AGENTS.md's stub-that-reports-success with a widget around it, and the
-        // panel behind it saying "get this from Google Play" would be the
-        // failure arriving somewhere unrelated to the cause.
-        assert_eq!(action_label(&None), "Check");
-        assert_eq!(action_label(&Some(checked(None, Some(732)))), "Check");
-        assert_eq!(action_label(&Some(checked(Some("0.732.23.7321040"), Some(732)))), "Check");
+    fn the_button_says_download_only_when_there_is_something_to_download() {
+        // The label is the promise. With no source configured nothing can be
+        // downloaded — Roblox publishes no Android artefact — so a button that
+        // said Download would be AGENTS.md's stub-that-reports-success with a
+        // widget around it, and the panel behind it saying "get this from Google
+        // Play" would be the failure arriving somewhere unrelated to the cause.
+        //
+        // This test runs with no `CORDIAL_UPDATE_URL` in the environment, which
+        // is the state every user is in until they deliberately leave it, so the
+        // update case here is the refusal case.
+        assert_eq!(action_label(&None), CHECK);
+        assert_eq!(action_label(&Some(checked(None, Some(732)))), CHECK);
+        assert_eq!(action_label(&Some(checked(Some("0.732.23.7321040"), Some(732)))), CHECK);
 
         let available = checked(Some("0.700.1.7001000"), Some(732));
         assert!(available.update_available());
-        assert_eq!(action_label(&Some(available)), "Update…");
+        assert!(Source::configured().is_err(), "a source leaked into the test environment");
+        assert_eq!(action_label(&Some(available)), UPDATE);
 
-        for label in [CHECK, UPDATE] {
-            assert!(!label.contains("Download"), "{label}");
-        }
+        // The word only becomes Download alongside a source, never alongside a
+        // mere update. Those two come apart in the ordinary case and that is the
+        // whole point of the gate.
+        assert!(!CHECK.contains("Download"), "{CHECK}");
+        assert!(!UPDATE.contains("Download"), "{UPDATE}");
         // The ellipsis is the GNOME convention for "opens something rather than
         // doing it", and it is the difference between this button and a lie.
         assert!(UPDATE.ends_with('…'), "{UPDATE}");
+        assert!(!DOWNLOAD.ends_with('…'), "{DOWNLOAD}");
+    }
+
+    #[test]
+    fn the_header_icon_is_the_arrow_only_while_an_update_is_actually_waiting() {
+        // The arrow-in-a-star means "an update is waiting" to every GNOME user,
+        // so wearing it in the resting state would be the attention state drawn
+        // rather than written. Manual is deliberately not a case here: a mode
+        // you cannot see from the header bar must not change what it looks like.
+        assert_ne!(PACKAGE_ICON, UPDATE_ICON);
+        for automatic in [Automatic::Background, Automatic::Ask, Automatic::Manual] {
+            let (icon, _, attention) = dressing(&None, automatic);
+            assert_eq!(icon, PACKAGE_ICON, "{automatic:?} resting");
+            assert!(!attention, "{automatic:?} resting");
+
+            let (icon, _, attention) = dressing(&Some(checked(Some("0.732.23.7321040"), Some(732))), automatic);
+            assert_eq!(icon, PACKAGE_ICON, "{automatic:?} nothing newer");
+            assert!(!attention, "{automatic:?} nothing newer");
+
+            let (icon, _, attention) = dressing(&Some(checked(Some("0.700.1.7001000"), Some(732))), automatic);
+            assert_eq!(icon, UPDATE_ICON, "{automatic:?} update waiting");
+            assert!(attention, "{automatic:?} update waiting");
+        }
     }
 
     #[test]
@@ -1225,21 +1273,25 @@ mod tests {
 
     #[test]
     fn a_fetched_changelog_shows_its_title_date_and_opening() {
-        let (title, body) = release_lines(&Ok((release(732), notes(732))));
+        let (title, body) = release_lines_full(&Ok((release(732), notes(732))));
         assert_eq!(title, "Release Notes for 732 — 2026-07-29");
         assert!(body.starts_with("Hi all,"), "{body}");
     }
 
     #[test]
-    fn a_long_set_of_notes_is_cut_rather_than_pasted_whole() {
-        // Roblox's release notes run to thousands of words. A row that takes all
-        // of them is a window nobody can see the rest of.
-        let long = "line\n".repeat(200);
-        let cut = summarise(&long);
-        assert!(cut.lines().count() <= SUMMARY_LINES, "{cut}");
-        let wide = "x".repeat(5000);
-        assert!(summarise(&wide).chars().count() <= SUMMARY_CHARS + 1);
-        assert!(summarise(&wide).ends_with('…'));
+    fn a_long_set_of_notes_arrives_whole_now_that_it_has_a_window() {
+        // The inverse of the test that used to be here. Roblox's release notes
+        // run to thousands of words and this used to clip them to eight lines,
+        // because they had to fit in a row. They are the window now, so the
+        // thing worth pinning is that nothing is dropped: a changelog someone
+        // opened a window to read, truncated, is the bug that sends them to the
+        // DevForum instead.
+        let long: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let mut release = notes(732);
+        release.html = long.clone();
+        let (_, body) = release_lines_full(&Ok((self::release(732), release)));
+        assert!(body.contains("line 199"), "the last line was dropped");
+        assert!(!body.ends_with('…'), "{body}");
     }
 
     #[test]

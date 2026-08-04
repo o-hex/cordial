@@ -1557,6 +1557,50 @@ fn main() -> ExitCode {
                                             }
                                         }
 
+                                        // The two `UpdateSurface...WithPlatformParams` calls,
+                                        // here because this is where Sober makes them — at about
+                                        // 3.79s, immediately after StartApp and before any join.
+                                        //
+                                        // Sober makes 87 `JNIAppBridge` calls in a session and
+                                        // Cordial made 3; these were two of the missing ones, and
+                                        // neither was referenced anywhere in this tree. Whether
+                                        // they are what stops the server sending disconnect
+                                        // reason 304 sixty-one seconds into a join is **not
+                                        // established** — this is the largest measured difference
+                                        // between a client that stays connected and one that does
+                                        // not, which earns an experiment rather than a claim.
+                                        //
+                                        // `CORDIAL_SKIP_UPDATE_SURFACE=1` is the control: it
+                                        // restores exactly the previous behaviour, so a session
+                                        // that survives can be shown to survive *because* of
+                                        // these rather than because something else moved.
+                                        if std::env::var_os("CORDIAL_SKIP_UPDATE_SURFACE").is_none() {
+                                            for (native, game) in [
+                                                ("Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeV2UpdateSurfaceAppWithPlatformParams", false),
+                                                ("Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeV2UpdateSurfaceGameWithPlatformParams", true),
+                                            ] {
+                                                let which = if game { "game" } else { "app" };
+                                                match lib.symbol(native) {
+                                                    Some(f) => match linker::game_activity::appbridge_update_surface(
+                                                        f, &apk_path, width, height, game,
+                                                    ) {
+                                                        Ok(()) => println!("  surface+platform params delivered ({which})"),
+                                                        Err(e) => println!("  UpdateSurface {which} failed: {e}"),
+                                                    },
+                                                    // Not a warning to swallow: the export list is
+                                                    // per build, and a rename is exactly the kind
+                                                    // of change that would make this quietly stop.
+                                                    None => {
+                                                        println!("  UpdateSurface {which}: the engine does not export it");
+                                                        cordial_runtime::unimplemented::placeholder(
+                                                            &format!("nativeAppBridgeV2UpdateSurface{which}WithPlatformParams"),
+                                                            "not exported by this build; not called",
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         match linker::game_activity::start(
                                             handle, width, height, format,
                                         ) {

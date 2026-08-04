@@ -19,6 +19,22 @@ fn main() {
         .define("CMAKE_C_COMPILER", "clang")
         .define("CMAKE_CXX_COMPILER", "clang++")
         .define("CMAKE_BUILD_TYPE", "Release")
+        // `CORDIAL_JNI_TRACE=1 cargo build` turns on libjnivm's trace.
+        //
+        // Not a convenience. libjnivm only emits `Constructed Unresolved
+        // symbol` -- the one notice that the engine asked for a Java class or
+        // method nobody wrote -- from inside `#ifdef JNI_TRACE`, so without
+        // this the JNI section of `unimplemented::report` is empty for the
+        // wrong reason and reads as "nothing was missing". It produced exactly
+        // that false negative on its first real run.
+        //
+        // It is ruinously slow: the engine polls `MotionEvent.getRawX`/`getRawY`
+        // per pointer per frame and this writes a line for each, unbuffered. Use
+        // it to take an inventory, not to play.
+        .define(
+            "CORDIAL_JNI_TRACE",
+            if std::env::var_os("CORDIAL_JNI_TRACE").is_some() { "ON" } else { "OFF" },
+        )
         .build();
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
@@ -34,6 +50,8 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=z");
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=pthread");
+
+    println!("cargo:rerun-if-env-changed=CORDIAL_JNI_TRACE");
 
     // Watch the whole native tree, not a hand-maintained list. A file missing
     // from that list is not a build error — Cargo simply does not re-run this

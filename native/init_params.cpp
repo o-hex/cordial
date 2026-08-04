@@ -1592,6 +1592,72 @@ int cordial_appbridge_start_app(void* fn, const char* assets, int width, int hei
     }
 }
 
+/// `NativeGLInterface.nativeAppBridgeV2UpdateSurfaceAppWithPlatformParams(Surface, PlatformParams)`
+/// and `...UpdateSurfaceGameWithPlatformParams(Surface, PlatformParams, Activity)`.
+///
+/// **Measured gap, 2026-08-04.** Sober makes 87 `FLog::JNIAppBridge` calls in a
+/// session and Cordial made 3; these two were among the ones Cordial never made,
+/// and neither was referenced anywhere in the tree. Sober calls both at about
+/// 3.79s — before any join — and again at 109s, so they are not a one-shot part
+/// of startup. Everything they need was already built here for
+/// `StartAppWithParams`; nothing was constructing them and handing them over.
+///
+/// Whether this is what the server wants before it stops sending disconnect
+/// reason 304 is **not established**. It is the largest measured difference
+/// between a client that stays connected and one that does not, which is a
+/// reason to try it and not a reason to claim it.
+///
+/// The signatures come from the dex's own method table
+/// (`tools/dex_method.py`), not from reading what the Java side does with them.
+static int update_surface(void* fn, const char* assets, int width, int height, bool with_activity,
+                          char* err, size_t err_len) {
+    using CallApp = void (*)(JNIEnv*, jobject, jobject, jobject);
+    using CallGame = void (*)(JNIEnv*, jobject, jobject, jobject, jobject);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or the UpdateSurface native is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeGLInterface");
+        // The same Surface and PlatformParams `StartAppWithParams` builds — one
+        // registered `android/view/Surface` C++ class for the one Java name, or
+        // libjnivm throws on the second registration.
+        auto surface = cordial::AppSurface::Create(env);
+        auto params = cordial::PlatformParams::Create(env, assets, width, height);
+        if (with_activity) {
+            auto activity = cordial::AndroidActivity::Create(env);
+            reinterpret_cast<CallGame>(fn)(env->GetJNIEnv(),
+                                           (jobject)cordial::to_jni(env, cls),
+                                           (jobject)cordial::to_jni(env, surface),
+                                           (jobject)cordial::to_jni(env, params),
+                                           (jobject)cordial::to_jni(env, activity));
+        } else {
+            reinterpret_cast<CallApp>(fn)(env->GetJNIEnv(),
+                                          (jobject)cordial::to_jni(env, cls),
+                                          (jobject)cordial::to_jni(env, surface),
+                                          (jobject)cordial::to_jni(env, params));
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+int cordial_appbridge_update_surface_app(void* fn, const char* assets, int width, int height,
+                                         char* err, size_t err_len) {
+    return update_surface(fn, assets, width, height, /*with_activity=*/false, err, err_len);
+}
+
+int cordial_appbridge_update_surface_game(void* fn, const char* assets, int width, int height,
+                                          char* err, size_t err_len) {
+    return update_surface(fn, assets, width, height, /*with_activity=*/true, err, err_len);
+}
+
 } // extern "C"
 
 extern "C" {

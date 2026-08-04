@@ -406,6 +406,22 @@ pub mod game_activity {
             err: *mut c_char,
             n: usize,
         ) -> c_int;
+        fn cordial_appbridge_update_surface_app(
+            f: *mut c_void,
+            assets: *const c_char,
+            w: c_int,
+            h: c_int,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
+        fn cordial_appbridge_update_surface_game(
+            f: *mut c_void,
+            assets: *const c_char,
+            w: c_int,
+            h: c_int,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
         fn cordial_call_static_bare_bool(
             f: *mut c_void,
             class_name: *const c_char,
@@ -1002,6 +1018,32 @@ pub mod game_activity {
 
     /// `nativeAppBridgeV2StartAppWithParams` — the call that hands the engine
     /// its window. Everything before it is setup.
+    /// `nativeAppBridgeV2UpdateSurfaceApp/GameWithPlatformParams`.
+    ///
+    /// Two calls Sober makes and Cordial did not — see `update_surface` in
+    /// `native/init_params.cpp` for the measurement. `game` selects the
+    /// three-argument form, which takes an Activity as well.
+    pub fn appbridge_update_surface(
+        native: *mut c_void,
+        assets: &str,
+        width: i32,
+        height: i32,
+        game: bool,
+    ) -> Result<(), String> {
+        let a = CString::new(assets).map_err(|e| e.to_string())?;
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; `a` outlives the call.
+        let rc = unsafe {
+            let f = if game {
+                cordial_appbridge_update_surface_game
+            } else {
+                cordial_appbridge_update_surface_app
+            };
+            f(native, a.as_ptr(), width, height, err.as_mut_ptr() as *mut c_char, err.len())
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
     pub fn appbridge_start_app(
         native: *mut c_void,
         assets: &str,

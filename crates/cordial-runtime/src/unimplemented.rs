@@ -163,6 +163,17 @@ fn report_path() -> PathBuf {
 /// capturing stdout.
 pub fn render() -> String {
     let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    render_from(&seen)
+}
+
+/// The formatting, over a map passed in.
+///
+/// Split from [`render`] because the register is a process-global and tests
+/// that share one interfere: the first version of these tests passed run alone
+/// and failed under `cargo test --workspace`, where a test recording a JNI entry
+/// raced one asserting the JNI section was absent. Same arrangement, and the
+/// same reason, as `window::busy_body` and `updater::dressing`.
+fn render_from(seen: &BTreeMap<(Kind, String), u64>) -> String {
     if seen.is_empty() {
         return "=== nothing went unanswered this run ===\n".to_string();
     }
@@ -225,27 +236,35 @@ pub fn report() {
 mod tests {
     use super::*;
 
+    /// A register of its own, so these do not race each other through the
+    /// process-global one. That interference is not hypothetical: the first
+    /// version of these tests passed individually and failed under
+    /// `cargo test --workspace`.
+    fn map(entries: &[(Kind, &str, u64)]) -> BTreeMap<(Kind, String), u64> {
+        entries.iter().map(|(k, d, n)| ((*k, (*d).to_string()), *n)).collect()
+    }
+
     #[test]
     fn repeats_are_counted_rather_than_repeated() {
         // The behaviour that makes this readable at all: one missing callback
         // arrived tens of thousands of times in a single session, and a report
         // that printed it once per call would be the log it was meant to replace.
-        record(Kind::Jni, "Class=`Foo`, Method=`bar`");
-        record(Kind::Jni, "Class=`Foo`, Method=`bar`");
-        record(Kind::Jni, "Class=`Foo`, Method=`bar`");
-        let text = render();
+        let text = render_from(&map(&[(Kind::Jni, "Class=`Foo`, Method=`bar`", 3)]));
         assert_eq!(text.matches("Class=`Foo`, Method=`bar`").count(), 1, "{text}");
         assert!(text.contains("3  Class=`Foo`, Method=`bar`"), "{text}");
     }
 
     #[test]
     fn a_placeholder_records_what_it_returned_not_just_that_it_failed() {
-        // "Not implemented" is not actionable. The value handed back is the
-        // thing the engine then reasons from, so it is the thing worth writing
-        // down -- the same argument `native/opensles.cpp` makes for reporting
-        // failure rather than a dead object.
-        placeholder("PackageManager.getInstallerPackageName", "an empty string");
-        let text = render();
+        // "Not implemented" is not actionable. The value handed back is what the
+        // engine then reasons from, so it is the thing worth writing down -- the
+        // same argument `native/opensles.cpp` makes for reporting failure rather
+        // than returning a dead object.
+        let text = render_from(&map(&[(
+            Kind::Placeholder,
+            "PackageManager.getInstallerPackageName -> an empty string",
+            1,
+        )]));
         assert!(text.contains("an empty string"), "{text}");
         assert!(text.contains("PackageManager.getInstallerPackageName"), "{text}");
     }
@@ -253,11 +272,10 @@ mod tests {
     #[test]
     fn the_report_says_it_is_a_work_queue_rather_than_a_cause() {
         // Load-bearing wording. Nine consecutive conclusions in this project's
-        // history came from reading a plausible-looking artefact and deciding it
-        // explained the bug; a report listing gaps invites exactly that, so it
-        // has to say what it is not.
-        record(Kind::LibcStub, "some_symbol");
-        let text = render();
+        // history came from reading a plausible artefact and deciding it
+        // explained the bug; a list of gaps invites exactly that, so it has to
+        // say what it is not.
+        let text = render_from(&map(&[(Kind::LibcStub, "some_symbol", 1)]));
         assert!(text.contains("not a diagnosis"), "{text}");
         assert!(text.contains("Only what was reached this run"), "{text}");
     }
@@ -265,23 +283,35 @@ mod tests {
     #[test]
     fn an_empty_jni_section_says_the_trace_was_off_rather_than_implying_none() {
         // The false negative this report produced on its first real run: it
-        // listed no JNI gaps on a full signed-in session, which read as "the JNI
-        // surface is complete" and was really "the marker is behind
-        // `#ifdef JNI_TRACE` and the trace was off". A blank section that does
-        // not say why is worse than no section.
-        record(Kind::LibcStub, "something_so_the_report_is_not_empty");
-        let text = render();
+        // listed no JNI gaps on a full signed-in session, which reads as "the
+        // JNI surface is complete" and was really "the marker is behind
+        // `#ifdef JNI_TRACE` and the trace was off".
+        let text = render_from(&map(&[(Kind::LibcStub, "anything", 1)]));
         assert!(text.contains("NOT evidence there were none"), "{text}");
         assert!(text.contains("CORDIAL_JNI_TRACE"), "{text}");
+
+        // And it does not say it when the section has something in it.
+        let with_jni = render_from(&map(&[(Kind::Jni, "Class=`X`, Method=`y`", 1)]));
+        assert!(!with_jni.contains("NOT evidence there were none"), "{with_jni}");
     }
 
     #[test]
     fn the_c_entry_point_maps_its_codes_to_the_right_headings() {
-        let name = std::ffi::CString::new("from_cpp").unwrap();
+        // Exercises the global deliberately -- it is the only way to reach the
+        // C entry point -- and asserts only on its own detail string, so it
+        // cannot be disturbed by, or disturb, anything else in the register.
+        let name = std::ffi::CString::new("from_cpp_marker").unwrap();
         // SAFETY: a live, NUL-terminated string for the duration of the call.
         unsafe { cordial_unimplemented_record(0, name.as_ptr()) };
-        let text = render();
-        assert!(text.contains("libjnivm does not have"), "{text}");
-        assert!(text.contains("from_cpp"), "{text}");
+        let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(seen.get(&(Kind::Jni, "from_cpp_marker".to_string())), Some(&1));
+    }
+
+    #[test]
+    fn every_kind_has_a_heading_so_none_can_be_added_without_one() {
+        for kind in [Kind::Jni, Kind::LibcStub, Kind::NativeNotRegistered, Kind::Placeholder] {
+            let text = render_from(&map(&[(kind, "detail", 1)]));
+            assert!(text.contains(kind.heading()), "{kind:?} missing its heading");
+        }
     }
 }

@@ -44,6 +44,12 @@ pub fn hit(index: usize) -> i64 {
         first
     };
 
+    // Once per symbol into the central register, so the end-of-run report can
+    // put libc stubs beside the JNI and framework gaps rather than in a table of
+    // their own that has to be correlated by hand.
+    if first {
+        crate::unimplemented::record(crate::unimplemented::Kind::LibcStub, SYMBOLS[index].0);
+    }
     if first && !quiet() {
         eprintln!("[stub] {}", SYMBOLS[index].0);
     }

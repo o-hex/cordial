@@ -26,6 +26,9 @@ fn main() {
     println!("cargo:rustc-link-lib=static=cordial_jni_shim");
     println!("cargo:rustc-link-lib=static=cordial_liblog");
     println!("cargo:rustc-link-lib=static=jnivm");
+    // After jnivm: it is jnivm that references `Log::debug`, and a static
+    // archive only satisfies symbols from archives listed after it.
+    println!("cargo:rustc-link-lib=static=logger");
     println!("cargo:rustc-link-lib=static=linker");
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-lib=dylib=z");

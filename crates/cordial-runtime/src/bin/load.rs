@@ -1669,6 +1669,14 @@ fn main() -> ExitCode {
 
     stubs::report();
 
+    // Everything the engine asked for that Cordial could not answer, in one
+    // table: JNI classes and methods libjnivm never had, libc stubs, AGDK
+    // natives called while unregistered, and framework calls that returned
+    // something invented. Printed and written beside the engine's own logs,
+    // because the question after a failure is "what did we fail to tell it"
+    // and the answer used to be spread across four kinds of line.
+    cordial_runtime::unimplemented::report();
+
     // Before `_exit`, which runs nothing. gamemoded would notice the process
     // was gone on its own — it reaps clients whose pid has vanished — but that
     // is a poll, so leaving it implicit means the governor stays raised for

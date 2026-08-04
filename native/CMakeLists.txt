@@ -154,6 +154,26 @@ option(CORDIAL_JNI_TRACE "Log every JNI call libjnivm handles (very slow)" OFF)
 set(JNIVM_ENABLE_TRACE ${CORDIAL_JNI_TRACE} CACHE BOOL "" FORCE)
 set(JNIVM_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
 set(JNIVM_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+# libjnivm's own seam, taken rather than patched. Its CMakeLists says
+#
+#     if(TARGET logger)
+#         target_compile_definitions(jnivm PRIVATE HAVE_LOGGER)
+#         target_link_libraries(jnivm PRIVATE logger)
+#     endif()
+#
+# so defining a target with that name before the `add_subdirectory` below is the
+# entire integration. Nothing in `third_party/` changes, which matters because
+# the JNI surface is the part of this tree most likely to want a newer libjnivm
+# and a vendored dependency carrying local edits is one nobody updates.
+#
+# What it captures is `Constructed Unresolved symbol` — the only notice Cordial
+# gets that the engine asked for a Java class, method or field nobody has
+# written. See `jnivm_logger/log.cpp`.
+add_library(logger STATIC jnivm_logger/log.cpp)
+target_include_directories(logger PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/jnivm_logger)
+set_target_properties(logger PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libjnivm
                  ${CMAKE_CURRENT_BINARY_DIR}/libjnivm EXCLUDE_FROM_ALL)
 
@@ -165,4 +185,4 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libjnivm
 add_library(cordial_jni_shim STATIC jni_shim.cpp android_classes.cpp game_activity.cpp init_params.cpp accessibility.cpp cookies.cpp audio_classes.cpp deeplink.cpp clipboard.cpp)
 target_link_libraries(cordial_jni_shim PUBLIC jnivm)
 
-install(TARGETS cordial_jni_shim jnivm ARCHIVE DESTINATION lib)
+install(TARGETS cordial_jni_shim jnivm logger ARCHIVE DESTINATION lib)

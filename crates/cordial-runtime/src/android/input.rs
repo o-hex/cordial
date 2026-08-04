@@ -141,6 +141,7 @@ pub fn keysym_to_android(keysym: c_ulong) -> Option<i32> {
 /// floor is not tracing, and the one run where it mattered had the flag on and
 /// still learned nothing.
 pub(crate) fn report_unregistered(name: &'static str) {
+    crate::unimplemented::record(crate::unimplemented::Kind::NativeNotRegistered, name);
     static DROPPED: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
     let n = {
         let mut seen = DROPPED.lock().unwrap_or_else(|e| e.into_inner());

@@ -108,10 +108,15 @@ modules:
         # which was half of issue #3 and the cheap half. Vendoring the crate
         # graph is the other half and is still open.
         #
-        # This is what keeps Cordial off Flathub, and that is a deliberate
-        # trade rather than an oversight: the remote is hosted from this
-        # repository's own GitHub Pages, which has no such rule. Anyone
-        # submitting to Flathub has to finish issue #3 first.
+        # This used to say it "is what keeps Cordial off Flathub". It is not,
+        # and that mattered enough to correct: Flathub's generative-AI policy
+        # does not allow applications containing AI-generated or AI-assisted
+        # code or documentation, and Cordial's history records exactly that in
+        # its commit trailers. Finishing issue #3 would not change the answer.
+        #
+        # It is still worth finishing. A build that does not reach the network
+        # is a build that is reproducible, which is the reason that outlives
+        # whichever remote the package is served from. See docs/HANDOVER.md.
         - --share=network
     build-commands:
       - cargo build --release --offline || cargo build --release

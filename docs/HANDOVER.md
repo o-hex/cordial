@@ -273,30 +273,53 @@ and it rewrote prose in this very file that was *about* the old identifier,
 turning a true sentence into a false one. Grep the diff for the new string in
 running text, not just in code.
 
-## Getting onto Flathub, and what currently prevents it
+## Flathub, and why it is not the plan
 
-Three things, in the order they will stop you:
+**Flathub's generative-AI policy does not allow applications containing
+AI-generated or AI-assisted code, documentation, or any other content**, and it
+extends to the submission itself: the pull request, manifest, metadata, patches,
+build scripts and every review comment on it must not be LLM-generated either.
+Submissions that violate it can be rejected without further review, and repeat
+violations can earn a permanent ban.
+
+**Cordial is squarely inside that.** Large parts of the tree, this document
+included, were written with an LLM, and the git history says so in
+`Co-Authored-By` trailers on dozens of commits. That was recorded deliberately
+and it should stay recorded.
+
+So the honest position is: **the GitHub Pages remote is Cordial's distribution
+channel**, not a waiting room. Anything in the tree that reads as "until we get
+on Flathub" is wrong and should be corrected where you find it.
+
+The policy does say **exceptions may be granted for mature, well-maintained
+projects.** That is the only route, and it is a route that starts with saying
+plainly what is in the tree, in a pull request a human wrote. It is not a route
+that starts with rewriting history to remove the trailers — that is deceiving the
+reviewers the policy exists to serve, and it would cost this project the one
+property that makes its claims worth anything.
+
+**If somebody does pursue an exception**, three technical things still stand in
+the way and are worth fixing regardless, because they are what a self-hosted
+remote wants anyway:
 
 1. **The build needs the network** ([issue #3](https://github.com/luohoa97/cordial/issues/3)).
    Flathub's builders have none. The submodule half is done — `libjnivm` and
    `mcpelauncher-linker` are pinned as `git` sources by commit — and the crate
    half is not. `flatpak-cargo-generator.py` from `flatpak-builder-tools` turns
    `Cargo.lock` into a `cargo-sources.json`, after which `--share=network` comes
-   out of `build-options.build-args`. This is the only blocker that is real work.
-2. ~~**The application ID.**~~ **Done** — see the section above.
+   out of `build-options.build-args`. This also makes the local build
+   reproducible, which is reason enough on its own.
+2. ~~**The application ID.**~~ **Done** — `io.github.luohoa97.Cordial`, see the
+   section above.
 3. **No screenshots.** The metainfo has none, and Flathub's linter requires at
-   least one. This is the cheapest of the three and the one most likely to be
-   forgotten until a reviewer asks.
+   least one. Cheap, and worth having for the software-centre listing on the
+   existing remote whatever happens with Flathub.
 
-**What will not stop you, despite feeling like it should:** a third-party Roblox
+**What would not have stopped you, for the record:** being a third-party Roblox
 client is not itself disqualifying — Sober ships on Flathub as
-`org.vinegarhq.Sober`. Cordial's position is if anything the easier one to
-defend, because it ships no Roblox code, asset or APK at all and the user
-supplies the client, where Sober fetches it. Say that plainly in the submission
-along with the fact that there is no script execution, hooking or memory access
-([ADR-001](adr/ADR-001-in-process-hooking.md)); a reviewer's first question will
-be whether this is a cheat client, and the answer should be in the first
-paragraph rather than three replies down.
+`org.vinegarhq.Sober` — and Cordial's case is the easier one, since it ships no
+Roblox code, asset or APK at all and the user supplies the client where Sober
+fetches it. That was never the obstacle. The AI policy is.
 
 ## Traps that have already caught people
 

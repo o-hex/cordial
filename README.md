@@ -208,26 +208,32 @@ list of build dependencies moved down to §3, where it belongs.
 
 ### 2. Install it
 
+**This is the way to install Cordial.** Building from source (§3) is for people
+changing it, not for people running it.
+
 > [!NOTE]
-> **The remote exists and serves, and the package installs.** Measured on
-> 2026-08-05 against the published URL with flatpak 1.18.0: `remote-add`
-> accepted, `remote-ls` returning the application ref at 6.1 MB to download and
-> 16.1 MB installed, `install` placing both `cordial-shell` and `cordial-run` in
-> `/app/bin`, and `cordial-run --help` answering from inside the sandbox. The
-> appstream branch resolves and the metainfo validates, so a software centre can
-> list it.
+> **Measured end to end on 2026-08-05, flatpak 1.18.0**, against the published
+> URL rather than a stand-in: `remote-add` accepted, `remote-ls` returning
+> `app/io.github.luohoa97.Cordial/x86_64/master`, `install` placing both
+> `cordial-shell` and `cordial-run` in `/app/bin`, and `flatpak run` bringing up
+> the launcher window and holding it. The appstream branch resolves and the
+> metainfo validates, so a software centre lists it too.
 >
-> Those measurements were taken under the previous application ID. The ID
-> changed to `io.github.luohoa97.Cordial` in 0.5.1 — see
-> [CHANGELOG.md](CHANGELOG.md) — so the ref name above is the one the next
-> published build carries, not the one that was measured.
+> **Cordial is not on Flathub, and on current policy it cannot be.** Flathub's
+> generative-AI policy does not allow applications containing AI-generated or
+> AI-assisted code, documentation or content, and Cordial contains a great deal
+> of both — the git history records it in `Co-Authored-By` trailers rather than
+> hiding it. The policy allows exceptions for mature, well-maintained projects,
+> and that is the only route; it is not one to take by quietly deleting the
+> evidence. **This remote is therefore the distribution channel, not a stopgap
+> until a better one arrives.**
 >
-> **What has not been made to work is the shell opening a window.** From the
-> installed package `cordial-shell` exits 0 immediately, printing nothing. The
-> leading candidate is that a `GApplication` with a fixed id is single-instance
-> by design, and a development build running from `target/release` already owned
-> the name — but **the control for that has not been run**, so treat it as an
-> open question rather than a diagnosis. §3 builds the same thing from source.
+> **One known limitation of the Flatpak specifically.** The updater asks
+> NetworkManager on the system bus whether your connection is metered, the
+> sandbox has no system bus, and the check fails closed — so a Flatpak install
+> treats every connection as metered and will not download a Roblox build in the
+> background unless you turn on *Download on metered connections*. Manual
+> downloads are unaffected.
 >
 > [The workflow](https://github.com/luohoa97/cordial/actions/workflows/flatpak.yml)
 > is worth a glance before a fresh install: it publishes only on a green run, so
@@ -264,7 +270,12 @@ but a remote added while it was unsigned stays unverified, so re-add it.
 If you would rather not extend that trust, §3 builds the same package from
 source and is the whole of the alternative.
 
-### 3. Build it from source instead
+### 3. Or build it from source
+
+**You do not need this to run Cordial** — §2 is the install route, and it is
+measured to work. Build from source if you are changing Cordial, if you would
+rather not extend trust to an unsigned remote, or if you want a build with your
+own patches in it.
 
 Building needs rather more than running does:
 

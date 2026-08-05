@@ -429,6 +429,29 @@
       button, because Roblox publishes no Android file to download — it distributes through
       Google Play and the Amazon Appstore.
     </p>
+<pre><span class="c"># Add the remote and install. This is the way to install Cordial.</span>
+flatpak remote-add --if-not-exists cordial \
+  https://luohoa97.github.io/cordial/cordial.flatpakrepo
+flatpak install cordial io.github.luohoa97.Cordial</pre>
+    <p>
+      Then launch it from your application list, or <code>flatpak run
+      io.github.luohoa97.Cordial</code>. <code>flatpak update</code> picks up new builds.
+    </p>
+    <div class="callout">
+      <p><strong>Cordial is not on Flathub, and on current policy it cannot be.</strong>
+      Flathub does not allow applications containing AI-generated or AI-assisted code,
+      documentation or content, and Cordial contains a great deal of both &mdash; its git
+      history records that in <code>Co-Authored-By</code> trailers rather than hiding it.
+      So this remote is the distribution channel, not a stopgap until a better one arrives.</p>
+      <p><strong>The remote is unsigned.</strong> <code>flatpak install</code> checks that what
+      it downloaded matches the repository&rsquo;s own checksums, and nothing beyond that &mdash;
+      it does not prove who built it. Anyone who can write to this GitHub&nbsp;Pages site can
+      serve a different package under the same name. That is a weaker guarantee than
+      Flathub&rsquo;s, and you should know which one you are taking.</p>
+    </div>
+    <p class="section__intro">
+      Building from source is for changing Cordial rather than for running it:
+    </p>
 <pre><span class="c"># Clang is required; AOSP bionic does not build with GCC.</span>
 cargo build --release
 cargo test --workspace
@@ -437,11 +460,6 @@ cargo test --workspace
 cargo run --release --bin cordial-run -- \
   --lib-dir /path/to/lib/x86_64 --apk /path/to/base.apk \
   --host-libc --game-activity</pre>
-    <div class="callout">
-      <p>A Flatpak and a signed remote are in preparation, so this becomes two commands.</p>
-      <p>It is not published yet, and this page will say so until it is. Announcing an install
-      route that does not work is the same failure as a button that does nothing.</p>
-    </div>
   </div>
 </section>
 

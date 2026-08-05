@@ -1,6 +1,6 @@
 <svg width="420" height="420" viewBox="130 30 420 420" role="img" xmlns="http://www.w3.org/2000/svg">
   <!--
-    The application icon, kept separate from ../../../org.cordial.Cordial.svg
+    The application icon, kept separate from ../../../io.github.luohoa97.Cordial.svg
     because that one is the README banner and is 680x480. flatpak-builder runs
     flatpak-validate-icon over everything it exports and refuses a non-square
     icon outright — "Expected a square icon but got: 680x480", and the export

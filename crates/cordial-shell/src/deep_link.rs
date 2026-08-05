@@ -2,7 +2,7 @@
 //! believed.
 //!
 //! Cordial registers as the handler for `roblox-player:` and `roblox:` in
-//! `packaging/org.cordial.Cordial.desktop`, which is the thing Sober did and the
+//! `packaging/io.github.luohoa97.Cordial.desktop`, which is the thing Sober did and the
 //! reason a Play button on the website has anywhere to go on this machine. What
 //! arrives is a string produced by a browser acting on a click, so it is treated
 //! as hostile input rather than as an instruction: nothing here builds a path
@@ -29,7 +29,7 @@
 /// The schemes Cordial answers for.
 ///
 /// **These have to stay in step with `MimeType` in
-/// `packaging/org.cordial.Cordial.desktop`.** A scheme registered there and
+/// `packaging/io.github.luohoa97.Cordial.desktop`.** A scheme registered there and
 /// missing here is a link the desktop hands over and the shell throws away with
 /// a line on a stdout nobody is reading; the reverse is a scheme nothing will
 /// ever deliver.

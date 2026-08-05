@@ -2,20 +2,28 @@
 #
 #     flatpak remote-add --if-not-exists cordial \
 #         https://luohoa97.github.io/cordial/cordial.flatpakrepo
-#     flatpak install cordial org.cordial.Cordial
+#     flatpak install cordial io.github.luohoa97.Cordial
 #
 # installs Cordial without anyone building anything.
 #
-# INFERRED: none of this has been run on a GitHub runner. What *was* run, on a
-# Fedora workstation with flatpak 1.18.0, flatpak-builder 1.4.10 and libostree
-# 2026.2, is every flatpak/ostree step below against a stand-in app with the
-# real desktop file, icon and metainfo: export, `build-update-repo`, deleting
-# the `.Debug` ref, `--prune`, serving the result over a plain static HTTP
-# server, `remote-add` from the `.flatpakrepo`, `install`, and `run`. Signed and
-# unsigned were both exercised, and a signed remote definition pointed at an
-# unsigned repository was correctly refused. What is *not* verified is the
-# runner: apt package names, the disk budget, and whether Cordial itself
-# compiles inside the Flatpak SDK, which nobody has yet done on any machine.
+# This header used to be marked INFERRED, on the grounds that none of it had run
+# on a GitHub runner and that nobody had compiled Cordial inside the Flatpak SDK
+# on any machine. Both are now false, and the correction is worth more than the
+# caveat was: three consecutive green runs on 2026-08-05, and the whole workspace
+# — gtk4, gdk4, gsk4, gdk4-wayland, libadwaita and all five crates — builds
+# inside org.gnome.Sdk//50. The runner's apt package names and disk budget hold.
+#
+# What the old note claimed *had* been exercised locally is where it went wrong.
+# It said signed and unsigned `.flatpakrepo` forms were both tested and that a
+# signed definition over an unsigned repository was correctly refused. Whatever
+# was tested, it was not the unsigned form this workflow writes: it emitted
+# `GPGKey=` with an empty value, which flatpak 1.18.0 refuses outright with
+# `error: Invalid gpg key`. That was only discovered once a run went green and
+# the generated file existed to be added at all.
+#
+# Verified against the deployed remote, not a stand-in: `remote-add` accepted,
+# `remote-ls` returning app/io.github.luohoa97.Cordial/x86_64/master, and
+# `install` placing both cordial-shell and cordial-run in /app/bin.
 #
 # The site and the repository share one Pages deployment:
 #
@@ -58,8 +66,8 @@ concurrency:
 # not derived from github.repository here: the Url a user's flatpak remembers
 # must not change under them because the repository was renamed or forked.
 env:
-  APP_ID: org.cordial.Cordial
-  MANIFEST: packaging/org.cordial.Cordial.yml
+  APP_ID: io.github.luohoa97.Cordial
+  MANIFEST: packaging/io.github.luohoa97.Cordial.yml
 
 jobs:
   build:
@@ -125,7 +133,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .flatpak-builder/downloads
-          key: flatpak-downloads-${{ hashFiles('Cargo.lock', 'packaging/org.cordial.Cordial.yml') }}
+          key: flatpak-downloads-${{ hashFiles('Cargo.lock', 'packaging/io.github.luohoa97.Cordial.yml') }}
           restore-keys: flatpak-downloads-
 
       # Absent secret means an unsigned repository, and the README says so in
@@ -231,7 +239,7 @@ jobs:
             #   GPGKey=      -> error: Invalid gpg key      (remote-add fails)
             #   omitted      -> accepted; gpg-verify=false,
             #                   gpg-verify-summary=false, and
-            #                   app/org.cordial.Cordial/x86_64/master lists
+            #                   app/io.github.luohoa97.Cordial/x86_64/master lists
             #
             # So an unsigned remote is expressed by the absence of the line, and
             # the README is where "this remote is unsigned" gets said to a human

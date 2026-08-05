@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 /// The `xdg_toplevel` app_id this window carries, and X11's `WM_CLASS` before
 /// it. Must keep matching `StartupWMClass` in
-/// `packaging/org.cordial.Cordial.desktop` for the reasons in ADR-009 — GNOME
+/// `packaging/io.github.luohoa97.Cordial.desktop` for the reasons in ADR-009 — GNOME
 /// Shell, the screen-cast portal's window picker and every capture tool match a
 /// window to its desktop entry through this string, and a drift shows up as a
 /// missing icon rather than as an error. Pinned by
@@ -439,7 +439,7 @@ mod tests {
         // the toplevel now, so this constant is what reaches the wire, and the
         // test has to live beside it or it pins nothing. ADR-009 is why the
         // two must agree.
-        let desktop = include_str!("../../../packaging/org.cordial.Cordial.desktop");
+        let desktop = include_str!("../../../packaging/io.github.luohoa97.Cordial.desktop");
         let declared = desktop
             .lines()
             .find_map(|l| l.strip_prefix("StartupWMClass="))

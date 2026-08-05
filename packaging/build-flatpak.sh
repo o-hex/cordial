@@ -14,7 +14,7 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$here")"
-manifest="$here/org.cordial.Cordial.yml"
+manifest="$here/io.github.luohoa97.Cordial.yml"
 builddir="$root/target/flatpak"
 repo="$root/target/flatpak-repo"
 
@@ -81,12 +81,12 @@ echo
 echo "built into $repo"
 
 # A single-file bundle, which is what you hand someone who wants to try it.
-flatpak build-bundle "$repo" "$root/target/cordial.flatpak" org.cordial.Cordial
+flatpak build-bundle "$repo" "$root/target/cordial.flatpak" io.github.luohoa97.Cordial
 echo "bundle: $root/target/cordial.flatpak"
 
 if [[ "${1:-}" == "--install" ]]; then
-    flatpak install --user --noninteractive --or-update --reinstall "$repo" org.cordial.Cordial
-    echo "installed. run with: flatpak run org.cordial.Cordial"
+    flatpak install --user --noninteractive --or-update --reinstall "$repo" io.github.luohoa97.Cordial
+    echo "installed. run with: flatpak run io.github.luohoa97.Cordial"
 else
     echo "install with: packaging/build-flatpak.sh --install"
 fi

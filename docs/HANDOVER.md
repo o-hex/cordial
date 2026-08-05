@@ -223,48 +223,55 @@ no file. Sober does not fetch from Roblox either; it routes users through Google
 Play. Aptoide is deliberately not wired — a mirror offering only a hash it
 supplied itself is verification theatre.
 
-## The application ID names a domain this project does not own
+## The application ID, and why it is not org.cordial.Cordial
 
-**`org.cordial.Cordial` is a claim on `cordial.org`, and `cordial.org` belongs to
-somebody else.** It was registered on 1999-04-16, is held through InterNetX GmbH
-with `clientTransferProhibited` set, currently resolves to 185.148.170.48 behind
-iwelt.de nameservers, and does not expire until 2027-04-16. It is a twenty-seven
-year old domain in active use. "Register cordial.org" is not on the table, and
-anyone who assumes it is will waste an afternoon finding that out.
+**It was, until 2026-08-05, and that was a claim on a domain this project does
+not own.** `cordial.org` was registered on 1999-04-16, is held through InterNetX
+GmbH with `clientTransferProhibited` set, resolves to 185.148.170.48 behind
+iwelt.de nameservers and does not expire until 2027-04-16. It is a
+twenty-seven-year-old domain in active use. **"Just register cordial.org" is not
+on the table**, and anyone who assumes it is will spend an afternoon finding that
+out — which is the only reason this section still exists now that the rename is
+done.
 
-This matters because **Flathub requires the application ID to be a domain or
-forge account you demonstrably control**, and will reject a submission that
-claims one it does not. It is not a formality: the ID is what a user's machine
-trusts for the lifetime of the install.
+It mattered because **Flathub requires an application ID over a domain or forge
+account you demonstrably control**, and rejects a submission claiming one it does
+not. It is not a formality: the ID is what a user's machine trusts for the
+lifetime of the install.
 
-There are two honest ways out, and they are not equal:
+The ID is now **`io.github.luohoa97.Cordial`**, which needs no domain, matches
+the homepage, and is what `<developer id="io.github.luohoa97">` in the metainfo
+had been saying all along.
 
-1. **Rename to `io.github.luohoa97.Cordial`.** Costs nothing, needs no domain,
-   is what the homepage already is, and is what `<developer id="io.github.luohoa97">`
-   in the metainfo already says. This is the recommendation.
-2. **Acquire a domain the project actually controls** — `cordial.app`,
-   `getcordial.org`, anything free — and use its reverse ID. Worth it only if
-   somebody wants the project to have its own domain for its own sake, and it
-   should be bought *before* the rename, not after.
+**It was done on the same day the remote first went live, on purpose.** A rename
+after a package has users is a support burden; before, it is a `git mv` and a
+sed. If you are reading this because you want to move to a real domain later,
+that is fine — buy it first, and expect the cost below rather than the cost
+above.
 
-**What a rename touches**, because it is more than a string:
+**What a rename touches**, recorded because the next one will need it:
 
-- `app-id` in `packaging/org.cordial.Cordial.yml`, and the `APP_ID` env in
-  `.github/workflows/flatpak.yml`
-- the manifest, desktop, metainfo and icon **filenames**, all four of which must
-  match the new ID
-- `<id>` in the metainfo
-- `flatpak install cordial <id>` in the README, and the `Icon=` URL in
-  `packaging/cordial.flatpakrepo`
-- **user data.** A Flatpak's data lives at `~/.var/app/<app-id>/`, so a rename
-  silently orphans every existing profile, sign-in and extracted Roblox build.
-  Anyone doing this owes users either a migration or a release note that says
-  plainly what will be left behind — and given [ADR-012](adr/ADR-012-profiles-and-instances.md)
-  holds profiles under an `flock`, a migration that runs while an instance is up
-  is its own problem.
+- `app-id` in the manifest, and `APP_ID` in `.github/workflows/flatpak.yml`
+- the manifest, desktop, metainfo and **both** icon filenames — all of which must
+  match the ID, and one of which is the README banner rather than the app icon
+- `<id>` and `<launchable>` in the metainfo
+- `const APP_ID` in `crates/cordial-shell/src/main.rs`, which is also what makes
+  Cordial single-instance
+- two `include_str!` paths that pin the desktop file's contents from tests
+- the `Icon=` URL in `packaging/cordial.flatpakrepo`
+- the README's install, uninstall and plugin-directory paths
+- **user data**, which is the one that bites. A Flatpak's data lives at
+  `~/.var/app/<app-id>/`, so a rename orphans every profile, sign-in and
+  extracted Roblox build behind it. Nobody had any at the time of this one. Next
+  time somebody will, and they are owed either a migration or a release note
+  saying plainly what is being left behind — and since [ADR-012](adr/ADR-012-profiles-and-instances.md)
+  holds profiles under an `flock`, a migration running while an instance is up is
+  its own problem.
 
-Do the rename **before** the remote has users rather than after. It is a
-half-hour change today and a support burden later.
+**Do not do a blanket `sed` over the tree and call it done.** This rename did,
+and it rewrote prose in this very file that was *about* the old identifier,
+turning a true sentence into a false one. Grep the diff for the new string in
+running text, not just in code.
 
 ## Getting onto Flathub, and what currently prevents it
 
@@ -276,7 +283,7 @@ Three things, in the order they will stop you:
    half is not. `flatpak-cargo-generator.py` from `flatpak-builder-tools` turns
    `Cargo.lock` into a `cargo-sources.json`, after which `--share=network` comes
    out of `build-options.build-args`. This is the only blocker that is real work.
-2. **The application ID.** See the section above.
+2. ~~**The application ID.**~~ **Done** — see the section above.
 3. **No screenshots.** The metainfo has none, and Flathub's linter requires at
    least one. This is the cheapest of the three and the one most likely to be
    forgotten until a reviewer asks.

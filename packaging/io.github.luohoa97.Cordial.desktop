@@ -12,7 +12,7 @@ Comment=Run Roblox on Linux
 # The manifest's command: key does not rescue it — that applies to a bare
 # `flatpak run` with no desktop entry involved.
 Exec=cordial-shell %u
-Icon=org.cordial.Cordial
+Icon=io.github.luohoa97.Cordial
 Terminal=false
 Categories=Game;
 # Cordial handles Roblox's own links, which is how a Play button on the website

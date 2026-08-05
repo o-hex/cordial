@@ -4,7 +4,7 @@
 #
 #     flatpak remote-add --if-not-exists cordial \
 #         https://luohoa97.github.io/cordial/cordial.flatpakrepo
-#     flatpak install cordial org.cordial.Cordial
+#     flatpak install cordial io.github.luohoa97.Cordial
 #
 # There is deliberately no GPGKey line here. The workflow appends one when the
 # FLATPAK_GPG_PRIVATE_KEY secret is set, and appends nothing when it is not.
@@ -27,5 +27,5 @@
 Title=Cordial
 Url=https://luohoa97.github.io/cordial/repo/
 Homepage=https://luohoa97.github.io/cordial/
-Icon=https://raw.githubusercontent.com/luohoa97/cordial/main/packaging/icons/hicolor/scalable/apps/org.cordial.Cordial.svg
+Icon=https://raw.githubusercontent.com/luohoa97/cordial/main/packaging/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.svg
 Description=Run Roblox on Linux natively. Cordial loads Roblox's official Android x86-64 engine directly, with no emulator, container or virtual machine. It ships no Roblox code; you supply the Android client yourself.

@@ -1,7 +1,7 @@
 # Flatpak manifest for Cordial.
 #
 # Flatpak is the primary distribution target (spec §11), which is why the plugin
-# directory is `~/.var/app/org.cordial.Cordial/data/plugins/` and drag-and-drop
+# directory is `~/.var/app/io.github.luohoa97.Cordial/data/plugins/` and drag-and-drop
 # is the install path rather than a convenience.
 #
 # Build:
@@ -23,7 +23,7 @@
 #     nowhere near `--filesystem=host`. notify.send and url.open needed no
 #     manifest entry at all; see the comment beside them.
 
-app-id: org.cordial.Cordial
+app-id: io.github.luohoa97.Cordial
 # The GNOME runtime, not the freedesktop one, because the shell is GTK4 and
 # libadwaita (ADR-011) and org.freedesktop.Sdk has neither. This was wrong from
 # the first commit of this file and every CI run failed the same way for it:
@@ -122,17 +122,17 @@ modules:
       # find anything to launch.
       - install -Dm755 target/release/cordial-shell /app/bin/cordial-shell
       - install -Dm755 target/release/cordial-run /app/bin/cordial-run
-      # The square icon, not packaging/icons/org.cordial.Cordial.svg, which is
+      # The square icon, not packaging/icons/io.github.luohoa97.Cordial.svg, which is
       # the 680x480 README banner. flatpak-validate-icon rejects a non-square
       # icon and the export fails rather than warns.
-      - install -Dm644 packaging/icons/hicolor/scalable/apps/org.cordial.Cordial.svg
-          /app/share/icons/hicolor/scalable/apps/org.cordial.Cordial.svg
-      - install -Dm644 packaging/org.cordial.Cordial.desktop
-          /app/share/applications/org.cordial.Cordial.desktop
+      - install -Dm644 packaging/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.svg
+          /app/share/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.svg
+      - install -Dm644 packaging/io.github.luohoa97.Cordial.desktop
+          /app/share/applications/io.github.luohoa97.Cordial.desktop
       # Without this the hosted remote installs but does not browse: a software
       # centre lists the remote and finds nothing in it. See the file.
-      - install -Dm644 packaging/org.cordial.Cordial.metainfo.xml
-          /app/share/metainfo/org.cordial.Cordial.metainfo.xml
+      - install -Dm644 packaging/io.github.luohoa97.Cordial.metainfo.xml
+          /app/share/metainfo/io.github.luohoa97.Cordial.metainfo.xml
       # Licence and attribution. MIT requires its notice in "all copies or
       # substantial portions", and Apache-2.0 section 4(d) requires the NOTICE
       # file to travel with derivative works — both apply to a binary build, not

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/luohoa97/cordial/main/packaging/icons/org.cordial.Cordial.svg" alt="Cordial" width="460">
+  <img src="https://raw.githubusercontent.com/luohoa97/cordial/main/packaging/icons/io.github.luohoa97.Cordial.svg" alt="Cordial" width="460">
 </p>
 
 # Run Roblox on Linux natively — Plugins, all yours. (Please don't DMCA take down this hobby project)
@@ -209,16 +209,25 @@ list of build dependencies moved down to §3, where it belongs.
 ### 2. Install it
 
 > [!NOTE]
-> **The remote exists and serves.** Measured on 2026-08-05 against the published
-> URL with flatpak 1.18.0: `remote-add` is accepted and `flatpak remote-ls`
-> returns `app/org.cordial.Cordial/x86_64/master`, 6.1 MB to download and
-> 16.1 MB installed. It is browsable in a software centre too — the appstream
-> branch resolves and the metainfo validates.
+> **The remote exists and serves, and the package installs.** Measured on
+> 2026-08-05 against the published URL with flatpak 1.18.0: `remote-add`
+> accepted, `remote-ls` returning the application ref at 6.1 MB to download and
+> 16.1 MB installed, `install` placing both `cordial-shell` and `cordial-run` in
+> `/app/bin`, and `cordial-run --help` answering from inside the sandbox. The
+> appstream branch resolves and the metainfo validates, so a software centre can
+> list it.
 >
-> **What has not been observed is the installed package launching.** The build
-> is green and the remote is real; nobody has run `flatpak run
-> org.cordial.Cordial` from it. If it does not start, that is a known unknown
-> rather than a surprise, and §3 builds the same thing from source.
+> Those measurements were taken under the previous application ID. The ID
+> changed to `io.github.luohoa97.Cordial` in 0.5.1 — see
+> [CHANGELOG.md](CHANGELOG.md) — so the ref name above is the one the next
+> published build carries, not the one that was measured.
+>
+> **What has not been made to work is the shell opening a window.** From the
+> installed package `cordial-shell` exits 0 immediately, printing nothing. The
+> leading candidate is that a `GApplication` with a fixed id is single-instance
+> by design, and a development build running from `target/release` already owned
+> the name — but **the control for that has not been run**, so treat it as an
+> open question rather than a diagnosis. §3 builds the same thing from source.
 >
 > [The workflow](https://github.com/luohoa97/cordial/actions/workflows/flatpak.yml)
 > is worth a glance before a fresh install: it publishes only on a green run, so
@@ -227,18 +236,18 @@ list of build dependencies moved down to §3, where it belongs.
 ```bash
 flatpak remote-add --if-not-exists cordial \
     https://luohoa97.github.io/cordial/cordial.flatpakrepo
-flatpak install cordial org.cordial.Cordial
+flatpak install cordial io.github.luohoa97.Cordial
 ```
 
 Then launch Cordial from your desktop's application list, or:
 
 ```bash
-flatpak run org.cordial.Cordial
+flatpak run io.github.luohoa97.Cordial
 ```
 
 `flatpak update` picks up new builds. Uninstall with
-`flatpak uninstall org.cordial.Cordial`, and
-`flatpak uninstall --delete-data org.cordial.Cordial` if you also want the
+`flatpak uninstall io.github.luohoa97.Cordial`, and
+`flatpak uninstall --delete-data io.github.luohoa97.Cordial` if you also want the
 profiles, the sign-in and the extracted Roblox build gone.
 
 **The remote is not signed.** There is no GPG key on it, so `flatpak install`
@@ -305,7 +314,7 @@ From the package, the shell is what starts — it finds a Roblox build, or
 explains how to get one, and launches the engine for you:
 
 ```bash
-flatpak run org.cordial.Cordial
+flatpak run io.github.luohoa97.Cordial
 ```
 
 From a source build, the loader can be run on its own, which is what a debugging
@@ -345,8 +354,8 @@ CORDIAL_MONITOR=1 CORDIAL_FULLSCREEN=1 cargo run --release --bin cordial-run -- 
 Roblox is configured by FastFlags, and Cordial lets you override any of them.
 Create `~/.local/share/cordial/profiles/<profile>/flags.json` (or point
 `CORDIAL_FLAGS` at another file) with a flat object. Installed as a Flatpak the
-sandbox moves `~/.local/share` to `~/.var/app/org.cordial.Cordial/data`, so the
-same file is `~/.var/app/org.cordial.Cordial/data/cordial/profiles/<profile>/flags.json`
+sandbox moves `~/.local/share` to `~/.var/app/io.github.luohoa97.Cordial/data`, so the
+same file is `~/.var/app/io.github.luohoa97.Cordial/data/cordial/profiles/<profile>/flags.json`
 — `INFERRED` from how Flatpak remaps `XDG_DATA_HOME`, not yet checked against an
 installed package.
 

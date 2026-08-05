@@ -9,12 +9,57 @@ what the history contains and hiding it would make the rest less trustworthy.
 
 The version in `Cargo.toml` is stamped into the window title by
 `crates/cordial-shell/build.rs` via `git describe --tags`. A release reads
-`Cordial 0.5.0`; a development build reads `Cordial 0.5.0-14-g8db7100`.
+`Cordial 0.5.1`; a development build reads `Cordial 0.5.1-14-g8db7100`.
 
 **There was never a 0.1.0.** The first version this project gave itself was
 0.2.0, in `8db7100`, once there was something a person could sign into. The 178
 commits before that were the bionic linker port, the JNI layer and the framework
 work, and none of them were released.
+
+## 0.5.1 — 2026-08-05
+
+**The Flatpak actually builds, the remote actually exists, and the application
+ID no longer claims a domain this project does not own.**
+
+- **The application ID is now `io.github.luohoa97.Cordial`.** It was
+  `org.cordial.Cordial`, which is a claim on `cordial.org` — a domain registered
+  in 1999 and in active use by somebody else. Flathub requires an ID you
+  demonstrably control, so the old one was unsubmittable. Done on the same day
+  the remote first went live, deliberately: a rename before a package has users
+  costs a `git mv`, and after it costs everyone their profiles. **A Flatpak's
+  data lives at `~/.var/app/<app-id>/`, so an existing install keeps its old
+  directory and will look freshly installed.** Nobody had one.
+- **The Flatpak had never built, on any machine.** The manifest asked for
+  `org.freedesktop.Platform`, and the shell is GTK4 and libadwaita end to end,
+  which that runtime does not carry. Every CI run had failed on
+  `Package 'gtk4' not found` — five in a row, unlooked at, under a commit titled
+  "A Flatpak that builds". Now `org.gnome.Platform`/`org.gnome.Sdk` 50.
+- **The published `.flatpakrepo` could not be added.** Both the workflow and the
+  file's own comment recorded that `GPGKey=` with an empty value is how a remote
+  states "unsigned", and that omitting the line says the same thing by accident.
+  Backwards: measured with flatpak 1.18.0, the empty form is refused with
+  `error: Invalid gpg key`, and omitting it is accepted and sets
+  `gpg-verify=false`. Only a green run could expose this, because until one
+  happened the generated file had never existed.
+- **GitHub Pages is enabled and the site is live** at
+  <https://luohoa97.github.io/cordial/>, sharing one deployment with the OSTree
+  remote under `/repo/`.
+- **Releases exist.** `v0.2.0` and `v0.3.0` had been tagged and never published;
+  `v0.4.0` was a version bump that never got a tag. All four are on the Releases
+  page now, and this file is new.
+- The documentation table stopped at ADR-013; ADR-014 through ADR-018 and
+  `HANDOVER.md` were written and never listed.
+
+Measured against the deployed remote: `remote-add` accepted, `remote-ls`
+returning the app ref at 6.1 MB download and 16.1 MB installed, and `install`
+placing **both** `cordial-shell` and `cordial-run` in `/app/bin`.
+`cargo test --workspace`: 460 passed, 0 failed.
+
+**Not verified:** that the installed shell opens a window. It exits 0 without
+one on the developer's machine, and the leading candidate is a name collision
+with a host-built instance rather than a packaging fault — but the control that
+would settle it has not been run, and saying otherwise is what this file exists
+not to do.
 
 ## 0.5.0 — 2026-08-05
 

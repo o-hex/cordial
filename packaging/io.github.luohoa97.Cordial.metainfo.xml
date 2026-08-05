@@ -3,7 +3,7 @@
   AppStream metadata, which exists so the hosted remote is browsable rather than
   only installable. `flatpak build-update-repo` builds an `appstream2/<arch>`
   branch out of whatever metainfo the refs carry; with no metainfo at all it
-  prints "No appstream data for app/org.cordial.Cordial/x86_64/master" and
+  prints "No appstream data for app/io.github.luohoa97.Cordial/x86_64/master" and
   writes an empty branch, and GNOME Software and Discover then show a remote
   with nothing in it. Someone who has added the remote and cannot find Cordial
   in their software centre has no way to tell that from a broken remote.
@@ -13,7 +13,7 @@
   is exactly where nobody building the package is looking.
 -->
 <component type="desktop-application">
-  <id>org.cordial.Cordial</id>
+  <id>io.github.luohoa97.Cordial</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <name>Cordial</name>
@@ -41,7 +41,7 @@
       is not captured in first person. Install it expecting rough edges.
     </p>
   </description>
-  <launchable type="desktop-id">org.cordial.Cordial.desktop</launchable>
+  <launchable type="desktop-id">io.github.luohoa97.Cordial.desktop</launchable>
   <url type="homepage">https://luohoa97.github.io/cordial/</url>
   <url type="bugtracker">https://github.com/luohoa97/cordial/issues</url>
   <url type="vcs-browser">https://github.com/luohoa97/cordial</url>
@@ -69,6 +69,19 @@
     first version this project gave itself was 0.2.0.
   -->
   <releases>
+    <release version="0.5.1" date="2026-08-05">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.5.1</url>
+      <description>
+        <p>
+          The application ID changes from org.cordial.Cordial to
+          io.github.luohoa97.Cordial, which is an identifier this project
+          controls. An existing install keeps its old data directory and will
+          look freshly installed. The Flatpak also builds for the first time —
+          it had been asking for a runtime with no GTK4 in it — and the
+          published remote definition can now be added at all.
+        </p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-08-05">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.5.0</url>
       <description>

@@ -213,6 +213,19 @@ jobs:
           else
             echo "site/ is absent or empty; publishing the remote without a landing page"
           fi
+          # The page's icons, copied from the ones the package and the README
+          # already use rather than duplicated into site/. There is one drawing
+          # of each and this is what keeps it that way: a second copy under
+          # site/ would be the one that goes stale, and nobody diffs an SVG.
+          #
+          # Two files because they are two different pictures. The square one
+          # is the application icon, which is what a browser tab wants; the
+          # 680x480 one is the banner at the top of the README, which is what
+          # the page shows at size. Naming them by role here rather than by
+          # app-id means the rename that happened today does not reach into the
+          # HTML as well.
+          cp "packaging/icons/hicolor/scalable/apps/$APP_ID.svg" pages/favicon.svg
+          cp "packaging/icons/$APP_ID.svg" pages/cordial.svg
           mv repo pages/repo
           # Belt and braces. deploy-pages serves the artifact verbatim and does
           # not run Jekyll, but Jekyll skips paths beginning with _ or . and an

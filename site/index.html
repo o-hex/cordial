@@ -5,6 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cordial — Roblox's Android engine, natively on Linux</title>
 <meta name="description" content="Cordial loads Roblox's official Android x86-64 engine directly on Linux: a ported AOSP bionic linker, a bionic/glibc ABI shim, and a JNI VM in place of ART. No emulator, no container. GPL-3.0, and looking for a maintainer.">
+<!--
+  Both icons are copied into the deployment by .github/workflows/flatpak.yml
+  out of packaging/icons/, so there is exactly one drawing of each in the tree.
+  They are relative hrefs because this site is served from /cordial/ rather
+  than a domain root, and an absolute /favicon.svg would 404 there.
+
+  favicon.svg is the square application icon; cordial.svg is the 680x480
+  banner the README uses. Opening site/index.html straight off disk shows
+  neither, which is the cost of not keeping a second copy here.
+-->
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<meta property="og:image" content="https://luohoa97.github.io/cordial/cordial.svg">
 <style>
   :root {
     --ground:      #131519;
@@ -125,6 +137,16 @@
     border-bottom: 1px solid var(--line);
   }
   .hero__grid { display: flex; flex-direction: column; gap: 2rem; }
+  /* The README banner, at size. `height: auto` with both attributes set on the
+     element keeps the box reserved before it loads, so the hero does not jump.
+     Capped rather than full-bleed: it is 680x480 artwork and stretching it past
+     that only makes the strokes thin. */
+  .hero__mark {
+    display: block;
+    width: min(100%, 30rem);
+    height: auto;
+    margin-bottom: -0.5rem;
+  }
 
   h1 {
     font-family: var(--mono);
@@ -303,6 +325,8 @@
 
 <header class="hero">
   <div class="wrap hero__grid">
+    <img class="hero__mark" src="cordial.svg" width="680" height="480"
+         alt="Cordial">
     <p class="eyebrow">GPL-3.0 · Rust · x86-64 Linux</p>
     <h1>Cordial<span class="dot">.</span></h1>
     <p class="lede">

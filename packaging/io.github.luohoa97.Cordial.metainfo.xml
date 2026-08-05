@@ -69,6 +69,19 @@
     first version this project gave itself was 0.2.0.
   -->
   <releases>
+    <release version="0.5.2" date="2026-08-05">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.5.2</url>
+      <description>
+        <p>
+          The Flatpak works. Six separate faults stood between the packaged
+          build and a running client, and every one was invisible from a source
+          build: a linker compiled with PATH_MAX=256 that aborted at load, no
+          access to the Roblox build the setup dialog pointed at, the session
+          being written to disk instead of the keyring, every connection reading
+          as metered, and no accessibility bus.
+        </p>
+      </description>
+    </release>
     <release version="0.5.1" date="2026-08-05">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.5.1</url>
       <description>

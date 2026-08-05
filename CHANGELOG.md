@@ -9,12 +9,100 @@ what the history contains and hiding it would make the rest less trustworthy.
 
 The version in `Cargo.toml` is stamped into the window title by
 `crates/cordial-shell/build.rs` via `git describe --tags`. A release reads
-`Cordial 0.5.1`; a development build reads `Cordial 0.5.1-14-g8db7100`.
+`Cordial 0.5.2`; a development build reads `Cordial 0.5.2-14-g8db7100`.
 
 **There was never a 0.1.0.** The first version this project gave itself was
 0.2.0, in `8db7100`, once there was something a person could sign into. The 178
 commits before that were the bionic linker port, the JNI layer and the framework
 work, and none of them were released.
+
+## 0.5.2 — 2026-08-05
+
+**The Flatpak works. It never had, on any machine, and six separate faults
+were between it and a running client.**
+
+Every one of them was invisible from `cargo run`, which is the reason they
+survived: the packaged build is a different machine with a different libc, a
+different filesystem and no session services, and nothing here had ever been
+launched by a person from an installed package until today.
+
+- **The bionic linker was compiled with `PATH_MAX=256`.** Upstream's
+  `third_party/mcpelauncher-linker/CMakeLists.txt` defines it, shrinking seven
+  `char buf[PATH_MAX]` buffers across four linker files, while the `realpath`
+  and `readlink` they are handed to are the *host's* and may write 4096. The
+  client aborted at linker init with `*** buffer overflow detected ***`, and the
+  call site read `mov $0x100,%edx` into `__realpath_chk`. Corrected to 4096 from
+  `native/CMakeLists.txt`, since the manifest clones that submodule fresh by
+  commit.
+
+  **The host build is the less trustworthy of the two results here.** It makes
+  the same calls through plain `realpath@plt` with *zero* `__realpath_chk` in
+  the binary — unfortified, so never checked. It has carried the same undersized
+  buffers all along, and a resolved path over 255 characters smashes that frame
+  today with nothing to report it. The Flatpak's runtime fortifies these calls,
+  so it was the first thing to notice a latent overflow rather than the thing
+  that introduced one.
+- **The sandbox could not see Sober's APK.** "No Roblox build found" named the
+  exact path it looked in, and that path held a 97 MB `base.apk` the sandbox had
+  no grant for — `~/.var/app/` inside the sandbox contains only Cordial's own
+  directory. The instructions were right, the user followed them, and the
+  program said they had not. Granted read-only, narrowed to `packages` rather
+  than the whole of Sober's data, which holds Roblox's own storage and session.
+- **The session was being written to disk.** With no `org.freedesktop.secrets`
+  grant, `secrets.rs` found no service and fell back to a 0600 file, announcing
+  it plainly. So the install route the README recommends was the one build that
+  kept the session on disk — the exact thing the keyring work removed. It now
+  reports: *the session is kept in the desktop secret service; nothing is
+  written to the profile.*
+- **Every connection read as metered**, because there was no system bus at all.
+  Granted `org.freedesktop.NetworkManager` read-only. Deliberately **not** the
+  portal: `org.freedesktop.portal.NetworkMonitor` needs no grant and was the
+  obvious answer, but it reports `metered` as a boolean where `NMMetered` has
+  five values, and this project's rule is that only an explicit `NO` enables a
+  background download. A boolean cannot carry that, and going through the portal
+  would have quietly rewritten the rule while looking tidier.
+- **AT-SPI needed two grants, and one would have been a lie.**
+  `org.a11y.Bus.GetAddress` answers as soon as the name is granted and hands
+  back a socket path that is not in the sandbox — so the name alone moves the
+  failure from a lookup to a connect and looks like a fix. With
+  `--filesystem=xdg-run/at-spi` as well it connects.
+- **GameMode is not fixed and is not claimed to be.** The name resolves now, so
+  the grant works; `gamemoded` itself declines to register the sandboxed process
+  with `rc -1`. That is progress from `ServiceUnknown`, and it is a different
+  problem.
+
+**Measured on a clean install from the published remote, with the local
+override reset so only the package's own permissions applied:**
+
+```text
+[secrets] the session is kept in the desktop secret service
+[accessibility] connected to the AT-SPI bus as :1.559
+[android] display backend: Wayland
+LOADED in 25ms
+[android] vulkan: swapchain present mode FIFO -> MAILBOX
+[roblox] datamodel notification: APP_READY Landing
+```
+
+**Correcting 0.5.1.** That entry said the installed shell opening a window had
+not been observed, and offered a name-collision hypothesis for why it exited
+immediately. The hypothesis was right and it is now observed: the launcher runs,
+draws its window, finds a Roblox build and starts the client. The earlier exits
+were a `GApplication` with a fixed id handing off to a development build that
+already owned the name — the single-instance mechanism working, not a fault.
+
+- **CI could hang the queue indefinitely.** The build job had no
+  `timeout-minutes`, so GitHub's six-hour default applied while the concurrency
+  group allows one run at a time; a run stuck in `apt-get` held everything
+  behind it and two queued runs were dropped as superseded. Capped at 45
+  minutes against a 7–11 minute green run.
+- The website shows the mark the README leads with, and has a favicon. Both are
+  copied out of `packaging/icons/` by the workflow rather than duplicated into
+  `site/`.
+
+Still broken, and none of it changed today: text fields do not paint while
+focused, the pointer is not captured in first person, X11 fullscreen segfaults,
+web views are unimplemented, and audio initialises then fails with
+`FMOD_ERR_OUTPUT_INIT`.
 
 ## 0.5.1 — 2026-08-05
 

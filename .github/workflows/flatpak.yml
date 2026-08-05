@@ -58,6 +58,21 @@ permissions:
 
 # One at a time. Two runs exporting into the same Pages deployment would race,
 # and cancelling a half-finished OSTree export is worse than queueing.
+#
+# Two consequences of this that look like faults and are not, both seen on
+# 2026-08-05 and worth recognising before someone debugs them:
+#
+#   * A run **queued** behind another is superseded when a newer push arrives,
+#     and shows as `cancelled`. Nothing is lost — the newer run builds the newer
+#     tree, which contains the older commit — but a Actions page full of
+#     "cancelled" reads like breakage. Five pushes in half an hour produced
+#     three of them.
+#   * A tag pushed alongside `main` lands in this same group and is usually the
+#     one dropped, so `v0.5.1` has no build of its own. Same content, built by
+#     `main`; only the attribution differs.
+#
+# The pairing that makes this safe is `timeout-minutes` on the build job. Without
+# it a single stuck run holds the queue for GitHub's default six hours.
 concurrency:
   group: flatpak-pages
   cancel-in-progress: false
@@ -72,6 +87,18 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # A ceiling, because there is a queue behind this.
+    #
+    # GitHub's default is six hours, and the concurrency group above means one
+    # stuck run holds every later one behind it. That is not hypothetical: a run
+    # hung in `apt-get` on `Install flatpak` for twenty-eight minutes and had to
+    # be cancelled by hand, by which time two queued runs had been superseded and
+    # dropped. Six hours of that would have looked exactly like CI being broken.
+    #
+    # Green runs here take seven to eleven minutes, so this is generous rather
+    # than tight; anything past it is stuck rather than slow, and a failed run
+    # publishes nothing while a hung one blocks everything.
+    timeout-minutes: 45
     steps:
       # No submodules. The manifest pins third_party/libjnivm and
       # third_party/mcpelauncher-linker as `git` sources by commit and skips

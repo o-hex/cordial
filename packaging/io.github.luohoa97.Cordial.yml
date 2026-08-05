@@ -112,6 +112,32 @@ finish-args:
   # `GtkFileDialog`, which is the portal inside a sandbox, and the portal hands
   # over the chosen file itself.
   - --filesystem=~/.var/app/org.vinegarhq.Sober/data/sober/packages:ro
+  # NetworkManager's `Metered` property, read-only, so the updater can ask the
+  # same question inside the sandbox that it asks outside it.
+  #
+  # Without this there is no system bus at all — `Could not connect: No such
+  # file or directory` — and `metered::current` fails closed to Unknown, which
+  # `is_metered` counts as metered. Fail-closed is right; the consequence is
+  # that a Flatpak install never runs a background download on a connection
+  # NetworkManager explicitly reports as unmetered, which is the one case the
+  # setting exists to serve.
+  #
+  # **Not the portal, and this is the interesting part.**
+  # org.freedesktop.portal.NetworkMonitor needs no manifest grant and was the
+  # obvious answer, but it exposes `metered` as a *boolean* where NMMetered has
+  # five values. This module's central rule is that only an explicit NO turns
+  # the download on — Unknown, GuessNo, GuessYes and anything unrecognised are
+  # all held back — and a boolean cannot carry that distinction. INFERRED from
+  # GLib's documented mapping rather than measured, because this machine reports
+  # an explicit No today and both sources therefore agree: GLib folds
+  # {Unknown, No, GuessNo} to false, so going through the portal would silently
+  # turn "only an explicit NO" into "anything that is not a yes-ish guess". That
+  # is precisely the loosening metered.rs was written to prevent.
+  #
+  # Measured inside the installed package, with a control:
+  #   without the grant   Error connecting: Could not connect
+  #   with the grant      (<uint32 2>,)
+  - --system-talk-name=org.freedesktop.NetworkManager
   # notify.send and url.open are not listed here at all: both go through
   # org.freedesktop.portal.Notification and org.freedesktop.portal.OpenURI,
   # which Flatpak already exposes to every sandboxed app without a

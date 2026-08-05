@@ -18,19 +18,42 @@
 //!
 //! ## What this machine reports, and why it matters more than it looks
 //!
-//! Measured on 2026-08-02, on an ordinary desktop on wired/wireless LAN:
+//! Measured on 2026-08-02, on an ordinary desktop on wired/wireless LAN, this
+//! answered `u 4` — `GUESS_NO` — and the paragraph here concluded that the
+//! ordinary desktop case is a *guess* rather than a `NO`, so the background
+//! download does not run there either.
+//!
+//! **Re-measured on 2026-08-05 on the same machine, it answers `u 2`:**
 //!
 //! ```text
 //! $ busctl --system get-property org.freedesktop.NetworkManager \
 //!     /org/freedesktop/NetworkManager org.freedesktop.NetworkManager Metered
-//! u 4
+//! u 2
 //! ```
 //!
-//! Four is `GUESS_NO`. So the ordinary desktop case is a *guess*, not a `NO`,
-//! and with the default *Unmetered connections only* the background download
-//! does not run there either. That is the rule working as written rather than a
-//! bug, and it is written up in `docs/design/updating-roblox.md` because it is
-//! the sort of consequence that gets discovered later and read as one.
+//! Two is an explicit `NO`. So the earlier conclusion is not a property of
+//! ordinary desktops; it was a property of that connection on that day. Both
+//! readings are real and the value moves, which is the actual lesson: do not
+//! reason about what "the ordinary case" reports without asking the machine in
+//! front of you. The consequence is still written up in
+//! `docs/design/updating-roblox.md`, and it still applies whenever the answer
+//! is a guess.
+//!
+//! ## Inside a Flatpak
+//!
+//! There is no system bus unless the manifest grants
+//! `--system-talk-name=org.freedesktop.NetworkManager`, and without it [`query`]
+//! fails with `Could not connect` and [`current`] falls closed to
+//! [`Metered::Unknown`]. The grant is in the manifest for that reason.
+//!
+//! **`org.freedesktop.portal.NetworkMonitor` is not the answer**, despite
+//! needing no grant at all and being the route `notify.send` and `url.open`
+//! take. It reports `metered` as a boolean, and the rule below is that only an
+//! explicit `No` counts — a boolean cannot carry the difference between `No`,
+//! `GuessNo` and `Unknown`. `INFERRED` that GLib folds all three to `false`:
+//! this machine reports an explicit `No` today, so the portal and
+//! NetworkManager agree here and the mapping could not be observed. If somebody
+//! can get a machine to report `GUESS_NO` and asks both, that settles it.
 
 use std::fmt;
 

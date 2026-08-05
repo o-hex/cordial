@@ -138,6 +138,39 @@ finish-args:
   #   without the grant   Error connecting: Could not connect
   #   with the grant      (<uint32 2>,)
   - --system-talk-name=org.freedesktop.NetworkManager
+  # The Secret Service, and this one is a security fix rather than a feature.
+  #
+  # Without it `secrets.rs` finds no service on the session bus and falls back
+  # to a 0600 file, announcing it in those words:
+  #
+  #   there is no secret service on the session bus, so the session falls back
+  #   to a 0600 file at .../profiles/<name>/cookies. Anything that can read your
+  #   files can take the account.
+  #
+  # So the Flatpak — the install route the README now recommends — was the one
+  # build that kept the session on disk, which is exactly the thing 4ade316
+  # moved into the keyring in the first place. The fallback behaved correctly
+  # and said so plainly; it was the packaging that put every user into it.
+  #
+  # Measured: without the grant `org.freedesktop.secrets` is ServiceUnknown;
+  # with it, Collections returns the login and session collections.
+  - --talk-name=org.freedesktop.secrets
+  # Feral GameMode. Absent, it was ServiceUnknown and the runtime carried on
+  # without it, which is the honest behaviour and also a silently missing
+  # feature. `ClientCount` answers with the grant.
+  - --talk-name=com.feralinteractive.GameMode
+  # The AT-SPI accessibility bridge needs *both* of these, and the name on its
+  # own would have been a stub that lies.
+  #
+  # `org.a11y.Bus.GetAddress` answers as soon as the name is granted — and hands
+  # back `unix:path=/run/user/1001/at-spi/bus`, a socket that is not in the
+  # sandbox. So the bridge would have got past the lookup it currently fails at
+  # and died one step later, on a connect, with a less obvious message. Granting
+  # the name alone would have looked like a fix and moved the failure.
+  #
+  # With both, a Peer.Ping to org.a11y.atspi.Registry round-trips.
+  - --talk-name=org.a11y.Bus
+  - --filesystem=xdg-run/at-spi
   # notify.send and url.open are not listed here at all: both go through
   # org.freedesktop.portal.Notification and org.freedesktop.portal.OpenURI,
   # which Flatpak already exposes to every sandboxed app without a

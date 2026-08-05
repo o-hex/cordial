@@ -231,3 +231,20 @@ symbols lib_dir:
       | awk '$7=="UND" {print $8}' | sed 's/@.*//' | sort -u > "$new"
     cut -f2 docs/analysis/undefined-symbols.tsv | sort -u > "$old"
     comm -23 "$new" "$old"
+
+# Pull vinegarhq/sober's issue tracker into a local, triage-searchable corpus (ADR-017)
+sober-corpus-fetch:
+    deno run \
+      --allow-net=api.github.com \
+      --allow-env=GITHUB_TOKEN,GH_TOKEN \
+      --allow-run=gh \
+      --allow-read=tools/sober-corpus/data \
+      --allow-write=tools/sober-corpus/data \
+      tools/sober-corpus/fetch.ts
+
+# Derive the triage set (problem + maintainer resolution) from the raw corpus
+sober-corpus-derive:
+    deno run \
+      --allow-read=tools/sober-corpus/data \
+      --allow-write=tools/sober-corpus/data \
+      tools/sober-corpus/derive.ts

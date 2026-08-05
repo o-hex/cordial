@@ -61,7 +61,58 @@
     <content_attribute id="social-chat">intense</content_attribute>
     <content_attribute id="social-info">moderate</content_attribute>
   </content_rating>
+  <!--
+    Every released tag, newest first, because a software centre shows only what
+    is here and an app with one <release> reads as one that has shipped once.
+    CHANGELOG.md is the long form; these are the one-line versions of the same
+    entries and should not say anything it does not. There is no 0.1.0 — the
+    first version this project gave itself was 0.2.0.
+  -->
   <releases>
-    <release version="0.4.0" date="2026-08-03"/>
+    <release version="0.5.0" date="2026-08-05">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.5.0</url>
+      <description>
+        <p>
+          The app bridge is given the surface and platform parameters it was
+          never handed, and everything Cordial fails to answer is collected into
+          one report at exit. Graphics gains an explicit OpenGL ES option.
+          Ctrl+V pastes into Roblox text boxes. Plugins run inside a kernel
+          sandbox beneath Deno's permissions and the capability broker.
+        </p>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-08-03">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.4.0</url>
+      <description>
+        <p>
+          Sound comes out, and the microphone is open only while Roblox is
+          recording. The pointer locks, and the launcher no longer imposes a
+          session length. An earlier 1 fps report is withdrawn: it was the
+          desktop, not the engine.
+        </p>
+      </description>
+    </release>
+    <release version="0.3.0" date="2026-08-02">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.3.0</url>
+      <description>
+        <p>
+          Keys work inside an experience: the engine wants evdev codes, not
+          Android keycodes. Present mode MAILBOX gives a flat 60 where FIFO gave
+          a variable 35 to 50. The engine cache now invalidates when the Roblox
+          build changes, so a warm start runs the build you installed.
+        </p>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-08-02">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.2.0</url>
+      <description>
+        <p>
+          The first release anyone could use. Signing in works and the session
+          persists in the desktop keyring rather than on disk; profiles isolate
+          accounts so two run side by side; a native Wayland backend replaces the
+          blank window; and the plugin brokers do something.
+        </p>
+      </description>
+    </release>
   </releases>
 </component>

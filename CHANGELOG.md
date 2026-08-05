@@ -1,0 +1,140 @@
+# Changelog
+
+What changed between releases, and what was measured rather than assumed.
+
+Entries here follow the same rule as commit messages and pull requests: a claim
+that was tested says what it was tested with, and a claim that was not is marked
+`INFERRED`. Several entries are retractions of earlier claims, because that is
+what the history contains and hiding it would make the rest less trustworthy.
+
+The version in `Cargo.toml` is stamped into the window title by
+`crates/cordial-shell/build.rs` via `git describe --tags`. A release reads
+`Cordial 0.5.0`; a development build reads `Cordial 0.5.0-14-g8db7100`.
+
+**There was never a 0.1.0.** The first version this project gave itself was
+0.2.0, in `8db7100`, once there was something a person could sign into. The 178
+commits before that were the bionic linker port, the JNI layer and the framework
+work, and none of them were released.
+
+## 0.5.0 — 2026-08-05
+
+**The app bridge, the register of what is missing, and a kernel sandbox under
+plugins.**
+
+- **The app bridge was never given its surface or platform params.** Sober makes
+  87 `JNIAppBridge` calls during a join; Cordial made 3. Both
+  `UpdateSurfaceAppWithPlatformParams` and `UpdateSurfaceGameWithPlatformParams`
+  are now driven after `StartApp`, with `CORDIAL_SKIP_UPDATE_SURFACE=1` as the
+  control. **Whether this fixes the 304 disconnect is untested** — it needs a
+  join run on a real account and has not had one.
+- **Error 304 is not what it looked like.** The join *succeeds*: connection at
+  4.0 s, replication for roughly 61 s, then `Disconnect reason received: 304`
+  from the server. The websocket to `10.110.101.222:5052` that looked like the
+  cause is a red herring — Sober opens the identical connection and plays for
+  942 s. `KeyRing` is identical between the two.
+- **A register of everything unimplemented** (`unimplemented.rs`): unresolved
+  JNI symbols, called libc stubs, unregistered natives and placeholder returns,
+  printed as one report at exit. The JNI half only populates when libjnivm is
+  built with `CORDIAL_JNI_TRACE=1`, and the report says so when the section is
+  empty rather than letting an empty list read as a clean bill of health.
+- **Graphics gets an explicit OpenGL ES option**, and loses the FastFlag that
+  never worked. `FStringDebugGraphicsPreferredBackend` was measured to be inert:
+  `libroblox.so` imports **zero** Vulkan symbols and 91 EGL/GL ones, and picks
+  its backend by `dlopen`. Selection now works by withholding the virtual
+  `libvulkan` soname, which is the mechanism that actually decides it.
+  `flags_file.rs` is deleted.
+- **A kernel sandbox under the plugin process.** `bwrap` with `--unshare-all`,
+  a private tmpfs and the entry module bound read-only, below Deno's zero
+  permissions and the capability broker. Its absence is a downgrade, not a hole,
+  and every spawn prints which layers are in force ([ADR-018](docs/adr/ADR-018-plugin-sub-sandboxing.md)).
+- **A Flatpak grant deliberately not taken.** `--talk-name=org.freedesktop.Flatpak`
+  would have let Cordial create sub-sandboxes inside Flatpak — and, because
+  `flatpak-spawn --sandbox` and `--host` are the same D-Bus name, would equally
+  have handed every plugin arbitrary command execution on the host. A Flatpak
+  install keeps two layers instead of three; that is the correct trade.
+- **The clipboard reaches the engine.** Ctrl+V pastes into any Roblox text box
+  or chat. A focused box still does not draw what you type — that is the open
+  bug, not this one.
+- **The queued-link banner was showing part of an auth ticket.** `summarise()`
+  truncated a deep link to 64 characters, which was enough to include it. Fixed,
+  with a test that a synthetic ticket cannot appear in the banner.
+- **Updates:** the build window is a changelog with one button under it, sourced
+  from Roblox's Creator Hub release-notes table and rendered from markdown.
+  Two icons, and Download only when there is something to download.
+- **Download on Wi-Fi was the metered switch wearing the wrong name.** One
+  switch now: download on metered connections, off by default.
+- **Per-profile VPN gate** (#8): a profile marked vpn-required refuses to launch
+  without `pvpn` rather than leaking the connection.
+- Deep links reach the engine; `roblox-player://` does not, and the README says
+  which does.
+- Tooling: the Sober issue corpus fetcher, ported to Deno, with its data kept
+  out of history ([ADR-017](docs/adr/ADR-017-sober-issue-corpus.md)).
+
+Known broken: text fields do not paint while focused; the pointer is not
+captured in first person; X11 fullscreen segfaults; web views are unimplemented;
+audio initialises then fails with `FMOD_ERR_OUTPUT_INIT` (51) at about t=3.3 s on
+a signed-in session.
+
+## 0.4.0 — 2026-08-03
+
+**Sound comes out, the pointer locks, and two claims are withdrawn.**
+
+- **Sound comes out**, and the microphone is only open while Roblox is recording.
+- **The pointer locks**, and the run ends when the window closes.
+- **The launcher stops imposing a session length.** `--run 30` was a debugging
+  aid that had become a default.
+- **The 1 fps report is withdrawn.** It was the desktop, not the engine. See the
+  standing warning about present counts in [AGENTS.md](AGENTS.md) — every count
+  recorded before 2026-08-02 is an idle throttle integrated over a window.
+- **ADR-015 was wrong and is corrected:** Roblox publishes no Android build that
+  Cordial may ship, so Cordial may fetch a build and may never ship one.
+- The busy-profile message names the process actually holding the lock instead
+  of guessing.
+- The MangoHUD hint named two packages and sent people to the wrong one.
+- A handover document, and a note at the top that this needs a maintainer.
+
+## 0.3.0 — 2026-08-02
+
+**Keys work in an experience, and the frame-rate metric is retracted.**
+
+- **Keys work in an experience.** `nativePassKeyEvent` wants evdev codes, not
+  Android keycodes — which is why every keystroke had been arriving as the wrong
+  key or as nothing.
+- **Present mode MAILBOX instead of FIFO:** a flat 60 where FIFO gave a variable
+  35–50.
+- **The frame-rate metric measured an idle throttle, not a frame rate.**
+  `vkQueuePresentKHR` counts run at about 60/s for thirteen seconds and then drop
+  to exactly 1.0/s, identically on X11 and Wayland. Synthetic pointer motion holds
+  50–60 for a whole 240 s run and toggling it flips the rate both ways. Several
+  earlier numbers quoted as evidence were this curve.
+- **`pthread_cond_t` is 48 bytes in bionic, not 32** — a recorded finding was
+  wrong and is corrected. `pthread_once` and thread-specific data are implemented
+  in the shim; the stub that returned success for `pthread_once` could not be
+  survived.
+- **The extracted engine cache never invalidated**, so a new APK ran the old
+  engine. Warm start now invalidates on APK change.
+- **The build is stamped with `git describe`**, so a binary says which tree it
+  came from — including `-dirty`.
+
+## 0.2.0 — 2026-08-02
+
+**You can sign in, stay signed in, and run two accounts side by side.**
+
+- **Sign-in works** via Quick Sign-in, and **the session persists across
+  restarts in the desktop keyring** rather than in a plaintext file on disk.
+- **Profiles:** storage per account, owner-only directories, and an `flock` so
+  one instance holds one profile ([ADR-012](docs/adr/ADR-012-profiles-and-instances.md)).
+  Two accounts run at once.
+- **A libadwaita shell** that finds a Roblox build, explains how to get one when
+  there is not, and launches the client beside itself.
+- **A native Wayland backend** — xdg_shell, EGL, input, and the `zwp_text_input_v3`
+  IME bridge — replacing the blank window.
+- **Real plugin brokers:** `presence.set`, `notify.send`, `url.open` and
+  `events.*` do something, as payloads and effects rather than channels
+  ([ADR-007](docs/adr/ADR-007-host-resources-are-brokered.md)).
+- **An AT-SPI accessibility bridge** over Roblox's Android accessibility surface.
+- The scroll wheel works; every mouse button and a real delta are passed, so the
+  camera can turn.
+- **The XSendEvent injection advice is retracted:** Wayland has no such thing.
+- Text is invisible while typing because Android draws it with a widget — the
+  cause is recorded, the fix is not in this release.

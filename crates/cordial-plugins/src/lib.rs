@@ -21,6 +21,7 @@ pub mod manifest;
 pub mod notify;
 pub mod presence;
 pub mod protocol;
+pub mod sandbox;
 pub mod registry;
 pub mod resolve;
 pub mod settings;

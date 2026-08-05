@@ -20,7 +20,7 @@ use crate::{notify, urlopen};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 pub struct Plugin {
     pub id: String,
@@ -37,11 +37,19 @@ impl Plugin {
     /// nobody to ask. With it, an attempt to touch the filesystem fails
     /// immediately instead of hanging on a prompt nothing will answer.
     pub fn spawn(id: &str, entry: &Path) -> std::io::Result<Self> {
-        let mut child = Command::new("deno")
-            .arg("run")
-            .arg("--no-prompt")
-            .arg("--quiet")
-            .arg(entry)
+        // A third layer under the two above, when the host can enforce one. It
+        // does not replace either: a sub-sandbox only ever subtracts from what
+        // Cordial holds, so every effect is still performed by the broker. See
+        // `crate::sandbox`, which says so at length because "we sandbox now" is
+        // the argument someone will use to justify handing a plugin an fd.
+        //
+        // Absence is a downgrade rather than a hole -- the Deno process still
+        // has no permissions at all -- so a missing `bwrap` does not stop a
+        // plugin running. It is said out loud instead, because a layer nobody
+        // can tell is missing is one nobody notices went away.
+        let sandbox = crate::sandbox::available();
+        println!("[plugin] {id}: {}", sandbox.describe());
+        let mut child = crate::sandbox::command(sandbox, entry)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

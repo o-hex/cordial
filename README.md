@@ -430,6 +430,8 @@ Start with [`docs/NEXT.md`](docs/NEXT.md). The rest is reference.
 | | |
 |---|---|
 | [`docs/NEXT.md`](docs/NEXT.md) | Where to start, what is blocking, and what has already been ruled out |
+| [`docs/HANDOVER.md`](docs/HANDOVER.md) | Written for whoever takes this on: every open thread, which claims are `INFERRED`, and the traps |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed between releases, retractions included. [Releases](https://github.com/luohoa97/cordial/releases) |
 | [`docs/findings.md`](docs/findings.md) | Bootstrap analysis: the architecture verdict and what is unknown |
 | [`docs/framework-api-inventory.md`](docs/framework-api-inventory.md) | The framework backlog, enumerated from the shipping APK |
 | [`docs/traces/`](docs/traces) | A capture of the same APK on real Android — the ground truth this project checks itself against |
@@ -443,6 +445,11 @@ Start with [`docs/NEXT.md`](docs/NEXT.md). The rest is reference.
 | [`docs/adr/ADR-012-profiles-and-instances.md`](docs/adr/ADR-012-profiles-and-instances.md) | A profile is storage, an instance is a window, and why one profile takes a lock |
 | [`docs/adr/ADR-013-per-profile-configuration.md`](docs/adr/ADR-013-per-profile-configuration.md) | Flags, grants and plugin settings belong to the profile; plugin code belongs to the machine |
 | [`docs/adr/ADR-010-plugin-asset-overlays.md`](docs/adr/ADR-010-plugin-asset-overlays.md) | Why plugins may now overlay Roblox's assets, non-destructively |
+| [`docs/adr/ADR-014-plugin-registry-and-unpacking.md`](docs/adr/ADR-014-plugin-registry-and-unpacking.md) | Where plugins come from, and how an archive is unpacked without trusting it |
+| [`docs/adr/ADR-015-fetching-the-roblox-build.md`](docs/adr/ADR-015-fetching-the-roblox-build.md) | Cordial may fetch a Roblox build and may never ship one |
+| [`docs/adr/ADR-016-per-profile-network-egress.md`](docs/adr/ADR-016-per-profile-network-egress.md) | Why a profile can require a VPN, and what that does and does not guarantee |
+| [`docs/adr/ADR-017-sober-issue-corpus.md`](docs/adr/ADR-017-sober-issue-corpus.md) | Why the local Sober issue corpus exists and what it deliberately drops |
+| [`docs/adr/ADR-018-plugin-sub-sandboxing.md`](docs/adr/ADR-018-plugin-sub-sandboxing.md) | A kernel sandbox under Deno, why it cannot replace the broker, and the Flatpak grant not taken |
 | [`docs/design/instances-and-launch.md`](docs/design/instances-and-launch.md) | Multi-instance, multi-account, and `roblox://` |
 | [`plugins/README.md`](plugins/README.md) | Writing a plugin, and what a plugin cannot do |
 | [`docs/design/sign-in.md`](docs/design/sign-in.md) | What signing in actually requires — the current blocker |

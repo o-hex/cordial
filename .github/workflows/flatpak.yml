@@ -218,11 +218,25 @@ jobs:
             printf 'GPGKey=%s\n' "$(base64 -w0 < pages/cordial.gpg)" \
                 >> pages/cordial.flatpakrepo
           else
-            # An empty GPGKey is how a .flatpakrepo states "unsigned" in a form
-            # flatpak parses. Leaving the key out altogether says the same thing
-            # by accident, and the difference matters when someone is reading
-            # the file to decide whether to trust it.
-            printf 'GPGKey=\n' >> pages/cordial.flatpakrepo
+            # Nothing is appended, and that is not an oversight.
+            #
+            # This used to write `GPGKey=` with an empty value, on the recorded
+            # belief that an empty key is how a .flatpakrepo states "unsigned"
+            # in a form flatpak parses, where omitting it says the same thing by
+            # accident. That belief was wrong, and it was wrong in the way that
+            # costs most: the file looked more careful and did not work.
+            #
+            # Measured against the deployed remote with flatpak 1.18.0:
+            #
+            #   GPGKey=      -> error: Invalid gpg key      (remote-add fails)
+            #   omitted      -> accepted; gpg-verify=false,
+            #                   gpg-verify-summary=false, and
+            #                   app/org.cordial.Cordial/x86_64/master lists
+            #
+            # So an unsigned remote is expressed by the absence of the line, and
+            # the README is where "this remote is unsigned" gets said to a human
+            # in a form a human reads.
+            echo "no signing key; the .flatpakrepo is published without a GPGKey line"
           fi
 
       - name: Report the payload size

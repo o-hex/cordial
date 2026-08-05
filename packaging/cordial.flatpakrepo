@@ -7,11 +7,18 @@
 #     flatpak install cordial org.cordial.Cordial
 #
 # There is deliberately no GPGKey line here. The workflow appends one when the
-# FLATPAK_GPG_PRIVATE_KEY secret is set, and adds `GPGKey=` with nothing after
-# it when it is not — which is how a `.flatpakrepo` says "this remote is
-# unsigned" in a way flatpak understands, rather than by omission. A key
-# committed to the repository would be a key anyone can sign with, so the real
-# one only ever exists as an Actions secret.
+# FLATPAK_GPG_PRIVATE_KEY secret is set, and appends nothing when it is not.
+#
+# That second half used to read "adds `GPGKey=` with nothing after it, which is
+# how a .flatpakrepo says this remote is unsigned in a way flatpak understands,
+# rather than by omission". It is a nice sentence and it is false. Measured
+# against the deployed remote with flatpak 1.18.0, `GPGKey=` with an empty value
+# is refused outright — `error: Invalid gpg key`, and `remote-add` fails — while
+# omitting the line is accepted and sets gpg-verify=false. The published file
+# was unusable for the first eight minutes of its existence for exactly this.
+#
+# A key committed to the repository would be a key anyone can sign with, so the
+# real one only ever exists as an Actions secret.
 #
 # Url has to be the OSTree repository, not the site root: the site root is the
 # project's web page and a browser hitting it should get that.

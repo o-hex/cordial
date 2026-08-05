@@ -92,18 +92,30 @@ jobs:
 
       # Read from the manifest rather than repeated here, so bumping the
       # runtime is a one-line change in one file.
+      #
+      # Two versions, not one. The GNOME runtime carries GTK4 and libadwaita and
+      # is numbered 50; the freedesktop SDK extensions it inherits are numbered
+      # by the base runtime, 25.08. This step used to derive all four from
+      # `runtime-version`, which asked Flathub for a rust-stable//50 that does
+      # not exist — though it never got that far, because the build itself was
+      # failing earlier on a runtime with no gtk4 in it.
       - name: Install the runtimes the manifest names
         run: |
           set -euo pipefail
           v=$(sed -n "s/^runtime-version: *'\(.*\)'/\1/p" "$MANIFEST")
-          echo "runtime version: $v"
+          e=$(sed -n "s/^# sdk-extension-version: *'\(.*\)'/\1/p" "$MANIFEST")
+          if [ -z "$v" ] || [ -z "$e" ]; then
+            echo "::error::could not read runtime-version / sdk-extension-version from $MANIFEST"
+            exit 1
+          fi
+          echo "runtime version: $v; sdk extension version: $e"
           flatpak remote-add --user --if-not-exists flathub \
               https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak install --user --noninteractive flathub \
-              "org.freedesktop.Platform//$v" \
-              "org.freedesktop.Sdk//$v" \
-              "org.freedesktop.Sdk.Extension.rust-stable//$v" \
-              "org.freedesktop.Sdk.Extension.llvm20//$v"
+              "org.gnome.Platform//$v" \
+              "org.gnome.Sdk//$v" \
+              "org.freedesktop.Sdk.Extension.rust-stable//$e" \
+              "org.freedesktop.Sdk.Extension.llvm20//$e"
 
       # Crate downloads and the two pinned git clones, which are the same on
       # every run until Cargo.lock or the manifest changes. Not the built

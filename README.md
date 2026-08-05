@@ -209,14 +209,20 @@ list of build dependencies moved down to §3, where it belongs.
 ### 2. Install it
 
 > [!WARNING]
-> **The remote below does not exist yet.** The workflow that builds and
-> publishes it is written but has never run: GitHub Pages is not enabled on this
-> repository and nothing has been deployed, so `flatpak remote-add` against that
-> URL will fail today. Build from source — §3 — until this notice is removed.
+> **The remote below goes live with the first green run of the Flatpak
+> workflow, and may not have had one yet.** GitHub Pages is now enabled on this
+> repository with GitHub Actions as its source, and `PUBLISH_PAGES` is set, so
+> the gates that used to stop it are open — but the workflow publishes nothing
+> until it builds successfully, and its first five runs all failed on a runtime
+> with no GTK4 in it.
+>
+> [**Check the workflow**](https://github.com/luohoa97/cordial/actions/workflows/flatpak.yml)
+> before trusting the commands: a green run on `main` means the remote is
+> serving, a red one means `flatpak remote-add` will fail and §3 is your route.
 >
 > It is written out here rather than hidden because the commands are what they
-> will be, and because a project that documents an install route before it works
-> should say which half is true.
+> are either way, and because a project that documents an install route before
+> it works should say which half is true.
 
 ```bash
 flatpak remote-add --if-not-exists cordial \

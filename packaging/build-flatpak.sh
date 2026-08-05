@@ -29,12 +29,21 @@ need flatpak-builder
 
 # The manifest names these explicitly; installing them here rather than letting
 # flatpak-builder fail halfway keeps the error legible.
+# Two versions, not one. The GNOME runtime carries GTK4 and libadwaita and is
+# numbered 50; the freedesktop SDK extensions it inherits are numbered by the
+# base runtime, 25.08. Deriving all four from `runtime-version` asked for a
+# rust-stable//50 that does not exist.
 runtime_version=$(sed -n "s/^runtime-version: *'\\(.*\\)'/\\1/p" "$manifest")
+ext_version=$(sed -n "s/^# sdk-extension-version: *'\\(.*\\)'/\\1/p" "$manifest")
+if [[ -z "$runtime_version" || -z "$ext_version" ]]; then
+    echo "error: could not read runtime-version / sdk-extension-version from $manifest" >&2
+    exit 1
+fi
 required=(
-    "org.freedesktop.Platform//${runtime_version}"
-    "org.freedesktop.Sdk//${runtime_version}"
-    "org.freedesktop.Sdk.Extension.rust-stable//${runtime_version}"
-    "org.freedesktop.Sdk.Extension.llvm20//${runtime_version}"
+    "org.gnome.Platform//${runtime_version}"
+    "org.gnome.Sdk//${runtime_version}"
+    "org.freedesktop.Sdk.Extension.rust-stable//${ext_version}"
+    "org.freedesktop.Sdk.Extension.llvm20//${ext_version}"
 )
 missing=()
 for ref in "${required[@]}"; do

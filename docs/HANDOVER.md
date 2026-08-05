@@ -223,6 +223,74 @@ no file. Sober does not fetch from Roblox either; it routes users through Google
 Play. Aptoide is deliberately not wired — a mirror offering only a hash it
 supplied itself is verification theatre.
 
+## The application ID names a domain this project does not own
+
+**`org.cordial.Cordial` is a claim on `cordial.org`, and `cordial.org` belongs to
+somebody else.** It was registered on 1999-04-16, is held through InterNetX GmbH
+with `clientTransferProhibited` set, currently resolves to 185.148.170.48 behind
+iwelt.de nameservers, and does not expire until 2027-04-16. It is a twenty-seven
+year old domain in active use. "Register cordial.org" is not on the table, and
+anyone who assumes it is will waste an afternoon finding that out.
+
+This matters because **Flathub requires the application ID to be a domain or
+forge account you demonstrably control**, and will reject a submission that
+claims one it does not. It is not a formality: the ID is what a user's machine
+trusts for the lifetime of the install.
+
+There are two honest ways out, and they are not equal:
+
+1. **Rename to `io.github.luohoa97.Cordial`.** Costs nothing, needs no domain,
+   is what the homepage already is, and is what `<developer id="io.github.luohoa97">`
+   in the metainfo already says. This is the recommendation.
+2. **Acquire a domain the project actually controls** — `cordial.app`,
+   `getcordial.org`, anything free — and use its reverse ID. Worth it only if
+   somebody wants the project to have its own domain for its own sake, and it
+   should be bought *before* the rename, not after.
+
+**What a rename touches**, because it is more than a string:
+
+- `app-id` in `packaging/org.cordial.Cordial.yml`, and the `APP_ID` env in
+  `.github/workflows/flatpak.yml`
+- the manifest, desktop, metainfo and icon **filenames**, all four of which must
+  match the new ID
+- `<id>` in the metainfo
+- `flatpak install cordial <id>` in the README, and the `Icon=` URL in
+  `packaging/cordial.flatpakrepo`
+- **user data.** A Flatpak's data lives at `~/.var/app/<app-id>/`, so a rename
+  silently orphans every existing profile, sign-in and extracted Roblox build.
+  Anyone doing this owes users either a migration or a release note that says
+  plainly what will be left behind — and given [ADR-012](adr/ADR-012-profiles-and-instances.md)
+  holds profiles under an `flock`, a migration that runs while an instance is up
+  is its own problem.
+
+Do the rename **before** the remote has users rather than after. It is a
+half-hour change today and a support burden later.
+
+## Getting onto Flathub, and what currently prevents it
+
+Three things, in the order they will stop you:
+
+1. **The build needs the network** ([issue #3](https://github.com/luohoa97/cordial/issues/3)).
+   Flathub's builders have none. The submodule half is done — `libjnivm` and
+   `mcpelauncher-linker` are pinned as `git` sources by commit — and the crate
+   half is not. `flatpak-cargo-generator.py` from `flatpak-builder-tools` turns
+   `Cargo.lock` into a `cargo-sources.json`, after which `--share=network` comes
+   out of `build-options.build-args`. This is the only blocker that is real work.
+2. **The application ID.** See the section above.
+3. **No screenshots.** The metainfo has none, and Flathub's linter requires at
+   least one. This is the cheapest of the three and the one most likely to be
+   forgotten until a reviewer asks.
+
+**What will not stop you, despite feeling like it should:** a third-party Roblox
+client is not itself disqualifying — Sober ships on Flathub as
+`org.vinegarhq.Sober`. Cordial's position is if anything the easier one to
+defend, because it ships no Roblox code, asset or APK at all and the user
+supplies the client, where Sober fetches it. Say that plainly in the submission
+along with the fact that there is no script execution, hooking or memory access
+([ADR-001](adr/ADR-001-in-process-hooking.md)); a reviewer's first question will
+be whether this is a cheat client, and the answer should be in the first
+paragraph rather than three replies down.
+
 ## Traps that have already caught people
 
 **Do not use present counts as a frame rate.** Every figure recorded before

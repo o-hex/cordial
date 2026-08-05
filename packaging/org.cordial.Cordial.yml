@@ -24,9 +24,26 @@
 #     manifest entry at all; see the comment beside them.
 
 app-id: org.cordial.Cordial
-runtime: org.freedesktop.Platform
-runtime-version: '25.08'
-sdk: org.freedesktop.Sdk
+# The GNOME runtime, not the freedesktop one, because the shell is GTK4 and
+# libadwaita (ADR-011) and org.freedesktop.Sdk has neither. This was wrong from
+# the first commit of this file and every CI run failed the same way for it:
+#
+#     Package 'gtk4' not found
+#     The system library `gtk4` required by crate `gdk4-sys` was not found.
+#
+# which is a legible message that nobody read, because nothing was gating on
+# the workflow and the five red runs sat there unlooked at. org.gnome.Platform
+# is a superset of org.freedesktop.Platform, so the GL, PipeWire and Vulkan
+# bits the runtime already relied on are all still there.
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+# The freedesktop SDK extensions are versioned by the *base* runtime rather than
+# by GNOME's number: org.gnome.Sdk//50 is built on org.freedesktop.Sdk//25.08,
+# and there is no rust-stable//50 to install. Both packaging/build-flatpak.sh
+# and .github/workflows/flatpak.yml read the line below to know what to fetch,
+# so keep its format exactly as it is — it is parsed, not decorative.
+# sdk-extension-version: '25.08'
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
   - org.freedesktop.Sdk.Extension.llvm20

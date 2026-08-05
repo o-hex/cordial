@@ -91,6 +91,27 @@ finish-args:
   # app-id directory rather than directly in $XDG_RUNTIME_DIR. Read-only,
   # since Cordial only ever connects out to it.
   - --filesystem=xdg-run/app/com.discordapp.Discord:ro
+  # Sober's unpacked copy of the official Android build, read-only.
+  #
+  # Without this the Flatpak's "No Roblox build found" dialog tells the user to
+  # install Sober, names the exact path it looked in, and then cannot see that
+  # path even once the file is sitting there — 97 MB of base.apk on the host and
+  # `No such file or directory` inside the sandbox, because `~/.var/app/` in
+  # here contains this application's own directory and nothing else. It is the
+  # worst shape a bug can take: the instructions are right, the user follows
+  # them, and the program says they did not.
+  #
+  # Narrowed to `packages` rather than the whole of Sober's data, because the
+  # rest of that tree is Sober's configuration and Roblox's own storage under
+  # Sober — an account's session included — and Cordial has no business reading
+  # any of it. Read-only for the same reason: Cordial copies the engine out and
+  # never writes back. The path is `install::sober_apk_under`'s, and a test
+  # pins it; if that moves, this moves in the same edit.
+  #
+  # A user-picked APK needs no entry here and does not get one: settings.rs uses
+  # `GtkFileDialog`, which is the portal inside a sandbox, and the portal hands
+  # over the chosen file itself.
+  - --filesystem=~/.var/app/org.vinegarhq.Sober/data/sober/packages:ro
   # notify.send and url.open are not listed here at all: both go through
   # org.freedesktop.portal.Notification and org.freedesktop.portal.OpenURI,
   # which Flatpak already exposes to every sandboxed app without a

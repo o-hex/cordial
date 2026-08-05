@@ -141,6 +141,46 @@ binary that touches the variable. If a future file needs to point
 `CORDIAL_PROFILE_ROOT` at a scratch directory in a test, use that one rather
 than adding a fourth private mutex that looks like it works.
 
+## A local Sober issue corpus for triage (ADR-017)
+
+`tools/sober-corpus/` is a Deno tool, not Rust, and it does not touch the
+engine — worth saying plainly because everything else in this file does.
+It pulls vinegarhq/sober's issue tracker (another Roblox-on-Linux project,
+closed source, so its GitHub repo is purely an issue tracker) into a local,
+gitignored, PII-redacted corpus. Sober's tracker is prior art: real users
+hitting real problems on the same engine Cordial loads, with a
+maintainer's actual answer attached. `just sober-corpus-fetch` pulls it;
+`just sober-corpus-derive` filters it down to the cases with a substantive
+maintainer reply. Read `tools/sober-corpus/README.md` for day-to-day use
+and ADR-017 for the reasoning.
+
+**Run and verified, this session, not assumed:** a cold run against the
+live tracker completed in 91.9s, 22 pages, ~44 GraphQL points of a
+5,000/hour budget, and produced 2,195 issues (2,194 at the time the
+original version of this tool was measured elsewhere; the tracker gained
+one issue in the interim, which is itself a small proof the fetch is
+talking to the real, current API). SIGKILLing it mid-run (confirmed dead:
+exit 137) and re-running showed "Resuming an interrupted pass: 3 page(s) /
+300 issue(s) already done this pass" and continued from page 4 rather than
+restarting — the checkpoint scheme works as designed. A warm re-run with
+nothing new to fetch cost one page, 2 points, 4.1s. `grep`ing the full
+corpus for `/home/` turned up zero unredacted username paths (1,786
+occurrences of the redaction marker, one benign non-match that was a
+literal `"me"` string in a user's own malformed `$HOME`, not a real
+username). Cross-checked against `gh api repos/vinegarhq/sober/pulls
+?state=all` — zero of the repo's 20 real pull request numbers appear among
+the 2,195 fetched issue numbers, confirming the GraphQL `issues` connection
+this fetcher uses does not leak pull requests the way REST's `/issues`
+endpoint would.
+
+**Dropped on purpose:** an LLM-scoring harness (`evaluate.ts`, `model.ts`,
+`sampling.ts`, a Cordial-context builder) existed alongside the fetcher in
+the project this was ported from. It called an external LLM API to
+auto-judge diagnoses against the derived set, and the founder explicitly
+cancelled it ("No openrouter"). It is not in this tree and nothing here
+depends on it — what ships is the fetcher and the maintainer-reply quality
+filter that makes the raw corpus worth searching by hand.
+
 ## Open threads, with what is actually known
 
 **Fullscreen clips and letterboxes** until you switch workspaces and back. Not

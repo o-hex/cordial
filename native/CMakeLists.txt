@@ -18,6 +18,56 @@ endif()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mcpelauncher-linker
                  ${CMAKE_CURRENT_BINARY_DIR}/mcpelauncher-linker)
 
+# Undo the upstream `-DPATH_MAX=256`, which is a stack overflow waiting for a
+# long enough path.
+#
+# third_party/mcpelauncher-linker/CMakeLists.txt does:
+#
+#     target_compile_definitions(linker PRIVATE PATH_MAX=256 _GNU_SOURCE)
+#
+# so every `char buf[PATH_MAX]` in the linker port is 256 bytes — seven of them,
+# in linker.cpp, linker_utils.cpp, linker_main.cpp and linker_config.cpp — while
+# the `realpath`, `readlink` and `snprintf` those buffers are handed to are the
+# *host's*, which are entitled to write up to the real PATH_MAX of 4096.
+#
+# glibc caught it. Inside the Flatpak, whose runtime fortifies these calls, the
+# client aborted at linker init with `*** buffer overflow detected ***`, and the
+# check reads exactly this:
+#
+#     lea    -0x130(%rbp),%rsi
+#     mov    $0x100,%edx          ; 256, the buffer this define created
+#     call   __realpath_chk@plt   ; refuses anything under PATH_MAX
+#
+# The host build makes the same calls through plain `realpath@plt` with no
+# `__realpath_chk` anywhere in the binary, so it has carried the same undersized
+# buffers unchecked for as long as this has existed. **The host build working is
+# the less trustworthy of the two results**, not the baseline the Flatpak
+# departed from: a resolved path over 256 bytes smashes that stack frame there
+# today and nothing reports it.
+#
+# Corrected to 4096 rather than deleted, and the difference was measured. The
+# first attempt removed the define outright on the theory that `<limits.h>`
+# would then supply the real value; the build failed immediately with
+#
+#     linker_utils.cpp:216:22: error: use of undeclared identifier 'PATH_MAX'
+#
+# because these translation units are compiled with `-include compat.h` against
+# `include/`, and never see a `<limits.h>` that defines it. Supplying the macro
+# is exactly why upstream's line exists. Only its value was wrong.
+#
+# 4096 is what the kernel uapi header in this same submodule says
+# (bionic/libc/kernel/uapi/linux/limits.h), and what both this host and the
+# Flatpak SDK report from `<limits.h>` — checked, not assumed.
+#
+# Kept on our side rather than patched into the submodule because the Flatpak
+# manifest pins that repository by commit and clones it fresh: a local edit
+# there would fix `cargo build` and leave the package broken, which is the
+# worse half to get right by accident.
+get_target_property(_linker_defs linker COMPILE_DEFINITIONS)
+list(REMOVE_ITEM _linker_defs "PATH_MAX=256")
+list(APPEND _linker_defs "PATH_MAX=4096")
+set_target_properties(linker PROPERTIES COMPILE_DEFINITIONS "${_linker_defs}")
+
 # PipeWire, for opensles.cpp's audio backend. Headers only, and only if
 # present: libpipewire-0.3.so is never linked (dlopen'd at run time instead,
 # see pipewire_backend.cpp), so this only decides whether that file compiles

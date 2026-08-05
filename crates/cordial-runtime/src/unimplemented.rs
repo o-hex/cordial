@@ -134,10 +134,17 @@ pub unsafe extern "C" fn cordial_unimplemented_record(kind: u32, detail: *const 
 /// diagnostics for an issue is already being pointed at that folder and a second
 /// location is a second thing to forget.
 fn report_path() -> PathBuf {
-    let base = std::env::var_os("HOME")
+    // `XDG_DATA_HOME` first, then `$HOME/.local/share`, which is what every
+    // other path derivation in the tree does and what this one did not. Inside
+    // a Flatpak that variable is the app's own data directory; going straight
+    // to `$HOME/.local/share` there names the real home, which the sandbox
+    // holds no `--filesystem=home` for, so the last-resort fallback would fail
+    // to write in exactly the case it exists to cover.
+    let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(std::env::temp_dir)
-        .join(".local/share/cordial");
+        .join("cordial");
     // `files/appData/logs` is relative to the client's working directory, which
     // is the profile's data dir; the engine resolves it itself. This mirrors it
     // rather than deriving it, because the profile in force is `profile.rs`'s

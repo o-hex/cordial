@@ -208,21 +208,21 @@ list of build dependencies moved down to §3, where it belongs.
 
 ### 2. Install it
 
-> [!WARNING]
-> **The remote below goes live with the first green run of the Flatpak
-> workflow, and may not have had one yet.** GitHub Pages is now enabled on this
-> repository with GitHub Actions as its source, and `PUBLISH_PAGES` is set, so
-> the gates that used to stop it are open — but the workflow publishes nothing
-> until it builds successfully, and its first five runs all failed on a runtime
-> with no GTK4 in it.
+> [!NOTE]
+> **The remote exists and serves.** Measured on 2026-08-05 against the published
+> URL with flatpak 1.18.0: `remote-add` is accepted and `flatpak remote-ls`
+> returns `app/org.cordial.Cordial/x86_64/master`, 6.1 MB to download and
+> 16.1 MB installed. It is browsable in a software centre too — the appstream
+> branch resolves and the metainfo validates.
 >
-> [**Check the workflow**](https://github.com/luohoa97/cordial/actions/workflows/flatpak.yml)
-> before trusting the commands: a green run on `main` means the remote is
-> serving, a red one means `flatpak remote-add` will fail and §3 is your route.
+> **What has not been observed is the installed package launching.** The build
+> is green and the remote is real; nobody has run `flatpak run
+> org.cordial.Cordial` from it. If it does not start, that is a known unknown
+> rather than a surprise, and §3 builds the same thing from source.
 >
-> It is written out here rather than hidden because the commands are what they
-> are either way, and because a project that documents an install route before
-> it works should say which half is true.
+> [The workflow](https://github.com/luohoa97/cordial/actions/workflows/flatpak.yml)
+> is worth a glance before a fresh install: it publishes only on a green run, so
+> a red one on `main` means the remote is serving the previous build.
 
 ```bash
 flatpak remote-add --if-not-exists cordial \

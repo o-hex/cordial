@@ -453,6 +453,48 @@ believed to be the cause. A ping thread and a time-sync thread failing to exist
 is at least the right shape for something that kills a session sixty seconds in,
 and that is exactly the kind of resemblance that has been wrong twice already.
 
+### The transport socket is written and never read
+
+Captured with `strace -f -e trace=network` over one join, 2026-08-06. This
+narrows the 304 lead from "networking" to a single socket, and rules out the
+explanations that sound most likely.
+
+```text
+fd 120   RakNet, which carries the game     sends 5153   recvs 11978
+fd 124   RbxTransport DummyClient probe     sends   10   recvs     0
+```
+
+Both connect to the same server IP and both `connect()` return 0. On fd 124
+Cordial sends ten 1231-byte handshake datagrams, every one returning `= 1231`,
+and then **never calls `recv` on that socket at all** — not "read and got
+nothing", never attempted. Five seconds later `RbxTransportDummyClient` reports
+`NoResponse`, which turns out to be literally true.
+
+**What this rules out.** Not reachability: the packets leave. Not "UDP does not
+work under Cordial": RakNet is UDP and takes nearly twelve thousand receives on
+the same run. Not a `getaddrinfo` fault, which was the first suspicion because
+`netdb_compat.cpp` is the *only* network function Cordial implements — everything
+else forwards to the host's glibc unmodified — and the endpoint here is numeric
+anyway.
+
+**What it points at.** Whatever owns that socket inside `RtcIoRna` is not
+polling it. The engine logs `Initialized RtcIoRna with 1 event loop threads`; a
+socket that is written and never read is what an event loop that never runs
+looks like from outside. Cordial's threading has been the cause before —
+`pthread_cond_t` is 48 bytes in bionic against 32 in glibc, and `pthread_once`
+returning a lie was survivable by nothing.
+
+**Not established: that this causes the 304.** The two facts are consistent —
+Sober opens the same socket in 38 ms, starts a ping thread and a time sync
+thread, and is never disconnected; Cordial gets none of that and is kicked 60.1
+seconds after its RakNet accept. That is a good shape and it is not a mechanism.
+Twice in this investigation something with exactly that shape has been wrong.
+
+**The next step needs no account run of its own.** Re-take the same capture with
+`-e trace=desc` and look for fd 124 in an `epoll_ctl`. If it is never registered,
+that is the mechanism and the fix is in the shim rather than anywhere near the
+network.
+
 **Still unchecked, and the obvious next candidates.** Comparing Sober's
 `appData` with Cordial's, Sober has `ClientSettings/` and `rbx-storage.db`;
 Cordial has neither. And [issue #2](https://github.com/luohoa97/cordial/issues/2)

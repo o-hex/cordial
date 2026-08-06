@@ -450,6 +450,7 @@ Start with [`docs/NEXT.md`](docs/NEXT.md). The rest is reference.
 | | |
 |---|---|
 | [`docs/NEXT.md`](docs/NEXT.md) | Where to start, what is blocking, and what has already been ruled out |
+| [`docs/architecture.md`](docs/architecture.md) | How the pieces fit, as a diagram: shell, linker, symbol table, JNI, framework, plugins |
 | [`docs/HANDOVER.md`](docs/HANDOVER.md) | Written for whoever takes this on: every open thread, which claims are `INFERRED`, and the traps |
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed between releases, retractions included. [Releases](https://github.com/luohoa97/cordial/releases) |
 | [`docs/findings.md`](docs/findings.md) | Bootstrap analysis: the architecture verdict and what is unknown |

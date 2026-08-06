@@ -183,13 +183,44 @@ filter that makes the raw corpus worth searching by hand.
 
 ## Open threads, with what is actually known
 
-**Fullscreen clips and letterboxes** until you switch workspaces and back. Not
-started. One read-only lead, unverified: on Wayland the swapchain extent does
-not come from the compositor — `vk_get_physical_device_surface_capabilities_khr`
-substitutes `wayland::current().geometry()` when Mesa reports `0xFFFFFFFF`, and
-that geometry is written only by `apply_resize`, which early-returns when the
-size is unchanged. So the thing to measure first is whether `apply_resize` fires
-with the fullscreen size at all — not whether the swapchain was recreated.
+**Fullscreen offsets the content** — right and down on entering, then bleeding
+up and left past the window edge on restore. Issue #7.
+
+**The lead previously recorded here is disproved.** It said the swapchain extent
+comes from `wayland::current().geometry()`, that geometry is written only by
+`apply_resize`, and that `apply_resize` early-returns when the size is unchanged
+— so the thing to measure was whether it fires with the fullscreen size at all.
+It does. Measured 2026-08-06 with `CORDIAL_INSTR=1` and temporary logging added
+around the early return:
+
+```text
+apply_resize(accept) 1370x765  -> 3440x1359      entering fullscreen
+surface_caps currentExtent <- geometry() 3440x1359
+apply_resize(accept) 3440x1359 -> 1370x765       restoring
+surface_caps currentExtent <- geometry() 1370x765   (repeatedly, after)
+```
+
+666 `apply_resize` entries over the run, 650 of them early returns and 16 real
+changes — but **both** fullscreen transitions are in the 16. The geometry
+updates, and the extent handed to `vkGetPhysicalDeviceSurfaceCapabilitiesKHR`
+tracks it in both directions. Neither the early return nor a stale extent
+explains the offset, and the next person should not spend the afternoon there.
+
+**What is now suspicious instead, and is not yet explained.** The fullscreen
+surface was **3440x1359**. `org.gnome.Mutter.DisplayConfig` on the same machine
+reports a 1920x1200 mode at scale 1.0, so that surface is both wider than the
+display and an odd number of pixels tall. Every height in the run is odd — 721,
+765, 1359 — while every width is even. That pattern wants explaining before any
+fix is attempted; it is the kind of detail that turns out to be the whole bug or
+a complete red herring, and this investigation has produced three of the latter
+in one evening.
+
+The measurement to take next is what the *compositor* configured versus what
+Cordial applied: log the `xdg_toplevel::configure` width and height alongside
+the `apply_resize` call they produce. If those disagree, the fix is in the
+configure handling. If they agree, the offset is downstream of the surface size
+entirely — canvas placement or the engine's own viewport — and neither of those
+is where anyone has been looking.
 
 **Textures and meshes render wrong, and the font is broken until it isn't.**
 Unexplained. The leading suspect is Cordial's own MAILBOX-for-FIFO present-mode

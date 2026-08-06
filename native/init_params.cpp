@@ -650,12 +650,60 @@ public:
         fprintf(stderr, "[roblox] app ready: %s\n", s ? s->c_str() : "");
     }
 
+    // The experience lifecycle, which the engine has been announcing to nobody.
+    //
+    // These four are the rest of the channel above, and until now every one of
+    // them was an unresolved symbol: the engine looked them up at `JNI_OnLoad`,
+    // libjnivm handed back a placeholder, and each announcement went into it.
+    // On Android the app is listening — Sober's bridge answers the game-loaded
+    // one and prints `{"place_id":…,"type":"game_loaded"}`.
+    //
+    // They are being answered now because of what sits beside them in the log.
+    // `SessionTransitionFSM` reaches `Entered play session` in both clients and
+    // then diverges: Sober logs `Sent play session success` and Cordial logs
+    // nothing, and roughly sixty seconds later the server disconnects with 304.
+    // Whether these callbacks are what unblocks that report is **not
+    // established** — they are `void` notifications, so it is equally possible
+    // the engine tells the app and carries on regardless. What is not in doubt
+    // is that the engine is speaking and Cordial was not listening, which is
+    // the `broken_feature` shape and worth closing on its own.
+    //
+    // Answering a `void` notification by receiving it is not a stub that lies.
+    // Nothing here reports success at a question it cannot answer; there is no
+    // question, only an announcement, and the honest response to an
+    // announcement is to have received it.
+    static void onExperienceStart(ENV*, Object*) {
+        fprintf(stderr, "[roblox] experience start\n");
+    }
+    static void onGameLoaded(ENV*, Object*, jlong place_id) {
+        fprintf(stderr, "[roblox] game loaded: place %lld\n",
+                static_cast<long long>(place_id));
+    }
+    /// The argument is a session identifier, not a credential — but this
+    /// boundary is next to the one that carries `.ROBLOSECURITY`, so it is
+    /// counted rather than printed. A log line is a file somebody pastes into
+    /// an issue.
+    static void onDidLogInReceived(ENV*, Object*, std::shared_ptr<String> s) {
+        fprintf(stderr, "[roblox] logged in (%zu bytes, not shown)\n",
+                s ? s->length() : 0u);
+    }
+    static void onScreenOrientationChanged(ENV*, Object*, jint orientation,
+                                           jboolean locked) {
+        fprintf(stderr, "[roblox] orientation %d (locked: %s)\n",
+                static_cast<int>(orientation), locked ? "yes" : "no");
+    }
+
     static void Register(ENV* env) {
         env->GetClass<NativeHelper>("com/roblox/client/startup/NativeHelper");
         auto c = env->GetClass("com/roblox/client/startup/NativeHelper");
         c->HookInstanceFunction(env, "gameActivity_onFlagsFailed", &NativeHelper::onFlagsFailed);
         c->HookInstanceFunction(env, "gameActivity_onFlagsLoaded", &NativeHelper::onFlagsLoaded);
         c->HookInstanceFunction(env, "gameActivity_onAppReady", &NativeHelper::onAppReady);
+        c->HookInstanceFunction(env, "gameActivity_onExperienceStart", &NativeHelper::onExperienceStart);
+        c->HookInstanceFunction(env, "gameActivity_onGameLoaded", &NativeHelper::onGameLoaded);
+        c->HookInstanceFunction(env, "gameActivity_onDidLogInReceived", &NativeHelper::onDidLogInReceived);
+        c->HookInstanceFunction(env, "gameActivity_onScreenOrientationChanged",
+                                &NativeHelper::onScreenOrientationChanged);
     }
 };
 

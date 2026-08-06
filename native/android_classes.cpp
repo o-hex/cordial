@@ -593,6 +593,16 @@ const char* platform_name() {
 /// become `onLeave` in the plugin event schema.
 class NativeGLJavaInterface : public Object {
 public:
+    /// The static half of the same game-loaded announcement `NativeHelper`
+    /// carries as an instance method — the engine calls both, and until now
+    /// this one was an unresolved symbol too. See the note beside
+    /// `NativeHelper::onGameLoaded` in `init_params.cpp` for why the pair is
+    /// being answered and what is not yet established about it.
+    static void gameLoadedCallback(ENV*, Class*, jlong place_id) {
+        fprintf(stderr, "[roblox] gameLoadedCallback: place %lld\n",
+                static_cast<long long>(place_id));
+    }
+
     static std::shared_ptr<DeviceStaticParams> getDeviceStaticParams(ENV*, Class*) {
         // Returning a live object rather than null is the whole point: Roblox
         // logs and gives up on null, and never reaches the code that would tell
@@ -821,6 +831,7 @@ public:
     static void Register(ENV* env) {
         env->GetClass<NativeGLJavaInterface>("com/roblox/engine/jni/NativeGLJavaInterface");
         auto c = env->GetClass("com/roblox/engine/jni/NativeGLJavaInterface");
+        c->Hook(env, "gameLoadedCallback", &NativeGLJavaInterface::gameLoadedCallback);
         c->Hook(env, "getDeviceStaticParams", &NativeGLJavaInterface::getDeviceStaticParams);
         c->Hook(env, "showKeyboard", &NativeGLJavaInterface::showKeyboard);
         c->Hook(env, "hideKeyboard", &NativeGLJavaInterface::hideKeyboard);

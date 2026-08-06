@@ -746,6 +746,37 @@ so that is shared and not the discriminator.
 absence causes the 304, or whether it is a third symptom of one cause. It is a
 lead with a mechanism, which is more than anything else here has.
 
+**Tried, and it did not work.** Five experience-lifecycle callbacks were
+unresolved — `NativeHelper.gameActivity_onExperienceStart`,
+`gameActivity_onGameLoaded`, `gameActivity_onDidLogInReceived`,
+`gameActivity_onScreenOrientationChanged` and
+`NativeGLJavaInterface.gameLoadedCallback`. The engine announces the experience
+starting and the game loading, Cordial was listening to none of it, and Sober's
+bridge answers the game-loaded one. Implementing them was the obvious first
+attempt at unblocking the report. **They fire — six calls in a run — and the 304
+is unchanged**: 60.2 s, and `SessionTransitionFSM` still goes `Entered play
+session` straight to `IASPE` with no `Sent play session success` in between. So
+the callbacks are answered now, which is worth having on its own, and they are
+**not** what gates the report.
+
+**One run in the middle of that looked like a fix and was not.** A 100-second run
+showed no 304 at all, the FSM reached `Teleported.` and a `Session history: IASPJ`
+— a `J` state Cordial had never produced. It was three connections of 42 s, 45 s
+and 10 s: the place teleports roughly every 45 seconds, **and every teleport
+starts a new connection with a fresh 60-second deadline**. Nothing survived long
+enough to be disconnected. Run for 240 s instead, it teleports less and the 304
+returns on the first connection to cross 60 s.
+
+That is a trap worth naming, because it will catch the next person: **on a place
+that teleports, absence of a 304 means nothing unless a single connection
+exceeded 60 seconds.** Check `Connection accepted from` against the following
+`connectMode` line before reading anything into a clean run. A place that does
+not teleport would make a better test rig.
+
+Also: **do not run Sober and Cordial at once on a 16 GB machine.** Both were up
+during one attempt and the kernel killed Cordial (exit 137) and then Sober (134),
+which reads as a Cordial crash and is not one.
+
 **Causality is still open, and both stories fit the evidence.** Either the RCC
 allocates a netstack port, waits for the probe, and drops the client at 60 s when
 nothing arrives — which fits Sober connecting in 28 ms and living 256 s — or the

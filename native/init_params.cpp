@@ -716,12 +716,24 @@ class NativeHelper : public Object {
 public:
     static void onFlagsFailed(ENV*, Object*) {
         fprintf(stderr,
-            "[roblox] flags: engine reported onFlagsFailed (this is not the same "
-            "as flag data failing to load, and does not block startup — see "
-            "docs/analysis/flag-init.md)\n");
+            "[roblox] flags: engine reported onFlagsFailed (the flag data did "
+            "load; this does not block startup but it does block the content "
+            "store — see docs/analysis/flag-init.md)\n");
     }
-    static void onFlagsLoaded(ENV*, Object*, std::shared_ptr<Object>) {
-        fprintf(stderr, "[roblox] flags loaded\n");
+    /// The buffer is the flag cache the engine hands back for the app to keep.
+    /// On Android that is where `flag_cache.dat` comes from — Sober's log writes
+    /// it a second after this fires, 362 KB compressed.
+    ///
+    /// The parameter type is the whole point of this declaration. libjnivm
+    /// derives the hook's descriptor from these C++ types, and the engine looks
+    /// the method up as `(Ljava/nio/ByteBuffer;)V`. This took
+    /// `std::shared_ptr<Object>` until now, which derives `(Ljava/lang/Object;)V`
+    /// — so the hook registered, the symbol resolved, and it could never once be
+    /// called. `tools/hook_descriptors.py` is what found it, and this was one of
+    /// only two such hooks left in the tree.
+    static void onFlagsLoaded(ENV*, Object*, std::shared_ptr<jnivm::ByteBuffer> buf) {
+        fprintf(stderr, "[roblox] flags loaded (%lld bytes)\n",
+                buf ? static_cast<long long>(buf->capacity) : -1LL);
     }
     static void onAppReady(ENV*, Object*, std::shared_ptr<String> s) {
         fprintf(stderr, "[roblox] app ready: %s\n", s ? s->c_str() : "");

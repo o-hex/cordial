@@ -103,6 +103,9 @@ void set_display_size(int width, int height) {
 
 class AndroidActivity;
 std::shared_ptr<Object> make_display_metrics(ENV* env);
+/// Defined below with `Insets`; declared here so game_activity.cpp can
+/// return one without duplicating the class.
+std::shared_ptr<Object> cordial_make_zero_insets(ENV* env);
 
 /// `android.util.DisplayMetrics`
 ///
@@ -141,6 +144,171 @@ public:
         F(density); F(scaledDensity); F(xdpi); F(ydpi); F(densityDpi);
         F(widthPixels); F(heightPixels);
 #undef F
+    }
+};
+
+
+/// `android.content.res.Configuration`
+///
+/// Eighteen fields, every one of them read by the engine and none of them
+/// answered before this. From the JNI inventory in
+/// `docs/analysis/unresolved-jni.tsv`, all eighteen arrived as
+/// `Constructed Unresolved symbol`, which answers zero.
+///
+/// **Zero is a specific wrong answer here, not a blank.** `orientation` 0 is
+/// `ORIENTATION_UNDEFINED`, `densityDpi` 0 is a screen with no pixels, and
+/// `fontScale` 0.0 scales every glyph to nothing. A layout engine given those
+/// does not fail — it lays out for an impossible device.
+///
+/// Nothing here is invented. The numeric fields are derived from the same
+/// `g_width`/`g_height` and the same 160 dpi that `DisplayMetrics` above
+/// already reports, because the comment on `set_display_size` says AConfiguration,
+/// PlatformParams and DisplayMetrics all have to agree — and three sources
+/// disagreeing about the screen is worse than one being absent. At density 1.0
+/// a density-independent pixel *is* a real pixel, so `screenWidthDp` is the
+/// pixel width and no conversion is hiding here.
+///
+/// The categorical fields describe this machine honestly rather than imitating
+/// a phone: a desktop has a hardware keyboard, no touchscreen, and no D-pad.
+/// Their values are Android's own documented constants, named below so the
+/// numbers are readable rather than magic.
+class Configuration : public Object {
+public:
+    // Android constants, spelled out so a reader does not have to trust a bare
+    // integer. These are platform API values, not anything read out of Roblox.
+    static constexpr jint kOrientationPortrait  = 1;
+    static constexpr jint kOrientationLandscape = 2;
+    static constexpr jint kTouchscreenNoTouch   = 1;
+    static constexpr jint kKeyboardQwerty       = 2;
+    static constexpr jint kKeyboardHiddenNo     = 1;
+    static constexpr jint kHardKeyboardHiddenNo = 1;
+    static constexpr jint kNavigationNoNav      = 1;
+    static constexpr jint kNavigationHiddenNo   = 1;
+    static constexpr jint kUiModeTypeNormal     = 1;
+    static constexpr jint kUiModeNightNo        = 0x10;
+    static constexpr jint kScreenlayoutSizeLarge = 0x03;
+    static constexpr jint kScreenlayoutLongNo    = 0x10;
+    static constexpr jint kColorModeWideCgNo     = 0x01;
+
+    jfloat fontScale = 1.0f;
+    jint densityDpi = 160;
+    jint screenWidthDp = 1280;
+    jint screenHeightDp = 720;
+    jint smallestScreenWidthDp = 720;
+    jint orientation = kOrientationLandscape;
+    /// A desktop window is not a phone screen and not a watch. Large rather
+    /// than XLarge because the window is resizable and usually well under a
+    /// tablet's dimensions.
+    jint screenLayout = kScreenlayoutSizeLarge | kScreenlayoutLongNo;
+    jint uiMode = kUiModeTypeNormal | kUiModeNightNo;
+    jint colorMode = kColorModeWideCgNo;
+    /// Mouse and keyboard, no touch panel. Saying otherwise would ask Roblox
+    /// for touch controls on a machine that cannot produce a touch event.
+    jint touchscreen = kTouchscreenNoTouch;
+    jint keyboard = kKeyboardQwerty;
+    jint keyboardHidden = kKeyboardHiddenNo;
+    jint hardKeyboardHidden = kHardKeyboardHiddenNo;
+    jint navigation = kNavigationNoNav;
+    jint navigationHidden = kNavigationHiddenNo;
+    /// No SIM. 0 is `MCC_UNDEFINED`/`MNC_UNDEFINED` and is the honest answer
+    /// for a desktop, not a placeholder — this is the one pair where zero is
+    /// what Android itself would report.
+    jint mcc = 0;
+    jint mnc = 0;
+    /// Android 14 and up; 0 means "no adjustment", which is correct here.
+    jint fontWeightAdjustment = 0;
+
+    static std::shared_ptr<Configuration> Create(ENV* env, int width, int height) {
+        auto p = std::make_shared<Configuration>();
+        // density is 1.0 at 160 dpi, so dp and px are the same number. Stated
+        // rather than multiplied by 1 so the relationship survives a future
+        // change to DisplayMetrics::densityDpi — if that moves, this must too.
+        p->screenWidthDp = width;
+        p->screenHeightDp = height;
+        p->smallestScreenWidthDp = width < height ? width : height;
+        p->orientation = width >= height ? kOrientationLandscape : kOrientationPortrait;
+        to_jni(env, p);
+        return p;
+    }
+
+    static void Register(ENV* env) {
+        env->GetClass<Configuration>("android/content/res/Configuration");
+        auto c = env->GetClass("android/content/res/Configuration");
+#define F(name) c->HookInstance(env, #name, &Configuration::name)
+        F(fontScale); F(densityDpi); F(screenWidthDp); F(screenHeightDp);
+        F(smallestScreenWidthDp); F(orientation); F(screenLayout); F(uiMode);
+        F(colorMode); F(touchscreen); F(keyboard); F(keyboardHidden);
+        F(hardKeyboardHidden); F(navigation); F(navigationHidden);
+        F(mcc); F(mnc); F(fontWeightAdjustment);
+#undef F
+    }
+};
+
+/// `androidx.core.graphics.Insets`
+///
+/// Four fields. Zero on every one is the correct answer and, unusually here,
+/// not a placeholder: Cordial's window has no status bar, no navigation bar,
+/// no display cutout and no gesture areas, so there is genuinely nothing for
+/// the engine to inset its layout by. Registering them matters anyway — an
+/// unresolved *field* is not the same as a field that reads zero, and the
+/// engine's `getWaterfallInsets`/`getWindowInsets` return one of these.
+class Insets : public Object {
+public:
+    jint left = 0;
+    jint top = 0;
+    jint right = 0;
+    jint bottom = 0;
+
+    static std::shared_ptr<Insets> Create(ENV* env) {
+        auto p = std::make_shared<Insets>();
+        to_jni(env, p);
+        return p;
+    }
+
+    static void Register(ENV* env) {
+        env->GetClass<Insets>("androidx/core/graphics/Insets");
+        auto c = env->GetClass("androidx/core/graphics/Insets");
+#define F(name) c->HookInstance(env, #name, &Insets::name)
+        F(left); F(top); F(right); F(bottom);
+#undef F
+    }
+};
+
+std::shared_ptr<Object> cordial_make_zero_insets(ENV* env) { return Insets::Create(env); }
+
+/// `androidx.core.view.WindowInsetsCompat$Type`
+///
+/// Nine static methods returning the bitmask AndroidX uses to name each inset
+/// family. The engine calls them to build a mask it then passes to
+/// `GameActivity.getWindowInsets(int)`.
+///
+/// **The exact bit values do not need to match AndroidX's**, and pretending
+/// otherwise would be the guess. What has to hold is that they are distinct
+/// and stable within one process, because the only consumer of the mask is
+/// Cordial's own `getWindowInsets`, which answers zero insets for every family.
+/// Distinct powers of two satisfy that. If a future change makes Cordial return
+/// real insets per family, these become load-bearing and should be taken from
+/// the capture rather than from here.
+class WindowInsetsCompatType : public Object {
+public:
+    static jint statusBars(ENV*, Class*)              { return 1 << 0; }
+    static jint navigationBars(ENV*, Class*)          { return 1 << 1; }
+    static jint captionBar(ENV*, Class*)              { return 1 << 2; }
+    static jint ime(ENV*, Class*)                     { return 1 << 3; }
+    static jint systemGestures(ENV*, Class*)          { return 1 << 4; }
+    static jint mandatorySystemGestures(ENV*, Class*) { return 1 << 5; }
+    static jint tappableElement(ENV*, Class*)         { return 1 << 6; }
+    static jint displayCutout(ENV*, Class*)           { return 1 << 7; }
+    static jint systemBars(ENV*, Class*)              { return (1 << 0) | (1 << 1) | (1 << 2); }
+
+    static void Register(ENV* env) {
+        env->GetClass<WindowInsetsCompatType>("androidx/core/view/WindowInsetsCompat$Type");
+        auto c = env->GetClass("androidx/core/view/WindowInsetsCompat$Type");
+#define M(name) c->Hook(env, #name, &WindowInsetsCompatType::name)
+        M(statusBars); M(navigationBars); M(captionBar); M(ime);
+        M(systemGestures); M(mandatorySystemGestures); M(tappableElement);
+        M(displayCutout); M(systemBars);
+#undef M
     }
 };
 
@@ -950,6 +1118,9 @@ void register_init_params_classes(ENV* env) {
     DisplayMetrics::Register(env);
     AppSurface::Register(env);
     Resources::Register(env);
+    Configuration::Register(env);
+    Insets::Register(env);
+    WindowInsetsCompatType::Register(env);
     AndroidActivity::Register(env);
     // These classes are registered by register_game_activity_classes, which runs
     // first; only the descriptor-correct hook belongs here.

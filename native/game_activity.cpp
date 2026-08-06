@@ -27,6 +27,11 @@
 
 namespace cordial {
 std::shared_ptr<jnivm::Object> make_display_metrics(jnivm::ENV* env);
+/// Defined beside `Insets` in init_params.cpp. Declared rather than
+/// duplicated for the same reason make_display_metrics is: one class, one
+/// definition, and the insets the engine gets here are the same object the
+/// rest of the framework layer hands out.
+std::shared_ptr<jnivm::Object> cordial_make_zero_insets(jnivm::ENV* env);
 std::shared_ptr<jnivm::Object> make_resources(jnivm::ENV* env);
 void set_display_size(int width, int height);
 
@@ -131,11 +136,35 @@ public:
     void setImeEditorInfoFields(ENV*, jint, jint, jint) {}
     void setWindowFlags(ENV*, jint, jint) {}
 
+    /// `getWindowInsets(int)` and `getWaterfallInsets()`.
+    ///
+    /// Both return an `androidx.core.graphics.Insets` with every edge zero,
+    /// and that is the true answer rather than a placeholder: Cordial's window
+    /// has no status bar, no navigation bar, no display cutout and no gesture
+    /// exclusion areas, so there is nothing for the engine to inset its layout
+    /// by. A phone's values invented here would push Roblox's UI inward from
+    /// edges that do not exist.
+    ///
+    /// They were `Constructed Unresolved symbol` until now, which is worse than
+    /// zero insets: the engine asked for a layout constraint and got a null it
+    /// then has to interpret. The mask argument is ignored on purpose — every
+    /// inset family is zero, so there is nothing for it to select between, and
+    /// `WindowInsetsCompat$Type`'s own comment records that its bit values only
+    /// have to be distinct for exactly this reason.
+    std::shared_ptr<Object> getWindowInsets(ENV* env, jint /*typeMask*/) {
+        return cordial_make_zero_insets(env);
+    }
+    std::shared_ptr<Object> getWaterfallInsets(ENV* env) {
+        return cordial_make_zero_insets(env);
+    }
+
     static void Register(ENV* env) {
         env->GetClass<GameActivity>("com/google/androidgamesdk/GameActivity");
         auto c = env->GetClass("com/google/androidgamesdk/GameActivity");
         c->HookInstanceFunction(env, "setImeEditorInfoFields", &GameActivity::setImeEditorInfoFields);
         c->HookInstanceFunction(env, "setWindowFlags", &GameActivity::setWindowFlags);
+        c->HookInstanceFunction(env, "getWindowInsets", &GameActivity::getWindowInsets);
+        c->HookInstanceFunction(env, "getWaterfallInsets", &GameActivity::getWaterfallInsets);
     }
 };
 

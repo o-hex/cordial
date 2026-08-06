@@ -551,6 +551,91 @@ counterexample to a 60-second rule, so it matters, and it should be treated as
 unverified rather than quietly dropped: if it is accurate the deadline is not
 universal, and if it was mis-transcribed the rule is clean.
 
+#### 2026-08-06, later: 304 reproduces on demand, and four more leads are dead
+
+**The join no longer needs a person.** `cordial-run --join-url
+'roblox://experiences/start?placeId=<id>'` joins directly, with the same
+`--profile` the shell passes, so the session and cookie store are the real ones.
+The shell's own deep-link path holds a link "until you press Roblox" and cannot
+be driven headlessly; the runtime's flag can. Two things fall out of that:
+
+- **`roblox-player://` does not work as a `--join-url`.** The runtime says so
+  itself — `FStringGameLaunchLinkURL` admits `roblox://` and `robloxmobile://`
+  only. Use the translated shape, which is what `deep_link` produces anyway.
+- **A join succeeds without the `gameinfo` ticket**, which `deeplink.rs` records
+  as "not established". It is established now: six joins, no ticket, all reached
+  the place and replicated.
+
+**304 is now 100% reproducible in about 70 seconds.** Six joins on 2026-08-06,
+every one of them:
+
+```text
+run          connect    alive     reason
+baseline3      1.9 s    60.1 s     304
+jnitrace       2.1 s    60.1 s     304
+strace         1.9 s    60.1 s     304
+nodummy        2.0 s    60.1 s     304
+(+ the two hand-driven joins earlier: 60.2 s and 89.9→150.2 s)
+```
+
+That is a hard 60-second deadline from `Connection accepted`, never anything
+else. **Reproducing it is no longer the hard part**, which is what every earlier
+entry here was blocked on.
+
+**Ruled out, each with a control rather than an argument:**
+
+| lead | how it died |
+|---|---|
+| the server address | Sober connected to `128.116.51.33` — the exact server Cordial dies on — and ran **256 s clean** |
+| the websocket to `10.110.101.222:5052` | **Sober hits the identical timeout**, same 59998 ms, same URL, and survives. In one Cordial run it fired 89 s *before* the 304 |
+| a missing JNI answer during play | JNI-trace build: `Constructed Unresolved symbol` appears only at `JNI_OnLoad` and at shutdown. **Nothing unresolved during the session** |
+| `NetworkUtils.getPublicIPv4Addresseses` | unresolved, yes — and **never invoked**, 0 calls in 17,749 traced lines. Implementing it would change nothing |
+| client settings not reaching the engine | `nativeInitClientSettings -> 0`, and **0 is documented success** in `client_settings.rs`. The 1.27 MB document is fetched, cached and delivered |
+
+**What the transport actually does**, from `strace -f -e trace=network` on a
+failing run — the capture this file has been asking for since the lead was
+opened:
+
+```text
+connect(146, 128.116.51.33:37074)                       = 0
+setsockopt(146, SO_RCVBUF/SO_SNDBUF, 524288)            = 0
+getsockname(146)                        -> 192.168.1.112:49485
+sendmsg(146, 1231 bytes) x10                            = 1231 each
+(no reply ever arrives; no recvmsg on 146 at all)
+```
+
+**Cordial sends.** Ten 1231-byte datagrams leave the socket successfully and the
+server answers none of them. Sober's equivalent connects in **28 ms** to the same
+address. So "the socket is epoll-registered and the event loop works" was right
+and remains right — the packets go out and nothing comes back.
+
+**RbxTransport is QUIC**, which the flag names give away
+(`DFFlagLogRbxTransportEphemeralEarlyPubKey`,
+`DFFlagRbxTransportDummyClientReportPubKeyOnQuicError`,
+`DFFlagRbxTransportFixNoQuicFrameCrash`), and 1231 bytes is a QUIC Initial
+padded past the 1200-byte floor.
+
+**The DummyClient is a telemetry probe, and that matters.**
+`DFFlagReportDummyClientConnectionAttemptResult`,
+`DFFlagNetStackDummyClientEnablePingTelemetry` and
+`FStringRbxTransportDummyClientEnabledMinorVersions_PlaceFilter` together say
+Roblox is shadow-testing a QUIC transport and reporting whether it would have
+worked, while `selectedTransport=RakNet` carries the actual game. A probe whose
+purpose is to report failure is a poor candidate for *causing* a disconnect.
+
+**The control for that is written and it did not work — say so.** Setting
+`FStringRbxTransportDummyClientEnabledMinorVersions_PlaceFilter` to `"0"` and
+`DFFlagReportDummyClientConnectionAttemptResult` to `false` via `CORDIAL_FLAGS`
+applied cleanly (`flags: 2 override(s) applied`) and **the DummyClient ran
+anyway** and failed identically. So whether the probe causes the 304 is still
+**not established**; those two flags simply are not its gate. Finding the real
+gate, or making the probe succeed, is the experiment that settles it — and
+unlike everything before, it can now be run in 70 seconds a time.
+
+`docs/analysis/unresolved-jni.tsv` is **stale**: it still lists
+`org/fmod/AudioDevice`, which is implemented. Regenerate it from a JNI-trace run
+before trusting a count from it.
+
 **What this changes about the next step.** Diffing a failing capture against a
 known-good one was the plan while the difference was believed to be the server.
 If the deadline is time-based, the question is instead *what the client owes the

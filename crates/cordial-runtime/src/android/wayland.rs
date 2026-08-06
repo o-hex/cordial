@@ -968,6 +968,14 @@ fn instr_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("CORDIAL_INSTR").is_some())
 }
 
+/// The control for the redraw nudge in [`WaylandWindow::apply_resize`], so the
+/// change can be shown to move the number in the same session rather than
+/// across two builds.
+fn redraw_nudge_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("CORDIAL_NO_REDRAW_NUDGE").is_some())
+}
+
 // -------------------------------------------------------------- construction
 
 /// Collected while walking `wl_registry`'s globals. A plain struct on the
@@ -1387,13 +1395,38 @@ impl WaylandWindow {
     /// downstream half only: resize the EGL window if one exists, and tell the
     /// engine. Mirrors `window.rs::dispatch_configure`.
     fn apply_resize(&self, width: i32, height: i32) {
+        // TEMPORARY INSTRUMENTATION -- not for commit. `CORDIAL_INSTR=1`.
+        //
+        // The early return below is the thing issue #7 needs measured, and
+        // until now it was silent: the existing `[instr] surface_resized` lines
+        // sit *after* it, so "apply_resize was never called with the fullscreen
+        // size" and "it was called and returned without doing anything" looked
+        // identical in a log. Those want opposite fixes.
+        if instr_on() {
+            eprintln!("[instr] apply_resize(entry) requested {width}x{height}");
+        }
         if width <= 0 || height <= 0 {
+            if instr_on() {
+                eprintln!("[instr] apply_resize(reject) non-positive {width}x{height}");
+            }
             return;
         }
         let format = {
             let mut g = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
             if g.width == width && g.height == height {
+                if instr_on() {
+                    eprintln!(
+                        "[instr] apply_resize(early-return) already {}x{}; geometry() stays stale",
+                        g.width, g.height
+                    );
+                }
                 return;
+            }
+            if instr_on() {
+                eprintln!(
+                    "[instr] apply_resize(accept) {}x{} -> {width}x{height}",
+                    g.width, g.height
+                );
             }
             g.width = width;
             g.height = height;
@@ -1417,6 +1450,48 @@ impl WaylandWindow {
         }
         if instr_on() {
             eprintln!("[instr] surface_resized {width}x{height} returned");
+        }
+        // Nudge the engine to repaint *now*, because a resized surface it has
+        // not drawn into yet is visible, not merely stale.
+        //
+        // `set_position` latches on the parent commit above and takes effect
+        // immediately; the engine's buffer only changes size when the engine
+        // next renders. Between the two the compositor shows a buffer of the
+        // old size at the new position, and nothing clips a subsurface to its
+        // parent. Reported symptom, restoring from fullscreen: "it restores
+        // position first, which means it takes up that space on the second
+        // monitor, then redraw kicks in and puts the size back in its place."
+        // The lag is the measured part. On this run the engine
+        // re-queried surface caps 3 log lines after an accepted resize but did
+        // not recreate the swapchain for another 5 pumps, and on one transition
+        // not for 20 — roughly 250ms to a second at the idle pump interval.
+        //
+        // This is `onSurfaceRedrawNeededNative`, which `sync_canvas_geometry`
+        // records as having been tried and not helped. That attempt called it
+        // every pump, and judged it on `vkQueuePresentKHR` counts over an idle
+        // 240-second run — the one measurement this project has established is
+        // an idle throttle rather than a frame rate, so it could not have shown
+        // a difference either way. Here it fires only on a resize the engine
+        // has just been told about, and the measurement is the pump distance
+        // from accept to swapchain recreate, with `CORDIAL_NO_REDRAW_NUDGE=1`
+        // as the control.
+        //
+        // **INFERRED.** That the nudge shortens the gap is reasoning, not a
+        // result: the control has not been run yet, so this may turn out to be
+        // as inert as the last attempt and should be deleted if it is. What is
+        // measured is the gap itself, quoted above. The parent commit in
+        // `sync_canvas_geometry` is the part that is confirmed.
+        if handle != 0 && !redraw_nudge_disabled() {
+            match cordial_linker_sys::game_activity::surface_redraw_needed(handle) {
+                Ok(Some(())) => {}
+                // The engine does not always have a native to call here; that
+                // is not an error, it just means the nudge is unavailable.
+                Ok(None) => {}
+                Err(e) => super::trace(format_args!("wayland: redraw nudge failed: {e}")),
+            }
+            if instr_on() {
+                eprintln!("[instr] redraw_needed sent after {width}x{height}");
+            }
         }
     }
 
@@ -1477,6 +1552,43 @@ impl WaylandWindow {
             // Latched on the parent's commit, not ours — see `HostWindow::
             // queue_commit`.
             self.host.0.queue_commit();
+            // ...and then commit the parent here as well, because *asking* GTK
+            // to repaint is not the same as GTK repainting. `queue_draw` marks
+            // the widget dirty; GTK4 still renders through GSK, and a frame
+            // whose render node is unchanged produces no damage, no attach and
+            // no `wl_surface.commit`. On a fullscreen transition nothing in
+            // GTK's own content changes — the header bar draws identically —
+            // so the request can be honoured with no commit at all, and the
+            // `set_position` above stays pending indefinitely.
+            //
+            // That is issue #7. Everything Cordial records looks right, because
+            // all of it is bookkeeping on this side: `content_rect` returns the
+            // new rectangle, `placed_at` updates, `set_position` is marshalled,
+            // `apply_resize` accepts and the swapchain follows. The one step
+            // that is not ours — the parent commit that makes the position take
+            // effect — is the one that does not happen. The reporter's
+            // "alt-tabbing fixes it" is the proof: focus changes the header
+            // bar's backdrop styling, which *is* real damage, so GTK commits
+            // and the compositor applies a position that had been sitting
+            // pending since the transition.
+            //
+            // Safe from here specifically because this runs on the thread that
+            // ran `gtk_init`, immediately after `host.pump()` returned, so GTK
+            // is between frames rather than part-way through staging one. A
+            // commit with nothing attached applies pending subsurface state and
+            // changes nothing else.
+            //
+            // SAFETY: `self.parent_surface` is GTK's toplevel `wl_surface`,
+            // live for the process's lifetime, and `commit` takes no arguments.
+            unsafe {
+                (self.wl.marshal_flags)(
+                    self.parent_surface,
+                    WL_SURFACE_COMMIT,
+                    std::ptr::null(),
+                    1,
+                    0,
+                );
+            }
         }
         // `onSurfaceRedrawNeededNative` was tried here, on both halves of this
         // function, and **did not help** — see docs/NEXT.md §1e. The reasoning

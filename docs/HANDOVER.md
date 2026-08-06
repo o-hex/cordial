@@ -513,10 +513,51 @@ not Cordial failing to poll; two of three joins simply got no answer from one
 particular server while a third answered in 432 ms.
 
 **What is established.** Cordial can connect that socket — nothing structural
-prevents it. 304 has never been observed on a run where the DummyClient
-connected. The failures correlate with the server address, not with the build.
-Sober's own logs contain a `NoResponse` too, on a join it abandoned 1.2 seconds
-later for a different server.
+prevents it. Sober's own logs contain a `NoResponse` too, on a join it abandoned
+1.2 seconds later for a different server.
+
+#### Retracted 2026-08-06: 304 does not correlate with the server address
+
+**"The failures correlate with the server address, not with the build" is wrong,
+and it was wrong because the sample was three joins that happened to land on two
+edges.** This is the fourth lead in this investigation to dissolve. Sweeping
+every surviving `*_Player_*.log` across all data roots for a `Connection accepted
+from` line and the `Disconnect reason received` that followed it gives:
+
+```text
+server           connection lifetime   outcome
+128.116.44.33          60.7 s          304
+128.116.56.33          60.6 s          304
+128.116.51.33          60.2 s          304
+128.116.51.33          15.6 s          --     (session ended first)
+```
+
+**Three different servers, three 304s, all between 60.2 and 60.7 seconds after
+`Connection accepted`.** `128.116.51.33` appears on both sides of the old
+correlation, which is what breaks it: the run that escaped was not on a kinder
+server, it was a session that ended at 15.6 s and never reached the deadline.
+The variable is elapsed time on a connection, not which edge answered.
+
+The reproduction that produced the newest row was not scripted and had nothing
+driving it — a plain `cordial-shell` with `CORDIAL_INSTR=1` and no
+`CORDIAL_SCRIPT`, with the join made by hand. The engine's own words are
+`Disconnect reason received: 304` and `connectMode: Peer Disconnected`, with
+`AckTimeout 0, IsOutgoingDataWaiting 0`: **the server sent it, and RakNet's own
+health was fine at the moment it arrived.** Nothing was stalled or backed up.
+
+**The `128.116.63.33` row above — "no 304, ran 96 s" — cannot be re-checked.**
+No surviving log in any data root contains that address. It is the one recorded
+counterexample to a 60-second rule, so it matters, and it should be treated as
+unverified rather than quietly dropped: if it is accurate the deadline is not
+universal, and if it was mis-transcribed the rule is clean.
+
+**What this changes about the next step.** Diffing a failing capture against a
+known-good one was the plan while the difference was believed to be the server.
+If the deadline is time-based, the question is instead *what the client owes the
+server within 60 seconds of joining and never sends* — which is the shape of an
+unanswered periodic report, and points back at the stub table rather than at the
+network. `docs/analysis/unresolved-jni.tsv` is the place to start looking, not
+`strace`.
 
 **What is not established, and must not be written down as though it were:** why
 `128.116.51.33` does not answer, whether the unanswered probe *causes* the 304 or

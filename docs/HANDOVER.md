@@ -938,3 +938,77 @@ writing; the voice is consistent and matching it is not optional.
 
 Arguing with an ADR is welcome — ADR-004 was reversed exactly that way. What is
 not acceptable is quietly contradicting one in code.
+
+## A whole class of bug: hooks that register and never bind
+
+**libjnivm binds by descriptor, and a mismatch fails silently in both
+directions.** The hook registers, the symbol resolves, and the engine still
+reports `Constructed Unresolved symbol` — or worse, calls a default and gets a
+zero. `tools/dex_method.py`'s docstring has warned about this since it was
+written; what is new is that **two live instances were found in one evening**,
+both in code that had been committed and believed to be working.
+
+**`LocalStorageManager.getAllocatableBytes` was hooked as an instance method and
+is static.** The JNI trace shows the engine calling it three times, every call
+logging a `java/lang/Class` receiver, which is what a static call looks like.
+`HookInstanceFunction` never matched, so the engine read free space as zero.
+Fixed. `docs/analysis/unresolved-jni.tsv` records it as an instance method and is
+wrong.
+
+**`GameActivity.getWindowInsets`/`getWaterfallInsets` return the wrong type.**
+They are hooked correctly, as instance methods on the right class, and they still
+do not bind: the hooks return `std::shared_ptr<Object>`, so libjnivm registers
+`(I)Ljava/lang/Object;` while the engine looks up
+`(I)Landroidx/core/graphics/Insets;`. **The insets work has therefore never taken
+effect**, months after it was committed and while it was being cited in the
+fullscreen investigation.
+
+*The fix for that one is not in the tree.* Moving `Insets` into a shared header so
+both files have the complete type made the process abort at `JNI_OnLoad` with
+"Rust cannot catch foreign exceptions" — almost certainly a duplicate class
+registration once the type appears in two translation units. Reverted rather
+than shipped. **Anyone attempting it again should check the run actually
+started**: the aborted build reported *zero* unanswered JNI methods, which looks
+like a total fix and means the opposite.
+
+**The general rule this suggests:** if a hook must return a specific Java class,
+the C++ return type has to *be* that class. `Object` is not a wildcard, and
+nothing warns you.
+
+## What Cordial does not answer, measured rather than derived
+
+`docs/analysis/unanswered-jni-observed.tsv` — 19 distinct methods across 9
+classes, from one traced run that joined a game and played to the 304. Notable:
+`NativeGLJavaInterface` accounts for 6 (purchases, advertising id, analytics
+callback, VR, save-image), `GameActivity` for 4 (including the two insets above,
+which are the bug rather than a gap), and `ActivityThread`, `JNIBaseUrlSetter`,
+`JNIAppRestarter`, `CookieProtocol.setCookie` and
+`NetworkUtils.getPublicIPv4Addresseses` one each.
+
+Only 2 of the 648 generated libc stubs were called: `ZSTD_trace_compress_begin`
+and `ZSTD_trace_decompress_begin`. **Those are not gaps.** They are zstd's
+tracing hooks, imported by `libzstd-jni` as well as by the engine, and returning
+zero is what "not tracing" means to zstd — demonstrated by 324 calls to
+`decompress_begin` in one run with every asset decompressing correctly.
+
+## rbx-storage: what it is not
+
+Five things ruled out, so nobody repeats them:
+
+- **Not the init call.** `LocalStorageManager.initStorageManagerNativeV3` is now
+  called with the prototype read from the dex, and returns cleanly.
+- **Not free space.** `getAllocatableBytes` now answers a real `statvfs`; storage
+  is still down.
+- **Not SQLite.** The engine imports zero `sqlite3_*` symbols and has no
+  `libsqlite` in `DT_NEEDED` — it is statically linked, so nothing is stubbed.
+- **Not the directories.** `files` and `cache` are created before use and exist.
+- **Not a flag Sober sets.** Sober's `config.json` `fflags` block is the stock
+  `{"FFlagExample": true}`. Whatever brings up its 167 MB `rbx-storage.db` is
+  platform-layer completeness, not configuration, so there is nothing to copy.
+
+**And the measurement that reframes it:** under `CORDIAL_TRACE_PATHS=1`, across a
+whole run, the engine **never touches a path containing `rbx-storage` at all**.
+It is not failing to open the database. It never tries. So the question is not
+"why does the open fail" but "what never asks for the store to exist", and the
+next instrument is a traced run read forward from `initStorageManagerNativeV3`
+rather than another candidate native.

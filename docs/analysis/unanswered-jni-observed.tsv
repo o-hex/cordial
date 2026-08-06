@@ -1,0 +1,26 @@
+# Java methods the engine asked for and Cordial did not answer.
+# Observed, not derived: one CORDIAL_JNI_TRACE=ON run that joined a game and
+# played until the 304, on 2026-08-06. Only what was reached that run is here,
+# so absence from this list is not evidence a method is answered.
+# Supersedes nothing -- unresolved-jni.tsv is a different (and staler) list, and
+# is wrong about at least getAllocatableBytes, which it calls an instance method.
+class	method
+android/app/ActivityThread	currentActivityThread
+android/app/ActivityThread	getApplication
+com/google/androidgamesdk/GameActivity	bootstrapTheApp
+com/google/androidgamesdk/GameActivity	finish
+com/google/androidgamesdk/GameActivity	getWaterfallInsets
+com/google/androidgamesdk/GameActivity	getWindowInsets
+com/roblox/client/JNIAppRestarter	restartApp
+com/roblox/client/JNIBaseUrlSetter	setBaseUrl
+com/roblox/engine/jni/NativeGLJavaInterface	getMobileAdvertisingId
+com/roblox/engine/jni/NativeGLJavaInterface	onExtendedAnalyticsRecvCallback
+com/roblox/engine/jni/NativeGLJavaInterface	onVrSessionStateUpdate
+com/roblox/engine/jni/NativeGLJavaInterface	promptNativePurchase
+com/roblox/engine/jni/NativeGLJavaInterface	promptNativePurchaseWithPaymentSessionId
+com/roblox/engine/jni/NativeGLJavaInterface	saveImageToAlbum
+com/roblox/engine/jni/util/NetworkUtils	getPublicIPv4Addresseses
+com/roblox/universalapp/cookie/CookieProtocol	setCookie
+java/lang/Class	getClassLoader
+java/util/List	get
+java/util/List	size

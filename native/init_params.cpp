@@ -1401,6 +1401,58 @@ int cordial_set_device_info(void* fn, int width, int height, char* err, size_t e
     }
 }
 
+/// `LocalStorageManager.initStorageManagerNativeV3(AssetManager, String, String)`
+///
+/// The engine's content store, which Cordial has never initialised. Its own log
+/// says so on every run -- `RbxStorage is not initialized, cannot access storage
+/// interface`, and `CrashMetricStorage: Failed to initialize storage interface`
+/// -- and the effect is visible on disk: Sober's `appData` carries a 167 MB
+/// `rbx-storage.db` plus `rbx-storage/` and `rbx-storage.id`, and Cordial's
+/// carries none of the three.
+///
+/// The prototype is read from the dex with `tools/dex_method.py`, not guessed.
+/// Guessing arity has already cost this project two crashes in one session.
+///
+/// The `AssetManager` is the deliberately-empty object from `game_activity.cpp`:
+/// the native side reaches assets through `AAssetManager_fromJava`, which
+/// resolves to Cordial's process-wide manager, so the object only has to exist
+/// and be of the right class.
+///
+/// **What the two strings are is not established.** They are passed the files
+/// and cache directories, in that order, because those are the two paths the
+/// engine is already given separately by `nativeSetBaseDataDirectories(files,
+/// cache)` and the shapes match. If that is wrong, the engine's own RbxStorage
+/// logging is what will say so.
+int cordial_init_storage_manager(void* fn, const char* a, const char* b, char* err,
+                                 size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jobject, jstring, jstring);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or initStorageManagerNativeV3 is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/client/LocalStorageManager");
+        auto am_cls = env->GetClass("android/content/res/AssetManager");
+        auto am = std::make_shared<jnivm::Object>();
+        am->clazz = am_cls;
+        auto sa = cordial::S_pub(a ? a : "");
+        auto sb = cordial::S_pub(b ? b : "");
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(),
+                                   (jobject)cordial::to_jni(env, cls),
+                                   (jobject)cordial::to_jni(env, am),
+                                   (jstring)cordial::to_jni(env, sa),
+                                   (jstring)cordial::to_jni(env, sb));
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
 /// A native taking only `(JNIEnv*, jobject)` — `nativeRetryInit`.
 int cordial_call_bare(void* fn, char* err, size_t err_len) {
     using Call = void (*)(JNIEnv*, jobject);

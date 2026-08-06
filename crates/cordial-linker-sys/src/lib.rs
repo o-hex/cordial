@@ -553,6 +553,27 @@ pub mod game_activity {
         if rc == 0 { Ok(()) } else { Err(take_err(err)) }
     }
 
+    /// `LocalStorageManager.initStorageManagerNativeV3(AssetManager, String, String)`
+    ///
+    /// The engine's content store. See the C++ side for why this exists and what
+    /// about the two paths is still unestablished.
+    pub fn init_storage_manager(native: *mut c_void, a: &str, b: &str) -> Result<(), String> {
+        let ca = CString::new(a).map_err(|e| e.to_string())?;
+        let cb = CString::new(b).map_err(|e| e.to_string())?;
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; both buffers outlive the call.
+        let rc = unsafe {
+            cordial_init_storage_manager(
+                native,
+                ca.as_ptr(),
+                cb.as_ptr(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
     /// A static, zero-argument native returning `boolean`. Added purely to
     /// observe `NativeSettingsInterface.nativeIsLuaLoginEnabled()`'s own
     /// verdict for `docs/design/sign-in.md` — diagnostic-only, does not drive
@@ -1345,6 +1366,13 @@ pub mod game_activity {
             err: *mut c_char,
             err_len: usize,
         ) -> c_int;
+        fn cordial_init_storage_manager(
+            native: *mut c_void,
+            a: *const c_char,
+            b: *const c_char,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> i32;
         fn cordial_game_activity_surface_redraw_needed(
             handle: i64,
             err: *mut c_char,

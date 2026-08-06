@@ -962,7 +962,7 @@ fn main() -> ExitCode {
                                                 // wrote a `channel` preference with
                                                 // an empty value and logged no
                                                 // `ClientRunInfo` at all.
-                                                vec!["production"],
+                                                vec![std::env::var("CORDIAL_CHANNEL").unwrap_or_else(|_| "production".into()).leak()],
                                                 // `nativeSetBaseUrl` is exported
                                                 // and still not called. The dex
                                                 // settles its prototype --
@@ -991,6 +991,24 @@ fn main() -> ExitCode {
                                                 Ok(()) => println!("  device info set"),
                                                 Err(e) => println!("  nativeSetDeviceInfo failed: {e}"),
                                             }
+                                        }
+
+                                        // The content store, after the
+                                        // directories above are set and before
+                                        // anything asks for an asset. The engine
+                                        // reports "RbxStorage is not initialized"
+                                        // on every run without this.
+                                        if let Some(f) = lib.symbol(
+                                            "Java_com_roblox_client_LocalStorageManager_initStorageManagerNativeV3",
+                                        ) {
+                                            match linker::game_activity::init_storage_manager(
+                                                f, &files, &cache,
+                                            ) {
+                                                Ok(()) => println!("  storage manager initialised"),
+                                                Err(e) => println!("  initStorageManagerNativeV3 failed: {e}"),
+                                            }
+                                        } else {
+                                            println!("  initStorageManagerNativeV3 not exported");
                                         }
 
                                         for (name, cls, args) in dirs2 {

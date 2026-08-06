@@ -1114,3 +1114,34 @@ the arity, two crashes this session came from exactly that.
 `nativePostClientSettingsLoadedInitialization3(List)` being handed an **empty
 ArrayList** is the other candidate at the same seam and is already flagged as
 unresolved in `flag-init.md` §7.4.
+
+### Tried live: the compressed settings variant does not accept either
+
+`nativeInitClientSettingsCachedCompressed` was wired up end to end — the real
+302 KB `.zst` fetched from
+`clientsettingscdn.roblox.com/v2/settings-compressed/application/AndroidApp.zst`,
+handed over as a `jbyteArray` with the dex's arity, and the `int` read back. It
+is reachable and it does not accept:
+
+```text
+compressed client settings (302349 bytes) -> 2      (during a full run)
+compressed client settings (302350 bytes) -> 5      (three short runs, all 5)
+```
+
+**The return code is not a function of the arguments.** Varying the trailing
+`long` and `boolean` across three probes produced 5 every time, and an earlier
+run with the *same* arguments produced 2. So the code reflects state or document
+content rather than the call, and `client_settings.rs`'s "0 accepted, 1 rejected"
+table does not cover it. Neither 2 nor 5 is 0, so the compressed path is not
+succeeding, and `onFlagsFailed` and the missing `RbxStorage::init` are unchanged.
+
+The code was **reverted** rather than left in: a startup call that always fails
+and changes nothing is noise, and shipping it would imply the path works.
+
+Two things worth keeping from it. The byte count moved between fetches minutes
+apart (302349 → 302350), so **the settings document is live and changes
+continuously** — any experiment that compares two runs is comparing two different
+flag sets, which the 6-hour cache in `client_settings.rs` normally hides.
+And the probe loop itself is the cheap way to work on this: the call happens at
+startup, so `--run 8` with no `--join-url` reads the return code in seconds
+without joining a game or touching an account.

@@ -1012,3 +1012,48 @@ It is not failing to open the database. It never tries. So the question is not
 "why does the open fail" but "what never asks for the store to exist", and the
 next instrument is a traced run read forward from `initStorageManagerNativeV3`
 rather than another candidate native.
+
+## Voice: the shim Cordial has is for a path this engine does not drive
+
+`org.webrtc.voiceengine.WebRtcAudioManager`/`WebRtcAudioRecord` are implemented
+here, and the downlink half (`WebRtcAudioTrack`) was the recorded next step. **It
+cannot be written.** `WebRtcAudioTrack`'s whole job is to pull audio from the
+engine by calling `nativeGetPlayoutData(int, long)` and
+`nativeCacheDirectBufferAddress(ByteBuffer, long)`, and **this engine exports
+neither.** Across the whole of `libroblox.so` there is exactly one WebRTC JNI
+export:
+
+```text
+Java_com_roblox_universalapp_webrtc_WebRtcLoader_initialize
+```
+
+The `org/webrtc/voiceengine/*` classes are in the dex because the Android app
+bundles Google's WebRTC Java, not because this engine calls into them. Writing
+`WebRtcAudioTrack` would produce a class with nothing on the other side of it.
+
+**The path the engine actually drives is `com.roblox.audio.AppRtcDeviceWrapper`,
+and Cordial implements none of it.** Its native counterpart *is* exported —
+`Java_com_roblox_audio_AppRtcDeviceWrapper_nativeAudioDeviceChanged` — and the
+dex declares the Java side:
+
+```text
+AppRtcDeviceWrapper.<init>(J)V
+AppRtcDeviceWrapper.wrapStartCommunication()V
+AppRtcDeviceWrapper.wrapStopCommunication()V
+AppRtcDeviceWrapper.wrapSetCommunicationMute(Z)V
+AppRtcDeviceWrapper.getSelectedAudioDeviceAsInt()I
+AppRtcDeviceWrapper.getSelectedAudioDeviceName()Ljava/lang/String;
+AppRtcDeviceWrapper.isValid()Z
+AppRtcDeviceWrapper.nativeAudioDeviceChanged(IJ)V
+```
+
+That is a communication-device wrapper — start/stop/mute and which device is
+selected — which is a much smaller surface than a WebRTC audio backend, and it
+sits on top of the PipeWire streams that already exist. **It is the voice work
+that is worth doing**, and the seven static-hook fixes in `2ca7811` are not
+undone by this: they were real bugs, they just live on a path the engine may
+never take.
+
+`WebRtcAudioManager.init` reporting failure therefore remains correct, and for a
+better reason than the one recorded beside it: not only is the downlink
+unimplemented, it is unimplementable against this build.

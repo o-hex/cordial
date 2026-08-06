@@ -769,3 +769,76 @@ between paths while the verdict stays constant. Both results hold at once — th
 flag load really does fail, and that failure really does not block the frame. So
 this is a genuine defect worth fixing for correctness, but it is **not** the
 render blocker, and it should not be worked before the thread-race deadlock.
+
+## §11. 2026-08-07: two unresolved symbols on the path, both answered, verdict unmoved
+
+Run with `tools/hook_descriptors.py`, a JNI-traced startup, and the engine's own
+`FLog` file, which this document had not been using.
+
+### The engine log exists, and it says the flags load
+
+`<profile>/data/files/appData/logs/*.log`. Earlier work looked for it in the
+wrong place and concluded none was written; that was wrong. Cordial's `FlagCache`
+compresses 1273559 bytes to 366594 and writes them, channel `production`,
+tombstone valid. Sober's writes 362169 on the same document. So `onFlagsFailed`
+is misleading in the way §7 suspected and now on the engine's own evidence rather
+than on a return code.
+
+### Three symbols that could never bind
+
+* `NativeHelper.gameActivity_onFlagsLoaded` — registered `(Ljava/lang/Object;)V`,
+  dex declares `(Ljava/nio/ByteBuffer;)V`. **Every prior observation in this
+  document that `onFlagsLoaded` "is never resolved or called" was made with this
+  bug in place** and cannot distinguish "the engine did not call it" from "it
+  could not have been called". §9's reasoning about the success path rests on
+  that observation and should be re-taken, not trusted.
+* `GameActivity.bootstrapTheApp()V` — the dex declares it on the subclass
+  `MainGameActivity`; the engine looks it up on the base
+  `com/google/androidgamesdk/GameActivity` and libjnivm walks no superclass
+  chain. It was `Constructed Unresolved symbol` on every run this project has
+  ever made.
+* `java/util/List.size()I` and `get(I)Ljava/lang/Object;` — `JavaList` registered
+  on `java/util/ArrayList` only, and the engine asks the interface. The list
+  handed to `nativePostClientSettingsLoadedInitialization3` was therefore an
+  object whose every method was a stub.
+
+All three are fixed. The sweep is down to one, `getWaterfallInsets`.
+
+### None of them is the cause
+
+`CORDIAL_TRACE_PATHS=1` over a `--run 10` startup: zero paths containing
+`rbx-storage`, byte-identical in that respect to the `CORDIAL_NO_BOOTSTRAP=1`
+control taken minutes later. `onFlagsFailed` still fires. Delivering in Sober's
+order — settings, then post, then flag names, read off its log at 3.700s and
+3.796s — did not change it.
+
+### Where the gap now is
+
+Sober's log, immediately after `nativePostClientSettingsLoadedInitialization3`
+at 3.796751s: `ClientRunInfo` git hash, base url and channel; then
+`AppPlatformQoSEmergencyHandler was instanced`; then the `Mimalloc` block; then
+`RbxStorage::init [INIT] user: flagLoaded` at 3.820885s.
+
+Cordial's log contains **none** of those, zero occurrences each, on a run where
+the `AndroidGLView` channel is demonstrably open because another line on it
+appears. Comparing distinct log channels over the same ten seconds, Sober reaches
+ten and Cordial seven; absent are `AppPlatformQoSEmergency`, `KeyRing`,
+`Mimalloc`, `NetworkClient`, `RbxStorage` and `RbxTransportDummyClient`.
+`NetworkClient` is expected on a startup-only run and `Mimalloc` is explained by
+Cordial not linking it. The other four are not explained.
+
+So: Cordial's call to `nativePostClientSettingsLoadedInitialization3` returns
+without the engine's own body of it having run. The two symbols it needs on the
+way in are now answered and the body still does not run. The one difference left
+that this session can point at is the argument — an empty `List` whose `size()`
+now truthfully returns 0, where before it returned whatever an unresolved stub
+returns. What that list should contain is still unknown, and recovering it means
+reading code units rather than declarations, which is out of scope. **That is
+the open question, stated as narrowly as the evidence allows.**
+
+### One assertion in the tree corrected
+
+`init_params.cpp` says the real client passes 139 flag names to
+`nativeInitializeNativeFlags`, from a Waydroid capture. The capture is not in
+doubt, but Sober — which works — logs `flagCount = 0`. Passing 139 is not a
+requirement.

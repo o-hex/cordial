@@ -830,7 +830,63 @@ fn main() -> ExitCode {
                                             ),
                                         ];
                                         let assets_now = asset_folder(&opt.apk);
+                                        // The preferences file. `INFERRED`: no
+                                        // capture line names it, unlike the app
+                                        // policy below. The path is where the
+                                        // engine already writes
+                                        // `GlobalBasicSettings_13.xml` of its own
+                                        // accord, so this tells it the name it
+                                        // had picked anyway rather than moving
+                                        // anything. If it turns out to change
+                                        // nothing, say so and delete it — issue
+                                        // #5 asks for that answer, not for the
+                                        // call.
+                                        let prefs =
+                                            format!("{files}/appData/GlobalBasicSettings_13.xml");
                                         let dirs2: &[(&str, &str, Vec<&str>)] = &[
+                                            (
+                                                // **The one difference from Sober
+                                                // that is established rather than
+                                                // suspected.** Sober's own log
+                                                // reports
+                                                //
+                                                //   rbx.JNIRobloxSettings: Setting
+                                                //   default app policy file:
+                                                //   content/guac/defaultConfigs/
+                                                //   GuacDefaultPolicy-GlobalDist.json
+                                                //
+                                                // and `docs/traces/` shows the real
+                                                // Android client logging that exact
+                                                // line. Cordial never called this,
+                                                // so the engine ran with no app
+                                                // policy at all.
+                                                //
+                                                // Relative, not absolute, because
+                                                // both the capture and Sober log it
+                                                // relative — it resolves under the
+                                                // asset root that
+                                                // `nativeSetAssetPath` sets, and
+                                                // the APK carries the file at
+                                                // `assets/content/guac/...`.
+                                                //
+                                                // GlobalDist of the three the APK
+                                                // ships (CJVDist and VNGGamesDist
+                                                // are the other two) because that
+                                                // is the one the capture uses and
+                                                // the one named in the real
+                                                // client's User-Agent as
+                                                // `(GlobalDist; GooglePlayStore)`.
+                                                "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetDefaultAppPolicyFile",
+                                                SETTINGS,
+                                                vec![
+                                                    "content/guac/defaultConfigs/GuacDefaultPolicy-GlobalDist.json",
+                                                ],
+                                            ),
+                                            (
+                                                "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetPreferencesFile",
+                                                SETTINGS,
+                                                vec![prefs.as_str()],
+                                            ),
                                             (
                                                 "Java_com_roblox_client_startup_MainGameActivity_nativeSetAssetPath",
                                                 "com/roblox/client/startup/MainGameActivity",

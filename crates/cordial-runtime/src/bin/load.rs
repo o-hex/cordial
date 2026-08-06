@@ -964,18 +964,22 @@ fn main() -> ExitCode {
                                                 // `ClientRunInfo` at all.
                                                 vec!["production"],
                                                 // `nativeSetBaseUrl` is exported
-                                                // and is NOT called here on
-                                                // purpose: passing it one string
-                                                // took the process down before
-                                                // `initializeNativeCode`, so its
-                                                // prototype is not
-                                                // `(Ljava/lang/String;)V` and
-                                                // guessing again would just crash
-                                                // again. Sober logs a base url and
-                                                // Cordial does not, so this is
-                                                // still an open gap -- read the
-                                                // prototype out of the dex with
-                                                // `--dump-classes` before trying.
+                                                // and still not called. The dex
+                                                // settles its prototype --
+                                                // `(Ljava/lang/String;Ljava/lang/
+                                                // String;)V`, which is why an
+                                                // earlier one-string guess killed
+                                                // the process -- but calling it
+                                                // with the same origin twice makes
+                                                // the engine stop considering
+                                                // itself signed in: the deeplink
+                                                // join then refuses with "Signing
+                                                // in is required before a join can
+                                                // proceed". So the second argument
+                                                // is not a second copy of the
+                                                // first, and until somebody knows
+                                                // what it is, not calling this is
+                                                // better than calling it wrong.
                                             ),
                                         ];
                                         if let Some(f) = lib.symbol(

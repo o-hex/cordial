@@ -876,6 +876,11 @@ fn main() -> ExitCode {
                                         let assets_now = asset_folder(&opt.apk);
                                         let engine_ver = engine_version(&opt.lib_dir)
                                             .unwrap_or_default();
+                                        // Read by `build_user_agent` on the C++
+                                        // side, which has no other route to it.
+                                        if !engine_ver.is_empty() {
+                                            std::env::set_var("CORDIAL_ENGINE_VERSION", &engine_ver);
+                                        }
                                         if engine_ver.is_empty() {
                                             println!("  engine version not readable from libroblox.so; not setting one");
                                         } else {

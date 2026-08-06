@@ -25,6 +25,7 @@
 // it is not this object. See docs/analysis/platform-identity.md.
 
 #include <jnivm.h>
+#include <vector>
 #include <sys/statvfs.h>
 
 #include <cstdio>
@@ -107,6 +108,81 @@ std::shared_ptr<Object> make_display_metrics(ENV* env);
 /// Defined below with `Insets`; declared here so game_activity.cpp can
 /// return one without duplicating the class.
 std::shared_ptr<Object> cordial_make_zero_insets(ENV* env);
+
+/// The `User-Agent` the engine puts on every HTTP request it makes.
+///
+/// **This was `"Roblox/Android"`, and the comment above it was wrong in the most
+/// expensive way available.** It said the string was "Roblox's own client
+/// string, not Cordial's: the service routes and gates on it, and a fabricated
+/// one would be both untrue and likely rejected". `Roblox/Android` appears
+/// **zero times** in `libroblox.so`. It was fabricated, by us, and the comment
+/// stated the exact risk of doing so while doing it.
+///
+/// The real client's is in `docs/traces/waydroid-roblox-startup.log.gz` — the
+/// capture AGENTS.md says to grep before investigating anything — and is about
+/// 230 characters of structured device data:
+///
+/// ```text
+/// Mozilla/5.0 (15701MB; 3440x1330; 180x180; 2584x999; Waydroid WayDroid x86_64 Device; 13)
+///  AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App 2.732.1043 Tablet Hybrid()
+///  GooglePlayStore RobloxApp/2.732.1043 (GlobalDist; GooglePlayStore)
+/// ```
+///
+/// Built here with the same **shape** and Cordial's own **honest values**: real
+/// installed memory, the real window size, the density `DisplayMetrics` already
+/// reports, the API level `Build.VERSION.SDK_INT` already answers, and the
+/// engine version already read out of the binary. The device name stays
+/// `Cordial` rather than borrowing a phone's — matching the format is not the
+/// same as claiming to be hardware we are not, and every other identity field
+/// in this file makes the same choice for the same reason.
+///
+/// **INFERRED that this matters to the server.** It is a candidate for the 304
+/// disconnect because the previous value could not have come from any real
+/// client, not because a server-side check has been observed. If it turns out
+/// to be inert, the string is still right and the old one was still invented.
+static std::string build_user_agent() {
+    long ram_mb = 0;
+    if (FILE* f = fopen("/proc/meminfo", "re")) {
+        char line[256];
+        while (fgets(line, sizeof line, f)) {
+            long kb = 0;
+            if (sscanf(line, "MemTotal: %ld kB", &kb) == 1) {
+                ram_mb = kb / 1024;
+                break;
+            }
+        }
+        fclose(f);
+    }
+
+    // The engine build is four parts (2.730.0.790); the app version the real
+    // client puts in its User-Agent is three (2.732.1043 for engine
+    // 2.732.0.1043), dropping the third. Derived rather than hardcoded, so it
+    // cannot go stale across an APK update the way `nativeSetRobloxVersion`'s
+    // literal silently did.
+    std::string app = "0.0.0";
+    if (const char* v = getenv("CORDIAL_ENGINE_VERSION")) {
+        std::string ver(v);
+        std::vector<std::string> parts;
+        size_t start = 0;
+        for (size_t i = 0; i <= ver.size(); ++i) {
+            if (i == ver.size() || ver[i] == '.') {
+                parts.push_back(ver.substr(start, i - start));
+                start = i + 1;
+            }
+        }
+        if (parts.size() == 4) {
+            app = parts[0] + "." + parts[1] + "." + parts[3];
+        }
+    }
+
+    char buf[512];
+    snprintf(buf, sizeof buf,
+             "Mozilla/5.0 (%ldMB; %dx%d; 160x160; %dx%d; Cordial; 33) "
+             "AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App %s Tablet Hybrid()  "
+             "GooglePlayStore RobloxApp/%s (GlobalDist; GooglePlayStore)",
+             ram_mb, g_width, g_height, g_width, g_height, app.c_str(), app.c_str());
+    return std::string(buf);
+}
 
 /// `android.util.DisplayMetrics`
 ///
@@ -1055,10 +1131,9 @@ public:
         auto p = std::make_shared<InitParams>();
         p->baseURL = S("https://www.roblox.com");
         p->buildVariant = S("release");
-        // The engine sends this on every request. It is Roblox's own client
-        // string, not Cordial's: the service routes and gates on it, and a
-        // fabricated one would be both untrue and likely rejected.
-        p->userAgent = S("Roblox/Android");
+        // See `build_user_agent`. The literal that used to be here was
+        // invented, and the comment beside it claimed the opposite.
+        p->userAgent = S(build_user_agent().c_str());
         p->deviceParams = DeviceParams::Create(env, width, height);
         p->platformParams = PlatformParams::Create(env, assets, width, height);
         // "Potato" is Roblox's own name for a device below the quality floor.

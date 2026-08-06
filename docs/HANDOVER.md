@@ -385,13 +385,44 @@ SOBER    258.157  Transport selection: useRbxTransportEnabled=false,
         1053.358  DisconnectClientInitiated — the player left
 ```
 
-**`RbxTransportDummyClient … NoResponse` is benign. Do not chase it.** It is the
-loudest error in the log and it looks exactly like a cause, which is why it is
-written down here as a ruled-out one. Sober logs the identical failure against
-the identical server and plays on for another thirteen minutes. `RbxTransport`
-is not the live transport in either client — `useRbxTransportEnabled=false` and
-`selectedTransport=RakNet` say so on the line above it. Same shape as the
-websocket to `10.110.101.222:5052` that was ruled out the same way.
+**`RbxTransportDummyClient … NoResponse` was written up here as benign. That
+was wrong, and it is the opposite of benign — it is the strongest lead there
+is.** The retraction is left in place rather than tidied away, because the
+reasoning that produced it is a trap worth seeing.
+
+The first control used a Sober log in which the *first* join also logged
+`NoResponse`, which looked like proof the failure did not matter. Read further
+and that join was abandoned 1.2 seconds later for a different place, and the
+join that actually stuck had the DummyClient **connected**. One log, one glance,
+one wrong conclusion — from a control that was real but not read to the end.
+
+Re-run 2026-08-06 with both clients pointed at the same place by deep link,
+same machine, same network, same server IP:
+
+```text
+SOBER    54.616  DummyClient will connect to 128.116.51.33:57479
+         54.654  Connected to server at 128.116.51.33:57479      (38 ms)
+         54.654  Started ping thread (interval 1000 ms, 64 bytes)
+         54.654  Started time sync thread (interval 5000 ms)
+        306.058  Disconnection Notification. Reason: 285 — the player left
+                 no 304, four minutes in the place
+
+CORDIAL   4.121  DummyClient will connect to 128.116.51.33:41297
+          4.156  Connection accepted from 128.116.51.33|52398   (RakNet, fine)
+          9.122  Error: Failed to establish connection, reason NoResponse
+                 — a five second timeout, no connection, no threads
+         64.292  Disconnect reason received: 304
+```
+
+**Sober connects that socket in 38 milliseconds. Cordial times out after five
+seconds and is disconnected 60.1 seconds after its RakNet accept.** RakNet
+itself — also UDP — connects fine in both, so this is not "UDP does not work".
+Something specific to the `RtcIoRna` path fails only under Cordial.
+
+The ping thread and the time sync thread are the shape to keep in mind: a
+liveness channel that never opens, and a kick almost exactly sixty seconds
+later. That is a hypothesis and not yet a mechanism — nobody has established
+*why* the connect times out.
 
 **What the control does establish.** The two clients are indistinguishable
 through connection: same transport selection, same RakNet accept, same

@@ -384,7 +384,13 @@ extern "C" fn run_bootstrap() {
         eprintln!("  bootstrapTheApp: nothing planned");
         return;
     };
-    BOOTSTRAP_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The engine calls `bootstrapTheApp` twice per launch -- the trace shows two
+    // `Call Member Function ... bootstrapTheApp ()V` -- and delivering on both
+    // registered two flag providers where Sober registers one. Deliver once.
+    if BOOTSTRAP_RAN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        println!("  bootstrapTheApp: already delivered");
+        return;
+    }
     println!("  bootstrapTheApp: delivering settings and flags");
     if plan.settings_native != 0 {
         match linker::game_activity::init_client_settings(
@@ -871,9 +877,21 @@ fn main() -> ExitCode {
                         // lost the race, because the decision had already been
                         // made. This is the last position that is actually
                         // earlier than the decision.
-                        if let Some(f) = lib.symbol(
-                            "Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings",
-                        ) {
+                        // Skipped when `bootstrapTheApp` is going to do the
+                        // delivery, which is the default. Both running meant the
+                        // engine registered a flag provider per call: Cordial
+                        // logged `Registered Flag Provider ID from Java:` 0, 1
+                        // and 2 on one launch where Sober logs 0 and nothing
+                        // else. Whether repeated registration is harmful is not
+                        // established, but matching the real client costs
+                        // nothing and an unnecessary difference on the path
+                        // being investigated is worth removing.
+                        if let Some(f) = lib
+                            .symbol(
+                                "Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings",
+                            )
+                            .filter(|_| std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_some())
+                        {
                             let settings = cordial_runtime::client_settings::load(
                                 opt.client_settings.as_deref(),
                             )
@@ -1326,9 +1344,28 @@ fn main() -> ExitCode {
                                         // than the onFlagsFailed/onFlagsLoaded
                                         // print, which comes from an
                                         // unrelated async path.
-                                        if let Some(f) = lib.symbol(
-                                            "Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings",
-                                        ) {
+                                        // Only when bootstrapTheApp has not
+                                        // already delivered. Running both meant
+                                        // three registered flag providers on one
+                                        // launch -- Cordial logged `Registered
+                                        // Flag Provider ID from Java:` 0, 1 and 2
+                                        // where Sober logs 0 and nothing else.
+                                        // Whether repeated registration harms
+                                        // anything is not established; matching
+                                        // the real client costs nothing, and an
+                                        // unnecessary difference on the path
+                                        // under investigation is worth removing.
+                                        let already = BOOTSTRAP_RAN
+                                            .load(std::sync::atomic::Ordering::SeqCst);
+                                        if already {
+                                            println!("  settings and flags already delivered by bootstrapTheApp");
+                                        }
+                                        if let Some(f) = lib
+                                            .symbol(
+                                                "Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings",
+                                            )
+                                            .filter(|_| !already)
+                                        {
                                             // Cordial is the host app, so
                                             // Cordial does the fetch the app
                                             // would do. Cached on disk, so a
@@ -1395,9 +1432,12 @@ fn main() -> ExitCode {
                                         // settings not being accepted, and with
                                         // nativeInitClientSettings returning 0
                                         // this call succeeds.
-                                            if let Some(f) = lib.symbol(
-                                                "Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3",
-                                            ) {
+                                            if let Some(f) = lib
+                                                .symbol(
+                                                    "Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3",
+                                                )
+                                                .filter(|_| !already)
+                                            {
                                                 match linker::game_activity::post_client_settings_loaded(f) {
                                                     Ok(()) => println!(
                                                         "  postClientSettingsLoadedInitialization3 ok"
@@ -1412,9 +1452,12 @@ fn main() -> ExitCode {
                                         // them: bootstrapTheApp's whole job is to
                                         // reach this, and the engine reports
                                         // onFlagsFailed without it.
-                                        if let Some(f) = lib.symbol(
-                                            "Java_com_roblox_client_flags_FlagJniInterface_nativeInitializeNativeFlags",
-                                        ) {
+                                        if let Some(f) = lib
+                                            .symbol(
+                                                "Java_com_roblox_client_flags_FlagJniInterface_nativeInitializeNativeFlags",
+                                            )
+                                            .filter(|_| !already)
+                                        {
                                             // Flag NAMES, not the settings
                                             // document — the engine loads
                                             // values itself. Feeding the

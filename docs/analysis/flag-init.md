@@ -995,3 +995,27 @@ flag providers per launch, IDs 0, 1 and 2, because it calls
 `nativeInitializeNativeFlags` three times — the early call, `bootstrapTheApp`,
 and the original post-init block. Sober registers one. Whether repeated
 registration is harmless is not established.
+
+### §11.6 One delivery, not three. Measured, and still not the fix
+
+The debug run in §11.5 showed Cordial registering flag providers 0, 1 and 2 on a
+single launch where Sober registers 0 and stops. Three deliveries: the pre-init
+call, `bootstrapTheApp`, and the original post-init block. A fourth would have
+followed, because the engine calls `bootstrapTheApp` **twice** per launch — two
+`Call Member Function ... bootstrapTheApp ()V` in the trace.
+
+Now one. The pre-init call runs only under `CORDIAL_NO_BOOTSTRAP=1`, the
+post-init block is skipped when the bootstrap delivered, and `run_bootstrap`
+swaps a flag so the engine's second call is a no-op. `Registered Flag Provider
+ID from Java: 0`, once, matching Sober exactly.
+
+It is not the fix. Same run: zero `RbxStorage` in the engine log, zero
+`rbx-storage` paths, `onFlagsFailed` still reported.
+
+One thing did move, and it is recorded because it is the only quantity in this
+whole session that responded to anything: `onFlagsFailed` is reported **twice**
+with the single delivery and **four times** in the `CORDIAL_NO_BOOTSTRAP=1`
+control taken minutes later. So the verdict is reported once per delivery
+attempt, not once per launch. That is consistent with the verdict being a
+property of each attempt rather than a latched startup state, which is new, and
+nobody should read more into it than that.

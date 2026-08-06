@@ -957,6 +957,33 @@ fn main() -> ExitCode {
                                                 vec![engine_ver.as_str()],
                                             ),
                                             (
+                                                // The engine fetches its own
+                                                // settings from
+                                                // `clientsettingscdn.roblox.com/v2/
+                                                // settings-compressed/application/
+                                                // <name>.zst` and was asking for
+                                                // `application/.zst` -- an EMPTY
+                                                // name -- then taking the 403 and
+                                                // reporting `Could not fetch
+                                                // settings`. It does not know what
+                                                // application it is because
+                                                // nothing told it. `AndroidApp` is
+                                                // not a guess: it is the name
+                                                // `client_settings.rs` established
+                                                // by experiment, where
+                                                // AndroidClient, AndroidPlayer,
+                                                // AndroidClientSettings and
+                                                // AndroidAppSettings all return
+                                                // HTTP 400 "The application name is
+                                                // invalid" and this one returns the
+                                                // real document. Verified again
+                                                // here: that URL with `AndroidApp`
+                                                // serves 302080 bytes.
+                                                "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeOverrideChannelPlatformName",
+                                                SETTINGS,
+                                                vec!["AndroidApp"],
+                                            ),
+                                            (
                                                 "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetRobloxChannel",
                                                 SETTINGS,
                                                 // "the live channel is the empty

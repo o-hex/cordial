@@ -321,6 +321,64 @@ client is not itself disqualifying — Sober ships on Flathub as
 Roblox code, asset or APK at all and the user supplies the client where Sober
 fetches it. That was never the obstacle. The AI policy is.
 
+## Why Roblox reports a client-integrity problem, so far
+
+Open, and the most-asked question about this project. What follows is what has
+been **established**, so nobody spends the afternoon twice.
+
+**Play Integrity is not reachable from Cordial, and is not what differs from
+Sober.** `docs/traces/` shows the real Android client calling Google Play
+Services during startup — `requestIntegrityToken(IntegrityTokenRequest{nonce=…,
+cloudProjectNumber=676451317595})` for `com.roblox.client`, binding to
+`com.android.vending/…finsky.integrityservice.IntegrityService`, and Finsky
+answering `Integrity key attestation record generated successfully`.
+
+That happens in **the APK's Java layer, not in `libroblox.so`**. Cordial runs the
+native engine and provides the platform beneath it; it never runs the app's Java
+code, so the call is not made and cannot be. Measured rather than reasoned:
+`--dump-classes` reports **3249** classes the engine asked Cordial for and **not
+one** is Play-Integrity shaped. Sober is in exactly the same position and shows
+no integrity error, so whatever differs, it is not this.
+
+**Do not try to produce that token.** It is a device and app attestation from
+Google, and the only ways to make one appear are forging it or relaying one from
+a real device. Both are circumventing an anti-tamper control rather than making
+Cordial an honest client, and both are out of scope here for the same reason
+in-process hooking is ([ADR-001](adr/ADR-001-in-process-hooking.md)).
+
+**What was actually different, and is now fixed.** Sober's own log on this
+machine, and the capture from real Android, both contain:
+
+```text
+rbx.JNIRobloxSettings: Setting default app policy file:
+  content/guac/defaultConfigs/GuacDefaultPolicy-GlobalDist.json
+```
+
+Cordial never called `nativeSetDefaultAppPolicyFile`, so the engine came up with
+no app policy at all. That was issue #5. It is wired now, relative rather than
+absolute because both the capture and Sober log it that way, and the engine
+emits the identical line and still reaches `APP_READY Landing`.
+
+**Whether that fixes the integrity report is not established.** It needs a
+signed-in join to see and that run has not happened. A gap being real is not
+evidence it is the gap that broke anything.
+
+**Still unchecked, and the obvious next candidates.** Comparing Sober's
+`appData` with Cordial's, Sober has `ClientSettings/` and `rbx-storage.db`;
+Cordial has neither. And [issue #2](https://github.com/luohoa97/cordial/issues/2)
+— User-Agent and base URL not matching what the real client sends — is still
+open, with the exact string sitting in the capture:
+
+```text
+Mozilla/5.0 (…; 13) AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App
+2.732.1043 Tablet Hybrid()  GooglePlayStore RobloxApp/2.732.1043
+(GlobalDist; GooglePlayStore)
+```
+
+Matching that is honest self-description — it is what the official Android
+client sends, and Cordial *is* running that client. Forging an attestation is
+not the same kind of thing, and the line between them is the one to hold.
+
 ## Traps that have already caught people
 
 **Do not use present counts as a frame rate.** Every figure recorded before

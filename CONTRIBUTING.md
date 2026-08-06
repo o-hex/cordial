@@ -200,14 +200,26 @@ Users install the Flatpak; this is a contributor's shell.
 The per-distro lists above stay first-class. Most contributors do not have Nix
 and should not need it.
 
-**`INFERRED`, and stated plainly: the flake has not been built successfully by
-anyone yet.** It was written on a Fedora Silverblue host where `/nix` is part of
-the read-only ostree image and `nix-daemon` is disabled, so `nix flake check`
-fails with `Read-only file system` before evaluating anything. On such a host
-the store needs to be made writable first — the Determinate Systems installer
-handles ostree, or a systemd mount unit can bind a writable directory over
-`/nix`. If you are the first to run it and it works, say so and delete this
-paragraph.
+**The flake has still not been built successfully by anyone, and this is now
+measured rather than `INFERRED`.** Run on the developer's Fedora Atomic host on
+2026-08-06, `nix develop` fails before evaluating anything:
+
+```text
+error: creating directory "/nix/store/.links": Read-only file system
+```
+
+`findmnt /nix` reports no mount at all — `/nix` is inside the read-only
+composefs image, `/nix/store` is not writable, and `nix-daemon` is inactive.
+Nix itself is present and working (`nix-core-2.34.8-1.fc44`); it has nowhere to
+put a store.
+
+So on an ostree host the store must be made writable first — the Determinate
+Systems installer handles ostree, or a systemd mount unit can bind a writable
+directory over `/nix`. **That is a larger change to the host than installing the
+one devel package Nix was reached for in order to avoid**, which is worth
+weighing before going down this road.
+
+If you are the first to build the flake successfully, say so and replace this.
 
 `webkitgtk6.0-devel` (`libwebkitgtk-6.0-dev` on Debian/Ubuntu) will be needed by
 whoever picks up the web view — Marketplace, Profile, Communities and most

@@ -911,3 +911,49 @@ So: the same channel, the same level, an open log, a call that returns 0, and no
 line. Every symbol on the way in resolves and every argument is correct. The
 engine's own body of `nativeInitClientSettings` does not appear to execute, and
 naming what stops it is where the next session starts.
+
+### §11.4 Retraction: the native's body does run. Four more leads, all dead
+
+**§11.3 above is wrong and is retracted.** It concluded that the engine's own
+body of `nativeInitClientSettings` "does not appear to execute", on the strength
+of `[FLog::AndroidGLView] nativeInitClientSettings` never appearing. The
+reasoning did not survive its own control.
+
+Cordial made that call three times per run, the first before the log file opens
+at 1.806s, so the missing line could have been an artifact of ordering. Gating
+the pre-`initializeNativeCode` call off and re-running settles it: `FlagCache`
+still fires nine times and still writes the document. So the body runs, well
+inside the logged window, consumes the 1273559-byte document, and does not emit
+its own line. Why it does not is unknown; `FLogAndroidGLView` is absent from the
+settings document, so both clients run the compiled-in default and verbosity is
+not the difference either. Neither half of §11.3 stands.
+
+Four further leads, each dead, each recorded so it is not re-run:
+
+* **`FFlagStartRbxStorageInitRighAfterFlags=False`.** The premise of this whole
+  line is that the store constructs off the flags-loaded event because that flag
+  is True. Overriding it to False, which should route construction back to the
+  direct call Cordial already makes, applies cleanly (`1 override(s) applied`)
+  and produces no `RbxStorage` line and no `rbx-storage` path. Storage does not
+  construct on the other path either.
+* **`nativeSetAppPreviousExitReasons`** — §11.2, inert.
+* **`nativeRegisterJavaFlagProvider`** — exported by the engine and never called
+  by Cordial, which made it look like the missing registration step. It is **not
+  declared anywhere in the dex**: no Java class in this APK has a counterpart for
+  it, so it is not on any path this build takes. A tempting name is not a lead.
+* **The natives Cordial does not call.** The engine exports 91 on
+  `NativeGLInterface`, `MainGameActivity` and `FlagJniInterface` together;
+  `load.rs` calls 42. The 49 it does not are lifecycle (`PauseApp`, `LeaveGame`),
+  purchase, VR, text-box and the three unused client-settings variants. Nothing
+  in that list is a plausible prerequisite for the settings handshake.
+
+**The one divergence left that is not explained.** Sober logs
+`nativeInitializeNativeFlags: Registered Flag Provider ID from Java: 0`.
+No Cordial run in this session logs it, and in its place Cordial emits the same
+`JNIRobloxSettings nativeInitializeNativeFlags:` prefix with an empty message,
+while every other line on that tag formats correctly (`... 0: <name> not
+found.`). Whether that empty line is the provider-registration message arriving
+without its value, or Cordial's `__android_log_print` shim dropping a format it
+does not handle, is **not established** — and the distinction matters, because
+one is an engine-state difference and the other is a logging bug in Cordial.
+That is the next thing to settle, and it is one instrumented run away.

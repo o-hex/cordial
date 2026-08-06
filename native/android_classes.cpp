@@ -1080,6 +1080,42 @@ public:
     }
 };
 
+/// `android.os.Build$VERSION`
+///
+/// One static field, and the engine version-gates on it. From the JNI trace,
+/// asked for and not answered:
+///
+///     Constructed Unresolved symbol, Class=`android/os/Build$VERSION`,
+///       StaticField=`SDK_INT`, Signature=`I`
+///
+/// An unanswered `SDK_INT` is not a harmless gap. Code reading it is choosing
+/// between two paths, and the answer for a field nobody registered is zero —
+/// which reads as an Android older than any release, so every
+/// `if (SDK_INT >= X)` takes the legacy branch. A wrong answer delivered
+/// confidently, which is the failure this project has a rule about.
+///
+/// **33, because that is what the capture shows the real client running.**
+/// `docs/traces/` has the same APK on real Android reporting Android 13 in its
+/// User-Agent, and 13 is API level 33. Sourced rather than picked: a number
+/// invented here would be a guess about which paths Roblox takes, and not
+/// having to guess is the entire point of the capture.
+///
+/// Raise it when a future Roblox build wants a newer platform, and choose the
+/// new value from what the trace says the real client reports — not from
+/// whatever Android is current.
+class BuildVersion : public jnivm::Object {
+public:
+    static jint SDK_INT;
+
+    static void Register(ENV* env) {
+        env->GetClass<BuildVersion>("android/os/Build$VERSION");
+        auto c = env->GetClass("android/os/Build$VERSION");
+        c->Hook(env, "SDK_INT", &BuildVersion::SDK_INT);
+    }
+};
+
+jint BuildVersion::SDK_INT = 33;
+
 } // namespace cordial
 
 // Defined in accessibility.cpp — kept in its own file rather than added to
@@ -1199,6 +1235,7 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
     cordial::SessionReporterJavaInterface::Register(env);
     cordial::VideoCodecCapability::Register(env);
     cordial::MediaCodecInfoUtils::Register(env);
+    cordial::BuildVersion::Register(env);
     cordial::register_accessibility_classes(env);
     cordial::register_cookie_classes(env);
     cordial::register_audio_classes(env);

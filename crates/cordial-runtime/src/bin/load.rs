@@ -368,6 +368,50 @@ fn requested_resolution() -> (u32, u32) {
     (1280, 720)
 }
 
+/// The engine's own version, read out of `libroblox.so` rather than hardcoded.
+///
+/// This existed as a hardcoded `"2.732.0.1043"` with a comment claiming it was
+/// "the engine's own answer rather than a guess". It was neither: the engine in
+/// the APK on this machine is **2.730.0.790**, which is what it stamps on every
+/// log file it writes, so Cordial was telling the server one version while the
+/// client was another. A build that misreports its own version is exactly the
+/// shape of thing a server-side check rejects, and the value had gone stale
+/// silently across an APK update with nothing to catch it.
+///
+/// Reading it back out is a plain string search, not disassembly: the version
+/// is stored as an ASCII literal and `strings` finds exactly one match for the
+/// four-part shape. Returning `None` when that is not true is deliberate —
+/// skipping the call is honest, and inventing a version is what caused this.
+fn engine_version(lib_dir: &str) -> Option<String> {
+    let bytes = std::fs::read(std::path::Path::new(lib_dir).join("libroblox.so")).ok()?;
+    let mut found: Option<String> = None;
+    let mut run = Vec::new();
+    for &b in bytes.iter().chain(std::iter::once(&0u8)) {
+        if b.is_ascii_digit() || b == b'.' {
+            run.push(b);
+            continue;
+        }
+        if run.len() >= 9 && run.len() <= 20 {
+            let s = String::from_utf8_lossy(&run).to_string();
+            let parts: Vec<&str> = s.split('.').collect();
+            if parts.len() == 4
+                && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+                && parts[0] == "2"
+            {
+                // More than one distinct candidate means the shape is not
+                // unique in this build and the assumption behind reading it
+                // has stopped holding. Say so rather than pick one.
+                match &found {
+                    Some(prev) if *prev != s => return None,
+                    _ => found = Some(s),
+                }
+            }
+        }
+        run.clear();
+    }
+    found
+}
+
 fn main() -> ExitCode {
     let mut opt = match parse() {
         Ok(o) => o,
@@ -830,6 +874,13 @@ fn main() -> ExitCode {
                                             ),
                                         ];
                                         let assets_now = asset_folder(&opt.apk);
+                                        let engine_ver = engine_version(&opt.lib_dir)
+                                            .unwrap_or_default();
+                                        if engine_ver.is_empty() {
+                                            println!("  engine version not readable from libroblox.so; not setting one");
+                                        } else {
+                                            println!("  engine version {engine_ver} (read from the binary)");
+                                        }
                                         // The preferences file. `INFERRED`: no
                                         // capture line names it, unlike the app
                                         // policy below. The path is where the
@@ -895,19 +946,36 @@ fn main() -> ExitCode {
                                             (
                                                 "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetRobloxVersion",
                                                 SETTINGS,
-                                                // The version the engine stamps on
-                                                // its own log file names, so it is
-                                                // the engine's own answer rather
-                                                // than a guess.
-                                                vec!["2.732.0.1043"],
+                                                // Read out of the binary by
+                                                // `engine_version`. See there for
+                                                // why this is no longer a literal.
+                                                vec![engine_ver.as_str()],
                                             ),
                                             (
                                                 "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetRobloxChannel",
                                                 SETTINGS,
-                                                // The capture reports
-                                                // `Build = googleProdRelease`; the
-                                                // live channel is the empty one.
-                                                vec![""],
+                                                // "the live channel is the empty
+                                                // one" was wrong. Sober's engine
+                                                // log says `The channel is
+                                                // production` on the same APK, and
+                                                // with the empty string the engine
+                                                // wrote a `channel` preference with
+                                                // an empty value and logged no
+                                                // `ClientRunInfo` at all.
+                                                vec!["production"],
+                                                // `nativeSetBaseUrl` is exported
+                                                // and is NOT called here on
+                                                // purpose: passing it one string
+                                                // took the process down before
+                                                // `initializeNativeCode`, so its
+                                                // prototype is not
+                                                // `(Ljava/lang/String;)V` and
+                                                // guessing again would just crash
+                                                // again. Sober logs a base url and
+                                                // Cordial does not, so this is
+                                                // still an open gap -- read the
+                                                // prototype out of the dex with
+                                                // `--dump-classes` before trying.
                                             ),
                                         ];
                                         if let Some(f) = lib.symbol(

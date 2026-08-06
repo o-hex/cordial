@@ -906,6 +906,14 @@ extern "C" fn vk_get_physical_device_surface_capabilities_khr(
     {
         if let Some(w) = crate::android::wayland::current() {
             let (width, height, _) = w.geometry();
+            // TEMPORARY INSTRUMENTATION -- not for commit. `CORDIAL_INSTR=1`.
+            // This is the extent the swapchain is actually built from. If it
+            // disagrees with the window after a fullscreen toggle, the content
+            // is drawn against the wrong rectangle and offsets by the
+            // difference — which is what issue #7 looks like on screen.
+            if std::env::var_os("CORDIAL_INSTR").is_some() {
+                eprintln!("[instr] surface_caps currentExtent <- geometry() {width}x{height}");
+            }
             // Clamped into [minImageExtent, maxImageExtent] on principle —
             // Cordial's window is always within Mesa's advertised range in
             // practice (1x1..16384x16384 observed), but a substitution that

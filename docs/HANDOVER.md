@@ -718,7 +718,57 @@ process is exactly the primitive [ADR-001](adr/ADR-001-in-process-hooking.md)
 rules out, and a debugging exception would be the thin end of it. A packet
 capture needs root and is the honest route if this is ever needed again.
 
-#### The lead that replaces it: Cordial never sends the play session report
+#### Retracted within the hour: the play session report is an *exit* report
+
+**The section below is wrong and is kept only so the mistake is legible.** `Sent
+play session success` is not something the client owes after joining. It is the
+report a session sends when it **ends**, and reading the FSM timings with labels
+on shows it immediately:
+
+```text
+Sober     1.176  Entered app session
+         28.438  Sent app session success     <- app session ENDS here
+         28.438  Entered play session
+         49.427  Sent play session success    <- play session ENDS here
+         49.427  Entered app session          <- back to the app
+
+Cordial   1.330  Entered app session
+          2.032  Sent app session success     <- same pattern, works fine
+          2.033  Entered play session
+                 (kicked at 62 s -> IASPE)
+```
+
+Sober logged the play report because somebody **left the game** at 49.4 s and
+went back to the app. Cordial never logs it because Cordial is *disconnected*
+rather than leaving — the FSM goes to `E` instead of reporting a clean exit.
+Cordial's `Sent app session success` proves the mechanism works: the same
+reporting path fires correctly for the session that did end normally, one second
+into the run.
+
+So the difference was a consequence of the 304, in exactly the way the `E` state
+already was, and the "mechanism" was me pairing two log lines that are a session
+apart. **Both clients were being compared at different points in their
+lifecycle.** That is now four leads in this investigation killed by the same
+error shape — a real observation from one run, generalised without checking what
+it is relative to.
+
+Nothing was built on it: the lifecycle callbacks were committed on their own
+merits and labelled as not being the fix, which is the only reason this cost an
+hour instead of a day.
+
+**Also checked and clean:** the engine never asks for `getPackageCodePath`,
+`sourceDir`, `getApplicationInfo`, package signatures or any hash over JNI. There
+is **no client-side file integrity check reaching Cordial**, so "Roblox has
+detected missing or corrupted files" is a reused generic code and not a
+description of what the server actually objected to. Do not go looking for a
+checksum to satisfy.
+
+**One real gap did fall out of that sweep**, unrelated to 304:
+`android/content/Context.getSharedPreferences` is unresolved, and the engine goes
+on to call `edit()` and `putString()` on the `Invalid` class it gets back. The
+engine is trying to persist key/value state and every write is going nowhere.
+
+#### WRONG — kept for the record: Cordial never sends the play session report
 
 `SessionTransitionFSM` runs the same way in both up to the last step, and then
 diverges:

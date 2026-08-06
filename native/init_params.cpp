@@ -433,8 +433,25 @@ public:
 /// `nativePostClientSettingsLoadedInitialization3(List)` is the only reason
 /// this exists: it is the finishing step of the client-settings handshake,
 /// and whatever it iterates has to be a real, well-formed object rather than
-/// null or an unresolved stub. An empty list is the honest starting point —
-/// nothing here knows what real elements it would otherwise want.
+/// null or an unresolved stub.
+///
+/// **The list is the previous process's exit reasons, and empty is the correct
+/// value rather than a placeholder.** The erased descriptor says only
+/// `Ljava/util/List;`, which is why this was recorded as an open guess for two
+/// sessions; the dex's generic signature says
+///
+///     (Ljava/util/List<Lcom/roblox/engine/jni/model/ApplicationExitInfoCpp;>;)V
+///
+/// — `tools/dex_signature.py` prints it. The same element type appears on
+/// `nativeSetAppPreviousExitReasons`, and a traced startup shows the engine
+/// doing `FindClass com/roblox/engine/jni/model/ApplicationExitInfoCpp`
+/// immediately after this call, so the reading is confirmed twice over.
+///
+/// It is Android's `ActivityManager.getHistoricalProcessExitReasons()`: what
+/// killed the app last time. Cordial has no such history to report, and an empty
+/// list says exactly that — no prior abnormal exit. Inventing entries would be
+/// telling the engine about crashes that did not happen, which is the kind of
+/// stub that lies.
 class JavaList : public Object {
 public:
     jint size(ENV*) { return 0; }

@@ -842,3 +842,37 @@ the open question, stated as narrowly as the evidence allows.**
 `nativeInitializeNativeFlags`, from a Waydroid capture. The capture is not in
 doubt, but Sober — which works — logs `flagCount = 0`. Passing 139 is not a
 requirement.
+
+### §11.1 The empty `ArrayList` is correct, and 7.4 can be closed
+
+7.4 recorded the list passed to `nativePostClientSettingsLoadedInitialization3`
+as unresolved, and §11 above named it as the last difference worth pointing at.
+Both are now settled, and the lead dies.
+
+The erased descriptor is `(Ljava/util/List;)V`, which is all the method_ids table
+holds and is why two sessions treated the contents as a guess. The dex also
+carries the generic signature, in `dalvik.annotation.Signature`:
+
+    com/roblox/engine/jni/NativeGLInterface.nativePostClientSettingsLoadedInitialization3
+      (Ljava/util/List<Lcom/roblox/engine/jni/model/ApplicationExitInfoCpp;>;)V
+
+`tools/dex_signature.py` prints it. Two independent confirmations: the identical
+signature is on `nativeSetAppPreviousExitReasons`, and a traced startup shows the
+engine doing `FindClass com/roblox/engine/jni/model/ApplicationExitInfoCpp`
+immediately after this call.
+
+`ApplicationExitInfoCpp` declares three constructors — `(IIJLjava/lang/String;)V`,
+`(IJLjava/lang/String;)V`, and a nine-argument form carrying two more strings, two
+longs and an int. That is Android's `ApplicationExitInfo`: reason, importance,
+timestamp, description, and on the long form process name and more.
+
+**Who populates it:** the app, from
+`ActivityManager.getHistoricalProcessExitReasons()`. **What it means empty:** the
+previous run recorded no abnormal exit. So Cordial's empty `ArrayList` is not a
+placeholder standing in for something unknown — it is the correct value, and
+filling it would be telling the engine about crashes that did not happen.
+
+What that leaves: every input to this native is now correct and every symbol on
+the way in resolves, and the engine's body of it still does not run — none of the
+seven log lines Sober emits from it appear. The remaining gap is inside that
+native and this session cannot name it.

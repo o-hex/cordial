@@ -73,6 +73,8 @@
 #include <jnivm.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -860,6 +862,243 @@ void audio_selftest() {
         "microphones does not use one).\n", audio::active_capture_streams());
 }
 
+
+// ------------------------------------------------------------- org.fmod.*
+
+/// FMOD's Java audio path, which is the one Roblox actually takes.
+///
+/// This exists because of a measurement that overturned a long-held
+/// assumption. `native/opensles.cpp` implements a complete OpenSL ES object
+/// model over PipeWire, and it was believed to be Roblox's audio output. It is
+/// not: on a signed-in run that reaches an experience, `slCreateEngine` is
+/// called **zero** times, no audio library is `dlopen`ed, and FMOD fails at
+/// `System::init` with `FMOD_RESULT 51` (`FMOD_ERR_OUTPUT_INIT`) before it ever
+/// enumerates a device. What the engine does ask for, from the JNI trace:
+///
+///     FindClass org/fmod/AudioDevice
+///     FindClass org/fmod/MediaCodec
+///     FindClass org/fmod/FMOD
+///     Unresolved org/fmod/FMOD        static checkInit          ()Z
+///     Unresolved org/fmod/FMOD        static supportsLowLatency ()Z
+///     Unresolved org/fmod/FMOD        static supportsAAudio     ()Z
+///     Unresolved org/fmod/AudioDevice        <init>             ()V
+///     Unresolved org/fmod/AudioDevice        init               (IIII)Z
+///     Unresolved org/fmod/AudioDevice        write              ([BI)V
+///     Unresolved org/fmod/AudioDevice        close              ()V
+///
+/// Six methods. That trace is the source for every signature here; none of it
+/// is recalled from FMOD's SDK or read out of a decompilation.
+///
+/// The OpenSL ES model is deliberately left in place. It is complete, it is
+/// tested, and a future Roblox build that prefers `SL_IID_ENGINE` would use it
+/// — deleting it to celebrate this finding would throw away working code on the
+/// strength of one build's preference.
+
+/// `org.fmod.FMOD`
+///
+/// Three static predicates FMOD consults before choosing an output.
+class FMOD : public jnivm::Object {
+public:
+    /// Whether FMOD's Java side is ready. True: the class is registered and
+    /// `AudioDevice` below is real.
+    static jboolean checkInit(jnivm::ENV*, jnivm::Class*) { return JNI_TRUE; }
+
+    /// Android's low-latency fast-mixer path, which is an `AudioTrack` flag
+    /// this class does not create. False rather than true because claiming it
+    /// changes the buffer sizes FMOD asks for, and a stub that lies about
+    /// latency produces underruns rather than an error anybody can trace.
+    static jboolean supportsLowLatency(jnivm::ENV*, jnivm::Class*) { return JNI_FALSE; }
+
+    /// **AAudio: answered false, and this is a decision rather than a gap.**
+    ///
+    /// AAudio is Android's low-latency C API — `AAudioStreamBuilder_*`,
+    /// `AAudioStream_*`, roughly thirty entry points in `libaaudio.so`, none of
+    /// which Cordial has and none of which the linker offers as a virtual
+    /// library. Answering true here sends FMOD down a path that immediately
+    /// looks for that library. It is the better path when it exists — lower
+    /// latency is exactly why FMOD prefers it — and it is a real piece of work,
+    /// not a line change.
+    ///
+    /// Until that library exists, false is the honest answer and it routes FMOD
+    /// to the `AudioDevice` path below, which is implemented and which PipeWire
+    /// already serves. Flip this the day `libaaudio.so` is real, not before:
+    /// the failure mode of claiming it early is FMOD initialising against an
+    /// output that is not there, which is precisely the `FMOD_ERR_OUTPUT_INIT`
+    /// this whole file exists to fix.
+    static jboolean supportsAAudio(jnivm::ENV*, jnivm::Class*) { return JNI_FALSE; }
+
+    static void Register(jnivm::ENV* env) {
+        env->GetClass<FMOD>("org/fmod/FMOD");
+        auto c = env->GetClass("org/fmod/FMOD");
+        c->Hook(env, "checkInit", &FMOD::checkInit);
+        c->Hook(env, "supportsLowLatency", &FMOD::supportsLowLatency);
+        c->Hook(env, "supportsAAudio", &FMOD::supportsAAudio);
+    }
+};
+
+/// `org.fmod.AudioDevice` — FMOD's PCM sink, over `PlaybackStream`.
+///
+/// **`write` must copy.** `PlaybackStream::enqueue` is deliberately zero-copy:
+/// the caller's buffer has to stay valid and unmodified until the drain
+/// callback fires, which is the `SLAndroidSimpleBufferQueueItf` contract it was
+/// built against. A `jbyteArray` does not satisfy that — the pointer is the
+/// engine's array for the duration of this call and no longer. So each write
+/// takes a copy this class owns and frees when PipeWire reports the buffer
+/// drained. Handing the array pointer straight through would work for as long
+/// as it took the realtime thread to fall one cycle behind, and then produce
+/// audio built out of whatever the engine put there next.
+class AudioDevice : public jnivm::Object {
+public:
+    /// `init(channels, sampleRate, bufferFrames, numBuffers)`.
+    ///
+    /// **Measured, not recalled.** The first version of this read the four
+    /// arguments by magnitude and logged them, because the JNI trace gives the
+    /// signature `(IIII)Z` and no names, and FMOD's own header is not a source
+    /// this project reads. Roblox's first call was:
+    ///
+    ///     AudioDevice.init(2, 48000, 512, 4)
+    ///
+    /// which fixes the order beyond reasonable doubt — 48000 is the only
+    /// argument that can be a rate, 2 the only sensible channel count, and 512
+    /// frames x 4 buffers is an ordinary Android mixer configuration. Named
+    /// parameters now, with the magnitude check kept as an assertion rather
+    /// than as the mechanism: if a future build passes them in another order,
+    /// this refuses instead of opening a stream at 2 Hz.
+    jboolean init(jnivm::ENV*, jint channels, jint rate, jint buffer_frames, jint buffer_count) {
+        std::fprintf(stderr,
+            "I/Cordial-FMOD            AudioDevice.init(channels=%d, rate=%d, frames=%d, "
+            "buffers=%d)\n", channels, rate, buffer_frames, buffer_count);
+
+        if (rate < 8000 || rate > 192000 || channels < 1 || channels > 8) {
+            std::fprintf(stderr,
+                "E/Cordial-FMOD            AudioDevice.init: refusing (channels=%d, rate=%d). "
+                "The argument order measured on 2026-08-06 was (channels, rate, frames, "
+                "buffers); this build appears to pass something else. Reporting failure rather "
+                "than opening a stream at a guessed format.\n", channels, rate);
+            return JNI_FALSE;
+        }
+
+        std::lock_guard<std::mutex> guard(lock_);
+        // S16 interleaved: what `write([BI)V` hands over as bytes, and what
+        // every Android AudioTrack path FMOD has produces.
+        // FMOD's own buffer count, not a number of ours. It sized its mixer
+        // for this depth; a shallower queue drops what it legitimately wrote
+        // and a deeper one adds latency it did not ask for.
+        pending_depth_ = buffer_count > 0 ? static_cast<uint32_t>(buffer_count) : 4;
+        if (!stream_.open(static_cast<uint32_t>(rate), static_cast<uint32_t>(channels),
+                          16, 16, false, pending_depth_)) {
+            std::fprintf(stderr,
+                "E/Cordial-FMOD            AudioDevice.init: PipeWire refused a %d Hz, %d "
+                "channel S16 stream; reporting failure to FMOD.\n", rate, channels);
+            return JNI_FALSE;
+        }
+        stream_.set_drain_callback(&AudioDevice::drained, this);
+        stream_.set_active(true);
+        open_ = true;
+        std::fprintf(stderr,
+            "I/Cordial-FMOD            AudioDevice.init: PipeWire playback open at %d Hz, %d "
+            "channel(s), S16.\n", rate, channels);
+        return JNI_TRUE;
+    }
+
+    void write(jnivm::ENV* env, std::shared_ptr<jnivm::Array<jbyte>> pcm, jint length) {
+        (void)env;
+        std::unique_lock<std::mutex> guard(lock_);
+        if (!open_ || !pcm || length <= 0) return;
+        const jint have = static_cast<jint>(pcm->getSize());
+        const jint n = length < have ? length : have;
+        auto owned = std::make_unique<uint8_t[]>(static_cast<size_t>(n));
+        std::memcpy(owned.get(), pcm->getArray(), static_cast<size_t>(n));
+        uint8_t* raw = owned.get();
+        // **This blocks, and that is the whole point.**
+        //
+        // The first version returned immediately when the queue was full and
+        // dropped the buffer. It produced audio, and the audio was terrible:
+        // dropped buffer counts doubling 1, 2, 4, 8, 16, 32 within seconds of
+        // a join. The reason is that `android.media.AudioTrack.write` — the
+        // method FMOD believes it is calling — is *blocking* in its default
+        // mode, and FMOD's mixer thread uses that block as its clock. Return
+        // straight away and nothing paces the mixer: it produces as fast as the
+        // CPU allows, overruns a queue sized for realtime, and every buffer
+        // past the end is thrown away. What comes out is a fraction of the
+        // audio, which is exactly what it sounds like.
+        //
+        // So wait for room, the way the method being imitated does. The wait is
+        // on the same mutex the drain callback takes, which is what makes it
+        // safe: waiting releases the lock, PipeWire's realtime thread drains a
+        // buffer and notifies, and this wakes with room.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (!stream_.enqueue(raw, static_cast<uint32_t>(n), raw)) {
+            if (space_.wait_until(guard, deadline) == std::cv_status::timeout) {
+                // Half a second without the stream taking a buffer is a stalled
+                // device, not backpressure. Dropping beats blocking the engine's
+                // mixer thread for ever, and it is reported rather than silent.
+                static std::atomic<uint64_t> dropped{0};
+                const uint64_t n_dropped = ++dropped;
+                if ((n_dropped & (n_dropped - 1)) == 0) {
+                    std::fprintf(stderr,
+                        "W/Cordial-FMOD            AudioDevice.write: no room after 500 ms, "
+                        "dropped %llu buffer(s) so far — the playback stream is not draining.\n",
+                        static_cast<unsigned long long>(n_dropped));
+                }
+                return;
+            }
+            if (!open_) return;
+        }
+        owned_.emplace_back(std::move(owned));
+    }
+
+    void close(jnivm::ENV*) {
+        std::lock_guard<std::mutex> guard(lock_);
+        if (!open_) return;
+        open_ = false;
+        stream_.set_active(false);
+        stream_.clear();
+        stream_.close();
+        owned_.clear();
+        space_.notify_all();
+        std::fprintf(stderr, "I/Cordial-FMOD            AudioDevice.close: playback stream closed.\n");
+    }
+
+    static void Register(jnivm::ENV* env) {
+        env->GetClass<AudioDevice>("org/fmod/AudioDevice");
+        auto c = env->GetClass("org/fmod/AudioDevice");
+        c->Hook(env, "<init>", [](jnivm::ENV* e, jnivm::Class* cl) {
+            return std::make_shared<AudioDevice>(e, cl);
+        });
+        c->HookInstanceFunction(env, "init", &AudioDevice::init);
+        c->HookInstanceFunction(env, "write", &AudioDevice::write);
+        c->HookInstanceFunction(env, "close", &AudioDevice::close);
+    }
+
+    AudioDevice() = default;
+    AudioDevice(jnivm::ENV*, jnivm::Class*) {}
+
+private:
+    /// Matches what `PlaybackStream::open` is told, so `enqueue` refuses at the
+    /// same depth FMOD's own buffering expects rather than growing without end.
+    uint32_t pending_depth_ = 4;
+
+    /// Called from PipeWire's realtime thread with our own mutex released.
+    static void drained(void* buffer_context, void* user) {
+        auto* self = static_cast<AudioDevice*>(user);
+        std::lock_guard<std::mutex> guard(self->lock_);
+        for (auto it = self->owned_.begin(); it != self->owned_.end(); ++it) {
+            if (it->get() == buffer_context) { self->owned_.erase(it); break; }
+        }
+        // Wakes a `write` that is waiting for room. Notified with the lock
+        // held, which is correct here: the waiter re-checks `enqueue` rather
+        // than trusting a flag, so a spurious wake costs one retry.
+        self->space_.notify_one();
+    }
+
+    std::mutex lock_;
+    std::condition_variable space_;
+    bool open_ = false;
+    cordial::audio::PlaybackStream stream_;
+    std::vector<std::unique_ptr<uint8_t[]>> owned_;
+};
+
 void register_audio_classes(jnivm::ENV* env) {
     CharSequence::Register(env);
     AudioDeviceInfo::Register(env);
@@ -867,6 +1106,8 @@ void register_audio_classes(jnivm::ENV* env) {
     AudioRecord::Register(env);
     WebRtcAudioManager::Register(env);
     WebRtcAudioRecord::Register(env);
+    FMOD::Register(env);
+    AudioDevice::Register(env);
     audio_selftest();
 }
 

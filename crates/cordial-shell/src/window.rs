@@ -140,6 +140,91 @@ impl Shell {
 /// whole change exists to remove.
 const EARLY_EXIT_CHECK: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The dialog shown while the client starts.
+///
+/// Roblox takes a while to get from a launch to a window of its own, and until
+/// now that gap was a toast and then nothing -- the launcher looked idle while
+/// the most failure-prone part of the whole program was happening. This says
+/// "working" for as long as that lasts.
+///
+/// **The progress bar is indeterminate on purpose.** Nothing here knows how far
+/// along the client is: the shell holds a pid, not a progress channel, and a
+/// bar that filled at a made-up rate would be inventing a measurement, which is
+/// the one thing this project is strict about. A pulsing bar claims only that
+/// something is still happening, which is true and is all that is known.
+///
+/// The icon is Cordial's own. It is deliberately the only customisable part and
+/// it is customised by pointing at a file, never by shipping alternatives:
+/// Roblox's own icons are their assets, and AGENTS.md rules out vendoring any
+/// of them however small.
+fn starting_dialog(parent: &gtk::Window, profile: &str, joining: bool) -> gtk::Window {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    content.set_margin_top(28);
+    content.set_margin_bottom(24);
+    content.set_margin_start(36);
+    content.set_margin_end(36);
+
+    let icon = gtk::Image::from_icon_name("io.github.luohoa97.Cordial");
+    icon.set_pixel_size(72);
+    content.append(&icon);
+
+    let title = gtk::Label::new(Some(&match joining {
+        true => format!("Starting Roblox on {profile}, joining the link"),
+        false => format!("Starting Roblox on {profile}"),
+    }));
+    title.add_css_class("title-4");
+    title.set_wrap(true);
+    title.set_justify(gtk::Justification::Center);
+    title.set_max_width_chars(32);
+    content.append(&title);
+
+    let bar = gtk::ProgressBar::new();
+    bar.set_width_request(260);
+    content.append(&bar);
+
+    // 12 pulses a second is the shell's own animation and costs nothing; it is
+    // not tied to anything the client is doing and must not be read as though
+    // it were.
+    let pulse = glib::timeout_add_local(Duration::from_millis(80), {
+        let bar = bar.clone();
+        move || {
+            bar.pulse();
+            glib::ControlFlow::Continue
+        }
+    });
+
+    let dialog = gtk::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .resizable(false)
+        .deletable(false)
+        .titlebar(&{
+            let h = adw::HeaderBar::new();
+            h.set_show_end_title_buttons(false);
+            h.add_css_class("flat");
+            h
+        })
+        .child(&content)
+        .build();
+
+    // Stop the pulse whenever the dialog goes, however it goes -- closed here
+    // when the client is up, or closed by the early-exit path when it is not.
+    // A timeout left running against a dropped widget is a warning per frame
+    // for the rest of the session.
+    let pulse = std::cell::RefCell::new(Some(pulse));
+    dialog.connect_close_request(move |_| {
+        if let Some(id) = pulse.borrow_mut().take() {
+            id.remove();
+        }
+        glib::Propagation::Proceed
+    });
+
+    dialog.present();
+    dialog
+}
+
+
+
 pub fn build(
     app: &adw::Application,
     config: Rc<RefCell<ShellConfig>>,
@@ -381,7 +466,7 @@ fn activate_roblox(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
 ) {
-    match try_launch(window, toasts, config, join) {
+    match try_launch(window, config, join) {
         Outcome::Started => {}
         Outcome::Failed(message) => alert(window, "Roblox could not start", &message),
         Outcome::ProfileBusy(name, holder) => {
@@ -389,13 +474,12 @@ fn activate_roblox(
         }
         Outcome::NoBuild => {
             let window = window.clone();
-            let toasts = toasts.clone();
             let config = config.clone();
             let join = join.clone();
             instructions::present(&window.clone(), move || {
                 // Returning whether it worked is what lets the instructions
                 // window stay up while the user is still following them.
-                matches!(try_launch(&window, &toasts, &config, &join), Outcome::Started)
+                matches!(try_launch(&window, &config, &join), Outcome::Started)
             });
         }
     }
@@ -416,9 +500,11 @@ enum Outcome {
     Failed(String),
 }
 
+/// No `ToastOverlay` any more: the "Starting Roblox" toast this used to raise
+/// is now the loading dialog, which says the same thing and stays up for as
+/// long as it is true.
 fn try_launch(
     window: &gtk::Window,
-    toasts: &adw::ToastOverlay,
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
 ) -> Outcome {
@@ -453,16 +539,14 @@ fn try_launch(
     };
     join.clear();
 
-    toasts.add_toast(adw::Toast::new(&match url {
-        Some(_) => format!("Starting Roblox on profile {profile_name}, joining the link"),
-        None => format!("Starting Roblox on profile {profile_name}"),
-    }));
+    let starting = starting_dialog(&window, &profile_name, url.is_some());
 
     // A client that is already gone a moment later never started. Checked
     // rather than assumed, because the shell may well have been started from a
     // desktop icon with nowhere for the loader's own output to go.
     let window = window.clone();
     glib::timeout_add_local_once(EARLY_EXIT_CHECK, move || {
+        starting.close();
         if let Some(status) = instance.exited() {
             alert(
                 &window,

@@ -1057,3 +1057,60 @@ never take.
 `WebRtcAudioManager.init` reporting failure therefore remains correct, and for a
 better reason than the one recorded beside it: not only is the downlink
 unimplemented, it is unimplementable against this build.
+
+## `onFlagsFailed` is not harmless: it is what blocks the content store
+
+`docs/analysis/flag-init.md` and the comment in `native/init_params.cpp` both say
+`onFlagsFailed` "is not the same as flag data failing to load, and does not block
+startup". The first half is right and the second half is true but was read far
+too broadly — it does not block *startup*, and it does block **RbxStorage**.
+
+Three observations, one chain:
+
+```text
+Sober    0.494  [FLog::AndroidGLView] nativeInitClientSettings
+         0.510  [FLog::AndroidGLView] nativePostClientSettingsLoadedInitialization3
+         0.515  [DFLog::RbxStorage] RbxStorage::init [INIT] user: flagLoaded
+         0.536  [DFLog::RbxStorage] RbxStorage::init [DONE] dbOpenCount: 69
+
+Cordial         [roblox] flags: engine reported onFlagsFailed
+                (no AndroidGLView line, no RbxStorage line, in any of 31 runs)
+```
+
+and the live flag set carries `FFlagStartRbxStorageInitRighAfterFlags = True`.
+Storage constructs itself off the *flags-loaded* event. Cordial never produces
+that event, so the store is never built — which is why
+`CORDIAL_TRACE_PATHS=1` shows the engine never touching an `rbx-storage` path:
+there is nothing to open because nothing asked for it.
+
+**This retires "why does onFlagsFailed happen" from curiosity to blocking.** It
+was investigated with a debugger before and shelved because it appeared to cost
+nothing. It costs the content store, and possibly more.
+
+**A new lead the earlier investigation did not have.** The engine exports *five*
+client-settings entry points, and Cordial calls the plainest:
+
+```text
+nativeInitClientSettings(String,String,String)I                        <- Cordial
+nativeInitClientSettingsCached(String,String,String,String,J)I
+nativeInitClientSettingsCachedCompressed([B,String,String,String,J,Z)I
+nativeInitClientSettingsSigned(String,String,String,String)I
+```
+
+Cordial's call returns 0, which `client_settings.rs` establishes means the
+document was accepted. But acceptance is evidently not the same as the engine
+considering its flags *loaded*, and the modern app very likely uses the signed or
+cached-compressed path. Two supporting observations: Cordial's engine later goes
+and requests `clientsettingscdn.roblox.com/v2/settings-compressed/application/.zst`
+on its own and gets a 403, and the `AndroidGLView` log line Sober emits for this
+call never appears in Cordial even though Cordial's log is open well before the
+call runs (log opens 0.634s; the call is after `initializeNativeCode`).
+
+**Next experiment, and it is cheap:** call the signed or cached-compressed
+variant instead and watch for `RbxStorage::init` in the engine's own log. The
+prototypes are above, read from the dex with `tools/dex_method.py` — do not guess
+the arity, two crashes this session came from exactly that.
+
+`nativePostClientSettingsLoadedInitialization3(List)` being handed an **empty
+ArrayList** is the other candidate at the same seam and is already flagged as
+unresolved in `flag-init.md` §7.4.

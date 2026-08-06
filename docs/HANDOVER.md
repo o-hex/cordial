@@ -453,47 +453,50 @@ believed to be the cause. A ping thread and a time-sync thread failing to exist
 is at least the right shape for something that kills a session sixty seconds in,
 and that is exactly the kind of resemblance that has been wrong twice already.
 
-### The transport socket is written and never read
+### The transport probe fails on some servers and not others
 
-Captured with `strace -f -e trace=network` over one join, 2026-08-06. This
-narrows the 304 lead from "networking" to a single socket, and rules out the
-explanations that sound most likely.
+**A previous version of this section said the transport socket is "written and
+never read" and blamed `RtcIoRna`'s event loop. That was wrong, and the very
+capture proposed to test it is what disproved it.** The retraction stays visible:
+this is the third lead in this investigation to dissolve, and all three dissolved
+the same way — a real observation from one run, generalised into a property of
+Cordial.
+
+What was observed, across three joins on 2026-08-06:
 
 ```text
-fd 120   RakNet, which carries the game     sends 5153   recvs 11978
-fd 124   RbxTransport DummyClient probe     sends   10   recvs     0
+18:01   server 128.116.51.33   DummyClient NoResponse    304 at 60.1 s
+18:18   server 128.116.51.33   DummyClient NoResponse    304 at 64.3 s
+18:47   server 128.116.63.33   DummyClient CONNECTED     no 304, ran 96 s
+                               ping thread + time sync thread started
 ```
 
-Both connect to the same server IP and both `connect()` return 0. On fd 124
-Cordial sends ten 1231-byte handshake datagrams, every one returning `= 1231`,
-and then **never calls `recv` on that socket at all** — not "read and got
-nothing", never attempted. Five seconds later `RbxTransportDummyClient` reports
-`NoResponse`, which turns out to be literally true.
+And with `strace -f -e trace=desc,network` over the third:
 
-**What this rules out.** Not reachability: the packets leave. Not "UDP does not
-work under Cordial": RakNet is UDP and takes nearly twelve thousand receives on
-the same run. Not a `getaddrinfo` fault, which was the first suspicion because
-`netdb_compat.cpp` is the *only* network function Cordial implements — everything
-else forwards to the host's glibc unmodified — and the endpoint here is numeric
-anyway.
+```text
+fd 140 (DummyClient)   epoll_ctl registrations: 1     recv: yes
+```
 
-**What it points at.** Whatever owns that socket inside `RtcIoRna` is not
-polling it. The engine logs `Initialized RtcIoRna with 1 event loop threads`; a
-socket that is written and never read is what an event loop that never runs
-looks like from outside. Cordial's threading has been the cause before —
-`pthread_cond_t` is 48 bytes in bionic against 32 in glibc, and `pthread_once`
-returning a lie was survivable by nothing.
+**The socket is epoll-registered and the event loop works.** The failing runs are
+not Cordial failing to poll; two of three joins simply got no answer from one
+particular server while a third answered in 432 ms.
 
-**Not established: that this causes the 304.** The two facts are consistent —
-Sober opens the same socket in 38 ms, starts a ping thread and a time sync
-thread, and is never disconnected; Cordial gets none of that and is kicked 60.1
-seconds after its RakNet accept. That is a good shape and it is not a mechanism.
-Twice in this investigation something with exactly that shape has been wrong.
+**What is established.** Cordial can connect that socket — nothing structural
+prevents it. 304 has never been observed on a run where the DummyClient
+connected. The failures correlate with the server address, not with the build.
+Sober's own logs contain a `NoResponse` too, on a join it abandoned 1.2 seconds
+later for a different server.
 
-**The next step needs no account run of its own.** Re-take the same capture with
-`-e trace=desc` and look for fd 124 in an `epoll_ctl`. If it is never registered,
-that is the mechanism and the fix is in the shim rather than anywhere near the
-network.
+**What is not established, and must not be written down as though it were:** why
+`128.116.51.33` does not answer, whether the unanswered probe *causes* the 304 or
+merely accompanies it, and whether Sober's advantage is different behaviour or
+simply better luck with which edge it lands on.
+
+**The next capture is cheap and the baseline now exists**, which is what was
+missing before: rejoin until the client lands on a server that does not answer,
+take the same `-e trace=desc,network` capture, and diff `epoll_ctl` and `recv` on
+that fd against the good run above. One failing capture against one known-good
+capture answers it. Guessing in between does not.
 
 **Still unchecked, and the obvious next candidates.** Comparing Sober's
 `appData` with Cordial's, Sober has `ClientSettings/` and `rbx-storage.db`;

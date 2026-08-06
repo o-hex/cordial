@@ -247,6 +247,26 @@ pub mod game_activity {
     }
 
     extern "C" {
+        fn cordial_set_bootstrap(f: Option<extern "C" fn()>);
+    }
+
+    /// Install what `GameActivity.bootstrapTheApp()` runs.
+    ///
+    /// The engine calls that method from inside `initializeNativeCode` and reads
+    /// its flags verdict on the next line, so this has to be installed before
+    /// [`init`] rather than after it. Delivering the settings after
+    /// `initializeNativeCode` returned is what Cordial did for months, and it is
+    /// why the verdict was always `onFlagsFailed` no matter what the document
+    /// contained: the engine had already asked and been told nothing.
+    ///
+    /// Passing `None` restores the previous behaviour, which is the control for
+    /// any measurement of this.
+    pub fn set_bootstrap(f: Option<extern "C" fn()>) {
+        // SAFETY: stores a function pointer the C++ side only ever reads.
+        unsafe { cordial_set_bootstrap(f) }
+    }
+
+    extern "C" {
         fn cordial_game_activity_start(
             handle: i64,
             width: c_int,

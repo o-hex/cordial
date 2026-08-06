@@ -35,6 +35,16 @@ std::shared_ptr<jnivm::Object> cordial_make_zero_insets(jnivm::ENV* env);
 std::shared_ptr<jnivm::Object> make_resources(jnivm::ENV* env);
 void set_display_size(int width, int height);
 
+/// What `GameActivity.bootstrapTheApp()` runs, installed by the host side.
+///
+/// A plain function pointer rather than anything richer because it is read on
+/// the engine's own thread from inside `initializeNativeCode`, and whatever the
+/// host wants to keep hold of it can keep on its own side. See the hook itself
+/// for why this matters at all.
+using BootstrapFn = void (*)();
+static BootstrapFn g_bootstrap = nullptr;
+BootstrapFn bootstrap_callback() { return g_bootstrap; }
+
 /// Convert a C++ object into a `jobject` the way libjnivm expects.
 ///
 /// A raw `cordial::to_jni(env, p)` looks right — libjnivm does
@@ -158,6 +168,47 @@ public:
         return cordial_make_zero_insets(env);
     }
 
+    /// `bootstrapTheApp()` — the app's startup, called by the engine and until
+    /// now answered by nobody.
+    ///
+    /// This is the one that decides the flags verdict. A traced startup run
+    /// shows the engine resolving `getNativeHelper`, then:
+    ///
+    ///     Constructed Unresolved symbol, Class=`com/google/androidgamesdk/
+    ///       GameActivity`, Method=`bootstrapTheApp`, Signature=`()V`
+    ///     Call Unknown Member Function ... bootstrapTheApp ()V
+    ///     Found symbol, Class=`com/roblox/client/startup/NativeHelper`,
+    ///       Method=`gameActivity_onFlagsFailed`, Signature=`()V`
+    ///
+    /// — three consecutive lines. The engine calls the app's bootstrap, gets a
+    /// placeholder that does nothing, looks for flags, finds none, and reports
+    /// failure. That check happens *inside* `initializeNativeCode`, which is why
+    /// two days of varying the settings call changed nothing: Cordial delivered
+    /// the document correctly and did it after the verdict had already been
+    /// reached.
+    ///
+    /// The dex declares it on `com/roblox/client/startup/MainGameActivity`, the
+    /// subclass; the engine looks it up on `com/google/androidgamesdk/
+    /// GameActivity`, the base. libjnivm does not walk a superclass chain the
+    /// way ART does, so it is registered here, on the class the engine actually
+    /// asks.
+    ///
+    /// The work itself belongs to Cordial's host-application side, which owns
+    /// the settings document and the flag-name list, so this forwards to a
+    /// callback installed before `initializeNativeCode` runs. With no callback
+    /// installed it says so rather than returning quietly — an unanswered
+    /// bootstrap that looks answered is how this cost two days.
+    void bootstrapTheApp(ENV*) {
+        auto fn = cordial::bootstrap_callback();
+        if (!fn) {
+            fprintf(stderr,
+                    "[roblox] bootstrapTheApp: no bootstrap installed; the engine "
+                    "will report onFlagsFailed\n");
+            return;
+        }
+        fn();
+    }
+
     static void Register(ENV* env) {
         env->GetClass<GameActivity>("com/google/androidgamesdk/GameActivity");
         auto c = env->GetClass("com/google/androidgamesdk/GameActivity");
@@ -165,6 +216,7 @@ public:
         c->HookInstanceFunction(env, "setWindowFlags", &GameActivity::setWindowFlags);
         c->HookInstanceFunction(env, "getWindowInsets", &GameActivity::getWindowInsets);
         c->HookInstanceFunction(env, "getWaterfallInsets", &GameActivity::getWaterfallInsets);
+        c->HookInstanceFunction(env, "bootstrapTheApp", &GameActivity::bootstrapTheApp);
     }
 };
 
@@ -612,6 +664,14 @@ void register_game_activity_classes(ENV* env) {
 } // namespace cordial
 
 extern "C" {
+
+/// Install what `GameActivity.bootstrapTheApp()` should run.
+///
+/// Must be called before `cordial_game_activity_init`: the engine calls
+/// `bootstrapTheApp` from inside `initializeNativeCode` and reads the flags
+/// verdict on the very next line, so anything installed afterwards is too late
+/// by construction — which is exactly the bug this exists to fix.
+void cordial_set_bootstrap(void (*fn)()) { cordial::g_bootstrap = fn; }
 
 /// Call `initializeNativeCode` and return its handle, or 0.
 ///

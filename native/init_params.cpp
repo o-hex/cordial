@@ -454,6 +454,27 @@ public:
         c->HookInstanceFunction(env, "size", &JavaList::size);
         c->HookInstanceFunction(env, "isEmpty", &JavaList::isEmpty);
         c->HookInstanceFunction(env, "get", &JavaList::get);
+
+        // And again on the interface, because that is the name the engine
+        // actually looks the methods up under. libjnivm resolves against the
+        // exact class it is given and does not walk up to an interface the way
+        // ART does, so registering only on `ArrayList` left a traced startup
+        // reporting
+        //
+        //   Constructed Unresolved symbol, Class=`java/util/List`, Method=`get`
+        //   Constructed Unresolved symbol, Class=`java/util/List`, Method=`size`
+        //   Call Unknown Member Function Class=`java/util/ArrayList` Method=`size`
+        //
+        // — the object was fine and the *methods* were stubs, so the engine read
+        // whatever a stub returns for the length of the list it had just been
+        // handed. `JavaMap` above registers on `java/util/Map` and not on any
+        // concrete class for the same reason; this one had it the other way
+        // round and so never worked. Both names, so neither lookup can miss.
+        env->GetClass<JavaList>("java/util/List");
+        auto i = env->GetClass("java/util/List");
+        i->HookInstanceFunction(env, "size", &JavaList::size);
+        i->HookInstanceFunction(env, "isEmpty", &JavaList::isEmpty);
+        i->HookInstanceFunction(env, "get", &JavaList::get);
     }
 };
 

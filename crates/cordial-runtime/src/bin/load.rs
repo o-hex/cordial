@@ -351,6 +351,79 @@ fn enter_run_dir(opt: &mut Options) {
 ///
 /// `CORDIAL_RESOLUTION=<w>x<h>`; defaults to 1280x720, and `CORDIAL_FULLSCREEN`
 /// overrides both with the monitor's own size.
+/// What `GameActivity.bootstrapTheApp()` runs, and whether it ran.
+///
+/// On Android this is Kotlin: the app fetches its client settings and its flag
+/// set and hands both to the engine, and the engine calls it from inside
+/// `initializeNativeCode`. Cordial is the host application, so this is Cordial's
+/// job — it was simply being done in the wrong place. The delivery below used to
+/// happen after `initializeNativeCode` returned, and a traced run shows the
+/// engine calling `bootstrapTheApp`, getting an unresolved placeholder, and
+/// reporting `gameActivity_onFlagsFailed` on the very next line. Nothing
+/// delivered afterwards could have changed that verdict.
+///
+/// Function pointers rather than anything borrowed because the callback crosses
+/// into C++ and back on the engine's own thread, with no lifetime to speak of.
+struct BootstrapPlan {
+    settings_native: usize,
+    post_native: usize,
+    flags_native: usize,
+    settings: String,
+    flag_names: String,
+}
+
+static BOOTSTRAP: std::sync::OnceLock<BootstrapPlan> = std::sync::OnceLock::new();
+static BOOTSTRAP_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Deliver settings and flags, from inside the engine's own bootstrap call.
+///
+/// Prints rather than returning a result because there is nobody to return one
+/// to: the caller is the engine, three frames into `initializeNativeCode`.
+extern "C" fn run_bootstrap() {
+    let Some(plan) = BOOTSTRAP.get() else {
+        eprintln!("  bootstrapTheApp: nothing planned");
+        return;
+    };
+    BOOTSTRAP_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+    println!("  bootstrapTheApp: delivering settings and flags");
+    if plan.settings_native != 0 {
+        match linker::game_activity::init_client_settings(
+            plan.settings_native as *mut std::ffi::c_void,
+            &plan.settings,
+            "",
+            "",
+        ) {
+            Ok(code) => println!("    nativeInitClientSettings -> {code}"),
+            Err(e) => println!("    nativeInitClientSettings failed: {e}"),
+        }
+    }
+    // `post` immediately after `settings`, and the flag names last.
+    //
+    // That is Sober's order, read off its own log rather than guessed:
+    // nativeInitClientSettings at 3.700s, nativePostClientSettingsLoaded
+    // Initialization3 at 3.796s, RbxStorage::init at 3.820s, and
+    // nativeInitializeNativeFlags only later. The first arrangement here put the
+    // flag names between the two and the 139-name list takes long enough that
+    // `post` landed after the verdict had already been reported.
+    if plan.post_native != 0 {
+        match linker::game_activity::post_client_settings_loaded(
+            plan.post_native as *mut std::ffi::c_void,
+        ) {
+            Ok(()) => println!("    postClientSettingsLoadedInitialization3 ok"),
+            Err(e) => println!("    postClientSettingsLoadedInitialization3 failed: {e}"),
+        }
+    }
+    if plan.flags_native != 0 {
+        match linker::game_activity::init_flags(
+            plan.flags_native as *mut std::ffi::c_void,
+            &plan.flag_names,
+        ) {
+            Ok(()) => println!("    flags initialised"),
+            Err(e) => println!("    flag init failed: {e}"),
+        }
+    }
+}
+
 fn requested_resolution() -> (u32, u32) {
     let Ok(v) = std::env::var("CORDIAL_RESOLUTION") else {
         return (1280, 720);
@@ -813,6 +886,39 @@ fn main() -> ExitCode {
                                 }
                                 Err(e) => println!("  early client settings failed: {e}"),
                             }
+                        }
+
+                        // Install the bootstrap before the engine can call it.
+                        // `initializeNativeCode` calls `bootstrapTheApp` and
+                        // reads the flags verdict immediately after, so this is
+                        // the last line at which it can be installed at all.
+                        //
+                        // `CORDIAL_NO_BOOTSTRAP=1` is the control: it leaves the
+                        // hook installed but with nothing behind it, which
+                        // reproduces the old behaviour in the same session.
+                        if std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_none() {
+                            const FLAG_NAMES: &str = include_str!("../native-flag-names.txt");
+                            let plan = BootstrapPlan {
+                                settings_native: lib
+                                    .symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings")
+                                    .map_or(0, |p| p as usize),
+                                post_native: lib
+                                    .symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3")
+                                    .map_or(0, |p| p as usize),
+                                flags_native: lib
+                                    .symbol("Java_com_roblox_client_flags_FlagJniInterface_nativeInitializeNativeFlags")
+                                    .map_or(0, |p| p as usize),
+                                settings: cordial_runtime::client_settings::load(
+                                    opt.client_settings.as_deref(),
+                                )
+                                .unwrap_or_default(),
+                                flag_names: FLAG_NAMES.to_string(),
+                            };
+                            let _ = BOOTSTRAP.set(plan);
+                            linker::game_activity::set_bootstrap(Some(run_bootstrap));
+                            println!("  bootstrapTheApp installed");
+                        } else {
+                            println!("  bootstrapTheApp NOT installed (CORDIAL_NO_BOOTSTRAP)");
                         }
 
                         println!("\ncalling GameActivity.initializeNativeCode");

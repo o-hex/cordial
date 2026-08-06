@@ -25,6 +25,7 @@
 // it is not this object. See docs/analysis/platform-identity.md.
 
 #include <jnivm.h>
+#include <sys/statvfs.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -707,6 +708,51 @@ public:
     }
 };
 
+/// `com.roblox.client.LocalStorageManager`
+///
+/// `getAllocatableBytes` is how the engine asks how much room it has before it
+/// builds its content store, and it was unresolved: libjnivm handed back a
+/// placeholder and the engine read the answer as zero.
+///
+/// That matters because RbxStorage gates itself on the answer. The live flag set
+/// carries `DFFlagRbxStorageAvailableSpaceError`,
+/// `DFFlagRbxStorageAvailableSpaceCreatePath` and `DFFlagRbxStorageFixEmptyPath`,
+/// and Cordial's engine reports `RbxStorage is not initialized, cannot access
+/// storage interface` on every run while Sober's `appData` carries a 167 MB
+/// `rbx-storage.db`. A client that believes it has no disk has no reason to
+/// build a cache.
+///
+/// **INFERRED that this is what gates it.** The mechanism fits and the gap is
+/// real, but the run after this is what says whether storage comes up.
+///
+/// `statvfs` on the working directory rather than on `files_dir()`, which
+/// hardcodes `instances/default` and does not follow `--profile` -- the same
+/// trap `SharedPreferences` hit. The client runs with its working directory set
+/// to the profile, so this measures the filesystem the store would actually
+/// live on.
+class LocalStorageManager : public Object {
+public:
+    static jlong getAllocatableBytes(ENV*, Object*) {
+        struct statvfs vfs {};
+        if (statvfs(".", &vfs) != 0) {
+            // Reporting zero would be the lie that is suspected of causing this
+            // in the first place, so say nothing is known by failing loudly in
+            // the log rather than quietly claiming a full disk.
+            fprintf(stderr, "[roblox] getAllocatableBytes: statvfs failed\n");
+            return 0;
+        }
+        auto bytes = static_cast<jlong>(vfs.f_bavail) * static_cast<jlong>(vfs.f_frsize);
+        return bytes;
+    }
+
+    static void Register(ENV* env) {
+        env->GetClass<LocalStorageManager>("com/roblox/client/LocalStorageManager");
+        auto c = env->GetClass("com/roblox/client/LocalStorageManager");
+        c->HookInstanceFunction(env, "getAllocatableBytes",
+                                &LocalStorageManager::getAllocatableBytes);
+    }
+};
+
 /// `android.content.res.Resources`
 ///
 /// Android's path to the screen is `activity.getResources().getDisplayMetrics()`,
@@ -1163,6 +1209,7 @@ void register_init_params_classes(ENV* env) {
     JSONObject::Register(env);
     ClientLocalFlags::Register(env);
     NativeHelper::Register(env);
+    LocalStorageManager::Register(env);
     DisplayMetrics::Register(env);
     AppSurface::Register(env);
     Resources::Register(env);

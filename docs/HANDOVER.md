@@ -1145,3 +1145,29 @@ flag sets, which the 6-hour cache in `client_settings.rs` normally hides.
 And the probe loop itself is the cheap way to work on this: the call happens at
 startup, so `--run 8` with no `--join-url` reads the return code in seconds
 without joining a game or touching an account.
+
+### The signed settings endpoint does not exist at any guessable URL
+
+`nativeInitClientSettingsSigned(String,String,String,String)I` is exported, but
+there is nothing to feed it. Probed on both hosts, 2026-08-07:
+
+```text
+clientsettings.roblox.com     v2/settings/application/AndroidApp          200  1273628B
+clientsettingscdn.roblox.com  v2/settings/application/AndroidApp          200  1273628B
+both hosts                    v2/settings-signed/application/AndroidApp   404
+both hosts                    v1/settings-signed/...                      404
+both hosts                    v2/signed-settings/...                      404
+both hosts                    v2/settings/application/AndroidApp/signed   404
+both hosts                    v2/settings-compressed-signed/...zst        404
+```
+
+The 404 body is `{"errors":[{"code":0,"message":""}]}` — empty, so it names no
+correct path. Changing the base URL does not help: the plain document is served
+identically by both hosts, and neither has a signed sibling. **Whatever supplies
+the signature is not a public CDN path that can be guessed**, so the signed
+variant cannot be tried without learning where the real app gets it — and that is
+not answerable from the URLs, only from watching a real client's traffic.
+
+So of the four client-settings entry points, the state is: plain **accepted (0)**
+but leaves `onFlagsFailed`; compressed **reachable, never accepts (2/5)**; signed
+**unfeedable**; cached untried.

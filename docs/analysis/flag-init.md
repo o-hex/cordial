@@ -957,3 +957,41 @@ without its value, or Cordial's `__android_log_print` shim dropping a format it
 does not handle, is **not established** — and the distinction matters, because
 one is an engine-state difference and the other is a logging bug in Cordial.
 That is the next thing to settle, and it is one instrumented run away.
+
+### §11.5 Retraction: the flag-provider divergence was Cordial's own log filter
+
+§11.4 closed by naming one unexplained divergence — Sober logs
+`nativeInitializeNativeFlags: Registered Flag Provider ID from Java: 0` and no
+Cordial run does. **That is wrong and is retracted.** It also described an "empty
+message" line in its place, which never existed; that was an artifact of the
+`grep -o` pattern used to look for it, not of any run.
+
+Sober's line is at `debug:` priority. `native/liblog.cpp`'s `minimum_priority()`
+defaults to `ANDROID_LOG_INFO` and drops everything below it, so Cordial had been
+discarding the line before it reached a terminal. `CORDIAL_LOG_LEVEL=d` on the
+same build:
+
+    Registered Flag Provider ID from Java: 0
+    flagCount = 139.
+    Registered Flag Provider ID from Java: 1
+    flagCount = 139.
+
+Cordial registers a flag provider, exactly as Sober does.
+
+**The general warning, which is worth more than the retraction.** Sober's log
+file contains `debug:` lines; Cordial's stderr, at its default level, does not.
+Any comparison between the two that concludes something from an *absence* on the
+Cordial side is invalid unless it was taken at `CORDIAL_LOG_LEVEL=d`. Two
+conclusions in this session were drawn that way and one of them survived only
+because it was tested.
+
+This does not touch the `RbxStorage`, `ClientRunInfo` or `AppPlatformQoS`
+absences in §11 and §11.4. Those were read from the engine's own `FLog` file in
+`<profile>/data/files/appData/logs`, which the engine writes directly and which
+`liblog.cpp` does not filter.
+
+One real difference does fall out of the debug run: Cordial registers **three**
+flag providers per launch, IDs 0, 1 and 2, because it calls
+`nativeInitializeNativeFlags` three times — the early call, `bootstrapTheApp`,
+and the original post-init block. Sober registers one. Whether repeated
+registration is harmless is not established.

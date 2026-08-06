@@ -876,3 +876,38 @@ What that leaves: every input to this native is now correct and every symbol on
 the way in resolves, and the engine's body of it still does not run — none of the
 seven log lines Sober emits from it appear. The remaining gap is inside that
 native and this session cannot name it.
+
+### §11.2 `nativeSetAppPreviousExitReasons` — tried, inert, not shipped
+
+It is exported (`0x295cc6c`) and carries the identical
+`(Ljava/util/List<Lcom/roblox/engine/jni/model/ApplicationExitInfoCpp;>;)V`, and
+Cordial had never called it, which made it the obvious next candidate on this
+handshake. Called with the same empty list, before the settings call, on a
+`--run 10` startup: it returns cleanly and changes nothing. Zero `RbxStorage`,
+zero `ClientRunInfo`, zero `AppPlatformQoS`, zero `[FLog::AndroidGLView] native*`
+lines, and zero paths containing `rbx-storage`.
+
+The code is **not** in the tree. A call that reports success and produces no
+engine-log line is exactly what this project forbids adding, so it is recorded
+here instead of left behind a flag for somebody to find and switch on.
+
+Worth noting for whoever picks this up: the export addresses put
+`nativeSetAppPreviousExitReasons` (`0x295cc6c`) next to
+`nativeInitClientSettingsSigned` (`0x295c421`), `...Cached` (`0x295c731`) and
+`...CachedCompressed` (`0x295c9ad`), while the two natives Cordial actually calls
+sit far away at `0x20b6981` and `0x20f2f6d`. That is an observation about layout
+and nothing more, but the newer cluster is the one Cordial has never reached.
+
+### §11.3 The strongest form of the remaining question
+
+`[FLog::AndroidGLView] nativeInitClientSettings` appears in Sober's log and never
+in Cordial's, and this is not a verbosity difference. Cordial's log does contain
+`[FLog::AndroidGLView] rbx.datamodel: setTaskSchedulerBackgroundMode()` at
+severity 6 — the same channel at the same level as Sober's line. The log opens at
+1.806s and Cordial's third call to that native happens after the Vulkan device
+lines at 3.4s, well inside the window.
+
+So: the same channel, the same level, an open log, a call that returns 0, and no
+line. Every symbol on the way in resolves and every argument is correct. The
+engine's own body of `nativeInitClientSettings` does not appear to execute, and
+naming what stops it is where the next session starts.

@@ -363,6 +363,65 @@ emits the identical line and still reaches `APP_READY Landing`.
 signed-in join to see and that run has not happened. A gap being real is not
 evidence it is the gap that broke anything.
 
+### What 304 actually looks like, with a Sober control beside it
+
+Captured 2026-08-06 on the `CordialTest` profile, joining place 17625359962,
+against a Sober run from 2026-08-05 that played for seventeen minutes. Both
+lines are from the engine's own log, times are seconds since process start.
+
+```text
+CORDIAL  248.658  Transport selection: useRbxTransportEnabled=false,
+                  selectedTransport=RakNet, rccPort=52398
+         248.973  Connection accepted from 128.116.51.33|52398
+         253.672  Error RbxTransportDummyClient: Failed to establish
+                  connection to 128.116.51.33:41297, reason NoResponse
+         309.161  Disconnect reason received: 304
+
+SOBER    258.157  Transport selection: useRbxTransportEnabled=false,
+                  selectedTransport=RakNet, rccPort=63935
+         258.203  Connection accepted from 128.116.51.33|63935
+         260.174  Error RbxTransportDummyClient: Failed to establish
+                  connection to 128.116.51.33:43197, reason NoResponse
+        1053.358  DisconnectClientInitiated — the player left
+```
+
+**`RbxTransportDummyClient … NoResponse` is benign. Do not chase it.** It is the
+loudest error in the log and it looks exactly like a cause, which is why it is
+written down here as a ruled-out one. Sober logs the identical failure against
+the identical server and plays on for another thirteen minutes. `RbxTransport`
+is not the live transport in either client — `useRbxTransportEnabled=false` and
+`selectedTransport=RakNet` say so on the line above it. Same shape as the
+websocket to `10.110.101.222:5052` that was ruled out the same way.
+
+**What the control does establish.** The two clients are indistinguishable
+through connection: same transport selection, same RakNet accept, same
+harmless probe failure. The join *succeeds*. Cordial is then disconnected
+**60.5 seconds after the connection was accepted** — `connectionTime 248689`
+against `timeMS 309172` — while Sober is never disconnected at all.
+
+So 304 is not a handshake or an integrity check at load. **It is something
+periodic that Cordial fails roughly a minute into replication**, at which point
+the server sends a disconnect whose text talks about missing or corrupted files.
+The message is worth reading as a category rather than a diagnosis: nothing in
+Cordial's install is missing, and the same binary reaches the same server the
+same way that Sober does.
+
+**One behavioural difference worth the next look, and no more than that.** On
+Sober's second join the DummyClient *did* connect and started two threads:
+
+```text
+RbxTransportDummyClient  Connected to server at 128.116.51.33:54811
+RbxTransportDummyClient  Started ping thread (interval: 1000 ms, payload: 64 bytes)
+RbxTransportDummyClient  Started time sync thread (interval: 5000 ms, …)
+```
+
+Cordial has never reached that on any join observed so far. Whether it matters,
+or is simply which server answered on the day, is **unestablished** — it is
+recorded because it is the only place the two logs diverge, not because it is
+believed to be the cause. A ping thread and a time-sync thread failing to exist
+is at least the right shape for something that kills a session sixty seconds in,
+and that is exactly the kind of resemblance that has been wrong twice already.
+
 **Still unchecked, and the obvious next candidates.** Comparing Sober's
 `appData` with Cordial's, Sober has `ClientSettings/` and `rbx-storage.db`;
 Cordial has neither. And [issue #2](https://github.com/luohoa97/cordial/issues/2)

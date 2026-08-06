@@ -681,8 +681,8 @@ public:
     // Mono in both directions: `CaptureStream` is opened mono for voice, and
     // claiming stereo would have WebRTC size its buffers for frames that never
     // arrive.
-    static jboolean getStereoInput(ENV*, Object*) { return false; }
-    static jboolean getStereoOutput(ENV*, Object*) { return false; }
+    static jboolean getStereoInput(ENV*, Class*) { return false; }
+    static jboolean getStereoOutput(ENV*, Class*) { return false; }
 
     /// 10 ms at 48 kHz, WebRTC's own frame size. Not a hardware figure — there
     /// is no fixed hardware period to report when PipeWire negotiates the
@@ -691,11 +691,11 @@ public:
     /// itself against.
     static jint getLowLatencyInputFramesPerBuffer(ENV*, Object*) { return DEFAULT_SAMPLE_RATE / 100; }
     static jint getLowLatencyOutputFramesPerBuffer(ENV*, Object*) { return DEFAULT_SAMPLE_RATE / 100; }
-    static jint getMinInputFrameSize(ENV*, Object*, jint sampleRate, jint channels) {
+    static jint getMinInputFrameSize(ENV*, Class*, jint sampleRate, jint channels) {
         return (sampleRate > 0 ? sampleRate : DEFAULT_SAMPLE_RATE) / 100 *
                (channels > 0 ? channels : 1);
     }
-    static jint getMinOutputFrameSize(ENV*, Object*, jint sampleRate, jint channels) {
+    static jint getMinOutputFrameSize(ENV*, Class*, jint sampleRate, jint channels) {
         return getMinInputFrameSize(nullptr, nullptr, sampleRate, channels);
     }
 
@@ -704,8 +704,8 @@ public:
     // can claim on the device's behalf — and saying otherwise would have
     // WebRTC switch off its own software AEC in favour of one that does not
     // exist, which is audible as echo rather than as an error.
-    static jboolean isAcousticEchoCancelerSupported(ENV*, Object*) { return false; }
-    static jboolean isNoiseSuppressorSupported(ENV*, Object*) { return false; }
+    static jboolean isAcousticEchoCancelerSupported(ENV*, Class*) { return false; }
+    static jboolean isNoiseSuppressorSupported(ENV*, Class*) { return false; }
     static jboolean isLowLatencyInputSupported(ENV*, Object*) { return false; }
     static jboolean isLowLatencyOutputSupported(ENV*, Object*) { return false; }
     static jboolean isProAudioSupported(ENV*, Object*) { return false; }
@@ -717,25 +717,30 @@ public:
     static void Register(ENV* env) {
         env->GetClass<WebRtcAudioManager>("org/webrtc/voiceengine/WebRtcAudioManager");
         auto c = env->GetClass("org/webrtc/voiceengine/WebRtcAudioManager");
+    // Static on all of these, and the difference is not cosmetic. libjnivm binds
+    // by descriptor: hooked as instance methods they registered cleanly and the
+    // engine never reached one of them, so every answer below was a value
+    // nothing read. Found by tools/hook_descriptors.py, which diffs each hook's
+    // derived descriptor against the dex; the dex marks these ACC_STATIC.
         c->HookInstanceFunction(env, "init", &WebRtcAudioManager::init);
         c->HookInstanceFunction(env, "dispose", &WebRtcAudioManager::dispose);
         c->HookInstanceFunction(env, "getNativeOutputSampleRate",
                                 &WebRtcAudioManager::getNativeOutputSampleRate);
         c->HookInstanceFunction(env, "getSampleRateForApiLevel",
                                 &WebRtcAudioManager::getSampleRateForApiLevel);
-        c->HookInstanceFunction(env, "getStereoInput", &WebRtcAudioManager::getStereoInput);
-        c->HookInstanceFunction(env, "getStereoOutput", &WebRtcAudioManager::getStereoOutput);
+        c->Hook(env, "getStereoInput", &WebRtcAudioManager::getStereoInput);
+        c->Hook(env, "getStereoOutput", &WebRtcAudioManager::getStereoOutput);
         c->HookInstanceFunction(env, "getLowLatencyInputFramesPerBuffer",
                                 &WebRtcAudioManager::getLowLatencyInputFramesPerBuffer);
         c->HookInstanceFunction(env, "getLowLatencyOutputFramesPerBuffer",
                                 &WebRtcAudioManager::getLowLatencyOutputFramesPerBuffer);
-        c->HookInstanceFunction(env, "getMinInputFrameSize",
+        c->Hook(env, "getMinInputFrameSize",
                                 &WebRtcAudioManager::getMinInputFrameSize);
-        c->HookInstanceFunction(env, "getMinOutputFrameSize",
+        c->Hook(env, "getMinOutputFrameSize",
                                 &WebRtcAudioManager::getMinOutputFrameSize);
-        c->HookInstanceFunction(env, "isAcousticEchoCancelerSupported",
+        c->Hook(env, "isAcousticEchoCancelerSupported",
                                 &WebRtcAudioManager::isAcousticEchoCancelerSupported);
-        c->HookInstanceFunction(env, "isNoiseSuppressorSupported",
+        c->Hook(env, "isNoiseSuppressorSupported",
                                 &WebRtcAudioManager::isNoiseSuppressorSupported);
         c->HookInstanceFunction(env, "isLowLatencyInputSupported",
                                 &WebRtcAudioManager::isLowLatencyInputSupported);
@@ -772,7 +777,12 @@ public:
 class WebRtcAudioRecord : public Object {
 public:
     audio::CaptureStream capture;
-    std::atomic<bool> microphoneMuted{false};
+    /// Process-wide, not per-instance, because `setMicrophoneMute` is static
+    /// in the dex -- there is no receiver to hang it off. It was previously
+    /// stored on the instance and set through a `dynamic_cast` of the receiver,
+    /// which could never have fired: the hook was registered as an instance
+    /// method and so never bound at all.
+    static inline std::atomic<bool> microphoneMuted{false};
 
     static jint initRecording(ENV*, Object*, jint sampleRate, jint channels) {
         std::fprintf(stderr,
@@ -801,8 +811,8 @@ public:
         return true;
     }
 
-    static void setMicrophoneMute(ENV*, Object* self, jboolean mute) {
-        if (auto* r = dynamic_cast<WebRtcAudioRecord*>(self)) r->microphoneMuted.store(mute);
+    static void setMicrophoneMute(ENV*, Class*, jboolean mute) {
+        microphoneMuted.store(mute);
     }
 
     // Both report that the hardware effect is unavailable, matching
@@ -821,7 +831,7 @@ public:
         c->HookInstanceFunction(env, "initRecording", &WebRtcAudioRecord::initRecording);
         c->HookInstanceFunction(env, "startRecording", &WebRtcAudioRecord::startRecording);
         c->HookInstanceFunction(env, "stopRecording", &WebRtcAudioRecord::stopRecording);
-        c->HookInstanceFunction(env, "setMicrophoneMute", &WebRtcAudioRecord::setMicrophoneMute);
+        c->Hook(env, "setMicrophoneMute", &WebRtcAudioRecord::setMicrophoneMute);
         c->HookInstanceFunction(env, "enableBuiltInAEC", &WebRtcAudioRecord::enableBuiltInAEC);
         c->HookInstanceFunction(env, "enableBuiltInNS", &WebRtcAudioRecord::enableBuiltInNS);
         c->Hook(env, "getDefaultAudioSource", &WebRtcAudioRecord::getDefaultAudioSource);

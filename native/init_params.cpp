@@ -732,7 +732,7 @@ public:
 /// live on.
 class LocalStorageManager : public Object {
 public:
-    static jlong getAllocatableBytes(ENV*, Class*) {
+    static jlong getAllocatableBytes(ENV*, Object*) {
         struct statvfs vfs {};
         if (statvfs(".", &vfs) != 0) {
             // Reporting zero would be the lie that is suspected of causing this
@@ -748,15 +748,14 @@ public:
     static void Register(ENV* env) {
         env->GetClass<LocalStorageManager>("com/roblox/client/LocalStorageManager");
         auto c = env->GetClass("com/roblox/client/LocalStorageManager");
-        // Static, not an instance method, and the difference was measured
-        // rather than read: with `HookInstanceFunction` the JNI trace shows the
-        // engine calling it three times with a `java/lang/Class` receiver, which
-        // is what a static call looks like, and the hook is simply never
-        // reached. libjnivm binds by descriptor and a mismatch is silent -- the
-        // hook registers, the symbol resolves, and the engine gets a default
-        // zero back. `docs/analysis/unresolved-jni.tsv` records this one as an
-        // instance method and is wrong about it.
-        c->Hook(env, "getAllocatableBytes", &LocalStorageManager::getAllocatableBytes);
+        // Instance, per the dex's own ACC_STATIC bit. An earlier commit moved
+        // this to `Hook` after reading a JNI-trace line as evidence of a static
+        // call -- `Call Member Function Class=java/lang/Class` -- but that logs
+        // the *receiver object's* class, not how the method is bound, and the
+        // same trace shows `Found symbol` for the instance hook right above it.
+        // The hook was binding all along; the reading was wrong.
+        c->HookInstanceFunction(env, "getAllocatableBytes",
+                                &LocalStorageManager::getAllocatableBytes);
     }
 };
 

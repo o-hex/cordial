@@ -18,11 +18,14 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <memory>
 
 // ------------------------------------------------------- focused text box
@@ -1231,6 +1234,315 @@ extern "C" void cordial_app_ready_set_sink(void (*on_ready)(const char*)) {
     cordial::g_app_ready_sink.store(on_ready, std::memory_order_release);
 }
 
+namespace cordial {
+
+/// `android.content.SharedPreferences` and its `Editor`.
+///
+/// The engine writes key/value state through this and, until now, every write
+/// went nowhere: `Context.getSharedPreferences` was an unresolved symbol, so
+/// libjnivm handed back a placeholder and the engine then called `edit()` and
+/// `putString()` on the `Invalid` class it got — visible in a JNI trace as
+/// `Call Unknown Member Function Class=Invalid Method=putString`.
+///
+/// Backed by a real file per preference name under the instance's own files
+/// directory, so it survives a restart and, because `files_dir()` is
+/// per-instance, two profiles cannot see each other's — the same property the
+/// multi-account design rests on everywhere else (ADR-012).
+///
+/// **This is not a fix for 304** and was not written as one. It came out of a
+/// sweep looking for integrity checks, and it is here because an unanswered
+/// write is a `broken_feature` gap whatever else is going on.
+///
+/// The file format is Cordial's own. Android would write XML; nothing reads
+/// this except the code below, and a line-oriented file is far easier to look
+/// at when a question is "did the engine actually store that". One
+/// type-tagged record per line, value newline-escaped:
+///
+/// ```text
+/// S<TAB>key<TAB>value
+/// ```
+class SharedPreferences : public Object {
+public:
+    static std::string escape(const std::string& v) {
+        std::string out;
+        for (char c : v) {
+            if (c == '\n') { out += "\\n"; }
+            else if (c == '\\') { out += "\\\\"; }
+            else { out += c; }
+        }
+        return out;
+    }
+    static std::string unescape(const std::string& v) {
+        std::string out;
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (v[i] == '\\' && i + 1 < v.size()) {
+                out += (v[++i] == 'n') ? '\n' : v[i];
+            } else {
+                out += v[i];
+            }
+        }
+        return out;
+    }
+
+    std::string name;
+    std::map<std::string, std::string> values;
+    std::mutex lock;
+
+    /// Relative to the working directory, **not** `files_dir()`.
+    ///
+    /// That is deliberate and was measured. `files_dir()` hardcodes
+    /// `instances/default/data` and does not follow `--profile`, so the first
+    /// version of this wrote `CordialTest`'s preferences into the `default`
+    /// profile — two profiles sharing one preference store, which is exactly
+    /// what ADR-012 exists to prevent. The engine's own `appData` follows the
+    /// profile because the client runs with its working directory set there, so
+    /// hanging this off the same anchor puts it in the right place by
+    /// construction. `unimplemented.rs` resolves its log the same way and for
+    /// the same reason.
+    ///
+    /// The name the engine passes is a full path — observed:
+    /// `…/CordialTest/data/files/appData/GlobalBasicSettings_13.xml` — so the
+    /// basename is what makes a readable file, and a short digest of the whole
+    /// string is appended so two settings files with the same basename in
+    /// different directories cannot collide.
+    std::string path() const {
+        ::mkdir("shared_prefs", 0700);
+        std::string base = name;
+        auto slash = base.find_last_of('/');
+        if (slash != std::string::npos) base = base.substr(slash + 1);
+        std::string safe;
+        for (char c : base) {
+            safe += (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-')
+                        ? c : '_';
+        }
+        if (safe.empty()) safe = "prefs";
+        // FNV-1a over the full name. Not security, just collision avoidance.
+        uint64_t h = 1469598103934665603ULL;
+        for (unsigned char c : name) { h ^= c; h *= 1099511628211ULL; }
+        char digest[9];
+        snprintf(digest, sizeof digest, "%08x", static_cast<unsigned>(h & 0xffffffffu));
+        return "shared_prefs/" + safe + "-" + digest + ".prefs";
+    }
+
+    void load() {
+        FILE* f = fopen(path().c_str(), "re");
+        if (!f) return;
+        char line[8192];
+        while (fgets(line, sizeof line, f)) {
+            std::string s(line);
+            if (!s.empty() && s.back() == '\n') s.pop_back();
+            auto a = s.find('\t');
+            if (a == std::string::npos) continue;
+            auto b = s.find('\t', a + 1);
+            if (b == std::string::npos) continue;
+            values[s.substr(a + 1, b - a - 1)] = unescape(s.substr(b + 1));
+        }
+        fclose(f);
+    }
+
+    /// Written whole and renamed over the old file. A half-written preferences
+    /// file would be indistinguishable from a corrupt one on the next launch,
+    /// and this is the store an engine restart reads its own state back out of.
+    void save() {
+        std::string tmp = path() + ".tmp";
+        FILE* f = fopen(tmp.c_str(), "we");
+        if (!f) return;
+        for (auto& [k, v] : values) {
+            fprintf(f, "S\t%s\t%s\n", k.c_str(), escape(v).c_str());
+        }
+        fclose(f);
+        rename(tmp.c_str(), path().c_str());
+    }
+};
+
+/// Returned by `SharedPreferences.edit()`. Android's editor stages changes and
+/// applies them on `apply`/`commit`; this does the same rather than writing
+/// through, because the engine batches and a write-through would fsync per key.
+class SharedPreferencesEditor : public Object {
+public:
+    std::shared_ptr<SharedPreferences> owner;
+    std::map<std::string, std::string> staged;
+    std::vector<std::string> removed;
+    bool clear_all = false;
+
+    // Returned by every put/remove/clear so the engine can chain them, exactly
+    // as Android's Editor does. libjnivm converts a `shared_ptr` return value
+    // itself, so there is no `to_jni` here and must not be.
+    std::shared_ptr<SharedPreferencesEditor> self(ENV*) {
+        return std::static_pointer_cast<SharedPreferencesEditor>(shared_from_this());
+    }
+    std::shared_ptr<SharedPreferencesEditor> putString(ENV* env, std::shared_ptr<String> k,
+                                                       std::shared_ptr<String> v) {
+        if (k) staged[*k] = v ? std::string(*v) : std::string();
+        return self(env);
+    }
+    std::shared_ptr<SharedPreferencesEditor> putInt(ENV* env, std::shared_ptr<String> k, jint v) {
+        if (k) staged[*k] = std::to_string(v);
+        return self(env);
+    }
+    std::shared_ptr<SharedPreferencesEditor> putLong(ENV* env, std::shared_ptr<String> k, jlong v) {
+        if (k) staged[*k] = std::to_string(static_cast<long long>(v));
+        return self(env);
+    }
+    std::shared_ptr<SharedPreferencesEditor> putFloat(ENV* env, std::shared_ptr<String> k, jfloat v) {
+        if (k) staged[*k] = std::to_string(v);
+        return self(env);
+    }
+    std::shared_ptr<SharedPreferencesEditor> putBoolean(ENV* env, std::shared_ptr<String> k,
+                                                        jboolean v) {
+        if (k) staged[*k] = v ? "true" : "false";
+        return self(env);
+    }
+    std::shared_ptr<SharedPreferencesEditor> remove(ENV* env, std::shared_ptr<String> k) {
+        if (k) removed.push_back(*k);
+        return self(env);
+    }
+    std::shared_ptr<SharedPreferencesEditor> clear(ENV* env) {
+        clear_all = true;
+        return self(env);
+    }
+    void flush() {
+        if (!owner) return;
+        std::lock_guard<std::mutex> g(owner->lock);
+        if (clear_all) owner->values.clear();
+        for (auto& k : removed) owner->values.erase(k);
+        for (auto& [k, v] : staged) owner->values[k] = v;
+        owner->save();
+        staged.clear();
+        removed.clear();
+        clear_all = false;
+    }
+    void apply(ENV*) { flush(); }
+    /// `commit` returns whether the write happened. It is written to disk
+    /// synchronously here, so `true` is the truth rather than optimism — but
+    /// only when there is a store behind it, which is why the null case says
+    /// false instead of pretending.
+    jboolean commitEditor(ENV*) {
+        if (!owner) return JNI_FALSE;
+        flush();
+        return JNI_TRUE;
+    }
+
+    static void Register(ENV* env) {
+        env->GetClass<SharedPreferencesEditor>("android/content/SharedPreferences$Editor");
+        auto c = env->GetClass("android/content/SharedPreferences$Editor");
+        c->HookInstanceFunction(env, "putString", &SharedPreferencesEditor::putString);
+        c->HookInstanceFunction(env, "putInt", &SharedPreferencesEditor::putInt);
+        c->HookInstanceFunction(env, "putLong", &SharedPreferencesEditor::putLong);
+        c->HookInstanceFunction(env, "putFloat", &SharedPreferencesEditor::putFloat);
+        c->HookInstanceFunction(env, "putBoolean", &SharedPreferencesEditor::putBoolean);
+        c->HookInstanceFunction(env, "remove", &SharedPreferencesEditor::remove);
+        c->HookInstanceFunction(env, "clear", &SharedPreferencesEditor::clear);
+        c->HookInstanceFunction(env, "apply", &SharedPreferencesEditor::apply);
+        c->HookInstanceFunction(env, "commit", &SharedPreferencesEditor::commitEditor);
+    }
+};
+
+/// The getters, and the `edit()` that hands out the editor above.
+class SharedPreferencesImpl {
+public:
+    static std::shared_ptr<SharedPreferencesEditor> edit(ENV*, SharedPreferences* self) {
+        auto e = std::make_shared<SharedPreferencesEditor>();
+        e->owner = std::static_pointer_cast<SharedPreferences>(self->shared_from_this());
+        return e;
+    }
+    static std::shared_ptr<String> getString(ENV*, SharedPreferences* self,
+                                             std::shared_ptr<String> k,
+                                             std::shared_ptr<String> fallback) {
+        std::lock_guard<std::mutex> g(self->lock);
+        auto it = k ? self->values.find(*k) : self->values.end();
+        if (it == self->values.end()) return fallback;
+        return std::make_shared<String>(it->second);
+    }
+    static jint getInt(ENV*, SharedPreferences* self, std::shared_ptr<String> k, jint fallback) {
+        std::lock_guard<std::mutex> g(self->lock);
+        auto it = k ? self->values.find(*k) : self->values.end();
+        if (it == self->values.end()) return fallback;
+        try { return std::stoi(it->second); } catch (...) { return fallback; }
+    }
+    static jlong getLong(ENV*, SharedPreferences* self, std::shared_ptr<String> k, jlong fallback) {
+        std::lock_guard<std::mutex> g(self->lock);
+        auto it = k ? self->values.find(*k) : self->values.end();
+        if (it == self->values.end()) return fallback;
+        try { return std::stoll(it->second); } catch (...) { return fallback; }
+    }
+    static jfloat getFloat(ENV*, SharedPreferences* self, std::shared_ptr<String> k,
+                           jfloat fallback) {
+        std::lock_guard<std::mutex> g(self->lock);
+        auto it = k ? self->values.find(*k) : self->values.end();
+        if (it == self->values.end()) return fallback;
+        try { return std::stof(it->second); } catch (...) { return fallback; }
+    }
+    static jboolean getBoolean(ENV*, SharedPreferences* self, std::shared_ptr<String> k,
+                               jboolean fallback) {
+        std::lock_guard<std::mutex> g(self->lock);
+        auto it = k ? self->values.find(*k) : self->values.end();
+        if (it == self->values.end()) return fallback;
+        return it->second == "true" ? JNI_TRUE : JNI_FALSE;
+    }
+    static jboolean contains(ENV*, SharedPreferences* self, std::shared_ptr<String> k) {
+        std::lock_guard<std::mutex> g(self->lock);
+        return (k && self->values.count(*k)) ? JNI_TRUE : JNI_FALSE;
+    }
+
+    static void Register(ENV* env) {
+        env->GetClass<SharedPreferences>("android/content/SharedPreferences");
+        auto c = env->GetClass("android/content/SharedPreferences");
+        c->HookInstanceFunction(env, "edit", &SharedPreferencesImpl::edit);
+        c->HookInstanceFunction(env, "getString", &SharedPreferencesImpl::getString);
+        c->HookInstanceFunction(env, "getInt", &SharedPreferencesImpl::getInt);
+        c->HookInstanceFunction(env, "getLong", &SharedPreferencesImpl::getLong);
+        c->HookInstanceFunction(env, "getFloat", &SharedPreferencesImpl::getFloat);
+        c->HookInstanceFunction(env, "getBoolean", &SharedPreferencesImpl::getBoolean);
+        c->HookInstanceFunction(env, "contains", &SharedPreferencesImpl::contains);
+    }
+};
+
+/// One store per name for the process's lifetime, which is what Android
+/// guarantees: two `getSharedPreferences("x", …)` calls return the same
+/// instance, so a write through one is visible to the other without a reload.
+static std::shared_ptr<SharedPreferences> prefs_named(ENV*, const std::string& name) {
+    static std::mutex reg_lock;
+    static std::map<std::string, std::shared_ptr<SharedPreferences>> registry;
+    std::lock_guard<std::mutex> g(reg_lock);
+    auto it = registry.find(name);
+    if (it != registry.end()) {
+        return it->second;
+    }
+    auto p = std::make_shared<SharedPreferences>();
+    p->name = name;
+    p->load();
+    registry[name] = p;
+    return p;
+}
+
+/// `Context.getSharedPreferences(String, int)`.
+///
+/// The mode argument is ignored, and that is correct rather than lazy: every
+/// value it can take describes multi-process sharing on Android
+/// (`MODE_MULTI_PROCESS` and friends), and Cordial's whole storage model is one
+/// instance per profile holding an `flock` — there is no second process to
+/// share with by construction.
+static std::shared_ptr<SharedPreferences> context_get_shared_preferences(
+    ENV* env, Object*, std::shared_ptr<String> name, jint) {
+    return prefs_named(env, name ? std::string(*name) : std::string("default"));
+}
+
+void register_shared_preferences(ENV* env) {
+    SharedPreferencesEditor::Register(env);
+    SharedPreferencesImpl::Register(env);
+    // Hooked on both, because the engine resolved the method against
+    // `android/content/Context` but calls it on whatever object it is holding,
+    // and the one it is holding is the Activity.
+    for (const char* klass : {"android/content/Context", "android/app/Activity"}) {
+        env->GetClass<Object>(klass);
+        env->GetClass(klass)->HookInstanceFunction(env, "getSharedPreferences",
+                                                   &context_get_shared_preferences);
+    }
+}
+
+} // namespace cordial
+
 extern "C" void cordial_register_android_classes(void* env_ptr) {
     auto* env = static_cast<jnivm::ENV*>(env_ptr);
     if (!env) {
@@ -1251,6 +1563,7 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
     cordial::register_cookie_classes(env);
     cordial::register_audio_classes(env);
     cordial::register_clipboard_classes(env);
+    cordial::register_shared_preferences(env);
     if (getenv("CORDIAL_JNI_TRACE")) {
         fprintf(stderr, "[classes] Cordial's Java side registered\n");
     }

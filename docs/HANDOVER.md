@@ -632,6 +632,59 @@ anyway** and failed identically. So whether the probe causes the 304 is still
 gate, or making the probe succeed, is the experiment that settles it — and
 unlike everything before, it can now be run in 70 seconds a time.
 
+**Take the connection lifetime from the engine's own line, not from two greps.**
+A run that teleports has several connections, and pairing the *first* `Connection
+accepted` with the *last* disconnect reported 77.0 s for a connection that
+actually lived 60.8 s — the 60-second rule looked broken when only the
+arithmetic was. `timeMS` and `connectionTime` sit on the one `Connection lost`
+line and both belong to the same connection:
+
+```bash
+grep -m1 "connectMode: Peer Disconnected" "$log"   # alive = (timeMS - connectionTime)/1000
+```
+
+Recomputed that way, every capture to date: **60.99, 60.25, 60.14, 60.15, 60.16,
+60.80 seconds.** Including one that teleported to an entirely different place
+mid-session and was dropped 60.8 s into the *second* connection, which is good
+evidence the deadline is per-connection and not per-session or per-place.
+
+**The DummyClient's gate is not client-side, and three attempts say so.**
+`FStringRbxTransportDummyClientEnabledMinorVersions_PlaceFilter`,
+`DFFlagReportDummyClientConnectionAttemptResult` and
+`DFFlagClientReceiveNetStackPortAndToken` were each overridden through
+`CORDIAL_FLAGS`, all applied cleanly, and **the probe ran every time**. That is
+consistent with where the instruction comes from: the target arrives in the join
+payload — `RbxTransport DummyClient will connect to server 128.116.51.33:35731
+... rccAddr = 10.60.2.74:35731` — and the flags that decide whether a server
+hands one out are RCC-side (`DFFlagRccReportNetStackPort`,
+`DFFlagRccReportNetStackConfig`). A client flag cannot stop a server allocating
+a port and naming it. **Guessing further flag names is not worth more joins**;
+if the probe is to be suppressed the lever is not in this document.
+
+**There is nothing for Cordial to implement in the transport.** Cordial does not
+speak this protocol — the engine does, through Cordial's socket calls, and the
+strace shows those are ordinary and correct: `socket(AF_INET, SOCK_DGRAM,
+IPPROTO_UDP)`, `connect`, `SO_RCVBUF`/`SO_SNDBUF`, no `bind` (ephemeral source
+port, which is normal), then ten good `sendmsg`. The framing that leaves
+(`01 00 00 1F 01 11 01 …`) is the same shape as what the *working* RakNet socket
+receives (`01 00 00 17 01 11 02 …`), so this is Roblox's own RUPP framing rather
+than textbook QUIC on the wire, whatever the flag names say. The open question
+is why the server ignores those datagrams, and **that cannot be answered from
+this side of the connection.**
+
+**The experiment that would answer it, and why it has not been run:** strace
+Sober's probe and diff the first datagram against Cordial's. That needs Sober
+launched into a game, which is the *main* account — deliberately kept separate
+from the test account for ban-correlation reasons. Automated joins on it are not
+something to do unattended.
+
+**Causality is still open, and both stories fit the evidence.** Either the RCC
+allocates a netstack port, waits for the probe, and drops the client at 60 s when
+nothing arrives — which fits Sober connecting in 28 ms and living 256 s — or the
+probe is pure telemetry and the 60-second deadline belongs to something else not
+yet looked at. The second is not idle: a probe whose flags exist to *report*
+whether it failed implies failure is an expected, tolerated outcome.
+
 `docs/analysis/unresolved-jni.tsv` is **stale**: it still lists
 `org/fmod/AudioDevice`, which is implemented. Regenerate it from a JNI-trace run
 before trusting a count from it.

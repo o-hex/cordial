@@ -1019,3 +1019,50 @@ control taken minutes later. So the verdict is reported once per delivery
 attempt, not once per launch. That is consistent with the verdict being a
 property of each attempt rather than a latched startup state, which is new, and
 nobody should read more into it than that.
+
+### §11.7 The ordering, read file-to-file: Cordial starts the app bridge first
+
+§11 and §11.4 compared Cordial's `FLog` file against Sober's *captured stdout*,
+which after §11.5 is not a comparison anyone should trust. Sober writes its own
+`FLog` file, `appData/logs/<version>_<ts>_Player_<id>_last.log`, the same sink in
+the same format from the same build. Redone file-to-file, the earlier reading
+survives: Sober's file carries all seven lines (`AndroidGLView`
+`nativeInitClientSettings` ×1, `ClientRunInfo` ×3, `RbxStorage` ×2,
+`AppPlatformQoSEmergency` ×1, `Mimalloc` ×43) and Cordial's carries none.
+
+What the file-to-file view adds is the sequence, and it is not what this document
+has assumed.
+
+| | Sober | Cordial |
+|---|---|---|
+| log opens | 1.652 `RobloxChannel has been set to production` | 1.781 |
+| | *engine silent for 2.05 s* | |
+| `nativeInitClientSettings` | 3.700 | never logged |
+| `nativePostClientSettingsLoadedInitialization3` | 3.796 | never logged |
+| `RbxStorage::init [INIT] user: flagLoaded` | 3.820 | never |
+| `nativeAppBridgeV2Init` | **3.901** | **1.781 — the first line in the file** |
+| `initializeWithAppStarter` | 3.906 | 1.781 |
+| `InitializedLuaApp` | — | 3.102 |
+
+**Sober brings the app bridge up 200 ms after the content store. Cordial brings
+it up first, and it is the very first thing the engine logs.** Sober's engine
+does nothing at all between 1.652 s and 3.700 s: it is waiting for the host
+application to hand it settings, and only starts once it has them. Cordial's
+engine is already into `nativeAppBridgeV2Init`, `initializeWithAppStarter` and
+`InitializedLuaApp` while that handshake is still going on.
+
+Channels Sober reaches and Cordial never does, whole file against whole file:
+`AppPlatformQoSEmergency`, `KeyRing`, `Mimalloc`, `RbxStorage`, plus
+`AssetProvider`, `NetworkClient`, `RbxTransportDummyClient`,
+`RbxTransportRnaExpConnection` and `TrackerAnimationStreamSourceTrace`, which are
+join-time and expected absent from a startup-only run. `Mimalloc` is explained by
+Cordial not linking it. `AppPlatformQoSEmergency`, `KeyRing` and `RbxStorage` all
+sit inside the window Cordial skips past.
+
+**This is the named divergence, and it is an ordering one, not a missing
+symbol.** Every symbol on the path now resolves and every argument is now known
+correct; what differs is when Cordial does the handshake relative to starting the
+engine's application layer. The next experiment is to deliver settings after
+`nativeAppBridgeV2InitWithParams` rather than inside `initializeNativeCode`, and
+watch for `RbxStorage::init`. That is a reordering of `load.rs`, it is not
+attempted here, and it should be done with the `--run 8` startup and a control.

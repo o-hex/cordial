@@ -678,6 +678,74 @@ launched into a game, which is the *main* account — deliberately kept separate
 from the test account for ban-correlation reasons. Automated joins on it are not
 something to do unattended.
 
+#### Retracted: the DummyClient has nothing to do with 304
+
+**"304 has never been observed on a run where the DummyClient connected" is
+false**, and it was false the whole time — the sample was too small and nobody
+had tabulated the probe's outcome against the disconnect. Doing that across every
+Cordial capture:
+
+```text
+probe outcome          alive     reason
+Connected to server    60.99 s    304
+Connected to server    60.25 s    304
+Failed to establish    60.14 s    304
+Failed to establish    60.15 s    304
+Failed to establish    60.16 s    304
+Failed to establish    60.80 s    304
+Failed to establish       -       no 304   (session ended before 60 s)
+Failed to establish       -       no 304   (session ended before 60 s)
+```
+
+**Cordial's probe connects sometimes, and the 304 arrives at 60 seconds either
+way.** The probe is irrelevant to the disconnect, which also means Sober's
+advantage was never that its probe connects. Every "DummyClient NoResponse"
+entry above this line is describing a coincidence.
+
+**This cancelled the experiment that needed the main account.** Stracing Sober to
+diff the first datagram was queued as the decisive test; it was decisive for
+nothing, and the table that killed it came from logs already on disk. Worth
+remembering next time an expensive capture looks necessary: tabulate the cheap
+observation across every run first.
+
+For the record, since it cost some effort to establish: Sober's Flatpak cannot be
+traced from outside (`ptrace(PTRACE_SEIZE)` gives `EPERM` regardless of
+`ptrace_scope=0`, and the distrobox container's own seccomp blocks the tracer),
+`--devel` swaps the Platform runtime for the SDK and Sober segfaults on the
+different `libcurl`, and `--allow=devel` does not lift the attach block. An
+`LD_PRELOAD` shim would work and is **refused**: injecting code into the Roblox
+process is exactly the primitive [ADR-001](adr/ADR-001-in-process-hooking.md)
+rules out, and a debugging exception would be the thin end of it. A packet
+capture needs root and is the honest route if this is ever needed again.
+
+#### The lead that replaces it: Cordial never sends the play session report
+
+`SessionTransitionFSM` runs the same way in both up to the last step, and then
+diverges:
+
+```text
+Sober     Initialized -> Entered app session -> Sent app session success
+          -> Entered play session -> Sent play session success
+Cordial   Initialized -> Entered app session -> Sent app session success
+          -> Entered play session -> (nothing)
+```
+
+**Cordial logs `Sent app session success` but never `Sent play session
+success`.** The `E` in its `Session history: IASPE` arrives at 62.065 s, in the
+same breath as the 304 — so the error state is the *consequence* of the
+disconnect, not its cause, and the real gap is the missing report in the 60
+seconds before it.
+
+That is the exact shape the 60-second deadline predicts: something the client
+owes shortly after joining and never delivers. **It is not a visible HTTP
+failure** — the only failing requests in that window are
+`users.roblox.com/v1/users` (400 and three 429s), and **Sober gets the same 400**,
+so that is shared and not the discriminator.
+
+**Not established:** what `Sent play session success` actually sends, whether its
+absence causes the 304, or whether it is a third symptom of one cause. It is a
+lead with a mechanism, which is more than anything else here has.
+
 **Causality is still open, and both stories fit the evidence.** Either the RCC
 allocates a netstack port, waits for the probe, and drops the client at 60 s when
 nothing arrives — which fits Sober connecting in 28 ms and living 256 s — or the

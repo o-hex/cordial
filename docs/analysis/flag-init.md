@@ -1185,3 +1185,77 @@ A caution on how that was nearly misread: `grep -c RbxStorage` on this log
 returns 2, and the obvious reading is that the store initialised on a join when
 it does not on a startup. It is the opposite; both matches are the error above.
 Count then read, in that order.
+
+## §12. What is blocking `RbxStorage::init`: nothing is. It is never asked for
+
+Chased from the `CaptureStorage` error in §11.11. The conclusion is that the
+question "what is blocking storage init" has no answer because storage init is
+not blocked.
+
+**There is no way to initialise it directly.** `RbxStorage` is engine-internal.
+The engine exports `LocalStorageManager_initStorageManagerNative`, `...V3`, the
+`memstorage` family and the `localstorageplatforminterface` family — all of which
+are *LocalStorage*, a different thing that Cordial already has working
+(`appData/LocalStorage/*.json` is populated). Nothing exported, and nothing in the
+dex, constructs `RbxStorage`. There is no handle to pull.
+
+**Its only trigger is the flags-loaded event.** `FFlagStartRbxStorageInitRighAfterFlags
+= True` in the live set, and Sober's own log names the trigger in the line
+itself: `RbxStorage::init [INIT] user: flagLoaded`.
+
+**The routing flags were tried and do nothing.** `FFlagRbxStorageUseStdThread`,
+`RunInitInStdThreadLatch`, `BackgroundThread` and `SynchronizeInit2` all False,
+plus `StartRbxStorageInitRighAfterFlags` False — seven overrides applied, zero
+`RbxStorage` lines, zero `rbx-storage` paths.
+
+**And the overrides are real, which had never been established.** Static flags
+were assumed to land and were not tested. `FLogGraphics=0` takes
+`[FLog::Graphics]` from **30 lines to 0** on the same build. Static and dynamic
+overrides both reach the engine, so every flag experiment in §11 and here is a
+genuine negative rather than a no-op. The "settings arrive too late for static
+flags" theory is dead.
+
+**The engine says nothing about it at any verbosity.** All 134 `FLog*`/`DFLog*`
+keys in the document set to 7: the engine log goes from ~220 lines to **6247**,
+reaching 31 distinct channels, and contains zero lines matching `RbxStorage`,
+`InitBlocked`, `flagLoaded` or the verdict. `FFlagRbxStorageReportInitBlocked` is
+True in the live set and never fires. Storage is not failing to initialise; it is
+not being asked to.
+
+### §12.1 `NativeFlagsInitResult` — three methods implemented and never registered
+
+Found while chasing the above, fixed, and **not** the cause. The dex declares
+five members; Cordial registered two:
+
+    <init>                   (I)V                        registered
+    addBoolean               (Ljava/lang/String;ZZ)V     registered
+    getNativeFlagProviderId  ()I                         written, not registered
+    getBooleanCachedMap      ()Ljava/util/Map;           written, not registered
+    resolveFlagValue         (Ljava/lang/String;)Z       written, not registered
+
+All three had working C++ bodies sitting in the class. `Register()` never hooked
+them, so the object answered its constructor and `addBoolean` and returned an
+unresolved stub to every question about what it had stored. **This is a third
+variant of the silent-hook bug**, after the wrong descriptor and the wrong class:
+an implemented method that is never registered. It does not show up in a grep for
+the method name, which is why it survived the audit in 2ca7811 that was looking
+for precisely this, and `tools/hook_descriptors.py` cannot see it either because
+it only checks hooks that exist.
+
+Registered now. It changes nothing, and the trace says why: across a whole
+startup the engine calls `<init>` once and `addBoolean` **138 times** and never
+looks up any of the three. It builds the result object, fills it, and never reads
+it back.
+
+### §12.2 Where that leaves the verdict
+
+The flag handshake completes on Cordial's side. 138 of 139 names accepted, the
+flag cache written, static and dynamic overrides demonstrably in effect. The
+engine then reports `onFlagsFailed` over JNI without having asked Cordial a single
+further question — no unresolved lookup, no failed call, no log line at any
+verbosity. Every symbol on the path resolves and every argument is correct.
+
+So the verdict is not a reaction to anything Cordial does or fails to do at the
+JNI boundary. That is a much narrower statement than this document has been able
+to make before, and it rules out the entire class of fix it has been pursuing
+since §7.

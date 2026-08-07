@@ -632,6 +632,26 @@ public:
         auto c = env->GetClass("com/roblox/client/flags/NativeFlagsInitResult");
         c->Hook(env, "<init>", &NativeFlagsInitResult::ctor);
         c->HookInstanceFunction(env, "addBoolean", &NativeFlagsInitResult::addBoolean);
+        // The other three the dex declares. They were written and then not
+        // registered, so the class answered `<init>` and `addBoolean` and handed
+        // back an unresolved stub for every question about what it had stored --
+        // including `resolveFlagValue`, which is the engine asking for a flag it
+        // just cached and getting whatever a stub returns instead of the value.
+        //
+        //     com/roblox/client/flags/NativeFlagsInitResult getNativeFlagProviderId ()I
+        //     com/roblox/client/flags/NativeFlagsInitResult getBooleanCachedMap    ()Ljava/util/Map;
+        //     com/roblox/client/flags/NativeFlagsInitResult resolveFlagValue       (Ljava/lang/String;)Z
+        //
+        // An implemented method that is never registered is the same silent
+        // failure as a mismatched descriptor and does not show up in a grep for
+        // the method name, which is why this survived a hook audit that was
+        // looking for exactly this.
+        c->HookInstanceFunction(env, "getNativeFlagProviderId",
+                                &NativeFlagsInitResult::getNativeFlagProviderId);
+        c->HookInstanceFunction(env, "getBooleanCachedMap",
+                                &NativeFlagsInitResult::getBooleanCachedMap);
+        c->HookInstanceFunction(env, "resolveFlagValue",
+                                &NativeFlagsInitResult::resolveFlagValue);
         c->HookInstanceFunction(env, "getNativeFlagProviderId",
                                 &NativeFlagsInitResult::getNativeFlagProviderId);
         c->HookInstanceFunction(env, "getBooleanCachedMap",

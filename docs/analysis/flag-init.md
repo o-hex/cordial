@@ -1152,3 +1152,36 @@ run taken immediately afterwards on the same build:
 Identical. The overlay is not the difference, and the flag-set discrepancy noted
 in §11.9 can be closed: it is one empty `FString` about a render texture budget
 and it has nothing to do with the flags verdict or the content store.
+
+### §11.11 A join, after all of the above: 304 at 60.6 s, unchanged
+
+Everything from §11 onwards was startup-only. One instrumented join on the test
+profile, after all of it, to answer whether any of it moved the disconnect:
+
+    RESULT postfix server=128.116.50.33 alive=60.6s reason=304 (connections: 1)
+
+Squarely inside the 60.1–60.9 s band recorded across twelve-plus earlier runs.
+**Nothing in §11 is a fix for the 304**, which was never claimed but is now
+measured rather than assumed. The client is healthy at the moment it is dropped:
+`Connection lost: AckTimeout 0, IsOutgoingDataWaiting 1`.
+
+In the same run: `bootstrapTheApp` delivered once, `onFlagsFailed` twice,
+`FlagCache` wrote, and `KeyRing` logged two parsed configs — so `KeyRing`, listed
+in §11.7 as a channel Cordial never reaches, is simply join-time and is reached
+normally. That entry in §11.7's list is wrong and is corrected here.
+
+The store is still not constructed, and for the first time the engine says so in
+its own words rather than by absence:
+
+    8.486503 Error [DFLog::CaptureStorage] RbxStorage is not initialized,
+                                           cannot access storage interface
+
+Twice, at 8.49 s, on the join path. There is no `rbx-storage.db` under the
+profile. So the picture from §11 holds — the store never initialises — and there
+is now a named consumer that wanted it and was refused, which is a better handle
+than an absent log line.
+
+A caution on how that was nearly misread: `grep -c RbxStorage` on this log
+returns 2, and the obvious reading is that the store initialised on a join when
+it does not on a startup. It is the opposite; both matches are the error above.
+Count then read, in that order.

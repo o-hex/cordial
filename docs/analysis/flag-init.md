@@ -1094,3 +1094,41 @@ is what the next session should chase.
 The gate is left in `load.rs` with the crash recorded in the comment beside it,
 on the same reasoning 7.4 kept `CORDIAL_TRY_POST_CLIENT_SETTINGS`: the experiment
 has a result and the next person should not have to rebuild it to find out.
+
+### §11.9 There is no state. Those two seconds are the application's, not the engine's
+
+§11.8 ended by saying Sober's engine "spends two seconds in a state Cordial never
+enters" and that identifying that state was the next thing to chase. There is no
+such state, and that closing sentence is retracted.
+
+The two log lines either side of the gap carry the same thread id:
+
+    1.652055,b25302c0,6 [FLog::Output] RobloxChannel has been set to production
+    3.700769,b25302c0,6 [FLog::AndroidGLView] nativeInitClientSettings
+
+Same thread, and the engine emits nothing at all in between. So it did not block
+inside a call — it **returned to the host application**, and the application
+called back in two seconds later. The only entry in the whole window is Sober's
+own launcher, not the engine:
+
+    info: state: Applying remote app settings override: FStringRenderTextureBudgetByRam=""
+
+Sober's lifecycle log accounts for the time in its own terms: `fs_init` 1132 ms,
+`devices_init` 1716 ms, `gamemode_init` 1409 ms, `app_core` 669 ms,
+`check_security` 465 ms, `runtime_handler` 716 ms. That is a launcher doing
+launcher work between two engine calls.
+
+Cordial's equivalent stretch is short because Cordial's work is short: the
+settings document is already on disk under a six-hour cache, there is no security
+check, no gamemode integration and no device enumeration of that weight. The
+compressed timeline in §11.7's table is Cordial being faster, not Cordial
+skipping a phase. Nothing in the gap is a prerequisite the engine is waiting on,
+which is also why §11.8's reordering could not work and should not have been
+expected to.
+
+One detail worth carrying, unrelated to the verdict: Sober applies its **own**
+`app_settings` manifest on top of Roblox's document —
+`{"app_settings":{"FStringRenderTextureBudgetByRam":""}, ...}` — so the two
+clients are not running byte-identical flag sets even when they fetch the same
+document. Cordial applies no such overlay. That has not been tested against the
+verdict and is recorded only so nobody assumes the flag sets match exactly.

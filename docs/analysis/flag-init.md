@@ -1066,3 +1066,31 @@ engine's application layer. The next experiment is to deliver settings after
 `nativeAppBridgeV2InitWithParams` rather than inside `initializeNativeCode`, and
 watch for `RbxStorage::init`. That is a reordering of `load.rs`, it is not
 attempted here, and it should be done with the `--run 8` startup and a control.
+
+### §11.8 The reordering §11.7 proposed was run. It crashes
+
+`CORDIAL_LATE_SETTINGS=1` moves the whole handshake out of
+`initializeNativeCode` and into Sober's position, after
+`nativeAppBridgeV2InitWithParams`. Two runs, both `--run 8`:
+
+| | SIGSEGV | reached the app bridge |
+|---|---|---|
+| `CORDIAL_LATE_SETTINGS=1` | 2 of 2 | no |
+| default (`bootstrapTheApp` delivers) | 0 of 2 | yes |
+| `CORDIAL_NO_BOOTSTRAP=1` | 0 of 1 | yes |
+
+The engine dies before the bridge is reached, so the late delivery never runs at
+all. **Cordial cannot adopt Sober's ordering by moving the call.** Sober's engine
+can afford to sit idle from 1.652 s to 3.700 s because the Kotlin activity
+lifecycle is what will eventually hand it settings; Cordial drives the natives
+directly and by that point has advanced past the state in which they can arrive.
+
+So §11.7's ordering observation stands as a description and dies as a fix. The
+difference is real and it is not something a reordering of `load.rs` can close.
+Whatever Sober's engine is waiting for during those two seconds, Cordial never
+enters that state — and identifying *that* state, rather than any further symbol,
+is what the next session should chase.
+
+The gate is left in `load.rs` with the crash recorded in the comment beside it,
+on the same reasoning 7.4 kept `CORDIAL_TRY_POST_CLIENT_SETTINGS`: the experiment
+has a result and the next person should not have to rebuild it to find out.

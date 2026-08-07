@@ -890,7 +890,10 @@ fn main() -> ExitCode {
                             .symbol(
                                 "Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings",
                             )
-                            .filter(|_| std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_some())
+                            .filter(|_| {
+                                std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_some()
+                                    && std::env::var_os("CORDIAL_LATE_SETTINGS").is_none()
+                            })
                         {
                             let settings = cordial_runtime::client_settings::load(
                                 opt.client_settings.as_deref(),
@@ -914,7 +917,13 @@ fn main() -> ExitCode {
                         // `CORDIAL_NO_BOOTSTRAP=1` is the control: it leaves the
                         // hook installed but with nothing behind it, which
                         // reproduces the old behaviour in the same session.
-                        if std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_none() {
+                        // `CORDIAL_LATE_SETTINGS=1` moves the whole handshake
+                        // to after the app bridge, where Sober does it. Sober's
+                        // FLog file has nativeAppBridgeV2Init at 3.901, 200ms
+                        // AFTER RbxStorage::init; Cordial's has it at 1.781 as
+                        // the first line in the file. See flag-init.md §11.7.
+                        let late = std::env::var_os("CORDIAL_LATE_SETTINGS").is_some();
+                        if std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_none() && !late {
                             const FLAG_NAMES: &str = include_str!("../native-flag-names.txt");
                             let plan = BootstrapPlan {
                                 settings_native: lib
@@ -1356,7 +1365,8 @@ fn main() -> ExitCode {
                                         // unnecessary difference on the path
                                         // under investigation is worth removing.
                                         let already = BOOTSTRAP_RAN
-                                            .load(std::sync::atomic::Ordering::SeqCst);
+                                            .load(std::sync::atomic::Ordering::SeqCst)
+                                            || std::env::var_os("CORDIAL_LATE_SETTINGS").is_some();
                                         if already {
                                             println!("  settings and flags already delivered by bootstrapTheApp");
                                         }
@@ -1740,6 +1750,31 @@ fn main() -> ExitCode {
                                                 Ok(()) => println!("  app bridge initialised"),
                                                 Err(e) => println!("  app bridge init failed: {e}"),
                                             }
+                                        }
+
+                                        // The §11.7 experiment, kept because it
+                                        // has a result and somebody will want to
+                                        // re-run it: the handshake in Sober's
+                                        // position, after the bridge.
+                                        //
+                                        // **It never gets here.** With the
+                                        // handshake moved out of
+                                        // `initializeNativeCode` the engine takes
+                                        // a SIGSEGV before the app bridge is
+                                        // reached -- twice out of two, against a
+                                        // default run and a `CORDIAL_NO_BOOTSTRAP=1`
+                                        // run in the same session, neither of
+                                        // which crashes and both of which reach
+                                        // the bridge. So Cordial cannot simply
+                                        // adopt Sober's ordering: Sober's engine
+                                        // sits idle for 2.05s waiting for the
+                                        // Kotlin activity to hand it settings,
+                                        // and Cordial, driving the natives
+                                        // directly, has already advanced past the
+                                        // point where they can arrive.
+                                        if std::env::var_os("CORDIAL_LATE_SETTINGS").is_some() {
+                                            println!("  late settings: delivering after the app bridge");
+                                            run_bootstrap();
                                         }
 
                                         // The saved session goes back in here,

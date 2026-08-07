@@ -1132,3 +1132,23 @@ One detail worth carrying, unrelated to the verdict: Sober applies its **own**
 clients are not running byte-identical flag sets even when they fetch the same
 document. Cordial applies no such overlay. That has not been tested against the
 verdict and is recorded only so nobody assumes the flag sets match exactly.
+
+### §11.10 Sober's `app_settings` overlay — applied, no effect
+
+§11.9 recorded that Sober applies its own `app_settings` manifest on top of
+Roblox's document, so the two clients do not run identical flag sets. Tested,
+because "untested" is not a place to leave something that was raised as a
+difference.
+
+Sober's manifest carries exactly one entry: `FStringRenderTextureBudgetByRam=""`.
+Given to Cordial through `CORDIAL_FLAGS`, `--run 10` startup, against a control
+run taken immediately afterwards on the same build:
+
+| | overrides applied | `RbxStorage` | `onFlagsFailed` |
+|---|---|---|---|
+| with Sober's overlay | 1 | 0 | 2 |
+| control, no overlay | 0 | 0 | 2 |
+
+Identical. The overlay is not the difference, and the flag-set discrepancy noted
+in §11.9 can be closed: it is one empty `FString` about a render texture budget
+and it has nothing to do with the flags verdict or the content store.

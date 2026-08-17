@@ -66,6 +66,7 @@ disabled. Plugins extend *Cordial*.
 - [Why there is no script execution, ever 🔒](docs/adr/ADR-001-in-process-hooking.md)
 - [Report a bug 🐛](https://github.com/luohoa97/cordial/issues)
 - [Contribute 🛠️](CONTRIBUTING.md)
+- [Official Discord](https://discord.gg/qJzU3Xfr9b)
 
 **New here?** Read the warning below first, then
 [`docs/NEXT.md`](docs/NEXT.md) — it is written for someone picking the project

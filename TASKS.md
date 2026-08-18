@@ -524,3 +524,71 @@ general and links the Discord server, and never mentions that a Discord presence
 plugin ships or how to enable it. `site/index.html` is the website. Both want a
 section. That is a writing task, not an engineering one, and it should not be
 filed as "fully implement Discord RPC" — the misfiling is the bug.
+
+---
+
+## WebView: the protocol is engine-side and self-describing
+
+The highest-value thing the mocktail comparison produced. mocktail answers
+`com/roblox/protocols/webview/WebViewProtocol`; **Cordial answers none of it**,
+which is why account settings, Robux purchase and anything else that opens a web
+window do nothing.
+
+`libroblox.so` exports **23** natives for it, and the shape they describe is a
+complete protocol the application only has to provide a window for:
+
+    initializeAndroidWebViewProtocol      the app registers itself as the provider
+    getProtocolName                       the channel's name
+    getOpenWindowId / getCloseWindowId    message ids the engine will send
+    getMutateWindowId / getHandleWindowCloseId
+    getIsAvailableId
+    getUrlKey / getTitleKey / getWindowTypeKey / getSearchParamsKey
+    getSearchTypeKey / getIsVisibleKey / getHideHeaderKey
+    getBackButtonVisibleKey / getShowDomainAsTitleKey / getAvailableKey
+    getFFlagWebViewHasBackButtonVisible / getFFlagWebViewHasHideHeader
+    signalJavascriptCallback              the app returns a JS result to the engine
+
+Plus `DomainAllowListChecker` — `checkDomainAllowList`,
+`isKnownTrustedDomain`, `enableDomainAllowListChecker` — also engine-side.
+
+**Nothing here needs guessing, and that is the point.** Every message id and
+every payload key is obtained by *calling the engine's own getter*. An
+implementation that hardcodes `"url"` because that is what the key is probably
+called would break silently on the next build; one that calls `getUrlKey()` cannot.
+Write it that way.
+
+### Design notes worth taking, in our own terms
+
+mocktail runs its webview **out of process** — `mocktail_webview_helper.cc` has
+its own `main()` and is launched by a separate launcher — with a JS bridge named
+`executeRoblox` and an origin check on every message
+(`rejected executeRoblox from untrusted origin`).
+
+Both properties are right and both match decisions Cordial has already made.
+Out-of-process isolation is ADR-003's reasoning applied to a browser engine: a
+WebKit crash or a hostile page cannot reach the Roblox process. And origin
+validation is not optional — this window is where the user signs in and where
+payment happens, so a page that can post arbitrary commands to the engine is the
+whole security boundary.
+
+Cordial already links WebKitGTK for the cookie path, so the dependency is
+present. What is missing is the protocol side and the window.
+
+- **Touches:** new `native/webview.cpp` for the protocol surface, a new
+  out-of-process helper binary, the cookie module for the shared session.
+- **Scope:** major, and the largest single feature gap Cordial has.
+- **Isolated?** Mostly. The cookie/session sharing is the one piece that touches
+  existing state.
+- **Do not transcribe.** mocktail's helper is 45 KB of WebKitGTK plumbing under
+  Apache-2.0. The protocol above is read off the engine's own exports and the
+  dex, which is ours to implement freshly. Write the helper from the WebKitGTK
+  documentation, not from their file.
+
+### Still not established: whether mocktail survives past 60 seconds
+
+`space.bigrat.mocktail` 1.0.3 is installed. Its 41 commits and its source contain
+no integrity, anti-cheat or 304 handling — but that is consistent both with it
+never hitting the error and with it hitting the error and nobody having written
+anything down. **It has not been run.** Until it is, "mocktail does not get the
+integrity error" is an assumption, and this document should not be read as
+supporting it.

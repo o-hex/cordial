@@ -1259,3 +1259,94 @@ So the verdict is not a reaction to anything Cordial does or fails to do at the
 JNI boundary. That is a much narrower statement than this document has been able
 to make before, and it rules out the entire class of fix it has been pursuing
 since §7.
+
+## §13. mocktail does not take the 304, and the difference is visible
+
+The experiment that had been deferred for two days. mocktail 1.0.3, Flatpak,
+signed in and joined to place 17625359962 — the same place Cordial dies in.
+
+    Joining game ... place 17625359962 at 10.60.0.203     84.048s
+    Connection accepted from 128.116.51.33|61655          84.102s
+    last engine timestamp                                333.512s
+    Disconnect / Peer Disconnected / Connection lost            0
+
+**249 seconds connected and still running**, against Cordial's 60.6. So the 304
+is not something every third-party client gets, not a property of the engine on
+Linux, and not unavoidable. A working comparison now exists.
+
+### The startup difference, counted on the same place and the same day
+
+| | mocktail | Cordial |
+|---|---|---|
+| `onFlagsFailed` | **0** | 2 |
+| `RbxStorage::init` | **[INIT] 0.164s, [DONE] 1.037s** | never (only "not initialized" errors) |
+| `ClientRunInfo` | **3** | 0 |
+| `AppPlatformQoS` | **1** | 0 |
+| 304 | **no** | at 60.6s |
+
+This is the chain ad985a8 proposed, now with the other side of it. The client
+that raises the flags-loaded event builds its content store and keeps its
+connection; the client that reports `onFlagsFailed` does neither.
+
+mocktail's order, which Cordial reproduces up to the third line and then stops:
+
+    0.139  nativeInitClientSettings
+    0.155  [FlagCache] Deferring flag cache write to post TTI
+    0.158  nativePostClientSettingsLoadedInitialization3
+    0.158  [ClientRunInfo] RobloxGitHash: 9141bfb7...
+    0.158  [ClientRunInfo] The base url is https://www.roblox.com/
+    0.158  [ClientRunInfo] The channel is production
+    0.159  AppPlatformQoSEmergencyHandler was instanced
+    0.164  RbxStorage::init [INIT] user: flagLoaded
+
+**`ClientRunInfo` is the first thing Cordial does not reach.** It is the engine
+stating its own run identity — git hash, base url, channel — immediately after
+the post-settings call, and six milliseconds before the store is built. Cordial
+makes both calls, gets 0 and "ok" from them, and produces none of these lines.
+
+### Two things mocktail does that Cordial does not do at all
+
+Neither is established as the cause. Both are recorded because they are
+differences between a client that works and one that does not, which is a much
+better position than this document has been in.
+
+**It presents as a PC, not a phone.** `src/runtime/device_profile.cc` reports
+`device profile=pc-windows-11 class=pc model="Windows 11 PC"`. Cordial tells the
+engine it is an Android tablet — 6d8c280 built a User-Agent saying exactly that,
+on the reasoning that the real Android client sends it. mocktail's choice is the
+opposite one and mocktail is the client that survives.
+
+**It bootstraps a tracker identity before the engine starts.**
+`src/services/browser_tracker_service.cc` calls
+`https://apis.roblox.com/browser-tracker-api/device/initialize?suggestedBrowserTrackerId=`
+and keeps the `RBXEventTrackerV2` cookie it returns. Cordial has no equivalent
+and no such cookie.
+
+This was already half-written down here and never connected to anything:
+`docs/analysis/webview-surface.md` records that `libroblox.so` carries the string
+`BrowserTrackerIdRequest: No RBXEventTrackerV2 in cookie.`, and
+`docs/design/sign-in.md` has the same endpoint in an Android capture. So the
+engine has a code path that notices this cookie missing, and Cordial has never
+supplied it.
+
+**Not evidence, and worth stating so nobody quotes it as such:** that log string
+did **not** appear in Cordial's join log, and the only BrowserTracker line in
+mocktail's log is mocktail's own launcher rather than the engine. Neither engine
+said anything about a tracker cookie at default verbosity. The string's presence
+in the binary shows the check exists; it does not show it fired.
+
+### What to do next, in order
+
+1. **Raise the log level and rerun the Cordial join.** §12 established that flag
+   overrides reach the engine, so the channels around `ClientRunInfo`,
+   `BrowserTrackerIdRequest` and `AppPlatformQoS` can be turned up. Find out
+   whether the engine says anything about the tracker cookie when it is missing.
+2. **Supply `RBXEventTrackerV2`.** Cordial owns the cookie jar already
+   (`crates/cordial-runtime/src/cookies.rs`) and the endpoint is a documented,
+   ordinary HTTPS request the real client makes. Nothing here forges or replays
+   anything.
+3. **Try the PC device profile.** Cheap, reversible, and the client that works
+   uses it.
+
+Take them one at a time with a control each. Three changes at once against a
+failure that takes sixty seconds to reproduce would tell us nothing.

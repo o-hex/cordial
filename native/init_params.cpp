@@ -1800,6 +1800,66 @@ extern "C" {
 /// is otherwise dead code here. Calling it directly, with no argument and no
 /// forged network response, is legitimate: it is the engine's own exported
 /// native reading its own bundled state.
+/// `NativeGLInterface.nativePassCurrentDisplayRefreshRate(F)V` and
+/// `nativePassSupportedRefreshRates([F)V`.
+///
+/// How a client tells the engine what its display can do. Cordial has never
+/// called either, so the engine has been running on whatever it assumes when the
+/// application says nothing — and AGENTS.md records the frame rate as a hard
+/// FIFO vsync lock to the output's refresh whenever input is flowing. Whether
+/// speaking changes that is untested; being the only party able to speak and
+/// staying silent is worth ending either way.
+///
+/// The choice of *which* rate, when a window is on two outputs at once, is made
+/// in `crates/cordial-runtime/src/refresh.rs` and tested there. These two only
+/// carry the answer across.
+int cordial_pass_current_refresh_rate(void* fn, float hz, char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jclass, jfloat);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or nativePassCurrentDisplayRefreshRate is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeGLInterface");
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jclass)cordial::to_jni(env, cls),
+                                   static_cast<jfloat>(hz));
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+int cordial_pass_supported_refresh_rates(void* fn, const float* rates, size_t count, char* err,
+                                         size_t err_len) {
+    using Call = void (*)(JNIEnv*, jclass, jfloatArray);
+    auto* env = cordial::process_env();
+    if (!fn || !env || (!rates && count)) {
+        snprintf(err, err_len, "no JavaVM, or nativePassSupportedRefreshRates is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeGLInterface");
+        auto arr = std::make_shared<jnivm::Array<jfloat>>(count);
+        for (size_t i = 0; i < count; ++i) {
+            (*arr)[i] = static_cast<jfloat>(rates[i]);
+        }
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jclass)cordial::to_jni(env, cls),
+                                   (jfloatArray)cordial::to_jni(env, arr));
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
 int cordial_read_local_flags(void* fn, char* err, size_t err_len) {
     using Call = jobject (*)(JNIEnv*, jclass);
     auto* env = cordial::process_env();

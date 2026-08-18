@@ -474,6 +474,19 @@ pub mod game_activity {
             err: *mut c_char,
             n: usize,
         ) -> c_int;
+        fn cordial_pass_current_refresh_rate(
+            f: *mut c_void,
+            hz: f32,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
+        fn cordial_pass_supported_refresh_rates(
+            f: *mut c_void,
+            rates: *const f32,
+            count: usize,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
         fn cordial_deeplink_protocol_string(
             f: *mut c_void,
             class_name: *const c_char,
@@ -613,6 +626,44 @@ pub mod game_activity {
             )
         };
         if rc == 0 { Ok(out != 0) } else { Err(take_err(err)) }
+    }
+
+    /// `NativeGLInterface.nativePassCurrentDisplayRefreshRate(F)V`.
+    ///
+    /// Which rate to send when a window is on two outputs at once is decided in
+    /// `cordial_runtime::refresh`, not here.
+    pub fn pass_current_refresh_rate(native: *mut c_void, hz: f32) -> Result<(), String> {
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; the buffer outlives the call.
+        let rc = unsafe {
+            cordial_pass_current_refresh_rate(native, hz, err.as_mut_ptr() as *mut c_char, err.len())
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
+    /// `NativeGLInterface.nativePassSupportedRefreshRates([F)V`.
+    ///
+    /// An empty slice is refused rather than sent. "Every rate this display
+    /// supports, and there are none" is not a thing to tell a renderer, and the
+    /// engine has been managing without the call at all — so saying nothing
+    /// remains strictly better than saying that.
+    pub fn pass_supported_refresh_rates(native: *mut c_void, rates: &[f32]) -> Result<(), String> {
+        if rates.is_empty() {
+            return Err("no plausible refresh rates to report".into());
+        }
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; `rates` and the error
+        // buffer both outlive the call.
+        let rc = unsafe {
+            cordial_pass_supported_refresh_rates(
+                native,
+                rates.as_ptr(),
+                rates.len(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
     }
 
     /// A static, zero-argument native returning `String`.

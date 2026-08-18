@@ -26,6 +26,7 @@ pub mod graphics;
 pub mod identity;
 pub mod plugin_host;
 pub mod profile;
+pub mod refresh;
 pub mod secrets;
 pub mod bionic;
 pub mod stubs;

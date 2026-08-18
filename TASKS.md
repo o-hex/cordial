@@ -222,3 +222,80 @@ the engine's own Vulkan output; there is no processing stage for it to live in.
 
 Nothing above has been implemented. `INFERRED` markers are load-bearing: T1's
 mechanism, T2 entirely, and T3's applicability to Cordial are all unestablished.
+
+---
+
+## Direct verdicts on the proposed libraries
+
+| library | verdict | why |
+|---|---|---|
+| **mimalloc** | **try it, measure it** | Contained: Cordial's shim does not interpose malloc, so the engine takes host glibc. Linking mimalloc into `cordial-run` so it wins symbol resolution is the standard override and touches nothing else. No evidence allocation is hot yet — so it is cheap to try and must not ship on vibes. |
+| **detex** | **yes, if T3 is real** | It is the honest alternative to hand-writing an ETC1→BC1 transcoder. Tied to T3; assess together. |
+| **nlohmann/json** | **no** | Cordial's JSON is `serde_json` on the Rust side. The native side barely parses JSON. |
+| **volk** | **no** | Saves the Vulkan loader trampoline. Unmeasured, probably marginal. Revisit only if a profile shows it. |
+| **fmt** | **no** | The native side is `fprintf`/`snprintf` throughout with a consistent voice. Adding fmt means a mixed style or a sweep, for no capability. |
+| **mcl / oaknut** | **no** | AArch64 instruction emission. Cordial loads the **x86-64** build natively on x86-64. Nothing to emit. Sober-architecture-specific. |
+| **dyncall** | **no** | Runtime-signature FFI, for a translation layer that learns ABIs at runtime. Cordial's JNI boundary is statically typed through libjnivm. Sober-specific. |
+| **imgui** | **no** | New UI stack for a project that deliberately has one (libadwaita). Diagnostics here are logs and traces. |
+| **libxml2** | **no** | Nothing in Cordial parses XML. |
+| **AOSP portions** | **already have it** | The ported bionic linker is exactly this. |
+| **SDL3** | **no** | mocktail uses it as its platform layer under a GTK shell. Cordial's canvas is a Wayland subsurface of the libadwaita window (ADR-011) and works. Two platform layers means two event loops competing to be the Wayland client. |
+| **libplacebo** | **no** | GPU scaling/tone-mapping/colour. Cordial presents the engine's own Vulkan output; there is no processing stage for it to live in. |
+
+## Input, voice, camera, VR — what the engine we load actually supports
+
+Measured by class-name presence across the three dex files of the shipped
+x86-64 Android build, `2.730.0.790`:
+
+| surface | hits in the dex | verdict |
+|---|---|---|
+| `hardware/camera2`, `CameraDevice`, `CameraManager` | **89** | reachable |
+| `WebRtcAudio` | **40** | reachable, and partly hooked already |
+| `InputDevice`, `MotionEvent` | **21** | reachable |
+| `AppRtcDevice` | **5** | reachable — this is the real voice path |
+| `Oculus`, `OpenXR`, `Cardboard`, `GvrLayout` | **0** | **not present** |
+
+### VR is not available and this is not a Cordial limitation
+
+The Android build contains no VR surface of any kind. Roblox's VR support is a
+PC-client feature; the mobile engine this project loads does not have it. There
+is no shim, capability or amount of platform work that adds it, because there is
+no engine code on the other side to call. **Closed, not deferred.**
+
+### Voice chat — the nearest of the three
+
+`AppRtcDeviceWrapper` is the real voice path and Cordial implements none of it.
+The WebRTC audio classes in `native/audio_classes.cpp` are hooked and this
+session fixed seven of them that were registered as instance methods when the dex
+declares them static. So the capture side has been worked; the device-wrapper
+layer above it has not.
+
+- **Touches:** `native/audio_classes.cpp`, a new device-wrapper module, the
+  PipeWire capture path.
+- **Scope:** major, but the best-understood of the three. Its own PR.
+
+### Gamepad and extended input
+
+`InputDevice`/`MotionEvent` is the Android surface, so the engine will take
+gamepad input if something feeds it. Cordial's own input path is
+`input::pass_key_event`/`pass_text` into GameActivity.
+
+Use **`libmanette`**, not SDL3 — it is GNOME's gamepad library, integrates with
+the GTK4 main loop Cordial already runs, and carries the SDL gamepad mapping
+database without bringing a second platform layer.
+
+- **Touches:** `crates/cordial-runtime/src/android/input.rs` (or equivalent),
+  the GameActivity motion-event path.
+- **Scope:** moderate. Isolated PR.
+
+### Camera
+
+89 hits on Camera2. The engine expects an Android `CameraManager`/`CameraDevice`
+and Cordial answers none of it, so anything camera-driven silently does nothing —
+the `broken_feature` shape from AGENTS.md.
+
+- **Touches:** new `native/camera_classes.cpp`, a PipeWire/v4l2 source.
+- **Scope:** major. Lower priority than voice unless something specific needs it.
+
+**Order for these four:** gamepad (moderate, isolated, immediately useful) →
+voice (major, best understood) → camera (major, no current demand) → VR (closed).

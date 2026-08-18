@@ -1388,3 +1388,62 @@ whether the cookie arrives on its own.
 `crates/cordial-runtime/src/browser_tracker.rs` is written and tested and
 **deliberately not called from anywhere**. Wiring in a request that returns 500
 would put a line in the log saying Cordial had done something it had not.
+
+## §14. The 304 no longer reproduces, and the device profile is not why
+
+Four join runs on 2026-08-18, place 17625359962, profile CordialTest, 90 seconds
+each:
+
+| run | identity | result |
+|---|---|---|
+| pc | `CORDIAL_DEVICE_PROFILE=pc-windows-11` | connected 1.77s, last log 90.70s, **0 disconnects** |
+| control-1 | default android-tablet | still connected at exit |
+| control-2 | default android-tablet | still connected at exit |
+| control-3 | default android-tablet | still connected at exit |
+
+Every one survived. Against twelve-plus runs that died at 60.1–60.9s with reason
+304, the disconnect is gone.
+
+**The control is the point.** The PC identity run came first and looked like the
+answer; three runs with the identity left at its Android default did exactly the
+same thing. So `CORDIAL_DEVICE_PROFILE` is not what changed, and crediting it
+would have been the easiest wrong conclusion available today.
+
+### What actually changed is not established
+
+Two candidates, and nothing here separates them:
+
+**Roblox shipped a new engine.** Every 304 was measured on 2.730.0.790. The APK
+updated mid-session and all four of these runs are 2.734.0.917. A server-side
+disconnect that stops happening across a client update is exactly what a
+server-side change looks like from here.
+
+**Or one of the day's changes.** `hypotf` (which the new build needs to load at
+all), the texture-manager default, the webview subscription, the MessageBus
+generalisation, the refresh-rate calls, the plugin host work.
+
+The engine update is the stronger candidate on timing alone, and it is also the
+one Cordial cannot take credit for. **Nothing in this document should be read as
+"the 304 was fixed".** It is not reproducing, on this build, on this day, on four
+runs.
+
+### What did not change
+
+    RbxStorage::init=0   ClientRunInfo=0   onFlagsFailed=2   webview-open=0
+
+Identical in all four. So the chain §13 established is untouched: the engine
+still reports `onFlagsFailed`, still never builds its content store, still never
+prints `ClientRunInfo`. Whatever stopped the disconnect did not fix that, and
+§13's correlation between the flags verdict and the 304 is weakened by exactly
+this — mocktail had the storage *and* stayed connected; Cordial now stays
+connected *without* it.
+
+The honest reading is that the two were never as tightly coupled as the
+correlation suggested, and that the storage chain is worth pursuing on its own
+merits — a client with no content store re-fetches every asset, which is a real
+cost whether or not it ever caused a disconnect.
+
+### Before this is quoted anywhere
+
+Run it again on a different day, and if the 304 returns, the engine update was a
+reprieve rather than a fix. `tools/join-run.sh` exists so that is one command.

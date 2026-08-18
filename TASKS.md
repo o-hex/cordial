@@ -365,3 +365,91 @@ So mocktail is not a source of a fix for the error Cordial hits at 60 seconds.
 It is a useful source for texture handling, platform layering and packaging, and
 it is silent on this. Anyone reading this backlog hoping the comparison would
 close the 304 should stop here rather than go looking.
+
+---
+
+## mimalloc: measured, and the answer is no. Roblox already ships it
+
+Adopting was agreed on the argument that Roblox's workload — many small
+allocations, many threads, CPU-bound — is mimalloc's designed-for case. The
+argument is sound. It does not apply, because the engine got there first.
+
+`libroblox.so` imports **no allocation entry point at all**. Filtering its 578
+undefined symbols for `malloc`, `calloc`, `realloc`, `free`, `reallocarray`,
+`posix_memalign`, `aligned_alloc`, `memalign`, `malloc_usable_size`, `strdup`,
+`strndup` and the whole `operator new`/`delete` family leaves **`realpath` and
+`vasprintf`** and nothing else. The C++ allocation operators come back **0**.
+
+An engine that never calls the system allocator cannot be given a different one.
+And `strings libroblox.so` says why:
+
+    10  mimalloc
+    48  Mimalloc
+
+**Roblox links mimalloc statically into the engine.** So it is already running
+under exactly the allocator this task proposed to give it, and the version it
+uses is Roblox's own choice rather than ours.
+
+Overriding `malloc` in `bionic::function_overrides` would therefore have reached
+only Cordial's own Rust allocations, which are trivial next to the engine's. That
+is the no-op-wearing-a-performance-badge outcome, and it is now measured rather
+than guessed at.
+
+**Do not adopt.** This also weakens the "Sober does it, so should we" reasoning
+generally: Sober's mimalloc serves Sober's own process, not the engine's heap.
+
+## detex: premise unproven, do not vendor yet
+
+The engine already knows the formats. `strings libroblox.so`:
+
+    DXT 21   ASTC 14   KTX2 14   ETC2 10   ETC1 7   BC3 3   BC7 1   BC1 0
+
+and it links no third-party decoder — no detex, bcdec, etcdec, rgbcx, astcenc.
+So format handling is the engine's own, and whether it ever hands the driver
+something a desktop GPU cannot take is a **runtime** question that no amount of
+reading answers.
+
+Vendoring detex before knowing that is the same mistake mimalloc nearly was.
+**The measurement first:** one join with the graphics log turned up, recording
+which `VK_FORMAT_*` the engine requests and whether any are refused. If ETC
+formats reach the driver, detex earns its place; if the engine transcodes to DXT
+itself, it does not.
+
+## JNI surface diff — 24 classes mocktail names that Cordial does not
+
+The comparison that is actually apples-to-apples between a Rust project and a C++
+one: not source, but which Java classes each answers. Cordial answers 62;
+mocktail names 86.
+
+Spot-checked rather than trusted, four of the five confirmed absent from Cordial:
+
+| class | Cordial | mocktail |
+|---|---|---|
+| `com/roblox/engine/jni/memstorage/MemStorage` (+ `Connection`, `Callback`) | **absent** | yes |
+| `com/roblox/engine/jni/autovalue/StartGameParams` | **absent** | yes |
+| `com/roblox/engine/jni/EngineJavaCallback2` | **absent** | yes |
+| `android/hardware/SensorManager` | **absent** | yes |
+| `com/roblox/engine/jni/NativeAppBridgeInterface` | present | yes |
+
+Also named by mocktail and unanswered here: `RobloxActivity`,
+`MainGameActivity`, the `localstorageplatforminterface/generated/` family,
+`PackageManager`/`PackageInfo`/`ApplicationInfo`, `DisplayManager`, `Display`,
+`InputMethodManager`, `SurfaceView`/`SurfaceHolder`/`View`/`Window`/
+`WindowManager`, `ViewRootImpl`, `Context`.
+
+**`MemStorage` is the most interesting.** The engine exports
+`MemStorage_bind`, `_fire`, `_getItem`, `_setItem`, `hasItem`, `removeItem` and
+`Connection_disconnect`/`_releaseConnection` — a complete key-value channel with
+a subscription mechanism — and Cordial answers none of it. **`StartGameParams`**
+is second: it is on the join path, which is where Cordial's remaining problem
+lives.
+
+Two honest caveats. mocktail *naming* a class is not proof it implements it
+usefully. And this diff was built by grepping `GetClass("...")` out of Cordial
+and string literals out of mocktail, so a class Cordial answers by another route
+would read as absent. **This is a lead list, not a verdict** — each entry needs
+confirming against a JNI trace before anyone builds to it.
+
+**Next:** run one `CORDIAL_JNI_TRACE=1` join and intersect the unresolved-symbol
+lines with this list. That turns 24 leads into the subset the engine actually
+asks for, and it costs one run.

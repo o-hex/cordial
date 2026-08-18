@@ -25,6 +25,11 @@ mod profile_switcher;
 mod settings;
 mod shell_config;
 mod updater;
+// The window itself needs webkitgtk6.0-devel, which an immutable host does not
+// have; the policy beside it needs nothing and is always compiled, because it is
+// the part that has to be right and it should be under test everywhere.
+#[cfg(feature = "webview")]
+mod webview;
 mod webview_policy;
 mod window;
 

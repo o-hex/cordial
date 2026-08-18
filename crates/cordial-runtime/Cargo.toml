@@ -25,7 +25,7 @@ cordial-shell = { path = "../cordial-shell" }
 # runtime makes, and it needs the trait that carries it. Same version
 # cordial-shell pins, because two versions of gtk4-rs in one process would be
 # two sets of GObject type registrations for the same C types.
-gtk4 = { version = "0.11", features = ["v4_22"] }
+gtk4 = { version = "0.11", features = ["v4_20"] }
 ureq = "3.3.0"
 # The client-settings document is JSON and user flag overrides have to be merged
 # into it correctly. A textual splice on a 1.2 MB document is not correctness.

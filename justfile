@@ -8,7 +8,7 @@
 _default:
     @just --list
 
-# Build: just build [host|distrobox|nix]  (Clang required; bionic will not build with GCC)
+# Build: just build [host|toolbox|distrobox|nix]  (Clang required; bionic will not build with GCC)
 build where="host":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -31,6 +31,11 @@ build where="host":
         # silently omits the audio backend when libpipewire-0.3 is absent, and the
         # web views want webkitgtk6.0-devel, both of which mean `dnf install` and a
         # reboot on an immutable host. A container is neither.
+        # Superseded by `toolbox` above, which pins the image and installs a
+        # known dependency set. Kept because people already have a
+        # `my-distrobox`: it builds with whatever that container carries, and on
+        # a Fedora 43 image that is gtk4 4.20.3 against the 4.22 this workspace
+        # pins, which dies in three *-sys build scripts.
         box="${CORDIAL_DISTROBOX:-my-distrobox}"
         # Not `grep -q`. It exits at the first match and closes the pipe, which
         # SIGPIPEs `distrobox list`, and `set -o pipefail` then reports the whole
@@ -44,6 +49,44 @@ build where="host":
         distrobox enter "$box" -- bash -lc \
           'CARGO_TARGET_DIR=target-distrobox cargo build --release'
         echo "built into target-distrobox/release"
+        ;;
+      toolbox)
+        # Cordial's own container, and the recommended way to build. `distrobox`
+        # below predates it and is kept working for anyone who already has one.
+        #
+        # It exists because the two things the full client needs are exactly the
+        # two an immutable host will not give you without layering a package and
+        # rebooting: `webkitgtk6.0-devel` for the in-experience web window, and
+        # `libpipewire-0.3` headers for the audio backend, which
+        # native/CMakeLists.txt otherwise omits in silence.
+        #
+        # Fedora 44 specifically. Fedora 43 carries gtk4 4.20.3 and libadwaita
+        # 1.8.3 against the 4.22 / 1.9 this workspace pins, and the failure is
+        # three *-sys build scripts dying with a pkg-config hint that reads as a
+        # missing package rather than an old one.
+        #
+        # To create it:
+        #   distrobox create --name cordial \
+        #     --image registry.fedoraproject.org/fedora-toolbox:44 --yes
+        #   distrobox enter cordial -- sudo dnf install -y \
+        #     gtk4-devel libadwaita-devel webkitgtk6.0-devel pipewire-devel \
+        #     clang cmake gcc-c++ pkgconf-pkg-config openssl-devel \
+        #     wayland-devel vulkan-loader-devel libxkbcommon-devel \
+        #     binutils llvm lld
+        #
+        # binutils is not optional and not obvious: clang arrives without `ar`,
+        # and CMake's static-library step then fails with "Error running link
+        # command: no such file or directory", which names neither the tool nor
+        # the package.
+        box="${CORDIAL_TOOLBOX:-cordial}"
+        if ! distrobox list 2>/dev/null | grep "| $box " >/dev/null; then
+            echo "no container called '$box' (set CORDIAL_TOOLBOX to pick another)" >&2
+            echo "create it with the commands in this recipe's comment" >&2
+            exit 1
+        fi
+        distrobox enter "$box" -- bash -lc \
+          'CARGO_TARGET_DIR=target-toolbox cargo build --release --features cordial-shell/webview'
+        echo "built into target-toolbox/release"
         ;;
       nix)
         # Unverified on an ostree host, where /nix is part of the read-only image
@@ -96,9 +139,10 @@ dev *args:
     # under test.
     case "$env" in
       host)      bindir=target/release ;;
+      toolbox)   bindir=target-toolbox/release ;;
       distrobox) bindir=target-distrobox/release ;;
       nix)       bindir=target-nix/release ;;
-      *)         echo "usage: just dev [--in host|distrobox|nix] [--apk PATH]" >&2; exit 1 ;;
+      *)         echo "usage: just dev [--in host|toolbox|distrobox|nix] [--apk PATH]" >&2; exit 1 ;;
     esac
     if [ ! -x "$bindir/cordial-shell" ]; then
         echo "no cordial-shell in $bindir — did 'just build $env' succeed?" >&2
@@ -200,6 +244,7 @@ client *args:
     # would silently run a stale host binary after a container build.
     case "$env" in
       host)      bindir=target/release ;;
+      toolbox)   bindir=target-toolbox/release ;;
       distrobox) bindir=target-distrobox/release ;;
       nix)       bindir=target-nix/release ;;
       *)         echo "usage: just client [--in host|distrobox|nix] ..." >&2; exit 1 ;;

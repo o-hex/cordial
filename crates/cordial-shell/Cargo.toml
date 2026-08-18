@@ -14,6 +14,20 @@ path = "src/lib.rs"
 name = "cordial-shell"
 path = "src/main.rs"
 
+# The in-experience web window. Off by default because it needs
+# `webkitgtk6.0-devel`, which an immutable host does not have and cannot get
+# without layering a package and rebooting -- the same reason `just build
+# distrobox` exists. The container has the headers; the host has only the
+# runtime library, and a container-built binary runs on the host perfectly well
+# because the runtime library is what execution needs.
+#
+# So: `just build distrobox` gets a client that can open account settings and
+# buy Robux, and `just build host` gets one that cannot. That is a worse default
+# than it sounds only until somebody tries to build on a stock Silverblue.
+[features]
+default = []
+webview = ["dep:webkit6"]
+
 [dependencies]
 cordial-plugins = { path = "../cordial-plugins" }
 # The engine cache's stamp (ADR-015). `install.rs` used to test presence alone,
@@ -26,7 +40,7 @@ serde_json = "1"
 # `v4_10` for `GtkFileDialog`, which the settings window uses to pick the APK
 # and the engine directory. GTK 4.10 is this project's floor already, and the
 # alternative — `GtkFileChooserNative` — is deprecated as of that same version.
-gtk4 = { version = "0.11", features = ["v4_22"] }
+gtk4 = { version = "0.11", features = ["v4_20"] }
 # Getting `libroblox.so` out of the APK. On a split build it is inside
 # `split_config.x86_64.apk` rather than `base.apk`, so the shell has to open a
 # zip to set a user up rather than telling them to run `unzip` first. Same
@@ -39,14 +53,22 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # closed by the same gesture as every other GNOME sheet, rather than a second
 # top-level that lands wherever the compositor decides.
 #
-# 1.9 rather than 1.5 because there is no reason to sit on an old floor. This
-# is a runtime for the current desktop; GNOME 48 ships 1.7 and GNOME 49 ships
-# 1.9, and anyone running a native Roblox client is not doing it on last year's
-# libadwaita. The cost is real and worth stating: **this raises the minimum
-# system libadwaita to 1.9**, so a distro or Flatpak runtime older than that
-# will no longer build the shell. Lower it here if that becomes a problem;
-# these flags only gate which of the safe wrapper's functions compile in.
-libadwaita = { version = "0.9", features = ["v1_9"] }
+# 1.8 rather than the host's 1.9, and the difference is the whole lesson. The
+# floor was first set to 1.9 because that is what this developer's host has —
+# and that broke `just build distrobox`, which is the *only* environment that
+# can build the web view at all, because its fedora-toolbox image carries
+# libadwaita 1.8.3 and GTK 4.20.3 against the host's 1.9.1 and 4.22.4.
+#
+# Nothing is given up. AdwDialog, the reason for moving off 1.4, landed in 1.5.
+#
+# The rule this leaves behind: the floor is the lowest of every environment
+# `just build` supports, not the newest one to hand. The justfile already warns
+# that these environments differ and a stale build that still runs is this
+# project's most expensive mistake; a floor that only one of them meets is the
+# same mistake at configure time.
+libadwaita = { version = "0.9", features = ["v1_8"] }
+# Optional: see [features] above.
+webkit6 = { version = "0.6", optional = true }
 # `gdk_wayland_surface_get_wl_surface`/`gdk_wayland_display_get_wl_display`,
 # which is all `host_window` wants from it — the raw pointers the runtime's
 # hand-marshalled Wayland code needs to parent the engine's surface to this

@@ -26,19 +26,27 @@ serde_json = "1"
 # `v4_10` for `GtkFileDialog`, which the settings window uses to pick the APK
 # and the engine directory. GTK 4.10 is this project's floor already, and the
 # alternative — `GtkFileChooserNative` — is deprecated as of that same version.
-gtk4 = { version = "0.11", features = ["v4_10"] }
+gtk4 = { version = "0.11", features = ["v4_22"] }
 # Getting `libroblox.so` out of the APK. On a split build it is inside
 # `split_config.x86_64.apk` rather than `base.apk`, so the shell has to open a
 # zip to set a user up rather than telling them to run `unzip` first. Same
 # version and the same minimal feature set `cordial-runtime` already pins, so
 # this adds an edge to an already-resolved dependency rather than a new one.
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# v1_4 is the floor, not the ceiling: AdwToolbarView and AdwSwitchRow both
-# landed in libadwaita 1.4, and every other widget used here predates that.
-# The system library only has to be 1.4 or newer; it does not have to match
-# this feature exactly, gtk-rs feature flags just gate which of the safe
-# wrapper's functions get compiled in.
-libadwaita = { version = "0.9", features = ["v1_4"] }
+# The floor was 1.4 for as long as AdwToolbarView and AdwSwitchRow were the
+# newest things used. `AdwDialog` moves it: it landed in 1.5 and it is what a
+# Roblox web window should be — attached to the client window, adaptive, and
+# closed by the same gesture as every other GNOME sheet, rather than a second
+# top-level that lands wherever the compositor decides.
+#
+# 1.9 rather than 1.5 because there is no reason to sit on an old floor. This
+# is a runtime for the current desktop; GNOME 48 ships 1.7 and GNOME 49 ships
+# 1.9, and anyone running a native Roblox client is not doing it on last year's
+# libadwaita. The cost is real and worth stating: **this raises the minimum
+# system libadwaita to 1.9**, so a distro or Flatpak runtime older than that
+# will no longer build the shell. Lower it here if that becomes a problem;
+# these flags only gate which of the safe wrapper's functions compile in.
+libadwaita = { version = "0.9", features = ["v1_9"] }
 # `gdk_wayland_surface_get_wl_surface`/`gdk_wayland_display_get_wl_display`,
 # which is all `host_window` wants from it — the raw pointers the runtime's
 # hand-marshalled Wayland code needs to parent the engine's surface to this

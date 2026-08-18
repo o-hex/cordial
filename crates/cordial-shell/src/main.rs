@@ -22,6 +22,7 @@ mod install;
 mod instructions;
 mod launch;
 mod profile_switcher;
+mod refresh_watch;
 mod settings;
 mod shell_config;
 mod updater;

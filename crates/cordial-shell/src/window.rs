@@ -28,6 +28,7 @@ use crate::install::{self, NotFound};
 use crate::instructions;
 use crate::launch;
 use crate::profile_switcher;
+use crate::refresh_watch;
 use crate::settings;
 use crate::shell_config::ShellConfig;
 use crate::updater;
@@ -405,6 +406,17 @@ pub fn build(
 
     window.present();
     open_on_start(&window, &update_button);
+
+    // This is the shell's own launcher window, not the engine's -- the two
+    // are the same *definition* per ADR-011 but separate processes with
+    // separate `HostWindow`s, and the one hosting the engine's subsurface is
+    // built by `cordial-run`, out of reach from here. Watching this one is
+    // what proves `refresh_watch` observes a real display correctly; the
+    // callback is empty because there is nothing on this side of the process
+    // boundary to tell -- see `refresh_watch.rs` for where the JNI wiring
+    // belongs instead.
+    refresh_watch::watch(&window, |_outputs| {});
+
     Shell { window, join }
 }
 

@@ -1350,3 +1350,41 @@ in the binary shows the check exists; it does not show it fired.
 
 Take them one at a time with a control each. Three changes at once against a
 failure that takes sixty seconds to reproduce would tell us nothing.
+
+### §13.1 The tracker cookie comes through the WebView, not from an API call
+
+Tried, and it does not work the way §13 assumed.
+
+`browser-tracker-api/device/initialize` refuses a plain request. `GET` answers
+**404**, which is a route that does not exist. `POST` with mocktail's own headers
+— `Accept: application/json`, `Content-Type: application/json`, body `{}` —
+answers **500** with an empty body, unchanged whether the User-Agent says
+`Mocktail/0.1` or `Cordial/0.5`. So the method is right and something else about
+the request is not.
+
+`docs/design/sign-in.md` already recorded why, from a logged-out Android capture:
+
+    Flushed WebViewCookieHandler with Cookies from URL
+      https://apis.roblox.com/browser-tracker-api/device/initialize
+    OnSetCookieHandlerImpl.b(): Updated WebViewCookieHandler with Cookies from URL
+      https://apis.roblox.com/browser-tracker-api/device/initialize
+
+**`WebViewCookieHandler`.** The real client obtains this cookie inside its web
+view, during the logged-out sign-in flow, with a browser's full context behind
+the request. It is not a standalone API call, and mocktail's succeeds because
+mocktail signs in through its web view first.
+
+That joins two gaps that were being tracked separately:
+
+    no WebView -> no sign-in in a browser context -> no RBXEventTrackerV2
+                                                  -> no device identity
+
+Which raises the WebView from "account settings and Robux do not work" to a
+possible prerequisite for the session surviving at all. **Still `INFERRED` —
+nothing here shows the missing cookie causes the 304.** But the ordering is now
+the right way round to test: build the web window, sign in through it, and see
+whether the cookie arrives on its own.
+
+`crates/cordial-runtime/src/browser_tracker.rs` is written and tested and
+**deliberately not called from anywhere**. Wiring in a request that returns 500
+would put a line in the log saying Cordial had done something it had not.

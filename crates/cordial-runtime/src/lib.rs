@@ -17,6 +17,7 @@ pub fn window_title(backend: &str) -> String {
 }
 
 pub mod android;
+pub mod browser_tracker;
 pub mod client_settings;
 pub mod cookies;
 pub mod deeplink;

@@ -229,7 +229,7 @@ mechanism, T2 entirely, and T3's applicability to Cordial are all unestablished.
 
 | library | verdict | why |
 |---|---|---|
-| **mimalloc** | **try it, measure it** | Contained: Cordial's shim does not interpose malloc, so the engine takes host glibc. Linking mimalloc into `cordial-run` so it wins symbol resolution is the standard override and touches nothing else. No evidence allocation is hot yet — so it is cheap to try and must not ship on vibes. |
+| **mimalloc** | **yes — adopt** | See the note below. The earlier "measure first" verdict was over-cautious. |
 | **detex** | **yes, if T3 is real** | It is the honest alternative to hand-writing an ETC1→BC1 transcoder. Tied to T3; assess together. |
 | **nlohmann/json** | **no** | Cordial's JSON is `serde_json` on the Rust side. The native side barely parses JSON. |
 | **volk** | **no** | Saves the Vulkan loader trampoline. Unmeasured, probably marginal. Revisit only if a profile shows it. |
@@ -299,3 +299,66 @@ the `broken_feature` shape from AGENTS.md.
 
 **Order for these four:** gamepad (moderate, isolated, immediately useful) →
 voice (major, best understood) → camera (major, no current demand) → VR (closed).
+
+---
+
+## mimalloc — revised to yes
+
+The earlier verdict here was "try it, measure it", which was over-cautious. The
+case for adopting is stronger than that, on three grounds that do not require a
+profile first:
+
+**The workload is mimalloc's designed-for case.** A game engine doing many small,
+short-lived allocations across many threads is precisely the pattern mimalloc's
+free-list sharding and thread-local heaps target, and precisely where glibc's
+malloc arena contention costs most. This is not a general "allocators are faster"
+claim; it is a specific match between this workload and this allocator.
+
+**Sober uses it, and Sober works.** When the reference implementation that reaches
+gameplay has made a choice and we are diverging from it for no reason, the
+divergence is the thing that needs justifying, not the adoption.
+
+**It is cheap and trivially revertible.** Link mimalloc's override into
+`cordial-run` so it wins symbol resolution ahead of glibc; remove one line to
+undo it.
+
+**The one real technical question, which is not a hedge.** Cordial runs with
+`--host-libc`, so the engine resolves libc symbols through the host, and the AOSP
+bionic linker does its own symbol resolution. Whether mimalloc's override
+actually captures the *engine's* allocations — as opposed to only Cordial's own —
+depends on how that resolution binds `malloc`. If the ported linker binds it from
+`libc.so`'s handle directly rather than through the global symbol table, the
+override captures nothing and the change is a no-op wearing a performance badge.
+
+That is checkable rather than arguable: mimalloc reports allocation statistics
+(`MIMALLOC_SHOW_STATS=1`). If the engine's allocations are flowing through it,
+the counts will be large; if they are not, they will be Cordial-sized. **Do that
+check first — not to decide whether to adopt, but to know whether the adoption
+did anything.** Shipping a no-op as a performance improvement is the exact
+failure mode AGENTS.md exists to prevent.
+
+- **Touches:** `crates/cordial-runtime` dependency list, one `#[global_allocator]`
+  or link-order change in `cordial-run`. Possibly the linker's symbol table
+  handling if the check comes back negative.
+- **Scope:** trivial to add, moderate if the shim needs to route it.
+- **Priority:** high. Do it after T1.
+
+---
+
+## Client integrity: mocktail does not address it
+
+Asked directly and answered plainly, because the possibility was worth checking
+and the answer is no.
+
+Across all 41 commits there is **no** commit mentioning integrity, signature
+verification, anti-cheat, Hyperion, Byfron, bans, or disconnects. Searching the
+source, the only `integrity` hits are `src/update/payload_integrity.cc`,
+`candidate_approval.cc` and `apk_bundle.cc` — that is *update payload* integrity,
+verifying a downloaded APK bundle before installing it. Unrelated to client
+attestation. There is no handling of a 304 or any server-initiated disconnect
+anywhere in the tree.
+
+So mocktail is not a source of a fix for the error Cordial hits at 60 seconds.
+It is a useful source for texture handling, platform layering and packaging, and
+it is silent on this. Anyone reading this backlog hoping the comparison would
+close the 304 should stop here rather than go looking.

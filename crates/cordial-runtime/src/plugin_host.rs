@@ -10,6 +10,7 @@
 //! broker's decisions are per plugin and made before dispatch.
 
 use cordial_plugins::broker::Broker;
+use cordial_plugins::enablement;
 use cordial_plugins::host::{authorise, Plugin as PluginProc};
 use cordial_plugins::presence::{DiscordPresence, PresencePayload};
 use cordial_plugins::protocol::{Request, Response};
@@ -41,6 +42,22 @@ pub fn start_all() -> usize {
 
     for plugin in found {
         let id = plugin.manifest.id.clone();
+
+        // Checked before anything about grants, and before the process is
+        // spawned at all. The bug this fixes was `start_all` never reading
+        // `plugin-enabled.json` in the first place, so Settings' switch wrote
+        // a file nothing consulted; a plugin that started and then had every
+        // request refused would still be the "stub that lies" shape AGENTS.md
+        // warns about, just moved into a process. Absence in the file means
+        // enabled — `enablement::is_enabled` already encodes that, and a
+        // plugin nobody has an opinion about must keep running subject to its
+        // grants, the same as before this change, or turning this bug off
+        // would quietly turn a different one on.
+        if !enabled_in_profile(&profile, &id) {
+            println!("  plugin {id}: disabled in Settings, not started");
+            continue;
+        }
+
         let granted = approved.get(&id).cloned().unwrap_or_default();
 
         // Say what was withheld. A plugin silently doing less than it asked for
@@ -85,6 +102,17 @@ pub fn start_all() -> usize {
         }
     }
     started
+}
+
+/// Whether `id` is allowed to run in `profile_dir`, per Settings' plugin
+/// toggle (`cordial_plugins::enablement`).
+///
+/// A thin wrapper rather than calling `enablement::is_enabled` straight from
+/// `start_all`, so this file's own tests can exercise the decision on a
+/// scratch profile directory without going through manifest discovery and
+/// process spawning to do it.
+fn enabled_in_profile(profile_dir: &std::path::Path, id: &str) -> bool {
+    enablement::is_enabled(profile_dir, id)
 }
 
 fn serve(mut proc: PluginProc, mut broker: Broker, store: Store) {
@@ -299,5 +327,56 @@ mod tests {
             Response::Error { message, .. } => assert!(message.contains("not implemented yet"), "{message}"),
             other => panic!("expected the not-implemented-yet stub, got {other:?}"),
         }
+    }
+
+    // The bug this file exists to fix: `start_all` discovered every plugin
+    // with a nonempty grant and never once asked `enablement::is_enabled`,
+    // so Settings' switch wrote `plugin-enabled.json` and nothing read it
+    // back. These exercise the same decision `start_all` now makes —
+    // `enabled_in_profile`, called before a plugin's grants are even looked
+    // at — on a scratch profile directory, rather than against real
+    // discovered plugins and spawned processes, which is what `start_all`
+    // itself talks to and is not something a unit test should stand up.
+
+    fn scratch_profile(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cordial-plugin-host-enablement-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_plugin_explicitly_disabled_does_not_start() {
+        let dir = scratch_profile("disabled");
+        enablement::set_enabled(&dir, "flag-inspector", false).unwrap();
+        assert!(
+            !enabled_in_profile(&dir, "flag-inspector"),
+            "Settings turned this off; start_all must not spawn it"
+        );
+    }
+
+    #[test]
+    fn a_plugin_explicitly_enabled_does_start() {
+        let dir = scratch_profile("enabled");
+        // Written explicitly rather than left absent, so this test is
+        // distinct from the absence case below: this covers the entry
+        // reading `true`, not merely "nobody wrote anything".
+        enablement::set_enabled(&dir, "flag-inspector", false).unwrap();
+        enablement::set_enabled(&dir, "flag-inspector", true).unwrap();
+        assert!(enabled_in_profile(&dir, "flag-inspector"));
+    }
+
+    #[test]
+    fn a_plugin_absent_from_the_file_defaults_to_enabled() {
+        // The design question this change had to answer: an installed
+        // plugin the user has never touched must not be silently disabled
+        // by wiring `start_all` up to enablement. `enablement.rs`'s own
+        // contract is "absence means enabled" (see its module docs and
+        // `is_enabled`); this asserts that `start_all`'s call site actually
+        // gets that answer, rather than assuming the wrapper forwards it
+        // correctly.
+        let dir = scratch_profile("absent");
+        assert!(!std::path::Path::new(&enablement::path_in(&dir)).exists());
+        assert!(enabled_in_profile(&dir, "a-plugin-nobody-has-an-opinion-about"));
     }
 }

@@ -409,6 +409,51 @@
 </section>
 
 <section>
+  <div class="wrap col">
+    <h2>A plugin never gets the socket</h2>
+    <p class="section__intro">
+      Discord Rich Presence ships in the tree, and it is the worked example for how every
+      host resource is meant to reach a plugin &mdash; which is to say, not by being handed over.
+    </p>
+    <p>
+      <code>plugins/discord-presence/</code> is first-party in the sense that it comes with
+      Cordial and in no other: an ordinary manifest, ordinary grants, the same isolation as
+      anything you write. It requests three capabilities &mdash; <code>lifecycle.read</code>,
+      <code>presence.set</code>, <code>log</code> &mdash; and holds nothing else. It publishes a
+      presence when the client launches and again when it is ready, and clears it on shutdown.
+    </p>
+    <p>
+      What it never learns is where Discord&rsquo;s IPC socket is. The plugin sends a presence
+      payload; Cordial searches the socket paths, performs Discord&rsquo;s handshake and writes
+      the frames. The payload is a closed structure that refuses any field Discord does not
+      define, so nothing a plugin invents crosses the wire, and it cannot read Discord&rsquo;s
+      state or send anything else down the connection. A Flatpak permission is app-wide and
+      permanent; a capability is per-plugin and revocable. If installing a plugin could add a
+      permission, uninstalling it could not take one away &mdash; which is the whole argument
+      for brokering the effect rather than granting the channel.
+    </p>
+    <p>
+      Installing it is a copy into the plugin directory. Approving it is a file, per profile,
+      because default deny means the grants file is the only thing that grants:
+    </p>
+<pre><span class="c"># ~/.local/share/cordial/profiles/&lt;profile&gt;/plugin-grants.json</span>
+{ "discord-presence": ["lifecycle.read", "presence.set", "log"] }</pre>
+    <div class="callout">
+      <p><strong>None of it reaches Discord in a real session yet.</strong> The broker, the
+      payload validation and Discord&rsquo;s wire framing are covered end to end by a test that
+      spawns the shipped plugin as a real Deno process and watches the frames land on a
+      stand-in socket.</p>
+      <p>But the plugin host the <em>client</em> runs serves settings, flags and logging, and
+      answers everything else with <code>not implemented yet</code> &mdash; and nothing outside
+      that test pushes a lifecycle event. So a granted plugin starts, asks to subscribe, and is
+      told the method is not implemented. That is read from the source rather than measured in
+      a session, and joining the two hosts up is the first thing to do if you want this
+      working.</p>
+    </div>
+  </div>
+</section>
+
+<section>
   <div class="wrap">
     <h2>Things this project got wrong, and corrected</h2>
     <p class="section__intro">

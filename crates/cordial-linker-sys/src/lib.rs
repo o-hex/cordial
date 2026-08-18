@@ -509,6 +509,16 @@ pub mod game_activity {
             err: *mut c_char,
             n: usize,
         ) -> c_int;
+        fn cordial_deeplink_two_strings_ret_string(
+            f: *mut c_void,
+            class_name: *const c_char,
+            arg_a: *const c_char,
+            arg_b: *const c_char,
+            out: *mut c_char,
+            out_len: usize,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
         fn cordial_deeplink_string_ret_string(
             f: *mut c_void,
             class_name: *const c_char,
@@ -736,6 +746,44 @@ pub mod game_activity {
     /// A static native taking one `String` and returning one —
     /// `MessageBus.getLastRaw(String)`, which is how a publish is checked
     /// rather than assumed.
+    /// A static native taking two `String`s and returning `String`.
+    ///
+    /// `MessageBus.getMessageId(protocolName, methodId)` composes a bus id this
+    /// way. Asking the engine to compose it is the point: a subscriber that
+    /// spelled the id itself would be guessing at a constant the engine owns,
+    /// and would find out by never receiving anything.
+    pub fn call_static_two_strings_ret_string(
+        native: *mut c_void,
+        class_name: &str,
+        a: &str,
+        b: &str,
+    ) -> Result<String, String> {
+        let cls = CString::new(class_name).map_err(|e| e.to_string())?;
+        let ca = CString::new(a).map_err(|e| e.to_string())?;
+        let cb = CString::new(b).map_err(|e| e.to_string())?;
+        let mut out = vec![0u8; 512];
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; every buffer outlives the call.
+        let rc = unsafe {
+            cordial_deeplink_two_strings_ret_string(
+                native,
+                cls.as_ptr(),
+                ca.as_ptr(),
+                cb.as_ptr(),
+                out.as_mut_ptr() as *mut c_char,
+                out.len(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc == 0 {
+            let n = out.iter().position(|b| *b == 0).unwrap_or(out.len());
+            Ok(String::from_utf8_lossy(&out[..n]).into_owned())
+        } else {
+            Err(take_err(err))
+        }
+    }
+
     pub fn call_static_string_ret_string(
         native: *mut c_void,
         class_name: &str,

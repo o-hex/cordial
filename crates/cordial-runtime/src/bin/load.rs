@@ -1590,6 +1590,21 @@ fn main() -> ExitCode {
                                             cordial_runtime::webview::report(&v);
                                         }
 
+                                        // The transport for that vocabulary:
+                                        // `MessageBus.getMessageId` and
+                                        // `MessageBus.doSubscribeRaw`, the two
+                                        // natives `openWindow` needs. Resolved
+                                        // and reported only — see
+                                        // crates/cordial-runtime/src/webview.rs
+                                        // for why `getMessageId` is not called
+                                        // from here.
+                                        {
+                                            let n = cordial_runtime::webview::find_bus_natives(
+                                                |name| lib.symbol(name),
+                                            );
+                                            cordial_runtime::webview::report_bus_natives(&n);
+                                        }
+
 
                                         // Kicks the engine's initialisation once
                                         // everything it depends on is in place.

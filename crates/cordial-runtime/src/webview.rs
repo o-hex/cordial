@@ -30,20 +30,35 @@
 //! ## What is established and what is not
 //!
 //! Established, by reading the engine's exports and the dex: the class, the
-//! twenty-three natives, their signatures, and that Cordial answers none of it.
+//! twenty-three natives, their signatures, and — corrected here, because an
+//! earlier version of this comment said the transport was untraced and that is
+//! no longer true — the transport itself. `docs/analysis/webview-surface.md`
+//! §"The transport, found in mocktail's bridge rather than by tracing" names it:
+//! `com.roblox.universalapp.messagebus.MessageBus`, the same bus
+//! `native/deeplink.cpp` already speaks for deep links. Receiving `openWindow`
+//! is three calls — `getMessageId("WebView", "openWindow")` to compose the bus
+//! id, `doSubscribeRaw(id, callback, false)` to subscribe, and the callback's
+//! `run(String)` handed the raw JSON when the engine publishes. The callback and
+//! `Connection` classes that shape needs are already registered, by
+//! `native/clipboard.cpp`'s `register_clipboard_classes` — this module must not
+//! register them a second time, because a second registration of the same class
+//! name overwrites the first and silently breaks the clipboard subscription
+//! that got there first.
 //!
-//! **Not established: how the engine delivers a message once the protocol is
-//! initialised.** `WebViewProtocol`'s non-native methods are obfuscated down to
-//! single letters — `a`, `b`, `c` through `k` — and take `org.json.JSONObject`,
-//! so there is a JSON message bus in between whose shape has not been traced.
-//! Until that is known there is no honest way to write the receiving half, and
-//! guessing at it would produce exactly the stub that reports success and does
-//! nothing which AGENTS.md forbids.
-//!
-//! So this module does the half that can be done truthfully: it reads the
-//! vocabulary and reports it. That is a diagnostic, it changes no engine state
-//! beyond registering the app as the provider, and the log it prints is the
-//! input the next piece of work needs.
+//! **What this module still cannot do: call `getMessageId`.** Its descriptor is
+//! `(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;` — two `String`s in,
+//! one back out — and no call shape `cordial-linker-sys` exports fits that.
+//! `call_static_string_ret_string` takes one `String` in and returns one;
+//! `call_static_strings` takes up to three `String`s in but returns nothing,
+//! because every native it was written for (`nativeSetFilesDirectory` and
+//! friends) is `void`. Composing the bus id needs a wrapper that does not
+//! exist, and this change is not permitted to add one to `cordial-linker-sys`
+//! or to the C++ side that would back it. Writing a raw JNI call by hand here
+//! instead would be exactly the machinery-rebuilding AGENTS.md warns is this
+//! project's most expensive mistake, done in a new place rather than not done.
+//! So [`find_bus_natives`] resolves and reports the two natives `openWindow`
+//! needs without calling either — a diagnostic, same as [`read_vocabulary`]
+//! below, and the blocker the next piece of work has to clear.
 
 use std::ffi::c_void;
 
@@ -128,6 +143,51 @@ pub fn report(v: &Vocabulary) {
     }
 }
 
+/// The two `com/roblox/universalapp/messagebus/MessageBus` natives that
+/// receiving `openWindow` needs, found or not, by the same symbol lookup
+/// [`read_vocabulary`] already uses.
+pub struct BusNatives {
+    pub get_message_id: bool,
+    pub do_subscribe_raw: bool,
+}
+
+/// Resolve `MessageBus.getMessageId` and `MessageBus.doSubscribeRaw`.
+///
+/// Finding a native and being able to call it are different facts —
+/// `getMessageId` is found by every build that has ever been run against this
+/// module, and it is still not called. See the module doc for why.
+pub fn find_bus_natives(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) -> BusNatives {
+    BusNatives {
+        get_message_id: symbol("Java_com_roblox_universalapp_messagebus_MessageBus_getMessageId")
+            .is_some(),
+        do_subscribe_raw: symbol(
+            "Java_com_roblox_universalapp_messagebus_MessageBus_doSubscribeRaw",
+        )
+        .is_some(),
+    }
+}
+
+/// Print what [`find_bus_natives`] found, and say plainly why that is where
+/// this stops rather than leaving the silence AGENTS.md warns is worse than an
+/// honest "not yet".
+pub fn report_bus_natives(n: &BusNatives) {
+    println!(
+        "  webview: MessageBus.getMessageId exported: {}",
+        n.get_message_id
+    );
+    println!(
+        "  webview: MessageBus.doSubscribeRaw exported: {}",
+        n.do_subscribe_raw
+    );
+    if n.get_message_id && n.do_subscribe_raw {
+        println!(
+            "  webview: both natives are present, but composing the openWindow bus id needs a \
+             two-String-argument, String-returning call, and cordial-linker-sys has no such \
+             wrapper (see module doc) — not subscribing rather than guessing the id"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +222,34 @@ mod tests {
         let v = read_vocabulary(|_| None);
         assert!(v.entries.is_empty());
         assert_eq!(v.missing.len(), STRING_GETTERS.len());
+    }
+
+    /// Same spelling discipline as the vocabulary getters: a typo in either
+    /// symbol name would read as "this build does not export MessageBus" and
+    /// send the next agent looking at the wrong build rather than at this file.
+    #[test]
+    fn bus_native_symbols_are_spelled_the_way_the_engine_exports_them() {
+        let mut asked = Vec::new();
+        let _ = find_bus_natives(|name| {
+            asked.push(name.to_string());
+            None
+        });
+        assert_eq!(asked.len(), 2);
+        assert!(asked.contains(
+            &"Java_com_roblox_universalapp_messagebus_MessageBus_getMessageId".to_string()
+        ));
+        assert!(asked.contains(
+            &"Java_com_roblox_universalapp_messagebus_MessageBus_doSubscribeRaw".to_string()
+        ));
+    }
+
+    /// Neither native being found must read as neither found, not as a partial
+    /// or default-true answer that would let `report_bus_natives` claim
+    /// something it never checked.
+    #[test]
+    fn missing_bus_natives_are_reported_as_missing() {
+        let n = find_bus_natives(|_| None);
+        assert!(!n.get_message_id);
+        assert!(!n.do_subscribe_raw);
     }
 }

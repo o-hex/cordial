@@ -476,3 +476,25 @@ endpoint answers 500. mocktail has the web view, signs in through it, gets the
 cookie, and plays for four minutes on the place Cordial is disconnected from at
 sixty seconds. That chain is unproven and it is the most coherent one this
 investigation has.
+
+### What is left, precisely
+
+The two natives `openWindow` needs are both exported and both resolve —
+`webview.rs` reports so on every startup. `getMessageId` can now be called:
+`cordial_deeplink_two_strings_ret_string` and its Rust wrapper
+`call_static_two_strings_ret_string` were added for it, because no existing call
+shape took two `String`s and returned one. That was the first blocker and it is
+gone.
+
+**The second is `doSubscribeRaw`'s callback, and it is not a missing wrapper.**
+`native/clipboard.cpp` subscribes to the bus already, and its machinery is
+deliberately single-slot: one `g_payload_sink`, one `g_connection`,
+one `g_connection_ptr`. Subscribing `openWindow` through it would not add a
+second subscription, it would replace the clipboard's — the same silent
+overwrite as registering a class twice, which happened once today already.
+
+So the remaining work is to generalise that side: a subscribe that keeps a
+callback and a `Connection` per message id rather than one of each. It is
+ordinary C++ and it is not large; it is simply not something to bolt onto
+clipboard's globals in passing, because the failure mode is the clipboard
+quietly ceasing to work with nothing in the log to say why.

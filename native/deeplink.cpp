@@ -183,6 +183,56 @@ int cordial_deeplink_protocol_init(void* fn, const char* class_name, char* err, 
 /// into: it hands back the last raw payload published on a message id. It is
 /// how "did the publish land" and "did the app shell answer" stop being
 /// assumptions.
+/// A static native taking *two* `String`s and returning `String`.
+///
+/// `MessageBus.getMessageId(String protocolName, String methodId)` is the one
+/// that needs this, and it is the call that composes a bus id: the engine keeps
+/// its message ids as protocol-plus-method, and asking it to compose one is how
+/// a subscriber gets an id it cannot have spelled wrong. The single-argument
+/// version above cannot express it, and the three-argument
+/// `cordial_call_static_strings` returns `void` because every native it was
+/// written for does.
+///
+/// Same body as its one-argument sibling with a second `jstring`. Kept beside it
+/// rather than generalised into a variadic: the shapes the engine actually uses
+/// are few and named, and a variadic JNI caller in this codebase would be a
+/// place for the argument count and the descriptor to disagree silently.
+int cordial_deeplink_two_strings_ret_string(void* fn, const char* class_name, const char* arg_a,
+                                            const char* arg_b, char* out, size_t out_len,
+                                            char* err, size_t err_len) {
+    using Call = jstring (*)(JNIEnv*, jobject, jstring, jstring);
+    auto* env = cordial::process_env();
+    if (!fn || !env || !class_name) {
+        snprintf(err, err_len, "no JavaVM, or the native is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass(class_name);
+        auto a = std::make_shared<cordial::String>(std::string(arg_a ? arg_a : ""));
+        auto b = std::make_shared<cordial::String>(std::string(arg_b ? arg_b : ""));
+        jstring r = reinterpret_cast<Call>(fn)(env->GetJNIEnv(),
+                                               (jobject)cordial::to_jni(env, cls),
+                                               (jstring)cordial::to_jni(env, a),
+                                               (jstring)cordial::to_jni(env, b));
+        const auto* s = reinterpret_cast<cordial::String*>(r);
+        const std::string value = s ? static_cast<const std::string&>(*s) : std::string();
+        if (value.size() >= out_len) {
+            snprintf(err, err_len, "the answer is %zu bytes and the buffer is %zu", value.size(),
+                     out_len);
+            return -1;
+        }
+        memcpy(out, value.data(), value.size());
+        out[value.size()] = '\0';
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
 int cordial_deeplink_string_ret_string(void* fn, const char* class_name, const char* arg, char* out,
                                        size_t out_len, char* err, size_t err_len) {
     using Call = jstring (*)(JNIEnv*, jobject, jstring);

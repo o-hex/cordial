@@ -1509,3 +1509,56 @@ tried, and neither moves `onFlagsFailed`. The verdict is still reached inside
 `initializeNativeCode`, before the settings calls, exactly as §12 measured. What
 mocktail does differently to reach `flagLoaded` is still not identified, and it
 is not either of these.
+
+## §16. mocktail's startup path, read call by call: the gap is not a missing call
+
+The question was why mocktail has no storage gap. Its whole pre-settings path
+has now been read, and the answer is not in the shape this investigation assumed.
+
+**Between `initializeNativeCode` and the settings call, mocktail makes five
+calls.** Cordial makes four of them:
+
+| call | Cordial |
+|---|---|
+| `nativeSetAssetPath` | yes |
+| NativeSettings directories | yes |
+| `JNIBaseUrlProtocol.init` | yes |
+| `nativeGameGlobalInit` | yes |
+| `nativeUpdateScreenOrientation` | **no** |
+
+One real gap, and it is a screen-orientation notification rather than anything
+that plausibly gates a content store. Worth closing on its own; not this.
+
+**And Cordial calls far more of the engine than mocktail does.** Counting the
+`Java_*` symbols each names: mocktail 17, Cordial 54. So the storage gap cannot
+be explained by Cordial failing to make a call mocktail makes — the set is the
+other way round.
+
+That inverts the hypothesis worth testing next: not a missing call but an
+**extra** one, something Cordial does that provokes the verdict. The obvious
+candidate was Cordial's early `nativeInitClientSettings`, made before
+`initializeNativeCode`, which mocktail does not do — added when the first
+`flags FAILED` was seen arriving before any settings call.
+
+**That candidate is dead too.** The call is gated behind `CORDIAL_NO_BOOTSTRAP`
+and does not fire in a default run at all; a default run's log contains no
+`early client settings` line. So it is not a difference between the two clients
+in normal operation, and an earlier reading of that line in this document came
+from a traced run with that variable set.
+
+### What has been ruled out, so nobody re-runs it
+
+- the empty `ArrayList` to `nativePostClientSettingsLoadedInitialization3`
+  (§15 — mocktail passes an empty one too)
+- `channelPlatformName` (§15 — corrected to the dex's value, no effect)
+- the device identity (§14 — three controls)
+- every flag routing `RbxStorage`'s construction (§12)
+- the settings document, in four variants (§7, §11)
+- a missing call in mocktail's pre-settings path (this section)
+- Cordial's early settings call (this section — it does not run)
+
+**The honest state: the difference is still unidentified.** It is not any of the
+things that were visible from the outside, and reading mocktail's source has
+removed candidates rather than supplied the answer. That is progress of the
+cheaper kind, and it is worth having written down before somebody spends another
+day re-testing the same seven things.

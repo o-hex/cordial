@@ -1278,9 +1278,43 @@ fn main() -> ExitCode {
                                                 // real document. Verified again
                                                 // here: that URL with `AndroidApp`
                                                 // serves 302080 bytes.
+                                                // ...and the reasoning above,
+                                                // which is preserved because it
+                                                // is still true, belongs to a
+                                                // different question. That URL
+                                                // is where the *settings
+                                                // document* is fetched from and
+                                                // `AndroidApp` is the right
+                                                // application name for it. This
+                                                // call is not that. It tells the
+                                                // engine which channel platform
+                                                // the *application* is, and the
+                                                // two got conflated.
+                                                //
+                                                // `GoogleAndroidApp` is what the
+                                                // real app passes, read out of
+                                                // the dex rather than guessed:
+                                                // the literal appears twice
+                                                // there and zero times in
+                                                // `libroblox.so`, while
+                                                // `AndroidApp` appears three
+                                                // times in the engine and zero
+                                                // in the dex. Two strings, two
+                                                // jobs, and this one had the
+                                                // other's value.
+                                                //
+                                                // mocktail passes
+                                                // `GoogleAndroidApp` here and
+                                                // reaches `RbxStorage::init`;
+                                                // Cordial passed `AndroidApp`
+                                                // and does not. Whether that is
+                                                // why is **not** established --
+                                                // see the run recorded in the
+                                                // commit, which changed nothing
+                                                // measurable.
                                                 "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeOverrideChannelPlatformName",
                                                 SETTINGS,
-                                                vec!["AndroidApp"],
+                                                vec!["GoogleAndroidApp"],
                                             ),
                                             (
                                                 "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetRobloxChannel",

@@ -1447,3 +1447,65 @@ cost whether or not it ever caused a disconnect.
 
 Run it again on a different day, and if the 304 returns, the engine update was a
 reprieve rather than a fix. `tools/join-run.sh` exists so that is one command.
+
+## §15. Two answers read out of mocktail's source, one of which kills a theory
+
+### The empty `ArrayList` was never the problem
+
+`flag-init.md` §7.4 has recorded since it was written that Cordial passes
+`nativePostClientSettingsLoadedInitialization3` an empty `java.util.ArrayList`
+and that this is unresolved — the implication being that a real list is what the
+engine wants and that the empty one is why nothing follows.
+
+mocktail's `BuildApplicationExitInfoList`, which is what it passes to that same
+native:
+
+    jobject BuildApplicationExitInfoList(JNIEnv* env) {
+      jobject list = NewObject(env, "java/util/ArrayList");
+      if (!list) list = NewObject(env, "java/util/List");
+      return list;
+    }
+
+**An empty `ArrayList`.** The same thing Cordial passes. And mocktail reaches
+`RbxStorage::init [INIT] user: flagLoaded` 6 ms later.
+
+So the argument is not the difference, and §7.4's open question is closed as a
+dead end rather than left to be re-investigated. The list's real element type is
+`ApplicationExitInfo` — Android's historical process exit reasons — and the
+engine evidently does not require any.
+
+### `channelPlatformName` was carrying the wrong string
+
+Cordial passed `AndroidApp` to
+`NativeSettingsInterface.nativeOverrideChannelPlatformName`. mocktail passes
+`GoogleAndroidApp`. Counted rather than argued, with exact whole-string matches:
+
+| literal | in `libroblox.so` | in the dex |
+|---|---|---|
+| `AndroidApp` | 3 | 0 |
+| `GoogleAndroidApp` | 0 | 2 |
+
+Two strings doing two jobs. `AndroidApp` is the application name in the settings
+URL — `v2/settings/application/AndroidApp` serves the real document and the other
+spellings return HTTP 400, which is established by experiment and still true.
+`GoogleAndroidApp` is what the *application* calls its channel platform, lives in
+the dex where the Java side is, and is what that native wants. The two were
+conflated and this call had the other's value.
+
+Corrected. **It changes nothing measurable**, which is recorded here so nobody
+tries it again expecting more:
+
+    RESULT gplat alive=still connected reason=none
+      RbxStorage::init=0 ClientRunInfo=0 onFlagsFailed=2 webview-open=0
+
+Identical to the four runs in §14. A correctness fix with a null result is still
+worth having — the value is now the one the dex declares rather than one that
+appears nowhere as a channel platform name — but it is not the storage fix.
+
+### Where that leaves the storage question
+
+Both of the concrete differences visible in mocktail's startup path have now been
+tried, and neither moves `onFlagsFailed`. The verdict is still reached inside
+`initializeNativeCode`, before the settings calls, exactly as §12 measured. What
+mocktail does differently to reach `flagLoaded` is still not identified, and it
+is not either of these.

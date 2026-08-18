@@ -409,3 +409,70 @@ Urls are printed with their query string elided. They can carry a single-use
 authentication ticket, and the cookie path beside them carries `.ROBLOSECURITY`
 (§4). A truncation rather than an elision would still print the front of a
 token, which is why the helper cuts at the `?` rather than at a length.
+
+## The transport, found in mocktail's bridge rather than by tracing
+
+`crates/cordial-runtime/src/webview.rs` said the receiving half could not be
+written because `WebViewProtocol`'s non-native methods are obfuscated to single
+letters and take `org.json.JSONObject`, so the message transport was unknown.
+It is not unknown. mocktail's `roblox_web_view_bridge.cc` names it outright, and
+Cordial already speaks it for something else.
+
+**`com/roblox/universalapp/messagebus/MessageBus`.** The engine exports
+twenty-one natives for it, and `native/deeplink.cpp` has been using two of them —
+`publishRaw` and `getLastRaw` — since deep links were wired up. The web window
+is the same bus with a different protocol name.
+
+Signatures, from the dex:
+
+    getMessageId    (Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+    doSubscribeRaw  (Ljava/lang/String;L...messagebus/RawCallback;Z)
+                        L...messagebus/Connection;
+    publishRaw      (Ljava/lang/String;Ljava/lang/String;)V
+    getLastRaw      (Ljava/lang/String;)Ljava/lang/String;
+    doSubscribeProtocolMethodRequestRaw
+                    (Ljava/lang/String;Ljava/lang/String;L...RawCallback;Z)
+                        L...Connection;
+
+So receiving `openWindow` is three steps, none of them mysterious:
+
+1. `getMessageId("WebView", "openWindow")` — the protocol name and the method id
+   both come from `WebViewProtocol`'s own getters, which Cordial already reads
+   and prints at startup. Composing them gives the bus id.
+2. `doSubscribeRaw(id, callback, false)` — returns a `Connection`.
+3. The callback receives the message as raw JSON.
+
+### What Cordial still owes
+
+Two classes the engine constructs or calls into, the `NativeFlagsInitResult`
+pattern again:
+
+    com/roblox/universalapp/messagebus/Connection   <init> (J)V
+                                                    isConnected (J)Z
+                                                    deleteSharedPtr (J)V
+                                                    finalize ()V
+    com/roblox/universalapp/messagebus/RawCallback  method name unknown
+
+`Connection` is fully specified — a native handle as a `jlong` and three methods.
+
+**`RawCallback` is not, and this is where reading stops being enough.** The name
+appears in `doSubscribeRaw`'s descriptor, but no class of that name is declared
+in the dex; what is there is
+`RawSubscriptionContract.<init>(Ljava/lang/String;Lgn/h;Ljava/lang/String;Z)V`,
+and `gn/h` is the obfuscated interface. So the dex will not say what method the
+engine calls on the callback.
+
+That is fine, and it is the shape this project handles best: **register the class
+and run it.** libjnivm resolves by what the engine asks for at runtime, and
+`CORDIAL_JNI_TRACE=1` prints every lookup, including the ones it cannot satisfy.
+One startup with a `RawCallback` class present and empty will name the method in
+the trace. Guessing it from the C++ would be the mistake AGENTS.md opens with.
+
+### Why this matters more than a feature
+
+`docs/analysis/flag-init.md` §13.1: the `RBXEventTrackerV2` device cookie is set
+through `WebViewCookieHandler` during sign-in, not by an API call — the standalone
+endpoint answers 500. mocktail has the web view, signs in through it, gets the
+cookie, and plays for four minutes on the place Cordial is disconnected from at
+sixty seconds. That chain is unproven and it is the most coherent one this
+investigation has.

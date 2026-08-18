@@ -25,6 +25,7 @@ mod profile_switcher;
 mod settings;
 mod shell_config;
 mod updater;
+mod webview_policy;
 mod window;
 
 /// Guards `CORDIAL_PROFILE_ROOT` across every test in this binary that points

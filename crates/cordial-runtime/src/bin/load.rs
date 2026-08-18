@@ -2250,6 +2250,25 @@ fn main() -> ExitCode {
                                                 if n > 0 {
                                                     println!("  {n} plugin(s) running");
                                                 }
+
+                                                // Subscribe to the engine's
+                                                // openWindow before the pump
+                                                // starts, the same point
+                                                // `android::clipboard::arm`
+                                                // is called from inside that
+                                                // pump: the message bus has
+                                                // to exist first, and by now
+                                                // the app bridge has started.
+                                                // This module cannot reach
+                                                // `looper::pump` to add
+                                                // itself there (off limits
+                                                // for this change), so it is
+                                                // called from here instead,
+                                                // one call earlier than
+                                                // clipboard's but after the
+                                                // same precondition holds.
+                                                cordial_runtime::webview::arm(|name| lib.symbol(name));
+
                                                 cordial_runtime::android::looper::pump(
                                                     std::time::Duration::from_secs(secs),
                                                     Some(handle),

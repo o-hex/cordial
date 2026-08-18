@@ -45,22 +45,31 @@
 //! name overwrites the first and silently breaks the clipboard subscription
 //! that got there first.
 //!
-//! **What this module still cannot do: call `getMessageId`.** Its descriptor is
-//! `(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;` — two `String`s in,
-//! one back out — and no call shape `cordial-linker-sys` exports fits that.
-//! `call_static_string_ret_string` takes one `String` in and returns one;
-//! `call_static_strings` takes up to three `String`s in but returns nothing,
-//! because every native it was written for (`nativeSetFilesDirectory` and
-//! friends) is `void`. Composing the bus id needs a wrapper that does not
-//! exist, and this change is not permitted to add one to `cordial-linker-sys`
-//! or to the C++ side that would back it. Writing a raw JNI call by hand here
-//! instead would be exactly the machinery-rebuilding AGENTS.md warns is this
-//! project's most expensive mistake, done in a new place rather than not done.
-//! So [`find_bus_natives`] resolves and reports the two natives `openWindow`
-//! needs without calling either — a diagnostic, same as [`read_vocabulary`]
-//! below, and the blocker the next piece of work has to clear.
+//! **The two blockers that used to stop here are both cleared.** The first was
+//! that no call shape `cordial-linker-sys` exported fit `getMessageId`'s
+//! descriptor, `(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;` — two
+//! `String`s in, one back out. `cordial_linker_sys::game_activity::
+//! call_static_two_strings_ret_string` now exists for exactly that shape. The
+//! second was that `native/clipboard.cpp`'s subscribe machinery held one
+//! callback and one `Connection` in module-level globals, so a second
+//! subscriber would not add a subscription, it would silently overwrite
+//! clipboard's. That file's `cordial_messagebus_subscribe` is now keyed by
+//! message id, in a map, so [`arm`] below and clipboard's own `arm` in
+//! `crate::android::clipboard` each get a `Subscription` of their own. Neither
+//! of those changes is this module's to make — this module is the first
+//! caller of both, not the place either was fixed.
+//!
+//! [`find_bus_natives`] and [`report_bus_natives`] stay as an early
+//! diagnostic: they run from `load.rs` before `nativeRetryInit`, while there is
+//! not yet an app bridge for anything to subscribe against. [`arm`] does the
+//! real work — `getMessageId`, then `doSubscribeRaw`, then a first read of
+//! `Connection.isConnected` — and is called later, once the AGDK handle
+//! exists, the same distinction clipboard's own `arm` draws against
+//! `looper::pump`.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::OnceLock;
 
 /// The class the whole protocol hangs off.
 pub const CLASS: &str = "com/roblox/protocols/webview/WebViewProtocol";
@@ -167,9 +176,11 @@ pub fn find_bus_natives(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) -> 
     }
 }
 
-/// Print what [`find_bus_natives`] found, and say plainly why that is where
-/// this stops rather than leaving the silence AGENTS.md warns is worse than an
-/// honest "not yet".
+/// Print what [`find_bus_natives`] found. This runs before `nativeRetryInit`,
+/// while the app bridge that `doSubscribeRaw` needs to call into does not
+/// exist yet — so finding both natives here is a fact worth logging, not
+/// grounds to subscribe from this spot. [`arm`] is the call that actually
+/// subscribes, made later once there is a bridge to subscribe against.
 pub fn report_bus_natives(n: &BusNatives) {
     println!(
         "  webview: MessageBus.getMessageId exported: {}",
@@ -180,12 +191,202 @@ pub fn report_bus_natives(n: &BusNatives) {
         n.do_subscribe_raw
     );
     if n.get_message_id && n.do_subscribe_raw {
-        println!(
-            "  webview: both natives are present, but composing the openWindow bus id needs a \
-             two-String-argument, String-returning call, and cordial-linker-sys has no such \
-             wrapper (see module doc) — not subscribing rather than guessing the id"
-        );
+        println!("  webview: both natives are present; openWindow is subscribed later, from arm()");
     }
+}
+
+// -------------------------------------------------------------- subscribing
+//
+// `native/clipboard.cpp` carries the C++ half of this: `RawCallback` and
+// `Connection` are classes it registers once for the whole process (never
+// again here — see that file's header for the second-registration bug that
+// already happened once), and `cordial_messagebus_subscribe` keeps one
+// `Subscription` per message id in a map, so this subscription and
+// clipboard's own live independently. Declared again here, rather than made
+// `pub` in `crate::android::clipboard` and imported, because that file is off
+// limits to edit for this change and an `extern "C"` block naming symbols the
+// linker already provides is not a second definition of anything — both
+// modules are just callers of the same three C++ functions.
+unsafe extern "C" {
+    fn cordial_messagebus_subscribe(
+        f: *mut c_void,
+        message_id: *const c_char,
+        sink: Option<extern "C" fn(*const c_char)>,
+        err: *mut c_char,
+        n: usize,
+    ) -> c_int;
+    fn cordial_messagebus_connection_ptr(message_id: *const c_char) -> i64;
+    fn cordial_messagebus_is_connected(
+        f: *mut c_void,
+        ptr: i64,
+        out_connected: *mut c_int,
+        err: *mut c_char,
+        n: usize,
+    ) -> c_int;
+}
+
+fn take_err(err: Vec<u8>) -> String {
+    let end = err.iter().position(|&b| b == 0).unwrap_or(err.len());
+    String::from_utf8_lossy(&err[..end]).into_owned()
+}
+
+static CONNECTION: AtomicI64 = AtomicI64::new(0);
+static IS_CONNECTED_NATIVE: OnceLock<usize> = OnceLock::new();
+
+/// The sink `cordial_messagebus_subscribe` calls when the engine publishes
+/// `openWindow`.
+///
+/// Runs on whichever thread the engine published from, same as clipboard's
+/// `on_payload`. Unlike clipboard, there is nothing here that needs the GTK
+/// thread — this prints and returns, it does not touch a window or a
+/// clipboard — so there is no pending slot to park into and no pump to drain
+/// it.
+///
+/// **The JSON is measured, never read.** Scope for this change is receiving
+/// the message, not acting on it — opening a window is `cordial-shell`'s, out
+/// of reach here — and the payload may carry a URL with a session token in
+/// it, so only its size is fit to print. `text_from_payload` in
+/// `android::clipboard` is the pattern for a module that does need the
+/// content: it exists, and this module deliberately does not call anything
+/// like it yet.
+extern "C" fn on_open_window(json: *const c_char) {
+    if json.is_null() {
+        println!("[webview] openWindow published with a null payload");
+        return;
+    }
+    // SAFETY: the C side passes a NUL-terminated string that outlives the
+    // call. Measured as raw bytes rather than decoded to `str`: a byte count
+    // is all this prints, so there is no reason to reject a payload over a
+    // UTF-8 question this module has no use for the answer to.
+    let json = unsafe { CStr::from_ptr(json) };
+    println!("[webview] openWindow message arrived: {} bytes", json.to_bytes().len());
+}
+
+/// Subscribe to the engine's `openWindow` message.
+///
+/// Three calls, each depending on the last having worked: `getMessageId`
+/// composes the bus id the way the engine itself would look it up rather than
+/// guessing at a constant that changes between builds (see the module doc on
+/// [`read_vocabulary`]); `doSubscribeRaw` installs [`on_open_window`] through
+/// the callback class `native/clipboard.cpp`'s `register_clipboard_classes`
+/// already registered; `Connection.isConnected` is the only honest way to say
+/// the subscription is live rather than merely attempted without throwing.
+///
+/// `symbol` is the same JNI-native lookup `load.rs` already threads through
+/// [`read_vocabulary`] and [`find_bus_natives`]. Call this once the AGDK
+/// handle exists and the app bridge has started — the same point
+/// `android::clipboard::arm` is called from, for the same reason: the bus has
+/// to exist before anything can subscribe to it, and this module cannot reach
+/// `looper::pump` to add itself there, so `load.rs` calls this directly,
+/// right before it hands control to that pump.
+pub fn arm(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) {
+    let vocabulary = read_vocabulary(&mut symbol);
+    let get = |label: &str| {
+        vocabulary
+            .entries
+            .iter()
+            .find(|(l, _)| *l == label)
+            .map(|(_, v)| v.clone())
+    };
+    let (Some(protocol), Some(open_window_id)) = (get("protocol"), get("open-window")) else {
+        println!(
+            "  webview: cannot subscribe to openWindow without getProtocolName and \
+             getOpenWindowId (see the vocabulary reported above)"
+        );
+        return;
+    };
+
+    let Some(get_message_id) =
+        symbol("Java_com_roblox_universalapp_messagebus_MessageBus_getMessageId")
+    else {
+        println!("  webview: MessageBus.getMessageId is not exported; not subscribing");
+        return;
+    };
+    let bus_id = match cordial_linker_sys::game_activity::call_static_two_strings_ret_string(
+        get_message_id,
+        "com/roblox/universalapp/messagebus/MessageBus",
+        &protocol,
+        &open_window_id,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            println!("  webview: getMessageId({protocol:?}, {open_window_id:?}) failed: {e}");
+            return;
+        }
+    };
+
+    let Some(do_subscribe_raw) =
+        symbol("Java_com_roblox_universalapp_messagebus_MessageBus_doSubscribeRaw")
+    else {
+        println!(
+            "  webview: MessageBus.doSubscribeRaw is not exported; openWindow will do nothing"
+        );
+        return;
+    };
+    let Ok(id) = CString::new(bus_id.clone()) else {
+        println!("  webview: the bus id getMessageId returned has a NUL in it: {bus_id:?}");
+        return;
+    };
+    let mut err = vec![0u8; 512];
+    // SAFETY: `do_subscribe_raw` resolved under its own name, so it is the
+    // native `cordial_messagebus_subscribe` expects; every buffer outlives
+    // the call.
+    let rc = unsafe {
+        cordial_messagebus_subscribe(
+            do_subscribe_raw,
+            id.as_ptr(),
+            Some(on_open_window),
+            err.as_mut_ptr() as *mut c_char,
+            err.len(),
+        )
+    };
+    if rc != 0 {
+        println!("  webview: doSubscribeRaw failed: {}", take_err(err));
+        return;
+    }
+    // SAFETY: reads a value the subscribe call above stored, keyed by the
+    // same message id.
+    let ptr = unsafe { cordial_messagebus_connection_ptr(id.as_ptr()) };
+    CONNECTION.store(ptr, Ordering::Relaxed);
+    if let Some(f) = symbol("Java_com_roblox_universalapp_messagebus_Connection_isConnected") {
+        let _ = IS_CONNECTED_NATIVE.set(f as usize);
+    }
+    match connected() {
+        Some(true) => println!(
+            "  webview: subscribed to {bus_id} ({protocol}.{open_window_id}); the bus says it \
+             is live"
+        ),
+        Some(false) => println!(
+            "  webview: subscribed to {bus_id}, but the bus says the connection is not live"
+        ),
+        None => println!(
+            "  webview: subscribed to {bus_id}; nothing here can confirm it (no Connection came \
+             back)"
+        ),
+    }
+}
+
+/// What `Connection.isConnected` says about the subscription, or `None` when
+/// there is nothing to ask about. Mirrors `android::clipboard::connected`.
+pub fn connected() -> Option<bool> {
+    let ptr = CONNECTION.load(Ordering::Relaxed);
+    let f = *IS_CONNECTED_NATIVE.get()? as *mut c_void;
+    if ptr == 0 {
+        return None;
+    }
+    let mut out: c_int = -1;
+    let mut err = vec![0u8; 256];
+    // SAFETY: the native resolved under its own name; the buffers outlive the call.
+    let rc = unsafe {
+        cordial_messagebus_is_connected(
+            f,
+            ptr,
+            &mut out as *mut c_int,
+            err.as_mut_ptr() as *mut c_char,
+            err.len(),
+        )
+    };
+    (rc == 0).then_some(out != 0)
 }
 
 #[cfg(test)]
@@ -251,5 +452,24 @@ mod tests {
         let n = find_bus_natives(|_| None);
         assert!(!n.get_message_id);
         assert!(!n.do_subscribe_raw);
+    }
+
+    /// `arm` must bail out before touching any of the `extern "C"` functions
+    /// when the vocabulary getters are not exported — a build with none of
+    /// this protocol must not crash trying to subscribe to it. Nothing here
+    /// should ever reach `cordial_messagebus_subscribe`, so the only failure
+    /// mode this rules out is a panic or a call into unresolved FFI.
+    ///
+    /// This is as far as `arm` can be exercised without a running engine:
+    /// every path past this point calls into `cordial-linker-sys` with a
+    /// function pointer the callee dereferences, and a test has no real JNI
+    /// environment to hand it one that would not crash. The rest of `arm` —
+    /// `getMessageId` composing a bus id, `doSubscribeRaw` installing the
+    /// callback, `Connection.isConnected` reporting live — is established by
+    /// running the client and reading what it printed, not by a unit test.
+    #[test]
+    fn arm_does_nothing_when_the_vocabulary_is_not_exported() {
+        arm(|_| None);
+        assert!(connected().is_none(), "a bare arm() with nothing exported must not connect");
     }
 }

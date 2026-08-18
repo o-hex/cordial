@@ -299,6 +299,117 @@ pub fn collect() -> Vec<Layer> {
     layers
 }
 
+/// Which device Cordial claims to be when the engine asks — the Android
+/// tablet identity it has always sent, or the PC one an experiment wants to
+/// try.
+///
+/// **Why this lives here rather than being a plain `getenv` in the C++ that
+/// uses it.** `docs/analysis/flag-init.md` §13 records that mocktail — a
+/// comparable third-party client — stays connected to the same place Cordial
+/// is disconnected from after 60.6s with reason 304, and that mocktail
+/// presents `device profile=pc-windows-11 class=pc model="Windows 11 PC"`
+/// where Cordial presents an Android tablet (`native/init_params.cpp`,
+/// commit 6d8c280). Whether that causes the 304 is **not established** — it
+/// is a difference between a client that works and one that does not, and
+/// this makes it a switch rather than a rewrite, so the experiment can be run
+/// with a control in the same session.
+///
+/// The key follows the convention `client_settings.rs`'s `CORDIAL_KEY_PREFIX`
+/// set up: a `Cordial`-prefixed name rides this module's layering for its
+/// precedence and provenance, and `client_settings.rs::is_roblox_flag`
+/// filters it back out before anything reaches Roblox's settings document —
+/// the engine has no idea this key exists, same as `CordialGraphicsBackend`.
+///
+/// **The gap this does not close.** Nothing yet turns a resolved
+/// `CordialDeviceProfile` into something `native/init_params.cpp` can see.
+/// The C++ side is a separately-compiled translation unit with no live call
+/// into this module; the one existing bridge for a comparable case —
+/// `CORDIAL_ENGINE_VERSION`, set with `std::env::set_var` right before the
+/// init-params call — lives in `crates/cordial-runtime/src/bin/load.rs`,
+/// which this change does not touch. So today `device_profile` is reachable
+/// from a `flags.json` entry and from tests, but the only thing that actually
+/// reaches the engine is the environment variable [`DEVICE_PROFILE_ENV`]
+/// itself, read directly by `native/init_params.cpp`'s `presenting_as_pc`.
+/// Wiring `flags.json` through to it is exactly the `load.rs` change
+/// described above, left for whoever owns that file next.
+pub const DEVICE_PROFILE_KEY: &str = "CordialDeviceProfile";
+
+/// The environment variable that actually reaches the engine today, read
+/// directly by `native/init_params.cpp`. Named to match [`DEVICE_PROFILE_KEY`]
+/// so the two are recognisably the same switch, not two different ones.
+pub const DEVICE_PROFILE_ENV: &str = "CORDIAL_DEVICE_PROFILE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceProfile {
+    /// The identity Cordial has always sent. Must stay the default: an
+    /// experiment that changes behaviour by default is not a control.
+    AndroidTablet,
+    /// mocktail's identity, spelled `pc-windows-11` to match its own log line
+    /// verbatim rather than a name invented here.
+    PcWindows11,
+}
+
+impl DeviceProfile {
+    pub fn parse(text: &str) -> Option<DeviceProfile> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "" | "android" | "android-tablet" | "tablet" => Some(DeviceProfile::AndroidTablet),
+            "pc" | "pc-windows-11" | "windows" | "windows-11" => Some(DeviceProfile::PcWindows11),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DeviceProfile::AndroidTablet => "android-tablet",
+            DeviceProfile::PcWindows11 => "pc-windows-11",
+        }
+    }
+}
+
+impl Default for DeviceProfile {
+    fn default() -> Self {
+        DeviceProfile::AndroidTablet
+    }
+}
+
+/// What the flag layers say about [`DEVICE_PROFILE_KEY`], if anything.
+///
+/// Split from [`device_profile`] so a test can supply a resolved map directly
+/// rather than writing through the filesystem, matching how this file's other
+/// tests exercise `resolve` on synthetic layers.
+fn device_profile_from_resolved(resolved: &BTreeMap<String, Resolved>) -> Option<DeviceProfile> {
+    resolved.get(DEVICE_PROFILE_KEY).and_then(|r| DeviceProfile::parse(&r.value))
+}
+
+/// Resolve which device identity is in force.
+///
+/// The environment variable wins, because it is the one thing that reliably
+/// reaches `native/init_params.cpp` today (see [`DEVICE_PROFILE_KEY`]'s
+/// doc for why the flag-layer path does not, yet) — checking it first rather
+/// than only in C++ means a caller in this crate gets the same answer the
+/// engine will. An unparseable value is reported and treated as the default
+/// rather than silently ignored, matching `graphics::resolve`'s reasoning: a
+/// switch that looks set but does nothing is the failure this exists to
+/// avoid.
+pub fn device_profile() -> DeviceProfile {
+    if let Ok(text) = std::env::var(DEVICE_PROFILE_ENV) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            match DeviceProfile::parse(trimmed) {
+                Some(p) => return p,
+                None => {
+                    println!(
+                        "  flags: {DEVICE_PROFILE_ENV}={text:?} is not a device profile; \
+                         using android-tablet. Known: android-tablet, pc-windows-11"
+                    );
+                    return DeviceProfile::AndroidTablet;
+                }
+            }
+        }
+    }
+    device_profile_from_resolved(&resolve(collect())).unwrap_or_default()
+}
+
 /// Report what was resolved, naming every conflict.
 ///
 /// Printed rather than silent because a flag doing nothing — because something
@@ -374,6 +485,73 @@ mod tests {
         let r = resolve(vec![layer(Source::User, &[("FFlagY", "true")])]);
         assert!(r["FFlagY"].overridden.is_empty());
         assert_eq!(r["FFlagY"].source, Source::User);
+    }
+
+    #[test]
+    fn the_device_profile_key_carries_the_cordial_prefix_client_settings_filters_on() {
+        // client_settings.rs's `is_roblox_flag` keeps this out of Roblox's
+        // settings document by checking exactly this prefix. If this constant
+        // ever drifted from "Cordial", the key would silently start reaching
+        // the engine's own FastFlag document instead of staying Cordial's.
+        assert!(DEVICE_PROFILE_KEY.starts_with("Cordial"));
+    }
+
+    #[test]
+    fn device_profile_parses_both_spellings_and_nothing_else() {
+        assert_eq!(DeviceProfile::parse(""), Some(DeviceProfile::AndroidTablet));
+        assert_eq!(DeviceProfile::parse("android-tablet"), Some(DeviceProfile::AndroidTablet));
+        assert_eq!(DeviceProfile::parse("PC-Windows-11"), Some(DeviceProfile::PcWindows11));
+        assert_eq!(DeviceProfile::parse("windows"), Some(DeviceProfile::PcWindows11));
+        assert_eq!(DeviceProfile::parse("ps5"), None);
+    }
+
+    #[test]
+    fn an_absent_device_profile_flag_defaults_to_the_tablet_identity() {
+        // The default has to be current behaviour: an experiment that changes
+        // what ships by default is not a control for anything.
+        let resolved = resolve(vec![layer(Source::User, &[("FFlagUnrelated", "true")])]);
+        assert_eq!(device_profile_from_resolved(&resolved), None);
+    }
+
+    #[test]
+    fn the_pc_identity_is_reachable_through_the_flag_layer_by_its_cordial_key() {
+        let resolved =
+            resolve(vec![layer(Source::User, &[(DEVICE_PROFILE_KEY, "pc-windows-11")])]);
+        assert_eq!(device_profile_from_resolved(&resolved), Some(DeviceProfile::PcWindows11));
+    }
+
+    #[test]
+    fn the_users_flag_file_beats_a_plugin_asking_for_the_other_identity() {
+        // Same precedence rule as everything else in this module: the user's
+        // own choice is the one thing a plugin must not override.
+        let resolved = resolve(vec![
+            layer(Source::Plugin("fps".into()), &[(DEVICE_PROFILE_KEY, "pc-windows-11")]),
+            layer(Source::User, &[(DEVICE_PROFILE_KEY, "android-tablet")]),
+        ]);
+        assert_eq!(device_profile_from_resolved(&resolved), Some(DeviceProfile::AndroidTablet));
+    }
+
+    #[test]
+    fn the_environment_variable_is_the_one_that_actually_reaches_the_engine_today() {
+        // Mutex'd for the same reason `scratch` is: env vars are process-wide
+        // and cargo runs tests in parallel threads of the one process. Only
+        // the set-variable cases are exercised here — with it unset,
+        // `device_profile` falls through to `collect()`, which reads real
+        // profile directories; that fallthrough is already covered without
+        // touching the filesystem by `device_profile_from_resolved` above, so
+        // this test never needs to depend on what happens to be on disk.
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+
+        std::env::set_var(DEVICE_PROFILE_ENV, "pc-windows-11");
+        assert_eq!(device_profile(), DeviceProfile::PcWindows11);
+
+        // An unparseable value falls back to the default rather than being
+        // silently treated as either identity, so a typo cannot be mistaken
+        // for a deliberate choice of either side of the experiment.
+        std::env::set_var(DEVICE_PROFILE_ENV, "amiga-500");
+        assert_eq!(device_profile(), DeviceProfile::AndroidTablet);
+
+        std::env::remove_var(DEVICE_PROFILE_ENV);
     }
 
     /// `XDG_CONFIG_HOME` and `CORDIAL_FLAGS` are process-wide, and cargo runs

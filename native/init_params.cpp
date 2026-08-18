@@ -109,6 +109,40 @@ std::shared_ptr<Object> make_display_metrics(ENV* env);
 /// return one without duplicating the class.
 std::shared_ptr<Object> cordial_make_zero_insets(ENV* env);
 
+/// Whether Cordial should present itself to the engine as a Windows 11 PC
+/// rather than the Android tablet identity 6d8c280 built.
+///
+/// `docs/analysis/flag-init.md` §13: mocktail, a comparable third-party
+/// client, stays connected to a place Cordial is disconnected from at 60.6s
+/// with reason 304, and mocktail's own startup log reports `device
+/// profile=pc-windows-11 class=pc model="Windows 11 PC"` where Cordial
+/// reports an Android tablet. **Whether that causes the 304 is not
+/// established.** It is a difference between a client that works and one
+/// that does not, so this makes it a switch rather than a rewrite: the
+/// default stays the tablet identity, and this experiment is opt-in.
+///
+/// `CORDIAL_DEVICE_PROFILE=pc-windows-11` turns it on; anything else,
+/// including unset, keeps current behaviour. The name and accepted spelling
+/// match `crates/cordial-runtime/src/flags.rs`'s `DeviceProfile` — that file
+/// resolves the same choice from a `Cordial`-prefixed flag-layer entry, for a
+/// user who wants to opt in from `flags.json` rather than the environment.
+/// **They are not wired together.** This translation unit has no live call
+/// into Rust for this value; the one existing bridge for a comparable case —
+/// `CORDIAL_ENGINE_VERSION`, exported with `std::env::set_var` just before
+/// the init-params call — lives in `crates/cordial-runtime/src/bin/load.rs`,
+/// which is out of scope for this change. So the environment variable read
+/// here is, for now, the only thing that actually reaches the engine; see
+/// `flags.rs`'s module doc on `DEVICE_PROFILE_KEY` for the rest of this gap.
+static bool presenting_as_pc() {
+    static const bool v = [] {
+        const char* e = getenv("CORDIAL_DEVICE_PROFILE");
+        if (!e) return false;
+        std::string s(e);
+        return s == "pc-windows-11" || s == "pc" || s == "windows" || s == "windows-11";
+    }();
+    return v;
+}
+
 /// The `User-Agent` the engine puts on every HTTP request it makes.
 ///
 /// **This was `"Roblox/Android"`, and the comment above it was wrong in the most
@@ -140,6 +174,21 @@ std::shared_ptr<Object> cordial_make_zero_insets(ENV* env);
 /// disconnect because the previous value could not have come from any real
 /// client, not because a server-side check has been observed. If it turns out
 /// to be inert, the string is still right and the old one was still invented.
+///
+/// **`presenting_as_pc()`, opt-in, swaps the platform words for mocktail's.**
+/// Nobody here has captured what Roblox's actual Windows client sends — only
+/// mocktail's own `class=pc model="Windows 11 PC"` line
+/// (`docs/analysis/flag-init.md` §13) — so this does not invent a Windows
+/// build number, an NT version, or any other syntax nothing here has seen. It
+/// swaps exactly the two words that would otherwise contradict `isTablet`
+/// below (`Android` and `Tablet`, for `Windows` and `Desktop`), drops the
+/// trailing Android API-level slot rather than filling it with a guess, and
+/// replaces the two `GooglePlayStore` tokens with `Cordial` — honest about
+/// who actually built and is distributing this client, on a desktop that
+/// installs from neither Google Play nor a Windows store this project has
+/// evidence for. Everything else — memory, resolution, density, engine
+/// version — is unchanged, because none of it is Android- or Windows-specific
+/// in the first place.
 static std::string build_user_agent() {
     long ram_mb = 0;
     if (FILE* f = fopen("/proc/meminfo", "re")) {
@@ -176,11 +225,19 @@ static std::string build_user_agent() {
     }
 
     char buf[512];
-    snprintf(buf, sizeof buf,
-             "Mozilla/5.0 (%ldMB; %dx%d; 160x160; %dx%d; Cordial; 33) "
-             "AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App %s Tablet Hybrid()  "
-             "GooglePlayStore RobloxApp/%s (GlobalDist; GooglePlayStore)",
-             ram_mb, g_width, g_height, g_width, g_height, app.c_str(), app.c_str());
+    if (presenting_as_pc()) {
+        snprintf(buf, sizeof buf,
+                 "Mozilla/5.0 (%ldMB; %dx%d; 160x160; %dx%d; Cordial) "
+                 "AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Windows App %s Desktop Hybrid()  "
+                 "Cordial RobloxApp/%s (GlobalDist; Cordial)",
+                 ram_mb, g_width, g_height, g_width, g_height, app.c_str(), app.c_str());
+    } else {
+        snprintf(buf, sizeof buf,
+                 "Mozilla/5.0 (%ldMB; %dx%d; 160x160; %dx%d; Cordial; 33) "
+                 "AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App %s Tablet Hybrid()  "
+                 "GooglePlayStore RobloxApp/%s (GlobalDist; GooglePlayStore)",
+                 ram_mb, g_width, g_height, g_width, g_height, app.c_str(), app.c_str());
+    }
     return std::string(buf);
 }
 
@@ -1024,6 +1081,16 @@ public:
         // `ro.build.version.sdk` and implementing
         // `android_get_device_api_level()` both left the log saying 15, and only
         // this field moved it.
+        //
+        // Left at "33" even when `presenting_as_pc()` -- unlike the
+        // User-Agent and `InitParams.isTablet`, this field is a gate the
+        // engine has been measured refusing Vulkan over, not just a
+        // description, and there is no captured value for what a PC-presenting
+        // client should send here. Changing a load-bearing compatibility
+        // check on a guess is a worse experiment than leaving one field
+        // pointing at Android while the presentational ones point at PC; this
+        // whole switch does not claim to have closed every seam, only the two
+        // that visibly contradicted each other.
         p->osVersion = S("33");
         p->testDeviceName = S("");
         // Reported as "not on a metered mobile connection". The engine uses this
@@ -1203,14 +1270,29 @@ public:
         p->buildVariant = S("release");
         // See `build_user_agent`. The literal that used to be here was
         // invented, and the comment beside it claimed the opposite.
-        p->userAgent = S(build_user_agent().c_str());
+        //
+        // Printed unconditionally, same reasoning `graphics.rs`'s `report()`
+        // gives for doing the same thing there: this is the one line that
+        // makes the switch's own doc comment's claim checkable against a run
+        // rather than only against the source, and the User-Agent itself
+        // never appears in Cordial's own logs or the engine's FLog output --
+        // it goes out on the wire, not into anything grep can reach here.
+        std::string ua = build_user_agent();
+        fprintf(stderr, "[cordial] device identity: %s (User-Agent: %s)\n",
+                presenting_as_pc() ? "pc-windows-11, from CORDIAL_DEVICE_PROFILE" : "android-tablet, the default",
+                ua.c_str());
+        p->userAgent = S(ua.c_str());
         p->deviceParams = DeviceParams::Create(env, width, height);
         p->platformParams = PlatformParams::Create(env, assets, width, height);
         // "Potato" is Roblox's own name for a device below the quality floor.
         p->isPotato = false;
         // Tablet rather than phone: a desktop window is a large screen, and this
-        // agrees with the XLARGE reported through AConfiguration.
-        p->isTablet = true;
+        // agrees with the XLARGE reported through AConfiguration. False when
+        // `presenting_as_pc()`, because a User-Agent that says `Windows` and
+        // `Desktop` while this field still says tablet is a worse story than
+        // either half told alone -- the whole point of gating it on the same
+        // switch rather than leaving it always true.
+        p->isTablet = !presenting_as_pc();
         p->isVrDevice = false;
         p->vrContext = AndroidActivity::Create(env);
         to_jni(env, p);

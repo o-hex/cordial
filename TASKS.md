@@ -592,3 +592,57 @@ never hitting the error and with it hitting the error and nobody having written
 anything down. **It has not been run.** Until it is, "mocktail does not get the
 integrity error" is an assumption, and this document should not be read as
 supporting it.
+
+---
+
+## Input: Cordial answers 7 of the engine's 22 entry points
+
+Counted against `libroblox.so`'s exports, not guessed.
+
+**Cordial calls:** `nativePassKeyEvent`, `nativePassText`, `nativePassMouse`,
+`nativePassMouseButton`, `nativePassMouseMove`, `nativePassMousePan`,
+`nativePassMouseWheel`.
+
+**The engine also exports, and nothing here calls:**
+
+    nativePassInput                   nativePassInputBatch
+    nativePassTapGesture              nativePassSwipeGesture
+    nativePassPinchGesture            nativePassRotateGesture
+    nativePassLongPressGesture        nativePassMousePinch
+    nativePassPanGestureWithVelocity  nativePassPanGestureMultitouch
+    nativePassTouchEndVelocity
+    nativePassAccelerometerChange     nativePassGravityChange
+    nativePassGyroscopeChange
+    nativePassCurrentDisplayRefreshRate  nativePassSupportedRefreshRates
+
+### The two worth doing first are not the gestures
+
+`nativePassCurrentDisplayRefreshRate` and `nativePassSupportedRefreshRates` tell
+the engine what the display can do. AGENTS.md records that with input flowing the
+frame rate is a hard FIFO vsync lock to the output's refresh — 60 Hz gives 60, a
+50 Hz monitor gives 49.4 even in fullscreen at four times the pixels. **Cordial
+has never told the engine what refresh rates exist.** Whether that is why the
+lock is so rigid is untested, but it is the one place a client can say something
+about refresh and Cordial says nothing.
+
+- **Touches:** the input path in `crates/cordial-runtime/src/android/`, plus
+  whatever reads the Wayland output mode.
+- **Scope:** small. Isolated PR. Measure with input flowing, per AGENTS.md, and
+  report the input rate beside the frame rate.
+
+### On IME and text: do not copy mocktail here
+
+The question was how mocktail types. The answer is that **it does not call
+`nativePassText` at all** — the name does not appear in its input surface.
+Instead it carries `roblox_text_editor.cc` (788 lines),
+`roblox_text_input_jni_bridge.cc` (799), `roblox_text_surface_overlay.cc` (598),
+`roblox_text_display_state.cc` (305) and two input routers — **3840 lines**
+reimplementing text editing above the engine.
+
+Cordial hands text to the engine through `nativePassText` and lets the engine own
+the editing. That is the simpler path and it is the engine's own interface. Given
+mocktail's input is reportedly broken, its text stack is the least attractive
+thing in the repository to borrow, not the most.
+
+What is worth taking from that area is the gesture and sensor list above, which
+is a list of calls rather than a design.

@@ -27,3 +27,11 @@ pub mod host_window;
 pub mod network;
 pub mod profile;
 pub mod pvpn;
+// Not pulled in by `host_window` or `network` -- registered here on its own
+// so `cordial-runtime` can reach it as `cordial_shell::refresh_watch`, which
+// `refresh_watch.rs`'s own header names as the one thing left to do before
+// its `watch` can be wired to the engine. Wiring `watch` itself onto the
+// engine's own window is not done by this line alone -- see
+// `crates/cordial-runtime/src/bin/load.rs`'s `wire_refresh_rate` for what
+// that still needs and does not yet have.
+pub mod refresh_watch;

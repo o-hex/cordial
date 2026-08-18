@@ -4,11 +4,18 @@
 //! layout work against the real 116 MB object, and turns
 //! docs/framework-api-inventory.md into a prioritised list of what to implement.
 
+use std::cell::Cell;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::time::Instant;
 
 use cordial_linker_sys as linker;
 use cordial_runtime::{stubs, symtab};
+// `ListModelExt` (`n_items`/`item`) and `Cast` (`downcast`), for
+// `refresh_outputs` walking `gdk::Display::monitors()`. The same `gtk4` this
+// crate already depends on for `instr_close_window` -- see that dependency's
+// own comment in Cargo.toml for why a second gtk4-rs version is not an option.
+use gtk4::prelude::*;
 
 struct Options {
     lib_dir: String,
@@ -445,6 +452,165 @@ fn requested_resolution() -> (u32, u32) {
     }
     println!("  CORDIAL_RESOLUTION={v:?} is not <w>x<h> within reason; using 1280x720");
     (1280, 720)
+}
+
+/// Every monitor GDK currently knows about, as `cordial_runtime::refresh::Output`.
+///
+/// This is `cordial_shell::refresh_watch::outputs` in spirit but not in fact:
+/// that function marks an output `current` by asking `gdk::Display::
+/// monitor_at_surface` about the specific `gtk::Window` the caller passes it,
+/// and there is no such window reachable from here. The engine's own host
+/// window is built and kept entirely inside `android::wayland::WaylandWindow`
+/// -- a private field (`HostWindowCell`) with no accessor -- and `android/**`
+/// was out of scope for the change that wired this up. So every `Output` below
+/// carries `current: false`; see `wire_refresh_rate` for what that means for
+/// the rate actually reported as current.
+///
+/// `gdk::Display::default()` answers regardless of that gap, because GTK/GDK
+/// is initialised once, process-wide, as a side effect of the engine's window
+/// opening (`cordial_shell::host_window::init_wayland`, called from inside
+/// `wayland::open`) -- it does not itself need the window object, only that
+/// something in the process has already brought GDK up. Empty before that has
+/// happened, which `refresh::supported_from`/`current_for` already treat as
+/// "nothing plausible is known" rather than a fault.
+fn refresh_outputs() -> Vec<cordial_runtime::refresh::Output> {
+    let Some(display) = gtk4::gdk::Display::default() else { return Vec::new() };
+    let monitors = display.monitors();
+    (0..monitors.n_items())
+        .filter_map(|i| monitors.item(i))
+        .filter_map(|obj| obj.downcast::<gtk4::gdk::Monitor>().ok())
+        .map(|m| cordial_runtime::refresh::Output {
+            // Reusing `refresh::hz_from_millihertz` rather than repeating its
+            // one-line body: `refresh_watch.rs` only re-derives that division
+            // because the Cargo cycle noted in its header leaves it no other
+            // choice, and load.rs is on the correct side of that edge.
+            hz: cordial_runtime::refresh::hz_from_millihertz(m.refresh_rate()),
+            current: false,
+        })
+        .collect()
+}
+
+/// Tell the engine what the display can do, and keep it told.
+///
+/// `NativeGLInterface.nativePassSupportedRefreshRates`/
+/// `nativePassCurrentDisplayRefreshRate` are exported by every build this
+/// project has looked at and neither had ever been called -- see
+/// `cordial_runtime::refresh` for the policy this follows.
+///
+/// **What this does not achieve.** The design in `refresh.rs` and
+/// `refresh_watch.rs` reports "current" as the output the engine's own window
+/// is *mostly on*, tracked as the window moves and re-announced through
+/// `worth_announcing`. That needs a live `gtk::Window` to call `watch` on, and
+/// -- see `refresh_outputs` -- none is reachable from this file. What this
+/// does instead: send the real supported-rate list at startup and on every
+/// hotplug, and send a "current" rate chosen by `current_for`'s own documented
+/// fallback (the first plausible rate, when nothing is marked current) rather
+/// than inventing a second heuristic here. On a single-monitor machine that
+/// fallback is exact, because there is only one candidate. On a multi-monitor
+/// one -- this is true of the machine this was tested on -- it is a real rate
+/// of a real attached output, not a fabricated number, but it is **not**
+/// verified to be the output the window actually landed on, and must not be
+/// read as though it were.
+///
+/// Window-crosses-a-boundary tracking specifically -- the case
+/// `refresh_watch.rs`'s own header calls out -- is therefore not wired by this
+/// change. It needs a `pub fn` on `android::wayland::WaylandWindow` (or on
+/// `android::WindowHandle`) handing back the `adw::Window`
+/// `cordial_shell::host_window::HostWindow::window()` already exposes;
+/// `android/**` was off limits to the change that added this function, so
+/// that accessor does not exist yet.
+fn wire_refresh_rate(lib: linker::Library) {
+    let supported_native = lib.symbol(
+        "Java_com_roblox_engine_jni_NativeGLInterface_nativePassSupportedRefreshRates",
+    );
+    let current_native = lib.symbol(
+        "Java_com_roblox_engine_jni_NativeGLInterface_nativePassCurrentDisplayRefreshRate",
+    );
+    println!(
+        "  refresh: nativePassSupportedRefreshRates {}",
+        if supported_native.is_some() { "resolved" } else { "NOT exported" }
+    );
+    println!(
+        "  refresh: nativePassCurrentDisplayRefreshRate {}",
+        if current_native.is_some() { "resolved" } else { "NOT exported" }
+    );
+    let (Some(supported_native), Some(current_native)) = (supported_native, current_native) else {
+        return;
+    };
+
+    // Shared between the startup call below and the hotplug callback, so a
+    // hotplug that leaves the rate unchanged does not re-announce -- see
+    // `refresh::worth_announcing`'s own reasoning for why that matters.
+    let previous_current: Rc<Cell<Option<f32>>> = Rc::new(Cell::new(None));
+    let announce = {
+        let previous_current = previous_current.clone();
+        move || {
+            let outputs = refresh_outputs();
+            let supported = cordial_runtime::refresh::supported_from(&outputs);
+            if supported.is_empty() {
+                println!("  refresh: no plausible output to report yet");
+            } else {
+                match linker::game_activity::pass_supported_refresh_rates(supported_native, &supported) {
+                    Ok(()) => println!("  refresh: nativePassSupportedRefreshRates {supported:?}"),
+                    Err(e) => println!("  refresh: nativePassSupportedRefreshRates failed: {e}"),
+                }
+            }
+            // Only when there is no ambiguity about which output that is.
+            //
+            // Nothing reachable from here holds the engine's window, so no
+            // `Output` built above can carry `current: true`, and
+            // `current_for`'s fallback picks the first plausible rate -- which
+            // is GDK's enumeration order, not where the window is. On the
+            // machine this was written on that is a coin flip between 49.998
+            // and 60.002 Hz.
+            //
+            // Sending it anyway would be telling the engine something specific
+            // and unverified, in the one area AGENTS.md is most emphatic about:
+            // with input flowing the frame rate is a hard FIFO vsync lock to
+            // the output's refresh, so a client that names the wrong output has
+            // asked the engine to schedule against a display it is not on. The
+            // supported list above is complete and true whatever the window is
+            // doing, and goes regardless; this one waits.
+            //
+            // What unblocks it is small and named: an accessor on
+            // `android::wayland::WaylandWindow` handing back the `adw::Window`
+            // that `cordial_shell::host_window::HostWindow::window()` already
+            // exposes, so `monitor_at_surface` can answer properly.
+            let unambiguous = supported.len() == 1;
+            let current = if unambiguous {
+                cordial_runtime::refresh::current_for(&outputs)
+            } else {
+                None
+            };
+            if cordial_runtime::refresh::worth_announcing(previous_current.get(), current) {
+                if let Some(hz) = current {
+                    match linker::game_activity::pass_current_refresh_rate(current_native, hz) {
+                        Ok(()) => println!("  refresh: nativePassCurrentDisplayRefreshRate {hz}"),
+                        Err(e) => println!("  refresh: nativePassCurrentDisplayRefreshRate failed: {e}"),
+                    }
+                }
+            } else if !unambiguous && previous_current.get().is_none() {
+                println!(
+                    "  refresh: {} outputs differ and nothing here knows which the window is on; \
+                     not naming a current rate",
+                    supported.len()
+                );
+            }
+            previous_current.set(current);
+        }
+    };
+
+    announce();
+
+    // Hotplug only -- a monitor appearing or disappearing changes
+    // `display.monitors()` regardless of where the window is, so this needs
+    // no window reference either. GDK's `items-changed` fires from whichever
+    // code pumps the process's one `glib::MainContext`, which
+    // `android::wayland`'s own pump already does on every tick; nothing here
+    // has to add a second pump loop.
+    if let Some(display) = gtk4::gdk::Display::default() {
+        display.monitors().connect_items_changed(move |_, _, _, _| announce());
+    }
 }
 
 /// The engine's own version, read out of `libroblox.so` rather than hardcoded.
@@ -1157,6 +1323,12 @@ fn main() -> ExitCode {
                                                 Err(e) => println!("  nativeSetDeviceInfo failed: {e}"),
                                             }
                                         }
+
+                                        // What the display can do, alongside
+                                        // the device info just above -- see
+                                        // `wire_refresh_rate` for what this
+                                        // does and does not establish.
+                                        wire_refresh_rate(lib);
 
                                         // The content store, after the
                                         // directories above are set and before

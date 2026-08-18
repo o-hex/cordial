@@ -1565,6 +1565,31 @@ fn main() -> ExitCode {
                                             }
                                         }
 
+                                        // The in-experience web window's
+                                        // protocol, read out of the engine
+                                        // rather than guessed at. Account
+                                        // settings and Robux both open one of
+                                        // these, and with nobody answering they
+                                        // do nothing at all -- no window, no
+                                        // error, no log line.
+                                        //
+                                        // Reading only. Every name below is a
+                                        // getter returning a constant the engine
+                                        // already holds, so this changes no
+                                        // state; what it produces is the
+                                        // vocabulary the receiving half will
+                                        // need, which is not yet written because
+                                        // the message transport has not been
+                                        // traced. See crates/cordial-runtime/
+                                        // src/webview.rs for why that half is
+                                        // absent rather than stubbed.
+                                        {
+                                            let v = cordial_runtime::webview::read_vocabulary(
+                                                |name| lib.symbol(name),
+                                            );
+                                            cordial_runtime::webview::report(&v);
+                                        }
+
 
                                         // Kicks the engine's initialisation once
                                         // everything it depends on is in place.

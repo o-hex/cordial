@@ -82,16 +82,23 @@ fn trace() -> bool {
 
 // SAFETY: all of these live in `native/clipboard.cpp`, linked into this binary
 // through `cordial-linker-sys`'s `cordial_jni_shim`.
+//
+// Generalised names, not `cordial_clipboard_*`: the C++ side keeps a callback
+// and a `Connection` per message id now rather than one of each for the whole
+// process, so clipboard is one caller of that mechanism and not its owner —
+// see the file comment at the top of `native/clipboard.cpp`. `grep -rn
+// cordial_clipboard_` before this change turned up nothing outside that file
+// and this one, so the rename carries no dangling caller.
 unsafe extern "C" {
-    fn cordial_clipboard_set_sink(sink: Option<extern "C" fn(*const c_char)>);
-    fn cordial_clipboard_subscribe(
+    fn cordial_messagebus_subscribe(
         f: *mut c_void,
         message_id: *const c_char,
+        sink: Option<extern "C" fn(*const c_char)>,
         err: *mut c_char,
         n: usize,
     ) -> c_int;
-    fn cordial_clipboard_connection_ptr() -> i64;
-    fn cordial_clipboard_is_connected(
+    fn cordial_messagebus_connection_ptr(message_id: *const c_char) -> i64;
+    fn cordial_messagebus_is_connected(
         f: *mut c_void,
         ptr: i64,
         out_connected: *mut c_int,
@@ -441,24 +448,29 @@ pub fn arm() {
         return;
     };
 
-    // The sink before the subscription, not after: the bus may deliver
-    // something from inside the subscribing call, and a message that arrived
-    // with nothing listening is one nobody would ever know had been sent.
-    if enabled() {
-        // SAFETY: `on_payload` is `extern "C"` and outlives the process.
-        unsafe { cordial_clipboard_set_sink(Some(on_payload)) };
+    // The sink is passed into the subscribe call itself now, rather than
+    // installed separately beforehand: the C++ side sets it on the callback
+    // object before that object is ever handed to `doSubscribeRaw`, which
+    // keeps the same ordering guarantee clipboard always needed — the bus may
+    // deliver a message synchronously from inside the subscribing call, and a
+    // callback whose sink was still unset at that point would drop it with
+    // nothing in the log to say why.
+    let sink = if enabled() {
+        Some(on_payload as extern "C" fn(*const c_char))
     } else {
         println!("[clipboard] bridge off (CORDIAL_SKIP_CLIPBOARD); subscribing anyway, as a control");
-    }
+        None
+    };
 
     let id = CString::new(SET_CLIPBOARD_TEXT).expect("the message id has no NUL in it");
     let mut err = vec![0u8; 512];
     // SAFETY: `subscribe` resolved under its own name, so it is the native this
     // signature describes; every buffer outlives the call.
     let rc = unsafe {
-        cordial_clipboard_subscribe(
+        cordial_messagebus_subscribe(
             subscribe,
             id.as_ptr(),
+            sink,
             err.as_mut_ptr() as *mut c_char,
             err.len(),
         )
@@ -467,8 +479,9 @@ pub fn arm() {
         println!("[clipboard] doSubscribeRaw failed: {}", take_err(err));
         return;
     }
-    // SAFETY: reads a value the subscribe call above stored.
-    let ptr = unsafe { cordial_clipboard_connection_ptr() };
+    // SAFETY: reads a value the subscribe call above stored, keyed by the same
+    // message id.
+    let ptr = unsafe { cordial_messagebus_connection_ptr(id.as_ptr()) };
     CONNECTION.store(ptr, Ordering::Relaxed);
     if let Some(f) = lib.symbol("Java_com_roblox_universalapp_messagebus_Connection_isConnected") {
         let _ = IS_CONNECTED_NATIVE.set(f as usize);
@@ -496,7 +509,7 @@ pub fn connected() -> Option<bool> {
     let mut err = vec![0u8; 256];
     // SAFETY: the native resolved under its own name; the buffers outlive the call.
     let rc = unsafe {
-        cordial_clipboard_is_connected(
+        cordial_messagebus_is_connected(
             f,
             ptr,
             &mut out as *mut c_int,

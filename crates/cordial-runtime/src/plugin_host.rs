@@ -11,6 +11,7 @@
 
 use cordial_plugins::broker::Broker;
 use cordial_plugins::host::{authorise, Plugin as PluginProc};
+use cordial_plugins::presence::{DiscordPresence, PresencePayload};
 use cordial_plugins::protocol::{Request, Response};
 use cordial_plugins::settings::{self, Store};
 use cordial_plugins::{grants, manifest};
@@ -88,6 +89,11 @@ pub fn start_all() -> usize {
 
 fn serve(mut proc: PluginProc, mut broker: Broker, store: Store) {
     let id = proc.id.clone();
+    // One Discord connection per plugin thread, held for the plugin's whole
+    // run rather than opened fresh on every call — Session does the same for
+    // the same reason: a plugin that calls presence.set on every tick must
+    // not hand-shake with Discord that often.
+    let mut presence = DiscordPresence::new();
     while let Some(req) = proc.next_request() {
         let req = match req {
             Ok(r) => r,
@@ -98,7 +104,7 @@ fn serve(mut proc: PluginProc, mut broker: Broker, store: Store) {
         };
         let response = match authorise(&mut broker, &id, &req) {
             Err(refusal) => refusal,
-            Ok(()) => dispatch(&id, &req, &store),
+            Ok(()) => dispatch(&id, &req, &store, &mut presence),
         };
         if proc.reply(&response).is_err() {
             break;
@@ -109,13 +115,34 @@ fn serve(mut proc: PluginProc, mut broker: Broker, store: Store) {
 
 /// Serve one authorised request. The broker has already decided this may
 /// proceed, so this only has to do the work.
-fn dispatch(id: &str, req: &Request, store: &Store) -> Response {
+fn dispatch(id: &str, req: &Request, store: &Store, presence: &mut DiscordPresence) -> Response {
     match req.method.as_str() {
         // `id` is this thread's own plugin — the process on the other end of
         // its pipe — and it is the only id the settings broker is given. A
         // plugin naming another one in its params reads and writes its own
         // document; see cordial_plugins::settings.
         "settings.get" | "settings.set" => settings::serve(Some(store), id, req),
+        // ADR-007's worked example, finally reachable from the host the
+        // client actually runs: cordial-plugins already speaks Discord's IPC
+        // framing (presence.rs) and cordial_plugins::host::Session already
+        // wires it up, but Session is only ever constructed in that crate's
+        // own tests. This is the same wiring, once, for the real host —
+        // reusing DiscordPresence rather than re-opening the socket search
+        // here, so there is exactly one place that knows where Discord's IPC
+        // socket might be.
+        "presence.set" => match PresencePayload::parse(&req.params) {
+            Ok(payload) => respond(req.id, presence.set(&payload)),
+            Err(message) => Response::Error { id: req.id, message },
+        },
+        "presence.clear" => respond(req.id, presence.clear()),
+        // Acknowledges the capability the way Session's does: there is
+        // nothing to subscribe to yet, because delivering a lifecycle event
+        // means the client's own run loop pushing one down this plugin's
+        // stdin at the moment it happens, and nothing in this file's reach
+        // owns that loop. Answering Ok here is honest about what it claims —
+        // "you hold lifecycle.read" — and not about delivery, which stays
+        // unimplemented rather than silently promised.
+        "lifecycle.subscribe" => Response::Ok { id: req.id, result: serde_json::Value::Null },
         "flags.list" => {
             let resolved = crate::flags::resolve(crate::flags::collect());
             let list: Vec<_> = resolved
@@ -153,7 +180,124 @@ fn dispatch(id: &str, req: &Request, store: &Store) -> Response {
     }
 }
 
+/// Turn a broker effect's plain `Result` into the wire `Response` — the
+/// success case carries nothing back, so this only exists to spell the
+/// error case the same way every time. Copied from
+/// `cordial_plugins::host::respond` rather than imported: it is three lines,
+/// and pulling it in would mean making it `pub` in a crate whose own doc
+/// comment says `Session` is the only thing with a real broker for this.
+fn respond(id: u64, result: Result<(), String>) -> Response {
+    match result {
+        Ok(()) => Response::Ok { id, result: serde_json::Value::Null },
+        Err(message) => Response::Error { id, message },
+    }
+}
+
 /// Where plugins are installed, exposed so the loader can report it.
 pub fn root() -> PathBuf {
     manifest::plugin_root()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(method: &str, params: serde_json::Value) -> Request {
+        Request { id: 1, method: method.into(), params }
+    }
+
+    fn scratch_store(tag: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!("cordial-plugin-host-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Store::new(dir)
+    }
+
+    // XDG_RUNTIME_DIR is process-wide, and cargo runs this file's tests on
+    // multiple threads by default; presence.rs's own tests take the same
+    // lock for the same reason. Held for as long as the env var points at a
+    // scratch directory, so the two tests below cannot race each other's
+    // socket search.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn presence_set_fails_honestly_when_discord_is_not_running() {
+        // AGENTS.md: a stub must never claim success it did not have. With
+        // no Discord IPC socket present, dispatch must answer Error, not Ok
+        // — the exact failure this dispatch arm exists to reach past the
+        // "not implemented yet" catch-all in dispatch's `other` arm, and the
+        // failure it must still report honestly now that it does.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir()
+            .join(format!("cordial-plugin-host-no-discord-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+
+        let store = scratch_store("presence-set");
+        let mut presence = DiscordPresence::new();
+        let req = call(
+            "presence.set",
+            serde_json::json!({"client_id": "1234567890123456", "details": "Playing Baseplate"}),
+        );
+        let res = dispatch("discord-presence", &req, &store, &mut presence);
+        match res {
+            Response::Error { message, .. } => assert!(message.contains("not running"), "{message}"),
+            other => panic!("expected an honest failure with no Discord listening, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn presence_clear_is_a_quiet_no_op_when_nothing_was_ever_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir()
+            .join(format!("cordial-plugin-host-clear-noop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+
+        let store = scratch_store("presence-clear");
+        let mut presence = DiscordPresence::new();
+        let req = call("presence.clear", serde_json::Value::Null);
+        let res = dispatch("discord-presence", &req, &store, &mut presence);
+        assert!(matches!(res, Response::Ok { .. }), "{res:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_presence_payload_is_an_error_not_a_panic() {
+        let store = scratch_store("presence-bad-payload");
+        let mut presence = DiscordPresence::new();
+        let req = call("presence.set", serde_json::json!({"client_id": "not-a-snowflake"}));
+        let res = dispatch("discord-presence", &req, &store, &mut presence);
+        match res {
+            Response::Error { message, .. } => assert!(message.contains("snowflake"), "{message}"),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_subscribe_acknowledges_the_capability() {
+        let store = scratch_store("lifecycle-subscribe");
+        let mut presence = DiscordPresence::new();
+        let req = call("lifecycle.subscribe", serde_json::Value::Null);
+        let res = dispatch("some-plugin", &req, &store, &mut presence);
+        assert!(matches!(res, Response::Ok { .. }), "{res:?}");
+    }
+
+    #[test]
+    fn an_unimplemented_method_still_says_so_rather_than_pretending() {
+        // The catch-all this change carves presence and lifecycle.subscribe
+        // out of must still hold for everything else `Session` answers that
+        // this host does not yet wire up.
+        let store = scratch_store("unimplemented");
+        let mut presence = DiscordPresence::new();
+        let req = call("notify.send", serde_json::json!({"summary": "hi"}));
+        let res = dispatch("some-plugin", &req, &store, &mut presence);
+        match res {
+            Response::Error { message, .. } => assert!(message.contains("not implemented yet"), "{message}"),
+            other => panic!("expected the not-implemented-yet stub, got {other:?}"),
+        }
+    }
 }

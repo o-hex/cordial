@@ -756,6 +756,7 @@ libroblox.so	glViewport
 libroblox.so	gmtime
 libroblox.so	gmtime_r
 libroblox.so	__gnu_strerror_r
+libroblox.so	hypotf
 libroblox.so	if_indextoname
 libroblox.so	if_nametoindex
 libroblox.so	ilogb

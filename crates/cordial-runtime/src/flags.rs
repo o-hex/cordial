@@ -58,6 +58,8 @@ pub enum Source {
     User,
     /// A plugin, by its directory name.
     Plugin(String),
+    /// Cordial's own defaults, below every other layer.
+    Builtin,
 }
 
 impl Source {
@@ -65,6 +67,7 @@ impl Source {
         match self {
             Source::User => "user".into(),
             Source::Plugin(id) => format!("plugin:{id}"),
+            Source::Builtin => "built-in".into(),
         }
     }
 }
@@ -229,8 +232,37 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// Every layer, in precedence order: plugins first (alphabetically, so the
-/// outcome does not depend on directory iteration order), then the user.
+/// Flags Cordial sets for itself, at the bottom of the stack.
+///
+/// The bar for anything here is a setting whose default is wrong specifically
+/// *because* the engine is an Android build running on a desktop, and which the
+/// settings document does not carry — so there is no value from Roblox being
+/// overridden, only a compiled-in default being replaced.
+///
+/// `FStringGraphicsTextureManager2DenyPattern2` is absent from the document
+/// entirely. TextureManager2 picks a streaming tier from hardware it recognises,
+/// the document's sibling `...DenyPattern` already denies tiers 1 to 3, and a
+/// desktop GPU behind this stack matches nothing it knows — so it settles on low
+/// residency and textures load blurred. `.*` denies every pattern, which takes
+/// the engine off TextureManager2 and onto the legacy streaming path that
+/// `FFlagTextureManager2SupportLegacyStreaming2` keeps alive.
+///
+/// **`INFERRED`.** The flag's absence from the document and its effect on
+/// mocktail are established; the tier-matching story above is the reading that
+/// fits, not something measured here. It is at the bottom layer precisely
+/// because it is a guess a user should be able to overrule with one line.
+const BUILTIN: &[(&str, &str)] = &[("FStringGraphicsTextureManager2DenyPattern2", ".*")];
+
+fn builtin_layer() -> Layer {
+    Layer {
+        source: Source::Builtin,
+        values: BUILTIN.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+    }
+}
+
+/// Every layer, in precedence order: Cordial's own defaults first so anything
+/// can overrule them, then plugins (alphabetically, so the outcome does not
+/// depend on directory iteration order), then the user.
 pub fn collect() -> Vec<Layer> {
     // The move happens here because this is the one path every reader of the
     // user's overrides goes through, and the runtime has no single startup hook
@@ -243,7 +275,7 @@ pub fn collect() -> Vec<Layer> {
         migrate_legacy_user_file(&crate::profile::active());
     });
 
-    let mut layers = Vec::new();
+    let mut layers = vec![builtin_layer()];
 
     let mut ids: Vec<String> = std::fs::read_dir(plugin_dir())
         .into_iter()

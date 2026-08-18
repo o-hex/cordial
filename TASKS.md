@@ -44,7 +44,7 @@ pinned by tag.
 
 ## Tier 1 — no code, testable immediately
 
-### T1. `FStringGraphicsTextureManager2DenyPattern2 = ".*"`
+### T1. `FStringGraphicsTextureManager2DenyPattern2 = ".*"` — DONE, unverified
 
 **This is the "fix low resolution textures" commit** (`e161fec`), and it is one
 line of configuration, not code.
@@ -65,8 +65,11 @@ value and its absence from our document.**
 
 - **Touches:** Cordial's default flag layer only. No source change to the
   runtime or native side.
+- **Status:** shipped in a new built-in flag layer (`flags.rs`), below plugins
+  and the user so one line in `flags.json` overrules it. Confirmed applying, and
+  confirmed overridable: `= USER-WINS from user (overrides built-in=.*)`.
 - **Scope:** trivial. Isolated PR.
-- **Verification:** requires a join and a visual comparison, since textures do
+- **Verification:** still outstanding — requires a join and a visual comparison, since textures do
   not load on a startup-only run. Control by toggling the flag in the same
   session. The flag pipeline itself is proven — `FLogGraphics=0` takes
   `[FLog::Graphics]` from 30 lines to 0 on the same build.

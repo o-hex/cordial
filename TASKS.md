@@ -453,3 +453,74 @@ confirming against a JNI trace before anyone builds to it.
 **Next:** run one `CORDIAL_JNI_TRACE=1` join and intersect the unresolved-symbol
 lines with this list. That turns 24 leads into the subset the engine actually
 asks for, and it costs one run.
+
+---
+
+## Correction: the 24-class list, re-read against the dex
+
+The "Cordial answers none of `MemStorage`" framing was wrong in a way that
+changes what the work is.
+
+`MemStorage`'s methods are **engine natives**. `libroblox.so` exports
+`Java_com_roblox_engine_jni_memstorage_MemStorage_bind`, `_fire`, `_getItem`,
+`_setItem`, `hasItem`, `removeItem` and `Connection_disconnect`/
+`_releaseConnection`. So the engine *implements* that channel and the application
+*calls* it. There is nothing for Cordial to answer there, and an implementation
+would be shadowing the engine's own.
+
+What Cordial does owe is the two classes the engine constructs and calls back
+into, exactly the `NativeFlagsInitResult` pattern:
+
+    com/roblox/engine/jni/memstorage/Connection   <init> (J)V
+                                                  disconnect ()V
+                                                  finalize ()V
+    com/roblox/engine/jni/memstorage/Callback     (engine calls into it)
+
+`Connection` takes a native handle as a `jlong`, so it is a real, well-defined
+object with no guessing involved. **Safe to implement.**
+
+### `EngineJavaCallback2` is not safe to implement blind
+
+Its entire surface is obfuscated — `a(I)V`, `b(J)V`, `c(I)V`, `d()V`,
+`e(String)V`, through to `q(JZ[BLcom/roblox/engine/jni/model/NativeTextBoxInfo;)V`
+— seventeen single-letter methods whose meanings the dex does not carry.
+
+They are all `void`, so *receiving* them is honest in the way
+`NativeHelper`'s lifecycle callbacks are: an announcement's honest answer is to
+have received it. But anything beyond logging the call would be inventing
+semantics. **Implement as receivers that log, and nothing more, and say so in
+the comment.** Do not let a later reader mistake a named parameter for known
+meaning.
+
+### And the startup trace does not settle this either way
+
+A `CORDIAL_JNI_TRACE=1` startup on 2.734.0.917 leaves only five classes
+unresolved — `NativeGLJavaInterface` (14), `GameActivity` (6), `java/util/List`
+(2), `java/lang/Class` (2), `NetworkUtils` (2). None of the 24 appear.
+
+That is **not** evidence they are unneeded. `KeyRing` was recorded earlier in
+this same investigation as reaching nothing on startup and logging normally on a
+join, and `StartGameParams` is by its name a join-path class. A ten-second
+startup trace only proves what startup asks for. The list stands; the trace to
+settle it has to be a join.
+
+## Discord Rich Presence: it exists and it works
+
+Asked as "where is the plugin". It is at `plugins/discord-presence/` —
+`plugin.json` declaring `lifecycle.read`, `presence.set` and `log`, plus
+`main.ts`. The host side is `crates/cordial-plugins/src/presence.rs`, ADR-007's
+worked example.
+
+It is not a sketch. Four tests pass, including an end-to-end one that runs the
+real shipped plugin:
+
+    presence::tests::presence_set_speaks_discords_framing_to_a_local_socket ... ok
+    presence::tests::details_over_the_discord_limit_is_refused ... ok
+    presence::tests::a_payload_rejects_fields_discord_does_not_define ... ok
+    discord_presence_follows_lifecycle_events_all_the_way_to_the_wire ... ok
+
+**The gap is documentation, not implementation.** `README.md` mentions plugins in
+general and links the Discord server, and never mentions that a Discord presence
+plugin ships or how to enable it. `site/index.html` is the website. Both want a
+section. That is a writing task, not an engineering one, and it should not be
+filed as "fully implement Discord RPC" — the misfiling is the bug.

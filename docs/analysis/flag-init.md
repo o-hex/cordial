@@ -1813,6 +1813,11 @@ not, and everything in §§12–17 was working without it.
 
 ### §19.1 What the TaskScheduler line does and does not explain
 
+**Superseded in part by §22.** The conclusion below that "the gate is
+satisfied on the path Cordial actually uses" is wrong: it reads the absence of
+the fatal error as the gate being passed, when it is the gate never being
+reached. Kept because the narrowing it does to the late-settings ordering holds.
+
 Chased, and the scope is narrower than §19 implied. Worth pinning before anyone
 builds on it.
 
@@ -1930,7 +1935,189 @@ that to the late-settings ordering only. Nobody has yet asked what *does* bring
 the scheduler up on the default path, or whether the flags machinery runs behind
 it there too, quietly, without the fatal error.
 
-**Loud logging is exhausted as a technique.** 135 channels at maximum produce
+**Loud logging is exhausted as a technique.** *(Retracted in §22: the sweep
+drew its 135 names from a 30-line list of channels seen on Android, out of 724 in
+the binary, and setting a channel in `flags.json` is shown there to silence it.
+`FLog::NativeDM` was never in the list and has been printing the answer all
+along.)* 135 channels at maximum produce
 5961 lines and not one about the verdict — before or after the stdio fix, which
 was the last hope that the engine had been trying to tell us and could not. It
 had not. Whatever decides this does not log.
+
+## §22. The engine has been naming the state every run, on a channel nobody read
+
+§21 closed with "loud logging is exhausted as a technique". That was wrong, and
+the way it was wrong is worth stating before the finding itself.
+
+The 135-channel sweep drew its channel names from `docs/traces/flog-channels.txt`,
+which is 30 lines — the channels that happened to appear in the Waydroid capture.
+`libroblox.so` defines **724**. `FLog::NativeDM` is not in the 30, was never
+enabled, never grepped for, and has been printing twelve lines in every run this
+project has ever made.
+
+### What it says
+
+From a plain `--run 12` with no overrides at all:
+
+    [FLog::NativeDM] nativeActivity_onStart:
+    [FLog::NativeDM] nativeActivity_onResume:
+    [FLog::NativeDM] dataModelBindings_onGameLoaded: placeId = 0.
+    [FLog::NativeDM] nativeActivity_onSurfaceChanged: state:11.
+    [FLog::NativeDM] nativeActivity_onSurfaceChanged: ... Flags-Not-Received. Return.
+    [FLog::NativeDM] nativeActivity_onSurfaceChanged: state:11.
+    [FLog::NativeDM] nativeActivity_onSurfaceChanged: ... Flags-Not-Received. Return.
+    [FLog::NativeDM] nativeActivity_onKillSurface: state:11.
+    [FLog::NativeDM] nativeActivity_onKillSurface: ... Flags-Not-Received. Return.
+    [FLog::NativeDM] nativeActivity_onStop:
+    [FLog::NativeDM] nativeActivity_onDestroyed:
+    [FLog::NativeDM] nativeActivity_onDestroyed: ... Flags-Not-Received. Return.
+
+`NativeDM` is `RBX::NativeDataModelManager` — the class `init_params.cpp` already
+names as the writer of `onFlagsFailed`, from `getFlagsFromEngine_`'s completion
+lambda. **`Flags-Not-Received` is its own word for the state Cordial is stuck
+in**, and every lifecycle callback the engine delivers turns round and returns on
+it. That is the mechanism by which nothing downstream happens: not a missing
+call, a latched state.
+
+Absent from the log, and they are the rest of that class's vocabulary:
+`[Constructor]`, `initialize: state:{}. areFlagsLoaded:{}.`, `getFlagsFromEngine_:`,
+`continueAfterFlagsLoaded_:`, `initEngine_:`.
+
+### §19.1 was wrong about the TaskScheduler and this is the retraction
+
+§19.1 concluded "in a working default run the TaskScheduler is fine … the gate is
+satisfied on the path Cordial actually uses", reasoning from the absence of the
+fatal error. Absence of the error is not evidence the gate was passed; it is
+equally what never reaching the gate looks like, and that is the case here.
+`RbxStorage::init` and `ClientRunInfo` are absent from every Cordial run, and both
+sit downstream of it.
+
+The one scheduler line Cordial does produce —
+`setTaskSchedulerBackgroundMode() enable:false context:ASMA.start` — lands at
+**0.480s**, while the same line on real Android lands at 0.417s *after*
+`RbxStorage::init`. It is background mode rather than initialisation either way,
+so it is not itself the fatal path, but it is not the clean bill of health §19.1
+read it as.
+
+### The signature theory, killed by a control before it cost anything
+
+Cordial's flag cache write logs `Wrote signatureSize: 0`, and the engine exports
+`nativeInitClientSettingsSigned(String, String, String, String)I` alongside the
+plain three-argument form Cordial calls. That is a tidy story and it is false:
+**Sober logs `Wrote signatureSize: 0` as well**, on the run at
+`2.734.0.917_20260819T003213Z`, and Sober reaches `flagLoaded`. Nothing is gated
+on a signature Cordial is failing to supply.
+
+### The flags themselves are fine, and this is now measured rather than argued
+
+Same run, no overrides:
+
+    [FlagCache] writeFlagCache: Compressing flag cache data (input size: 1270529 bytes)
+    [FlagCache] writeFlagCache: Compression complete. Output size: 328040 bytes, ratio: 3.87x
+    [FlagCache] writeFlagCache: Successfully wrote 328045 bytes
+    [FLog::TombstoneCache] Tombstone 1, expiry time 360, holdout false, channel 'production', written
+
+1.27 MB of flag data parsed, zstd-compressed and persisted, against Sober's
+1301322 → 333489 on the same day. The data loads. The *event* does not fire.
+`init_params.cpp`'s comment — "the flag data did load" — is confirmed, and the
+question is narrowed to the notification rather than the payload.
+
+### Overriding an `FLog` channel can silence it
+
+Set out here because it invalidates the sweep §21 rested on, and because it will
+mislead the next person the same way:
+
+| `flags.json` | `NativeDM` lines |
+|---|---|
+| absent | 12 |
+| `{"DFLogNativeDM": 7}` | 12 (wrong prefix, no effect) |
+| `{"FLogNativeDM": 1}` | **0** |
+| `{"FLogNativeDM": "100"}` | **0** |
+| `{"FLogGraphics": 7}` | 12 — an unrelated override changes nothing |
+
+Controls on both sides: no-override runs before and after read 12. So naming a
+channel in `flags.json` set it to *quiet* at every value tried, including 100,
+while `FLogAppShellReporter: 7` took that channel 0 → 14 on the same mechanism.
+Whatever the semantics are, **"set 135 channels to maximum" is not verified to
+have raised anything and may have lowered some of them.** §21's conclusion that
+loud logging is exhausted does not follow from that sweep.
+
+### mocktail does not solve this. It patches the byte
+
+The comparison this project has run against mocktail for weeks assumed mocktail
+reaches the flags-loaded state legitimately and Cordial fails to. It does not.
+`src/legacy/legacy_runtime.cc:13354` (Apache-2.0, read directly):
+
+```cpp
+bool ForceNativeFlagsLoadedForTaskScheduler(const char* reason) {
+  ...
+  auto* flag = reinterpret_cast<unsigned char*>(
+      g_libroblox_base + kRobloxNativeFlagsLoadedByteOffset);
+  ...
+  if (!EnsureWritablePage(flag)) { ... }
+  const unsigned int old_value = *flag;
+  *flag = 1;
+```
+
+`mprotect` the page, write `1` to a fixed offset inside `libroblox.so`, and the
+gate opens. It is on by default —
+`SetEnvDefault("MOCKTAIL_PATCH_NATIVE_FLAGS_LOADED", "1")` at line 2818 — and it
+is not the only one; `MOCKTAIL_PATCH_STAGE6_START_LUA_DM_FORCE_SAME_THREAD` and
+`ForceStage6DataModelPatcherForceLocalFlag` sit beside it. The function is named
+for our fatal error.
+
+**Cordial cannot do this and will not.** In-process memory patching is exactly
+what [ADR-001](../adr/ADR-001-in-process-hooking.md) and
+[ADR-003](../adr/ADR-003-plugin-isolation.md) make *absent* rather than disabled,
+so that no fork can extract the primitive. That decision stands; this is the
+first time it has had a visible cost, and the cost is that the one comparable
+implementation's answer is off the table.
+
+What that changes: every "mocktail gets further, find the call we are missing"
+inference in §§13–17 was chasing a difference that does not exist at the call
+level. mocktail is not further along this path. It is past it by force.
+
+### Sober, however, reaches `flagLoaded` and how is not established
+
+Sober's log for 2026-08-19, at the same landmarks:
+
+    3.001397 [FLog::AndroidGLView] nativeInitClientSettings
+    3.064486 [DFLog::FlagCache] Deferring flag cache write to post TTI
+    3.067240 [FLog::AndroidGLView] nativePostClientSettingsLoadedInitialization3
+    3.067323 [FLog::ClientRunInfo] RobloxGitHash / base url / channel
+    3.072664 [DFLog::AppPlatformQoSEmergency] instanced
+    3.075039 [DFLog::Mimalloc] ...
+    3.082697 [FLog::TombstoneCache] Tombstone 1 ... read from file
+    3.091522 [DFLog::RbxStorage] RbxStorage::init [INIT] user: flagLoaded
+    3.093661 [FLog::JNIAppBridge] nativeAppBridgeAppStart:
+
+Cordial has none of the block between `nativePostClientSettingsLoadedInitialization3`
+and `RbxStorage::init`, and its `nativeAppBridgeV2Init` is the **first** line in
+its log at 0.228s where Sober's app bridge starts at 3.093s, after the storage is
+up. Sober also *reads* an existing tombstone where Cordial writes a fresh one.
+
+Whether Sober patches memory to get there is **not established** — the reference
+tree here (`~/Projects/sober-oss-reference`) contains only `libbadcpu`, and its
+`decompiled/` directory is off-limits under AGENTS.md. So "Sober does it
+legitimately" is *not* a claim this section makes. What is observed is only that
+Sober reaches the state and Cordial does not.
+
+### Where this leaves it
+
+Not fixed. What is now established rather than guessed:
+
+* The stuck state has a name, `Flags-Not-Received`, and it is latched — the
+  engine re-checks and re-returns on every lifecycle callback.
+* The flag data is not the problem: 1.27 MB loads, compresses and persists.
+* No signature is required; the control kills that.
+* `getFlagsFromEngine_`'s completion chooses failure with all of that in place,
+  and `initialize:` / `continueAfterFlagsLoaded_` never log.
+* The only known implementation past the gate forces it with a memory write
+  Cordial has permanently ruled out.
+
+The next experiment is the one this section could not run: get
+`getFlagsFromEngine_:` and `initialize: state:{}. areFlagsLoaded:{}.` to print.
+They are the two lines that would say what the engine thinks the state is at the
+moment it decides, and the channel is already open by default — it is the
+verbosity of those particular lines that is not. Raising it through `flags.json`
+demonstrably does the opposite, so that route needs understanding first.

@@ -2388,3 +2388,59 @@ an absence licenses. Establishing which needs the channel genuinely raised, and
 §22's measurement is that naming a channel in `flags.json` can silence it rather
 than raise it. That mechanism is still not understood and is now the thing
 blocking the question, not the storage code.
+
+### §23.2 Storage is never attempted, and this settles it
+
+§23.1 left the question as "never attempted or attempted and unlogged", and said
+the logging mechanism was blocking the answer. It is not: the filesystem answers
+it without any log channel.
+
+`CORDIAL_TRACE_PATHS=1`, one 35-second run, **19,296 intercepted path calls, zero
+of them containing `rbx-storage`**. The absence of `RbxStorage::init` from the
+log is therefore "never attempted". Nothing is being initialised quietly.
+
+(That switch is real and works. It is worth saying because an earlier attempt in
+this session concluded it produced no output at all — the grep was for `[path]`
+and the format is `[paths]`. The tool was fine; the measurement was wrong.)
+
+What the engine does touch, once the 17k `/sys/devices/system/cpu/*/cpufreq`
+polls are set aside:
+
+    180  /proc/self
+     51  <profile>/data/files/appData
+     50  <profile>/data/cache
+     30  ./exe
+     23  <profile>/data/files/appData/LocalStorage
+     14  http                      <- relative
+     14  /dev
+      8  <profile>/data/cache/wob
+      6  cache                     <- relative
+
+So the engine is doing local storage, under `appData/LocalStorage`, and simply
+never reaches for the content store.
+
+### The block is short by three steps, and they are consecutive
+
+Against Sober at the same point, Cordial's post-settings block is missing exactly
+the three lines that run together at the end of it:
+
+    Sober                                          Cordial
+    IxpStorageManager: Failed to open cache file   absent
+    TombstoneCache: Tombstone 1 ... read from file absent
+    TombstoneCache: Setting holdout state: false   present
+    LocalStorageHandler: Not available             present
+    RbxStorage::init [INIT] user: flagLoaded       absent
+
+Cordial reaches `Setting holdout` and `LocalStorageHandler`, so it is not that
+the block stops early. It skips the Ixp cache open and the tombstone *read* while
+still writing a tombstone of its own — and Cordial's write goes to
+`cache/tombstone.dat`, **relative**, where Sober's is absolute. Both
+`<profile>/run/cache/tombstone.dat` and `<profile>/data/cache/cache/tombstone.dat`
+exist on disk here, which is what a relative write and an absolute read look like
+when they disagree.
+
+**Whether the tombstone read gates `RbxStorage::init` is not established.** It is
+the only difference left inside the block, it is immediately upstream of the
+missing line, and the relative-path split is a mechanism that would explain a
+silent skip. That is a lead with something behind it rather than another flag to
+try, and it is where the next session should start.

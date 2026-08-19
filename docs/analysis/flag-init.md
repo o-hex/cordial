@@ -2460,3 +2460,27 @@ the late post call, against a control without it, on fresh data roots:
     without                flags loaded = 1   RbxStorage = 0   storage files = 0
 
 The switch is kept, off by default, as the record. Sixteen candidates now.
+
+### §23.4 The settings document Cordial supplies is the wrong one, and that is not the storage bug either
+
+Cordial fetches `clientsettingscdn.roblox.com/v2/settings/application/**AndroidApp**`
+and separately calls `nativeOverrideChannelPlatformName` to say it is
+**`GoogleAndroidApp`**. When the engine went looking for flags itself, it fetched
+`.../application/GoogleAndroidApp.zst` — its own name for itself, not the one
+Cordial had handed it.
+
+The two documents are not the same. `AndroidApp` carries 22,196 flags,
+`GoogleAndroidApp` 22,610; 441 values differ, 27 of them with `Storage`, `Cache`,
+`Ixp` or `Tombstone` in the name. So Cordial has been running the client on a
+document meant for a slightly different application than the one it claims to be.
+
+**It is not the storage bug.** Supplying `GoogleAndroidApp` via
+`--client-settings`, against a control on the stock document, on fresh data
+roots:
+
+    GoogleAndroidApp   flags loaded = 1   RbxStorage = 0   storage files = 0
+    AndroidApp         flags loaded = 1   RbxStorage = 0   storage files = 0
+
+Candidate seventeen. Worth correcting on its own terms regardless — a client
+should be given the flags for the application it says it is — but it is a
+separate change from this one and is not made here.

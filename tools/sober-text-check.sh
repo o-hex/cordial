@@ -58,4 +58,10 @@ fi
 [ -n "$PID" ] || { echo "could not find Sober's bwrap process" >&2; exit 1; }
 echo "Sober bwrap pid $PID — entering its namespaces (this is the sudo prompt)"
 
-sudo nsenter -t "$PID" -p -m --mount-proc /usr/bin/python3 "$DIFF"
+# `--mount-proc` is an `unshare` option, not an `nsenter` one; `-m` already
+# brings the sandbox's /proc along with its mount namespace.
+#
+# The script is fed on stdin rather than by path: inside Sober's mount namespace
+# this repository does not exist, so a path argument would resolve to nothing.
+# The redirect is performed by this shell, on the host, before nsenter runs.
+sudo nsenter -t "$PID" -p -m /usr/bin/python3 - < "$DIFF"

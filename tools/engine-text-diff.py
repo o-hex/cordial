@@ -118,8 +118,17 @@ def main():
     )
     args = ap.parse_args()
 
-    seg_off, seg_size = exec_segment(args.lib)
-    print(f"reference {args.lib}: executable PT_LOAD at 0x{seg_off:x}, {seg_size} bytes")
+    # The reference is optional, because inside another process's mount
+    # namespace the host's copy of the library is not on the filesystem. When it
+    # is missing the size-matching fallback cannot run, but the named-mapping
+    # path below can — and that path is better anyway, since it reads the file
+    # the process actually mapped rather than one we hope is the same build.
+    if os.path.exists(args.lib):
+        seg_off, seg_size = exec_segment(args.lib)
+        print(f"reference {args.lib}: executable PT_LOAD at 0x{seg_off:x}, {seg_size} bytes")
+    else:
+        seg_off, seg_size = 0, -1
+        print(f"no reference at {args.lib}; relying on the mapping naming its own file")
 
     # A named mapping is its own reference and is preferred: it removes any
     # question of whether the process loaded the same build as `--lib`. Sober

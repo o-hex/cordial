@@ -3381,3 +3381,71 @@ own `flagLoaded` timing. The three categories are still cleanly eliminated,
 just in a window that turns out not to contain the failing call. The one
 tested retry candidate (`nativeRetryInit`) is a clean negative. The
 LocalStorageManager family remains an open, untested lead.
+
+## §29. Nothing Cordial can reach is consulted at the moment of failure
+
+Three results, each with a control.
+
+**The directory setters, at the earliest timing that exists.** `CORDIAL_DEFER_CTORS=1`
+calls all four `NativeSettingsInterface` setters *before* `libroblox.so`'s own ELF
+constructors run — before `JNI_OnLoad`, before `bootstrapTheApp` can fire. They
+report `ok (pre-ctors)`. **The identical three `stat("") = -1` still happen.** §27
+eliminated the setters; this eliminates them again under a strictly stronger
+timing condition, and it is a controlled negative rather than an inference.
+
+**No JNI call happens at the point of failure.** Rebuilt with
+`CORDIAL_JNI_TRACE=1` and run with `CORDIAL_TRACE_PATHS=1`: on the failing
+thread, between `nativeInitClientSettings -> 0` and its three `stat("")`, there
+are **zero** method-ID resolutions and zero invocations. Whatever supplies the
+empty root is not being fetched from Java at the moment it is used.
+
+**Angles 1 and 2 are closed by inspection rather than left open.** Every field on
+`InitParams`, `StartAppParams`, `PlatformParams` and `DeviceParams` is filled, and
+the only path-shaped one is `assetFolderPath`, which is the APK asset root and
+unrelated. Both string arguments to `initStorageManagerNativeV3` are real,
+non-empty absolute paths whose directories exist on disk before the call. The
+recorded ordering bug there — the first call precedes the four setters, against
+its own comment — is real and **moot**, because storage has already failed and
+memoised before either call site is reached.
+
+The stacks corroborate §28's identification: all three empty-path hits share
+callers at `0x226eea1`, `0x226ec71`/`0x226f571`, `0x2315ced`, `0x2312fe3`,
+`0x230c3b4`, `0x230bd04`, bottoming at `start_thread`/`__clone3`. `0x2312fe3` is
+0x27 bytes past the `[INIT]` emit at `0x2312fbc`. They diverge at exactly one
+frame, so it is three distinct call sites stating an empty path, not one site
+retried.
+
+### The sixth instrument artefact, and this one is subtle
+
+The first `CORDIAL_JNI_TRACE` run appeared to show JNI activity clustered right
+after the failure. It was not real. libjnivm's `LOG` writes to **stdout** via
+`printf`; Cordial's path tracer writes to **stderr**. Redirected to a file,
+stdout is block-buffered and stderr is not, so the interleaving in the log is not
+temporal order. `stdbuf -o0 -e0` and two reruns gave the true ordering, which is
+the zero-JNI-calls result above.
+
+Six artefacts now: a path trace blind to `statvfs`, a channel sweep with the
+wrong value shape, a function boundary from a prologue scan, two `lldb` attaches
+arriving too late, a halting harness that could not be trusted for timing, and
+now two output streams with different buffering read as one timeline. **Every
+single wrong conclusion in this document has been an instrument, never the
+engine.** That is the most reliable pattern here and the next person should
+assume it before assuming anything about Roblox.
+
+### Where this leaves the question
+
+Storage fails on a root that is empty at the moment of use, and at that moment
+nothing in the JNI surface Cordial implements is being consulted. So the value is
+either cached from earlier than any Cordial code runs, or is an engine-internal
+default nothing in the app-facing interface can reach.
+
+The next observational angle, and it has not been tried: **trace what runs on
+that spawned thread before its first `stat("./appData")`, back to `__clone3`** —
+who creates the thread and what it does first. Reading the disassembly at
+`0x2315ced`/`0x2312fe3` would answer it faster and is out of scope.
+
+If that angle also comes back empty, the honest conclusion is the one §22.1
+reached about the flags gate and had to un-reach: this may not be reachable
+through the interface Roblox exposes to a host application, and the remaining
+option is the memory write [ADR-001](../adr/ADR-001-in-process-hooking.md) makes
+absent. That is a decision for the project owner, not a measurement.

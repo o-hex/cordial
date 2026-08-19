@@ -42,6 +42,45 @@ plugins alongside it. In scope:
   [ADR-004](docs/adr/ADR-004-plugin-asset-overrides.md)). "Cordial cannot cheat"
   is the design, not a bug.
 
+## Forks, and clients built on Cordial
+
+Cordial does not support script execution, exploiting, botting or
+multi-accounting, and it will not. That is not a gap waiting to be filled.
+[ADR-001](docs/adr/ADR-001-in-process-hooking.md) makes in-process hooking,
+memory patching and injected script environments **absent** rather than
+disabled — there is no primitive here to switch on, and no API by which a plugin
+could ask for one. [ADR-003](docs/adr/ADR-003-plugin-isolation.md) is why a
+plugin never receives a socket, a file descriptor or a connection: it sends a
+payload and Cordial performs the effect.
+
+**Cordial is GPL-3.0, so anyone may fork it, including in directions we
+disagree with.** That is the licence working as intended and we are not going to
+pretend otherwise. It does mean:
+
+- A fork is an independent project. It is not endorsed by us, not affiliated
+  with us, and not supported here.
+- If you are using something built on Cordial that adds script execution, **you
+  are not using Cordial**, and this issue tracker cannot help you. We do not
+  know what that fork changed and we cannot reason about its behaviour.
+- Upstream will not accept commits that enable exploiting. Contributing here is
+  not a route to getting one merged. Nothing happens *to* you for having
+  contributed — this is a statement about patches, not about people.
+
+If you are considering using such a fork, understand what you are accepting.
+Roblox's enforcement is automated, runs in waves, and associates accounts sharing
+an address. A fork that adds an exploit surface does not carry the risk alone;
+it carries it into every account on your network.
+
+## WSL is not a supported target
+
+Running Cordial under WSL sidesteps client integrity checks, and that is the
+reason it is unsupported rather than merely untested. We will not help with WSL
+issues and will not take patches that exist to make that path work.
+
+This is not a judgement about Windows. It is that the value of running there is
+mostly the evasion, and building for it would make this project a tool for
+something it has said it is not.
+
 ## Expectations
 
 This is a hobby project with no funding and no on-call. There is no bounty and

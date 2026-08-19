@@ -64,11 +64,30 @@ pub fn is_configured() -> bool {
     MANAGER.get().is_some()
 }
 
+/// `CORDIAL_TRACE_ASSETS=1` is the one env var this module's tracing is
+/// documented to key off; `CORDIAL_TRACE` is accepted too where it was
+/// already wired in, but never required — `CORDIAL_TRACE=1` wraps variadic
+/// functions with fixed-arity declarations and aborts the engine
+/// (AGENTS.md), so a trace line gated on it alone is not reachable without
+/// killing the client. That was true of the miss line below until this
+/// change: it checked `CORDIAL_TRACE` only, so a miss — the empty-string
+/// signature this investigation is chasing — could never actually be
+/// observed. See docs/analysis/flag-init.md §34, "What is left after
+/// twenty-four".
+fn trace_assets_enabled() -> bool {
+    std::env::var_os("CORDIAL_TRACE_ASSETS").is_some() || std::env::var_os("CORDIAL_TRACE").is_some()
+}
+
 impl Manager {
     /// Read `assets/<name>`, consulting the overlay stack before the APK, and
-    /// caching whichever bytes win.
+    /// caching whichever bytes win. Every outcome — cache, overlay, APK, or
+    /// miss — is traced under `CORDIAL_TRACE_ASSETS=1` so a miss is visible,
+    /// not just a hit.
     fn read(&self, name: &str) -> Option<&'static [u8]> {
         if let Some(bytes) = self.cache.lock().ok()?.get(name) {
+            if trace_assets_enabled() {
+                eprintln!("[asset] hit (cache): {name}");
+            }
             return Some(bytes);
         }
 
@@ -79,8 +98,6 @@ impl Manager {
             // fallback — fall through to the APK exactly as if the overlay
             // had never had it.
             if let Ok(bytes) = std::fs::read(&path) {
-                // `CORDIAL_TRACE_ASSETS=1`, not `CORDIAL_TRACE`.
-                //
                 // This line was the only way to observe that an overlay had
                 // applied, and it was gated on a flag AGENTS.md tells people
                 // never to set: `CORDIAL_TRACE=1` wraps variadic functions with
@@ -88,10 +105,8 @@ impl Manager {
                 // diagnostic for ADR-010 could not be reached without killing
                 // the client, which means nobody could confirm an overlay was
                 // working except by looking at the screen.
-                if std::env::var_os("CORDIAL_TRACE_ASSETS").is_some()
-                    || std::env::var_os("CORDIAL_TRACE").is_some()
-                {
-                    eprintln!("[asset] overlay: {name} from {}", source.describe());
+                if trace_assets_enabled() {
+                    eprintln!("[asset] hit (overlay): {name} from {}", source.describe());
                 }
                 let leaked: &'static [u8] = Vec::leak(bytes);
                 self.cache.lock().ok()?.insert(name.to_string(), leaked);
@@ -99,11 +114,23 @@ impl Manager {
             }
         }
 
-        let file = File::open(&self.apk).ok()?;
-        let mut zip = zip::ZipArchive::new(file).ok()?;
-        let mut entry = zip.by_name(&format!("assets/{name}")).ok()?;
-        let mut bytes = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut bytes).ok()?;
+        let Some(bytes) = (|| -> Option<Vec<u8>> {
+            let file = File::open(&self.apk).ok()?;
+            let mut zip = zip::ZipArchive::new(file).ok()?;
+            let mut entry = zip.by_name(&format!("assets/{name}")).ok()?;
+            let mut bytes = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut bytes).ok()?;
+            Some(bytes)
+        })() else {
+            if trace_assets_enabled() {
+                eprintln!("[asset] miss: {name}");
+            }
+            return None;
+        };
+
+        if trace_assets_enabled() {
+            eprintln!("[asset] hit (apk): {name}");
+        }
 
         // Deliberately leaked. Asset lifetimes in this API are the caller's to
         // manage and Roblox is not careful about them; an asset outliving its
@@ -352,14 +379,11 @@ extern "C" fn asset_manager_open(
 
     match manager.read(&name) {
         Some(bytes) => Box::into_raw(Box::new(Asset { bytes })) as *mut c_void,
-        None => {
-            // Not an error worth failing on: Android's asset manager returns null
-            // for a missing asset and callers probe for optional files.
-            if std::env::var_os("CORDIAL_TRACE").is_some() {
-                eprintln!("[asset] miss: {name}");
-            }
-            std::ptr::null_mut()
-        }
+        // Not an error worth failing on: Android's asset manager returns null
+        // for a missing asset and callers probe for optional files. `read`
+        // already traced the miss (under `CORDIAL_TRACE_ASSETS=1`) with the
+        // name; nothing more to add here.
+        None => std::ptr::null_mut(),
     }
 }
 

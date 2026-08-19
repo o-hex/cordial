@@ -3756,3 +3756,80 @@ input. The first is testable. The second would mean §30's conclusion was right
 after all and only §31's evidence — Sober's byte-identical text — stands against
 it, which would put this back in front of the project owner as an ADR-001
 question rather than an engineering one.
+
+## §35. The contradiction is settled, AssetManager is dead, and that is the surface exhausted
+
+**§28 was right; §34's "at `dlopen` time" is retracted.** Markers either side of
+`linker::dlopen`, three plain undebugged repeats, identical in shape:
+
+    line  28   BEFORE dlopen(libroblox.so)
+    line 135   AFTER dlopen(libroblox.so) returned
+    line 162   nativeInitClientSettings -> 0
+    line 174   stat("") = -1   (x3, on a freshly spawned tid)
+
+`dlopen` returns and `JNI_OnLoad` completes long before `nativeInitClientSettings`
+runs, which is itself before the failure. So the attempt is **not** during ELF
+construction, and everything Cordial does before `dlopen` returns is available to
+it by the time it fails.
+
+**`AssetManager` is dead too, and finding that required fixing the instrument
+first.** `android/asset.rs` traced overlay *hits* under `CORDIAL_TRACE_ASSETS`,
+but the **miss** trace was gated on `CORDIAL_TRACE` — the flag AGENTS.md says
+never to set, because it wraps variadics unsafely and aborts the engine. **A miss
+had therefore never been observable.** That is the same shape as §23.5's path
+trace not wrapping `statvfs`, and it is the seventh instrument fault this
+document has recorded. All four outcomes are traced from one place now.
+
+With it fixed: four runs, 328 asset-trace lines, byte-identical as sets across
+repeats. Every miss is the engine's normal prefix probe — `android/<path>` then
+`ExtraContent/<path>` then `content/<path>` — resolving under a later prefix. Of
+56 distinct basenames, exactly one never resolves anywhere,
+`fonts/NotoSansCJK-Regular.ttc`, and `unzip -l` confirms it is genuinely absent
+from the APK rather than a Cordial gap. Nothing missing is root- or
+settings-shaped.
+
+And the timing settles it independently: **AssetManager's first request lands
+about a thousand log lines after the three failing `stat("")` calls**, in both
+combined runs. The channel is not touched until long after the failure has
+happened and been memoised.
+
+### Twenty-five candidates, and the surface is exhausted
+
+Self-path introspection (§32). JNI at the moment of failure (§29) and every
+specific method named (§33, §34). Every directory setter, at the earliest timing
+that exists (§27, §29). Every storage flag. The settings document. The scheduler.
+`getAllocatableBytes`. `statvfs`. The Android directory layout. Channel
+verbosity. `getenv`. System properties. `TMPDIR`. Constructor deferral. Retry.
+Init params. And now `AssetManager`.
+
+What remains is the one thing with no host-observable input at all: an internal
+default. That is §30's conclusion, which §31 knocked down and which now stands
+back up — with the important difference that **§31's evidence still holds**.
+Sober reaches `flagLoaded` storage with its engine text byte-identical to disk,
+so *something* reaches this state without rewriting instructions. Either Sober
+forces a data byte, which the text comparison cannot see and mocktail's own
+flags patch proves is a real technique, or there is a route none of
+twenty-five candidates has touched.
+
+**So this is where it goes to the project owner.** Not as "we ran out of ideas" —
+as a measured position: the host-application surface is exhausted, the remaining
+route is the memory write [ADR-001](../adr/ADR-001-in-process-hooking.md) and
+[ADR-003](../adr/ADR-003-plugin-isolation.md) make deliberately absent, and that
+absence exists precisely because a fork is building a script executor on this
+codebase. Storage would cost that.
+
+### What the investigation is worth
+
+Twenty-five candidates eliminated with controls. **Seven wrong conclusions
+retracted, and every single one was an instrument rather than the engine** — a
+path trace blind to `statvfs`, a channel sweep with the wrong value shape, a
+function boundary from a prologue scan, two `lldb` attaches arriving too late, a
+halting harness untrustworthy for timing, two output streams with different
+buffering read as one timeline, and an asset miss-trace behind a flag that kills
+the process.
+
+The other half of this same investigation *was* reachable, and is fixed:
+`onFlagsLoaded` fires, `areFlagsLoaded:true`, the chain runs to `startLuaApp_`.
+One gate was an ordering mistake in Cordial and the other is inside the engine.
+Only measurement told them apart, and it took seven retractions to trust the
+measurements.

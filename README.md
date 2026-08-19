@@ -153,7 +153,10 @@ will be declined.
 | Launching from the shell | ✅ finds a build, or explains how to get one |
 | Choosing a profile | ✅ a chooser above the Launch button; creates one, and shows a profile another window holds as unavailable |
 | Audio | 🟡 sound leaves the OpenSL ES bridge into PipeWire, measured with a control; never yet verified inside an experience, and FMOD may take a Java path that bypasses it entirely |
-| Web views (Marketplace, Profile, Communities…) | ❌ the surface is mapped; `openNativeOverlay` now reports instead of silently swallowing |
+| Web views (Marketplace, Profile, Communities…) | ❌ the request now *arrives* — Cordial subscribes to `WebView.openWindow` over the engine's own MessageBus and logs the payload — but nothing renders it yet, and opening one blanks the window |
+| **Asset overlays** (custom textures, sounds, fonts) | ✅ drop a file mirroring the APK's `assets/` tree into `~/.config/cordial/overlay` and it is served instead; nothing is modified, remove the file and the original returns |
+| Fullscreen | 🟡 F11 with the header bar hidden, and the choice persists per profile — but on the launcher window, not the one you play in |
+| **The engine's content store** | ❌ `RbxStorage` never initialises, so every asset is fetched from the network every session; this is why loading is sometimes slow-and-complete and sometimes fast-and-untextured |
 | Clean shutdown | ✅ full pause/stop/destroy sequence, observed in the engine's own log |
 | Plugins | 🟡 host, broker, per-profile grants and settings, an on/off switch, and a registry with hardened unpacking; no marketplace yet |
 
@@ -162,11 +165,25 @@ presents drop to exactly 1/s when nothing is happening and every earlier figure
 in this repository was that idle throttle integrated: a flat 60.0 on MAILBOX
 against a variable 35–50 on FIFO, four runs of 120 s.
 
-**What is left is polish and two real gaps.** Text fields take the characters
+**What is left is polish and three real gaps.** Text fields take the characters
 and do not draw them until focus leaves, because on Android a transparent
-`EditText` draws a focused box and there is none here. And Roblox is never told
-it may capture the pointer, so in first person the cursor walks off the window —
-the native that says so is exported and has never been called.
+`EditText` draws a focused box and there is none here — mocktail does not manage
+this either. Roblox is never told it may capture the pointer, so in first person
+the cursor walks off the window; the native that says so is exported and has
+never been called. And the content store does not come up, so nothing is cached
+between sessions.
+
+**The content store is the one worth knowing about**, because it is the reason
+loading is inconsistent rather than slow. `RbxStorage::init` does run — on every
+launch, during the engine's own ELF constructors, before `JNI_OnLoad` — and it
+fails on a path that is empty that early, then *memoises* the failure, so the
+later caller that succeeds on Android is handed the broken object and never
+retries. Twenty candidate explanations were eliminated with controls before that
+was established, and most of this repository's analysis of it had to be
+retracted: for weeks the evidence said storage was never asked for, and the
+evidence was a log channel that could not be configured until after the code had
+already run. See [`docs/analysis/flag-init.md`](docs/analysis/flag-init.md) §25
+onwards.
 
 **The keyboard took a week and the answer was one number.**
 `nativePassKeyEvent` wants Linux evdev codes; it was being handed Android

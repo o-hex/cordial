@@ -2759,6 +2759,49 @@ fn main() -> ExitCode {
                                                     std::thread::sleep(
                                                         std::time::Duration::from_millis(ms),
                                                     );
+                                                    // Deliver the settings again
+                                                    // here, immediately before the
+                                                    // post call, so the app-provided
+                                                    // document is the freshest thing
+                                                    // the engine has when the block
+                                                    // runs.
+                                                    //
+                                                    // Sober's `flagLoaded` arrives
+                                                    // from the app handing settings
+                                                    // over; Cordial's now arrives
+                                                    // from the engine fetching them
+                                                    // itself inside
+                                                    // `bootstrapTheApp_`. Both end
+                                                    // with `continueAfterFlagsLoaded_`
+                                                    // and only Sober's is followed by
+                                                    // `RbxStorage::init [INIT] user:
+                                                    // flagLoaded`, so the two routes
+                                                    // may not be equivalent to
+                                                    // whatever asks for storage.
+                                                    // **Tested and it changes
+                                                    // nothing**, so it is off by
+                                                    // default and kept only as the
+                                                    // record of a disproved theory:
+                                                    // with the app delivering the
+                                                    // document again here, against a
+                                                    // control without it, storage is
+                                                    // absent either way. The two
+                                                    // routes to `flagLoaded` are not
+                                                    // what distinguishes Sober.
+                                                    // `CORDIAL_LATE_SETTINGS_TOO=1`
+                                                    // turns it back on.
+                                                    if std::env::var_os("CORDIAL_LATE_SETTINGS_TOO").is_some() {
+                                                        if let Some(sf) = lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings") {
+                                                            let doc = cordial_runtime::client_settings::load(
+                                                                opt.client_settings.as_deref(),
+                                                            )
+                                                            .unwrap_or_default();
+                                                            match linker::game_activity::init_client_settings(sf, &doc, "", "") {
+                                                                Ok(code) => println!("  late settings ({} bytes) -> {code}", doc.len()),
+                                                                Err(e) => println!("  late settings failed: {e}"),
+                                                            }
+                                                        }
+                                                    }
                                                     match lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3") {
                                                         None => println!("  late post: not exported"),
                                                         Some(f) => match linker::game_activity::post_client_settings_loaded(f) {

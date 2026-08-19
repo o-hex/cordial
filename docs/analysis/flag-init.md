@@ -2444,3 +2444,19 @@ the only difference left inside the block, it is immediately upstream of the
 missing line, and the relative-path split is a mechanism that would explain a
 silent skip. That is a lead with something behind it rather than another flag to
 try, and it is where the next session should start.
+
+### §23.3 The two routes to `flagLoaded` are not the difference
+
+Sober reaches `flagLoaded` from the application handing the settings document
+over. Cordial now reaches it from the engine fetching its own inside
+`bootstrapTheApp_`. Both end in `continueAfterFlagsLoaded_`, and only Sober's is
+followed by `RbxStorage::init [INIT] user: flagLoaded`, which made "the routes
+are not equivalent to whatever asks for storage" the obvious next theory.
+
+It is wrong. Delivering the document again on the app's route, immediately before
+the late post call, against a control without it, on fresh data roots:
+
+    with late settings     flags loaded = 1   RbxStorage = 0   storage files = 0
+    without                flags loaded = 1   RbxStorage = 0   storage files = 0
+
+The switch is kept, off by default, as the record. Sixteen candidates now.

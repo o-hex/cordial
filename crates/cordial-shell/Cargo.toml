@@ -28,6 +28,14 @@ path = "src/main.rs"
 default = []
 webview = ["dep:webkit6"]
 
+# Asks a live page what it got, which is the only way to answer "does this
+# machine's WebKitGTK do WebAuthn" — see the file. Not built by `cargo test
+# --workspace`, which runs without `webview`: an example whose
+# `required-features` are absent is skipped rather than failed.
+[[example]]
+name = "webauthn_probe"
+required-features = ["webview"]
+
 [dependencies]
 cordial-plugins = { path = "../cordial-plugins" }
 # The engine cache's stamp (ADR-015). `install.rs` used to test presence alone,

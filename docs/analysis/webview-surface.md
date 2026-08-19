@@ -365,8 +365,14 @@ here has measured it.
 
 ## 7. Build dependency
 
-Stage 3 of this work — an actual `WebKitWebView` — is **blocked on a package that
-is not installed**:
+**Superseded.** The container `just build toolbox` uses carries
+`webkitgtk6.0-devel-2.52.5-1.fc44`, the `webview` feature builds, and §9's
+probe runs against a live `WebKitWebView`. What follows is the state that held
+when this section was written, kept because the pkg-config output below is
+still the check to run on a machine where the feature will not build.
+
+Stage 3 of this work — an actual `WebKitWebView` — was **blocked on a package
+that was not installed**:
 
 ```
 $ pkg-config --modversion webkitgtk-6.0
@@ -409,6 +415,124 @@ Urls are printed with their query string elided. They can carry a single-use
 authentication ticket, and the cookie path beside them carries `.ROBLOSECURITY`
 (§4). A truncation rather than an elision would still print the front of a
 token, which is why the helper cuts at the `?` rather than at a length.
+
+## 9. WebAuthn — measured absent, and not a build flag away
+
+**A Roblox account with a passkey enrolled cannot finish sign-in in this
+window, on any WebKitGTK build available today.** Not "does not yet"; the API
+the flow needs is absent from the browser engine, not merely disabled in it.
+
+### What was measured
+
+`crates/cordial-shell/examples/webauthn_probe.rs` drives the same
+`webview::open` the engine's `openWindow` request takes — same ephemeral
+`NetworkSession`, same `UserContentManager`, same policy — and `open` asks the
+loaded page three questions. Against `https://www.roblox.com/login`, six
+runs on 2026-08-20 with byte-identical output — three on a tree at
+`0.5.2-165-g76ec67e-dirty` and three after the 0.6.0 bump at `0.6.0-dirty` —
+and the same line again against `https://www.roblox.com/`, so it is a property
+of the build and not of the sign-in page:
+
+```
+[webview] this WebKitGTK build has no WebAuthn
+    (PublicKeyCredential/navigator.credentials/isSecureContext
+     = undefined undefined true)
+```
+
+`isSecureContext` is `true`, so this is not the ordinary "WebAuthn is hidden
+outside a secure context" answer — the bindings are absent. The same probe
+through `gjs` against the same library agrees, and so does
+`org.gnome.Platform//50`'s own `libwebkitgtk-6.0.so.4.16.9`, which is what a
+Flatpak build would run against rather than the host's.
+
+The control that makes this a measurement rather than a constant: the identical
+expression with `Notification` in place of `PublicKeyCredential` returns
+`function undefined true` on the same page, so the probe does distinguish a
+name that exists from one that does not. A second control fell out of the same
+script — the same expression on a `data:` URL reports `isSecureContext` as
+`false`, so the boolean is being read from the page rather than invented.
+
+The probe runs in a **named script world**, not the page's own, and that is not
+decoration either. Measured on a page whose only content is
+`window.PublicKeyCredential = function () {}`: the main world answers
+`function undefined true` and the named world answers `undefined undefined
+true` on the same load. A page can therefore talk the main world into
+reporting a capability the build does not have, and cannot talk this
+diagnostic into it — which matters because the page it runs on is the sign-in
+page.
+
+Builds measured: `webkitgtk6.0-2.52.5-1.fc44` (host, and what a
+`just build toolbox` binary executes against) and `org.gnome.Platform//50`.
+
+### Why no rebuild fixes it
+
+Read from upstream WebKit's own tree rather than from release notes, and this
+is source reading rather than a run — but it is source reading of the thing
+that would have to change, which is a different kind of claim from reasoning
+about a stripped binary:
+
+- `Source/cmake/WebKitFeatures.cmake` carries
+  `WEBKIT_OPTION_DEFINE(ENABLE_WEB_AUTHN "Toggle Web AuthN support" PRIVATE OFF)`.
+  `PRIVATE` means it is not a switch a packager is offered.
+- `Source/cmake/OptionsGTK.cmake` never mentions `WEB_AUTHN` or `LIBFIDO2` at
+  all, so the GTK port does not turn it on.
+- `Source/WebKit/UIProcess/WebAuthentication/` holds `Cocoa/`, `Mock/`,
+  `Virtual/` and `fido/`. `fido/` is the transport-agnostic CTAP layer.
+  **Every actual transport is Objective-C++ under `Cocoa/`** — `HidService.mm`
+  (USB), `NfcService.mm`, `CcidService.mm`, `LocalService.mm`/
+  `LocalAuthenticator.mm` (the platform authenticator).
+  `AuthenticatorTransportService::create` names all four unconditionally.
+
+So there is no Linux `HidService` to link against and no libfido2 backing in
+the tree; `-DENABLE_WEB_AUTHN=ON` on the GTK port would not build, let alone
+talk to a key. This is upstream work in WebKitGTK, not packaging work, and not
+work Cordial can do in this repository.
+
+Consistent with that, and cheap to re-check on any machine: `readelf -d` on
+either `libwebkitgtk-6.0.so.4` lists no `libfido2`, and its dynamic symbol
+table has no undefined `fido_*`. Enumerating all 782 `WebKitFeature`s through
+`webkit_settings_get_all_features` finds no WebAuthn toggle either — only
+`LoginStatusAPIRequiresWebAuthn`, which is a sub-flag of a different, also
+disabled, feature.
+
+### What Cordial does about it
+
+Reports it, and nothing else. `webview.rs` prints the line above once per
+process on the first finished load.
+
+**Deliberately no polyfill.** A shim standing in for
+`navigator.credentials.get` — even one that rejects — would be a stub that
+lies in the sense AGENTS.md means: the page would proceed believing an
+authenticator was asked and declined, when nothing was asked at all, and the
+failure would then surface somewhere with no relationship to its cause. The
+absence is left where a reader can find it.
+
+**Deliberately no Flatpak device grant.** A USB FIDO2 key is a `/dev/hidraw*`
+node, and Flatpak's only lever coarse enough to reach it is `--device=all`,
+which is every device node in the sandbox — cameras, input devices, everything.
+Granting that for a feature no code in the sandbox can use would be a
+permission that lies about a capability, on the one file in this repository
+that exists to be audited. `packaging/io.github.luohoa97.Cordial.yml` records
+what would be needed, commented out, beside the reason it is not granted.
+
+### What would actually let a passkey user in
+
+Unresolved, and listed rather than chosen, because each of these is a design
+decision for the maintainer and none of them has been measured:
+
+1. WebKitGTK grows a Linux WebAuthn backend upstream. **INFERRED** that the
+   manifest's device grant would then be the whole of Cordial's side of it —
+   nothing has been built that way to check.
+2. Sign-in moves out of the embedded view to the user's own browser through
+   `org.freedesktop.portal.OpenURI`, and the session comes back by a route the
+   user drives. Cordial already seeds a validated `.ROBLOSECURITY` into the
+   view (`WindowRequest::roblox_session_cookie`) and already keeps one in the
+   secret service (ADR-012), so the storage half exists; the transfer half does
+   not, and any design for it must not have Cordial reading another
+   application's cookie jar.
+3. Roblox's own cross-device sign-in, if the Android client's login page offers
+   it under Cordial's user agent. Nobody has looked, because looking means
+   reaching a sign-in page with an account.
 
 ## The transport, found in mocktail's bridge rather than by tracing
 

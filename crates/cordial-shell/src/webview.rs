@@ -355,6 +355,65 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
         true
     });
 
+    // Whether this WebKitGTK build has WebAuthn at all, asked of a live page,
+    // once per process. A Roblox account with a passkey enrolled cannot finish
+    // sign-in without `navigator.credentials.get`, and when the binding is
+    // absent the site's passkey button throws `undefined is not an object`
+    // somewhere inside minified JS, in a window with no console and no error
+    // path back to Cordial -- the silent shape this whole module exists to end.
+    //
+    // Asked rather than read off the library, because `ENABLE_WEB_AUTHN` is a
+    // property of whichever libwebkitgtk the machine happens to carry and
+    // upstream's default answers only for upstream. What was measured, and the
+    // reason it is not a passing detail, is in
+    // `docs/analysis/webview-surface.md` section 9.
+    //
+    // Nothing is polyfilled here and nothing should be. A shim standing in for
+    // `navigator.credentials.get` would be a stub that lies: the page would
+    // carry on believing an authenticator had been asked and had refused,
+    // when nothing was asked at all. Reporting the gap leaves it where
+    // somebody can find it, which is the whole of `native/opensles.cpp`'s
+    // reasoning applied one layer up.
+    view.connect_load_changed(|v, event| {
+        if event != webkit6::LoadEvent::Finished {
+            return;
+        }
+        static PROBED: std::sync::Once = std::sync::Once::new();
+        PROBED.call_once(|| {
+            // Two type names and a boolean, and deliberately nothing else. A
+            // bare `typeof` cannot carry a session cookie, a one-time ticket
+            // or an address, which matters because the page this runs on is
+            // usually the sign-in page.
+            const PROBE: &str = "[typeof PublicKeyCredential, typeof navigator.credentials, \
+                String(window.isSecureContext)].join(' ')";
+            // Run in a named script world rather than the page's own. A world
+            // sees the real IDL bindings but not properties the page defined,
+            // so `window.PublicKeyCredential = function () {}` in the page
+            // cannot talk this diagnostic into reporting a capability the
+            // build does not have. The distinction costs one argument and the
+            // page in question is a sign-in page.
+            const WORLD: &str = "cordial-capability-probe";
+            v.evaluate_javascript(PROBE, Some(WORLD), None, gtk4::gio::Cancellable::NONE, |r| {
+                match r {
+                    Ok(value) => {
+                        let answer = value.to_str();
+                        if answer.starts_with("undefined") {
+                            eprintln!(
+                                "[webview] this WebKitGTK build has no WebAuthn \
+                                 (PublicKeyCredential/navigator.credentials/isSecureContext = \
+                                 {answer}) -- a passkey sign-in cannot complete in this window; \
+                                 see docs/analysis/webview-surface.md section 9"
+                            );
+                        } else {
+                            eprintln!("[webview] WebAuthn is present in this build ({answer})");
+                        }
+                    }
+                    Err(e) => eprintln!("[webview] could not ask the page about WebAuthn: {e}"),
+                }
+            });
+        });
+    });
+
     let header = adw::HeaderBar::new();
     // `showDomainAsTitle` exists because a user in a payment flow needs to be
     // able to see who they are actually talking to. When the engine asks for it,

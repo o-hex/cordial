@@ -68,6 +68,31 @@ finish-args:
   # GPU. Roblox's Android build needs GLES2 + EGL; Vulkan is dlopen'd and
   # optional (docs/findings.md §5).
   - --device=dri
+  # **A USB FIDO2 security key is deliberately NOT reachable, and this is the
+  # reasoning rather than an oversight.**
+  #
+  # An account with a passkey enrolled cannot finish sign-in in Cordial's web
+  # window, because the window has no WebAuthn to offer it. Measured, not
+  # assumed: `PublicKeyCredential` and `navigator.credentials` are both
+  # `undefined` in a secure context, in `webview::open`'s own view, on both
+  # `webkitgtk6.0-2.52.5-1.fc44` and this runtime's own
+  # `libwebkitgtk-6.0.so.4.16.9`. It is not a build flag away either — every
+  # WebAuthn transport upstream is Objective-C++ under `Cocoa/`, so the GTK
+  # port has no USB HID service to enable. `docs/analysis/webview-surface.md`
+  # section 9 has the runs and the control.
+  #
+  # The grant it would need, when that changes:
+  #
+  #     - --device=all
+  #
+  # and only that one. A FIDO2 key is a `/dev/hidraw*` node; `--device=usb` is
+  # `/dev/bus/usb` alone (flatpak-metadata(5)) and does not reach hidraw, so
+  # there is no narrower lever than "every device node in /dev" — cameras and
+  # input devices included. Adding it today would widen the sandbox for a
+  # capability no code inside it can use, which is a permission that lies about
+  # what the application does, on the one file here that exists to be audited.
+  # Uncomment it in the same change that makes a passkey prompt actually reach
+  # a key, never before.
   - --socket=wayland
   - --socket=fallback-x11
   - --share=ipc

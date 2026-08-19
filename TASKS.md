@@ -646,3 +646,56 @@ thing in the repository to borrow, not the most.
 
 What is worth taking from that area is the gesture and sensor list above, which
 is a list of calls rather than a design.
+
+---
+
+## Audio, compared against mocktail: nothing to do
+
+Read-only comparison of `native/opensles.cpp`, `pipewire_backend.cpp` and
+`audio_classes.cpp` against mocktail's `src/audio/`. **No bugs found, and nothing
+missing relative to theirs.** Recorded so the next person does not repeat it.
+
+**Cordial is ahead here, in two ways worth protecting from a later "cleanup":**
+
+*The OpenSL recorder is real.* `native/opensles.cpp` implements the full
+`SLRecordItf` over PipeWire, opening and closing a capture stream on the actual
+`RECORDING`/`PAUSED`/`STOPPED`/`Destroy` transitions. mocktail's
+`EngineCreateAudioRecorder` unconditionally returns
+`kResultFeatureUnsupported` — recording through OpenSL is simply refused there.
+
+*The Android audio classes are answered.* Cordial implements
+`android/media/AudioManager`, `AudioRecord`, `AudioDeviceInfo`,
+`WebRtcAudioManager` and `WebRtcAudioRecord` with real PipeWire-backed device
+data. mocktail registers `AudioManager` with **zero method hooks** and has none of
+the others. A build that calls `AudioManager.getDevices()` gets a real answer from
+Cordial and jnivm's untyped fallback from mocktail.
+
+### A correction
+
+`AppRtcDeviceWrapper` has been described in this backlog as the real voice path
+that Cordial implements none of, with the implication that mocktail does.
+**It does not.** `grep -r AppRtcDeviceWrapper` returns nothing in mocktail's tree.
+The class is real — `libroblox.so` exports
+`Java_com_roblox_audio_AppRtcDeviceWrapper_nativeAudioDeviceChanged` — but it is
+unimplemented in *both* projects. Voice chat is dead on both for the same reason,
+and it is a shared gap rather than a comparative one.
+
+### One feature they have that Cordial cannot have
+
+mocktail feeds Roblox's own in-game audio-output picker a live device list by
+**vtable-patching `FmodAudioDevice` inside the mapped `libroblox.so` image** —
+`mprotect` on the RELRO range and writing over the output-selection methods,
+`src/audio/roblox_output_device_bridge.cc:120`.
+
+That is precisely what [ADR-001](docs/adr/ADR-001-in-process-hooking.md) and
+[ADR-003](docs/adr/ADR-003-plugin-isolation.md) put permanently out of scope: no
+hooking, no memory patching of the Roblox process, *absent* rather than disabled.
+
+So the user-visible difference is real and will not be closed by implementing
+something. A mocktail user who opens Roblox's audio-output menu sees it
+populated; a Cordial user does not. Cordial's output follows the host default
+through PipeWire's `PW_ID_ANY` and autoconnect instead, so switching devices
+works — through the system mixer rather than from inside Roblox's settings.
+
+Worth stating in those terms rather than as a gap, because someone will
+eventually file it as a bug and the answer is a design decision, not an omission.

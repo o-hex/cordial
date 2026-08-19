@@ -952,3 +952,61 @@ movement during the spike:
 If they appear in pairs while the sensitivity is wrong, that is it. Worth having
 before touching the lock logic — this file has a history of fixes that addressed
 the wrong half.
+
+---
+
+## The untextured load is not the texture manager. It is the missing content store
+
+Run side by side on the same place, same session, same account:
+
+| run | manager the engine chose | asset failures |
+|---|---|---|
+| default | **TM2** | 6 |
+| `...DenyPattern2=".*"` | **TM1** | 2 |
+| default, the untextured one reported from play | **TM2** | 12 |
+
+**The run that came out untextured was on TM2.** So denying TM2 was never the
+cause of the good case and TM1 was never the cause of the bad one — the same
+manager produces both. That closes the line of questioning `dc650e5` opened, and
+it means the flag was doing nothing useful in either direction.
+
+### What the failures actually are
+
+Not textures at all:
+
+    Asset (Image) "rbxthumb://type=AvatarHeadShot&id=&w=48&h=48..." load failed:
+      Error parsing batch thumbnail request
+
+**`id=` is empty.** Those are avatar head-shots requested with no user id, which
+is an identity-propagation problem wearing a texture's clothes, and it accounts
+for the blank player icons in the reported screenshot. Worth its own entry; it is
+not what makes the world untextured.
+
+### The variance has an obvious cause and we have been chasing it all session
+
+Reported: *"sometimes the loading screen is really slow and the game loads
+everything, but another run may load really fast but the textures aren't loaded
+and everything is still loading."*
+
+That is precisely what a client with **no content store** looks like.
+`RbxStorage::init` never runs, so nothing is cached between sessions or within
+one, and every asset is fetched from the network every time. Load behaviour is
+then entirely at the mercy of the network and of whatever order the engine
+happens to ask in — fast and incomplete, or slow and complete, with nothing in
+between and no reason for either.
+
+The same log carries `RbxStorage is not initialized` twice while this was
+happening.
+
+So the storage gap is not an abstract completeness issue to be closed one day.
+**It is the cause of the loading behaviour a player actually notices**, and that
+reframes its priority: it was being tracked as a possible cause of the 304, which
+§14 weakened, and it should be tracked as the cause of this instead, which is
+observed.
+
+### What this does not explain
+
+Nine frames per second in that session, with 188 ms ping. Untextured geometry
+should be cheaper to draw rather than more expensive, so the frame rate is a
+separate fact and AGENTS.md's rules about measuring it apply — nothing here drove
+input for the measurement, so 9 fps is a number off a HUD and not a result.

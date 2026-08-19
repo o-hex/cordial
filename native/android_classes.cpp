@@ -1226,6 +1226,15 @@ namespace cordial {
 void register_platform_classes(jnivm::ENV* env);
 }
 
+// Defined in battery.cpp. Separate because its header comment has to carry
+// where `BatteryStatus`'s field names came from (`tools/dex_fields.py`, a
+// declaration-only reader this task added alongside `dex_method.py`) and what
+// is and is not confirmed about them without a live run to watch, neither of
+// which belongs buried in this file's preamble.
+namespace cordial {
+void register_battery_classes(jnivm::ENV* env);
+}
+
 // -------------------------------------------------------- the identity, in and out
 //
 // Cordial's own boundary, not Roblox's: `crates/cordial-runtime/src/identity.rs`
@@ -1631,6 +1640,7 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
     cordial::register_shared_preferences(env);
     cordial::register_local_storage_classes(env);
     cordial::register_platform_classes(env);
+    cordial::register_battery_classes(env);
     if (getenv("CORDIAL_JNI_TRACE")) {
         fprintf(stderr, "[classes] Cordial's Java side registered\n");
     }

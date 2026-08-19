@@ -779,6 +779,103 @@ fn wire_refresh_rate(lib: linker::Library) {
     }
 }
 
+/// Tell the engine about the battery, and keep it told.
+///
+/// `NativeGLInterface.reportBatteryStateChanged`/`reportBatteryStatus` are
+/// exported by every build this project has looked at and neither had ever
+/// been called — see `cordial_runtime::battery` for the sysfs read and for
+/// where the two-int call's argument meaning came from (settled that the two
+/// things travel together and roughly how often; `INFERRED` on which int is
+/// which and their exact numbering).
+///
+/// Polls `/sys/class/power_supply` every fifteen seconds — the cadence
+/// `docs/traces/waydroid-roblox-startup.log.gz` shows the real Android app's
+/// own `BatteryStatusObserver` using for this same job, not a number invented
+/// here — well below the rate the engine itself polls cpufreq at, and only
+/// calls the engine when the reading actually differs from the one last
+/// reported, the same "do not re-announce nothing" shape `wire_refresh_rate`
+/// above uses `worth_announcing` for.
+fn wire_battery_reporting(lib: linker::Library) {
+    let state_changed_native =
+        lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_reportBatteryStateChanged");
+    let status_native =
+        lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_reportBatteryStatus");
+    println!(
+        "  battery: reportBatteryStateChanged {}",
+        if state_changed_native.is_some() { "resolved" } else { "NOT exported" }
+    );
+    println!(
+        "  battery: reportBatteryStatus {}",
+        if status_native.is_some() { "resolved" } else { "NOT exported" }
+    );
+    let (Some(state_changed_native), Some(status_native)) = (state_changed_native, status_native)
+    else {
+        return;
+    };
+
+    let power_supply_dir = std::path::PathBuf::from("/sys/class/power_supply");
+    let last: Rc<Cell<Option<cordial_runtime::battery::Reading>>> = Rc::new(Cell::new(None));
+
+    let report = move || {
+        let reading = cordial_runtime::battery::scan(&power_supply_dir);
+        let previous = last.take();
+        let changed = previous.as_ref() != Some(&reading);
+        if changed {
+            match cordial_runtime::battery::state_changed_args(&reading) {
+                Some((status, plugged)) => {
+                    match linker::game_activity::report_battery_state_changed(
+                        state_changed_native,
+                        status,
+                        plugged,
+                    ) {
+                        Ok(()) => {
+                            println!("  battery: reportBatteryStateChanged({status}, {plugged})")
+                        }
+                        Err(e) => println!("  battery: reportBatteryStateChanged failed: {e}"),
+                    }
+                }
+                // No battery present — see `battery::state_changed_args`'s own
+                // doc for why that skips the call rather than inventing a
+                // reading for a battery that does not exist.
+                None => println!(
+                    "  battery: no present battery; reportBatteryStateChanged skipped"
+                ),
+            }
+
+            let b = reading.battery.as_ref();
+            let fields = linker::game_activity::BatteryStatusFields {
+                present: b.map(|b| b.present),
+                percentage: b.and_then(|b| b.percentage).map(|p| p as i32),
+                status: b.map(|b| b.status),
+                health: b.and_then(|b| b.health),
+                voltage_mv: b.and_then(|b| b.voltage_mv),
+                current_now_ua: b.and_then(|b| b.current_now_ua),
+                current_avg_ua: b.and_then(|b| b.current_avg_ua),
+                charge_counter_uah: b.and_then(|b| b.charge_counter_uah),
+                power_now_uw: b.and_then(|b| b.power_now_uw),
+                technology: b.and_then(|b| b.technology.clone()),
+                // The DTO field is `Float`, not `Integer` — a real degree
+                // value, not Android's own tenths-of-a-degree convention. See
+                // `native/battery.cpp`'s `CordialBatteryStatus` doc.
+                temperature_c: b.and_then(|b| b.temperature_tenths_c).map(|t| t as f32 / 10.0),
+                plugged: reading.plugged,
+            };
+            match linker::game_activity::report_battery_status(status_native, &fields) {
+                Ok(()) => println!("  battery: reportBatteryStatus {fields:?}"),
+                Err(e) => println!("  battery: reportBatteryStatus failed: {e}"),
+            }
+        }
+        last.set(Some(reading));
+    };
+
+    report();
+
+    gtk4::glib::timeout_add_local(std::time::Duration::from_secs(15), move || {
+        report();
+        gtk4::glib::ControlFlow::Continue
+    });
+}
+
 /// Install what `cordial_runtime::webview::on_open_window` hands a parsed
 /// request to, so an `openWindow` message actually opens something instead of
 /// only being logged.
@@ -1965,6 +2062,13 @@ fn main() -> ExitCode {
                                         // `wire_refresh_rate` for what this
                                         // does and does not establish.
                                         wire_refresh_rate(lib);
+
+                                        // The battery, once, alongside the
+                                        // display facts just wired above --
+                                        // see `wire_battery_reporting` for
+                                        // what this does and does not
+                                        // establish about it mattering.
+                                        wire_battery_reporting(lib);
 
                                         // The content store, after the
                                         // directories above are set and before

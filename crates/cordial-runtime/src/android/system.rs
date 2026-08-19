@@ -20,6 +20,22 @@ use std::path::{Path, PathBuf};
 
 extern "C" {
     fn cordial_set_system_root(root: *const std::ffi::c_char);
+    fn cordial_set_files_dir(dir: *const std::ffi::c_char);
+}
+
+/// Tell the framework layer which files directory this profile uses.
+///
+/// `native/android_classes.cpp`'s `files_dir()` computed
+/// `cordial/instances/default/data` — the layout ADR-012 replaced — and followed
+/// no `--profile`, so `Context.getFilesDir()` answered about a directory the
+/// client was not using, identically for every profile. Call this with the same
+/// path handed to `nativeSetFilesDirectory`, and before anything asks: the C++
+/// side caches on first use.
+pub fn set_files_dir(dir: &Path) {
+    if let Ok(c) = CString::new(dir.to_string_lossy().as_bytes()) {
+        // SAFETY: the callee copies the string; `c` need not outlive the call.
+        unsafe { cordial_set_files_dir(c.as_ptr()) };
+    }
 }
 
 /// Where the host's fonts live. Searched in order; later entries do not

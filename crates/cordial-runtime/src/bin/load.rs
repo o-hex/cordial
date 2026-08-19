@@ -1444,6 +1444,21 @@ fn main() -> ExitCode {
                                         let external = format!("{root}/external");
                                         let _ = std::fs::create_dir_all(&external);
 
+                                        // And tell the framework layer the same
+                                        // thing, before anything asks it.
+                                        //
+                                        // `Context.getFilesDir()` was answering
+                                        // from a hardcoded
+                                        // `cordial/instances/default/data` -- the
+                                        // layout ADR-012 replaced -- which follows
+                                        // no profile and so gave every profile the
+                                        // same wrong directory. Passing the value
+                                        // the engine is about to be given means the
+                                        // two cannot disagree.
+                                        cordial_runtime::android::system::set_files_dir(
+                                            std::path::Path::new(files.as_str()),
+                                        );
+
                                         // The directory layout Android would
                                         // already have, created before the engine
                                         // looks for it.

@@ -3032,3 +3032,56 @@ since every directory Cordial sets is set after `dlopen` returns.
 The `[DONE]` emit site was not located; two mechanical scans found no reference,
 and pushing further would have crossed from observing into reading. So how far
 init gets past the empty stats is still unknown.
+
+### §26.1 Not getenv, not system properties, and not present on Android at all
+
+Three things established since §26, each with repeats.
+
+**The Android capture settles the shape.** `docs/traces/waydroid-roblox-startup.log.gz`
+contains exactly two `RbxStorage` lines in the whole file — `[INIT]` then
+`[DONE]`, both `user: flagLoaded`, 28.5 ms apart — and `[INIT]` fires at 0.4158 s,
+*after* `nativeInitClientSettings` at 0.3752 s. There is no earlier attempt, no
+failed attempt, and nothing labelled `"RbxStorage"` anywhere before it. **The
+constructor-time call Cordial makes does not happen on Android.** So this is not
+"Android supplies a value we do not"; it is "Android does not take this path".
+
+**`getenv` is ruled out.** Breakpoint on `getenv`, callers classified by whether
+the return address falls inside `libroblox.so`, gated against a breakpoint at
+`JNI_OnLoad`. Two runs: 1314 and 1309 calls process-wide, 8 from the engine in
+each, **all after `JNI_OnLoad`** — `OPENSSL_ia32cap`, `SSLKEYLOGFILE`, proxy
+variables. Zero before. Definitive.
+
+**System properties are ruled out too.** `CORDIAL_TRACE_PROPS=1` now names every
+`__system_property_get` and what it was told. An unknown key returns the empty
+string, which is exactly the `stat("")` shape, and properties are one of the few
+things readable that early on Android — so this was the strongest remaining
+candidate. It is wrong: **no property is queried before `JNI_OnLoad`.** Every
+query happens after, and they are `ro.build.version.sdk`, `ro.product.model`,
+`ro.hardware` and `ro.soc.manufacturer`.
+
+`ro.soc.manufacturer` comes back `<empty, not in table>`, twice a run. That is a
+real gap and it is **not** this bug — it happens after load — but it is the kind
+of empty answer that causes trouble somewhere else eventually, and it is now
+visible rather than silent.
+
+**And at the call site itself**, registers at the three empty `stat` calls hold
+`"rbx-storage"` as the only printable input; the pointers that come back empty
+have the shape of return-by-hidden-pointer output parameters rather than inputs.
+So the empty value is computed inside the callee, from state not visible at that
+frame at all. `INFERRED` from ABI shape, and the point at which further reading
+becomes reading Roblox's implementation rather than observing it.
+
+### Candidate twenty, and the question that is left
+
+Twenty eliminated. What is left is not "what value is missing" — that has been
+checked three ways and nothing is being handed in. It is:
+
+**What gates whether this constructor-time call is attempted at all, and why does
+that gate evaluate differently here than under Android's zygote-forked process?**
+
+Two routes follow from it, and they are design decisions rather than
+measurements: find and match the gate so the early attempt never happens, or find
+a way to make the engine retry after settings arrive. The second is implied by
+the `[INIT]`/`[DONE]` timing regardless — Android's single successful init is at
+0.4158 s, well after settings — so a client that fails at 0.0 s and memoises it
+needs a retry no matter what the gate turns out to be.

@@ -338,6 +338,22 @@ extern "C" fn system_property_get(name: *const c_char, value: *mut c_char) -> c_
         .map(|(_, v)| *v)
         .unwrap_or("");
 
+    // `CORDIAL_TRACE_PROPS=1` names every property the engine asks for and what
+    // it was told.
+    //
+    // An unknown key returns the empty string, and an empty string handed to
+    // something that then builds a path out of it is indistinguishable from a
+    // path that was never configured. `RbxStorage::init` fails during ELF
+    // construction on exactly that shape -- three `stat("")` in a row -- and
+    // system properties are one of the few things readable that early on
+    // Android and absent here. See docs/analysis/flag-init.md §26.
+    if std::env::var_os("CORDIAL_TRACE_PROPS").is_some() {
+        eprintln!(
+            "[props] {key} = {}",
+            if found.is_empty() { "<empty, not in table>" } else { found }
+        );
+    }
+
     let bytes = found.as_bytes();
     let n = bytes.len().min(PROP_VALUE_MAX - 1);
     // SAFETY: `value` has at least PROP_VALUE_MAX bytes per the ABI, and n < that.

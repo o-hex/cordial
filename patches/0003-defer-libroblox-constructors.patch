@@ -1,0 +1,60 @@
+diff --git a/linker/linker.cpp b/linker/linker.cpp
+index 5cc4238..357480d 100644
+--- a/linker/linker.cpp
++++ b/linker/linker.cpp
+@@ -2175,6 +2175,33 @@ static std::string android_dlextinfo_to_string(const android_dlextinfo* info) {
+                                         info->library_namespace : nullptr);
+ }
+ 
++// EXPERIMENTAL, cordial-agent-defer: whether the next do_dlopen() should map
++// and relocate a library without running its ELF constructors, leaving the
++// caller to call mcpelauncher_run_deferred_ctors() explicitly once it is
++// ready. See docs/analysis/flag-init.md §26 for why: RbxStorage::init runs
++// during libroblox.so's own constructors, before Cordial has told the engine
++// its directories, and memoises a failure nothing later can undo. This flag
++// exists to test whether deferring construction past that setup is coherent
++// at the linker level; it is not wired into the default load path.
++static bool g_defer_next_ctors = false;
++
++soinfo* soinfo_from_handle(void* handle);
++
++extern "C" void mcpelauncher_defer_next_ctors(int defer) {
++  g_defer_next_ctors = defer != 0;
++}
++
++// Runs whatever construction a prior do_dlopen() left pending because
++// g_defer_next_ctors was set. A no-op if constructors already ran (call_
++// constructors() is itself idempotent via soinfo::constructors_called), so
++// calling this on a handle that was never deferred is harmless.
++extern "C" void mcpelauncher_run_deferred_ctors(void* handle) {
++  soinfo* si = soinfo_from_handle(handle);
++  if (si != nullptr) {
++    si->call_constructors();
++  }
++}
++
+ void* do_dlopen(const char* name, int flags,
+                 const android_dlextinfo* extinfo,
+                 const void* caller_addr) {
+@@ -2284,10 +2311,17 @@ void* do_dlopen(const char* name, int flags,
+ 
+   if (si != nullptr) {
+     void* handle = si->to_handle();
+-    LD_LOG(kLogDlopen,
+-           "... dlopen calling constructors: realpath=\"%s\", soname=\"%s\", handle=%p",
+-           si->get_realpath(), si->get_soname(), handle);
+-    si->call_constructors();
++    if (g_defer_next_ctors) {
++      g_defer_next_ctors = false;
++      LD_LOG(kLogDlopen,
++             "... dlopen DEFERRING constructors (cordial-agent-defer): realpath=\"%s\", soname=\"%s\", handle=%p",
++             si->get_realpath(), si->get_soname(), handle);
++    } else {
++      LD_LOG(kLogDlopen,
++             "... dlopen calling constructors: realpath=\"%s\", soname=\"%s\", handle=%p",
++             si->get_realpath(), si->get_soname(), handle);
++      si->call_constructors();
++    }
+     if(extinfo && extinfo->flags & ANDROID_DLEXT_MCPELAUNCHER_HOOKS) {
+       for(auto&& sym : si->symbols) {
+         // Check if this symbol isn't relocated do a fake lookup to enshure orig is set

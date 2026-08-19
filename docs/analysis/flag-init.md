@@ -3085,3 +3085,141 @@ a way to make the engine retry after settings arrive. The second is implied by
 the `[INIT]`/`[DONE]` timing regardless — Android's single successful init is at
 0.4158 s, well after settings — so a client that fails at 0.0 s and memoises it
 needs a retry no matter what the gate turns out to be.
+
+## §27. Cordial can defer libroblox.so's own constructors past its directory
+## setup — and that is coherent but does not help, and going further is not
+## coherent at all
+
+Cordial owns its loader (`third_party/mcpelauncher-linker`, vendored), and
+`do_dlopen` (`bionic/linker/linker.cpp:2178`) already does its work in two
+separable steps: `find_library` maps and relocates the object, and only then,
+separately, does `si->call_constructors()` run the ELF constructors —
+`RbxStorage::init`'s home per §26. Nothing between those two steps requires
+the second; `soinfo::call_constructors()` is idempotent
+(`linker_soinfo.cpp:550`, guarded by `constructors_called`), so it can be
+called late instead of immediately without changing what a normal load does.
+
+`patches/0003-defer-libroblox-constructors.patch` adds exactly that split:
+`mcpelauncher_defer_next_ctors(1)` makes the next `dlopen` skip the
+constructor step; `mcpelauncher_run_deferred_ctors(handle)` runs it later.
+Both are new exports, called from nowhere in the default path —
+`crates/cordial-runtime/src/bin/load.rs` only reaches them behind
+`CORDIAL_DEFER_CTORS=1` (defer past the four `NativeSettingsInterface`
+directory setters, then run constructors) and `CORDIAL_DEFER_PAST_SETTINGS=1`
+(additionally defer past a direct, out-of-band call to
+`nativeInitClientSettings` — bypassing `bootstrapTheApp`'s normal callback
+route entirely, since that route needs `initializeNativeCode`, which needs
+constructors already run).
+
+### Deferring past the four directory setters is coherent, and does nothing
+
+Three plain runs, XDG_DATA_HOME wiped between each: `nativeSetFilesDirectory`,
+`nativeSetCacheDirectory`, `nativeSetExternalDirectory` and
+`nativeSetBaseDataDirectories` all report `ok (pre-ctors)` — called through
+Cordial's own `JNIEnv` (`linker::jni::create_vm()`, independent of
+libroblox.so's own state) before a single constructor of libroblox.so has
+run — and `mcpelauncher_run_deferred_ctors` then returns without crashing
+every time. This is the answer to the question this section set out to
+establish: **the four directory setters do not depend on
+constructor-initialised state.** Calling them before `.init_array` runs is
+safe.
+
+It also changes nothing. All three runs still show the exact §25 signature —
+
+    stat("./appData")  = 0
+    stat("./appData")  = 0
+    statvfs("./appData") = 0
+    stat("")            = -1
+    stat("")            = -1
+    stat("")            = -1
+
+— and no `rbx-storage.db` appears anywhere under the profile in any of them
+(checked with `find ~/.cache/cordial-agent-defer -iname '*rbx-storage*'`;
+only the empty directories Cordial itself pre-creates are ever there). A
+fourth run, launched under `lldb` with `eLaunchFlagStopAtEntry` per this
+document's own rule, breakpointed on `mcpelauncher_run_deferred_ctors`,
+`mcpelauncher_linker_notifylldb`, and the two §25/§26 offsets
+(`0x23121ae` real-init-entry, `0x2312fbc` the `[INIT]` emit), confirms it
+directly: both storage sites are hit exactly once, cleanly, no crash. One
+genuine surprise in that run: the hit lands on a thread **different** from
+the one that called `mcpelauncher_run_deferred_ctors` — where §25's own
+backtrace (`notifylldb ← call_constructors ← do_dlopen ← ... ← load.rs`)
+showed the same call same-thread in the default order. Not chased further;
+it does not change the verdict below and chasing it would mean reading which
+constructor hands the call to a worker thread, which is Roblox's own
+implementation rather than its observable behaviour.
+
+**So the directories were never the missing input.** This is the same
+conclusion §26.1 reached from register shapes at the call site (the empty
+pointers have output-parameter shape, not input) — reached again here by
+directly testing it rather than inferring it, and holding up.
+
+A methodology note earned the hard way while getting this measurement: the
+first attempt at the lldb-instrumented run reported a SIGSEGV. It was not a
+finding — it was the probe script gating its manually-poked `0xCC` restore on
+`reason == eStopReasonBreakpoint`, which this document's own rules already
+say is wrong (a manual poke reports `eStopReasonSignal`), so the breakpoint
+byte was never restored and the instruction it replaced (a bare `push rbp`)
+never ran, corrupting the stack. Fixed to check the hit address
+unconditionally, matching `probe_launch.py`, and the crash did not recur.
+Recorded because it is exactly the "wrong instrument" shape this document
+keeps finding, and because the corrected run's *clean* result is what
+appears above — the crash was never evidence about the engine.
+
+### Deferring further, past settings delivery, is not coherent
+
+`CORDIAL_DEFER_PAST_SETTINGS=1` fetches the real client-settings document
+(`cordial_runtime::client_settings::load`, a genuine HTTP round trip, done
+before any of libroblox.so's constructors have run) and calls
+`Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings`
+directly on the resolved symbol, out of band, the same way the directory
+setters were called. This is the direct test of the actual hypothesis this
+document has carried since §26: Android's capture shows `nativeInitClientSettings`
+at 0.3752 s strictly before `flagLoaded`'s successful `RbxStorage::init` at
+0.4158 s, so matching that order — rather than merely setting directories —
+is the natural next thing to try.
+
+It segfaults. Deterministically: two plain runs, both exit 139
+(`SIGSEGV`), both dying right after printing that the settings document was
+fetched and before any further output. A third run under `lldb` caught it
+precisely:
+
+    CRASH: signal SIGSEGV: address not mapped to object (fault address=0x10)
+    #3 cordial_init_client_settings
+    #4 cordial_linker_sys::game_activity::init_client_settings
+    #5 cordial_run::main (load.rs:1214, the CORDIAL_DEFER_PAST_SETTINGS call site)
+
+Fault address `0x10` — a small, fixed offset from a null pointer — is the
+shape of a `this`-pointer or vtable read on an object that has not been
+constructed. Frames #0–#2, inside libroblox.so/jnivm with no symbol names
+resolved, are not read further than that shape; doing so would mean reading
+how the native implements itself rather than observing that it faults.
+
+**So `nativeInitClientSettings` does depend on constructor-initialised
+state**, unlike the four directory setters, and calling it before
+`.init_array` runs is not safe. This closes off the direct route to matching
+Android's ordering from outside the engine: `RbxStorage::init`'s broken call
+happens *during* constructors (§26), and the settings delivery Android's
+capture puts *before* a successful storage init cannot be called until
+*after* constructors — so within Cordial's process, as it is built today,
+there is no point at which both "constructors have not yet reached
+`RbxStorage::init`" and "settings have already been delivered" are true at
+once. Deferring the constructor that contains the bug cannot outrun a
+dependency that sits inside the same constructor phase.
+
+### Where this leaves candidate twenty
+
+Coherent and inert (directories) is now measured, not inferred. Coherent and
+sufficient (settings) is now measured to be impossible by this route,
+specifically — not deferral in general, but deferral of *all* of
+libroblox.so's construction as a single unit, which is what `do_dlopen`
+offers to split. A finer split — running only whatever constructor
+`nativeInitClientSettings` itself needs, ahead of the one that reaches
+`RbxStorage::init` — would require knowing which entry in `.init_array`
+that is, and distinguishing them means reading what each one does, which
+is exactly the line AGENTS.md draws. Nobody has done that.
+
+The retry route §26.1 left standing is unaffected by any of this and remains
+the only route this document has not shown to be closed: nothing here found
+or ruled out a legitimate (non-patching) way to make the engine attempt
+`RbxStorage::init` a second time once settings exist. That is still open.

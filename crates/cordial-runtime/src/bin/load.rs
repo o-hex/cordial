@@ -1082,6 +1082,19 @@ fn main() -> ExitCode {
 
     println!("\nloading {} ...", opt.library);
 
+    // EXPERIMENTAL, cordial-agent-defer: see docs/analysis/flag-init.md §26.
+    // `RbxStorage::init` runs during libroblox.so's own ELF constructors —
+    // before Cordial has told the engine any directory — fails on an empty
+    // path, and memoises that failure permanently (a lazy singleton). This
+    // asks the linker to hold the constructors back so a minimal directory
+    // setup can run first; `defer_next_ctors` is consumed by the very next
+    // `dlopen`, and `run_deferred_ctors` below runs whatever it postponed.
+    // Off by default. Not part of the ordinary load path.
+    let defer_ctors = std::env::var_os("CORDIAL_DEFER_CTORS").is_some();
+    if defer_ctors {
+        linker::defer_next_ctors(true);
+    }
+
     let start = Instant::now();
     let result = linker::dlopen(&opt.library, linker::RTLD_NOW);
     let elapsed = start.elapsed();
@@ -1103,6 +1116,125 @@ fn main() -> ExitCode {
         code_size as f64 / (1024.0 * 1024.0)
     );
 
+    // EXPERIMENTAL, cordial-agent-defer, continued. Constructors have not
+    // run yet if `defer_ctors`: `libroblox.so`'s own global state, including
+    // whatever `RbxStorage::init` reads, does not exist. This calls exactly
+    // the four `NativeSettingsInterface` directory setters `--game-activity`
+    // otherwise calls only after a window and JNI_OnLoad, then runs the
+    // constructors that were held back. It does not touch JNI_OnLoad or any
+    // other bring-up step; those still happen later, unchanged, once this
+    // block returns.
+    if defer_ctors {
+        println!("\ncordial-agent-defer: constructors deferred for {}", opt.library);
+        let Some(vm) = linker::jni::create_vm() else {
+            eprintln!("cordial-agent-defer: could not create a JavaVM to call the setters with");
+            return ExitCode::FAILURE;
+        };
+        println!("cordial-agent-defer: JavaVM at {vm:p} (Cordial's own jnivm; libroblox.so's constructors have not run)");
+
+        let root = std::env::var("CORDIAL_FILES_DIR")
+            .unwrap_or_else(|_| format!("{}/data", cordial_runtime::profile::active().display()));
+        let files = format!("{root}/files");
+        let cache = format!("{root}/cache");
+        let external = format!("{root}/external");
+        for d in [&files, &cache, &external] {
+            if let Err(e) = std::fs::create_dir_all(d) {
+                println!("  could not create {d}: {e}");
+            }
+        }
+        // Same tree `--game-activity` creates before RbxStorage is expected
+        // to look for it — see the comment at its other call site for why
+        // each of these exists and where the list came from.
+        for base in [root.as_str(), "."] {
+            for rel in [
+                "files", "cache", "shared_prefs", "rbx-storage", "appData",
+                "appData/LocalStorage", "appData/rbx-storage", "appData/ClientSettings",
+                "files/appData", "files/appData/LocalStorage", "files/appData/OTAPatchBackups",
+                "files/appData/rbx-storage", "cache/ContentProvider_2", "cache/rbx-storage",
+                "cache/sounds",
+            ] {
+                let _ = std::fs::create_dir_all(format!("{base}/{rel}"));
+            }
+        }
+
+        const SETTINGS: &str = "com/roblox/engine/jni/NativeSettingsInterface";
+        let dirs: &[(&str, Vec<&str>)] = &[
+            (
+                "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetFilesDirectory",
+                vec![files.as_str()],
+            ),
+            (
+                "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetCacheDirectory",
+                vec![cache.as_str()],
+            ),
+            (
+                "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetExternalDirectory",
+                vec![external.as_str()],
+            ),
+            (
+                "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetBaseDataDirectories",
+                vec![files.as_str(), cache.as_str()],
+            ),
+        ];
+        for (name, args) in dirs {
+            match lib.symbol(name) {
+                None => println!("  {name} not exported (pre-ctors)"),
+                Some(f) => match linker::game_activity::call_static_strings(f, SETTINGS, args) {
+                    Ok(()) => println!(
+                        "  {} ok (pre-ctors)",
+                        name.rsplit('_').next().unwrap_or(name)
+                    ),
+                    Err(e) => println!("  {name} failed (pre-ctors): {e}"),
+                },
+            }
+        }
+
+        // EXPERIMENTAL, cordial-agent-defer, second step: `CORDIAL_DEFER_PAST_SETTINGS=1`
+        // additionally delivers client settings and flags before running the
+        // deferred constructors, bypassing `bootstrapTheApp`'s normal
+        // callback route entirely (that route needs `initializeNativeCode`,
+        // which needs constructors already run — so it cannot be reached
+        // this early). Tests the actual ordering hypothesis directly: on
+        // Android, `flagLoaded` succeeds at 0.4158s, strictly after
+        // `nativeInitClientSettings` at 0.3752s (docs/analysis/flag-init.md
+        // §26.1) — this asks whether matching that order, rather than
+        // merely setting directories, is what storage needs.
+        if std::env::var_os("CORDIAL_DEFER_PAST_SETTINGS").is_some() {
+            const FLAG_NAMES: &str = include_str!("../native-flag-names.txt");
+            let settings_json =
+                cordial_runtime::client_settings::load(opt.client_settings.as_deref())
+                    .unwrap_or_default();
+            println!(
+                "cordial-agent-defer: fetched {} bytes of client settings (pre-ctors)",
+                settings_json.len()
+            );
+            if let Some(f) = lib.symbol(
+                "Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings",
+            ) {
+                match linker::game_activity::init_client_settings(f, &settings_json, "", "") {
+                    Ok(code) => println!("  nativeInitClientSettings -> {code} (pre-ctors)"),
+                    Err(e) => println!("  nativeInitClientSettings failed (pre-ctors): {e}"),
+                }
+            } else {
+                println!("  nativeInitClientSettings not exported (pre-ctors)");
+            }
+            if let Some(f) = lib.symbol(
+                "Java_com_roblox_client_flags_FlagJniInterface_nativeInitializeNativeFlags",
+            ) {
+                match linker::game_activity::init_flags(f, FLAG_NAMES) {
+                    Ok(()) => println!("  flags initialised (pre-ctors)"),
+                    Err(e) => println!("  flag init failed (pre-ctors): {e}"),
+                }
+            } else {
+                println!("  nativeInitializeNativeFlags not exported (pre-ctors)");
+            }
+        }
+
+        println!("cordial-agent-defer: running the deferred constructors now");
+        linker::run_deferred_ctors(lib);
+        println!("cordial-agent-defer: constructors returned without crashing");
+    }
+
     match lib.symbol("JNI_OnLoad") {
         Some(p) => println!("  JNI_OnLoad {p:p}"),
         None => println!("  JNI_OnLoad not found"),
@@ -1110,9 +1242,19 @@ fn main() -> ExitCode {
 
     if opt.jni_onload {
         if let Some(p) = lib.symbol("JNI_OnLoad") {
-            let Some(vm) = linker::jni::create_vm() else {
-                eprintln!("could not create a JavaVM");
-                return ExitCode::FAILURE;
+            // EXPERIMENTAL, cordial-agent-defer: the defer block above already
+            // created the process JavaVM (it needed one to call the directory
+            // setters), so `create_vm()` here correctly reports "one already
+            // exists" rather than failing. `linker::jni::call_on_load` reaches
+            // for the global VM itself and does not need this pointer, so
+            // reusing it changes nothing about what JNI_OnLoad is called with.
+            let vm = match linker::jni::create_vm() {
+                Some(vm) => vm,
+                None if defer_ctors => std::ptr::null_mut(),
+                None => {
+                    eprintln!("could not create a JavaVM");
+                    return ExitCode::FAILURE;
+                }
             };
             println!("\nJavaVM at {vm:p}; calling JNI_OnLoad");
 

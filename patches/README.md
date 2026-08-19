@@ -56,3 +56,36 @@ exactly five `dlopen` calls (`libc.so`, `libcamera2ndk.so`, `libmediandk.so`,
 `vkGetInstanceProcAddr`, five `AThermal_*`). **Nothing mimalloc-shaped is ever
 looked up** — see `crates/cordial-runtime/src/mimalloc_lib.rs` for why that
 matters and what it rules out.
+
+## 0003 — split-phase `dlopen`, for testing whether libroblox.so's own
+## constructors can be deferred past Cordial's directory setup
+
+Inert unless something calls the two new exports it adds
+(`mcpelauncher_defer_next_ctors`, `mcpelauncher_run_deferred_ctors`) — nothing
+in the default load path does; `cordial-run` only reaches them behind
+`CORDIAL_DEFER_CTORS=1` / `CORDIAL_DEFER_PAST_SETTINGS=1` in
+`crates/cordial-runtime/src/bin/load.rs`. Exists to test the question
+`docs/analysis/flag-init.md` §26.1 leaves open: can `RbxStorage::init`'s
+constructor-time call be pushed past the point where Cordial has told the
+engine anything, and does that change its outcome.
+
+Splits `do_dlopen`'s existing two steps — `find_library` (map, relocate) then
+`si->call_constructors()` — so a caller can run the first, do its own setup
+against the mapped-and-relocated (but not yet constructed) object, then
+explicitly trigger the second. `soinfo::call_constructors()` is already
+idempotent (guarded by `constructors_called`), so `mcpelauncher_run_
+deferred_ctors` calling it late is exactly as safe as bionic's own recursive
+calls into it.
+
+**What it established, §27 of `docs/analysis/flag-init.md` has the full
+record:** deferring past Cordial's four `NativeSettingsInterface` directory
+setters is coherent — no crash, three plain runs and one lldb-instrumented
+run, all clean — but changes nothing: `RbxStorage::init`'s empty-path failure
+reproduces identically, meaning the directories were never the missing input.
+Deferring further, past `nativeInitClientSettings`, is **not** coherent: it
+segfaults deterministically (fault address `0x10`, a null-pointer-shaped
+dereference, 2/2 plain runs plus a captured backtrace confirming the fault is
+inside the native itself, not the calling code) — that native depends on
+state only libroblox.so's own constructors set up, so Android's actual
+ordering (settings before storage) cannot be reproduced this way from
+outside the engine.

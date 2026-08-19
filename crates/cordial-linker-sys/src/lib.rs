@@ -20,6 +20,10 @@ mod ffi {
         ) -> *mut c_void;
         pub fn cordial_linker_update_ld_library_path(path: *const c_char);
         pub fn cordial_linker_dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+        // EXPERIMENTAL, cordial-agent-defer: see docs/analysis/flag-init.md
+        // §26 and patches/README.md. Not called from the default load path.
+        pub fn cordial_linker_defer_next_ctors(defer: c_int);
+        pub fn cordial_linker_run_deferred_ctors(handle: *mut c_void);
         pub fn cordial_linker_dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         pub fn cordial_linker_dlerror() -> *const c_char;
         pub fn cordial_linker_get_library_base(handle: *mut c_void) -> usize;
@@ -129,6 +133,28 @@ pub fn dlopen(soname: &str, flags: c_int) -> Result<Library, Error> {
     } else {
         Ok(Library(handle))
     }
+}
+
+/// EXPERIMENTAL, cordial-agent-defer: make the *next* [`dlopen`] call map and
+/// relocate the object without running its ELF constructors. The caller must
+/// follow up with [`run_deferred_ctors`] on the returned [`Library`] once it
+/// wants them to run — nothing else runs them.
+///
+/// This exists to test whether `libroblox.so`'s constructors (which is where
+/// `RbxStorage::init` lives — see `docs/analysis/flag-init.md` §26) can be
+/// deferred past Cordial's own directory setup, which currently happens only
+/// after `dlopen` returns. It is not wired into the default load path in
+/// `cordial-run`; nothing calls this outside an explicit experiment.
+pub fn defer_next_ctors(defer: bool) {
+    unsafe { ffi::cordial_linker_defer_next_ctors(defer as c_int) }
+}
+
+/// EXPERIMENTAL, cordial-agent-defer: run whatever construction
+/// [`defer_next_ctors`] left pending for `lib`. Idempotent — the underlying
+/// `soinfo::call_constructors()` is itself guarded, so calling this on a
+/// library that was never deferred (or already constructed) is harmless.
+pub fn run_deferred_ctors(lib: Library) {
+    unsafe { ffi::cordial_linker_run_deferred_ctors(lib.0) }
 }
 
 fn last_error() -> String {

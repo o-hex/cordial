@@ -3701,3 +3701,58 @@ these runs, so if the engine reaches for its data directory by calling
 `getFilesDir()`, it does so on some other object shape, or not before
 `Landing`, or not by this route either. That is candidate twenty-three,
 untested.
+
+## §34. Candidates twenty-three and twenty-four, and one contradiction left open
+
+**`nativeSetExceptionReasonFilename` — dead.** The one path-shaped native in
+`jni-natives.tsv` that is exported, has no caller, and was not already accounted
+for (`nativeSetBaseUrl`'s omission is explained in `load.rs`'s own comments).
+Dex prototype `(Ljava/lang/String;)V`, wired temporarily into the pre-constructor
+path with a distinctive marker directory and run under `CORDIAL_TRACE_PATHS=1`.
+The call succeeds and prints before storage runs; storage's failure is
+byte-for-byte identical to baseline and the marker string appears nowhere in the
+trace. Edit reverted.
+
+**`getFilesDir()` by method call — dead**, which closes the candidate §33 named
+as untested. Two runs with the JNI trace on, to `app ready: Landing`.
+`SessionReporterJavaInterface.getFilesDir()` — a hook Cordial already implements,
+`android_classes.cpp` returning `files_dir()` — is *resolved* once during hook
+registration and **never dispatched**: zero `Call Static Function … getFilesDir`
+lines in either full trace. `Context` and `ApplicationInfo` are still never
+`FindClass`'d, consistent with §33.
+
+So the infrastructure to answer is in place before the failure — Cordial's class
+and method table is fully populated by then — and the engine simply never places
+a call.
+
+### The contradiction, recorded rather than resolved
+
+The agent that ran the above reports storage's attempt as happening "during
+`libroblox.so`'s own ELF constructors, at `dlopen` time". **§28 retracted exactly
+that claim**, on three clean undebugged runs, and placed the attempt on a freshly
+spawned thread immediately after `nativeInitClientSettings` returns 0 — with the
+observation that the earlier reading came from `call_constructors`/`do_dlopen`
+frames in a backtrace that bottomed out at `start_thread`/`__clone3`.
+
+Both cannot be right, and nothing here distinguishes them, because the two were
+established by different methods and neither was re-run against the other. **It
+is left open deliberately.** This document's most reliable pattern is that six
+wrong conclusions were the instrument rather than the engine, and picking a
+winner between two measurements on the strength of which is more recent would be
+the seventh.
+
+Whoever takes this next should settle it first, because it decides whether
+anything Cordial does before `dlopen` returns can matter at all — and it is one
+plain, undebugged run with `stdbuf -o0 -e0`, log ordering, and a marker printed
+either side of `dlopen`.
+
+### What is left after twenty-four
+
+Self-path introspection is eliminated (§32), JNI is eliminated as the channel at
+the moment of use (§29) and for every specific method anyone has named (§33,
+§34). What has not been examined: a value the engine reads out of the APK itself
+through `AssetManager`, or a genuinely internal default with no host-observable
+input. The first is testable. The second would mean §30's conclusion was right
+after all and only §31's evidence — Sober's byte-identical text — stands against
+it, which would put this back in front of the project owner as an ADR-001
+question rather than an engineering one.

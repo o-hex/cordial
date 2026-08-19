@@ -381,6 +381,19 @@ pub mod game_activity {
             err: *mut c_char,
             n: usize,
         ) -> c_int;
+        fn cordial_init_client_settings_cached_compressed(
+            f: *mut c_void,
+            data: *const u8,
+            len: usize,
+            a: *const c_char,
+            b: *const c_char,
+            c: *const c_char,
+            when: i64,
+            flag: c_int,
+            out_result: *mut c_int,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
         fn cordial_get_fint(
             f: *mut c_void,
             name: *const c_char,
@@ -1091,6 +1104,48 @@ pub mod game_activity {
                 ca.as_ptr(),
                 cb.as_ptr(),
                 cc.as_ptr(),
+                &mut out as *mut c_int,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc == 0 { Ok(out) } else { Err(take_err(err)) }
+    }
+
+    /// `NativeGLInterface.nativeInitClientSettingsCachedCompressed(...)I` —
+    /// hand the engine back the compressed flag cache it wrote itself.
+    ///
+    /// Cordial has only ever used the plain three-string form, so every launch
+    /// has looked cold to the engine even with `flag_cache.dat` on disk beside
+    /// it. Returns the engine's own `int`, on the same reasoning as
+    /// [`init_client_settings`]: the result code is a better signal than the log.
+    #[allow(clippy::too_many_arguments)]
+    pub fn init_client_settings_cached_compressed(
+        native: *mut c_void,
+        data: &[u8],
+        a: &str,
+        b: &str,
+        c: &str,
+        when: i64,
+        flag: bool,
+    ) -> Result<i32, String> {
+        let ca = CString::new(a).map_err(|e| e.to_string())?;
+        let cb = CString::new(b).map_err(|e| e.to_string())?;
+        let cc = CString::new(c).map_err(|e| e.to_string())?;
+        let mut err = vec![0u8; 512];
+        let mut out: c_int = 0;
+        // SAFETY: `native` is the exported JNI native; every buffer outlives the
+        // call, and `data` is copied into a Java array on the other side.
+        let rc = unsafe {
+            cordial_init_client_settings_cached_compressed(
+                native,
+                data.as_ptr(),
+                data.len(),
+                ca.as_ptr(),
+                cb.as_ptr(),
+                cc.as_ptr(),
+                when,
+                c_int::from(flag),
                 &mut out as *mut c_int,
                 err.as_mut_ptr() as *mut c_char,
                 err.len(),

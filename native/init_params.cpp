@@ -2144,6 +2144,66 @@ int cordial_get_fint(void* fn, const char* name, jint fallback, jint* out_result
     }
 }
 
+/// `NativeGLInterface.nativeInitClientSettingsCachedCompressed([B, String,
+/// String, String, long, boolean)I`
+///
+/// The engine writes its own compressed flag cache -- `flag_cache.dat`, 365 KB
+/// on this machine, produced by `[DFLog::FlagCache] writeFlagCache` -- and
+/// exports three natives that take a cache back in besides the plain
+/// three-string form Cordial has always used. Cordial has never handed one
+/// back, so every launch has been a cold one from the engine's point of view
+/// even when the cache was sitting on disk beside it.
+///
+/// Whether the cached path is what sets the engine's flags-loaded state is
+/// **not established** -- it is being tried because thirteen candidates that
+/// varied the plain path have all left the verdict where it was, and this is a
+/// different path rather than another variation of the same one. See
+/// docs/analysis/flag-init.md §22.
+///
+/// The trailing `long` and `boolean` are passed through as given rather than
+/// guessed at, for the same reason the three strings are: the caller can vary
+/// them and read the `int` back, which is a better signal than the log.
+int cordial_init_client_settings_cached_compressed(void* fn, const void* data, size_t len,
+                                                   const char* a, const char* b, const char* c,
+                                                   long long when, int flag, jint* out_result,
+                                                   char* err, size_t err_len) {
+    using Call = jint (*)(JNIEnv*, jclass, jbyteArray, jstring, jstring, jstring, jlong, jboolean);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or nativeInitClientSettingsCachedCompressed is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeGLInterface");
+        auto bytes = std::make_shared<jnivm::Array<jbyte>>(static_cast<jsize>(len));
+        if (len != 0 && data != nullptr) {
+            memcpy(bytes->getArray(), data, len);
+        }
+        auto sa = cordial::S_pub(a ? a : "");
+        auto sb = cordial::S_pub(b ? b : "");
+        auto sc = cordial::S_pub(c ? c : "");
+        jint result = reinterpret_cast<Call>(fn)(
+            env->GetJNIEnv(),
+            (jclass)cordial::to_jni(env, cls),
+            (jbyteArray)cordial::to_jni(env, bytes),
+            (jstring)cordial::to_jni(env, sa),
+            (jstring)cordial::to_jni(env, sb),
+            (jstring)cordial::to_jni(env, sc),
+            static_cast<jlong>(when),
+            static_cast<jboolean>(flag ? JNI_TRUE : JNI_FALSE));
+        if (out_result) {
+            *out_result = result;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
 /// `NativeGLInterface.nativePostClientSettingsLoadedInitialization3(List)V`
 ///
 /// The finishing step of the client-settings handshake on the real app's

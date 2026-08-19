@@ -2121,3 +2121,87 @@ They are the two lines that would say what the engine thinks the state is at the
 moment it decides, and the channel is already open by default — it is the
 verbosity of those particular lines that is not. Raising it through `flags.json`
 demonstrably does the opposite, so that route needs understanding first.
+
+### §22.1 Four more eliminations, and the shape they make
+
+All measured on the same build with controls, after §22.
+
+**Fourteen: the engine's own compressed flag cache, handed back.** The engine
+writes `flag_cache.dat` — 365074 bytes here — and exports three settings natives
+besides the plain three-string form Cordial has always used. Cordial had never
+handed one back, so every launch looked cold to the engine with the cache sitting
+on disk beside it. `nativeInitClientSettingsCachedCompressed([B, String, String,
+String, long, boolean)I` now takes it:
+
+    365074 bytes, [||],                     when 1787121646510, flag true  -> 3
+    365074 bytes, [||],                     when 1787121696442, flag false -> 2
+    365074 bytes, [||],                     when 0,             flag true  -> 3
+    365074 bytes, [AndroidApp|production|], when 1787121709184, flag true  -> 3
+    365074 bytes, [production||],           when 1787121722001, flag true  -> 3
+
+The **boolean** is the only argument that changes the result; the three strings
+and the timestamp are ignored. 2 and 3 are result codes this project has not seen
+before — the plain form gives 0 for a good document and 1 for a bad one — so the
+engine is reading the cache and rejecting it, probably over the five-byte
+signature/compression header the write log describes.
+
+Not pursued, and the reason matters: **the plain path already returns 0.** Making
+a second path also return 0 would be a fourteenth way of establishing "the
+settings were accepted", which is the one thing never in doubt. The wrapper stays
+because it is correct and someone will want it, behind `CORDIAL_CACHED_SETTINGS`.
+
+**Fifteen: not calling `nativeGameGlobalInit` at all.** §9's captured stack
+reaches the failure reporter through it, and §22's ordering test only moved it.
+`CORDIAL_NO_GLOBAL_INIT=1` skips the pair outright. The run segfaults later,
+exactly as the original comment predicted — `StartLuaAppDM` crashes on a null
+`JNIEnv` the globals init was supposed to store — but it gets far enough to
+answer the question:
+
+    onFlagsFailed=2   RbxStorage=0   Flags-Not-Received=4
+
+**The verdict fires twice with that call never made.** So it is not produced
+there. §9's stack was one of two occurrences and removing that path removes
+neither.
+
+### What the shape of fifteen eliminations says
+
+Every input the app-facing interface accepts has now been varied, and none of
+them moves the verdict:
+
+* the document — four variants, and its absence
+* when it arrives — six seconds early, mid-`initializeNativeCode`, and after
+* which native takes it — plain, and the compressed-cache form
+* preloaded overrides — three shapes, all accepted with no `ParseFailure`
+* the flag-name list, the flag provider, the `Configuration`, the `ArrayList`
+* call ordering — bootstrap, globals early, globals late, globals absent
+* the callbacks the engine can reach — 7 answered, then 19, descriptors verified
+
+That is the whole surface. The verdict is decided inside the engine at a point
+§9 pinned precisely — `movl $0xb` written unconditionally at `0x29c5529`, status
+11, the same 11 `NativeDM` then reports as `state:11` forever — and whatever
+picks `0xb` is upstream of anything the app hands in.
+
+**This is now a policy question rather than an engineering one.** The only
+implementation known to be past this gate writes the byte: mocktail's
+`ForceNativeFlagsLoadedForTaskScheduler`, one of **98** patch/force/install
+functions in `legacy_runtime.cc`, with 116 `PatchCode` call sites and 77
+`EnsureWritablePage` calls beside it. Memory patching is not incidental to
+mocktail, it is its method. Its git history was squashed on a GitLab migration,
+so there is no record of a legitimate route being tried and failing — only that
+the one real JNI candidate, `nativeInitializeNativeFlags`, defaults to **off**
+there while the patch runs unconditionally straight afterwards.
+
+Sober reaches `flagLoaded` and remains the existence proof that the state is
+reachable. **How it does so is not established** and cannot be from here: the
+reference tree holds only `libbadcpu`, and its `decompiled/` directory is
+off-limits. "Sober does it legitimately" is not a claim this document makes.
+
+So the honest position: Cordial cannot reach this state through the interface
+Roblox exposes to its host application, and the alternative on the table is the
+one [ADR-001](../adr/ADR-001-in-process-hooking.md) and
+[ADR-003](../adr/ADR-003-plugin-isolation.md) make *absent* rather than disabled,
+so that a fork cannot extract the primitive. That decision was taken when no
+feature depended on it. One does now. Reversing it is a change to Cordial's
+security posture, in a public GPL repository with a fork already layering exploit
+functionality on it, and it belongs to the project owner rather than to whoever
+is next to run out of eliminations.

@@ -384,6 +384,14 @@ struct BootstrapPlan {
     /// reads the real Java bootstrap as calling this native on a successful
     /// fetch. Whether it moves the verdict is what `CORDIAL_PRELOAD` is for.
     preload_native: usize,
+    /// `nativeInitClientSettingsCachedCompressed`, and the file it is fed.
+    ///
+    /// The engine writes `flag_cache.dat` itself and Cordial has never handed
+    /// one back, so every launch has looked cold to it. Empty path means no
+    /// cache was on disk when the plan was built, which is the ordinary first
+    /// run.
+    cached_native: usize,
+    cache_file: String,
     settings: String,
     flag_names: String,
 }
@@ -404,6 +412,20 @@ static BOOTSTRAP_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// before it. `when` is printed so a log makes it obvious which position a run
 /// used, which two earlier orderings did not.
 fn call_globals(lib: &linker::Library, when: &str) {
+    // `CORDIAL_NO_GLOBAL_INIT=1` is the control for the pair, not a setting.
+    //
+    // §9's captured stack reaches the failure reporter *through*
+    // `nativeGameGlobalInit`, and moving the pair earlier changed nothing. The
+    // question that leaves is whether calling it at all is what produces the
+    // verdict: on Android the app does not call these directly, the engine's own
+    // ActivityNativeMain chain does. If the second `onFlagsFailed` disappears
+    // when the pair is skipped, the verdict is localised to this call rather
+    // than to the settings handshake, which is worth far more than another
+    // variation of the handshake.
+    if std::env::var_os("CORDIAL_NO_GLOBAL_INIT").is_some() {
+        println!("  globals NOT called ({when}, CORDIAL_NO_GLOBAL_INIT)");
+        return;
+    }
     for name in [
         "Java_com_roblox_engine_jni_NativeGLInterface_nativeGameGlobalInit",
         "Java_com_roblox_engine_jni_NativeGLInterface_nativeUpdateAdapterInit",
@@ -474,6 +496,66 @@ extern "C" fn run_bootstrap() {
             }
         }
     }
+    // `CORDIAL_CACHED_SETTINGS=1` hands the engine back its own compressed flag
+    // cache before the plain document, when one exists.
+    //
+    // Thirteen candidates have varied the plain three-string path and left the
+    // verdict exactly where it was. This is a different path rather than a
+    // fourteenth variation of the same one: the engine wrote this file, exports
+    // a native that takes it, and has never been given it. Off by default until
+    // it is shown to do something.
+    if plan.cached_native != 0 && std::env::var_os("CORDIAL_CACHED_SETTINGS").is_some() {
+        match std::fs::read(&plan.cache_file) {
+            Err(e) => println!("    cached settings: no {} ({e})", plan.cache_file),
+            Ok(bytes) => {
+                let when = std::fs::metadata(&plan.cache_file)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_millis() as i64);
+                // The three strings and the boolean are swept rather than
+                // guessed. The first attempt -- all empty, flag true, mtime as
+                // the long -- returned 3, which is neither the 0 nor the 1 the
+                // plain three-string form produces, so the engine is reading
+                // these and rejecting them for a reason worth finding. The
+                // result code is the signal; the log says nothing about this
+                // call at all.
+                //
+                //   CORDIAL_CACHED_ARGS=AndroidApp,production,
+                //   CORDIAL_CACHED_FLAG=0
+                //   CORDIAL_CACHED_WHEN=0
+                let args = std::env::var("CORDIAL_CACHED_ARGS").unwrap_or_default();
+                let mut it = args.split(',');
+                let (a1, a2, a3) = (
+                    it.next().unwrap_or(""),
+                    it.next().unwrap_or(""),
+                    it.next().unwrap_or(""),
+                );
+                let flag = std::env::var("CORDIAL_CACHED_FLAG")
+                    .map_or(true, |v| v != "0");
+                let when = std::env::var("CORDIAL_CACHED_WHEN")
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(when);
+                match linker::game_activity::init_client_settings_cached_compressed(
+                    plan.cached_native as *mut std::ffi::c_void,
+                    &bytes,
+                    a1,
+                    a2,
+                    a3,
+                    when,
+                    flag,
+                ) {
+                    Ok(code) => println!(
+                        "    nativeInitClientSettingsCachedCompressed ({} bytes, [{a1}|{a2}|{a3}], when {when}, flag {flag}) -> {code}",
+                        bytes.len()
+                    ),
+                    Err(e) => println!("    cached settings failed: {e}"),
+                }
+            }
+        }
+    }
+
     if plan.settings_native != 0 {
         match linker::game_activity::init_client_settings(
             plan.settings_native as *mut std::ffi::c_void,
@@ -1281,6 +1363,10 @@ fn main() -> ExitCode {
                                 preload_native: lib
                                     .symbol("Java_com_roblox_client_startup_MainGameActivity_nativePreloadFlagOverrides")
                                     .map_or(0, |p| p as usize),
+                                cached_native: lib
+                                    .symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettingsCachedCompressed")
+                                    .map_or(0, |p| p as usize),
+                                cache_file: format!("{cache}/cache/flag_cache.dat"),
                                 settings: cordial_runtime::client_settings::load(
                                     opt.client_settings.as_deref(),
                                 )

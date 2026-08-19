@@ -3833,3 +3833,41 @@ The other half of this same investigation *was* reachable, and is fixed:
 One gate was an ordering mistake in Cordial and the other is inside the engine.
 Only measurement told them apart, and it took seven retractions to trust the
 measurements.
+
+### §35.1 What Sober's successful init looks like, read with everything now known
+
+    0.564820  [FLog::Output]            Build system id: 1
+    0.565690  [FLog::AppMemUsageStatus] 923286370
+    0.566499  [FLog::IxpStorageManager] Failed to open cache file for reading
+    0.566545  [FLog::TombstoneCache]    Tombstone 1 … read from file
+    0.566558  [FLog::TombstoneCache]    Setting holdout experiment state to: false
+    0.566566  [FLog::LocalStorageHandler] Not available on the current platform.
+    0.568104  [DFLog::RbxStorage] RbxStorage::init [INIT] user: flagLoaded, availableDiskSpace: 3284131840 bytes
+
+Three things worth having on record.
+
+**It is the same spawned-thread shape.** Sober's block runs on `80cfb4c0` and its
+`RbxStorage::init` lands 1.5 ms later on `a93d86c0` — a different thread, exactly
+as Cordial's failure runs on a thread spawned from a pool. So the mechanism is
+not different; Sober's simply succeeds.
+
+**`availableDiskSpace` is a live measurement, and Cordial's provider is never
+asked.** Sober reports 3,284,131,840 bytes here and 1,972,330,496 in an earlier
+run, so it is reading something real and varying. Android reported
+60,655,730,688. Cordial's `LocalStorageManager.getAllocatableBytes` — the JNI
+method whose own comment claims storage gates on it — is **never called** (§29,
+instrumented). So whatever supplies that number to storage, it is not that
+method, and `init_params.cpp`'s comment overstates a mechanism that does not
+fire. Worth correcting there.
+
+**Two lines Cordial never produces, still.** `IxpStorageManager: Failed to open
+cache file` and the tombstone **read**. Cordial writes a tombstone — to a
+relative `cache/tombstone.dat` — and no read line ever appears. Both were noted
+early and set aside when the framing was "storage is never asked for". Under the
+current framing, where storage *is* entered and fails on an empty root, a missing
+read immediately upstream of the failure is worth one more look than it has had —
+though note Sober's Ixp line is a *failure* that Sober logs and Cordial does not,
+which is as likely to be a channel difference as a behavioural one.
+
+None of this is a candidate yet. It is the shape of the successful path recorded
+properly, so the next attempt starts from a comparison rather than from a guess.

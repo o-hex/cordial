@@ -3223,3 +3223,161 @@ The retry route §26.1 left standing is unaffected by any of this and remains
 the only route this document has not shown to be closed: nothing here found
 or ruled out a legitimate (non-patching) way to make the engine attempt
 `RbxStorage::init` a second time once settings exist. That is still open.
+
+## §28. Candidate twenty was answered by asking it directly, and the answer is
+## that §25/§26's "before `JNI_OnLoad`" is wrong — retracted here
+
+§25/§26 concluded the failing "RbxStorage"-labelled call happens "during
+`libroblox.so`'s ELF constructors — before `JNI_OnLoad`", and built that on a
+backtrace containing `call_constructors`/`do_dlopen` frames. That backtrace
+was real, but **it was never checked against a live `JNI_OnLoad` breakpoint**
+— it was an inference from symbol names in a call chain, not a timestamp
+comparison, and §25.1's own backtrace already contained the fact that
+contradicts it: the empty-`stat()` chain bottoms out at `start_thread` ←
+`__clone3` (`probe_stat_bt_run1.log`), i.e. a **freshly spawned thread**, not
+the thread running `do_dlopen`. A constructor merely spawning a thread does
+not make that thread's later work happen before `dlopen()` returns, and
+nothing in this document had actually timed the two against each other.
+
+### Directly measured: it happens after `JNI_OnLoad`, right after `nativeInitClientSettings`
+
+Plain runs, no debugger — `CORDIAL_TRACE_PATHS=1 CORDIAL_TRACE_DLSYM=1
+XDG_DATA_HOME=~/.cache/cordial-agent-gate ./target/release/cordial-run
+--lib-dir ... --apk ... --host-libc --game-activity --run N`, log-line order
+read directly off the child's own stdout/stderr (a single file, and the
+informational milestones in it are printed by `load.rs`'s own control-flow
+thread in the order it reaches them — no cross-process synchronisation
+question at all for this specific comparison). Three fresh runs, three
+wiped data roots, identical shape every time:
+
+    run1  line 144  JNI_OnLoad returned 0x10006 = JNI 1.6
+          line 162      nativeInitClientSettings -> 0
+          line 173  [paths] tid=2028287 stat("./appData") = 0
+          line 174  [paths] tid=2028287 stat("./appData") = 0
+          line 176  [paths] tid=2028287 stat("") = -1
+          line 177  [paths] tid=2028287 stat("") = -1
+          line 178  [paths] tid=2028287 stat("") = -1
+
+    run2  line 144 / 162 / 174-179  same shape, tid=2031369
+    run3  line 144 / 162 / 173-178  same shape, tid=2031640
+
+`task scheduler foregrounded` does not appear until line ~1160-1210 in the
+same files — thousands of log-lines-worth of periodic `/sys/devices/system/cpu`
+polling later — so the failing sequence is not merely "somewhere after
+`JNI_OnLoad`", it is **immediately** after `nativeInitClientSettings` returns,
+on a thread (a fresh tid, never seen in the log before that line) that is not
+the one running `load.rs`'s own control flow. That thread is almost certainly
+the same one §25.1's backtrace already caught mid-`start_thread`; this is the
+first time its birth has been placed on the timeline.
+
+**§25 and §26's "before `JNI_OnLoad`" / "during ELF constructors" framing is
+retracted.** What is solid and still stands: the caller label is `"RbxStorage"`
+(not `"flagLoaded"`), the getter's slow path is taken exactly once and is
+memoised (§28.1 below), and the failure is the same three empty `stat("")`
+calls after two successful `stat("./appData")` and one `statvfs`. What changes
+is *when*: not constructor time, but a few log lines after settings delivery
+— structurally much closer to Android's own `flagLoaded` timing (settings
+before storage, per §26.1's capture) than previously stated, just reached by a
+differently-labelled caller that still hits the same empty-path bug.
+
+### A instrument caveat, recorded because this document has hit the shape before
+
+The launch-under-lldb harness (`probe_gate2.py`/`probe_gate3.py` in the
+scratch directory, built the way this document's own rules require —
+`eLaunchFlagStopAtEntry`, breakpoints planted in the `notifylldb` stop) was
+tried first and **produced a self-contradictory result**: it reported the
+`JNI_OnLoad` breakpoint, then the storage getter, both within ~150ms of
+`notifylldb`, with the file already containing content that the source proves
+cannot exist that early — `load.rs` performs a genuine, unconditional
+`std::thread::sleep(Duration::from_millis(250))` before the `late post:
+postClientSettingsLoadedInitialization3 ok (after 250 ms)` line
+(`crates/cordial-runtime/src/bin/load.rs:2977`), and that line was already
+present in a file read 150ms after process launch. Six lldb-instrumented runs
+(three with the trace env vars, three as a control without them) all showed
+this same impossible compression, consistently. The most likely mechanism:
+this harness fully halts every thread in the process on every breakpoint hit,
+and the Python-side bookkeeping between `Continue()` calls (file reads,
+prints, SBError handling) costs real wall-clock time on the *host* while the
+child's own clocks are frozen — so timestamps taken from separate `Continue()`
+iterations are not directly comparable to each other or to an undebugged
+run's timeline, even though which thread hit which breakpoint, and in what
+call-count, remained trustworthy (the getter-slowpath site fired exactly once
+with label `"RbxStorage"` in all six runs, matching the plain-run finding).
+**Comparing absolute or relative timestamps across separate breakpoint stops
+in this specific harness shape is not reliable; log-line order in a plain,
+undebugged run is what settled this section.** Filed alongside the other four
+"the instrument, not the engine" retractions this document already has.
+
+### §28.1 Categories checked pre-`JNI_OnLoad`: clean elimination, but now in a window that may not matter
+
+The three candidate categories the last session was asked to check —
+`dlopen`/`dlsym`, file-existence checks, `/proc` reads, all before
+`JNI_OnLoad` — were checked directly, three plain runs, no debugger,
+`CORDIAL_TRACE_DLSYM=1 CORDIAL_TRACE_PATHS=1`, boundary taken at the literal
+`JNI_OnLoad returned` log line (line 144, identical in all three runs):
+
+* **`dlopen`/`dlsym`**: exactly one of each, every run — `dlopen(libc.so, 2)`
+  then `dlsym(..., getauxval)`. Nothing else. No `libcamera2ndk`,
+  `libmediandk`, `libvulkan.so.1`, or `libandroid.so` lookups this early —
+  those are the five `dlopen`s patch 0002's own record names, all evidently
+  later.
+* **File-existence / path checks**: `/proc/cpuinfo` (one `fopen`),
+  `/dev/urandom` (repeated `open`/`fopen`), `/sys/devices/system/node/node1`
+  (one failing `access`), and a sweep of
+  `/sys/devices/system/cpu/cpu*/cpufreq/{cpuinfo_max_freq,stats/time_in_state}`
+  — CPU topology and frequency-scaling discovery, nothing else. No `/system`,
+  no `/data`, no `/proc/self`, nothing Android-shaped, nothing storage- or
+  settings-shaped.
+* **`/proc` reads**: covered by the same trace (`/proc` paths go through the
+  traced `open`/`fopen`/`stat` wrappers) — only `/proc/cpuinfo` pre-`JNI_OnLoad`.
+
+This is a clean, repeatable (3/3) negative for all three categories **in the
+pre-`JNI_OnLoad` window specifically**. But §28 just showed the failing call
+does not run in that window at all — it runs after `nativeInitClientSettings`,
+on a spawned thread. So this negative answers the question exactly as asked,
+without answering the question that actually matters now: what does *that*
+thread read, in the few log lines between `nativeInitClientSettings -> 0` and
+its own `stat("./appData")`, that could differ from Android. Nothing
+Cordial-traceable appears there either (no `[paths]` or dlsym-trace line from
+that tid before its first `stat`), which is consistent with §26.1's own
+ABI-shape finding that the empty value is computed inside the callee from
+state not visible at the caller's frame — not new evidence, but no longer
+resting on a mistaken "before flags exist" premise.
+
+### §28.2 The retry route: `nativeRetryInit` is already called twice, and it does not retry storage
+
+Cordial's own default run already calls
+`Java_com_roblox_client_startup_MainGameActivity_nativeRetryInit` — the one
+exported native whose name says "retry" — twice: an early `retryInit ok` and,
+250ms-sleep-gated, a `late retry: nativeRetryInit ok`. Both happen inside the
+same six lldb runs (§28's runs, and the earlier gate2/gate3 runs, all
+`--run 15`) that had the getter's slow-path call site instrumented for the
+entire run. **The getter-slowpath-direct-call-site breakpoint fired exactly
+once in all six runs, despite two `nativeRetryInit` calls occurring inside
+that same window.** `nativeRetryInit` does not cause `RbxStorage::init` to
+run again — it is a real, exported, app-facing native, already exercised by
+Cordial, and it is a clean negative for this specific candidate, not an
+inferred one.
+
+The rest of the app-facing JNI surface was checked by name against
+`docs/analysis/jni-natives.tsv` rather than by invoking each one — that is an
+`INFERRED` elimination, not an established one. `Java_com_roblox_client_
+LocalStorageManager_initStorageManagerNative`(`V3`) and the
+`localstorageplatforminterface`/`IPlatformLocalStorageHandler` family
+(`getSecureValue`, `setCurrentUser`, `deleteUserValues`, …) are the only other
+storage-shaped exports, but their method names are user-credential/secure-value
+shaped, not content-cache shaped, and `docs/traces/waydroid-roblox-startup.log.gz`
+— which does exercise real login and asset loading for the session it covers —
+contains no `LocalStorageManager` or `IPlatformLocalStorageHandler` line
+anywhere, alongside its exactly-two `RbxStorage` lines. Consistent with "this
+is a different subsystem", not proof of it; actually calling one of these
+(the way `nativeRetryInit` and the settings/flags calls already are) is the
+obvious next step and was not done here.
+
+**Where this leaves candidate twenty:** the constructor-time framing that
+motivated searching ELF-construction-time state is retracted — the failing
+call runs after settings delivery, on a spawned thread, much like Android's
+own `flagLoaded` timing. The three categories are still cleanly eliminated,
+just in a window that turns out not to contain the failing call. The one
+tested retry candidate (`nativeRetryInit`) is a clean negative. The
+LocalStorageManager family remains an open, untested lead.

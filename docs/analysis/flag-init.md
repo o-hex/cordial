@@ -3518,3 +3518,58 @@ The flags half of the same investigation *was* reachable and is fixed:
 chain runs to `startLuaApp_`. The difference between the two halves is the whole
 lesson — one gate was an ordering mistake in Cordial, the other is inside the
 engine, and only measurement told them apart.
+
+## §31. Sober does not patch, and it loads the engine from a real Android path
+
+`tools/sober-text-check.sh`, run with root by the maintainer:
+
+    mapping names its file; using /proc/191976/root/data/app/~~GeJ39qDZC-GggfI7DN3s8A==/com.roblox.client-RrbELHju2bHBP_kjZ6yvvA==/lib/x86_64/libroblox.so
+    pid 191976  7f3aaa0f0000-7f3ab0a83000 r-xp
+    compared 110701760 bytes of executable text
+    DIFFERING BYTES: 0
+
+**§30 is retracted.** It concluded the value storage fails on is engine-internal
+and unreachable through any host-application interface, and that the only
+remaining route was the memory write ADR-001 makes absent. Sober reaches
+`RbxStorage::init [INIT] user: flagLoaded` with **zero** bytes of its engine text
+altered. A legitimate route exists.
+
+The honest limit of this reading, stated because it was stated before the test
+was run rather than after: zero rules out *code* patching — mocktail's 116
+`PatchCode` sites — and not a forced *data* byte, which is what mocktail's own
+flags-loaded patch is. So this does not prove Sober touches nothing. It does
+prove Sober is not rewriting the engine's instructions, which is what "nobody has
+solved this honestly" would have looked like.
+
+### The path is the lead
+
+Sober's mapping names its file, and the name is an authentic Android application
+layout:
+
+    /data/app/~~<base64>/com.roblox.client-<base64>/lib/x86_64/libroblox.so
+
+Cordial loads from `~/.cache/cordial/lib/x86_64/libroblox.so`. Nothing about that
+path looks like an installed Android package.
+
+**Hypothesis, untested at the time of writing:** the engine derives its private
+data directory — the root storage is built from — by walking up from its own
+library path, the way an Android app can locate `/data/user/0/<package>/` from
+`/data/app/<package>/lib/<abi>/`. Given a path with no package component to find,
+that derivation yields nothing, which is exactly the empty string §25.1 traced
+into three `stat("")` calls, and exactly the kind of value §29 found is never
+fetched over JNI because it never needed to be.
+
+It also explains a detail nothing else has: why the two *successful* stats in the
+same function are `./appData`, resolved against the working directory, while the
+failing one is empty. Two different roots, one of which has a fallback and one of
+which does not.
+
+**This is testable without any memory write**, and that is the point. Cordial
+already remaps `/system/<rest>` onto a host directory in
+`native/system_paths.cpp`; the same machinery could present the engine with an
+Android-shaped `/data/app/...` path for its own library, and an Android-shaped
+private data directory beneath it. Whether the engine then finds a root is a
+measurement, not an argument.
+
+Twenty-one candidates died against the wrong question. This is the first one
+aimed at the right one.

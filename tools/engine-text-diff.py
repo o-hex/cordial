@@ -28,19 +28,27 @@ runs inside the sandbox's PID namespace -- no host `/proc/<pid>/maps` contains
 the mapping at all, and `flatpak enter` needs `CAP_SYS_ADMIN`:
 
     flatpak run org.vinegarhq.Sober &     # let it reach the landing page first
-    sudo flatpak enter \\
-        $(flatpak ps --columns=instance,application | awk '/Sober/{print $1; exit}') \\
-        /usr/bin/python3 - --lib /path/inside/sandbox/libroblox.so \\
-        < tools/engine-text-diff.py
+    sudo nsenter -t $(pgrep -f 'bwrap.*sober' | head -1) -p -m --mount-proc \\
+        /usr/bin/python3 /path/to/tools/engine-text-diff.py
 
-## Why it matches on size rather than on name
+`nsenter -p -m` joins Sober's PID and mount namespaces, which makes the inner
+processes visible and Sober's own copy of the engine readable at the path its
+mapping names.
 
-Both Cordial's ported bionic linker and Sober's map the engine anonymously, so
-`/proc/<pid>/maps` carries no path to grep for. Matching "any large executable
-anonymous mapping" instead picks up JIT arenas -- the first version of this
-script confidently selected a 512 MB region belonging to Chrome. So the
-executable `PT_LOAD` is read out of the reference ELF and its size is what a
-mapping has to match.
+## Naming, and a correction
+
+An earlier version of this docstring said Cordial maps the engine anonymously.
+**That is wrong** -- running the tool shows Cordial's mapping does name its file,
+and the tool now prefers that name as its own reference, which removes any
+question of whether the process loaded the same build as `--lib`. The claim came
+from the mapping being invisible in a host-side scan while Sober was running,
+which was the PID namespace, not the naming.
+
+The size fallback stays for the case where a loader really does map
+anonymously. It matches the executable `PT_LOAD` size read out of the reference
+ELF rather than "any large executable anonymous mapping", because the first
+version of this script did the latter and confidently selected a 512 MB JIT
+arena belonging to Chrome.
 """
 
 import argparse
@@ -113,26 +121,42 @@ def main():
     seg_off, seg_size = exec_segment(args.lib)
     print(f"reference {args.lib}: executable PT_LOAD at 0x{seg_off:x}, {seg_size} bytes")
 
+    # A named mapping is its own reference and is preferred: it removes any
+    # question of whether the process loaded the same build as `--lib`. Sober
+    # and Cordial both map anonymously, so this is the unusual case, but when it
+    # happens the file is read through /proc/<pid>/root so a sandboxed path
+    # still resolves.
     found = None
     for pid, fields, line in candidates(args.pid):
         lo, hi = (int(x, 16) for x in fields[0].split("-"))
+        named = fields[-1] if fields[-1].startswith("/") and "libroblox" in fields[-1] else None
+        if named:
+            sandboxed = f"/proc/{pid}/root{named}"
+            ref = sandboxed if os.path.exists(sandboxed) else named
+            try:
+                off, size = exec_segment(ref)
+            except SystemExit:
+                continue
+            print(f"mapping names its file; using {ref} as the reference")
+            found = (pid, lo, hi, line, ref, int(fields[2], 16), size)
+            break
         if abs((hi - lo) - seg_size) <= args.tolerance:
-            found = (pid, lo, hi, line)
+            found = (pid, lo, hi, line, args.lib, seg_off, seg_size)
             break
 
     if not found:
         print(
             "no readable process has a mapping matching that segment.\n"
             "Sober's engine lives in the Flatpak PID namespace and needs\n"
-            "`sudo flatpak enter` -- see the module docstring."
+            "`sudo nsenter` -- see the module docstring."
         )
         return 1
 
-    pid, lo, hi, line = found
+    pid, lo, hi, line, ref, seg_off, seg_size = found
     size = min(hi - lo, seg_size)
     print(f"pid {pid}  {fields_of(line)}")
 
-    with open(f"/proc/{pid}/mem", "rb", 0) as mem, open(args.lib, "rb") as f:
+    with open(f"/proc/{pid}/mem", "rb", 0) as mem, open(ref, "rb") as f:
         mem.seek(lo)
         live = mem.read(size)
         f.seek(seg_off)

@@ -1178,6 +1178,16 @@ namespace cordial {
 void register_local_storage_classes(jnivm::ENV* env);
 }
 
+// Defined in platform_classes.cpp. Separate because its header comment has to
+// carry the direction-of-call reasoning for `ActivityThread`/`Application` —
+// why the engine's own native code reaches for a `Context` this way rather
+// than through the app's Java bootstrap Cordial never runs — and the account
+// of which of the fork's requested classes were checked against the dex and
+// found absent, neither of which belongs buried in this file's preamble.
+namespace cordial {
+void register_platform_classes(jnivm::ENV* env);
+}
+
 // -------------------------------------------------------- the identity, in and out
 //
 // Cordial's own boundary, not Roblox's: `crates/cordial-runtime/src/identity.rs`
@@ -1541,10 +1551,17 @@ static std::shared_ptr<SharedPreferences> context_get_shared_preferences(
 void register_shared_preferences(ENV* env) {
     SharedPreferencesEditor::Register(env);
     SharedPreferencesImpl::Register(env);
-    // Hooked on both, because the engine resolved the method against
-    // `android/content/Context` but calls it on whatever object it is holding,
-    // and the one it is holding is the Activity.
-    for (const char* klass : {"android/content/Context", "android/app/Activity"}) {
+    // Hooked on all three, because the engine resolved the method against
+    // `android/content/Context` but calls it on whatever object it is holding.
+    // `android/app/Application` joined `Activity` here for the same reason
+    // `platform_classes.cpp`'s own header documents at length: since
+    // `ActivityThread.getApplication()` started handing the engine a real
+    // `android/app/Application` object, that object is a third kind of thing
+    // capable of being asked this question, and libjnivm does not walk from a
+    // class to a same-shaped-but-differently-named one to find a hook that was
+    // only ever registered under the other name.
+    for (const char* klass :
+         {"android/content/Context", "android/app/Activity", "android/app/Application"}) {
         env->GetClass<Object>(klass);
         env->GetClass(klass)->HookInstanceFunction(env, "getSharedPreferences",
                                                    &context_get_shared_preferences);
@@ -1575,6 +1592,7 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
     cordial::register_clipboard_classes(env);
     cordial::register_shared_preferences(env);
     cordial::register_local_storage_classes(env);
+    cordial::register_platform_classes(env);
     if (getenv("CORDIAL_JNI_TRACE")) {
         fprintf(stderr, "[classes] Cordial's Java side registered\n");
     }

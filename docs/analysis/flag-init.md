@@ -4145,3 +4145,40 @@ The one instrument that works is the filesystem. It has now been pointed at the
 delay, at warmth, at the storage flags, and at content activity, and all four are
 negative. Whoever continues should keep using it and should not trust a single
 `grep -c 'RbxStorage::init'` in this file.
+
+### §36.3 The working store was used, not merely created
+
+Opened it. `rbx-storage.db` carries one table and it has content:
+
+    CREATE TABLE files (id BLOB PRIMARY KEY NOT NULL, content BLOB,
+      size INTEGER, hits INTEGER, atime INTEGER, category INTEGER, score …)
+    CREATE INDEX files_atime_idx / files_size_idx / files_category_idx / files_score_idx
+
+    rows: 9
+
+Nine cached entries with real `content` blobs — sizes 786, 787, 1673, 1786, 2382,
+259040 and 8 bytes, across categories 1, 10 and 11, all sharing one `atime` of
+`1787125562730` (the creation moment). Several carry `RBXH` magic, so these are
+Roblox's own cache records rather than empty rows.
+
+So this was not a directory tree that happened to appear. **The engine
+initialised its content store, opened a database, created eight partitions,
+categorised nine assets and wrote them.** Whatever the trigger is, it produced a
+fully working store, once.
+
+The schema is worth having for whoever continues, because it says what the store
+is for and what a successful run should leave behind: content addressed by an
+opaque id, with hit counts, access times, categories and a score — an eviction
+cache. A successful reproduction will show rows here, not just files on disk.
+
+### The final state of this question
+
+Reachable — proven twice over now, by structure and by contents. Not reproduced,
+against the delay, warmth, the storage flags and content activity, all measured
+on the filesystem. And the log channel that would say what happened is silent
+even on success, which voids most of the scoring in this document.
+
+Nine instrument faults, eight of them an absence read as evidence. That is the
+finding this file is actually worth, more than any individual candidate: **in
+this codebase, when a measurement says nothing happened, suspect the
+measurement first.** It has been right eight times out of nine.

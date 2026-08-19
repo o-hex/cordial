@@ -52,6 +52,21 @@ pub fn function_overrides() -> Vec<(&'static str, *mut c_void)> {
         f!("android_get_device_api_level", android_get_device_api_level),
         // Selector numbering differs wholesale between the two libcs.
         f!("sysconf", bionic_sysconf),
+        // The legacy `__sF` streams. Zeroed storage below stops the load-time
+        // failure; these make a write through `&__sF[k]` reach the host's real
+        // stream instead of faulting on a zeroed FILE. Three separate engine
+        // calls were segfaulting at `0x8` inside `_IO_fflush` before this --
+        // docs/analysis/flag-init.md §18.
+        f!("fflush", legacy_fflush),
+        f!("fclose", legacy_fclose),
+        f!("fseek", legacy_fseek),
+        f!("ftell", legacy_ftell),
+        f!("fputs", legacy_fputs),
+        f!("setvbuf", legacy_setvbuf),
+        f!("fread", legacy_fread),
+        f!("fwrite", legacy_fwrite),
+        f!("fprintf", legacy_fprintf),
+        f!("vfprintf", legacy_vfprintf),
     ];
     // sigset_t is 8 bytes in bionic and 128 in glibc; struct sigaction is 32
     // against 152, with a different field order. Passing either through is a
@@ -98,6 +113,29 @@ pub fn data_overrides() -> Vec<(&'static str, *mut c_void)> {
     ]
 }
 
+unsafe extern "C" {
+    #[link_name = "cordial_legacy_fflush"]
+    fn legacy_fflush(f: *mut c_void) -> c_int;
+    #[link_name = "cordial_legacy_fclose"]
+    fn legacy_fclose(f: *mut c_void) -> c_int;
+    #[link_name = "cordial_legacy_fseek"]
+    fn legacy_fseek(f: *mut c_void, off: i64, whence: c_int) -> c_int;
+    #[link_name = "cordial_legacy_ftell"]
+    fn legacy_ftell(f: *mut c_void) -> i64;
+    #[link_name = "cordial_legacy_fputs"]
+    fn legacy_fputs(s: *const c_char, f: *mut c_void) -> c_int;
+    #[link_name = "cordial_legacy_setvbuf"]
+    fn legacy_setvbuf(f: *mut c_void, buf: *mut c_char, mode: c_int, size: usize) -> c_int;
+    #[link_name = "cordial_legacy_fread"]
+    fn legacy_fread(p: *mut c_void, sz: usize, n: usize, f: *mut c_void) -> usize;
+    #[link_name = "cordial_legacy_fwrite"]
+    fn legacy_fwrite(p: *const c_void, sz: usize, n: usize, f: *mut c_void) -> usize;
+    #[link_name = "cordial_legacy_fprintf"]
+    fn legacy_fprintf(f: *mut c_void, fmt: *const c_char, ...) -> c_int;
+    #[link_name = "cordial_legacy_vfprintf"]
+    fn legacy_vfprintf(f: *mut c_void, fmt: *const c_char, ap: *mut c_void) -> c_int;
+}
+
 /// bionic's pre-API-23 `FILE __sF[3]`, where `stdout` was the macro `&__sF[1]`.
 ///
 /// Roblox targets SDK 35 and reaches the standard streams through the modern
@@ -117,6 +155,21 @@ pub fn data_overrides() -> Vec<(&'static str, *mut c_void)> {
 /// function wrapped to remap the pointer onto the host's real stream, which is
 /// only worth building once something is observed using it.
 static LEGACY_SF: [[u8; LEGACY_FILE_SIZE]; 3] = [[0; LEGACY_FILE_SIZE]; 3];
+
+/// The array's address and stride, for `native/legacy_stdio.cpp`.
+///
+/// Exported rather than restated on that side because `LEGACY_FILE_SIZE` is a
+/// number nobody can derive twice reliably, and two copies that drift would send
+/// a legacy write to an address a third of a FILE off the stream it meant.
+#[unsafe(no_mangle)]
+pub extern "C" fn cordial_legacy_sf_base() -> *const u8 {
+    std::ptr::addr_of!(LEGACY_SF) as *const u8
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cordial_legacy_sf_stride() -> usize {
+    LEGACY_FILE_SIZE
+}
 
 /// `sizeof(struct __sFILE)` in pre-M bionic on LP64. Only the total matters: the
 /// array has to span the addresses a legacy caller would compute.

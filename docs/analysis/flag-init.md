@@ -1745,3 +1745,68 @@ that libjnivm does not provide. **`INFERRED` from the exception name and timing.
 Confirming it would mean reading the engine's own implementation, which is the
 line AGENTS.md draws, so it stays inferred. Whether the weak refs and the
 `_IO_fflush` fault are one problem or two is open.
+
+## §19. The streams are translated, and the engine finally says what is wrong
+
+`native/legacy_stdio.cpp` maps the three `__sF` slots onto the host's real
+`stdin`/`stdout`/`stderr` and routes the ten FILE-taking functions the engine
+imports through the translation. In C++ rather than Rust because `fprintf` is
+variadic, Rust cannot define a variadic `extern "C"`, and AGENTS.md records that
+this project's one previous attempt at wrapping variadics unsafely aborts the
+engine.
+
+### All three reproducers changed, and none of them segfaults
+
+| reproducer | before | after |
+|---|---|---|
+| `setPlatformImpl` | 139, `SIGSEGV` in `_IO_fflush` | 133, `SIGTRAP` |
+| `CORDIAL_LATE_SETTINGS` | crashed 2/2, never root-caused | 133, `SIGTRAP` |
+
+§18 predicted the fault and §18.1 found a third instance of it. The prediction
+holds: with the legacy streams translated, **no reproducer produces a `SIGSEGV`
+at `_IO_fflush` any more**. What each produces instead is a named error, which is
+the whole point.
+
+### And the named error is the answer this document has been looking for
+
+`CORDIAL_LATE_SETTINGS=1` now ends:
+
+    RBXCRASH: FatalRuntimeError
+      (Can't initialize the TaskScheduler before flags have been loaded)
+
+**The engine has been saying this all along and it was arriving as a memory
+fault.** For weeks this was "Cordial crashes when it uses mocktail's ordering,
+cause unknown" — §11.8 set it aside on exactly that basis. It is not unknown. The
+TaskScheduler is initialised before flags are loaded, and the engine treats that
+as fatal.
+
+That reframes the whole storage question. §12 established the flags verdict is
+reached inside `initializeNativeCode` before any settings call, and could not say
+why. This says why: something on that path brings the TaskScheduler up first, and
+the engine's flag machinery will not run behind it.
+
+`setPlatformImpl` ends differently — thirteen
+`djinni (djinni_support.cpp:529): weakRef` exceptions and then
+`RBXCRASH: JNI: Crashing due to unhandled Java exception`. A separate problem,
+now visible as one: djinni wants working weak global references and libjnivm does
+not provide them. Still `INFERRED` as to cause, but it is a reported Java
+exception rather than a corrupted heap, and it can be worked on.
+
+### What this cost and what it bought
+
+Ten wrapper functions and an address exported from Rust so the constant is not
+restated. No behaviour change on the default path — a pointer that is not one of
+the three legacy slots is passed through untouched, because a pointer this code
+does not recognise is not its to interpret.
+
+What it bought is that two failures which presented as heap corruption now
+present as sentences. AGENTS.md's rule is that a stub which reports success is
+worse than one that reports failure; the same holds a level down. A crash that
+names its cause is worth more than one that does not, and this project spent
+weeks on one that did not.
+
+### Next
+
+The TaskScheduler line is the thread to pull. It is the first statement from the
+engine itself about *why* flags are not loaded, as opposed to *that* they are
+not, and everything in §§12–17 was working without it.

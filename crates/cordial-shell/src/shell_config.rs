@@ -224,6 +224,32 @@ pub struct ShellConfig {
     /// one. See `graphics::resolve`.
     pub graphics: String,
     pub mangohud: bool,
+    /// The accelerator that toggles fullscreen, in GTK's own syntax.
+    ///
+    /// Configurable rather than hardcoded because F11 is not reachable on every
+    /// keyboard. A laptop whose function row defaults to media keys needs Fn held
+    /// to produce F11 at all, and on some of those the keypress never reaches the
+    /// application — so a client that only listens for F11 cannot be
+    /// fullscreened on that machine by any amount of pressing.
+    ///
+    /// GTK binds nothing here by default, deliberately: it offers
+    /// `gtk_window_fullscreen()` and leaves the key to the application, because
+    /// F11 means other things elsewhere. Apps that appear to have it "for free"
+    /// — Nautilus, Eye of GNOME — each bound it themselves.
+    ///
+    /// GNOME does carry a compositor-level `toggle-fullscreen` in
+    /// `org.gnome.desktop.wm.keybindings`, and ships it **unbound**. Setting it
+    /// there works for every window and is the better answer for somebody who
+    /// wants one key across their whole desktop; this setting is for the window
+    /// rather than the desktop, and the two do not conflict.
+    ///
+    /// Empty disables the binding entirely, for exactly that case.
+    #[serde(default = "default_fullscreen_accel")]
+    pub fullscreen_accel: String,
+}
+
+fn default_fullscreen_accel() -> String {
+    "F11".to_string()
 }
 
 impl Default for ShellConfig {
@@ -237,6 +263,7 @@ impl Default for ShellConfig {
             gamemode: true,
             graphics: "automatic".to_string(),
             mangohud: false,
+            fullscreen_accel: default_fullscreen_accel(),
         }
     }
 }

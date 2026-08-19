@@ -278,6 +278,26 @@ impl HostWindow {
             .content(&toolbar)
             .build();
 
+        // Hide the header bar while fullscreen, and put it back afterwards.
+        //
+        // GTK does not do this for you and is right not to: it cannot know
+        // whether a given toolbar is chrome the user wants gone or part of the
+        // application. For a game it is chrome. Without this, fullscreening
+        // leaves the title bar sitting across the top of the picture, which is
+        // what "fullscreen still shows the titlebar" means and is not a
+        // compositor problem — the window really is fullscreen, the bar is
+        // simply still inside it.
+        //
+        // `set_reveal_top_bars` rather than hiding the header directly, because
+        // ToolbarView owns the space it occupies: hiding the child leaves the
+        // gap it was sitting in.
+        {
+            let toolbar_for_fs = toolbar.clone();
+            window.connect_fullscreened_notify(move |w| {
+                toolbar_for_fs.set_reveal_top_bars(!w.is_fullscreen());
+            });
+        }
+
         HostWindow { window, header, toolbar, content: content.as_ref().clone() }
     }
 

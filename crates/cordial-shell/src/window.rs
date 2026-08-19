@@ -358,6 +358,11 @@ pub fn build(
     // can be seen without pressing something, which under ADR-011's Wayland is
     // not a thing an agent may do — see `open_on_start`. It goes through the
     // same action the button does rather than a second way in.
+    // Read before `config` is moved into the closure below. The value is a
+    // string in a config file, so it is copied out once here rather than
+    // borrowed later from something that has gone.
+    let fullscreen_accel = config.borrow().fullscreen_accel.trim().to_string();
+
     let settings_action =
         gtk::gio::SimpleAction::new("settings", Some(glib::VariantTy::STRING));
     let window_for_settings = window.clone();
@@ -410,9 +415,19 @@ pub fn build(
     actions.add_action(&profile_action);
     actions.add_action(&fullscreen_action);
     window.insert_action_group("win", Some(&actions));
+    // Whatever the user configured, defaulting to F11 but not insisting on it —
+    // see `ShellConfig::fullscreen_accel` for why a hardcoded F11 is unreachable
+    // on some laptops. An empty string leaves the action registered and
+    // unbound, which is the right state for somebody who would rather bind
+    // GNOME's own `toggle-fullscreen` and have it work for every window.
     if let Some(app) = window.application() {
         use gtk::prelude::GtkApplicationExt;
-        app.set_accels_for_action("win.fullscreen", &["F11"]);
+        let accel = fullscreen_accel.clone();
+        if accel.is_empty() {
+            app.set_accels_for_action("win.fullscreen", &[]);
+        } else {
+            app.set_accels_for_action("win.fullscreen", &[accel.as_str()]);
+        }
     }
     // The target before the name, and in that order deliberately: GTK's action
     // helper re-checks the pair every time either changes, and naming a

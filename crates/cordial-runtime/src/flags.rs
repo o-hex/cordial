@@ -247,6 +247,53 @@ pub fn plugin_dir() -> PathBuf {
         .unwrap_or_else(|| data_dir().join("cordial/plugins"))
 }
 
+/// How large one plugin's own `flags.json` may grow.
+///
+/// Nothing here validates the *keys* a plugin sends — only Roblox's own C++
+/// knows which FastFlag names are real, and an unrecognised one simply
+/// resolves to nothing, harmlessly. The size cap exists for the reason
+/// `settings.rs`'s does: an ordinary bug that keeps appending values must not
+/// be able to fill a plugin's directory silently just because nothing else
+/// was watching.
+const MAX_PLUGIN_FLAGS_BYTES: usize = 256 * 1024;
+
+/// Replace plugin `id`'s own `flags.json` with `values` — the effect behind
+/// the `flags.write` capability (`plugin_host.rs`'s `dispatch`).
+///
+/// A whole-document replace, not a merge, for the same reason
+/// `settings::Store::write` is: a plugin is the only writer of its own file,
+/// so it always knows the complete set it means to leave in place, and a
+/// merge would give it no way to withdraw a flag it has stopped wanting
+/// overridden. Written to a sibling file and renamed in — the same
+/// atomic-write shape every other per-plugin document in this project
+/// uses — so a process killed mid-write leaves the previous, valid document
+/// rather than one `read_layer` has to report and skip.
+///
+/// Takes effect at the **next launch only**: `FFlag`/`FInt`/`FString` are
+/// read once during `nativeInitClientSettings`, and this file is one layer
+/// `collect` reads before the engine process starts (see the module note) —
+/// there is no live effect here to have, which is the whole reason
+/// `flags.write` and `flags.write.dynamic` are two capabilities rather than
+/// one (ADR-005).
+pub fn write_plugin_layer(id: &str, values: &BTreeMap<String, String>) -> Result<(), String> {
+    if !cordial_plugins::manifest::is_valid_id(id) {
+        return Err(format!("{id:?} is not a usable plugin id"));
+    }
+    let text = serde_json::to_string_pretty(values).map_err(|e| e.to_string())?;
+    if text.len() > MAX_PLUGIN_FLAGS_BYTES {
+        return Err(format!(
+            "{} bytes of flags is more than the {MAX_PLUGIN_FLAGS_BYTES} byte limit",
+            text.len()
+        ));
+    }
+    let dir = plugin_dir().join(id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join("flags.json");
+    let tmp = path.with_extension("json.new");
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -485,7 +532,7 @@ pub fn report(resolved: &BTreeMap<String, Resolved>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// `read_layer` must not prefer one value shape over another: an `FLog`
@@ -626,11 +673,16 @@ mod tests {
         std::env::remove_var(DEVICE_PROFILE_ENV);
     }
 
-    /// `XDG_CONFIG_HOME` and `CORDIAL_FLAGS` are process-wide, and cargo runs
-    /// these in parallel threads of one process. Same reasoning as
-    /// `profile`'s own test mutex, which records that the unserialised version
-    /// passed anyway on its first run.
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// `XDG_CONFIG_HOME`, `CORDIAL_FLAGS` and `CORDIAL_PLUGIN_DIR` are
+    /// process-wide, and cargo runs these in parallel threads of one process.
+    /// Same reasoning as `profile`'s own test mutex, which records that the
+    /// unserialised version passed anyway on its first run.
+    ///
+    /// `pub(crate)` so `plugin_host.rs`'s tests can take the same lock before
+    /// touching `CORDIAL_PLUGIN_DIR` themselves — two module-local mutexes
+    /// guarding one process-wide variable would not actually exclude each
+    /// other, which is the flake this is written to avoid rather than repeat.
+    pub(crate) static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn scratch(tag: &str) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
         let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
@@ -693,5 +745,76 @@ mod tests {
         let layer = read_layer(&user_path_in(&profile), Source::User).unwrap();
         assert_eq!(layer.values["FIntQ"], "1", "the profile's own file must win");
         assert!(legacy.exists(), "and the old file is left untouched");
+    }
+
+    fn scratch_plugin_dir(tag: &str) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("cordial-flags-plugin-write-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("CORDIAL_PLUGIN_DIR", &root);
+        (root, guard)
+    }
+
+    #[test]
+    fn a_plugin_can_write_its_own_flags_layer_and_read_it_back() {
+        let (root, _g) = scratch_plugin_dir("roundtrip");
+        let values: BTreeMap<String, String> =
+            [("FFlagFoo".to_string(), "true".to_string())].into_iter().collect();
+        write_plugin_layer("tuner", &values).unwrap();
+
+        let layer = read_layer(&root.join("tuner/flags.json"), Source::Plugin("tuner".into()))
+            .expect("the written file should read back");
+        assert_eq!(layer.values["FFlagFoo"], "true");
+    }
+
+    #[test]
+    fn writing_a_plugins_flags_replaces_rather_than_merges() {
+        // The plugin is the only writer of its own file, so it must be able
+        // to drop a flag it has stopped wanting overridden — a merge would
+        // leave it there with nothing able to remove it.
+        let (root, _g) = scratch_plugin_dir("replace");
+        let first: BTreeMap<String, String> =
+            [("FFlagA".to_string(), "true".to_string()), ("FFlagStale".to_string(), "true".to_string())]
+                .into_iter()
+                .collect();
+        write_plugin_layer("tuner", &first).unwrap();
+        let second: BTreeMap<String, String> = [("FFlagA".to_string(), "false".to_string())].into_iter().collect();
+        write_plugin_layer("tuner", &second).unwrap();
+
+        let layer = read_layer(&root.join("tuner/flags.json"), Source::Plugin("tuner".into())).unwrap();
+        assert_eq!(layer.values["FFlagA"], "false");
+        assert!(layer.values.get("FFlagStale").is_none(), "{:?}", layer.values);
+    }
+
+    #[test]
+    fn a_plugin_id_that_is_not_valid_is_refused_rather_than_used_as_a_path() {
+        let (_root, _g) = scratch_plugin_dir("bad-id");
+        let values = BTreeMap::new();
+        for bad in ["..", "../../etc", "a/b", "/etc/passwd"] {
+            assert!(write_plugin_layer(bad, &values).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn an_oversized_flags_layer_is_refused() {
+        let (_root, _g) = scratch_plugin_dir("oversized");
+        let huge: BTreeMap<String, String> =
+            [("FFlagHuge".to_string(), "x".repeat(MAX_PLUGIN_FLAGS_BYTES + 1))].into_iter().collect();
+        assert!(write_plugin_layer("tuner", &huge).is_err());
+    }
+
+    #[test]
+    fn one_plugins_write_does_not_touch_another_plugins_flags_json() {
+        let (root, _g) = scratch_plugin_dir("isolation");
+        let a: BTreeMap<String, String> = [("FFlagA".to_string(), "true".to_string())].into_iter().collect();
+        let b: BTreeMap<String, String> = [("FFlagB".to_string(), "true".to_string())].into_iter().collect();
+        write_plugin_layer("plugin-a", &a).unwrap();
+        write_plugin_layer("plugin-b", &b).unwrap();
+
+        let layer_a = read_layer(&root.join("plugin-a/flags.json"), Source::Plugin("plugin-a".into())).unwrap();
+        let layer_b = read_layer(&root.join("plugin-b/flags.json"), Source::Plugin("plugin-b".into())).unwrap();
+        assert!(layer_a.values.get("FFlagB").is_none());
+        assert!(layer_b.values.get("FFlagA").is_none());
     }
 }

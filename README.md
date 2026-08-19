@@ -158,7 +158,7 @@ will be declined.
 | Fullscreen | 🟡 F11 with the header bar hidden, and the choice persists per profile — but on the launcher window, not the one you play in |
 | **The engine's content store** | ❌ `RbxStorage` never initialises, so every asset is fetched from the network every session; this is why loading is sometimes slow-and-complete and sometimes fast-and-untextured |
 | Clean shutdown | ✅ full pause/stop/destroy sequence, observed in the engine's own log |
-| Plugins | 🟡 host, broker, per-profile grants and settings, an on/off switch, and a registry with hardened unpacking; no marketplace yet |
+| Plugins | 🟡 host, broker and per-profile grants now enforce every capability, not only `flags.*`/`presence.*` as before — notify, url.open, asset overlays, `flags.write` and cross-plugin events all reach a real effect; Settings can grant or revoke a capability, and install or remove a plugin from a local `.tar.zst` archive; still no in-app fetch from a remote index, so the marketplace half of the registry is unbuilt |
 
 Frame rate measured with pointer motion driven for the whole run, because
 presents drop to exactly 1/s when nothing is happening and every earlier figure

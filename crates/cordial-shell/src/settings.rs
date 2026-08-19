@@ -18,7 +18,7 @@
 //! in the shell because the shell is what has to work when nothing else does.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use libadwaita as adw;
@@ -32,6 +32,7 @@ use cordial_plugins::capability::Capability;
 use cordial_plugins::enablement;
 use cordial_plugins::grants;
 use cordial_plugins::manifest::{self, Plugin};
+use cordial_plugins::unpack;
 
 use crate::install;
 use crate::shell_config::{self, AppearanceScheme, ShellConfig};
@@ -513,7 +514,285 @@ fn build_general_page(
 /// instance in any case. A toggle that looked immediate and was not is exactly
 /// the small lie this project keeps writing ADRs about, so the wording is the
 /// weaker claim.
-fn build_plugins_page(config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesPage {
+/// A short, user-facing sentence for one capability — a checkbox needs prose,
+/// and `cordial_plugins::capability::Capability`'s own doc comments are the
+/// protocol's vocabulary, not this window's. Kept here rather than in that
+/// crate for the same reason `capability_summary` is: this is a shell
+/// concern, not a protocol one.
+fn capability_description(cap: Capability) -> &'static str {
+    match cap {
+        Capability::FlagsRead => "Read which FastFlag overrides are in effect, and where each came from.",
+        Capability::FlagsWrite => "Contribute FastFlag overrides that take effect at the next launch.",
+        Capability::FlagsWriteDynamic => {
+            "Change a DFFlag/DFInt/DFString while the client is running. Not available yet — \
+             nothing in Cordial writes into the running engine."
+        }
+        Capability::Log => "Write log lines into Cordial's own output.",
+        Capability::LifecycleRead => "Observe client lifecycle events — launch, ready, shutdown.",
+        Capability::PresenceSet => {
+            "Publish Discord Rich Presence. Cordial holds the connection to Discord; this only \
+             sends what to show."
+        }
+        Capability::NotifySend => "Post a desktop notification.",
+        Capability::UrlOpen => "Open an http(s) link in your browser.",
+        Capability::AssetsOverride => {
+            "Overlay files in place of Roblox's own assets — textures, sounds, fonts. Never \
+             modifies the APK; removing the plugin restores the original."
+        }
+        Capability::SettingsRead => "Read the settings document Cordial keeps for it.",
+        Capability::SettingsWrite => "Replace the settings document Cordial keeps for it.",
+        Capability::EventsDeclare => "Register its own event types, for other plugins to hear.",
+        Capability::EventsPublish => "Broadcast on an event type it has declared.",
+        Capability::EventsSubscribe => "Receive events, including ones other plugins declared.",
+    }
+}
+
+/// Recompute and set `expander`'s subtitle from what is actually on disk,
+/// rather than from whatever a closure happened to capture when the row was
+/// built. Both the enable switch and every capability switch below call this
+/// after they write, so the summary line never lags behind the file it
+/// describes — the same reasoning the single switch this replaced already
+/// had, extended to cover more than one control changing the same plugin.
+fn refresh_plugin_subtitle(expander: &adw::ExpanderRow, plugin: &Plugin, profile_dir: Option<&PathBuf>, enabled: bool) {
+    let granted = profile_dir.map(|dir| grants::load(&grants::path_in(dir))).unwrap_or_default();
+    expander.set_subtitle(&capability_summary(plugin, granted.get(&plugin.manifest.id), enabled));
+}
+
+/// One installed plugin's row: enable switch, one capability switch per
+/// capability it requested, and a Remove button in the header. Factored out
+/// of `build_plugins_page` so the exact same row — grants wiring, remove
+/// wiring, everything — is what a freshly installed plugin gets too, rather
+/// than a second, drifting copy of this logic living in the install button's
+/// callback.
+fn build_plugin_row(
+    parent: &impl IsA<gtk::Window>,
+    plugin: &Plugin,
+    profile_dir: Option<&PathBuf>,
+    root: &Path,
+    group: &adw::PreferencesGroup,
+) -> adw::ExpanderRow {
+    let title = if plugin.manifest.name.is_empty() {
+        plugin.manifest.id.clone()
+    } else {
+        plugin.manifest.name.clone()
+    };
+    let id = plugin.manifest.id.clone();
+    let enabled = profile_dir.is_none_or(|dir| enablement::is_enabled(dir, &id));
+
+    let expander = adw::ExpanderRow::builder()
+        .title(title.clone())
+        .subtitle(capability_summary(plugin, profile_dir.map(|dir| grants::load(&grants::path_in(dir))).unwrap_or_default().get(&id), enabled))
+        .build();
+    expander.set_subtitle_lines(4);
+
+    // A freshly installed plugin has never been granted anything (ADR-003's
+    // default deny), so this button is reachable — and needed — the moment
+    // the row appears, not only after a page reload.
+    let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+    remove.set_valign(gtk::Align::Center);
+    remove.add_css_class("flat");
+    remove.set_tooltip_text(Some("Remove this plugin"));
+    expander.add_suffix(&remove);
+    {
+        let window = parent.as_ref().clone();
+        let root = root.to_path_buf();
+        let id = id.clone();
+        let title = title.clone();
+        let group = group.clone();
+        let expander = expander.clone();
+        remove.connect_clicked(move |_| {
+            let dialog = adw::MessageDialog::builder()
+                .transient_for(&window)
+                .modal(true)
+                .heading(format!("Remove {title}?"))
+                .body(
+                    "This deletes the plugin's installed files. Its saved settings and the \
+                     capabilities you granted it in this profile are kept — reinstalling the \
+                     same plugin later finds them again (ADR-013).",
+                )
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("remove", "Remove");
+            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+
+            let root = root.clone();
+            let id = id.clone();
+            let group = group.clone();
+            let expander = expander.clone();
+            dialog.connect_response(None, move |dialog, response| {
+                if response == "remove" {
+                    match unpack::uninstall(&root, &id) {
+                        Ok(()) => group.remove(&expander),
+                        Err(e) => eprintln!("shell: could not remove plugin {id}: {e}"),
+                    }
+                }
+                dialog.close();
+            });
+            dialog.present();
+        });
+    }
+
+    // The switch that used to be the whole row is now one child row among
+    // several, so switching a plugin off sits beside — and does not
+    // disturb — the capability switches it does not revoke.
+    let enable_row = adw::SwitchRow::builder().title("Enabled").active(enabled).build();
+    {
+        let plugin = plugin.clone();
+        let dir = profile_dir.cloned();
+        let id = id.clone();
+        let expander = expander.clone();
+        enable_row.connect_active_notify(move |row| {
+            let on = row.is_active();
+            if let Some(dir) = &dir {
+                if let Err(e) = enablement::set_enabled(dir, &id, on) {
+                    // Reported rather than swallowed, and the row is put back
+                    // to what is actually on disk: a switch that stays where
+                    // the user left it while the file says otherwise is a lie
+                    // the user has no way to see.
+                    eprintln!("shell: could not record that {id} is {}: {e}", if on { "on" } else { "off" });
+                    row.set_active(!on);
+                    return;
+                }
+            }
+            refresh_plugin_subtitle(&expander, &plugin, dir.as_ref(), on);
+        });
+    }
+    expander.add_row(&enable_row);
+
+    // One switch per capability the plugin actually requested — offering
+    // one for something it never asked for would be a control with nothing
+    // to grant.
+    if plugin.requested.is_empty() {
+        expander.add_row(&adw::ActionRow::builder().title("Requests no capabilities").build());
+    } else if let Some(dir) = profile_dir {
+        let granted_here = grants::load(&grants::path_in(dir)).get(&id).cloned().unwrap_or_default();
+        for &cap in &plugin.requested {
+            let cap_row = adw::SwitchRow::builder()
+                .title(cap.name())
+                .subtitle(capability_description(cap))
+                .active(granted_here.contains(&cap))
+                .build();
+            cap_row.set_subtitle_lines(2);
+            expander.add_row(&cap_row);
+
+            let dir = dir.clone();
+            let id = id.clone();
+            let plugin = plugin.clone();
+            let expander = expander.clone();
+            let enable_row = enable_row.clone();
+            cap_row.connect_active_notify(move |row| {
+                let on = row.is_active();
+                if let Err(e) = grants::set(&grants::path_in(&dir), &id, cap, on) {
+                    eprintln!("shell: could not record {id}'s {} grant: {e}", cap.name());
+                    row.set_active(!on);
+                    return;
+                }
+                refresh_plugin_subtitle(&expander, &plugin, Some(&dir), enable_row.is_active());
+            });
+        }
+    } else {
+        // No resolvable profile directory: there is nowhere a grant could be
+        // written, so say that rather than offering switches that could not
+        // persist anything a user did with them.
+        expander.add_row(
+            &adw::ActionRow::builder()
+                .title("No profile to grant against")
+                .subtitle("This profile's directory could not be resolved.")
+                .build(),
+        );
+    }
+
+    expander
+}
+
+/// "Install a plugin" — a `.tar.zst` picked from disk, unpacked the same
+/// hardened way an index install would be (ADR-014), with no index involved.
+///
+/// This is the piece that used to be missing entirely: `cordial-plugins`
+/// shipped a fully tested unpacker (`unpack::install_local`) that nothing in
+/// the shell ever called, so "installing a plugin" meant unpacking a `tar`
+/// archive by hand into `~/.local/share/cordial/plugins/` — which is not a
+/// user-facing installer, it is the absence of one. Fetching from a remote
+/// index — the marketplace half of ADR-014 — still needs a network fetcher
+/// this change does not add; this is the half that was reachable without one.
+fn build_install_group(
+    parent: &impl IsA<gtk::Window>,
+    root: &Path,
+    profile_dir: Option<PathBuf>,
+    installed_group: &adw::PreferencesGroup,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Install a plugin")
+        .description(
+            "An archive with plugin.json at its root — the format \
+             `tar --zstd -cf name-1.0.0.tar.zst -C plugins/name .` produces. Unpacking refuses a \
+             symlink, a path that escapes the plugin's own directory, and an oversized or \
+             over-large archive, the same checks an index install goes through (ADR-014). \
+             Installing adds the code only; it grants nothing on its own.",
+        )
+        .build();
+
+    let row = adw::ActionRow::builder()
+        .title("Choose an archive…")
+        .subtitle("Nothing is installed until you pick a file.")
+        .build();
+    row.set_subtitle_lines(3);
+    let button = gtk::Button::with_label("Choose file…");
+    button.set_valign(gtk::Align::Center);
+    row.add_suffix(&button);
+
+    let window = parent.as_ref().clone();
+    let root = root.to_path_buf();
+    let installed_group = installed_group.clone();
+    let row_for_status = row.clone();
+    button.connect_clicked(move |_| {
+        let picker_window = window.clone();
+        let window = window.clone();
+        let root = root.clone();
+        let profile_dir = profile_dir.clone();
+        let installed_group = installed_group.clone();
+        let row = row_for_status.clone();
+        choose_file(&picker_window, "Choose a plugin archive (.tar.zst)", false, move |path| {
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    row.set_subtitle(&format!("Could not read {}: {e}", path.display()));
+                    return;
+                }
+            };
+            match unpack::install_local(&bytes, &root) {
+                Ok((plugin, _dir)) => {
+                    let name = if plugin.manifest.name.is_empty() {
+                        plugin.manifest.id.clone()
+                    } else {
+                        plugin.manifest.name.clone()
+                    };
+                    let requests = if plugin.requested.is_empty() {
+                        "no capabilities".to_string()
+                    } else {
+                        plugin.requested.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")
+                    };
+                    row.set_subtitle(&format!(
+                        "Installed {name} ({}). It requests {requests} and is granted nothing \
+                         yet — approve what it may do below.",
+                        plugin.manifest.id
+                    ));
+                    let new_row =
+                        build_plugin_row(&window, &plugin, profile_dir.as_ref(), &root, &installed_group);
+                    installed_group.add(&new_row);
+                }
+                Err(e) => row.set_subtitle(&format!("Could not install {}: {e}", path.display())),
+            }
+        });
+    });
+
+    group.add(&row);
+    group
+}
+
+fn build_plugins_page(parent: &impl IsA<gtk::Window>, config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Plugins")
         .name("plugins")
@@ -523,84 +802,38 @@ fn build_plugins_page(config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesPage 
     let root = manifest::plugin_root();
     let plugins = manifest::discover(&root);
 
-    if plugins.is_empty() {
-        let status = adw::StatusPage::builder()
-            .icon_name("application-x-addon-symbolic")
-            .title("No plugins installed")
-            .description(format!(
-                "Cordial looks for one directory per plugin, each with a plugin.json, in\n{}",
-                root.display()
-            ))
-            .build();
-        // An `AdwStatusPage` is not a preferences row, so it needs a group to
-        // live in; without one `AdwPreferencesPage` has nothing to add it to.
-        let group = adw::PreferencesGroup::new();
-        group.add(&status);
-        page.add(&group);
-        return page;
-    }
-
     let profile_name = config.borrow().profile.clone();
     // A profile whose name will not resolve has no grants and no enablement
     // file to read, and the page still has to render. `None` here means every
     // row shows "granted nothing", which is what such a profile would in fact
     // give a plugin.
     let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
-    let granted = profile_dir
-        .as_ref()
-        .map(|dir| grants::load(&grants::path_in(dir)))
-        .unwrap_or_default();
 
     let group = adw::PreferencesGroup::builder()
         .title("Installed plugins")
         .description(format!(
-            "Grants and this switch both belong to the profile rather than to the machine \
-             (ADR-013); these are {profile_name}'s. Turning one off keeps its grants, and \
-             takes effect the next time the client starts."
+            "Enablement and grants both belong to the profile rather than to the machine \
+             (ADR-013); these are {profile_name}'s. Expand a plugin to approve or withdraw the \
+             capabilities it has asked for — nothing here is granted until you switch it on. \
+             Changes take effect the next time the client starts."
         ))
         .build();
 
-    for plugin in &plugins {
-        let title = if plugin.manifest.name.is_empty() {
-            plugin.manifest.id.clone()
-        } else {
-            plugin.manifest.name.clone()
-        };
-        let id = plugin.manifest.id.clone();
-        let enabled = profile_dir.as_ref().is_none_or(|dir| enablement::is_enabled(dir, &id));
-
-        let row = adw::SwitchRow::builder()
-            .title(title)
-            .subtitle(capability_summary(plugin, granted.get(&id), enabled))
-            .active(enabled)
-            .build();
-        row.set_subtitle_lines(4);
-
-        // The subtitle carries the state, so it has to be rewritten when the
-        // state changes; a row that says "Off" while its switch says on is
-        // worse than a row that says nothing.
-        let plugin = plugin.clone();
-        let granted_here = granted.get(&id).cloned();
-        let dir = profile_dir.clone();
-        row.connect_active_notify(move |row| {
-            let on = row.is_active();
-            if let Some(dir) = &dir {
-                if let Err(e) = enablement::set_enabled(dir, &id, on) {
-                    // Reported rather than swallowed, and the row is put back to
-                    // what is actually on disk: a switch that stays where the
-                    // user left it while the file says otherwise is a lie the
-                    // user has no way to see.
-                    eprintln!("shell: could not record that {id} is {}: {e}", if on { "on" } else { "off" });
-                    row.set_active(!on);
-                    return;
-                }
-            }
-            row.set_subtitle(&capability_summary(&plugin, granted_here.as_ref(), on));
-        });
-
-        group.add(&row);
+    if plugins.is_empty() {
+        group.add(
+            &adw::ActionRow::builder()
+                .title("No plugins installed")
+                .subtitle(format!("Cordial looks in\n{}", root.display()))
+                .build(),
+        );
+    } else {
+        for plugin in &plugins {
+            let row = build_plugin_row(parent, plugin, profile_dir.as_ref(), &root, &group);
+            group.add(&row);
+        }
     }
 
+    page.add(&build_install_group(parent, &root, profile_dir, &group));
     page.add(&group);
     page
 }
@@ -635,7 +868,7 @@ pub fn build_preferences_window(
     window.add(&crate::updater::build_update_page(config.clone(), config_path.clone()));
     window.add(&build_appearance_page(config.clone(), config_path.clone()));
     window.add(&build_general_page(config.clone(), config_path));
-    window.add(&build_plugins_page(config));
+    window.add(&build_plugins_page(&window, config));
 
     window
 }
@@ -691,5 +924,19 @@ mod tests {
         assert!(summary.contains("Requests: flags.read, log"), "{summary}");
         assert!(summary.contains("Granted: log"), "{summary}");
         assert!(!summary.contains("Granted: flags.read"), "{summary}");
+    }
+
+    #[test]
+    fn every_capability_has_a_description_a_user_could_read() {
+        // `capability_description` is matched exhaustively over
+        // `Capability`, so the compiler already refuses a variant added there
+        // and missed here — this is the other half: that no arm quietly
+        // returns an empty or placeholder string a real checkbox would show
+        // blank.
+        for cap in Capability::all() {
+            let text = capability_description(*cap);
+            assert!(!text.trim().is_empty(), "{cap} has no description");
+            assert!(text.len() > 10, "{cap}'s description is too short to be real prose: {text:?}");
+        }
     }
 }

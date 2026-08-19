@@ -179,6 +179,107 @@ pub fn install_with(
     }
 }
 
+/// Unpack an archive the user supplied directly — a file they downloaded or
+/// were sent — with no index entry to check it against.
+///
+/// [`install`] exists for the case ADR-014 designs for: an index told the user
+/// what a release claims, and the archive is held to that claim before
+/// anything is trusted. A locally supplied archive has no such claim to hold
+/// it to — there is no index, so there is nothing for `plugin.json` to
+/// disagree *with*. What does not change is everything [`extract_into`]
+/// enforces regardless of an `Entry` ever existing: no symlink, no path that
+/// escapes the destination, no setuid bit, the same entry and size caps. Only
+/// the "does the archive match what was published" check is absent, because
+/// there is no publication here to match.
+///
+/// Returns the parsed manifest alongside the installed directory so a caller
+/// can show what the plugin requests **before** granting it anything — this
+/// installs the code, not a capability. Nothing here writes to
+/// `plugin-grants.json`; ADR-003's default deny holds exactly as it does for
+/// a plugin copied into place by hand.
+pub fn install_local(archive: &[u8], root: &Path) -> Result<(manifest::Plugin, PathBuf), Refusal> {
+    install_local_with(archive, root, Limits::default())
+}
+
+pub fn install_local_with(
+    archive: &[u8],
+    root: &Path,
+    limits: Limits,
+) -> Result<(manifest::Plugin, PathBuf), Refusal> {
+    // A nonce rather than an id: the id is not known until the manifest
+    // inside the archive has been read, and it has to be read from
+    // *somewhere* on disk to be read at all. The final id-named directory is
+    // still only ever reached through `swap_into_place` below, once the
+    // manifest is known good.
+    let staging = staging_path(root, "local-install");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(io_err)?;
+
+    let result = (|| {
+        extract_into(archive, &staging, limits)?;
+        read_manifest(&staging)
+    })();
+    let plugin = match result {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+
+    let target = root.join(&plugin.manifest.id);
+    match swap_into_place(&staging, &target) {
+        Ok(()) => {
+            // Re-parsed at its final location: `read_manifest` above ran
+            // against the staging directory, and `Plugin::entry_path` is
+            // relative to wherever `dir` says the plugin lives — a caller
+            // resolving it from the returned value must get the real,
+            // permanent directory, not the staging one this function is
+            // about to have deleted the sibling of.
+            let plugin = read_manifest(&target).map_err(|e| {
+                let _ = std::fs::remove_dir_all(&target);
+                e
+            })?;
+            Ok((plugin, target))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
+}
+
+/// Remove an installed plugin's directory entirely.
+///
+/// Machine-level, matching the rest of this crate's split between "installed"
+/// and "approved": this deletes the code from disk and nothing else.
+/// `plugin-grants.json`, `plugin-enabled.json` and a plugin's own settings all
+/// live inside a profile and are left exactly where they are, for the same
+/// reason ADR-013 gives for surviving an uninstall — a stale document is
+/// cheap, and deleting a user's saved configuration because they removed the
+/// plugin that reads it is not a kindness. Reinstalling the same id later
+/// finds its old grants and settings waiting, which is the intended
+/// behaviour, not a leak to clean up.
+pub fn uninstall(root: &Path, id: &str) -> Result<(), String> {
+    if !manifest::is_valid_id(id) {
+        return Err(format!("{id:?} is not a usable plugin id"));
+    }
+    let target = root.join(id);
+    // `root.join(id)` cannot itself escape `root` once `is_valid_id` has
+    // refused every character that could — no `/`, no `..` — but the
+    // `is_dir` check below is what stops this from ever being asked to
+    // remove a bare file or a symlink standing in for one, which is not what
+    // "uninstall a plugin" should be able to do even if `id` were somehow
+    // wrong.
+    if !target.is_dir() {
+        // Already gone is not a failure: a settings UI offering "remove" on
+        // a plugin that raced its own removal should not have to distinguish
+        // that from success.
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&target).map_err(|e| format!("{}: {e}", target.display()))
+}
+
 /// Where a half-built install lives until it is whole.
 ///
 /// The leading dot is the load-bearing part. [`install_with`] removes this
@@ -241,10 +342,21 @@ fn nonce() -> String {
 /// `log`, be approved for `log`, and unpack a manifest requesting
 /// `assets.override`, and the approval the user gave would have been for a
 /// different plugin than the one on disk.
-fn check_manifest(dir: &Path, entry: &Entry) -> Result<(), Refusal> {
+/// Read and parse the `plugin.json` an extraction produced, with no index
+/// entry to hold it to yet.
+///
+/// Split out of [`check_manifest`] so [`install_local`] — which has no
+/// [`Entry`] to compare against, because there is no index behind a locally
+/// supplied archive — can still get a real, parsed manifest rather than
+/// re-reading the file itself and duplicating the two failure cases below.
+fn read_manifest(dir: &Path) -> Result<manifest::Plugin, Refusal> {
     let path = dir.join("plugin.json");
     let text = std::fs::read_to_string(&path).map_err(|_| Refusal::NoManifest)?;
-    let plugin = manifest::parse(&text, dir).map_err(Refusal::ManifestMismatch)?;
+    manifest::parse(&text, dir).map_err(Refusal::ManifestMismatch)
+}
+
+fn check_manifest(dir: &Path, entry: &Entry) -> Result<(), Refusal> {
+    let plugin = read_manifest(dir)?;
     if plugin.manifest.id != entry.id {
         return Err(Refusal::ManifestMismatch(format!(
             "it calls itself {:?}, published as {:?}",
@@ -483,6 +595,7 @@ impl<R: Read> Read for Capped<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability::Capability;
     use crate::registry::Index;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -814,5 +927,88 @@ mod tests {
             "an upgrade must not leave the previous version's files behind"
         );
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "and no staging left over");
+    }
+
+    #[test]
+    fn install_local_lands_at_the_plugin_id_with_no_index_involved() {
+        let good = good_archive(MANIFEST);
+        let root = scratch("install-local");
+        let (plugin, dir) = install_local(&good, &root).unwrap();
+        assert_eq!(dir, root.join("demo"));
+        assert_eq!(plugin.manifest.id, "demo");
+        assert_eq!(plugin.requested, [Capability::Log].into_iter().collect());
+        // The returned manifest resolves against its real, permanent
+        // directory rather than the staging one — a caller building the
+        // entry path from it must not be handed somewhere already deleted.
+        assert_eq!(plugin.entry_path().unwrap(), root.join("demo/main.ts"));
+
+        let found = manifest::discover(&root);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].manifest.id, "demo");
+    }
+
+    #[test]
+    fn install_local_still_refuses_a_hostile_archive() {
+        // No index entry to check does not mean no checking at all —
+        // `extract_into`'s own defences apply exactly as they do to `install`.
+        let mut b = tar::Builder::new(Vec::new());
+        append_file(&mut b, "plugin.json", MANIFEST.as_bytes(), 0o644);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(0);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_link_name("main.ts").unwrap();
+        h.set_path("shortcut.ts").unwrap();
+        h.set_cksum();
+        b.append(&h, io::empty()).unwrap();
+        let archive = compress(b.into_inner().unwrap());
+
+        let root = scratch("install-local-hostile");
+        assert!(matches!(install_local(&archive, &root), Err(Refusal::Symlink(_))));
+        assert!(manifest::discover(&root).is_empty());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "nothing staged should be left behind");
+    }
+
+    #[test]
+    fn install_local_refuses_an_archive_with_no_manifest_at_all() {
+        let mut b = tar::Builder::new(Vec::new());
+        append_file(&mut b, "main.ts", b"console.log('hi');", 0o644);
+        let archive = compress(b.into_inner().unwrap());
+
+        let root = scratch("install-local-no-manifest");
+        assert!(matches!(install_local(&archive, &root), Err(Refusal::NoManifest)));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn uninstalling_removes_the_directory_and_nothing_else_in_root() {
+        let root = scratch("uninstall");
+        let good = good_archive(MANIFEST);
+        install(&good, &entry_for(&good), &root).unwrap();
+        std::fs::create_dir_all(root.join("other-plugin")).unwrap();
+        std::fs::write(root.join("other-plugin/plugin.json"), r#"{"id":"other-plugin","entry":"m.ts"}"#).unwrap();
+
+        uninstall(&root, "demo").unwrap();
+
+        assert!(!root.join("demo").exists());
+        assert!(root.join("other-plugin").exists(), "uninstall must not touch a plugin it was not asked about");
+        assert!(manifest::discover(&root).iter().all(|p| p.manifest.id != "demo"));
+    }
+
+    #[test]
+    fn uninstalling_a_plugin_that_is_already_gone_is_not_an_error() {
+        let root = scratch("uninstall-missing");
+        assert!(uninstall(&root, "never-installed").is_ok());
+    }
+
+    #[test]
+    fn uninstalling_refuses_an_id_that_is_not_a_usable_plugin_id() {
+        // `root.join(id)` is exactly the join `settings.rs` warns about
+        // trusting on an unchecked id — refused here for the same reason,
+        // before it ever reaches `remove_dir_all`.
+        let root = scratch("uninstall-bad-id");
+        for bad in ["..", "../../etc", "a/b", "/etc"] {
+            assert!(uninstall(&root, bad).is_err(), "{bad:?} should be refused");
+        }
     }
 }

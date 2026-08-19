@@ -21,11 +21,52 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+use std::sync::{Arc, Mutex};
+
+/// A plugin's stdin, shareable across threads.
+///
+/// A real host runs one thread per plugin, blocking on that plugin's own
+/// stdout (see `cordial-runtime`'s `plugin_host.rs`). Delivering a published
+/// event to a *subscriber* means writing to a different plugin's stdin from
+/// whichever thread is serving the publisher's `events.publish` call — a
+/// write that has nothing to do with that subscriber's own request/response
+/// cycle and must not have to wait for one. Splitting the writable half out
+/// from `Plugin` and wrapping it in a mutex is what makes that possible
+/// without also having to share the read half, which only ever needs to be
+/// read from the one thread that owns the `Plugin` itself.
+///
+/// Cheap to clone: an `Arc` around one mutex, never a duplicated file
+/// descriptor.
+#[derive(Clone)]
+pub struct Writer(Arc<Mutex<ChildStdin>>);
+
+impl Writer {
+    fn write_line(&self, line: &str) -> std::io::Result<()> {
+        // A poisoned mutex means some other write already panicked mid-line;
+        // recovering the guard rather than propagating the poison lets this
+        // write still land cleanly rather than every subsequent push to this
+        // plugin failing forever over an unrelated panic.
+        let mut stdin = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        stdin.write_all(line.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()
+    }
+
+    /// Deliver a [`Push`] through this handle, from whichever thread holds
+    /// it — the counterpart to [`Plugin::push`] for a caller that only has
+    /// the writable half. `&self` rather than `&mut self`: the mutex inside
+    /// is what serialises concurrent writers, not Rust's own borrow checker,
+    /// because a `Writer` is meant to be called from a thread that does not
+    /// own the `Plugin` at all.
+    pub fn push(&self, push: &Push) -> std::io::Result<()> {
+        self.write_line(&serde_json::to_string(push).expect("Push always serialises"))
+    }
+}
 
 pub struct Plugin {
     pub id: String,
     child: Child,
-    stdin: ChildStdin,
+    writer: Writer,
     stdout: BufReader<ChildStdout>,
 }
 
@@ -56,7 +97,7 @@ impl Plugin {
             .spawn()?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = BufReader::new(child.stdout.take().expect("stdout was piped"));
-        Ok(Plugin { id: id.to_string(), child, stdin, stdout })
+        Ok(Plugin { id: id.to_string(), child, writer: Writer(Arc::new(Mutex::new(stdin))), stdout })
     }
 
     /// Read one request from the plugin. `None` at end of stream.
@@ -70,10 +111,7 @@ impl Plugin {
     }
 
     pub fn reply(&mut self, response: &Response) -> std::io::Result<()> {
-        let line = serde_json::to_string(response).expect("Response always serialises");
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()
+        self.writer.write_line(&serde_json::to_string(response).expect("Response always serialises"))
     }
 
     /// Deliver a message the plugin did not ask for in this call — a
@@ -81,10 +119,14 @@ impl Plugin {
     /// subscriber. See [`Push`] for how a plugin tells this apart from a
     /// reply to one of its own requests.
     pub fn push(&mut self, push: &Push) -> std::io::Result<()> {
-        let line = serde_json::to_string(push).expect("Push always serialises");
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()
+        self.writer.write_line(&serde_json::to_string(push).expect("Push always serialises"))
+    }
+
+    /// A cloneable handle to this plugin's stdin, for a host that wants to
+    /// push to it from a thread other than the one reading its stdout — see
+    /// [`Writer`].
+    pub fn writer(&self) -> Writer {
+        self.writer.clone()
     }
 
     pub fn kill(&mut self) {
@@ -309,6 +351,59 @@ mod tests {
 
     fn req(method: &str) -> Request {
         Request { id: 1, method: method.into(), params: serde_json::Value::Null }
+    }
+
+    /// A cloned [`Writer`] really does deliver to the same process, from a
+    /// thread that never reads that process's stdout at all.
+    ///
+    /// This is the property `cordial-runtime`'s real host depends on: one
+    /// thread blocks reading a plugin's own requests, and a *different*
+    /// plugin's publish has to be able to push into this one's stdin without
+    /// waiting for that read loop to be between requests. Proven against a
+    /// real Deno process rather than a mock, because the property in question
+    /// is about `ChildStdin` actually being safe to write from two threads
+    /// through one mutex — a unit test with a fake writer would not exercise
+    /// that at all.
+    #[test]
+    fn a_cloned_writer_pushes_into_the_same_process_from_a_different_thread() {
+        if std::process::Command::new("deno").arg("--version").output().is_err() {
+            eprintln!("skipping: deno is not installed");
+            return;
+        }
+        let entry = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/events_subscriber.ts");
+        let mut plugin = Plugin::spawn("writer-clone-test", &entry).expect("deno should start");
+
+        // The clone is what a publishing plugin's own serving thread would
+        // hold — never the `Plugin` itself, which stays owned by the thread
+        // reading this process's stdout below.
+        let writer = plugin.writer();
+        std::thread::spawn(move || {
+            let _ = writer.write_line(
+                &serde_json::to_string(&Push {
+                    event: "cross-thread/proof".into(),
+                    payload: serde_json::json!({"from": "another thread"}),
+                })
+                .unwrap(),
+            );
+        });
+
+        let mut logs = Vec::new();
+        while let Some(Ok(req)) = plugin.next_request() {
+            if req.method == "log.write" {
+                logs.push(req.params["message"].as_str().unwrap_or_default().to_string());
+                plugin.reply(&Response::Ok { id: req.id, result: serde_json::Value::Null }).unwrap();
+                break;
+            }
+            // The fixture's own `events.subscribe` call; not answering it is
+            // fine, since the pushed message arrives on an independent code
+            // path in the fixture's event loop and does not wait for a reply.
+        }
+        plugin.kill();
+
+        let joined = logs.join("\n");
+        assert!(joined.contains("push: cross-thread/proof"), "got:\n{joined}");
+        assert!(joined.contains(r#""from":"another thread""#), "got:\n{joined}");
     }
 
     #[test]

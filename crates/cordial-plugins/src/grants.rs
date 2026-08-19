@@ -141,6 +141,63 @@ pub fn load(path: &Path) -> BTreeMap<String, BTreeSet<Capability>> {
     }
 }
 
+/// Serialise grants to the JSON shape [`parse`] reads back, with plugin ids
+/// and capability names in sorted order so writing the same grants twice
+/// produces the same bytes rather than a spurious diff.
+fn render(grants: &BTreeMap<String, BTreeSet<Capability>>) -> String {
+    let raw: BTreeMap<&str, Vec<&str>> = grants
+        .iter()
+        .map(|(id, caps)| (id.as_str(), caps.iter().map(|c| c.name()).collect()))
+        .collect();
+    serde_json::to_string_pretty(&raw).expect("a set of capability names always serialises")
+}
+
+/// Replace the whole grants document at `path`.
+///
+/// Written to a sibling file and renamed in, the same atomic-write shape
+/// `enablement::set_enabled` and `settings::Store::write` use — a process
+/// killed mid-write must not leave a half-document that reads back as
+/// malformed, which here would present as every plugin's approvals having
+/// silently vanished.
+pub fn save(path: &Path, grants: &BTreeMap<String, BTreeSet<Capability>>) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.new");
+    std::fs::write(&tmp, render(grants))?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Grant or revoke exactly one capability for one plugin, leaving every other
+/// plugin's grants — and every other capability of this one — untouched.
+///
+/// This is the call a settings UI wants. Before it existed, this module could
+/// only read a grants file; approving or withdrawing a single capability had
+/// no way to happen except hand-editing `plugin-grants.json`, which is not a
+/// UI a user should have to operate. `set` reads the current document, flips
+/// one entry, and writes the whole thing back — there is no smaller unit to
+/// touch, because the file's shape is "one plugin maps to one set", not a
+/// list of individual grants that could be appended or removed in place.
+pub fn set(path: &Path, plugin: &str, cap: Capability, on: bool) -> std::io::Result<()> {
+    let mut grants = load(path);
+    let entry = grants.entry(plugin.to_string()).or_default();
+    if on {
+        entry.insert(cap);
+    } else {
+        entry.remove(&cap);
+        // An empty set and an absent key mean the same thing to `load` and to
+        // the broker — nothing granted — so an entry a revoke has emptied is
+        // dropped entirely rather than kept as `[]`. Otherwise the file would
+        // grow a permanent line for every plugin anyone ever revoked a
+        // capability from, the same reasoning `enablement::set_enabled` gives
+        // for recording only the exceptions.
+        if entry.is_empty() {
+            grants.remove(plugin);
+        }
+    }
+    save(path, &grants)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +329,106 @@ mod tests {
         assert!(migrate_legacy_into(&first).is_some());
         assert!(migrate_legacy_into(&second).is_none());
         assert!(load(&path_in(&second)).is_empty());
+    }
+
+    #[test]
+    fn granting_one_capability_persists_and_leaves_the_rest_of_the_file_alone() {
+        // The call a settings UI wants: flip one checkbox, touch nothing else.
+        let (root, _g) = scratch("set-grant");
+        let dir = root.join("profile");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = path_in(&dir);
+        std::fs::write(&path, r#"{"themer":["log"]}"#).unwrap();
+
+        set(&path, "flag-inspector", Capability::FlagsRead, true).unwrap();
+
+        let grants = load(&path);
+        assert!(grants["flag-inspector"].contains(&Capability::FlagsRead));
+        assert_eq!(grants["themer"], [Capability::Log].into_iter().collect(), "untouched");
+    }
+
+    #[test]
+    fn revoking_one_capability_leaves_its_siblings_granted() {
+        let (root, _g) = scratch("set-revoke");
+        let dir = root.join("profile");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = path_in(&dir);
+        std::fs::write(&path, r#"{"flag-inspector":["flags.read","log"]}"#).unwrap();
+
+        set(&path, "flag-inspector", Capability::FlagsRead, false).unwrap();
+
+        let grants = load(&path);
+        assert!(!grants["flag-inspector"].contains(&Capability::FlagsRead));
+        assert!(grants["flag-inspector"].contains(&Capability::Log), "log should still be granted");
+    }
+
+    #[test]
+    fn revoking_the_last_capability_drops_the_plugin_from_the_file_rather_than_leaving_an_empty_list() {
+        // An empty set and an absent key mean the same thing to `load`, so
+        // the file should not accumulate a permanent `"id": []` for every
+        // plugin anyone ever fully revoked — the same call `enablement.rs`
+        // makes for re-enabling.
+        let (root, _g) = scratch("set-revoke-last");
+        let dir = root.join("profile");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = path_in(&dir);
+        std::fs::write(&path, r#"{"flag-inspector":["log"]}"#).unwrap();
+
+        set(&path, "flag-inspector", Capability::Log, false).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("flag-inspector"), "{text}");
+        assert!(load(&path).is_empty());
+    }
+
+    #[test]
+    fn granting_a_capability_to_a_plugin_nobody_has_approved_yet_creates_its_entry() {
+        let (root, _g) = scratch("set-new");
+        let dir = root.join("profile");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = path_in(&dir);
+        assert!(!path.exists());
+
+        set(&path, "brand-new", Capability::Log, true).unwrap();
+
+        assert!(load(&path)["brand-new"].contains(&Capability::Log));
+    }
+
+    #[test]
+    fn a_capability_granted_in_one_profile_is_not_granted_in_another() {
+        // The property ADR-013 exists for, exercised through the write path
+        // this time rather than only through `load`: two profiles reading
+        // different files by construction is what makes an approval in one
+        // mean nothing in the other.
+        let (root, _g) = scratch("set-isolation");
+        let throwaway = root.join("throwaway");
+        let main = root.join("main");
+        std::fs::create_dir_all(&throwaway).unwrap();
+        std::fs::create_dir_all(&main).unwrap();
+
+        set(&path_in(&throwaway), "sketchy-plugin", Capability::PresenceSet, true).unwrap();
+
+        assert!(load(&path_in(&throwaway))["sketchy-plugin"].contains(&Capability::PresenceSet));
+        assert!(
+            load(&path_in(&main)).is_empty(),
+            "a grant written in one profile must not be readable from another"
+        );
+    }
+
+    #[test]
+    fn saving_replaces_the_whole_document() {
+        let (root, _g) = scratch("save-whole");
+        let dir = root.join("profile");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = path_in(&dir);
+        std::fs::write(&path, r#"{"stale-plugin":["log"]}"#).unwrap();
+
+        let mut fresh = BTreeMap::new();
+        fresh.insert("themer".to_string(), [Capability::Log].into_iter().collect());
+        save(&path, &fresh).unwrap();
+
+        let grants = load(&path);
+        assert!(!grants.contains_key("stale-plugin"), "{grants:?}");
+        assert!(grants["themer"].contains(&Capability::Log));
     }
 }

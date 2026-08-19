@@ -977,10 +977,18 @@ Not textures at all:
     Asset (Image) "rbxthumb://type=AvatarHeadShot&id=&w=48&h=48..." load failed:
       Error parsing batch thumbnail request
 
-**`id=` is empty.** Those are avatar head-shots requested with no user id, which
-is an identity-propagation problem wearing a texture's clothes, and it accounts
-for the blank player icons in the reported screenshot. Worth its own entry; it is
-not what makes the world untextured.
+**`id=` is empty**, and the first reading of that here was wrong. It was filed as
+an identity-propagation bug in Cordial on the strength of the empty field alone.
+
+It is not. Reported by the account's owner: Roblox's own servers lost that
+avatar's head-shot, and it renders blank on *every* client, Cordial or otherwise.
+So the empty id is Roblox asking for a thumbnail that no longer exists, and the
+parse failure is the honest downstream consequence.
+
+Worth keeping only as a caution: an asset error naming an image, in a session that
+looks untextured, is very easy to read as the cause of the untextured world. It
+was not, twice over — the world's textures are the content store, and these
+particular failures are somebody else's deleted file.
 
 ### The variance has an obvious cause and we have been chasing it all session
 

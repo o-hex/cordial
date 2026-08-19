@@ -1843,3 +1843,45 @@ remains unexplained after eight eliminated candidates, and the honest position i
 that §19's framing — "the answer this document has been looking for" — was one
 step ahead of the evidence. The engine named the cause of a crash, not the cause
 of the verdict.
+
+## §20. A 255-second leg of real gameplay, and the texture flag confirmed
+
+Reported from actual play rather than a harness: Doors, to room 15, stopped
+because the player got bored. Numbers from that session's engine log,
+`2.734.0.917_20260819T041725Z`:
+
+    connections                     3   (Doors teleports lobby -> run)
+    last engine timestamp     381.3s
+    last Connection accepted  126.1s
+    disconnect events               1
+
+The single disconnect is at 23.4s and is `connectMode: Disconnect ASAP`,
+`AckTimeout 0, IsOutgoingDataWaiting 0` — a client-initiated teleport out of the
+lobby, not a server drop. **The final leg ran from 126.1s to 381.3s: 255 seconds
+with no disconnect at all.**
+
+Against a 60.6s death that reproduced twelve-plus times, and against §14's four
+90-second harness runs, this is the first long session and it is four times the
+window those covered. The 304 is not merely failing to reproduce inside 90
+seconds; it does not reproduce across a real play session either.
+
+That does not change §14's conclusion about *why*. Roblox shipped 2.734.0.917
+mid-session and every 304 was measured on 2.730.0.790; the engine update remains
+the stronger candidate and Cordial still cannot claim the fix. What this adds is
+that the reprieve is not an artefact of short runs.
+
+### And the texture flag is doing something
+
+    14.930483 [FLog::Graphics] Using TM1
+    14.930499 [FLog::Graphics] Warning: Using TexturePackGenerator.
+
+**TM1 is TextureManager 1** — the legacy path. `FStringGraphicsTextureManager2DenyPattern2
+= ".*"`, shipped as a built-in default, denies every pattern in TextureManager2,
+and the engine has fallen back exactly as predicted. That entry was marked
+`INFERRED` on the grounds that the flag's absence from Roblox's document and its
+effect on mocktail were established while the mechanism was not.
+
+The mechanism is now observed. The engine says which texture manager it chose,
+and it chose the one the flag leaves available. Whether the resulting textures
+look better is still a judgement nobody has made side by side — but "the flag
+reaches the engine and changes which manager runs" is no longer inferred.

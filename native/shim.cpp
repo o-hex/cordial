@@ -64,25 +64,48 @@ void* cordial_linker_dlopen(const char* filename, int flags) {
 // libroblox.so's ELF constructors past Cordial's own directory setup is
 // coherent — see docs/analysis/flag-init.md §26 and patches/README.md for
 // the patch this corresponds to once (if) it earns a permanent home.
-extern "C" void mcpelauncher_defer_next_ctors(int defer);
-extern "C" void mcpelauncher_run_deferred_ctors(void* handle);
+//
+// **Weak.** These three live in `patches/0003` and `patches/0004`, which are
+// deliberately not committed to the submodule — `third_party` points at
+// upstream repositories this project cannot push to, so a local commit there
+// would leave the pointer naming an object nobody else can fetch. A strong
+// reference therefore links on a developer's machine with the patch applied and
+// fails everywhere else, which is exactly what happened: every Flatpak build
+// after they landed died on `undefined symbol: mcpelauncher_defer_next_ctors`
+// while the same tree built locally.
+//
+// Weak plus a null check means a stock checkout links and the experiment is
+// simply unavailable, and a patched checkout gets the real thing. The switches
+// that reach these are off by default in any case.
+extern "C" __attribute__((weak)) void mcpelauncher_defer_next_ctors(int defer);
+extern "C" __attribute__((weak)) void mcpelauncher_run_deferred_ctors(void* handle);
 
 void cordial_linker_defer_next_ctors(int defer) {
-    mcpelauncher_defer_next_ctors(defer);
+    if (mcpelauncher_defer_next_ctors) {
+        mcpelauncher_defer_next_ctors(defer);
+        return;
+    }
+    fprintf(stderr, "[linker] constructor deferral unavailable: patches/0003 is not applied\n");
 }
 
 void cordial_linker_run_deferred_ctors(void* handle) {
-    mcpelauncher_run_deferred_ctors(handle);
+    if (mcpelauncher_run_deferred_ctors) {
+        mcpelauncher_run_deferred_ctors(handle);
+    }
 }
 
 // docs/analysis/flag-init.md §31: overrides what dladdr() reports for a
 // loaded library's own path, called between defer_next_ctors and
 // run_deferred_ctors above so the override is visible to constructor-time
 // code. Nothing is reopened; this is metadata only.
-extern "C" void mcpelauncher_set_realpath(void* handle, const char* path);
+extern "C" __attribute__((weak)) void mcpelauncher_set_realpath(void* handle, const char* path);
 
 void cordial_linker_set_realpath(void* handle, const char* path) {
-    mcpelauncher_set_realpath(handle, path);
+    if (mcpelauncher_set_realpath) {
+        mcpelauncher_set_realpath(handle, path);
+        return;
+    }
+    fprintf(stderr, "[linker] realpath override unavailable: patches/0004 is not applied\n");
 }
 
 void* cordial_linker_dlsym(void* handle, const char* symbol) {

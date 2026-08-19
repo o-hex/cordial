@@ -2343,3 +2343,48 @@ still reaches `RbxStorage::init`, so that message is not the blocker either.
 **The delay is unfinished work, not a constant.** 250 ms, because at 0 ms the run
 reaches `Flags-Not-Received=0` — better than any other value tried — and then
 segfaults. Something is still racing and the delay hides it.
+
+### §23.1 RbxStorage after the fix: what was tried, and one observation nobody should build on
+
+With the flags chain working, everything §12–§21 eliminated deserved re-testing,
+because every one of those eliminations was measured against a baseline where the
+chain never ran. Done, and none of it moves storage:
+
+* `FFlagStartRbxStorageInitRighAfterFlags` and `DFFlagRbxStorageInitLatch` set
+  true, against a control with neither, on fresh data roots: no storage either
+  way. This flag was the premise of §11's whole storage theory.
+* Three consecutive launches against one warm root, so the flag cache and
+  tombstone are present: no storage on any of them, and the tombstone is never
+  *read* on any launch, only written. Sober reads one.
+* `CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL=1`: `setPlatformImpl ok` now succeeds
+  where §19 recorded it crashing, and the process then dies `SIGTRAP` after
+  repeated `djinni (djinni_support.cpp:529): weakRef`. **This is a dead end
+  regardless** — Sober logs `[FLog::LocalStorageHandler] Not available on the
+  current platform.` too, and reaches `RbxStorage::init` anyway. Storage does not
+  need this handler.
+* The late-post delay at 250 ms and at 2000 ms, `--run 40`, fresh roots: no
+  storage at either.
+
+`[DFLog::CaptureStorage] RbxStorage is not initialized, cannot access storage
+interface` fires on a real join, so it is genuinely down rather than quietly
+working.
+
+**The observation not to build on.** One data root does contain a real store —
+`rbx-storage.db` with a WAL, `rbx-storage-sc`, and partition directories `p14`
+and `p15` — created at 17:46:02 during this session. It has not been reproduced:
+re-running the two candidates that were live at that moment, on fresh roots with
+controls, produces nothing, and a fresh run against that same root does not touch
+the database's mtime. The one thing that root has which no fresh root does is 43
+`ContentProvider_*` cache directories, so content was being cached there by some
+other path. That is a lead, not a result, and it is written down as an
+unreproduced observation precisely so nobody quotes it as evidence that storage
+works.
+
+**Where this leaves it.** `DFLog::RbxStorage` has never appeared in a Cordial log
+at all, on any run, so there is no engine statement about storage to read — the
+absence of `RbxStorage::init` is consistent both with "never attempted" and with
+"attempted and unlogged", and §22 is the standing warning about which of those
+an absence licenses. Establishing which needs the channel genuinely raised, and
+§22's measurement is that naming a channel in `flags.json` can silence it rather
+than raise it. That mechanism is still not understood and is now the thing
+blocking the question, not the storage code.

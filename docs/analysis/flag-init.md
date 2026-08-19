@@ -2784,3 +2784,52 @@ considered that worth a dedicated switch.
 That is a legitimate JNI call, not a memory write, and it is the first lead in
 this document that connects the scheduler to the store by a mechanism rather than
 by proximity.
+
+### §24.1 The scheduler is already in foreground mode, and the job still does not run
+
+§24 named mocktail's two non-patch scheduler knobs as the lead. Cordial already
+satisfies what they do. From an ordinary run:
+
+    0.554648  [FLog::AndroidGLView] rbx.datamodel: setTaskSchedulerBackgroundMode() enable:false context:ASMA.start
+    1.196494  [FLog::NativeDM] startLuaApp_: ... (TaskScheduler) enable-Background = false.
+   30.966351  [FLog::NativeDM] pause-LuaApp: ... (TaskScheduler) enable-Background = true.
+
+Foreground from 0.55 s, confirmed again by the data model at 1.20 s, and only
+backgrounded at teardown. Giving it threads explicitly
+(`FIntTaskSchedulerAutoThreadLimit = 8`) against a control changes nothing:
+`RbxStorage` lines stay at zero and no store appears either way.
+
+So the scheduler is up, in the right mode, and the `RbxStorageInit` job still
+never executes. Candidate eighteen.
+
+### Where this stops, honestly
+
+The flags half of this document is finished: `onFlagsLoaded` fires, the
+`NativeDataModelManager` chain runs to `startLuaApp_`, reproducible with a flat
+control. **The store is not up and this session did not get it up.**
+
+What is now known that was not before, all of it measured:
+
+* `RbxStorage::init` is `0x23121ae` (`.eh_frame`, not a prologue scan), and it is
+  **never entered** — four runs, `0xCC` planted, including one arming it and both
+  of its unreachable callers together.
+* Storage initialises as a **scheduled task**, `RbxStorageInit`, registered with a
+  function pointer to `0x6824af8`.
+* The getter that would register it returns early on every call, because its
+  pointer is filled during bionic's `call_constructors` before any caller exists.
+* Its callers include `flagLoaded`, twice per run — §23.6 said otherwise and was
+  wrong.
+* The scheduler is foregrounded and threaded.
+
+Three of this document's own conclusions were retracted getting here — a function
+boundary off by a whole function, a path trace blind to `statvfs`, and a channel
+sweep that used the wrong value shape. Each was found by measuring something the
+previous conclusion had assumed. **That is the method that has worked, and it is
+what the next attempt should use** rather than the eighteen candidates already
+eliminated.
+
+The one thread with a mechanism behind it and no measurement yet: what makes the
+getter's pointer null at the moment `flagLoaded` calls it on a platform where the
+store does come up. Answering it means reading the state of an object whose
+layout is Roblox's, which is the line AGENTS.md draws, and it should be
+approached by observing that object at runtime rather than by decompiling it.

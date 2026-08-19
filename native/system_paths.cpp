@@ -33,6 +33,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <cstdint>
 #include <unistd.h>
 
 namespace {
@@ -203,6 +205,65 @@ int s_open(const char* path, int flags, ...) {
     return r;
 }
 
+/// `statvfs`, which the engine imports and Cordial had never intercepted.
+///
+/// Two separate defects, and the second is why this is not just a redirect.
+///
+/// **It was not path-translated.** Every other path-taking call here is; this
+/// one went straight to the host with whatever the engine built, and because it
+/// was not in the table it did not appear in `CORDIAL_TRACE_PATHS=1` output
+/// either. A trace that cannot see a call is not evidence the call did not
+/// happen, and a conclusion in flag-init.md §23.2 -- "storage is never
+/// attempted, 19,296 path calls and none of them `rbx-storage`" -- was drawn
+/// with this blind spot in it.
+///
+/// **The struct layouts differ.** bionic's `struct statvfs` runs
+/// `f_fsid, f_flag, f_namemax`; glibc's inserts an `int __f_unused` after
+/// `f_fsid`, which on LP64 pushes `f_flag` and `f_namemax` eight bytes along.
+/// The size fields the engine cares about for free space -- `f_bsize` through
+/// `f_favail` -- happen to align, so this is not obviously fatal, but the engine
+/// reading `f_flag` gets glibc's padding and reading `f_namemax` gets glibc's
+/// `f_flag`. `ST_RDONLY` lives in `f_flag`. This is the same family as the
+/// `sigset_t`, `struct sigaction` and `mallinfo` divergences already recorded,
+/// and it is fixed the same way: fill the bionic shape by hand rather than hope
+/// the two agree.
+struct bionic_statvfs {
+    unsigned long f_bsize;
+    unsigned long f_frsize;
+    unsigned long f_blocks;
+    unsigned long f_bfree;
+    unsigned long f_bavail;
+    unsigned long f_files;
+    unsigned long f_ffree;
+    unsigned long f_favail;
+    unsigned long f_fsid;
+    unsigned long f_flag;
+    unsigned long f_namemax;
+    uint32_t __f_reserved[6];
+};
+
+int s_statvfs(const char* path, bionic_statvfs* out) {
+    REMAP(path);
+    struct ::statvfs host {};
+    const int r = ::statvfs(real, &host);
+    trace_i("statvfs", real, r);
+    if (r == 0 && out) {
+        *out = bionic_statvfs{};
+        out->f_bsize = host.f_bsize;
+        out->f_frsize = host.f_frsize;
+        out->f_blocks = host.f_blocks;
+        out->f_bfree = host.f_bfree;
+        out->f_bavail = host.f_bavail;
+        out->f_files = host.f_files;
+        out->f_ffree = host.f_ffree;
+        out->f_favail = host.f_favail;
+        out->f_fsid = host.f_fsid;
+        out->f_flag = host.f_flag;
+        out->f_namemax = host.f_namemax;
+    }
+    return r;
+}
+
 #undef REMAP
 
 } // namespace
@@ -243,6 +304,7 @@ extern "C" const CordialSystemSymbol* cordial_system_symbols(size_t* count) {
         {"realpath", (void*)&s_realpath},
         {"readlink", (void*)&s_readlink},
         {"fopen", (void*)&s_fopen},
+        {"statvfs", (void*)&s_statvfs},
         {"open", (void*)&s_open},
     };
     *count = sizeof(table) / sizeof(table[0]);

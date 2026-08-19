@@ -1443,6 +1443,69 @@ fn main() -> ExitCode {
                                             "com/roblox/engine/jni/NativeSettingsInterface";
                                         let external = format!("{root}/external");
                                         let _ = std::fs::create_dir_all(&external);
+
+                                        // The directory layout Android would
+                                        // already have, created before the engine
+                                        // looks for it.
+                                        //
+                                        // `RbxStorage::init` reports
+                                        // `availableDiskSpace` as part of starting,
+                                        // so storage asks the filesystem how much
+                                        // room it has before it builds anything --
+                                        // and a `statvfs` of a directory that does
+                                        // not exist fails. On a real device these
+                                        // directories are part of the app's private
+                                        // data layout and are simply there. Under
+                                        // Cordial nothing had ever created them, so
+                                        // the engine stat'd a missing path and
+                                        // declined to initialise, silently: a
+                                        // `CORDIAL_TRACE_PATHS=1` run intercepts
+                                        // 19,296 path calls and **not one** contains
+                                        // `rbx-storage`. Storage was not failing, it
+                                        // was never attempting.
+                                        //
+                                        // The list is mocktail's (Apache-2.0,
+                                        // `src/libc_shim/libc_shim.cc`
+                                        // `EnsureDefaultDataLayout`), which creates
+                                        // exactly these and whose own tests assert
+                                        // `statvfs`/`statfs` succeed on the
+                                        // `rbx-storage` path. Two of them --
+                                        // `appData/LocalStorage` and
+                                        // `appData/OTAPatchBackups` -- were already
+                                        // visible as failed opens in Cordial's own
+                                        // path trace, which should have been the
+                                        // clue.
+                                        //
+                                        // Created under the process working
+                                        // directory as well as the data root,
+                                        // because the engine builds some of these
+                                        // paths relatively -- the same trace shows
+                                        // `fopen("cache/tombstone.dat")` and
+                                        // `fopen("./appData/ClientSettings/…")`
+                                        // beside absolute forms of the same files.
+                                        for base in [root.as_str(), "."] {
+                                            for rel in [
+                                                "files",
+                                                "cache",
+                                                "shared_prefs",
+                                                "rbx-storage",
+                                                "appData",
+                                                "appData/LocalStorage",
+                                                "appData/rbx-storage",
+                                                "appData/ClientSettings",
+                                                "files/appData",
+                                                "files/appData/LocalStorage",
+                                                "files/appData/OTAPatchBackups",
+                                                "files/appData/rbx-storage",
+                                                "cache/ContentProvider_2",
+                                                "cache/rbx-storage",
+                                                "cache/sounds",
+                                            ] {
+                                                let _ = std::fs::create_dir_all(
+                                                    format!("{base}/{rel}"),
+                                                );
+                                            }
+                                        }
                                         let dirs: &[(&str, Vec<&str>)] = &[
                                             (
                                                 "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetFilesDirectory",

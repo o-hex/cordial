@@ -2484,3 +2484,60 @@ roots:
 Candidate seventeen. Worth correcting on its own terms regardless — a client
 should be given the flags for the application it says it is — but it is a
 separate change from this one and is not made here.
+
+### §23.5 `statvfs` was never intercepted, and §23.2's instrument was blind to it
+
+mocktail's answer to storage is not a flag or an ordering. It is
+`EnsureDefaultDataLayout` (`src/libc_shim/libc_shim.cc`, Apache-2.0): it creates
+the Android private-data directory tree — including `rbx-storage`,
+`appData/rbx-storage`, `files/appData/rbx-storage`, `cache/rbx-storage`,
+`appData/LocalStorage`, `files/appData/OTAPatchBackups` — **before** the engine
+runs, and its own tests assert that `statvfs` and `statfs` succeed on the
+`rbx-storage` path. `RbxStorage::init` reports `availableDiskSpace` as part of
+starting, so storage asks the filesystem for room before it builds anything.
+
+Cordial created none of those directories. Two of them,
+`appData/LocalStorage` and `appData/OTAPatchBackups`, were already visible as
+failed opens in Cordial's own path trace, which should have been the clue.
+
+**And `statvfs` was not intercepted at all.** The engine imports it —
+`libroblox.so statvfs` is in `undefined-symbols.tsv`, and `nm -D` shows
+`U statvfs@LIBC` — while `native/system_paths.cpp` wrapped `stat`, `lstat`,
+`access`, `opendir`, `realpath`, `readlink`, `fopen` and `open`, and not this.
+So it was neither path-translated nor traced.
+
+That is a correction to §23.2. Its conclusion — "storage is never attempted,
+19,296 intercepted path calls and not one contains `rbx-storage`" — was drawn
+from a trace that could not see the call storage actually makes. **A trace that
+cannot see a call is not evidence the call did not happen**, and this document
+has now made that mistake twice: once reading an absent fatal error as a passed
+gate, and once here.
+
+With the interception in place, three `statvfs` calls appear, all succeeding:
+
+    [paths] tid=… statvfs("./appData") = 0
+    [paths] tid=… statvfs("…/profiles/default/data/files") = 0
+    [paths] tid=… statvfs("…/profiles/default/data/files") = 0
+
+The first is relative, resolved against the working directory, and only succeeds
+because the layout above now creates `./appData` there. Before this change it
+would have failed.
+
+### The ABI divergence found on the way
+
+bionic's `struct statvfs` runs `f_fsid, f_flag, f_namemax`. glibc's inserts an
+`int __f_unused` after `f_fsid`, which on LP64 pushes `f_flag` and `f_namemax`
+eight bytes along. The engine reading `f_flag` would get glibc's padding, and
+reading `f_namemax` would get glibc's `f_flag`; `ST_RDONLY` lives in `f_flag`.
+The free-space fields `f_bsize` through `f_favail` happen to align, so this was
+not obviously fatal, which is exactly why it survived. Fixed by filling the
+bionic shape field by field, as `sigset_t`, `struct sigaction` and `mallinfo`
+already are.
+
+### Still not initialising
+
+`RbxStorage::init` remains zero with the layout created, `statvfs` intercepted
+and succeeding, and the flags chain working. So the precondition mocktail
+satisfies is necessary-looking but has not proved sufficient here. What is
+different now is that the instrument is honest: `statvfs` is traced, so the next
+person can see what storage asks for instead of inferring from an absence.

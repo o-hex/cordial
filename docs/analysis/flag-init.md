@@ -2205,3 +2205,51 @@ feature depended on it. One does now. Reversing it is a change to Cordial's
 security posture, in a public GPL repository with a fork already layering exploit
 functionality on it, and it belongs to the project owner rather than to whoever
 is next to run out of eliminations.
+
+### §22.2 Sober's mechanism cannot be settled from here, and why
+
+§22.1 left the central question as: is the flags-loaded state reachable at all
+through the host-application interface, or does every implementation that gets
+there force it? mocktail forces it. Sober reaches `flagLoaded` and is the only
+existence proof that the state is reachable by something.
+
+The test designed for this was to compare Sober's in-memory `libroblox.so`
+executable text against the file on disk. Executable pages of a PIE carry no
+relocations on x86-64, so a faithful loader leaves `.text` byte-identical; a
+non-zero difference count is code patching. `tools/`-adjacent scratch script,
+`ptrace_scope` is 0 on this machine, and the method is sound.
+
+**It cannot be run.** Sober is a Flatpak and its engine runs inside the
+sandbox's PID namespace, so no host `/proc/<pid>/maps` contains the mapping —
+a scan of every readable process for an executable mapping over 50 MB finds
+Chrome, WebKitGTK and two LLVM copies, and nothing of Sober's. `flatpak enter`
+would cross the namespace but `setns` needs `CAP_SYS_ADMIN`, so it exits without
+output as an ordinary user. The mapping is also anonymous rather than named,
+exactly as Cordial's own loader leaves it, so it could not have been found by
+name either.
+
+Recorded rather than quietly dropped, because the next person will have the same
+idea. Settling it needs root, or a build of Sober's loader, or Sober's source —
+and the reference tree here holds only `libbadcpu`, with its `decompiled/`
+directory off-limits under AGENTS.md.
+
+### One inference not made
+
+`CORDIAL_LATE_SETTINGS=1` still ends the way §19 recorded, `SIGTRAP` at 0.231 s
+with `RBXCRASH: FatalRuntimeError (Can't initialize the TaskScheduler before
+flags have been loaded)`. The default path produces no such error.
+
+It is tempting to read that as the gate being satisfied on the default path, and
+therefore as evidence that `Flag::areFlagsLoaded()` is already true there while
+only `NativeDataModelManager` is uninformed. **That is precisely the reasoning
+§19.1 got wrong and §22 retracted**: absence of the error is equally what never
+attempting the initialisation looks like, and the default path shows no sign of
+attempting it — no `RbxStorage::init`, no `ClientRunInfo`. Cordial's own
+`setTaskSchedulerBackgroundMode` call is background mode, not initialisation, and
+does not bear on it.
+
+So what is observed is only this: the late ordering *attempts* the scheduler
+initialisation and dies on the gate, and the default ordering does not attempt
+it. Which of `Flag::areFlagsLoaded()` and NativeDM's `Flags-Not-Received` is
+false on the default path is **not established**, and the two are not known to be
+the same bit.

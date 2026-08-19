@@ -787,3 +787,79 @@ adoptable without touching this, since it does not care where the file came from
 avoids rehashing 115 MB every launch and still catches a swapped build. Keep.
 
 **Neither project has update channels.** Grepped both.
+
+---
+
+## From mocktail's commit history: one bug we share, one landmine
+
+All 41 commits read with diffs. A fix commit is a bug somebody actually hit,
+which makes this a better-yielding search than diffing current source — most of
+what follows is "already handled" or "not applicable", and that is the useful
+shape of the result.
+
+### C1. A rejected login cookie fails silently and the user becomes a guest
+
+mocktail's `0b8cbef` added a dialog when Roblox answers 401 to a saved cookie.
+Before it, the session died and the client fell back to guest sign-in with only a
+line on stdout.
+
+**Cordial has the same hole.** `cookies.rs` restores saved cookies mechanically
+and has no rejection handling; the only mention of 401 in the whole file is a
+comment at line 578 about ordering. Nothing in `cordial-shell` surfaces an
+expired session. So a user whose `.ROBLOSECURITY` has aged out is quietly signed
+out and finds out by noticing they are a guest.
+
+The shell already has somewhere to put this — `window.rs` and `updater.rs` both
+raise user-visible notices.
+
+**One caveat that makes this harder than mocktail's version, and it should be
+settled before anyone starts:** Cordial does not make the request that gets the
+401. The engine does its own HTTP, so there is no response for the cookie module
+to inspect. Either the signal comes from the engine's own log, or it comes from
+the web view once that path carries sign-in, or Cordial observes it somewhere not
+yet identified. **Find the observation point first.** Wiring a dialog to a
+condition nothing can detect is worse than the silence.
+
+- **Touches:** `crates/cordial-runtime/src/cookies.rs`, plus a notice in
+  `cordial-shell`. **Scope:** moderate, once the detection point is known.
+
+### C2. A landmine for whoever implements `pthread_create`
+
+mocktail's `23fe2ee` fixes glibc's static TLS eating into a guest thread's
+requested stack — a thread asks for N bytes and gets meaningfully less, and the
+overflow lands somewhere unrelated.
+
+**Not reachable in Cordial today**: `pthread_create` is not in
+`bionic::pthread::overrides()` at all — grepped, zero occurrences. So this is not
+a live bug. It is the first thing to get wrong when guest thread creation is
+implemented, and it is recorded here so that person does not discover it the
+expensive way. `INFERRED`: taken from their fix, not reproduced here.
+
+### Verified as not-present, so nobody re-checks
+
+- **`dlmopen` namespace collision** (`6aa22c2`). Theirs happened because a host
+  `dlopen`'d library bound to the executable's own exported bionic-compat
+  symbols. Cordial exports none — `readelf --dyn-syms` on both binaries shows no
+  libc-name collisions, and Roblox's imports resolve through a private in-process
+  table rather than the loader's global scope.
+- **LTO folding FORTIFY wrappers into self-recursion** (`52721bf`). Theirs
+  redefines `__memcpy_chk`-style names that collide with glibc's. Cordial's
+  equivalents are plain Rust that never carry a `__*_chk` symbol name and call the
+  unfortified host function. No name for LTO to collide on.
+- **Canary and first-install approval bugs** (`3ce39c1`, `63070b6`). Bugs inside a
+  build-approval system Cordial does not have. The adjacent real gap is already
+  U2 above.
+
+### Already ahead
+
+The low-quality-texture flag (adopted), user-editable FastFlag overrides (Cordial
+has layered ones with user-wins, predating theirs), and the Discord join-button
+fix (nothing to attach it to — Cordial's presence plugin has no party-secret
+concept).
+
+### Not applicable
+
+SDL3/CMake linkage, the FreeBSD port, system-proxy auto-detect,
+`--force-run-latest`, cross-launcher cookie borrowing they added and then removed,
+their logging rewrite, and twenty-two packaging, CI, AUR, release and website
+commits. One line each is the correct treatment.

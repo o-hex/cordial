@@ -86,6 +86,55 @@
 //! window controls. `pointer_enter` records which surface the pointer is on
 //! and nothing is delivered unless it is the engine's.
 //!
+//! ## A web-view dialog is invisible by default, and this is why
+//!
+//! **Reported as "opening the server browser turns the whole window
+//! white/blank", and it is neither white nor blank.** A first pass at this
+//! screenshotted a nested compositor and saw the real page, no engine canvas
+//! in the way, and wrote up "does not reproduce" -- wrong, and wrong for a
+//! reason worth naming: a nested compositor gives every one of
+//! its clients its own fresh stacking order, so the bug this file has cannot
+//! show up inside one. The tenth instrument fault of this kind recorded here;
+//! see AGENTS.md and `docs/adr/ADR-011-wayland-and-libadwaita.md`'s own list.
+//! Confirmed instead by the maintainer, on the real desktop, undialled.
+//!
+//! The actual mechanism is `wl_subsurface` stacking, and it is exactly what
+//! this file already says about `get_subsurface`: the engine's canvas is
+//! "positioned over the window's content area". A newly created subsurface's
+//! default z position is immediately above its parent, and nothing in this
+//! file ever moved it -- `grep` for `place_above`/`place_below` before this
+//! change found neither. An `AdwDialog` is not a second `xdg_toplevel`; per
+//! `cordial_shell::webview`'s own module doc it "draws inside its parent's
+//! own surface", meaning inside GTK's *toplevel* `wl_surface` -- the very
+//! surface the engine's subsurface sits in front of by default. So the
+//! moment a web-view dialog opens, it is painted correctly, into a surface
+//! that is there, and then the engine's own canvas -- still compositing
+//! above it every frame -- covers it completely. What the user sees is the
+//! engine's ordinary rendering, blank because Roblox itself stops drawing
+//! its own content once it believes a web view is covering it (the
+//! maintainer's own diagnosis, and the reason "blank" rather than "white" is
+//! the more precise word).
+//!
+//! The fix is [`WaylandWindow::webview_dialog_opened`] /
+//! [`WaylandWindow::webview_dialog_closed`]: `place_below`/`place_above` the
+//! engine's subsurface against `parent_surface` for exactly as long as at
+//! least one dialog is open, reference-counted rather than a bare flag so a
+//! second dialog opening while the first is still up cannot re-lower an
+//! already-lowered canvas, and closing one of two cannot raise it back too
+//! early. **Never leave it lowered permanently** -- it is above by default
+//! for the ordinary case, which is Roblox running with no dialog open, and a
+//! permanently-lowered canvas would be invisible then instead.
+//!
+//! Like `set_position`, `place_above`/`place_below` are requests on the
+//! *subsurface* but are double-buffered on the *parent's* next commit (the
+//! Wayland protocol XML says so explicitly for reordering requests, the same
+//! paragraph that says it for `set_position`). `set_engine_stacking` follows
+//! `sync_canvas_geometry`'s own fix for that -- `HostWindow::queue_commit`
+//! plus an explicit `wl_surface.commit` on `parent_surface` right here,
+//! because asking GTK to redraw is not the same as GTK having redrawn (see
+//! `sync_canvas_geometry`'s "issue #7" comment for the full account of why
+//! the direct commit is the one that is not optional).
+//!
 //! ## `zwp_text_input_v3` had a version-2 event table written to version 1
 //!
 //! **Correction to what this comment used to say.** It recorded `interface
@@ -457,6 +506,13 @@ static RELATIVE_POINTER_INTERFACE: WlInterface = WlInterface {
 // numbers, fixed by `wayland.xml`, need naming.
 const WL_SUBCOMPOSITOR_GET_SUBSURFACE: u32 = 1;
 const WL_SUBSURFACE_SET_POSITION: u32 = 1;
+// `place_above`/`place_below` take the sibling to reorder against as their
+// one argument -- see `WaylandWindow::set_engine_stacking` for why the
+// argument passed is always `parent_surface` rather than another sibling:
+// this window has exactly one subsurface, so the parent is the only other
+// member of the stack there is to reorder against.
+const WL_SUBSURFACE_PLACE_ABOVE: u32 = 2;
+const WL_SUBSURFACE_PLACE_BELOW: u32 = 3;
 const WL_SUBSURFACE_SET_DESYNC: u32 = 5;
 
 // wl_compositor/wl_display/wl_registry/wl_seat/wl_pointer/wl_surface opcodes.
@@ -954,6 +1010,14 @@ pub struct WaylandWindow {
     /// event signatures are fixed, not something this file can extend. `0` is
     /// "no handle observed yet", which is never a real `GameActivity` handle.
     active_handle: AtomicI64,
+
+    /// How many web-view dialogs are currently open. `place_below`/
+    /// `place_above` are only issued on the 0-to-1 and 1-to-0 edges (see
+    /// [`Self::webview_dialog_opened`]) so a second dialog opening while the
+    /// first is still up does not re-lower an already-lowered subsurface, and
+    /// closing one of two leaves the engine correctly hidden until the last
+    /// one goes.
+    open_web_view_dialogs: AtomicI32,
 }
 // SAFETY: every raw pointer field is either a `libwayland-client` proxy (only
 // ever touched from the single input-pump thread, matching the file-level
@@ -1352,6 +1416,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
             ime_producing: false,
         }),
         active_handle: AtomicI64::new(0),
+        open_web_view_dialogs: AtomicI32::new(0),
     };
     let host = WINDOW.get_or_init(|| host);
 
@@ -1612,6 +1677,82 @@ impl WaylandWindow {
         // ~75 without the call and ~74 with it. Left out rather than kept as a
         // plausible-sounding no-op.
         self.apply_resize(w, h);
+    }
+
+    /// A web-view dialog just opened; make sure the engine's canvas is not
+    /// compositing over it.
+    ///
+    /// See the module doc's "A web-view dialog is invisible by default"
+    /// section for the mechanism. Reference-counted rather than a flag: two
+    /// dialogs can be open at once (the protocol has no rule against it), and
+    /// the second one opening while the first is already up must not re-issue
+    /// `place_below` -- doing so costs nothing functionally (the subsurface is
+    /// already below), but it is not idempotent to *observe*, and a call site
+    /// that fires on every open rather than only the 0-to-1 edge is a call
+    /// site that will eventually be trusted to mean "just lowered it", which
+    /// would be false the second time.
+    pub fn webview_dialog_opened(&self) {
+        if self.open_web_view_dialogs.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.set_engine_stacking(false);
+        }
+    }
+
+    /// The mirror of [`Self::webview_dialog_opened`]: call once a dialog has
+    /// closed. Only the last-close (1-to-0) edge raises the canvas back —
+    /// with two dialogs open, closing one must leave the engine hidden behind
+    /// whichever is still up.
+    pub fn webview_dialog_closed(&self) {
+        if self.open_web_view_dialogs.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.set_engine_stacking(true);
+        }
+    }
+
+    /// Reorder the engine's subsurface relative to `parent_surface` — the
+    /// only other member of this window's subsurface stack, and so the only
+    /// valid reference for `place_above`/`place_below` to name (see the
+    /// opcode constants' own comment).
+    ///
+    /// `above = true` restores the default the subsurface was created with —
+    /// engine compositing over GTK's content, correct for the ordinary case
+    /// of no dialog open. `above = false` is the fix: GTK's content,
+    /// including anything an `AdwDialog` drew into it, shows through instead.
+    ///
+    /// Follows `sync_canvas_geometry`'s own fix for the same double-buffering
+    /// hazard `set_position` has: the reorder is pending on the *subsurface*
+    /// but does not take effect until the *parent's* next commit, and asking
+    /// GTK to redraw (`queue_commit`) is not the same as GTK having redrawn
+    /// (see that function's "issue #7" comment) — so this commits
+    /// `parent_surface` directly as well, the same belt-and-braces the
+    /// geometry sync already needed.
+    fn set_engine_stacking(&self, above: bool) {
+        let opcode = if above { WL_SUBSURFACE_PLACE_ABOVE } else { WL_SUBSURFACE_PLACE_BELOW };
+        // SAFETY: `self.subsurface` is a live proxy for the process's
+        // lifetime; `self.parent_surface` is the only valid sibling reference
+        // for a window with exactly one subsurface, and is itself a live
+        // proxy for the process's lifetime. `place_above`/`place_below`'s
+        // signature is "o" — one existing object argument, no new proxy
+        // created, hence the null interface.
+        unsafe {
+            (self.wl.marshal_flags)(
+                self.subsurface,
+                opcode,
+                std::ptr::null(),
+                1,
+                0,
+                self.parent_surface,
+            );
+        }
+        self.host.0.queue_commit();
+        // SAFETY: `self.parent_surface` is GTK's toplevel `wl_surface`, live
+        // for the process's lifetime, and `commit` takes no arguments.
+        unsafe {
+            (self.wl.marshal_flags)(self.parent_surface, WL_SURFACE_COMMIT, std::ptr::null(), 1, 0);
+        }
+        println!(
+            "[android] wayland: engine subsurface placed {} the host window (web-view dialogs open: {})",
+            if above { "above" } else { "below" },
+            self.open_web_view_dialogs.load(Ordering::SeqCst),
+        );
     }
 
     pub fn geometry(&self) -> (i32, i32, i32) {

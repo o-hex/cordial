@@ -915,7 +915,29 @@ fn install_webview_presenter() {
                 cordial_runtime::webview::roblox_session_cookie(&cordial_runtime::profile::active());
             let shell_request = cordial_runtime::webview::to_shell_request(&request, cookie);
             match cordial_shell::webview::open(window.window(), &shell_request) {
-                Some(_dialog) => println!("[webview] presented an openWindow request"),
+                Some(dialog) => {
+                    println!("[webview] presented an openWindow request");
+                    // The engine's subsurface sits above the host window's
+                    // own content by default (see
+                    // `android::wayland`'s module doc, "A web-view dialog is
+                    // invisible by default, and this is why"), and an
+                    // `AdwDialog` draws into that same content -- so without
+                    // this the dialog just opened is real and correctly
+                    // rendered and the engine is compositing over every pixel
+                    // of it. `webview_dialog_opened` lowers the canvas for as
+                    // long as this dialog (or any other) is up;
+                    // `connect_closed` is libadwaita's own notification that
+                    // it no longer is, which is the only reliable place to
+                    // raise the canvas back -- there is no `close_request` on
+                    // `AdwDialog` this presenter forces, so this is the one
+                    // path every dismissal (button, gesture, `closeWindow`)
+                    // actually takes.
+                    use libadwaita::prelude::AdwDialogExt;
+                    window.webview_dialog_opened();
+                    dialog.connect_closed(move |_| {
+                        window.webview_dialog_closed();
+                    });
+                }
                 None => println!(
                     "[webview] openWindow request was refused by policy before it could be presented"
                 ),

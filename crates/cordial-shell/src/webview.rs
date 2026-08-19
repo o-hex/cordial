@@ -24,6 +24,23 @@
 //! A second top-level would land wherever the compositor decided, which this
 //! project has already fought once over the engine canvas.
 //!
+//! **This choice held up, but needed a partner fix to actually be visible.**
+//! An `AdwDialog` "draws inside its parent's own surface" — true, and still
+//! true below — but that surface is the same `wl_surface` the engine's own
+//! canvas is a `wl_subsurface` of, per ADR-011, and a subsurface's default
+//! stacking is *above* its parent. So a dialog opened here rendered correctly
+//! from the moment this file was written, and was invisible from the same
+//! moment, painted into a surface the engine was compositing over every
+//! frame — reported as "the whole window goes white/blank", which reads as
+//! this window failing to open at all rather than as a stacking order one
+//! layer up from it. `crates/cordial-runtime/src/android/wayland.rs`'s
+//! `WaylandWindow::webview_dialog_opened`/`webview_dialog_closed` is the fix:
+//! it lowers the engine's subsurface behind `parent_surface` for as long as a
+//! dialog from [`open`] is up. Nothing in *this* file changed for it, because
+//! the stacking is entirely a property of the engine's own subsurface, which
+//! this crate has no handle to — see that module's own doc for the mechanism
+//! and why a nested-compositor screenshot missed it the first time.
+//!
 //! ## Why in-process, when mocktail's helper is not
 //!
 //! Checked directly against `webview_helper_launcher.cc` before writing this,

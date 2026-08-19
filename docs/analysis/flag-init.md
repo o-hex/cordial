@@ -2833,3 +2833,86 @@ getter's pointer null at the moment `flagLoaded` calls it on a platform where th
 store does come up. Answering it means reading the state of an object whose
 layout is Roblox's, which is the line AGENTS.md draws, and it should be
 approached by observing that object at runtime rather than by decompiling it.
+
+## §25. Storage init *is* entered. It runs too early, fails, and memoises the failure
+
+§24 said `0x23121ae` is never entered, on four instrumented runs. **That is
+wrong, and the instrument was the reason.** Every probe in §23 and §24 attached
+to an already-running process, and the `lldb` attach handshake is slower than the
+moment that matters. Launching `cordial-run` *under* lldb with
+`eLaunchFlagStopAtEntry`, then breaking on Cordial's own
+`mcpelauncher_linker_notifylldb` (`linker_soinfo.cpp:546`, called the instant
+`libroblox.so` is mapped and before one instruction of it runs) and planting the
+storage breakpoints in that same stop, changes the answer. Reproduced across six
+runs.
+
+The control is the strongest part: the same agent's own attach-based probe got
+zero hits on the same getter in the same session. **The difference is the
+instrument, not the engine** — which is the third time in this document a
+conclusion has turned out to be a property of how it was measured.
+
+### What actually happens
+
+The getter's slow path runs **exactly once**, on the first call, and it takes the
+**direct-call branch** (`0x230c3a7`, flag byte zero) straight into `0x23121ae`.
+It never takes the schedule-a-task branch: `0x230c373` was hit zero times in
+every run, and the registrar `0x29852f6` — which does fire about six times a run
+for other subsystems — never once carries the storage body pointer. So §24's
+"storage initialises as a scheduled task" is half right: the task branch exists
+and is simply not the one taken.
+
+The caller label at that one call is **`"RbxStorage"`**, not `"flagLoaded"`, and
+it fires **during `libroblox.so`'s ELF constructors — before `JNI_OnLoad`**.
+Backtrace: `notifylldb` ← `soinfo::call_constructors` ← `do_dlopen` ←
+`cordial_linker_sys::dlopen` ← `load.rs`.
+
+And it fails. Under `CORDIAL_TRACE_PATHS=1`, same thread, two runs:
+
+    stat("./appData")    = 0
+    stat("./appData")    = 0
+    statvfs("./appData") = 0
+    stat("")             = -1
+    stat("")             = -1
+    stat("")             = -1
+
+Something it needs resolves to an empty string.
+
+### Why that ends the investigation's confusion
+
+This is a **memoising lazy singleton: first caller wins, permanently.** The
+Waydroid capture shows Android's winner:
+
+    [DFLog::RbxStorage] RbxStorage::init [INIT] user: flagLoaded, availableDiskSpace: 60655730688 bytes
+    [DFLog::RbxStorage] RbxStorage::init [DONE] … dbOpenCount: 1
+
+On Android `flagLoaded` wins the race and succeeds. In Cordial `"RbxStorage"`
+wins it first, during ELF construction, before flags exist — and fails. When
+`flagLoaded` arrives later (twice a run, per §24's own count) it is handed the
+already-"initialised" broken object and never retries.
+
+So every one of the eighteen eliminated candidates was aimed at the wrong moment.
+They were all about the state at `flagLoaded` time. The decision had already been
+taken and cached before `JNI_OnLoad` ran.
+
+### The remaining question, now small
+
+**What does the pre-`JNI_OnLoad` caller need that resolves empty?** It cannot be
+a JNI or `Context` query — there is no JNI yet. It has to be something native
+resolves at constructor time, and every directory Cordial sets
+(`nativeSetFilesDirectory` and the rest) is set *after* `dlopen` returns, so none
+of them exist yet when this runs.
+
+`INFERRED, not established:` that the empty operand is a per-user or per-session
+path component unavailable pre-flags. Nobody has established what builds that
+string, and doing so by reading the binary means reading Roblox's own object
+layout, which AGENTS.md places off-limits. It should be answered by observation.
+
+The shape of a fix, if the guess is right, is that whatever the engine reads at
+constructor time has to be true *before* `dlopen`, not after — which is a
+different kind of change from anything tried so far, and cheap to test.
+
+**Reusable, and the most valuable artefact here:** the launch-time race-free
+breakpoint technique. `SBTarget.Launch` under a synchronous `SBDebugger` silently
+free-runs without `eLaunchFlagStopAtEntry`. Any future probe of anything that
+happens during library load must use it; attaching is too late, and this document
+has now drawn a wrong conclusion from that twice.

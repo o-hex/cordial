@@ -2254,6 +2254,85 @@ it. Which of `Flag::areFlagsLoaded()` and NativeDM's `Flags-Not-Received` is
 false on the default path is **not established**, and the two are not known to be
 the same bit.
 
+### §22.3 Correction (2026-08-19): the silencing was a value-shape mismatch, not the mechanism
+
+§22's "Overriding an `FLog` channel can silence it" table used one shape for
+every value tried — a bare number, `1`, `7` or `100` — and concluded that
+naming a channel in `flags.json` sets it to quiet at every value including the
+largest tried. That conclusion is wrong as stated, and the sweep it invalidated
+(§21) is not thereby exonerated either — this only settles the mechanism.
+
+Roblox's own cached settings document (`~/.cache/cordial/clientsettings.json`)
+already answers what §22 did not check: `FLog`/`DFLog` values there are not one
+shape. Most are a bare verbosity number (`FLogNetwork = "7"`,
+`DFLogHttpTraceError = "12"`), but a real minority are a severity name with an
+optional sub-level (`FLogAudio = "Info"`, `FLogWebRTC = "Error"`,
+`DFLogWebSocketTraceError = "Warning,6"`, `DFLogRakNetConnectTrace_PlaceFilter =
+"Verbose,9"`). Which shape a given channel's C++ declaration wants is not
+visible from the settings document or from `flags.rs`, and `flags.rs` never
+tries to guess it — see its `read_layer` doc comment, extended alongside this
+correction.
+
+Repeating §22's `FLogNativeDM` case with a severity name instead of a number,
+each figure the mean of two runs, `--run 20`, own profile, engine's own `FLog`
+file read directly (not stderr):
+
+| `flags.json` | `[FLog::NativeDM]` lines | `[FLog::AppShellReporter]` lines |
+|---|---|---|
+| absent | 29, 29 (repeat) | 0, 0 (repeat) |
+| `{"FLogNativeDM": "9"}` (bare number, as §22 used) | 0 | — |
+| `{"FLogNativeDM": "100"}` (bare number, as §22 used) | 0 | — |
+| `{"FLogNativeDM": "Debug", ...}` (severity name) | 29 | 14 |
+| `{"FLogNativeDM": "Verbose", ...}` (severity name) | 30, 30 (repeat) | 16, 14 (repeat) |
+
+A bare number silences `NativeDM` on every value tried, exactly as §22 found.
+A severity name does not — it leaves the channel at or above its unset count,
+and the *same* override raises `AppShellReporter`, which is silent by default,
+from 0 to 14–16 lines, matching what a bare `"7"`/`"9"` already did to that
+channel in §22 (0 → 14). So the direction of the effect (raise vs silence) is
+not a property of the mechanism or of the number chosen — it is a property of
+whether the value's shape matches what that specific channel's declaration
+expects. Wrong shape reads as "override present, channel now silent"; right
+shape raises it, on two independent channels, repeated.
+
+**What this means for `flags.rs` and `client_settings.rs`: nothing was wrong.**
+Both convert a JSON value to a plain string and hand it through unchanged —
+`"7"` stays `"7"`, `"Verbose"` stays `"Verbose"` — which is exactly the
+behaviour a heterogeneous, string-typed settings document requires. No code
+change was needed to "make it work"; using the right value shape was
+sufficient, demonstrated above. A doc comment on `read_layer` now says so, so
+the next person who reruns §22's experiment with a bare number does not
+independently re-arrive at "the override mechanism is broken".
+
+**The `FlagJniInterface.nativeGetFInt` cross-check, resolved.** §22's report
+noted every name probed through it, including `FLogGraphics`, reads back as
+"not a registered flag", and asked whether that means the probe reads an empty
+Java-side registry. Confirmed, and more specifically than suspected: the names
+`nativeInitializeNativeFlags` registers and `nativeGetFInt` can answer for are
+the **139 Android-app feature flags** in `docs/traces/native-flag-names.txt`
+(`EnableAndroidBinaryChannelDownloadTiming`, `PgsTreatmentActive`, and so on) —
+an entirely different namespace from the engine's internal `FLog`/`DFLog`
+channels, which are read out of the `applicationSettings` document at
+`nativeInitClientSettings` time and never touch `FlagJniInterface` at all. The
+probe was run again here with `CORDIAL_FLOG_PROBE=DFLogRbxStorage,FLogGraphics,
+FLogAppShellReporter` immediately after confirming (by grepping the same run's
+stdout) that `nativeInitializeNativeFlags` had already registered its 139
+names — so this is not a timing gap, either. `nativeGetFInt` is simply the
+wrong instrument for an `FLog`/`DFLog` channel's state; it was never going to
+answer this question, for any channel, regardless of ordering.
+
+**`DFLogRbxStorage`, raised correctly, still never appears.** With the shape
+mismatch understood and controlled for, `DFLogRbxStorage` was set to `"9"`,
+`"100"`, `"Debug"` and `"Verbose"` — bare numbers and severity names, the same
+four value-shapes that moved `NativeDM` and `AppShellReporter` above — across
+five separate runs. `[DFLog::RbxStorage]` count: **zero, every time**, while in
+the same runs `FLogNativeDM` and `FLogAppShellReporter` visibly responded to
+their own overrides, proving the mechanism was live and the document was being
+read. This is not a new finding — §23.1 already reached zero by a different
+route — but it is a second, independent confirmation, ruling out "the channel
+is suppressed" as the reason `RbxStorage::init` is absent. Whatever blocks it,
+it is not this.
+
 ## §23. The answer: the post-settings call was made too early
 
 `nativePostClientSettingsLoadedInitialization3` called once more, after the

@@ -93,6 +93,35 @@ pub struct Layer {
 /// converted rather than refused — a config file should not require knowing
 /// that. Returns `None` when the file is absent, and reports and skips when it
 /// is present but malformed: a typo should not stop the client from starting.
+///
+/// **This conversion is not the reason an `FLog`/`DFLog` override can appear
+/// to do nothing, or to silence a channel — established by experiment**
+/// (`docs/analysis/flag-init.md` §22, corrected in the addendum after it).
+/// Roblox's own settings document is entirely strings, and it is
+/// *heterogeneous*: some logging channels are declared as a bare verbosity
+/// number (`FLogNetwork = "7"`), others as a severity name with an optional
+/// sub-level (`FLogAudio = "Info"`, `DFLogWebSocketTraceError = "Warning,6"`,
+/// both seen directly in the cached document). Which shape a given channel
+/// wants is a property of its own C++ declaration, invisible from here, and
+/// this function does not try to guess it — Roblox's own document is not
+/// internally consistent about it either, so guessing wrong here would be no
+/// worse than guessing wrong there.
+///
+/// The failure mode when the wrong shape is sent looks exactly like this
+/// function doing something wrong. §22 measured `FLogNativeDM` at `"1"`,
+/// `"9"` and `"100"` — three bare numbers — and every one silenced a channel
+/// that logs 12–30 lines when left unset, which read as "naming a channel can
+/// quiet it". That does not survive a repeat with a severity name instead of
+/// a number: `{"FLogNativeDM": "Verbose"}` left the channel at or above its
+/// unset count (29 unset, 30 overridden, repeated), and the identical
+/// override raised `FLogAppShellReporter` from 0 to 14–16 lines exactly as a
+/// bare `"7"` or `"9"` already did elsewhere. So the conversion below was
+/// never the fault: it passes `"7"` and `"Verbose"` through with equal
+/// fidelity, which is all it should do. The engine's own parser, handed a
+/// value of the wrong shape for a particular channel, fails safe to silent
+/// rather than falling back to that channel's compiled default — and a
+/// silenced channel is indistinguishable from a broken override unless the
+/// shape is the first thing checked.
 pub fn read_layer(path: &Path, source: Source) -> Option<Layer> {
     let text = std::fs::read_to_string(path).ok()?;
     let parsed: serde_json::Value = match serde_json::from_str(&text) {
@@ -458,6 +487,29 @@ pub fn report(resolved: &BTreeMap<String, Resolved>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `read_layer` must not prefer one value shape over another: an `FLog`
+    /// channel's own type, bare number or severity name, is not something
+    /// this function can see (see its doc comment). A bare digit and a
+    /// severity name written as a JSON string both have to survive
+    /// unchanged, or a future "helpful" normalisation could reintroduce
+    /// exactly the confusion `docs/analysis/flag-init.md` §22 records.
+    #[test]
+    fn a_flog_channels_value_survives_whichever_shape_it_was_written_in() {
+        let dir = std::env::temp_dir().join("cordial-flags-test-flog-shape");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flags.json");
+        std::fs::write(
+            &path,
+            r#"{"FLogNativeDM":"Verbose","FLogAppShellReporter":9,"FLogNetwork":"7"}"#,
+        )
+        .unwrap();
+
+        let layer = read_layer(&path, Source::User).expect("valid JSON should read");
+        assert_eq!(layer.values["FLogNativeDM"], "Verbose");
+        assert_eq!(layer.values["FLogAppShellReporter"], "9");
+        assert_eq!(layer.values["FLogNetwork"], "7");
+    }
 
     fn layer(source: Source, pairs: &[(&str, &str)]) -> Layer {
         Layer {

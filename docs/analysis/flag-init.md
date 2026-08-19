@@ -4370,3 +4370,82 @@ continues from here and wants to go further has one narrower, harder question
 left: what, read *before* `0x23121ae`, the branch at `0x23160ec` is conditioned
 on — which means placing a watchpoint on whatever that branch reads, not on the
 path buffer, and accepting that the read may predate this function entirely.
+
+## §39. Local storage is unavailable because Cordial skips `setPlatformImpl`, and §38's "engine-internal" framing is superseded
+
+§38 ended by proposing a disassembly: find what the branch at `0x23160ec` is
+conditioned on. **Do not start there.** Asking the running engine what it thought
+was wrong answers it directly, and the answer was in its own log the whole time.
+
+A landing-page run with `AndroidEnableLocalStorage` overridden to `"true"`
+(`<profile>/flags.json`, applied — `flags: 1 override(s) applied`) still produced
+no store: all eight pre-created `rbx-storage` directories empty, no `.db`
+anywhere in the root. That is negative reproduction forty-something and, taken
+alone, would have been one more line in §37's tally. What makes it useful is the
+engine log beside it:
+
+    t=1.378s  Warning [DFLog::RbxmFileManager]    LocalStorageManager is not available.
+    t=2.848s  Warning [FLog::LocalStorageHandler] Not available on the current platform.
+    t=3.352s  Warning [FLog::LocalStorageHandler] Not available on the current platform.
+    t=3.824s  Warning [DFLog::RbxmFileManager]    LocalStorageManager is not available.
+
+"Not available on the current platform" is what a missing **platform
+implementation** reports, and Cordial's own startup log says so in as many words,
+three lines below `initStorageManagerNativeV3 ok`:
+
+    setPlatformImpl skipped (measured to crash the process a few calls later;
+    set CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL=1 to try it anyway)
+
+So the sequence §26–§38 spent nine sections characterising — a correct
+`"./appData"` built and then wiped — sits **downstream of a platform impl the
+engine was never given**. §38's measurement is not wrong: no Cordial-owned
+filesystem shim is called between the write and the wipe, and that remains true.
+Its *framing* is what this supersedes. "Engine-internal, not a host input Cordial
+withholds" reads as "there is nothing to supply", and there is: `setPlatformImpl`
+is a host input, it is withheld, and it is withheld deliberately by a line of
+Cordial's own that predates this whole investigation. The wipe was measured
+inside a function that had already been told this platform has no local storage.
+
+This is the ninth time in this document that an absence was read as evidence
+about the engine rather than as evidence about Cordial's own instrumentation or
+defaults, and it is the most expensive: the "no host call in the window" result
+is *true*, was measured four times, and still pointed the wrong way, because the
+window it measured began after the decision had been made.
+
+### What happens when it is not skipped
+
+`CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL=1`, same root, same run length:
+
+    setPlatformImpl ok
+    [JNIVM]: Exception with Message `djinni (djinni_support.cpp:529): weakRef` was thrown   (x10)
+    RBXCRASH: JNI: Crashing due to unhandled Java exception
+    exit 133 (SIGTRAP)
+
+Still no store — so **this section does not fix `RbxStorage`**, and nothing here
+should be read as claiming it does. What it establishes is that the skip is real,
+that lifting it changes the failure from a silent unavailability into a loud
+crash, and that the crash has a named mechanism rather than being the
+"occasional crash this document has always set aside".
+
+`third_party/libjnivm/src/jnivm/vm.cpp:313`'s `NewWeakGlobalRef` returns
+`(jweak)nullptr` whenever `JNITypes<std::shared_ptr<Object>>::JNICast` of the
+object it is handed yields no strong pointer, and djinni asserts on a null weak
+reference. That the two match is `INFERRED` — the message text and the null
+return are consistent, but nobody has yet watched that cast fail on the specific
+object `setPlatformImpl` passes. Establishing that is the next step, and it is a
+question about libjnivm and djinni, not about `libroblox.so`'s text.
+
+### What this changes for whoever continues
+
+The remaining question is no longer "what condition byte selects the wipe". It is
+"why does djinni's weak reference to Cordial's platform impl come back null", and
+that is answerable in code both projects can read, with a debugger that works,
+against sources that are not stripped. `patches/` is where a libjnivm fix would
+go — the submodule points at a repository this project cannot push to, and
+anything Cordial calls that exists only under a patch must be a weak symbol with
+a null check naming the missing patch, per `native/shim.cpp`.
+
+Whether fixing it produces a store is not established and should not be assumed.
+Forty-odd negatives say the trigger has resisted every explanation offered so
+far, and "the platform impl was missing" is an explanation for the *warnings*,
+measured, not yet an explanation for the *store*.

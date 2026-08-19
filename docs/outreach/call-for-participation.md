@@ -141,7 +141,7 @@ something harmless is how the next `hypotf` becomes a mystery instead of an erro
 
 ---
 
-## 6. `initStorageManagerNativeV3` runs before the directories it documents needing
+## 6. RETRACTED - `initStorageManagerNativeV3` does not run before the directory setters
 
 **Good first issue, and it is a stale comment as much as a bug.**
 
@@ -156,3 +156,23 @@ does, then either move the call or fix the comment.
 
 **Either outcome is a fix.** A comment that lies costs more than no comment, and
 this repository would rather have the correction than the reorder.
+
+**Not filed, because the premise does not hold.** Checked against a live run at
+`0.5.2-165-g76ec67e`, stdout ordering, single run, lines 788-795:
+
+    788  nativeSetFilesDirectory ok
+    789  nativeSetCacheDirectory ok
+    790  nativeSetExternalDirectory ok
+    791  nativeSetBaseDataDirectories ok
+    795  initStorageManagerNativeV3 ok
+
+All four directory setters run *before* `initStorageManagerNativeV3`, which is
+what its comment says happens. The draft above asserts the opposite and cites
+"stdout ordering across two runs" for it. One of those two readings is wrong and
+this one is the one with the line numbers, so the draft is retracted rather than
+filed -- publishing it would have sent a stranger to fix an ordering that is
+already correct, which is worse than filing nothing.
+
+Whether the order changed between the draft and now, or the draft was simply
+wrong, is not established here and the difference does not matter for the
+decision not to file it.

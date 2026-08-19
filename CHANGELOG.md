@@ -9,12 +9,64 @@ what the history contains and hiding it would make the rest less trustworthy.
 
 The version in `Cargo.toml` is stamped into the window title by
 `crates/cordial-shell/build.rs` via `git describe --tags`. A release reads
-`Cordial 0.5.2`; a development build reads `Cordial 0.5.2-14-g8db7100`.
+`Cordial 0.6.0`; a development build reads `Cordial 0.6.0-14-g8db7100`.
 
 **There was never a 0.1.0.** The first version this project gave itself was
 0.2.0, in `8db7100`, once there was something a person could sign into. The 178
 commits before that were the bionic linker port, the JNI layer and the framework
 work, and none of them were released.
+
+## 0.6.0 — 2026-08-20
+
+**The embedded web view is integrated in both directions.** Opening a web
+window worked in 0.5.2's successor commits; using one did not, and the gap was
+narrow and specific.
+
+`openWindow` already reached a dialog. Three things were missing and are here:
+
+- **Bridge messages now reach the engine.** Pressing Join in the Servers window
+  opened the game's detail page inside the same dialog instead of joining. That
+  read as a WebKit navigation bug and was not: the page posts its command to
+  `executeRoblox`/`RobloxWKHybrid`, nothing answered, and a page whose host is
+  not listening falls back to ordinary navigation. `signalJavascriptCallback`'s
+  shape is read from the dex's method table — `(Ljava/lang/String;)V` — rather
+  than guessed, so the argument list carries no risk.
+- **The engine is told when a window closes.** It blanks its own canvas when it
+  opens a web window, expecting to be covered. Nothing was telling it the cover
+  had gone, so the canvas stayed blank underneath a correctly stacked, visible
+  dialog. Lowering the subsurface was necessary and not sufficient.
+- **`setWebviewUserAgent` gets the identical string `InitParams.userAgent` was
+  built with**, via `cordial_build_user_agent`, so the view and the engine
+  cannot drift apart into two answers about what this client is.
+
+Measured: builds with both webview features, `readelf -d` confirms
+libwebkitgtk-6.0.so.4 actually linked, 608 tests across 19 suites, and all four
+natives are exported by 2.734.0.917.
+
+`INFERRED`, and written into the code rather than only here: that the engine
+wants the JSON rendering of the script message the page posted. It is what
+WebKitGTK hands over and the only thing available, but nothing observed
+confirms the engine parses exactly that. **A successful forward is not evidence
+that Join worked** — it means the native returned without throwing.
+
+### RbxStorage: the cause is ours, and §38 is superseded
+
+Local storage has never initialised. Nine sections of `docs/analysis/flag-init.md`
+characterised the engine building a correct `./appData` path and then wiping it,
+and §38 concluded it happened with no host call in the window — measured four
+times, and true.
+
+It still pointed the wrong way. The engine logs `LocalStorageManager is not
+available` and `Not available on the current platform`, which is what a missing
+platform implementation reports, and Cordial's own startup log says
+`setPlatformImpl skipped` three lines below `initStorageManagerNativeV3 ok`. The
+wipe was measured inside a function that had already been told this platform has
+no local storage. The window began after the decision.
+
+**This release does not fix storage and nothing here should be read as claiming
+it does.** Lifting the skip turns a silent unavailability into a crash with a
+named mechanism — ten `djinni ... weakRef` exceptions and a SIGTRAP — which is a
+better place to be stuck than a disassembly.
 
 ## 0.5.2 — 2026-08-05
 

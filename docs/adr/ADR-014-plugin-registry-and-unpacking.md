@@ -30,7 +30,9 @@ failures, not one "could not install".
 name rather than a skipped entry, and each one has a test that fails when the
 check is deleted.
 
-`crates/cordial-plugins/{registry,resolve,unpack}.rs`.
+`crates/cordial-plugins/{registry,resolve,unpack}.rs`, and — the marketplace
+foundations described further down — `crates/cordial-plugins/{source,sign,marketplace}.rs`
+and the Marketplace section of `crates/cordial-shell/src/settings.rs`.
 
 ## Why the manifest stays `plugin.json`
 
@@ -109,7 +111,7 @@ different bytes is **refused rather than resolved by precedence**. Precedence
 for one plugin would silently be deciding where a different plugin's bytes come
 from.
 
-## Signing: chosen, not implemented, and named so nobody forgets
+## Signing: the mechanism is implemented; the key is still nobody's to ship
 
 The intended scheme is a **detached minisign signature (Ed25519)** beside the
 index as `index.json.minisig`, checked against a key shipped with Cordial
@@ -122,16 +124,75 @@ SSH signatures (`ssh-keygen -Y sign`, with an `allowed_signers` file) would also
 have done and are a reasonable thing to argue for, since the index lives in git
 already.
 
-**None of it is implemented.** The only entry point is
-`Index::parse_unverified`, named so that no caller can hand an index to
-something trusting without writing the word "unverified" in the line they typed.
-Until the check lands, an index is exactly as trustworthy as the transport it
-arrived over.
+**Correcting what this ADR said before:** it said "none of it is implemented",
+and as of the marketplace foundations (below) that is no longer true of the
+*mechanism*. `crate::sign::verify` checks a minisign signature against exactly
+the bytes handed to it, in the order this section always specified — before
+`serde_json` runs — using the `minisign-verify` crate the paragraph above
+already named as the plan. `Index::parse_unverified` is still there, unchanged,
+for exactly the case its name always covered: a caller with no signature to
+check, which is still every caller in this codebase today, because nothing here
+configures a key.
+
+**What is still true, and is the part that actually matters:** no key is
+shipped with Cordial, none is hardcoded anywhere, and nothing falls back to
+trusting an index that has none configured. Implementing the check without
+shipping a key was deliberate, not an oversight — see "Browsing and installing
+from a source" below. Shipping a key means naming whose index it belongs to,
+which is the hosting decision this ADR has never made and still has not. Until
+that decision exists, `crate::marketplace::install` refuses every plan built
+from an index it was not handed a key to verify, and an index opened with no
+key is exactly as trustworthy as the transport it arrived over — which is what
+this paragraph said when there was no check at all, and remains true of every
+index nobody has configured a key for.
 
 The per-entry content hash is **not** a substitute and must not be read as one.
 It protects the *download* against a mirror that serves different bytes than
 were published. It cannot protect against a tampered *index*, because a tampered
 index carries a matching hash for whatever it is pointing at.
+
+## Browsing and installing from a source — the foundations, 2026-08-20
+
+The marketplace half of this ADR — browsing and installing from somewhere,
+rather than only being able to reason about an index file already on disk —
+did not exist. It now does, in three additions that change nothing about the
+decisions above; they are the plumbing those decisions were waiting for.
+
+**`crate::source::IndexSource`** is where "who hosts an index" plugs in. Two
+calls — fetch the index document (and its signature, if the source has one),
+fetch one entry's archive — because those are the only two things ADR-014
+ever needs moved over a network. `crate::source::LocalFileSource` is the one
+implementation today: a directory holding `index.json`, an optional
+`index.json.minisig`, and an `archives/` directory. This is not a stand-in for
+an HTTPS source waiting to be written; the "why the index is a static file"
+section above already designs an index to be "served straight out of a git
+repository", and a local clone of one is that arrangement with the network
+step removed. `cordial-plugins` still takes on no HTTP client dependency —
+doing that now, ahead of a host being named, would itself be a form of the
+policy call this ADR keeps declining to make.
+
+**`crate::sign`** is the signature check described above, as code.
+
+**`crate::marketplace`** is what an installer actually calls: open a source
+against an optional trusted key (`open`), and resolve a request against the
+result, fetch what the plan needs, and install every step through
+`crate::unpack::install` — never a second extraction path — while refusing
+outright, before a single byte is fetched, if the index behind the plan was
+never verified (`install`). `crates/cordial-shell/src/settings.rs`'s
+Marketplace section in the Plugins page is the UI wired to this: a directory
+and an optional pasted key, a listing of what it offers with each entry's
+requested capabilities shown in the same words the per-plugin grant switches
+use, and an Install button that is refused — visibly, with the reason stated
+on it — for every entry until a key is configured and verifies.
+
+**What this still does not do, on purpose.** No default index directory, no
+shipped key, no HTTPS fetcher, and — see [ADR-001](ADR-001-in-process-hooking.md)
+and [ADR-003](ADR-003-plugin-isolation.md) — nothing that would let an index
+install anything other than a Cordial plugin archive through the existing
+hardened unpacker: there is no broader "run this" primitive here for a
+listing to point at, which matters more once a marketplace exists than before
+one did, because a marketplace is exactly the shape a distribution channel for
+one would try to wear.
 
 ## Resolution, and how its order relates to ADR-006's start order
 
@@ -294,9 +355,16 @@ of schemes it can be talked into is worth being a short list.
 
 ## What would change this
 
-If the signature check lands, `parse_unverified` should stop being the only
-entry point and the paragraph above about the index being as trustworthy as its
-transport should be deleted rather than softened.
+If the project owner names a host for a default index, two things follow and
+neither is optional: a key for `crate::sign` to check it against, shipped and
+documented as belonging to that specific publisher, and an
+`IndexSource` implementation that fetches over HTTPS rather than reading a
+local directory. Neither is a large change against what exists now —
+`crate::marketplace` already refuses to install without a verified signature,
+and `crate::source::IndexSource` is already the seam an HTTPS fetcher drops
+into — but both are genuine decisions, made once, by the person who has to
+stand behind them, not defaults quietly picked to make the marketplace UI feel
+less empty.
 
 If a plugin ever legitimately needs two incompatible versions of a dependency —
 which would mean plugins linking each other's code rather than merely starting

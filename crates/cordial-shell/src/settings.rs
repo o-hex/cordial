@@ -32,6 +32,11 @@ use cordial_plugins::capability::Capability;
 use cordial_plugins::enablement;
 use cordial_plugins::grants;
 use cordial_plugins::manifest::{self, Plugin};
+use cordial_plugins::marketplace;
+use cordial_plugins::registry::Entry;
+use cordial_plugins::resolve;
+use cordial_plugins::sign;
+use cordial_plugins::source::LocalFileSource;
 use cordial_plugins::unpack;
 
 use crate::install;
@@ -792,7 +797,383 @@ fn build_install_group(
     group
 }
 
-fn build_plugins_page(parent: &impl IsA<gtk::Window>, config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesPage {
+/// The confirmation text for a marketplace install: every step the resolver
+/// chose, dependencies included, and exactly what each one would be granted.
+///
+/// Built once, before the dialog exists, and never held onto — ADR-014 is
+/// explicit that "resolution and approval are two calls, not one" because a
+/// user cannot approve a plan they have not been shown, and this is the
+/// showing. What actually grants anything is the dialog's response handler
+/// below, which resolves a second time once the user has agreed, rather than
+/// carrying this borrow of the index across the time a modal dialog is open.
+fn plan_confirmation_text(plan: &resolve::Plan<'_>) -> String {
+    let lines: Vec<String> = plan
+        .steps
+        .iter()
+        .map(|step| {
+            let caps = if step.capabilities.is_empty() {
+                "no capabilities".to_string()
+            } else {
+                step.capabilities.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")
+            };
+            format!("{} {} — requests: {caps}", step.id, step.version)
+        })
+        .collect();
+    format!(
+        "Installing this grants each plugin below exactly what it requests, in this profile \
+         only. Nothing is granted anywhere else, and nothing is granted at all if you cancel.\n\n{}",
+        lines.join("\n")
+    )
+}
+
+/// One entry a marketplace index offers: what it is, what installing it (and
+/// whatever it depends on) would request, and an Install button that runs the
+/// whole ADR-014 pipeline — resolve, show the plan, grant what was shown,
+/// fetch, and unpack through `cordial_plugins::unpack::install`.
+///
+/// `index_dir` is re-read into a fresh [`LocalFileSource`] inside the click
+/// handler rather than the row holding one: the source is cheap to build
+/// again and doing so avoids threading a borrow of `opened.index` through a
+/// GTK callback that outlives the button press that created it.
+fn build_marketplace_entry_row(
+    parent: &impl IsA<gtk::Window>,
+    opened: &Rc<marketplace::Opened>,
+    entry: &Entry,
+    index_dir: &Path,
+    root: &Path,
+    profile_dir: Option<&PathBuf>,
+    installed_group: &adw::PreferencesGroup,
+) -> adw::ActionRow {
+    let title = if entry.name.is_empty() { entry.id.clone() } else { entry.name.clone() };
+    let requests = if entry.capabilities.is_empty() {
+        "Requests no capabilities".to_string()
+    } else {
+        format!(
+            "Requests: {}",
+            entry.capabilities.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")
+        )
+    };
+    let deps = if entry.dependencies.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nDepends on: {}",
+            entry.dependencies.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+        )
+    };
+    let row = adw::ActionRow::builder()
+        .title(format!("{title} {}", entry.version))
+        .subtitle(format!("{requests}{deps}"))
+        .build();
+    row.set_subtitle_lines(4);
+
+    let install = gtk::Button::with_label("Install");
+    install.set_valign(gtk::Align::Center);
+    row.add_suffix(&install);
+
+    if !opened.verified {
+        // The refusal `marketplace::install` itself makes, said up front
+        // rather than only after a click: a button that looks live and then
+        // reports a refusal is the small lie AGENTS.md keeps finding here.
+        install.set_sensitive(false);
+        install.set_tooltip_text(Some(
+            "Refused: this index's signature has not been checked against a configured key.",
+        ));
+        return row;
+    }
+    let Some(profile_dir) = profile_dir.cloned() else {
+        install.set_sensitive(false);
+        install.set_tooltip_text(Some("No profile to grant against."));
+        return row;
+    };
+
+    let window = parent.as_ref().clone();
+    let opened = opened.clone();
+    let entry_id = entry.id.clone();
+    let entry_version = entry.version.clone();
+    let index_dir = index_dir.to_path_buf();
+    let root = root.to_path_buf();
+    let installed_group = installed_group.clone();
+    let row_for_status = row.clone();
+    install.connect_clicked(move |button| {
+        // Pinned to exactly the version the user clicked on, not a caret
+        // range: the row they are looking at names one version, and `^`
+        // would let the resolver silently choose a newer one that was not
+        // what was shown.
+        let wanted = vec![manifest::Dependency::new(&entry_id, &format!("={entry_version}")).unwrap()];
+
+        let body = match resolve::resolve(&opened.index, &wanted) {
+            Ok(plan) => plan_confirmation_text(&plan),
+            Err(e) => {
+                row_for_status.set_subtitle(&format!("Cannot resolve: {e}"));
+                return;
+            }
+        };
+
+        let dialog = adw::MessageDialog::builder()
+            .transient_for(&window)
+            .modal(true)
+            .heading(format!("Install {entry_id} {entry_version}?"))
+            .body(body)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("install", "Install and approve");
+        dialog.set_response_appearance("install", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let opened = opened.clone();
+        let wanted = wanted.clone();
+        let entry_id = entry_id.clone();
+        let index_dir = index_dir.clone();
+        let root = root.clone();
+        let profile_dir = profile_dir.clone();
+        let installed_group = installed_group.clone();
+        let window = window.clone();
+        let row_for_status = row_for_status.clone();
+        let button = button.clone();
+        dialog.connect_response(None, move |dialog, response| {
+            if response == "install" {
+                // Resolved again, now that the user has agreed to the plan
+                // shown above — see `plan_confirmation_text`'s doc comment
+                // for why this is a second call rather than the same `Plan`
+                // carried across the dialog.
+                match resolve::resolve(&opened.index, &wanted) {
+                    Ok(plan) => {
+                        let grants_path = grants::path_in(&profile_dir);
+                        for step in &plan.steps {
+                            for cap in &step.capabilities {
+                                if let Err(e) = grants::set(&grants_path, &step.id, *cap, true) {
+                                    eprintln!(
+                                        "shell: could not record {}'s {} grant: {e}",
+                                        step.id,
+                                        cap.name()
+                                    );
+                                }
+                            }
+                        }
+                        let granted = grants::load(&grants_path);
+                        let source = LocalFileSource::new(&index_dir);
+                        match marketplace::install(&source, &opened, &wanted, &granted, &root) {
+                            Ok(dirs) if dirs.is_empty() => {
+                                row_for_status.set_subtitle(&format!(
+                                    "{entry_id} is already installed at this version."
+                                ));
+                            }
+                            Ok(dirs) => {
+                                for dir in &dirs {
+                                    let Ok(text) = std::fs::read_to_string(dir.join("plugin.json"))
+                                    else {
+                                        continue;
+                                    };
+                                    let Ok(plugin) = manifest::parse(&text, dir) else { continue };
+                                    let new_row = build_plugin_row(
+                                        &window,
+                                        &plugin,
+                                        Some(&profile_dir),
+                                        &root,
+                                        &installed_group,
+                                    );
+                                    installed_group.add(&new_row);
+                                }
+                                button.set_sensitive(false);
+                                button.set_label("Installed");
+                            }
+                            Err(e) => {
+                                eprintln!("shell: marketplace install of {entry_id} failed: {e}");
+                                row_for_status.set_subtitle(&format!("Install failed: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => row_for_status.set_subtitle(&format!("Cannot resolve: {e}")),
+                }
+            }
+            dialog.close();
+        });
+        dialog.present();
+    });
+
+    row
+}
+
+/// "Marketplace" — browsing and installing from an index source, per
+/// ADR-014's design and the seam it deliberately leaves open.
+///
+/// **No index is configured by default, and no key is either.** ADR-014
+/// declines to name a host or ship a signing key — see
+/// `cordial_plugins::sign` and `cordial_plugins::source` for why — so there is
+/// nothing here to point at until the user supplies a directory of their own:
+/// a local checkout of an index repository (`index.json`, an optional
+/// `index.json.minisig`, and an `archives/` directory), exactly what
+/// ADR-014 already designs an index to be. Pointing this at a directory with
+/// no key configured still lists what it offers, because a user cannot decide
+/// whether to trust something they cannot see; every Install button stays
+/// refused, with the reason stated on it, until a key is set and verifies.
+///
+/// Two groups rather than one, because they change on different occasions:
+/// configuration (the directory, the key) changes rarely, and the listing is
+/// rebuilt every time "Check for plugins" is pressed. Rebuilding the whole
+/// page on every refresh would also discard whatever the user had just typed
+/// into the other group.
+fn build_marketplace_groups(
+    parent: &impl IsA<gtk::Window>,
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+    root: &Path,
+    profile_dir: Option<PathBuf>,
+    installed_group: &adw::PreferencesGroup,
+) -> (adw::PreferencesGroup, adw::PreferencesGroup) {
+    let config_group = adw::PreferencesGroup::builder()
+        .title("Marketplace")
+        .description(
+            "Lists and installs plugins from an index (ADR-014) — a directory holding \
+             index.json, exactly what a git clone of an index repository produces. Cordial \
+             ships no default index and trusts no key by default: point this at one you have, \
+             and paste the minisign public key you trust it under to enable installing, or \
+             leave the key blank to browse without installing anything.",
+        )
+        .build();
+
+    let dir_row = adw::ActionRow::builder()
+        .title("Index directory")
+        .subtitle(
+            config
+                .borrow()
+                .marketplace_index_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "Not set".to_string()),
+        )
+        .build();
+    let choose = gtk::Button::with_label("Choose…");
+    choose.set_valign(gtk::Align::Center);
+    dir_row.add_suffix(&choose);
+    config_group.add(&dir_row);
+    {
+        let window = parent.as_ref().clone();
+        let config = config.clone();
+        let config_path = config_path.clone();
+        let dir_row = dir_row.clone();
+        choose.connect_clicked(move |_| {
+            let config = config.clone();
+            let config_path = config_path.clone();
+            let dir_row = dir_row.clone();
+            choose_file(&window, "Choose an index directory", true, move |path| {
+                dir_row.set_subtitle(&path.display().to_string());
+                config.borrow_mut().marketplace_index_dir = Some(path);
+                persist(&config, &config_path);
+            });
+        });
+    }
+
+    let key_row = adw::EntryRow::builder().title("Trusted public key (minisign, base64)").build();
+    key_row.set_text(&config.borrow().marketplace_public_key.clone().unwrap_or_default());
+    config_group.add(&key_row);
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        key_row.connect_changed(move |row| {
+            let text = row.text().to_string();
+            config.borrow_mut().marketplace_public_key =
+                if text.trim().is_empty() { None } else { Some(text) };
+            persist(&config, &config_path);
+        });
+    }
+
+    let status_row = adw::ActionRow::builder()
+        .title("Nothing checked yet")
+        .subtitle("Press \"Check for plugins\" to fetch the index.")
+        .build();
+    status_row.set_subtitle_lines(3);
+    let check = gtk::Button::with_label("Check for plugins");
+    check.set_valign(gtk::Align::Center);
+    status_row.add_suffix(&check);
+    config_group.add(&status_row);
+
+    let listing_group = adw::PreferencesGroup::builder()
+        .title("Available")
+        .description("What the index above currently lists. Empty until you press \"Check for plugins\".")
+        .build();
+    let listing_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+
+    {
+        let window = parent.as_ref().clone();
+        let config = config.clone();
+        let root = root.to_path_buf();
+        let profile_dir = profile_dir.clone();
+        let installed_group = installed_group.clone();
+        let listing_group = listing_group.clone();
+        let listing_rows = listing_rows.clone();
+        let status_row = status_row.clone();
+        check.connect_clicked(move |_| {
+            for row in listing_rows.borrow_mut().drain(..) {
+                listing_group.remove(&row);
+            }
+            let Some(index_dir) = config.borrow().marketplace_index_dir.clone() else {
+                status_row.set_title("No index directory set");
+                status_row.set_subtitle("Choose one above first.");
+                return;
+            };
+            let key_text = config.borrow().marketplace_public_key.clone();
+            let source = LocalFileSource::new(&index_dir);
+            let trust_key = match key_text.as_deref().map(str::trim) {
+                Some(t) if !t.is_empty() => match sign::parse_key(t) {
+                    Ok(k) => Some(k),
+                    Err(e) => {
+                        status_row.set_title("Public key does not parse");
+                        status_row.set_subtitle(&e.to_string());
+                        return;
+                    }
+                },
+                _ => None,
+            };
+            let trust = match &trust_key {
+                Some(k) => marketplace::Trust::Key(k),
+                None => marketplace::Trust::Unconfigured,
+            };
+            let opened = match marketplace::open(&source, trust) {
+                Ok(o) => o,
+                Err(e) => {
+                    status_row.set_title("Could not open the index");
+                    status_row.set_subtitle(&e.to_string());
+                    return;
+                }
+            };
+
+            let n = opened.index.entries.len();
+            status_row.set_title(&format!("{n} release{} listed", if n == 1 { "" } else { "s" }));
+            status_row.set_subtitle(if opened.verified {
+                "Signature verified against the configured key."
+            } else {
+                "Not verified — no key is configured, or none was given. Installing is refused \
+                 until one is set and verifies."
+            });
+
+            let opened = Rc::new(opened);
+            for entry in &opened.index.entries {
+                let row = build_marketplace_entry_row(
+                    &window,
+                    &opened,
+                    entry,
+                    &index_dir,
+                    &root,
+                    profile_dir.as_ref(),
+                    &installed_group,
+                );
+                listing_group.add(&row);
+                listing_rows.borrow_mut().push(row);
+            }
+        });
+    }
+
+    (config_group, listing_group)
+}
+
+fn build_plugins_page(
+    parent: &impl IsA<gtk::Window>,
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Plugins")
         .name("plugins")
@@ -833,7 +1214,11 @@ fn build_plugins_page(parent: &impl IsA<gtk::Window>, config: Rc<RefCell<ShellCo
         }
     }
 
-    page.add(&build_install_group(parent, &root, profile_dir, &group));
+    page.add(&build_install_group(parent, &root, profile_dir.clone(), &group));
+    let (marketplace_config, marketplace_listing) =
+        build_marketplace_groups(parent, config.clone(), config_path.clone(), &root, profile_dir, &group);
+    page.add(&marketplace_config);
+    page.add(&marketplace_listing);
     page.add(&group);
     page
 }
@@ -867,8 +1252,8 @@ pub fn build_preferences_window(
     // Second, next to the page about the build it is about.
     window.add(&crate::updater::build_update_page(config.clone(), config_path.clone()));
     window.add(&build_appearance_page(config.clone(), config_path.clone()));
-    window.add(&build_general_page(config.clone(), config_path));
-    window.add(&build_plugins_page(&window, config));
+    window.add(&build_general_page(config.clone(), config_path.clone()));
+    window.add(&build_plugins_page(&window, config, config_path));
 
     window
 }
@@ -938,5 +1323,33 @@ mod tests {
             assert!(!text.trim().is_empty(), "{cap} has no description");
             assert!(text.len() > 10, "{cap}'s description is too short to be real prose: {text:?}");
         }
+    }
+
+    /// `plan_confirmation_text` is what stands between a marketplace click
+    /// and a grant that gets written to disk, so it has to actually name
+    /// every plugin the plan touches and what each one asks for — not only
+    /// the one the user clicked on. No GTK involved: `resolve::resolve` and
+    /// this function are both plain Rust, which is why this test can run
+    /// without a display the way the widget-building code around it cannot.
+    #[test]
+    fn the_confirmation_text_names_every_step_and_what_it_requests_including_pulled_in_dependencies() {
+        let index_json = r#"{"format":1,"plugins":[
+            {"id":"app","version":"1.0.0","capabilities":["log"],
+             "dependencies":{"lib":"^1.0.0"},
+             "url":"https://x.invalid/app-1.0.0.tar.zst",
+             "hash":"sha256:0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8"},
+            {"id":"lib","version":"1.0.0","capabilities":["assets.override"],"dependencies":{},
+             "url":"https://x.invalid/lib-1.0.0.tar.zst",
+             "hash":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}
+        ]}"#;
+        let index = cordial_plugins::registry::Index::parse_unverified(index_json).unwrap();
+        let wanted = vec![cordial_plugins::manifest::Dependency::new("app", "^1.0.0").unwrap()];
+        let plan = resolve::resolve(&index, &wanted).unwrap();
+        let text = plan_confirmation_text(&plan);
+        assert!(text.contains("app 1.0.0"), "{text}");
+        assert!(text.contains("lib 1.0.0"), "{text}");
+        assert!(text.contains("assets.override"), "a dependency's own capability must be shown, \
+            not only the plugin the user clicked on: {text}");
+        assert!(text.contains("log"), "{text}");
     }
 }

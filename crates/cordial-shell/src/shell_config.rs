@@ -246,6 +246,29 @@ pub struct ShellConfig {
     /// Empty disables the binding entirely, for exactly that case.
     #[serde(default = "default_fullscreen_accel")]
     pub fullscreen_accel: String,
+    /// A directory the Marketplace section of the Plugins page reads as a
+    /// [`cordial_plugins::source::LocalFileSource`] — `index.json`, an
+    /// optional `index.json.minisig`, and an `archives/` directory beside it.
+    ///
+    /// Never set by anything but the user, and never defaulted to a real
+    /// path: ADR-014 declines to name who hosts an index, so there is no
+    /// index for Cordial to point at until somebody supplies a directory of
+    /// their own. Machine-wide rather than per profile, on the same footing
+    /// as `roblox` above — which build to run, and which index to browse, are
+    /// both about the machine's software, not about an account (ADR-013).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace_index_dir: Option<PathBuf>,
+    /// The base64 minisign public key the Marketplace section checks
+    /// `marketplace_index_dir`'s signature against.
+    ///
+    /// Absent by default and not filled in with anything Cordial ships,
+    /// because Cordial ships no key — see `cordial_plugins::sign` for why. An
+    /// index opened with this unset still lists what it offers; installing
+    /// from it is refused until a key is set here and actually verifies,
+    /// which is `cordial_plugins::marketplace::install`'s doing, not this
+    /// field's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace_public_key: Option<String>,
 }
 
 fn default_fullscreen_accel() -> String {
@@ -264,6 +287,8 @@ impl Default for ShellConfig {
             graphics: "automatic".to_string(),
             mangohud: false,
             fullscreen_accel: default_fullscreen_accel(),
+            marketplace_index_dir: None,
+            marketplace_public_key: None,
         }
     }
 }

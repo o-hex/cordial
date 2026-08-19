@@ -575,7 +575,16 @@ extern "C" fn run_bootstrap() {
     // nativeInitializeNativeFlags only later. The first arrangement here put the
     // flag names between the two and the 139-name list takes long enough that
     // `post` landed after the verdict had already been reported.
-    if plan.post_native != 0 {
+    // `CORDIAL_NO_EARLY_POST=1` leaves this to the late call site.
+    //
+    // The early call was always a no-op: the engine's own
+    // `[FLog::AndroidGLView] nativePostClientSettingsLoadedInitialization3` line
+    // never appeared and none of the block that follows it on Android ever ran.
+    // Repeating the call after the surface is up produces the whole block, so the
+    // body does run -- just not this early. That leaves the question of whether
+    // the wasted early call is merely useless or actively harmful, which nobody
+    // can answer while both calls are made.
+    if plan.post_native != 0 && std::env::var_os("CORDIAL_NO_EARLY_POST").is_none() {
         match linker::game_activity::post_client_settings_loaded(
             plan.post_native as *mut std::ffi::c_void,
         ) {
@@ -2695,6 +2704,99 @@ fn main() -> ExitCode {
                                         ) {
                                             Ok(()) => {
                                                 println!("  surface handed to the engine");
+
+                                                // `CORDIAL_LATE_POST_MS=2000`
+                                                // repeats the post-settings call
+                                                // here, seconds after the
+                                                // bootstrap already made it.
+                                                //
+                                                // On Android this native is what
+                                                // raises the block Cordial has
+                                                // never produced -- ClientRunInfo,
+                                                // the QoS handler, Mimalloc,
+                                                // IxpStorageManager, the tombstone
+                                                // read, and RbxStorage::init all
+                                                // follow it within 25 ms. Sober
+                                                // makes the call at 3.067s, about
+                                                // 1.7 seconds after its engine is
+                                                // alive. Cordial makes it inside
+                                                // `bootstrapTheApp`, before the
+                                                // engine has opened its own log,
+                                                // and the block never appears.
+                                                //
+                                                // Every ordering tried so far moved
+                                                // the settings call and this one
+                                                // together, so "the handshake is
+                                                // too early" and "this call is too
+                                                // early" have never been separated.
+                                                // Settings stay where they are, in
+                                                // the bootstrap, so the flags still
+                                                // load; only this moves.
+                                                // On by default now, because it
+                                                // is what finally produces
+                                                // `gameActivity_onFlagsLoaded`.
+                                                // `CORDIAL_LATE_POST_MS=off`
+                                                // restores the old behaviour as a
+                                                // control.
+                                                //
+                                                // 250 ms rather than none: at 0 the
+                                                // run reaches `Flags-Not-Received=0`,
+                                                // better than any delay tried, and
+                                                // then segfaults. Something here is
+                                                // still racing and the delay hides
+                                                // it rather than fixing it. Said
+                                                // plainly so the next person does not
+                                                // read 250 as a tuned value -- it is
+                                                // the smallest number tried that did
+                                                // not crash, and the race underneath
+                                                // is unfinished work.
+                                                let late_post = std::env::var("CORDIAL_LATE_POST_MS")
+                                                    .ok()
+                                                    .map_or(Some(250), |v| {
+                                                        if v == "off" { None } else { v.parse::<u64>().ok() }
+                                                    });
+                                                if let Some(ms) = late_post {
+                                                    std::thread::sleep(
+                                                        std::time::Duration::from_millis(ms),
+                                                    );
+                                                    match lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3") {
+                                                        None => println!("  late post: not exported"),
+                                                        Some(f) => match linker::game_activity::post_client_settings_loaded(f) {
+                                                            Ok(()) => println!("  late post: postClientSettingsLoadedInitialization3 ok (after {ms} ms)"),
+                                                            Err(e) => println!("  late post failed: {e}"),
+                                                        },
+                                                    }
+
+                                                    // `CORDIAL_LATE_RETRY=1` asks
+                                                    // the engine to run its init
+                                                    // again, here, once the block
+                                                    // above has actually produced
+                                                    // something.
+                                                    //
+                                                    // `RbxStorage::init` is logged
+                                                    // on Android with
+                                                    // `user: flagLoaded` -- the
+                                                    // flags-loaded event is what
+                                                    // asks for it, and by this
+                                                    // point Cordial's verdict has
+                                                    // already come back failed
+                                                    // twice. Cordial does call
+                                                    // `nativeRetryInit`, but early,
+                                                    // before any of this ran. This
+                                                    // is the same call at the only
+                                                    // moment where the state it
+                                                    // would retry against is
+                                                    // different.
+                                                    if std::env::var("CORDIAL_LATE_RETRY").map_or(true, |v| v != "off") {
+                                                        match lib.symbol("Java_com_roblox_client_startup_MainGameActivity_nativeRetryInit") {
+                                                            None => println!("  late retry: not exported"),
+                                                            Some(f) => match linker::game_activity::appbridge_call_bare(f) {
+                                                                Ok(()) => println!("  late retry: nativeRetryInit ok"),
+                                                                Err(e) => println!("  late retry failed: {e}"),
+                                                            },
+                                                        }
+                                                    }
+                                                }
                                                 // `setInputConnectionNative`: on real
                                                 // Android this is Java calling native
                                                 // code from inside

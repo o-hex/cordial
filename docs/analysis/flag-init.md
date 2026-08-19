@@ -2620,3 +2620,57 @@ and succeeding, and the flags chain working. So the precondition mocktail
 satisfies is necessary-looking but has not proved sufficient here. What is
 different now is that the instrument is honest: `statvfs` is traced, so the next
 person can see what storage asks for instead of inferring from an absence.
+
+### §23.6 `RbxStorage::init` is entered and declines. It was never "not asked for"
+
+Found by scanning the current binary for references to the
+`RbxStorage::init [INIT] user: {}, availableDiskSpace: {} …` format string and
+then confirming live under `lldb`.
+
+**The addresses in §3, §9 and §10 are stale.** The build moved:
+`gameActivity_onFlagsFailed` is at `0x41e987` here, not `0x40f096`. The scan
+technique still works; the numbers do not.
+
+`RbxStorage::init` is `0x230bd3a`, and it is a lazy singleton getter with **63
+direct call sites**, each preceded by a `lea` loading its own label string —
+`AssetProvider`, `SessionTracking`, `CaptureStorage`, `ClientStorageInterface`,
+`LocalRuntimeContentStorage`, `ClientReplicator-init`, `CrashMetric`, `DeviceGL`,
+the `http-*` family, `shutdown`, `flagLoaded`, and fifty more. The `user:` field
+in the log line is that label. So `flagLoaded` is not *the* trigger, it is
+whichever of sixty-three callers happened to get there first on Android.
+
+**Live, with `0xCC` planted at `0x230bd3a` per §10's technique:** it fires. Two
+independent runs, `rdi` pointing at `"AssetProvider"`, one of them with three
+threads hitting concurrently. And the log-emit branch deeper in the same function
+was hit **zero** times in every run.
+
+So storage is entered and returns early. Both previous statements that it was
+never attempted were wrong, and they were wrong on two independent pieces of
+evidence: §23.2's path trace (retracted in §23.5 for being blind to `statvfs`)
+and §22.3's channel sweep. Two lines of evidence agreeing did not make them
+right; they were both measuring the same downstream absence.
+
+Two further facts:
+
+* The `flagLoaded` wrapper at `0x230bcc2` has **zero** direct callers in `.text`
+  and no raw-pointer reference in `.data`/`.data.rel.ro`, so it is reached only
+  by indirect dispatch — the same honest edge §3 and render-gate.md §2 hit — and
+  across ~85 s of live breakpoint coverage it was **never hit**. The specific
+  call Sober's log shows completing is one this build never issues in Cordial.
+* `AssetProvider` fires at **startup** in Cordial. §11 lists it as join-time and
+  expected absent from a startup-only run on Sober. Another instance of the
+  ordering scramble §11 already names.
+
+A methodological note kept deliberately: the first probe caused a `SIGSEGV` that
+looked like an engine crash. It restored a shared `0xCC` and single-stepped only
+the selected thread, leaving two others mid-prologue with `push rbp` unexecuted.
+The corrected probe hit the same three-thread pattern cleanly and ran to
+teardown. **The crash was the instrument.** This document already carries
+findings that turned out to be the measuring apparatus; that one was caught
+before it became one.
+
+**What is not established:** which of the early-return branches `AssetProvider`
+takes, and what writes the condition it tests. That is the next step and it is a
+dynamic one — a breakpoint on each branch target, then a hardware watchpoint on
+whatever byte the condition reads. Hardware watchpoints do not need the module
+registered with the debugger, so unlike breakpoints they work here directly.

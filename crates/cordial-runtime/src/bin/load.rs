@@ -657,6 +657,67 @@ fn engine_version(lib_dir: &str) -> Option<String> {
     found
 }
 
+// `native/local_storage.cpp`'s two exported callers. Declared directly here
+// rather than through `cordial_linker_sys::game_activity` -- that module is
+// the usual home for a wrapper like this, and it was off limits to the task
+// that added these two, on the reasoning that a crate several agents rely on
+// as a stable interface should not gain new surface mid-session. The symbols
+// still link in exactly the same way: `native/CMakeLists.txt` compiles
+// `local_storage.cpp` into the same `libcordial_jni_shim.a`
+// `cordial-linker-sys`'s `build.rs` already tells `cordial-run` to link, so a
+// bare `extern "C"` here resolves at the same final link step every other
+// wrapper in that crate does.
+extern "C" {
+    fn cordial_local_storage_set_platform_impl(
+        f: *mut std::ffi::c_void,
+        err: *mut std::os::raw::c_char,
+        err_len: usize,
+    ) -> std::os::raw::c_int;
+    fn cordial_update_screen_orientation(
+        f: *mut std::ffi::c_void,
+        width: std::os::raw::c_int,
+        height: std::os::raw::c_int,
+        err: *mut std::os::raw::c_char,
+        err_len: usize,
+    ) -> std::os::raw::c_int;
+}
+
+fn take_c_err(err: Vec<u8>) -> String {
+    let end = err.iter().position(|&b| b == 0).unwrap_or(err.len());
+    String::from_utf8_lossy(&err[..end]).into_owned()
+}
+
+/// `ILocalStorageHandlerCore.setPlatformImpl(IPlatformLocalStorageHandler)`.
+/// See `native/local_storage.cpp` for what the object handed over answers and
+/// why the call is believed to be static.
+fn local_storage_set_platform_impl(f: *mut std::ffi::c_void) -> Result<(), String> {
+    let mut err = vec![0u8; 512];
+    // SAFETY: `f` is the exported JNI native the caller resolved by name;
+    // `err` is a live buffer for the duration of this call.
+    let rc = unsafe {
+        cordial_local_storage_set_platform_impl(f, err.as_mut_ptr() as *mut std::os::raw::c_char, err.len())
+    };
+    if rc == 0 { Ok(()) } else { Err(take_c_err(err)) }
+}
+
+/// `NativeInputInterface.nativeUpdateScreenOrientation(I)V` -- the one call
+/// `docs/analysis/flag-init.md` §16 found mocktail makes between
+/// `initializeNativeCode` and the settings handshake that Cordial did not.
+fn update_screen_orientation(f: *mut std::ffi::c_void, width: i32, height: i32) -> Result<(), String> {
+    let mut err = vec![0u8; 512];
+    // SAFETY: as above.
+    let rc = unsafe {
+        cordial_update_screen_orientation(
+            f,
+            width,
+            height,
+            err.as_mut_ptr() as *mut std::os::raw::c_char,
+            err.len(),
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(take_c_err(err)) }
+}
+
 fn main() -> ExitCode {
     let mut opt = match parse() {
         Ok(o) => o,
@@ -1513,6 +1574,96 @@ fn main() -> ExitCode {
                                                 },
                                             }
                                         }
+
+                                        // `ILocalStorageHandlerCore.setPlatformImpl`.
+                                        // **Measured to crash, and left off by
+                                        // default because of it.** The call
+                                        // itself returns cleanly -- "setPlatformImpl
+                                        // ok" prints -- but the engine's own
+                                        // djinni glue starts throwing
+                                        // `[JNIVM] Exception ... djinni
+                                        // (djinni_support.cpp:529): weakRef`
+                                        // immediately afterwards, a dozen
+                                        // times in one run, and the process
+                                        // goes on to SIGSEGV inside libc's
+                                        // `_IO_fflush` a few calls later --
+                                        // the same crash SIGNATURE
+                                        // docs/analysis/flag-init.md §7.4/§15
+                                        // records for a different native, a
+                                        // fault at address 0x8, which reads as
+                                        // heap corruption rather than a clean
+                                        // null-check failure. A control run
+                                        // with this call skipped and every
+                                        // other change in this commit intact
+                                        // reached `app ready: Landing` and
+                                        // exited 0; the identical run with
+                                        // only this call re-enabled crashed
+                                        // under `lldb` inside `nativeRetryInit`,
+                                        // which this call precedes but does
+                                        // not touch. That is exactly the
+                                        // asymmetry mocktail's own
+                                        // `MOCKTAIL_LOCAL_STORAGE_SET_PLATFORM_IMPL`
+                                        // defaulting *off* already warned
+                                        // about (see `native/local_storage.cpp`'s
+                                        // header) -- confirmed here rather
+                                        // than taken on trust.
+                                        //
+                                        // `IPlatformLocalStorageHandler` and
+                                        // `ILocalStorageHandlerCore` are
+                                        // djinni-generated (the `$CppProxy`
+                                        // siblings in the dex are the
+                                        // giveaway), and djinni's own runtime
+                                        // wraps a Java-side interface
+                                        // implementation in machinery that
+                                        // needs working weak global
+                                        // references -- `NewWeakGlobalRef`
+                                        // and friends -- which is INFERRED to
+                                        // be what libjnivm does not fully
+                                        // provide, since the exception names
+                                        // `weakRef` specifically and starts
+                                        // firing the moment the engine has
+                                        // the object in hand. Not confirmed
+                                        // by reading djinni_support.cpp,
+                                        // which is engine code this project
+                                        // does not disassemble past what
+                                        // AGENTS.md allows.
+                                        //
+                                        // The C++ side (`PlatformLocalStorageHandler`
+                                        // in `native/local_storage.cpp`) is
+                                        // left in place and registered either
+                                        // way -- registering a class costs
+                                        // nothing until something calls a
+                                        // method on it -- so
+                                        // `CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL=1`
+                                        // is enough to pick the investigation
+                                        // back up without touching code.
+                                        if std::env::var_os(
+                                            "CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL",
+                                        )
+                                        .is_some()
+                                        {
+                                            match lib.symbol(
+                                                "Java_com_roblox_protocols_localstorageplatforminterface_generated_ILocalStorageHandlerCore_setPlatformImpl",
+                                            ) {
+                                                None => println!(
+                                                    "  setPlatformImpl not exported"
+                                                ),
+                                                Some(f) => match local_storage_set_platform_impl(f) {
+                                                    Ok(()) => println!("  setPlatformImpl ok"),
+                                                    Err(e) => {
+                                                        println!("  setPlatformImpl failed: {e}")
+                                                    }
+                                                },
+                                            }
+                                        } else {
+                                            println!(
+                                                "  setPlatformImpl skipped (measured to crash \
+                                                 the process a few calls later; set \
+                                                 CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL=1 to \
+                                                 try it anyway)"
+                                            );
+                                        }
+
                                         if let Some(p) = lib.symbol(
                                             "Java_com_roblox_client_startup_MainGameActivity_nativeAppBridgeSetInitParams",
                                         ) {
@@ -1532,6 +1683,35 @@ fn main() -> ExitCode {
                                                 Ok(()) => println!("  init params set"),
                                                 Err(e) => println!("  init params failed: {e}"),
                                             }
+                                        }
+
+                                        // `NativeInputInterface.nativeUpdateScreenOrientation(I)V`.
+                                        // docs/analysis/flag-init.md §16: the
+                                        // one call mocktail makes between
+                                        // `initializeNativeCode` and the
+                                        // settings handshake that Cordial
+                                        // did not. Cordial already knows the
+                                        // window size and, from it, whether
+                                        // the window is landscape -- the same
+                                        // comparison `Configuration::Create`
+                                        // in init_params.cpp already makes
+                                        // for `getResources().getConfiguration()`,
+                                        // so this tells the engine the same
+                                        // thing through its own dedicated
+                                        // entry point rather than leaving it
+                                        // to infer the answer from a class it
+                                        // may not read this early.
+                                        if let Some(f) = lib.symbol(
+                                            "Java_com_roblox_engine_jni_NativeInputInterface_nativeUpdateScreenOrientation",
+                                        ) {
+                                            match update_screen_orientation(f, width, height) {
+                                                Ok(()) => println!("  screen orientation set"),
+                                                Err(e) => println!(
+                                                    "  nativeUpdateScreenOrientation failed: {e}"
+                                                ),
+                                            }
+                                        } else {
+                                            println!("  nativeUpdateScreenOrientation not exported");
                                         }
 
                                         // Client settings BEFORE the flag
@@ -2489,5 +2669,456 @@ mod gamemode {
             Ok(rc) => println!("[gamemode] UnregisterGame returned {rc}"),
             Err(e) => println!("[gamemode] UnregisterGame failed: {e}"),
         }
+    }
+}
+
+/// The store behind `native/local_storage.cpp`'s `PlatformLocalStorageHandler`
+/// -- `ILocalStorageHandlerCore.setPlatformImpl`'s per-user, per-key secure
+/// values, which is a different thing from `RbxStorage` (the content cache)
+/// and from `LocalStorageManager`'s own `initStorageManagerNativeV3`. See that
+/// file's header for the full account of what the interface is and how it was
+/// confirmed; this module is the half of it the task that added it could not
+/// put in `secrets.rs`.
+///
+/// **Why this is not a third `secrets::Kind`.** `secrets.rs` is this project's
+/// settled answer for where a per-profile secret goes -- the desktop Secret
+/// Service first, an announced `0600` file second, never a reason startup
+/// fails -- and the right move would have been to add a variant and call it.
+/// Two things stopped that. First, the task this module was written under
+/// left `secrets.rs` off limits to edit, on the reasoning that a file several
+/// agents have been relying on as a fixed reference should not move under
+/// them mid-session. Second, and the reason a variant would not have been
+/// enough even without that restriction: `Kind::load`/`save` hold exactly one
+/// document per profile, and what this interface asks for is an arbitrary
+/// number of small values keyed by an account id *and* a name the engine
+/// picks — `getSecureValue`, `setSecureValueForUser`, `deleteUserValues`, all
+/// of them shaped around a key that is not fixed at compile time the way
+/// `"cookies"` and `"identity"` are. So this reuses `secrets::active()` --
+/// the same environment variable, the same keyring-vs-file-vs-none decision,
+/// decided once and shared with the cookie jar and the identity mirror rather
+/// than asked a second time -- and carries its own small read/write/remove
+/// against the same `org.freedesktop.secrets` interface under its own schema,
+/// because that half of `secrets.rs` is `HashMap<String,String>`-shaped for
+/// one document and cannot be reused as-is for many.
+///
+/// **The same restraint on printing.** Nothing below prints a stored value or
+/// a user id at any verbosity, matching `secrets.rs`'s own header and
+/// AGENTS.md's rule that this project's stubs answer honestly rather than
+/// pretending. Key *names* are printed, the same way `secrets.rs` prints
+/// `"cookies"`/`"identity"` -- they identify which field failed, not whose
+/// account or what the field held.
+///
+/// **Why a fresh connection per call rather than `secrets.rs`'s worker
+/// thread.** That thread exists because `secrets.rs` is called on a flush
+/// cadence and a stuck keyring daemon must not freeze whichever thread asks
+/// next. Local storage's calls are a handful of account-scoped values, not a
+/// periodic save, so the simpler shape here — connect, ask, time out, drop
+/// the connection — is enough: a wedged daemon leaks one thread for the one
+/// call that hit it rather than jamming every later call behind a single
+/// stuck worker the way a shared thread would.
+mod local_storage_secrets {
+    use std::collections::HashMap;
+    use std::ffi::CStr;
+    use std::io::Write as _;
+    use std::os::raw::{c_char, c_int, c_longlong};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use cordial_runtime::secrets::{self, Store};
+    use zbus::blocking::{Connection, Proxy};
+    use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+
+    const SERVICE: &str = "org.freedesktop.secrets";
+    const SERVICE_PATH: &str = "/org/freedesktop/secrets";
+    const IFACE_SERVICE: &str = "org.freedesktop.Secret.Service";
+    const IFACE_ITEM: &str = "org.freedesktop.Secret.Item";
+    /// A schema of its own, distinct from `secrets.rs`'s `org.cordial.Session`
+    /// -- so `secret-tool`/Seahorse show the two families separately, and so a
+    /// search for one can never turn up an item that belongs to the other.
+    const SCHEMA: &str = "org.cordial.LocalStorageSecureValue";
+    const CONTENT_TYPE: &str = "text/plain; charset=utf8";
+    const CALL_TIMEOUT: Duration = Duration::from_secs(3);
+    const FILE_NAME: &str = "local-storage-secrets.json";
+
+    fn profile_dir() -> PathBuf {
+        cordial_runtime::profile::active()
+    }
+
+    /// Keyed by profile path (never by name — see `secrets.rs`'s own
+    /// `attributes()` for why two profiles both called `default` must not
+    /// share an item) plus the account id and, for a single value, the name
+    /// the engine gave it. Omitting `key` widens a search to every value held
+    /// for that account, which `delete_user` below relies on.
+    fn attrs(user_id: i64, key: Option<&str>) -> HashMap<String, String> {
+        let mut m = HashMap::from([
+            ("xdg:schema".to_string(), SCHEMA.to_string()),
+            ("application".to_string(), "cordial".to_string()),
+            ("profile".to_string(), profile_dir().display().to_string()),
+            ("user".to_string(), user_id.to_string()),
+        ]);
+        if let Some(k) = key {
+            m.insert("key".to_string(), k.to_string());
+        }
+        m
+    }
+
+    fn with_timeout<T: Send + 'static>(
+        f: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<T, String>>(1);
+        if std::thread::Builder::new()
+            .name("cordial-ls-secret".to_string())
+            .spawn(move || {
+                let _ = tx.send(f());
+            })
+            .is_err()
+        {
+            return Err("could not start a worker thread".to_string());
+        }
+        rx.recv_timeout(CALL_TIMEOUT).unwrap_or_else(|_| {
+            Err(format!(
+                "the secret service did not answer within {} seconds",
+                CALL_TIMEOUT.as_secs()
+            ))
+        })
+    }
+
+    fn session() -> Result<(Connection, Proxy<'static>, OwnedObjectPath, OwnedObjectPath), String> {
+        let conn = Connection::session().map_err(|_| "there is no session bus".to_string())?;
+        let service = Proxy::new_owned(conn.clone(), SERVICE, SERVICE_PATH, IFACE_SERVICE)
+            .map_err(|e| format!("the secret service could not be addressed ({e})"))?;
+        let (_output, open_session): (OwnedValue, OwnedObjectPath) = service
+            .call("OpenSession", &("plain", Value::from("")))
+            .map_err(|_| "there is no secret service on the session bus".to_string())?;
+        let collection: OwnedObjectPath = service
+            .call("ReadAlias", &("default",))
+            .map_err(|e| format!("the secret service has no default collection ({e})"))?;
+        if collection.as_str() == "/" {
+            return Err("the secret service has no default collection".to_string());
+        }
+        Ok((conn, service, open_session, collection))
+    }
+
+    fn proxy(conn: &Connection, path: &OwnedObjectPath, iface: &'static str) -> Result<Proxy<'static>, String> {
+        Proxy::new_owned(conn.clone(), SERVICE, path.clone().into_inner(), iface)
+            .map_err(|e| format!("{path} could not be addressed ({e})"))
+    }
+
+    fn keyring_read(request_attrs: HashMap<String, String>) -> Result<Option<String>, String> {
+        with_timeout(move || {
+            let (conn, service, item_session, _collection) = session()?;
+            let (unlocked, _locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = service
+                .call("SearchItems", &(request_attrs,))
+                .map_err(|e| format!("the keyring could not be searched ({e})"))?;
+            let Some(item) = unlocked.into_iter().next() else {
+                return Ok(None);
+            };
+            let (_session, _parameters, value, _content): (
+                OwnedObjectPath,
+                Vec<u8>,
+                Vec<u8>,
+                String,
+            ) = proxy(&conn, &item, IFACE_ITEM)?
+                .call("GetSecret", &(&item_session,))
+                .map_err(|e| format!("the stored value could not be read ({e})"))?;
+            String::from_utf8(value)
+                .map(Some)
+                .map_err(|_| "the stored value is not text".to_string())
+        })
+    }
+
+    fn keyring_write(
+        request_attrs: HashMap<String, String>,
+        label: String,
+        body: String,
+    ) -> Result<(), String> {
+        with_timeout(move || {
+            let (conn, _service, item_session, collection) = session()?;
+            let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
+            properties.insert("org.freedesktop.Secret.Item.Label", Value::from(label.as_str()));
+            properties.insert(
+                "org.freedesktop.Secret.Item.Attributes",
+                Value::from(request_attrs),
+            );
+            let secret = (item_session, Vec::<u8>::new(), body.into_bytes(), CONTENT_TYPE);
+            let (_item, prompt): (OwnedObjectPath, OwnedObjectPath) =
+                proxy(&conn, &collection, "org.freedesktop.Secret.Collection")?
+                    .call("CreateItem", &(properties, secret, true))
+                    .map_err(|e| format!("the value could not be stored ({e})"))?;
+            if prompt.as_str() != "/" {
+                return Err("storing the value would have needed a prompt".to_string());
+            }
+            Ok(())
+        })
+    }
+
+    fn keyring_remove(request_attrs: HashMap<String, String>) -> Result<(), String> {
+        with_timeout(move || {
+            let (conn, service, _item_session, _collection) = session()?;
+            let (unlocked, _locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = service
+                .call("SearchItems", &(request_attrs,))
+                .map_err(|e| format!("the keyring could not be searched ({e})"))?;
+            for item in unlocked {
+                let _prompt: OwnedObjectPath = proxy(&conn, &item, IFACE_ITEM)?
+                    .call("Delete", &())
+                    .map_err(|e| format!("a stored value could not be removed ({e})"))?;
+            }
+            Ok(())
+        })
+    }
+
+    // -----------------------------------------------------------------
+    // The file backend: one JSON document per profile rather than one file
+    // per value, for the same reason `secrets.rs`'s file store is one
+    // document rather than one file per cookie — a directory full of
+    // ad-hoc-named files in a profile is a worse audit surface than one
+    // named store, and `write_file` below is the same temp-then-rename
+    // shape `secrets.rs`'s `write_private` uses, for the same reason: a
+    // reader must see the old body or the new one, never half of either.
+    // -----------------------------------------------------------------
+
+    type FileMap = HashMap<String, HashMap<String, String>>;
+
+    fn file_path() -> PathBuf {
+        profile_dir().join(FILE_NAME)
+    }
+
+    fn file_load() -> FileMap {
+        std::fs::read_to_string(file_path())
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn file_save(map: &FileMap) -> std::io::Result<()> {
+        let final_path = file_path();
+        let tmp = profile_dir().join(format!("{FILE_NAME}.new"));
+        let body = serde_json::to_string(map).map_err(std::io::Error::other)?;
+
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &final_path)
+    }
+
+    // -----------------------------------------------------------------
+    // The three operations, dispatched on the same `Store` cookies and
+    // identity already settled on this launch.
+    // -----------------------------------------------------------------
+
+    fn get(user_id: i64, key: &str) -> Option<String> {
+        match secrets::active() {
+            Store::None => None,
+            Store::File => file_load().get(&user_id.to_string()).and_then(|m| m.get(key)).cloned(),
+            Store::Keyring => match keyring_read(attrs(user_id, Some(key))) {
+                Ok(v) => v,
+                Err(why) => {
+                    println!("  [local-storage] {key}: not read back ({why})");
+                    None
+                }
+            },
+        }
+    }
+
+    fn set(user_id: i64, key: &str, value: &str) -> bool {
+        match secrets::active() {
+            // Matches secrets.rs's own `Store::None` save: accepted and
+            // discarded rather than refused, so a user who opted out of
+            // storage entirely is not additionally punished with a JNI
+            // `false` the engine has no way to explain to anyone.
+            Store::None => true,
+            Store::File => {
+                let mut map = file_load();
+                map.entry(user_id.to_string())
+                    .or_default()
+                    .insert(key.to_string(), value.to_string());
+                match file_save(&map) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        println!("  [local-storage] {key}: not saved ({e})");
+                        false
+                    }
+                }
+            }
+            Store::Keyring => {
+                let label = format!(
+                    "Cordial: Roblox local storage ({key}) for profile {:?}",
+                    profile_dir().file_name().map(|n| n.to_string_lossy().into_owned())
+                );
+                match keyring_write(attrs(user_id, Some(key)), label, value.to_string()) {
+                    Ok(()) => true,
+                    Err(why) => {
+                        println!("  [local-storage] {key}: not saved ({why})");
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    fn delete(user_id: i64, key: &str) -> bool {
+        match secrets::active() {
+            Store::None => true,
+            Store::File => {
+                let mut map = file_load();
+                if let Some(m) = map.get_mut(&user_id.to_string()) {
+                    m.remove(key);
+                }
+                match file_save(&map) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        println!("  [local-storage] {key}: not removed ({e})");
+                        false
+                    }
+                }
+            }
+            Store::Keyring => match keyring_remove(attrs(user_id, Some(key))) {
+                Ok(()) => true,
+                Err(why) => {
+                    println!("  [local-storage] {key}: not removed ({why})");
+                    false
+                }
+            },
+        }
+    }
+
+    fn delete_user(user_id: i64) -> bool {
+        match secrets::active() {
+            Store::None => true,
+            Store::File => {
+                let mut map = file_load();
+                map.remove(&user_id.to_string());
+                match file_save(&map) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        println!("  [local-storage] account values: not removed ({e})");
+                        false
+                    }
+                }
+            }
+            // No "key" attribute: every item this profile holds for the
+            // account, not one value of it.
+            Store::Keyring => match keyring_remove(attrs(user_id, None)) {
+                Ok(()) => true,
+                Err(why) => {
+                    println!("  [local-storage] account values: not removed ({why})");
+                    false
+                }
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The C boundary. `native/local_storage.cpp` declares these four
+    // directly against these symbol names — see that file's header for why
+    // there is no generated binding for them.
+    // -----------------------------------------------------------------
+
+    unsafe fn borrow_str<'a>(p: *const c_char) -> Option<&'a str> {
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: the caller (native/local_storage.cpp) passes a
+        // NUL-terminated buffer it owns for the duration of this call.
+        unsafe { CStr::from_ptr(p) }.to_str().ok()
+    }
+
+    /// Returns `0` on an ordinary call, whether or not anything was found;
+    /// `*found` and `*out_len` carry the actual answer. `-1` means the call
+    /// itself could not be made (a bad key, a null buffer) rather than
+    /// anything about whether a value exists.
+    #[no_mangle]
+    pub extern "C" fn cordial_local_storage_get(
+        user_id: c_longlong,
+        key: *const c_char,
+        out: *mut c_char,
+        out_cap: usize,
+        found: *mut c_int,
+        out_len: *mut usize,
+    ) -> c_int {
+        // SAFETY: `key` is a NUL-terminated C string owned by the caller for
+        // the duration of this call; `out`/`found`/`out_len` are live
+        // buffers the caller sized and will read back afterwards.
+        let Some(key) = (unsafe { borrow_str(key) }) else {
+            return -1;
+        };
+        if out.is_null() || found.is_null() || out_len.is_null() {
+            return -1;
+        }
+        let value = get(user_id as i64, key);
+        // SAFETY: pointers were just checked non-null; `out` has `out_cap`
+        // bytes per the caller's own contract in local_storage.cpp.
+        unsafe {
+            match value {
+                None => {
+                    *found = 0;
+                    *out_len = 0;
+                }
+                Some(v) => {
+                    let bytes = v.as_bytes();
+                    // `>=` rather than `>`: a byte of the cap is reserved for
+                    // the NUL the C++ side reads the string through.
+                    if bytes.len() >= out_cap {
+                        println!(
+                            "  [local-storage] {key}: {} bytes does not fit the platform \
+                             buffer; treated as absent rather than truncated",
+                            bytes.len()
+                        );
+                        *found = 0;
+                        *out_len = bytes.len();
+                    } else {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
+                        *out.add(bytes.len()) = 0;
+                        *found = 1;
+                        *out_len = bytes.len();
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    #[no_mangle]
+    pub extern "C" fn cordial_local_storage_set(
+        user_id: c_longlong,
+        key: *const c_char,
+        value: *const c_char,
+        value_len: usize,
+    ) -> c_int {
+        // SAFETY: as above; `value` points to `value_len` bytes the caller
+        // owns for the duration of this call.
+        let Some(key) = (unsafe { borrow_str(key) }) else {
+            return -1;
+        };
+        if value.is_null() {
+            return -1;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(value as *const u8, value_len) };
+        let Ok(value) = std::str::from_utf8(bytes) else {
+            println!("  [local-storage] {key}: value is not UTF-8; refused rather than stored");
+            return -1;
+        };
+        if set(user_id as i64, key, value) { 0 } else { -1 }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn cordial_local_storage_delete(user_id: c_longlong, key: *const c_char) -> c_int {
+        let Some(key) = (unsafe { borrow_str(key) }) else {
+            return -1;
+        };
+        if delete(user_id as i64, key) { 0 } else { -1 }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn cordial_local_storage_delete_user(user_id: c_longlong) -> c_int {
+        if delete_user(user_id as i64) { 0 } else { -1 }
     }
 }

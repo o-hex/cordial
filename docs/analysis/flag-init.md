@@ -1713,3 +1713,35 @@ returns `EAI_BADFLAGS` and fails every lookup. mocktail's `HostHints()` copies
 `ai_flags` **unmodified** — the same latent bug, not yet triggered by whatever
 its callers pass. Cordial is right here and mocktail is not; nobody should
 simplify that file to match theirs.
+
+### §18.1 The same crash, now from a third unrelated call
+
+§18 proposed that `__sF`'s zeroed `FILE` array explains §7.4's `SIGSEGV` at
+fault address `0x8` inside `libc.so.6` `_IO_fflush`, and called it a signature
+match rather than a demonstration.
+
+Wiring `ILocalStorageHandlerCore.setPlatformImpl` produced **the same crash
+again** — same function, same fault address — from a call that has nothing to do
+with client settings. Controlled both ways on this machine:
+
+    gate off  exit 0    reaches app ready: Landing
+    gate on   exit 139  SIGSEGV
+
+That is three independent paths now: `nativePostClientSettingsLoadedInitialization3`
+(§7.4), `CORDIAL_LATE_SETTINGS` (§11.8), and `setPlatformImpl`. Three unrelated
+natives cannot share a fault address by coincidence, and the `__sF` gap predicts
+exactly this shape for any engine path that touches a legacy stream.
+
+**It is still not demonstrated.** The demonstration is closing the gap and
+watching all three stop, and nobody has done that. But §18's order of work now
+has three reproducers to test against instead of one, and the cheapest of them is
+a one-variable environment flip rather than a join.
+
+One thing seen alongside and *not* explained: with the gate on, the engine's own
+djinni glue throws `djinni_support.cpp:529: weakRef` a dozen times before the
+segfault. `IPlatformLocalStorageHandler` is djinni-generated — the `$CppProxy`
+siblings give it away — so djinni plausibly wants working weak global references
+that libjnivm does not provide. **`INFERRED` from the exception name and timing.**
+Confirming it would mean reading the engine's own implementation, which is the
+line AGENTS.md draws, so it stays inferred. Whether the weak refs and the
+`_IO_fflush` fault are one problem or two is open.

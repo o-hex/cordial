@@ -1168,6 +1168,16 @@ namespace cordial {
 void register_clipboard_classes(jnivm::ENV* env);
 }
 
+// Defined in local_storage.cpp. Separate for the same reason as the three
+// above, and specifically because that file's header has to carry the
+// distinction between `RbxStorage` (the content cache, unrelated) and
+// `ILocalStorageHandlerCore`/`IPlatformLocalStorageHandler` (this), which
+// `docs/analysis/flag-init.md` §12 spent a session establishing and which
+// belongs next to the code it explains rather than buried here.
+namespace cordial {
+void register_local_storage_classes(jnivm::ENV* env);
+}
+
 // -------------------------------------------------------- the identity, in and out
 //
 // Cordial's own boundary, not Roblox's: `crates/cordial-runtime/src/identity.rs`
@@ -1564,6 +1574,7 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
     cordial::register_audio_classes(env);
     cordial::register_clipboard_classes(env);
     cordial::register_shared_preferences(env);
+    cordial::register_local_storage_classes(env);
     if (getenv("CORDIAL_JNI_TRACE")) {
         fprintf(stderr, "[classes] Cordial's Java side registered\n");
     }

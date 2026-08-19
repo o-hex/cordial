@@ -4007,3 +4007,56 @@ instructions.
 engine *data* at a known point, which is a different instrument from anything
 built here, and it is the honest next step rather than a twenty-sixth candidate
 drawn from an exhausted surface.
+
+## §36. Storage has worked. Under Cordial. And it logged nothing
+
+`/var/home/neilluo/.cache/cordial-agent-t/cordial/profiles/default/data/files/appData/`
+contains, right now:
+
+    rbx-storage.db        49152 bytes, a real SQLite database
+    rbx-storage.db-wal
+    rbx-storage/          p14  p15  p16  p19  p20  p30  p36  p5
+
+Eight partition directories. Sober's working store has the same structure
+(`p14 p15 p16 p19`). **These are engine-created**: the directory pre-creation
+added in §23.5 makes a single empty `rbx-storage/` and nothing inside it.
+
+Created at 17:45:25 on 19 August, which pins it to one run — the engine log
+`2.734.0.917_20260819T074525Z_Player_ec3a3_last.log`, from the
+`CORDIAL_LATE_POST_MS=2000 CORDIAL_LATE_RETRY=1 --run 35` repeats.
+
+**That log contains zero `RbxStorage` lines.**
+
+### What this retracts, which is most of this document's evidence base
+
+Storage initialised — built a database, built eight partitions — and did not emit
+one line on `DFLog::RbxStorage`. So every conclusion of the form "storage never
+runs, because no `RbxStorage::init` line appears" was reasoning from an absence
+on a channel that is silent **even when storage succeeds**.
+
+That includes the framing of §§12–24 and the confident negatives in §29–§35. The
+*mechanical* findings survive — the empty `stat("")` triple is real and observed,
+the timing in §28 is measured, the eliminations of `getenv`, system properties,
+self-path and `AssetManager` are real measurements of real channels. What does
+not survive is the conclusion those were pointed at. **The right instrument for
+storage was always the filesystem, and it was used twice: §23.4 found these files
+and could not reproduce them, and this section identifies the run.**
+
+Ninth instrument fault, and by far the most expensive. Eight of the nine have
+been an absence read as evidence.
+
+### What is now actually open, and it is tractable
+
+Storage is not unreachable. It has been reached, by this client, on this machine.
+`rbx-storage.id` is 8 random bytes — an engine-generated identifier, an output
+rather than an input, so not a lead.
+
+The run that worked differed from the fresh-root controls in §23.4 in two ways
+that were never separated: a 2000 ms late-post delay rather than the default 250,
+and a data root with substantial accumulated state — a flag cache, a tombstone,
+and 43 `ContentProvider_*` directories from earlier sessions. The three-launch
+warm-root test in §23.1 used the default delay, so **delay and warmth have never
+been varied against each other.**
+
+That is a two-by-two matrix, four runs, checked on the filesystem and not on the
+log. It should be the next thing anybody does, and it should have been the first.

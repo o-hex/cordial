@@ -487,6 +487,7 @@ pub fn pass_key_event(down: bool, evdev_code: i32, modifiers: i32) {
     if no_pass_key() {
         return;
     }
+    track_key_held(down, evdev_code);
     let key_code = evdev_code;
     let f = PASS_KEY_EVENT.load(std::sync::atomic::Ordering::Relaxed);
     if f.is_null() {
@@ -497,6 +498,79 @@ pub fn pass_key_event(down: bool, evdev_code: i32, modifiers: i32) {
     super::trace(format_args!(
         "nativePassKeyEvent(down={down}, keyCode={key_code}, modifiers={modifiers:#x}) -> {r:?}"
     ));
+}
+
+/// Which evdev codes are currently held, tracked here rather than in
+/// `window.rs`/`wayland.rs` because both backends already funnel every key
+/// transition through this one function. A `Vec` rather than a `HashSet`: the
+/// realistic size is single digits (nobody holds more than a few keys at
+/// once), so a linear scan is cheaper than hashing and `Vec::new()` is a
+/// `const fn`, which a `HashSet` field on a static would complicate for no
+/// measured benefit.
+///
+/// This exists for [`idle_keepalive`] — see that function for what it is
+/// tracking held keys *for*.
+static KEYS_HELD: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+fn track_key_held(down: bool, evdev_code: i32) {
+    let mut held = KEYS_HELD.lock().unwrap_or_else(|e| e.into_inner());
+    if down {
+        if !held.contains(&evdev_code) {
+            held.push(evdev_code);
+        }
+    } else {
+        held.retain(|&c| c != evdev_code);
+    }
+}
+
+/// Send a zero-delta `nativePassMouseMove` while a key is held, so the engine's
+/// own idle throttle does not mistake "walking in a straight line without
+/// touching the mouse" for nobody playing.
+///
+/// **What this is answering.** `docs/NEXT.md` §1d established that presents
+/// collapse from ~60/s to exactly 1.0/s about thirteen seconds into an idle
+/// app shell, and that driving `pass_mouse_move` continuously holds it at
+/// 50-60/s indefinitely — but that measurement drove mouse movement, camera
+/// look and held keys all together, so it could not say which one the engine
+/// was actually watching. Measured in isolation (`CORDIAL_SCRIPT=key-on`,
+/// `touch-on`, `look-on`, `ping-on` against a real `libroblox.so`, landing
+/// page, no account): a single held key produces exactly one down event under
+/// Wayland (`keyboard_repeat_info` in `wayland.rs` is a documented no-op, and
+/// nothing here reintroduces repeat), and that one event does not stop the
+/// collapse — it lands at the same ~15s mark as no input at all, twice.
+/// Redriving `deliver_key`/`pass_key_event` on every tick, simulating what a
+/// repeat timer would send, does not stop it either. Redriving
+/// `deliver_touch`'s AGDK touch queue every tick does not stop it. Only
+/// `pass_mouse_move` — `NativeInputInterface.nativePassMouseMove`, the "V2"
+/// interface call, not AGDK's `onTouchEventNative` — keeps it away, and it
+/// does so with the delta held at exactly zero: a fixed position resent every
+/// tick holds presents at a flat 60.0/s for the whole run, no less reliably
+/// than a moving one, and collapses within about a second of stopping. So the
+/// engine is watching this one call landing, not the camera actually turning.
+///
+/// **Why a real position matters.** The dex declares this native as an
+/// absolute position plus a delta, and `MOUSE_LAST` is the last position a
+/// genuine pointer event reported — reusing it, with a (0, 0) delta, tells the
+/// engine truthfully where the pointer already is and that it has not moved,
+/// which is honest in both halves. Inventing a position (window centre, say)
+/// would tell the engine the pointer jumped there, and Roblox's UI does hit
+/// testing against the reported absolute position — a jump risks nudging
+/// whatever the real cursor happens to be hovering. If no genuine pointer
+/// event has ever landed there is nothing honest to resend, so this does
+/// nothing rather than guess.
+///
+/// Called from [`super::looper::pump`] every tick a key is held; harmless to
+/// call when the interface native is not registered yet, since
+/// [`pass_mouse_move_delta`] already falls through to
+/// [`report_unregistered`]'s deduplicated logging rather than spamming.
+pub fn idle_keepalive() {
+    let any_held = !KEYS_HELD.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+    if !any_held {
+        return;
+    }
+    if let Some((x, y)) = *MOUSE_LAST.lock().unwrap_or_else(|e| e.into_inner()) {
+        pass_mouse_move_delta(x, y, 0.0, 0.0);
+    }
 }
 
 pub fn pass_text(which: i64, text: &str, cursor: i32) {

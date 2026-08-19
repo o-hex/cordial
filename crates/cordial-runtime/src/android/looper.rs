@@ -285,6 +285,25 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
         .collect();
     script.reverse();
     let mut motion = false;
+    // `touch-on`/`touch-off` and `look-on`/`look-off` isolate the two halves
+    // `motion-on` drives together, to find which one the idle throttle
+    // actually watches: `deliver_touch`'s AGDK `onTouchEventNative` queue, or
+    // `pass_mouse_move`'s `NativeInputInterface.nativePassMouseMove`. Separate
+    // from `motion` rather than replacing it, so `motion-on` still means what
+    // every existing `CORDIAL_SCRIPT` in this codebase's history already
+    // assumes it means.
+    let mut motion_touch = false;
+    let mut motion_look = false;
+    let mut motion_ping = false;
+    // Set on `key-on`/`keyrepeat-on`, cleared on the matching `-off` — the
+    // down-time of the held key, so the `-off` arm can report the same
+    // `down_time_ms` the down event carried rather than inventing one.
+    let mut key_down_ms: Option<i64> = None;
+    // Whether `keyrepeat-on` is active — see the arm's own comment. Separate
+    // from `key_down_ms` because `key-on` needs the down-time held across
+    // ticks without resending anything, and this flag is what tells the
+    // per-tick block below to resend.
+    let mut keyrepeat = false;
 
     // Subscribe to the engine's `setClipboardText` before the first tick.
     //
@@ -312,6 +331,71 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                     "windowed" => super::backend_set_fullscreen(false),
                     "motion-on" => motion = true,
                     "motion-off" => motion = false,
+                    "touch-on" => motion_touch = true,
+                    "touch-off" => motion_touch = false,
+                    "look-on" => motion_look = true,
+                    "look-off" => motion_look = false,
+                    // `ping-on`/`ping-off` — `pass_mouse_move` driven every
+                    // tick at a FIXED position, so after the first call every
+                    // delta is (0, 0). Answers whether the idle throttle needs
+                    // to see the camera actually move, or just needs the
+                    // interface call to keep landing — the difference between
+                    // a fix that is invisible (a zero-delta heartbeat while a
+                    // key is held) and one that is not (synthesising a real
+                    // camera nudge).
+                    "ping-on" => motion_ping = true,
+                    "ping-off" => motion_ping = false,
+                    // `key-on`/`key-off` — a single down/up transition each,
+                    // matching a held movement key exactly as Wayland delivers
+                    // one today: `keyboard_repeat_info` in `wayland.rs` is a
+                    // documented no-op, so a key held between the two script
+                    // lines produces exactly one `deliver_key`/`pass_key_event`
+                    // call on the way down and one on the way up, with nothing
+                    // in between — unlike `motion`, which redrives every tick.
+                    // This exists to answer one question `motion` cannot: does
+                    // the engine's idle throttle need a live *stream* of input
+                    // events, or is it satisfied once and stays satisfied while
+                    // a key is simply held down? A W/evdev-17/AKEYCODE-51 key
+                    // is used because it is the key `window.rs`/`wayland.rs`
+                    // both already map for "walk forward", so this is the
+                    // shape a real held-W matches, not a synthetic one.
+                    "key-on" => {
+                        if let Some(handle) = game_activity_handle {
+                            let ms = (t * 1000.0) as i64;
+                            super::input::deliver_key(handle, true, 51, 17, 0, 0, 'w' as i32, ms, ms);
+                            super::input::pass_key_event(true, 17, 0);
+                            key_down_ms = Some(ms);
+                        }
+                    }
+                    "key-off" => {
+                        if let Some(handle) = game_activity_handle {
+                            let ms = (t * 1000.0) as i64;
+                            let down_ms = key_down_ms.take().unwrap_or(ms);
+                            super::input::deliver_key(handle, false, 51, 17, 0, 0, 'w' as i32, ms, down_ms);
+                            super::input::pass_key_event(false, 17, 0);
+                        }
+                    }
+                    // `keyrepeat-on`/`keyrepeat-off` — throwaway probe, not a
+                    // real repeat implementation: while active this resends a
+                    // down event on every pump tick (`repeat_count` rising the
+                    // way `wl_keyboard`'s own `repeat_info` rate would drive
+                    // one), to answer one question before writing real repeat
+                    // handling — does *any* live key signal keep the throttle
+                    // off, or is the detector specifically watching pointer
+                    // events? See `key-on` above for the held-once case this
+                    // is contrasted against.
+                    "keyrepeat-on" => {
+                        key_down_ms = Some((t * 1000.0) as i64);
+                        keyrepeat = true;
+                    }
+                    "keyrepeat-off" => {
+                        keyrepeat = false;
+                        if let (Some(handle), Some(down_ms)) = (game_activity_handle, key_down_ms.take()) {
+                            let ms = (t * 1000.0) as i64;
+                            super::input::deliver_key(handle, false, 51, 17, 0, 0, 'w' as i32, ms, down_ms);
+                            super::input::pass_key_event(false, 17, 0);
+                        }
+                    }
                     // The close button, without a button. This is how the
                     // close-to-exit path is tested: `close` at t=10 should end
                     // the process at t=10 whatever `--run` says, and with
@@ -392,6 +476,51 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                     super::input::pass_mouse_move(x, y);
                 }
             }
+            if motion_touch {
+                if let Some(handle) = game_activity_handle {
+                    let (x, y) = (640.0 + 100.0 * (t as f32).sin(), 360.0 + 100.0 * (t as f32).cos());
+                    let ms = (t * 1000.0) as i64;
+                    super::input::deliver_touch(
+                        handle,
+                        super::input::ACTION_HOVER_MOVE,
+                        x,
+                        y,
+                        0,
+                        0,
+                        ms,
+                        0,
+                    );
+                }
+            }
+            if motion_look {
+                if game_activity_handle.is_some() {
+                    let (x, y) = (640.0 + 100.0 * (t as f32).sin(), 360.0 + 100.0 * (t as f32).cos());
+                    super::input::pass_mouse_move(x, y);
+                }
+            }
+            if motion_ping {
+                // Fixed position -- see `ping-on`'s own comment. Deliberately
+                // not `pass_mouse_move_delta(x, y, 0.0, 0.0)`, which would ALSO
+                // move `MOUSE_LAST`'s idea of where the pointer sits away from
+                // wherever the real pointer last was, and desync the very next
+                // real move's delta. Calling `pass_mouse_move` with the same
+                // position keeps `MOUSE_LAST` honestly at that position too.
+                if game_activity_handle.is_some() {
+                    super::input::pass_mouse_move(640.0, 360.0);
+                }
+            }
+            if keyrepeat {
+                // A down event on every tick, `repeat_count` rising with it —
+                // the shape `wl_keyboard.repeat_info`'s rate would produce, not
+                // one this file claims is the real cadence. See
+                // `keyrepeat-on`'s own comment for what this is testing.
+                if let (Some(handle), Some(down_ms)) = (game_activity_handle, key_down_ms) {
+                    let ms = (t * 1000.0) as i64;
+                    let repeat = ((ms - down_ms) / 33).max(0) as i32;
+                    super::input::deliver_key(handle, true, 51, 17, 0, repeat, 'w' as i32, ms, down_ms);
+                    super::input::pass_key_event(true, 17, 0);
+                }
+            }
         }
         if instr && tick.elapsed() >= std::time::Duration::from_secs(1) {
             let dt = tick.elapsed().as_secs_f64();
@@ -412,6 +541,11 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
         }
         if let Some(handle) = game_activity_handle {
             super::pump_input_events(handle);
+            // See `input::idle_keepalive`'s own comment: the engine's idle
+            // throttle answers to `nativePassMouseMove` landing, not to a key
+            // being held, so a player walking without touching the mouse gets
+            // throttled mid-play unless something keeps sending that call.
+            super::input::idle_keepalive();
         }
         looper_poll_once(
             if watching { 50 } else { 8 },

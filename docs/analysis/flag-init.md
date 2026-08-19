@@ -3962,3 +3962,48 @@ engine text, so *something* gets there without rewriting instructions.
 
 That contradiction is the whole remaining question, and it is a real one rather
 than a gap in effort.
+
+### §35.4 Sober's working store sits in `appData`, which Cordial already resolves
+
+Where the working store actually lives, on this machine:
+
+    ~/.var/app/org.vinegarhq.Sober/data/sober/appData/rbx-storage.db      167M
+    ~/.var/app/org.vinegarhq.Sober/data/sober/appData/rbx-storage.db-wal   16M
+    ~/.var/app/org.vinegarhq.Sober/data/sober/appData/rbx-storage.id
+    ~/.var/app/org.vinegarhq.Sober/data/sober/appData/rbx-storage-sc
+    ~/.var/app/org.vinegarhq.Sober/data/sober/appData/rbx-storage/         (dir)
+    ~/.var/app/org.vinegarhq.Sober/cache/sober/rbx-storage/                (cache side)
+
+**The root is `appData`** — the same directory that holds `ClientSettings`,
+`logs` and `LocalStorage`, and the same directory Cordial resolves without
+trouble: it stats `./appData` successfully twice in the failing function, and
+writes its own engine log into the absolute equivalent.
+
+So the empty root storage dies on is **not** `appData` and not the files
+directory. Cordial has both, correctly, and storage still fails — which narrows
+what the empty value can be rather than pointing at it.
+
+`rbx-storage.id` is worth noting for whoever picks this up: a separate identity
+file beside the database. Whether storage needs an identity that is empty here is
+**untested**, and it is written down as an observation rather than proposed as a
+candidate, because the last two candidates proposed at this level of evidence
+both died within the hour.
+
+### Closing position
+
+Storage is entered, on a pool-spawned thread, after `nativeInitClientSettings`
+returns 0. It performs every neighbouring step the working client performs —
+including the Ixp cache open and the tombstone open, both confirmed attempted in
+§35.3. It fails on a root that is empty, and that root is demonstrably neither
+`appData` nor the files directory.
+
+Twenty-five candidates eliminated with controls. Eight instrument faults, three
+of them channel absence. The host-application surface is exhausted, and against
+the conclusion that would follow stands §31: Sober reaches this state with
+byte-identical engine text, so something gets there without rewriting
+instructions.
+
+**That contradiction is the question.** Resolving it means comparing Sober's
+engine *data* at a known point, which is a different instrument from anything
+built here, and it is the honest next step rather than a twenty-sixth candidate
+drawn from an exhausted surface.

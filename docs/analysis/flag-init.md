@@ -1639,3 +1639,77 @@ deliberately stateless with a documented reason each. mocktail populates its Jav
 objects with synthetic hardware descriptions it cannot verify — `mcc`/`mnc` zero,
 `colorMode` zero, `navigation` one, guesses throughout. Keep the minimalism unless
 the experiment above proves a specific field load-bearing.
+
+## §18. `__sF` is unfinished, and the signature matches a crash already on record
+
+A comparison of Cordial's bionic/glibc boundary against mocktail's found three
+real ABI defects. One of them may be a crash this document has been carrying
+since §7.4.
+
+### The three, all verified against the engine's own imports
+
+**`__sF` — the legacy `stdin`/`stdout`/`stderr` array.** `bionic/mod.rs:97`
+supplies a zeroed three-element array and its own comment already says this stops
+a load-time crash and "does not make the legacy streams work". What it does not
+say is what happens next. The engine imports **ten** FILE-taking stdio
+functions — `fflush`, `fwrite`, `fread`, `fclose`, `fprintf`, `fputs`, `fseek`,
+`ftell`, `setvbuf`, `vfprintf` — and every one is unoverridden passthrough to
+host glibc. So a `FILE*` the engine computes as `&__sF[1]` reaches glibc's
+`fwrite` or `fflush` and is dereferenced as a real `FILE` against **zeroed
+memory**. That is not "no output"; it is a fault at a small offset.
+
+**`mallinfo` — a 40-byte struct filled into an 80-byte expectation.** bionic's
+`struct mallinfo` is ten `size_t`; this host's glibc is ten `int`, confirmed by
+compiling `sizeof(struct mallinfo)` here and getting **40**. `mallinfo` is
+imported by the engine and passes straight through, so the callee writes 40 bytes
+of int-strided fields and the caller reads them at 8-byte strides. Every field
+after the first is misaligned, and the upper half is never written at all.
+
+**`__cxa_thread_atexit_impl` — a stub that reports success.** Imported by the
+engine, no override, so it falls to the generated stub and returns 0. Every
+bionic-compiled `thread_local` with a non-trivial destructor is registered
+nowhere and never torn down. This is precisely the shape AGENTS.md singles out
+`__assert2` for: an answer that is not true, and a failure that surfaces
+somewhere unrelated.
+
+### The connection worth testing first
+
+§7.4 records `nativePostClientSettingsLoadedInitialization3` crashing
+**synchronously, under lldb, with `SIGSEGV` at fault address `0x8`, inside
+`libc.so.6` `_IO_fflush`**.
+
+A zeroed `FILE` handed to `_IO_fflush`, faulting on a pointer field a few bytes
+in, produces exactly that. `fflush` is one of the ten the engine imports.
+
+**This is a signature match, not a demonstration.** Nothing here has reproduced
+the crash with the `__sF` gap closed and watched it go away, and that is the only
+thing that would settle it. But it is a specific, mechanical account of a crash
+that has been described as unexplained for weeks, and it costs one experiment.
+
+It matters beyond §7.4 because §17 identified §11.8's `CORDIAL_LATE_SETTINGS`
+crash — Cordial segfaulting while doing what mocktail does successfully — as the
+strongest remaining lead on the flags verdict. **If both crashes are this bug,
+the ordering mocktail uses becomes available to Cordial**, and the thing §17 said
+to investigate becomes the thing to fix.
+
+### Order of work
+
+1. Translate the legacy streams. mocktail's `bionic_stdio_runtime.cc` checks each
+   FILE-taking entry point and redirects the three `__sF` slots to real
+   `stdin`/`stdout`/`stderr`. Roughly 150–200 lines of the same shape here, and
+   only for the entry points the engine actually imports.
+2. Re-run `nativePostClientSettingsLoadedInitialization3` and see whether the
+   `_IO_fflush` crash is gone. That is the test of the whole theory.
+3. Then `CORDIAL_LATE_SETTINGS=1`, which §17 wants re-tested on 2.734.0.917
+   anyway.
+4. `mallinfo` and `__cxa_thread_atexit_impl` independently — each is small,
+   neither depends on the above.
+
+### And one thing not to change
+
+`native/netdb_compat.cpp` translates bionic's `AI_*` bits before calling host
+`getaddrinfo`, because bionic's `AI_DEFAULT` is `0x600` and handing that to glibc
+returns `EAI_BADFLAGS` and fails every lookup. mocktail's `HostHints()` copies
+`ai_flags` **unmodified** — the same latent bug, not yet triggered by whatever
+its callers pass. Cordial is right here and mocktail is not; nobody should
+simplify that file to match theirs.

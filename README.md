@@ -140,12 +140,12 @@ will be declined.
 | **Signing in** | ✅ **via Quick Sign-in**, which is a code flow and needs no typing |
 | **Keyboard in an experience** | ✅ WASD, space, the lot |
 | Mouse: navigation, buttons, field focus | ✅ |
-| Mouse: turning the camera | ✅ right-drag; every button and a real delta reach the engine |
+| Mouse: turning the camera | ✅ right-drag, and the delta is the compositor's *unaccelerated* one — using the accelerated pair made sensitivity depend on your desktop mouse settings and made the camera speed up through a fast sweep |
 | Scroll wheel | ✅ |
 | Frame rate | ✅ a flat 60 on MAILBOX, where FIFO gave a variable 35–50 |
 | Feral GameMode | ✅ registered while the client runs |
 | Typing into text fields | ❌ characters reach the engine and are not drawn until the field loses focus |
-| Pointer capture in first person | ❌ Roblox is never told it may capture, so the cursor walks off the window |
+| Pointer capture in first person | ✅ the cursor stays in the window, reported from real play |
 | Staying signed in across a restart | ✅ cookies and identity kept in the **desktop keyring**, not a file |
 | Loading into an experience | ✅ world, avatar and UI render, signed in |
 | **Two accounts at once** | ✅ two profiles, two instances, side by side — see below |

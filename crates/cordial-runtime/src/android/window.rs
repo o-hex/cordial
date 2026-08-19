@@ -1121,6 +1121,28 @@ impl HostWindow {
     /// actually changed — re-driving `onSurfaceChangedNative` for every pixel
     /// of a drag would rebuild the engine's framebuffers dozens of times a
     /// second.
+    ///
+    /// **This used to update only the render surface.** `load.rs` calls
+    /// `config::set_screen` once, right after the window first opens, so
+    /// `AConfiguration_getScreenWidthDp`/`getScreenHeightDp` agree with the
+    /// window at launch — but nothing on this path ever called it again. A
+    /// resize (and fullscreen is a resize) kept the true render surface
+    /// current while `AConfiguration` went on answering whatever size the
+    /// window had when it first opened, which is a screen-size contradiction
+    /// of exactly the shape `docs/analysis/platform-identity.md` warns about,
+    /// just discovered on the resize path rather than the launch one. Calling
+    /// it here as well closes that gap for `AConfiguration` specifically.
+    ///
+    /// **What this does not close.** `native/init_params.cpp`'s own
+    /// `DisplayMetrics`/`Configuration`/`InitParams` objects are a separate
+    /// path — `DisplayMetrics` in particular is driven by a `g_width`/
+    /// `g_height` pair set only through `set_display_size`, which has no
+    /// caller anywhere in this tree, so it is stuck at its compiled 1280x720
+    /// regardless of this call. That file is out of scope for this change
+    /// (see AGENTS.md's file list for who owns it); this closes only the
+    /// `AConfiguration` half of the contradiction, not the `DisplayMetrics`
+    /// or `User-Agent` half. `INFERRED` that either half affects the camera —
+    /// nothing here was run against the engine to check.
     fn dispatch_configure(&self, handle: i64, width: i32, height: i32) {
         if width <= 0 || height <= 0 {
             return;
@@ -1134,6 +1156,7 @@ impl HostWindow {
             g.height = height;
             g.format
         };
+        super::config::set_screen(width, height);
         if let Err(e) = cordial_linker_sys::game_activity::surface_resized(
             handle, format, width, height,
         ) {

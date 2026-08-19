@@ -1397,7 +1397,21 @@ fn main() -> ExitCode {
                                         let (width, height, format) = w.geometry();
                                         cordial_runtime::android::config::set_screen(width, height);
                                         println!("  window {width}x{height}");
-                                        cordial_runtime::android::config::set_screen(width, height);
+                                        // And the framework layer, which had no
+                                        // way to be told at all: the C++ setter
+                                        // behind this was never `extern "C"`, so
+                                        // `DisplayMetrics`, the User-Agent
+                                        // resolution fields and everything else
+                                        // built on it reported the compiled
+                                        // 1280x720 whatever the window was
+                                        // doing. Harmless at the default
+                                        // resolution, which is why it survived
+                                        // this long, and wrong by the whole
+                                        // difference once anyone goes fullscreen.
+                                        linker::game_activity::set_display_size(
+                                            width as i32,
+                                            height as i32,
+                                        );
 
                                         // The engine's own init sequence, in the
                                         // order MainGameActivity.onCreate runs it.

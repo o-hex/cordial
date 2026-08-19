@@ -2101,6 +2101,32 @@ int cordial_init_client_settings(void* fn, const char* a, const char* b, const c
     }
 }
 
+/// Tell the framework layer how big the window actually is.
+///
+/// `set_display_size` has existed since the Activity was first stubbed and had
+/// **zero call sites anywhere in the tree** — it is not `extern "C"`, so nothing
+/// on the Rust side could ever have reached it. `g_width`/`g_height` therefore
+/// sat at the compiled 1280x720 for the life of every process, and every Java
+/// answer built from them lied by exactly the difference between that and the
+/// real window: `DisplayMetrics.widthPixels`/`heightPixels`, the resolution
+/// fields in the User-Agent, and the `AConfiguration` screen size the comment on
+/// those globals says all have to agree.
+///
+/// It matters most where it is least visible. At the tool's own default
+/// resolution the lie is zero, which is why every harness run looked consistent;
+/// go fullscreen on a 3440x1440 display and the engine is still being told
+/// 1280x720 by everything that reads these.
+///
+/// **Whether the engine scales pointer deltas by any of this is `INFERRED`** and
+/// is being chased separately. It is wired regardless, because an answer Cordial
+/// gives the engine should be true whether or not the current bug turns out to
+/// depend on it.
+extern "C" void cordial_set_display_size(int width, int height) {
+    if (width > 0 && height > 0) {
+        cordial::set_display_size(width, height);
+    }
+}
+
 /// `FlagJniInterface.nativeGetFInt(String, int)I` — read a live `FInt` back out
 /// of the engine.
 ///

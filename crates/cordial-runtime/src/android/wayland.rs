@@ -1432,6 +1432,16 @@ impl WaylandWindow {
             g.height = height;
             g.format
         };
+        // `config::set_screen` is otherwise only called once, right after the
+        // window first opens (`load.rs`), so `AConfiguration` kept answering
+        // the launch size through every later resize -- fullscreen included --
+        // while the render surface below tracked the real one. Same gap as
+        // `window.rs::dispatch_configure`'s X11 path, closed the same way;
+        // see that function's doc comment for what this does and does not
+        // fix. Deliberately before the EGL resize, matching `load.rs`'s own
+        // ordering of "tell the engine what the screen is" before "hand it
+        // the surface".
+        super::config::set_screen(width, height);
         let egl_win = *self.egl_window.lock().unwrap_or_else(|e| e.into_inner());
         if let (Some(egl), false) = (&self.egl, egl_win.is_null()) {
             // SAFETY: `egl_win` was created by `wl_egl_window_create` and is
@@ -2014,10 +2024,10 @@ unsafe extern "C" fn relative_pointer_motion(
     _rp: *mut c_void,
     _utime_hi: u32,
     _utime_lo: u32,
-    dx: i32,
-    dy: i32,
-    _dx_unaccel: i32,
-    _dy_unaccel: i32,
+    _dx: i32,
+    _dy: i32,
+    dx_unaccel: i32,
+    dy_unaccel: i32,
 ) {
     // Relative motion arrives whenever the seat's pointer has focus, lock or no
     // lock. Acting on it unlocked would double every ordinary mouse movement,
@@ -2025,8 +2035,24 @@ unsafe extern "C" fn relative_pointer_motion(
     if !POINTER_LOCK_ACTIVE.load(Ordering::Acquire) || !POINTER_ON_CANVAS.load(Ordering::Acquire) {
         return;
     }
+    // `zwp_relative_pointer_v1.relative_motion` carries two pairs: `dx`/`dy`,
+    // which the compositor has already run through the desktop's pointer
+    // profile (acceleration, "mouse speed"), and `dx_unaccel`/`dy_unaccel`,
+    // which have not. This used to send the accelerated pair, which is right
+    // for moving a UI cursor and wrong for a camera: acceleration is
+    // superlinear in speed, so a fast sweep turns the camera disproportionately
+    // more than a slow one covering the same real distance, and it makes the
+    // in-game sensitivity depend on whatever pointer-speed setting the user's
+    // desktop happens to have — neither of which a camera look should do. The
+    // unaccelerated pair is the one `libinput`'s own documentation and every
+    // engine that supports Wayland pointer lock uses for exactly this reason.
+    // `INFERRED` that this is what made the reported camera feel over-sensitive
+    // and speed up through a fast turn — not run against the engine, only
+    // reasoned from what the two fields are documented to mean — but it is not
+    // inferred that Cordial was sending the wrong pair: that part is read
+    // straight off the protocol's own field names.
     if let Some(w) = current() {
-        w.dispatch_relative_motion(fixed_to_f32(dx), fixed_to_f32(dy));
+        w.dispatch_relative_motion(fixed_to_f32(dx_unaccel), fixed_to_f32(dy_unaccel));
     }
 }
 

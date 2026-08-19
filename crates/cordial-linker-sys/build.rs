@@ -61,4 +61,26 @@ fn main() {
         let path = entry.expect("readable dir entry").path();
         println!("cargo:rerun-if-changed={}", path.display());
     }
+
+    // And the ported loader, for exactly the same reason.
+    //
+    // Watching only `native/` left a hole big enough to lose a change in: an
+    // edit to `linker_phdr.cpp` compiles nothing, links the previous static
+    // archive, and produces a binary that behaves as though the edit were never
+    // made. That is worse than a build error, and it has already cost one
+    // verification -- the change that stopped mapping the engine's text
+    // writable appeared to have no effect until `cargo clean -p
+    // cordial-linker-sys` forced the rebuild by hand.
+    //
+    // Cargo watches a directory recursively, so these are two lines rather than
+    // a hand-maintained file list -- which is the same argument the comment
+    // above makes about `native/`, and it should have been applied here at the
+    // same time.
+    for dir in ["third_party/mcpelauncher-linker/bionic/linker",
+                "third_party/mcpelauncher-linker/bionic/libdl"] {
+        let path = root.join(dir);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }

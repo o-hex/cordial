@@ -394,6 +394,7 @@ pub mod game_activity {
             err: *mut c_char,
             n: usize,
         ) -> c_int;
+        fn cordial_set_display_size(width: c_int, height: c_int);
         fn cordial_get_fint(
             f: *mut c_void,
             name: *const c_char,
@@ -1152,6 +1153,19 @@ pub mod game_activity {
             )
         };
         if rc == 0 { Ok(out) } else { Err(take_err(err)) }
+    }
+
+    /// Tell the framework layer the real window size.
+    ///
+    /// The C++ setter behind this had no `extern "C"` and therefore no caller,
+    /// so `DisplayMetrics`, the User-Agent resolution fields and the
+    /// `AConfiguration` screen size have all been reporting the compiled
+    /// 1280x720 regardless of the window. Call it as soon as the window's
+    /// geometry is known, and again whenever it changes.
+    pub fn set_display_size(width: i32, height: i32) {
+        // SAFETY: writes two ints behind a mutex-free but single-threaded
+        // startup path, the same one `set_init_params` already runs on.
+        unsafe { cordial_set_display_size(width as c_int, height as c_int) }
     }
 
     /// `FlagJniInterface.nativeGetFInt(String, int)I` — ask the engine what a

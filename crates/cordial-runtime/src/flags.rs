@@ -243,7 +243,7 @@ fn data_dir() -> PathBuf {
 /// because what was established was the flag's absence and its effect on
 /// mocktail — never that it improved anything here.
 ///
-Denying every pattern takes the engine off TextureManager 2 and onto the
+/// Denying every pattern takes the engine off TextureManager 2 and onto the
 /// legacy path, which a real session confirmed: the log prints
 /// `[FLog::Graphics] Using TM1`. What that cost, reported from play, was a lobby
 /// that refused to render and loading that was visibly slow. TM2 is the modern

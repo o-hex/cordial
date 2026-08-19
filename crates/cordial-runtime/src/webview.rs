@@ -412,26 +412,21 @@ pub fn roblox_session_cookie(dir: &std::path::Path) -> Option<String> {
 /// whoever owns a live `cordial_shell::host_window::HostWindow` to attach it
 /// to.
 ///
-/// **Nothing in this crate installs one**, and that is the honest state of
-/// this change rather than an oversight. Every place that owns a
-/// `HostWindow` — `crates/cordial-runtime/src/android/wayland.rs`'s
-/// `HostWindowCell`, and `crates/cordial-runtime/src/bin/load.rs`, which
-/// calls [`arm`] in the first place — was off limits to edit for the change
-/// that added this module's parsing and cookie handling, so the one call this
-/// needed to actually render a window could not be made here. What is
-/// missing is exactly one line, added at that ownership site once it is not
-/// off limits: `cordial_runtime::webview::set_presenter(...)`, with a closure
-/// that marshals onto the GTK thread — a `glib::MainContext::channel` whose
-/// receiver is `.attach()`ed once works, and needs no new call site of its
-/// own, because `HostWindow::pump` already iterates that context every
-/// engine loop tick — and then calls `cordial_shell::webview::open` with a
-/// [`OpenWindowRequest`] converted by hand (its fields map onto
-/// `WindowRequest`'s one for one) and, if wanted, a cookie from
-/// [`roblox_session_cookie`].
-///
-/// Until that line exists, [`on_open_window`] logs that a request arrived and
-/// was not presented, which is the true state of the feature rather than a
-/// claim it works.
+/// **Corrected**: this doc used to say "nothing in this crate installs one"
+/// and described the single missing call as future work. That is no longer
+/// true and left uncorrected would be exactly the kind of stale comment
+/// AGENTS.md asks to be fixed rather than tolerated. `load.rs`'s
+/// `install_webview_presenter` is that call now, made right after [`arm`],
+/// from the same GTK-owning thread `arm` is called from: it installs a
+/// closure that re-enters `glib::MainContext::default().invoke` (not a
+/// channel, which was the shape this doc used to propose, but the same
+/// "marshal onto the GTK thread" effect) and, once there, reads
+/// `android::wayland::current()` for the live `HostWindow`, fetches a session
+/// cookie via [`roblox_session_cookie`], and calls
+/// `cordial_shell::webview::open`. What was never established until a real
+/// run proved it, and is the reason [`dev_trigger_open_window`] exists: an
+/// `openWindow` message from the engine needs a click nobody could produce
+/// without one, so this path had never actually run end to end.
 type Presenter = dyn Fn(OpenWindowRequest) + Send + Sync;
 static PRESENTER: OnceLock<std::sync::Arc<Presenter>> = OnceLock::new();
 
@@ -444,6 +439,63 @@ static PRESENTER: OnceLock<std::sync::Arc<Presenter>> = OnceLock::new();
 pub fn set_presenter(f: impl Fn(OpenWindowRequest) + Send + Sync + 'static) {
     if PRESENTER.set(std::sync::Arc::new(f)).is_err() {
         println!("  webview: set_presenter called twice; the first presenter installed is the one in effect");
+    }
+}
+
+/// Synthesise the one message nobody could produce by clicking: drive the
+/// installed presenter directly with `url`, bypassing the engine, the message
+/// bus and `parse_open_window` entirely.
+///
+/// **Why this exists at all.** `openWindow` needs a real click in signed-in
+/// UI — the server browser, account settings, a purchase flow — and this
+/// project's own rule against synthesising input at the compositor (AGENTS.md
+/// "Two practical cautions") rules out faking that click from outside
+/// Cordial. It does not rule out calling Cordial's own code path directly,
+/// the same distinction that section draws for `input::pass_key_event`: this
+/// is that, aimed at the presenter instead of the input queue. Called from
+/// exactly one place, `load.rs`, guarded by the `CORDIAL_WEBVIEW_TEST`
+/// environment variable — see that call site's own comment for why it must
+/// stay off by default and out of the ordinary path.
+///
+/// **What is bypassed and what is not.** `parse_open_window` and its key
+/// vocabulary are skipped, because there is no real JSON payload to parse —
+/// the caller already has a URL as a Rust `String`. What is *not* skipped is
+/// everything downstream of a real parse: the presenter this hands off to is
+/// the identical closure `install_webview_presenter` installed, so it re-enters
+/// the GTK thread, re-fetches the profile's session cookie, and calls
+/// `cordial_shell::webview::open`, which runs the full
+/// [`crate::android::wayland`]-independent [`webview_policy::evaluate`] check
+/// this crate depends on `cordial_shell` for. A refused URL is refused here
+/// exactly as it would be for a real message; this function cannot open
+/// anything the policy would not have allowed a real click to open.
+///
+/// `title`, `back_button_visible` and `show_domain_as_title` are set rather
+/// than left at the parser's `false` default so the window this produces is
+/// visibly a synthesised one in a screenshot — a plain header with no domain
+/// shown would be indistinguishable from a real request that simply asked for
+/// that chrome, and the whole point of a diagnostic is that it not be mistaken
+/// for the thing it is standing in for.
+pub fn dev_trigger_open_window(url: String) {
+    match PRESENTER.get() {
+        Some(present) => present(synthetic_open_window_request(url)),
+        None => println!(
+            "[webview] CORDIAL_WEBVIEW_TEST set, but no presenter is installed yet; nothing to \
+             drive"
+        ),
+    }
+}
+
+/// The request [`dev_trigger_open_window`] hands to the presenter. Split out
+/// so the shape can be pinned by a test without touching the process-global
+/// `PRESENTER` — see `set_presenter_keeps_the_first_installation`'s own
+/// comment for why that static is exercised by exactly one test.
+fn synthetic_open_window_request(url: String) -> OpenWindowRequest {
+    OpenWindowRequest {
+        url,
+        title: Some("CORDIAL_WEBVIEW_TEST".to_string()),
+        hide_header: false,
+        back_button_visible: true,
+        show_domain_as_title: true,
     }
 }
 
@@ -917,5 +969,21 @@ mod tests {
             });
         }
         assert_eq!(CALLS.load(O::SeqCst), 1, "the second presenter must never run");
+    }
+
+    /// `CORDIAL_WEBVIEW_TEST`'s request must carry chrome that marks it as a
+    /// synthesised one -- a plain header with the domain hidden would be
+    /// indistinguishable from a real request that happened to ask for the
+    /// same thing, defeating the reason this diagnostic sets them at all (see
+    /// `dev_trigger_open_window`'s own doc). Deliberately does not touch
+    /// `PRESENTER`, so it cannot race with `set_presenter_keeps_the_first_installation`.
+    #[test]
+    fn the_synthetic_request_is_visibly_a_diagnostic() {
+        let request = synthetic_open_window_request("https://www.roblox.com/home".to_string());
+        assert_eq!(request.url, "https://www.roblox.com/home");
+        assert_eq!(request.title.as_deref(), Some("CORDIAL_WEBVIEW_TEST"));
+        assert!(!request.hide_header, "a hidden header would hide the fact this is synthetic");
+        assert!(request.back_button_visible);
+        assert!(request.show_domain_as_title, "the title bar must show the real host, not a guess");
     }
 }

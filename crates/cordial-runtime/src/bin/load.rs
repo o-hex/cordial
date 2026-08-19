@@ -3324,6 +3324,31 @@ fn main() -> ExitCode {
                                                 cordial_runtime::webview::arm(|name| lib.symbol(name));
                                                 install_webview_presenter();
 
+                                                // A dev-only trigger, in the same family as
+                                                // `CORDIAL_TRACE_PATHS`: off by default, out of the
+                                                // ordinary path, and read exactly once, here, after
+                                                // the presenter above is installed and before the
+                                                // pump this whole feature depends on starts.
+                                                //
+                                                // It exists because `openWindow` needs a real click
+                                                // in signed-in UI and AGENTS.md's "Two practical
+                                                // cautions" rules out faking that click at the
+                                                // compositor -- so there was no way to see whether a
+                                                // web window survives the engine's Vulkan swapchain
+                                                // without driving Cordial's own presenter directly.
+                                                // `webview::dev_trigger_open_window` is that: it
+                                                // skips the engine and the message bus, but not the
+                                                // policy check or the presenter itself, so what opens
+                                                // (or is refused) here is exactly what a real click
+                                                // would have produced for the same URL.
+                                                if let Ok(url) = std::env::var("CORDIAL_WEBVIEW_TEST") {
+                                                    println!(
+                                                        "  webview: CORDIAL_WEBVIEW_TEST set; synthesising an \
+                                                         openWindow request for {url}"
+                                                    );
+                                                    cordial_runtime::webview::dev_trigger_open_window(url);
+                                                }
+
                                                 cordial_runtime::android::looper::pump(
                                                     std::time::Duration::from_secs(secs),
                                                     Some(handle),

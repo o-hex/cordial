@@ -2674,3 +2674,39 @@ takes, and what writes the condition it tests. That is the next step and it is a
 dynamic one — a breakpoint on each branch target, then a hardware watchpoint on
 whatever byte the condition reads. Hardware watchpoints do not need the module
 registered with the debugger, so unlike breakpoints they work here directly.
+
+### §23.7 The function boundary was wrong, and `.eh_frame` is how to not get this wrong
+
+§23.6 reported `RbxStorage::init` as `0x230bd3a`, with the `[INIT]` log emit at
+`0x2312fbc` "further into the same function", and concluded that storage is
+entered and returns early. The entry-and-return is real. The attribution is not.
+
+`.eh_frame` carries exact function bounds and survives stripping, so this is a
+lookup rather than an investigation — 260,630 FDEs, from
+`readelf --debug-dump=frames-interp`:
+
+    0x230bd3a  ->  FDE 0x230bd3a .. 0x230c74a   size  2,576
+    0x2312fbc  ->  FDE 0x23121ae .. 0x2315c6a   size 15,036
+    0x230bcc2  ->  FDE 0x230bcc2 .. 0x230bd3a   size    120
+
+`0x230bd3a` is a 2,576-byte function that ends at `0x230c74a`. The log emit is in
+a **different function**, `0x23121ae`. A backward walk from an address to a
+function start has no way to know it has crossed a boundary on a stripped binary,
+and it crossed one here — the 29 KB span that reading implies should have been
+the tell.
+
+So the fast path traced in §23.6, the `.bss` pointer written by bionic's own
+`call_constructors` during `.init_array`, and the conclusion that the branch is
+an unconditional singleton-getter check are all **about the getter**. They stand
+as facts about `0x230bd3a` and say nothing about storage initialisation.
+
+`0x230bcc2`, the `flagLoaded`-labelled thing, is 120 bytes ending exactly where
+the getter begins — a thunk sitting in front of it, not a caller of init.
+
+**Whether `0x23121ae` is entered in Cordial is not established.** That is now the
+question, and it is a different one from the last three sections'.
+
+**Use `.eh_frame` for this from now on.** Every address in §3, §9 and §23.6 was
+derived by scanning backwards for a prologue, the build has moved at least once
+underneath those numbers, and one of them was wrong by a whole function. The FDE
+table is authoritative, costs one `readelf`, and is not disassembly.

@@ -234,24 +234,44 @@ fn data_dir() -> PathBuf {
 
 /// Flags Cordial sets for itself, at the bottom of the stack.
 ///
-/// The bar for anything here is a setting whose default is wrong specifically
-/// *because* the engine is an Android build running on a desktop, and which the
-/// settings document does not carry — so there is no value from Roblox being
-/// overridden, only a compiled-in default being replaced.
+/// **Empty, and the reason it is empty is worth keeping.**
 ///
-/// `FStringGraphicsTextureManager2DenyPattern2` is absent from the document
-/// entirely. TextureManager2 picks a streaming tier from hardware it recognises,
-/// the document's sibling `...DenyPattern` already denies tiers 1 to 3, and a
-/// desktop GPU behind this stack matches nothing it knows — so it settles on low
-/// residency and textures load blurred. `.*` denies every pattern, which takes
-/// the engine off TextureManager2 and onto the legacy streaming path that
-/// `FFlagTextureManager2SupportLegacyStreaming2` keeps alive.
+/// It briefly carried `FStringGraphicsTextureManager2DenyPattern2 = ".*"`, taken
+/// from a mocktail commit titled "Another fix for low quality texture" and
+/// shipped here as a default on the strength of that title plus the flag's
+/// absence from Roblox's own settings document. It was marked `INFERRED`,
+/// because what was established was the flag's absence and its effect on
+/// mocktail — never that it improved anything here.
 ///
-/// **`INFERRED`.** The flag's absence from the document and its effect on
-/// mocktail are established; the tier-matching story above is the reading that
-/// fits, not something measured here. It is at the bottom layer precisely
-/// because it is a guess a user should be able to overrule with one line.
-const BUILTIN: &[(&str, &str)] = &[("FStringGraphicsTextureManager2DenyPattern2", ".*")];
+Denying every pattern takes the engine off TextureManager 2 and onto the
+/// legacy path, which a real session confirmed: the log prints
+/// `[FLog::Graphics] Using TM1`. What that cost, reported from play, was a lobby
+/// that refused to render and loading that was visibly slow. TM2 is the modern
+/// manager and streams textures; the legacy path does not, so a large place pays
+/// twice.
+///
+/// **And the blurring it was meant to fix has never been seen here.** Not once,
+/// by anyone, on Cordial. The entire case for the flag was another project's
+/// commit title. Whatever they were fixing may be specific to their stack, or
+/// may have been something else with a texture-shaped name; either way this was
+/// a remedy shipped for a symptom nobody in this project had reported.
+///
+/// One further observation, and it is why this is not filed as "TM1 is bad":
+/// fullscreening the window made the lobby render correctly *with the deny in
+/// place*. That points at the viewport rather than the texture manager, so the
+/// render failure and the manager may not be the same fact at all. Untangling
+/// that needs a side-by-side nobody has done.
+///
+/// The mistake was not adopting the flag. It was making an `INFERRED` change a
+/// **default**. An inference belongs behind a switch somebody chooses, where
+/// being wrong costs that person an experiment; as a default it costs everybody
+/// a worse client and nobody knows why. Anything added here in future should be
+/// something measured on this project's own hardware, not something read off
+/// another project's commit title.
+///
+/// The flag itself still works through the ordinary layers — a user or plugin
+/// can set it in `flags.json` — so nothing is lost except the default.
+const BUILTIN: &[(&str, &str)] = &[];
 
 fn builtin_layer() -> Layer {
     Layer {

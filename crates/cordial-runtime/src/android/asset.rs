@@ -79,7 +79,18 @@ impl Manager {
             // fallback — fall through to the APK exactly as if the overlay
             // had never had it.
             if let Ok(bytes) = std::fs::read(&path) {
-                if std::env::var_os("CORDIAL_TRACE").is_some() {
+                // `CORDIAL_TRACE_ASSETS=1`, not `CORDIAL_TRACE`.
+                //
+                // This line was the only way to observe that an overlay had
+                // applied, and it was gated on a flag AGENTS.md tells people
+                // never to set: `CORDIAL_TRACE=1` wraps variadic functions with
+                // fixed-arity declarations and aborts the engine. So the one
+                // diagnostic for ADR-010 could not be reached without killing
+                // the client, which means nobody could confirm an overlay was
+                // working except by looking at the screen.
+                if std::env::var_os("CORDIAL_TRACE_ASSETS").is_some()
+                    || std::env::var_os("CORDIAL_TRACE").is_some()
+                {
                     eprintln!("[asset] overlay: {name} from {}", source.describe());
                 }
                 let leaked: &'static [u8] = Vec::leak(bytes);

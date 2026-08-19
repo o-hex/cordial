@@ -932,10 +932,24 @@ fn install_webview_presenter() {
                     // `AdwDialog` this presenter forces, so this is the one
                     // path every dismissal (button, gesture, `closeWindow`)
                     // actually takes.
+                    //
+                    // Raising the subsurface is necessary and not sufficient
+                    // -- reported live, after the stacking fix landed: the
+                    // engine blanks its own drawing when it opens a window,
+                    // expecting to be covered, and nothing was telling it the
+                    // cover was gone, so it stayed blank under a correctly-
+                    // stacked, now-visible canvas. `report_window_closed`
+                    // is that missing half -- see its own doc for the bus id
+                    // this publishes and why that choice is `INFERRED`. Both
+                    // calls belong in the same signal for the same reason:
+                    // one dismissal path, so the stacking fix and the report
+                    // to the engine cannot drift apart and one outlive the
+                    // other.
                     use libadwaita::prelude::AdwDialogExt;
                     window.webview_dialog_opened();
                     dialog.connect_closed(move |_| {
                         window.webview_dialog_closed();
+                        cordial_runtime::webview::report_window_closed();
                     });
                 }
                 None => println!(
@@ -944,6 +958,17 @@ fn install_webview_presenter() {
             }
         });
     });
+    // The other direction. `set_presenter` above carries the engine's
+    // `openWindow` out to a dialog; this carries a command the page issues
+    // back in. It is installed here, rather than beside `webview::arm`, for
+    // the reason `cordial_shell::webview::set_bridge_sink`'s doc gives:
+    // `cordial-runtime` depends on `cordial-shell` and not the reverse, so
+    // this binary is the only place that can see both halves at once.
+    //
+    // Without it the shell's handler has nowhere to send an approved message
+    // and says so on every one -- which is the state the maintainer was
+    // looking at when Join navigated instead of joining.
+    cordial_shell::webview::set_bridge_sink(cordial_runtime::webview::forward_bridge_message);
     println!("  webview: presenter installed; an openWindow request will now be attached to the host window");
 }
 
@@ -2138,6 +2163,56 @@ fn main() -> ExitCode {
                                                     Err(e) => println!("  {name} failed: {e}"),
                                                 },
                                             }
+                                        }
+
+                                        // `setWebviewUserAgent`, told the
+                                        // same string `InitParams.userAgent`
+                                        // just above was built with --
+                                        // `cordial_runtime::webview::user_agent`
+                                        // reads it back out of
+                                        // `native/init_params.cpp`'s
+                                        // `build_user_agent` rather than
+                                        // recomputing it, so the engine and
+                                        // the desktop web view
+                                        // (`cordial_shell::webview::open`,
+                                        // fed the same string through
+                                        // `to_shell_request`) cannot disagree
+                                        // about what this client claims to
+                                        // be. `getWebViewUserAgent()V` on
+                                        // `NativeGLJavaInterface` is the
+                                        // engine's own *request* for this
+                                        // value (`native/android_classes.cpp`,
+                                        // still unanswered there, correctly —
+                                        // see that hook's own doc) and this
+                                        // call does not wait for it: nothing
+                                        // established that request fires
+                                        // before a window is asked to open,
+                                        // and answering here, once, beside
+                                        // every other `NativeGLInterface` call
+                                        // this file already makes, cannot be
+                                        // too late for it.
+                                        match cordial_runtime::webview::user_agent() {
+                                            None => println!(
+                                                "  webview: could not read the User-Agent back from \
+                                                 native/init_params.cpp; not calling setWebviewUserAgent"
+                                            ),
+                                            Some(ua) => match lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeGLInterface_setWebviewUserAgent",
+                                            ) {
+                                                None => println!(
+                                                    "  webview: setWebviewUserAgent not exported by this build"
+                                                ),
+                                                Some(f) => match linker::game_activity::call_static_strings(
+                                                    f,
+                                                    "com/roblox/engine/jni/NativeGLInterface",
+                                                    &[ua.as_str()],
+                                                ) {
+                                                    Ok(()) => println!("  webview: setWebviewUserAgent ok"),
+                                                    Err(e) => println!(
+                                                        "  webview: setWebviewUserAgent failed: {e}"
+                                                    ),
+                                                },
+                                            },
                                         }
 
                                         // The cookie natives, resolved here

@@ -112,6 +112,34 @@ use crate::webview_policy;
 const BRIDGE_EXECUTE_ROBLOX: &str = "executeRoblox";
 const BRIDGE_ROBLOX_WK_HYBRID: &str = "RobloxWKHybrid";
 
+/// Where a policy-approved bridge message goes once it has passed
+/// [`webview_policy::bridge_message_acceptable`] against the page's *current*
+/// address.
+///
+/// This crate cannot call into `cordial_runtime` directly to reach the
+/// engine's JNI natives — `cordial-runtime` depends on `cordial-shell` for
+/// `host_window`, not the reverse, and adding the opposite edge would be a
+/// cycle. The presenter side of this same problem (`cordial_runtime::webview
+/// ::set_presenter`) solved it with a callback installed once at startup;
+/// this is that shape, in the other direction. `load.rs`'s
+/// `install_webview_presenter` installs a sink that forwards straight to
+/// `cordial_runtime::webview::forward_bridge_message`, which is where the
+/// actual `WebViewProtocol.signalJavascriptCallback` call lives — see that
+/// function's doc for the native, its declared signature, and what remains
+/// unestablished about what happens on the engine's side of it.
+type BridgeSink = dyn Fn(&str) + Send + Sync;
+static BRIDGE_SINK: std::sync::OnceLock<std::sync::Arc<BridgeSink>> = std::sync::OnceLock::new();
+
+/// Install the sink [`open`]'s bridge handler forwards an approved message
+/// to. Only the first call takes effect — see `cordial_runtime::webview::
+/// set_presenter`'s doc for why two installations racing is a bug worth
+/// seeing rather than one that resolves itself silently.
+pub fn set_bridge_sink(f: impl Fn(&str) + Send + Sync + 'static) {
+    if BRIDGE_SINK.set(std::sync::Arc::new(f)).is_err() {
+        eprintln!("[webview] set_bridge_sink called twice; keeping the first sink installed");
+    }
+}
+
 /// How the engine asked for the window to look.
 ///
 /// Field names deliberately match the protocol's own keys — `hideHeader`,
@@ -138,6 +166,25 @@ pub struct WindowRequest {
     /// happen before a value reaches a `Set-Cookie` header; this field only
     /// carries the already-checked result.
     pub roblox_session_cookie: Option<String>,
+    /// The `User-Agent` this window's `WebKitWebView` should send, or `None`
+    /// to leave WebKitGTK's own default in place.
+    ///
+    /// Why this exists at all: with no User-Agent set, WebKitGTK sends its
+    /// own, and roblox.com — reading a browser UA rather than the app's own
+    /// — serves the full desktop site, complete with the site's own
+    /// navigation bar (Search, Charts, Marketplace, Create, Robux, avatar,
+    /// notifications) stacked above whatever page the engine asked this
+    /// window to open. On Android the same URL renders the embedded in-app
+    /// layout, because the app sends its own User-Agent and the site branches
+    /// on it. Cordial already computes that string for the engine's own HTTP
+    /// client — see `InitParams.userAgent`, built by `native/init_params.cpp`'s
+    /// `build_user_agent` — and `cordial_runtime::webview::user_agent` hands
+    /// the identical bytes back out, so this field is never a second,
+    /// independently-typed copy of that string. Whether the site's own
+    /// navigation bar actually disappears once this is set is the thing this
+    /// change expects but a maintainer with a live window needs to confirm —
+    /// see this crate's caller for what was and was not run.
+    pub user_agent: Option<String>,
 }
 
 /// Open a web window for `request`, attached to `parent`.
@@ -206,23 +253,49 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
         }
     }
 
+    // With no User-Agent set, WebKitGTK sends its own, and roblox.com reads
+    // that as an ordinary desktop browser rather than the app it is -- and
+    // serves the full desktop site, complete with the site's own navigation
+    // bar (Search, Charts, Marketplace, Create, Robux, avatar, notifications)
+    // stacked above whatever page the engine actually asked this window to
+    // open. See `WindowRequest::user_agent`'s own doc for where the string
+    // comes from; `webkit_settings_set_user_agent` (via `Settings::builder`)
+    // is the API this crate has for the equivalent of Android's
+    // `WebSettings.setUserAgentString`. Built as its own `Settings` and
+    // handed to the builder below, rather than fetched from the view and
+    // mutated afterwards, so the very first navigation -- `load_uri`, at the
+    // end of this function -- already carries it; nothing here has
+    // established whether an in-flight load's headers can be changed after
+    // the fact, and there is no reason to find out when the ordering below
+    // never needs to.
+    let settings = webkit6::Settings::new();
+    if let Some(ua) = &request.user_agent {
+        settings.set_user_agent(Some(ua));
+    }
+
     let view = webkit6::WebView::builder()
         .network_session(&network_session)
         .user_content_manager(&user_content)
+        .settings(&settings)
         .hexpand(true)
         .vexpand(true)
         .build();
 
-    // Not yet wired to the engine -- there is no receiver on the other end
-    // yet (`MessageBus.publishRaw` is how a reply would leave this process;
-    // see `cordial_runtime::webview` and
-    // `docs/analysis/webview-surface.md` §3c), and connecting one is
-    // follow-up work, not this change's. Printing a bounded, JSON-only
-    // rendering rather than silently accepting the message is deliberate:
-    // AGENTS.md's rule against a stub that lies applies here as much as it
-    // does to `native/opensles.cpp` -- a page that believes its command was
-    // delivered when nothing on this end received it is exactly the lie that
-    // rule exists to rule out.
+    // **Corrected**: this used to say nothing here forwards to the engine,
+    // with the missing receiver left as follow-up work. That silence is what
+    // made "pressing Join navigates to the game's detail page instead of
+    // joining" look like a WebKit bug rather than what it was -- the page's
+    // JS calling `executeRoblox.postMessage`/`RobloxWKHybrid`, getting no
+    // answer, and falling back to plain navigation. [`set_bridge_sink`]
+    // above is the receiver; `load.rs`'s `install_webview_presenter` wires it
+    // to `cordial_runtime::webview::forward_bridge_message`, which calls
+    // `WebViewProtocol.signalJavascriptCallback` -- see that function's own
+    // doc for the native and what calling it does and does not establish.
+    // AGENTS.md's rule against a stub that lies is still the reason a
+    // message that fails policy, or arrives with no sink installed, is
+    // reported rather than silently dropped: a page that believes its
+    // command was delivered when nothing on this end received it is exactly
+    // the lie that rule exists to rule out.
     {
         let bridge_view = view.clone();
         user_content.connect_script_message_received(None, move |_manager, value| {
@@ -235,10 +308,21 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
                 eprintln!("[webview] rejected a bridge message (host {}): {reason}", verdict.host);
                 return;
             }
-            eprintln!(
-                "[webview] bridge message received and NOT forwarded to the engine (no receiver \
-                 wired yet): {rendered}"
-            );
+            // Never the payload itself, here or in anything this is handed
+            // to -- a bridge message can carry whatever the page and the
+            // engine are mid-conversation about, which is exactly the kind
+            // of session-scoped value `extract_roblosecurity` already
+            // refuses to print. Length and the fact that it passed policy
+            // are the whole of what is worth a log line.
+            match BRIDGE_SINK.get() {
+                Some(sink) => sink(&rendered),
+                None => eprintln!(
+                    "[webview] a bridge message passed policy (host {}, {} bytes), but no sink is \
+                     installed to forward it -- see set_bridge_sink's doc",
+                    verdict.host,
+                    rendered.len()
+                ),
+            }
         });
     }
 
@@ -317,6 +401,9 @@ mod tests {
         // The conservative default for a session, too: open signed out
         // rather than guess at a cookie nobody supplied.
         assert!(r.roblox_session_cookie.is_none());
+        // Same reasoning: no invented User-Agent, only one actually computed
+        // and threaded through by the caller.
+        assert!(r.user_agent.is_none());
     }
 
     /// `open()` itself needs a live GTK/Wayland display to construct a

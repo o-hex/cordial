@@ -241,6 +241,45 @@ static std::string build_user_agent() {
     return std::string(buf);
 }
 
+} // namespace cordial
+
+/// Hands `build_user_agent`'s exact answer to the Rust side.
+///
+/// `build_user_agent` has internal linkage (`static`, inside `namespace
+/// cordial`), which is correct for a value nothing outside this translation
+/// unit is supposed to invent independently — but the desktop web view and
+/// `NativeGLInterface.setWebviewUserAgent` both need to present the identical
+/// string `InitParams.userAgent` was built with, and they live in
+/// `crates/cordial-shell` and `crates/cordial-runtime/src/bin/load.rs`. The
+/// alternative was a second copy of this function in Rust, which is exactly
+/// the failure mode `docs/analysis/platform-identity.md` and this file's own
+/// history warn about: two computations of "what device are we" drifting the
+/// moment one changes and the other does not — a stale window size in one, a
+/// device profile switch (`presenting_as_pc`) forgotten in the other. This
+/// is a getter, not a reimplementation: it calls the same function and
+/// copies the same bytes out.
+///
+/// `buf`/`n` rather than returning a `std::string` across the FFI boundary,
+/// matching every other Rust-facing native in this tree (`cordial_set_display_size`'s
+/// neighbours below, `cordial_messagebus_subscribe` in clipboard.cpp) — none
+/// of them hand a C++ standard-library object across the boundary, all of
+/// them fill a caller-owned buffer and report how much they needed. Returns
+/// the full length of the User-Agent regardless of whether it fit, the same
+/// convention `snprintf` itself uses, so a caller with too small a buffer can
+/// tell truncation from success rather than silently reading a cut-off
+/// string.
+extern "C" size_t cordial_build_user_agent(char* buf, size_t n) {
+    std::string ua = cordial::build_user_agent();
+    if (buf && n > 0) {
+        size_t copy = ua.size() < n - 1 ? ua.size() : n - 1;
+        ua.copy(buf, copy);
+        buf[copy] = '\0';
+    }
+    return ua.size();
+}
+
+namespace cordial {
+
 /// `android.util.DisplayMetrics`
 ///
 /// The engine asks the Activity for these and reads `density` off the result.

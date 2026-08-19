@@ -74,6 +74,13 @@ use std::sync::OnceLock;
 /// The class the whole protocol hangs off.
 pub const CLASS: &str = "com/roblox/protocols/webview/WebViewProtocol";
 
+/// `com/roblox/universalapp/messagebus/MessageBus`, named once here for the
+/// close-handshake calls below. `deeplink.rs` keeps its own copy of the same
+/// literal (`BUS`) rather than importing this one, because that module
+/// predates this one and the two have no dependency on each other worth
+/// creating for one shared string.
+const BUS: &str = "com/roblox/universalapp/messagebus/MessageBus";
+
 /// The getters worth reading, by the native symbol that answers each.
 ///
 /// Not every export is here: the two `getFFlag...` natives return `boolean`
@@ -228,6 +235,41 @@ unsafe extern "C" {
 fn take_err(err: Vec<u8>) -> String {
     let end = err.iter().position(|&b| b == 0).unwrap_or(err.len());
     String::from_utf8_lossy(&err[..end]).into_owned()
+}
+
+// --------------------------------------------------------------- user agent
+//
+// `native/init_params.cpp`'s `build_user_agent` is what fills
+// `InitParams.userAgent` -- the string the engine's own HTTP client sends.
+// `cordial_build_user_agent` hands the identical bytes out to Rust, so the
+// desktop web view (`cordial_shell::webview::open`) and
+// `NativeGLInterface.setWebviewUserAgent` (`load.rs`'s call, beside the
+// other `NativeGLInterface` calls) can present the same client the engine
+// already told the server it was, rather than a second, Rust-side
+// recomputation that could silently drift from it.
+
+unsafe extern "C" {
+    fn cordial_build_user_agent(buf: *mut c_char, n: usize) -> usize;
+}
+
+/// The exact `User-Agent` `InitParams.userAgent` was built with.
+///
+/// `None` only if the string somehow does not fit a buffer four times the
+/// size of `build_user_agent`'s own 512-byte `snprintf` target, or is not
+/// valid UTF-8 -- neither of which that function's fixed format string and
+/// numeric/ASCII fields can produce. A real failure here is worth seeing
+/// rather than silently falling back to no User-Agent at all, which is why
+/// this returns `Option` instead of an empty string on error.
+pub fn user_agent() -> Option<String> {
+    let mut buf = vec![0u8; 2048];
+    // SAFETY: `cordial_build_user_agent` is statically linked into this
+    // binary via `cordial_jni_shim` (native/init_params.cpp); the buffer
+    // outlives the call.
+    let len = unsafe { cordial_build_user_agent(buf.as_mut_ptr() as *mut c_char, buf.len()) };
+    if len == 0 || len >= buf.len() {
+        return None;
+    }
+    std::str::from_utf8(&buf[..len]).ok().map(str::to_string)
 }
 
 // ------------------------------------------------------------- opening it
@@ -504,6 +546,19 @@ static KEYS: OnceLock<OpenWindowKeys> = OnceLock::new();
 static CONNECTION: AtomicI64 = AtomicI64::new(0);
 static IS_CONNECTED_NATIVE: OnceLock<usize> = OnceLock::new();
 
+/// The bus id [`report_window_closed`] publishes on, and the resolved
+/// `MessageBus.publishRaw` native to publish it with — both filled by
+/// [`arm`], both empty in a build that could not arm the close report. See
+/// [`report_window_closed`]'s own doc for why a window closing without
+/// either of these set must be loud rather than silent.
+static CLOSE_BUS_ID: OnceLock<String> = OnceLock::new();
+static PUBLISH_RAW_NATIVE: OnceLock<usize> = OnceLock::new();
+
+/// The resolved `WebViewProtocol.signalJavascriptCallback` native, filled by
+/// [`arm`]. See [`forward_bridge_message`] for what calling it does and does
+/// not establish.
+static SIGNAL_JAVASCRIPT_CALLBACK_NATIVE: OnceLock<usize> = OnceLock::new();
+
 /// The sink `cordial_messagebus_subscribe` calls when the engine publishes
 /// `openWindow`.
 ///
@@ -584,7 +639,58 @@ extern "C" fn on_open_window(json: *const c_char) {
 /// to exist before anything can subscribe to it, and this module cannot reach
 /// `looper::pump` to add itself there, so `load.rs` calls this directly,
 /// right before it hands control to that pump.
+///
+/// **Also arms the other direction.** Beyond subscribing to `openWindow`,
+/// this now also resolves what [`report_window_closed`] needs to tell the
+/// engine a window closed — see that function's doc for why
+/// `android::wayland`'s subsurface-lowering fix, on its own, leaves the
+/// engine's canvas blank after every web window: it makes the dialog visible
+/// and makes the canvas visible again, but nothing was ever telling the
+/// engine the window it blanked itself for is gone.
 pub fn arm(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) {
+    // Called first and unconditionally, because it is a lifecycle call on
+    // this protocol rather than a step in either direction below. The
+    // zero-argument shape is not a guess: the dex's own `method_ids`/
+    // `proto_ids` tables declare `initializeAndroidWebViewProtocol()V` —
+    // read directly out of the shipping APK the way `docs/analysis/
+    // webview-surface.md` reads every other prototype in this file, not
+    // inferred from the naming convention the way an earlier version of this
+    // comment had to. **Whether calling it is required is still not
+    // established** — `openWindow` subscribes and fires without this ever
+    // having been called (confirmed live, screenshot in hand), which is
+    // evidence it is not a precondition for that half of the protocol. It is
+    // attempted anyway because the maintainer's report named it as the first
+    // thing to rule out for the half that is broken, and now that the shape
+    // is confirmed rather than assumed, there is no argument-list risk left
+    // in trying it.
+    match symbol(
+        "Java_com_roblox_protocols_webview_WebViewProtocol_initializeAndroidWebViewProtocol",
+    ) {
+        Some(f) => match cordial_linker_sys::game_activity::protocol_init(f, CLASS) {
+            Ok(()) => println!("  webview: initializeAndroidWebViewProtocol ok"),
+            Err(e) => println!("  webview: initializeAndroidWebViewProtocol failed: {e}"),
+        },
+        None => println!(
+            "  webview: initializeAndroidWebViewProtocol is not exported by this build"
+        ),
+    }
+
+    // `signalJavascriptCallback` -- resolved here, alongside the protocol's
+    // other direct (non-message-bus) native, and stored for
+    // [`forward_bridge_message`] to use once a real bridge message arrives.
+    // See that function's own doc for the signature this was checked against
+    // and what calling it does and does not establish.
+    match symbol("Java_com_roblox_protocols_webview_WebViewProtocol_signalJavascriptCallback") {
+        Some(f) => {
+            let _ = SIGNAL_JAVASCRIPT_CALLBACK_NATIVE.set(f as usize);
+            println!("  webview: signalJavascriptCallback resolved; bridge messages can be forwarded");
+        }
+        None => println!(
+            "  webview: signalJavascriptCallback is not exported by this build; bridge messages \
+             will not be forwarded to the engine"
+        ),
+    }
+
     let vocabulary = read_vocabulary(&mut symbol);
     match OpenWindowKeys::from_vocabulary(&vocabulary) {
         Ok(keys) => {
@@ -622,7 +728,7 @@ pub fn arm(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) {
     };
     let bus_id = match cordial_linker_sys::game_activity::call_static_two_strings_ret_string(
         get_message_id,
-        "com/roblox/universalapp/messagebus/MessageBus",
+        BUS,
         &protocol,
         &open_window_id,
     ) {
@@ -682,6 +788,172 @@ pub fn arm(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) {
              back)"
         ),
     }
+
+    // The close report. `getMessageId` and `protocol` are the same values
+    // just used for `openWindow`'s bus id -- this is the same class asked
+    // for a different method id, not a second lookup of anything already
+    // established.
+    //
+    // **`getHandleWindowCloseId` is the id used here, and that choice is
+    // `INFERRED`.** The dex does not label which of `getCloseWindowId` and
+    // `getHandleWindowCloseId` is which direction, and nothing in this
+    // session observed either one fire. The reasoning: `get{Open,Close,
+    // Mutate}WindowId` are grouped together, both in `libroblox.so`'s own
+    // export order (`docs/analysis/webview-surface.md` §3c) and in
+    // `STRING_GETTERS` above -- three parallel *commands*, which reads
+    // naturally as engine-to-host, the direction `getOpenWindowId` already
+    // has confirmed. `getHandleWindowCloseId` sits apart from that group,
+    // beside `getIsAvailableId`, and "handle" names the thing that consumes
+    // a report rather than the thing that issues a command -- the same shape
+    // `onDataModelNotificationCallback` and `onAppBridgeNotification` have,
+    // both named for handling something that already happened. If a live run
+    // shows the canvas still blank after this publishes, that reading is
+    // wrong and `getCloseWindowId` — which this file does not otherwise use;
+    // by the same grouping argument it is likely the engine asking the host
+    // to close a window, a distinct feature from this one — is the next
+    // thing to try.
+    let Some(handle_close_id) = get("handle-window-close") else {
+        println!(
+            "  webview: no getHandleWindowCloseId in this build's vocabulary; a closed window \
+             will not be reported to the engine"
+        );
+        return;
+    };
+    let close_bus_id = match cordial_linker_sys::game_activity::call_static_two_strings_ret_string(
+        get_message_id,
+        BUS,
+        &protocol,
+        &handle_close_id,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            println!("  webview: getMessageId({protocol:?}, {handle_close_id:?}) failed: {e}");
+            return;
+        }
+    };
+    let Some(publish_raw) = symbol("Java_com_roblox_universalapp_messagebus_MessageBus_publishRaw")
+    else {
+        println!(
+            "  webview: MessageBus.publishRaw is not exported; a closed window will not be \
+             reported to the engine"
+        );
+        return;
+    };
+    if CLOSE_BUS_ID.set(close_bus_id.clone()).is_err() {
+        println!("  webview: arm() called twice; keeping the first build's close-report bus id");
+    }
+    let _ = PUBLISH_RAW_NATIVE.set(publish_raw as usize);
+    println!(
+        "  webview: armed to report a closed window on {close_bus_id} ({protocol}.{handle_close_id})"
+    );
+}
+
+/// Tell the engine a web window closed.
+///
+/// The missing half of the close handshake reported live: `android::wayland`'s
+/// `webview_dialog_opened`/`webview_dialog_closed` (called from `load.rs`'s
+/// `install_webview_presenter`, in the dialog's own `connect_closed`) lowers
+/// the engine's Wayland subsurface while a dialog is open and raises it again
+/// once the dialog is gone — which makes the *stacking* right, but the engine
+/// blanks its own drawing when a window opens expecting to be covered, and
+/// raising a subsurface back above blank content is still blank content.
+/// Nothing was telling the engine the window it blanked itself for had gone
+/// away. This is that: a publish on [`arm`]'s cached close-report bus id, the
+/// same `MessageBus.publishRaw` mechanism `deeplink.rs`'s `publish_url`
+/// already uses for `Game.launch` — see that function's own doc for why the
+/// engine reading this bus at all is established rather than assumed.
+///
+/// The payload is `{}`. Nothing in this protocol's key vocabulary names a
+/// window identifier (`STRING_GETTERS` has no `getWindowIdKey`), and Cordial
+/// opens at most one web window at a time, so there is nothing else honest to
+/// put in it — inventing a key nobody asked for would be the same mistake
+/// `nativeReportReceived`'s unused second argument is a warning about.
+///
+/// A loud no-op if [`arm`] never got this far — built without
+/// `getHandleWindowCloseId`, `publishRaw` unexported, or `arm` itself never
+/// run. Silence here would read as "the report was sent" to whoever is
+/// reading the log next to a canvas that is still blank.
+pub fn report_window_closed() {
+    let (Some(bus_id), Some(publish_raw)) = (CLOSE_BUS_ID.get(), PUBLISH_RAW_NATIVE.get()) else {
+        println!(
+            "[webview] a window closed, but this build never armed a handle-window-close report \
+             (see arm()'s log above); the engine will not be told"
+        );
+        return;
+    };
+    let f = *publish_raw as *mut c_void;
+    // SAFETY: `publish_raw` was resolved under its own symbol name in `arm`
+    // and never used for anything else; `call_static_strings` owns its own
+    // buffers for the call.
+    match cordial_linker_sys::game_activity::call_static_strings(f, BUS, &[bus_id.as_str(), "{}"]) {
+        Ok(()) => println!("[webview] reported window closed on {bus_id}"),
+        Err(e) => println!("[webview] reporting window closed on {bus_id} failed: {e}"),
+    }
+}
+
+/// Hand an approved bridge message to `WebViewProtocol.signalJavascriptCallback`.
+///
+/// The receiving half of `cordial_shell::webview::set_bridge_sink`, wired to
+/// it by `load.rs`'s `install_webview_presenter` — see that setter's doc for
+/// the crate dependency edge that rules out the shell calling this directly,
+/// and `cordial_shell::webview::open`'s bridge handler for the policy every
+/// message has already passed before it arrives here.
+///
+/// This is the half whose absence made "pressing Join opens the game's detail
+/// page instead of joining it" look like a WebKit bug. It was not: the page's
+/// JS posts its command to `executeRoblox`/`RobloxWKHybrid`, nothing on this
+/// end answered, and the page fell back to ordinary navigation — which is
+/// what a web page does when the application hosting it is not listening.
+///
+/// **The argument shape is established; what the engine does with it is not.**
+/// `signalJavascriptCallback(Ljava/lang/String;)V` is read out of the dex's
+/// own method table (`tools/dex_method.py --class WebViewProtocol`), so the
+/// single `String` is a fact rather than a naming-convention guess. What is
+/// `INFERRED` is that the string the engine wants is the JSON rendering of
+/// the script message the page posted: that is what WebKitGTK hands over and
+/// the only thing this side has, but nothing observed confirms the engine
+/// parses exactly that. **A successful call here is not evidence that Join
+/// worked** — it means the native returned without throwing. The observable
+/// test is a game actually launching, and until someone has seen that, this
+/// having "succeeded" says only that a string reached the engine.
+///
+/// Whether the native is declared static is likewise unsettled, and matters:
+/// [`call_static_strings`] passes the class where an instance method would
+/// want its object. Every other native Cordial reaches this way ignores that
+/// argument, which is why this is worth attempting rather than blocking on —
+/// and a native that does dereference it fails loudly on the error path below
+/// rather than silently doing nothing.
+///
+/// **The message itself is never logged**, only its length. A bridge command
+/// carries whatever the page and the engine are mid-conversation about, and
+/// `docs/analysis/webview-surface.md` §4's rule about one-time authentication
+/// tickets in a web-view url applies to this direction exactly as it does to
+/// that one.
+pub fn forward_bridge_message(message: &str) {
+    let Some(native) = SIGNAL_JAVASCRIPT_CALLBACK_NATIVE.get() else {
+        // Loud, for the same reason `report_window_closed` is: a page that
+        // believes its command was delivered, next to a log that said
+        // nothing, is precisely the lie AGENTS.md's rule about stubs exists
+        // to rule out.
+        println!(
+            "[webview] a bridge message passed policy ({} bytes), but this build never resolved \
+             signalJavascriptCallback (see arm()'s log above); the engine will not receive it",
+            message.len()
+        );
+        return;
+    };
+    let f = *native as *mut c_void;
+    // SAFETY: `native` was resolved under its own symbol name in `arm` and is
+    // never used for anything else; `call_static_strings` owns the buffers it
+    // passes for the duration of the call.
+    match cordial_linker_sys::game_activity::call_static_strings(f, CLASS, &[message]) {
+        Ok(()) => println!(
+            "[webview] forwarded a bridge message to signalJavascriptCallback ({} bytes); \
+             whether the engine acted on it is not established by this line",
+            message.len()
+        ),
+        Err(e) => println!("[webview] forwarding a bridge message failed: {e}"),
+    }
 }
 
 /// What `Connection.isConnected` says about the subscription, or `None` when
@@ -729,6 +1001,14 @@ pub fn to_shell_request(
         show_domain_as_title: request.show_domain_as_title,
         back_button_visible: request.back_button_visible,
         roblox_session_cookie,
+        // Same string `setWebviewUserAgent` gives the engine (see
+        // `load.rs`'s call, wired beside the other `NativeGLInterface`
+        // natives) -- one source of truth in `user_agent()` above, so the
+        // view and the engine cannot disagree about what this client claims
+        // to be. `None` here means `cordial_shell::webview::open` leaves
+        // WebKitGTK's own default in place rather than fabricating a string;
+        // see that module for why a mismatch is worse than a fallback.
+        user_agent: user_agent(),
     }
 }
 

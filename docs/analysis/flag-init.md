@@ -4182,3 +4182,89 @@ Nine instrument faults, eight of them an absence read as evidence. That is the
 finding this file is actually worth, more than any individual candidate: **in
 this codebase, when a measurement says nothing happened, suspect the
 measurement first.** It has been right eight times out of nine.
+
+## §37. The working run was misattributed by one launch, and twenty-three more attempts stay negative
+
+§36 pins the store to `…T074525Z_Player_ec3a3_last.log` because that is the
+nearest-named log to the file's creation. **That attribution is off by one
+launch.** Both logs still exist in `cordial-agent-t` and were read directly:
+
+    ec3a3  starts 07:45:25.241Z, last line 07:45:46.131Z (clean APP_CMD_DESTROY)
+    08d78  starts 07:45:47.245Z, last line 07:46:06.425Z (clean APP_CMD_DESTROY)
+    files.atime in rbx-storage.db: 1787125562730 ms = 07:46:02.730Z
+
+07:46:02.730Z falls inside `08d78`'s window and **16.6 seconds after `ec3a3` had
+already torn down**. The process alive at the instant the row was written is
+`08d78`, not `ec3a3`. Neither log shows a crash — both reach the same clean
+`APP_CMD_PAUSE → …→ APP_CMD_DESTROY → unLoad` sequence — so this is a correction
+to which launch gets credited, not a new lead: a channel-stripped diff of the two
+logs (`diff` after normalising timestamps/thread ids/pointers) shows no
+behavioural difference between them beyond nondeterministic addresses and HTTP
+response numbering. Whatever separates the run that worked from the one right
+next to it left no trace in either log.
+
+**Twenty-three more reproduction attempts, today's HEAD (`v0.5.2-159-g14861e0`,
+some built `-dirty` while other agents held `load.rs`/`webview.rs`), scored on
+the filesystem, all negative:**
+
+    fresh root, default delay, --run 30:              6 runs, db=0
+    warm root (same profile, runs 2-13 above):        6 runs, db=0
+    forced SIGKILL at 3s/6s/6s/10s (simulated crash):  4 runs, db=0
+    warm root after freeing disk (below), --run 30:    5 runs, db=0
+    (running total in this root: 23, all clean-exit or forced-kill, none
+    reproduced)
+
+Killing the process outright (SIGKILL, not a real engine crash) at four
+different points in startup does not trigger it either, which weakens §36.2's
+"a run that died mid-way" speculation without settling it — an external SIGKILL
+and an internal crash are not the same event, and the working root's "several
+crashed partway" was never characterised beyond a run count.
+
+### A variable nobody had checked: the disk was nearly full
+
+`/var/home` measured **3.9 GB available on a 728 GB volume (100% used)** at the
+start of this session — found only because `RbxStorageAvailableDiskSpaceTriggerMB`,
+`RbxStorageMinAvailableDiskSpaceMB`, `RbxStorageLowDiskSpaceMB`,
+`RbxStorageCapacityLowMB/HighMB/FixedMB` and
+`RbxStorageMinAvailableSpaceBeforeCleanupMB` all turned up scanning the binary's
+string table for `RbxStorage`, none of which the delay/warmth/flags/content
+matrix in §36.1–§36.2 had touched. `just clean` (no `all`, so it kept `target`)
+reclaimed `target-toolbox` and raised availability to ~6.6–6.8 GB. Five more runs
+at that level still did not produce a store, so low headroom is at most a
+contributing factor and not, on its own, sufficient — though 6.8 GB may still be
+below whatever threshold gates it, and this machine is shared with other agents'
+concurrent builds, so the number moves under you.
+
+**`getAllocatableBytes` — the Java hook this project already answers via
+`statvfs(".")` (§ near `native/init_params.cpp`'s `LocalStorageManager`) — is
+never called on a plain landing-page run.** Checked two ways: `CORDIAL_ANDROID_TRACE=1`
+shows no call, and a temporary `fprintf` was added directly to
+`LocalStorageManager::getAllocatableBytes`, built, run, and printed nothing over
+several runs (`cargo build --release` and `cargo test --workspace` both passed
+before removing the print; the removal was verified with `git diff --stat`
+showing no residual change). So whatever `RbxStorage::init`'s `AssetProvider`
+caller declines on (§23.6) is not asking Cordial through that surface.
+
+It does ask the kernel directly: `CORDIAL_TRACE_PATHS=1` shows the engine calling
+raw `statvfs()` itself, three times, on `./appData` and the profile's
+`data/files` directory, independent of any hook Cordial answers. That call
+already sees this machine's real, currently-thin headroom — nothing here spoofs
+it — which keeps disk space a live candidate for §23.6's still-open question
+even though the JNI route is ruled out as the channel.
+
+### Where this leaves §23.6's open question
+
+Unchanged in substance: which branch `RbxStorage::init`'s `AssetProvider` caller
+takes on entry, and what condition byte selects it, is still not established.
+This section narrows the search — the condition is not read through
+`getAllocatableBytes`, and disk headroom by itself (delay 3.9→6.8 GB) did not
+flip the outcome — without answering it. §23.6's own next step, a breakpoint on
+each branch target followed by a hardware watchpoint on the condition, is still
+the correct next move and is still undone.
+
+Tally for whoever continues: over forty controlled negative reproductions across
+this file (delay, warmth, the two storage flags, content activity, disk
+headroom, and four simulated crashes) against exactly one positive — this
+session confirmed that positive is real (independently reopened `rbx-storage.db`,
+9 rows, real content, matches §36.3) — now attributed to `08d78` rather than
+`ec3a3`. The trigger is still not known.

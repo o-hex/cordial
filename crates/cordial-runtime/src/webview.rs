@@ -230,6 +230,225 @@ fn take_err(err: Vec<u8>) -> String {
     String::from_utf8_lossy(&err[..end]).into_owned()
 }
 
+// ------------------------------------------------------------- opening it
+//
+// Everything above this point receives the message and, until this change,
+// only measured it. What follows turns the JSON into something
+// `cordial_shell::webview::open` can act on, and names the one call site that
+// is still missing — see [`set_presenter`].
+
+/// The JSON keys this build's engine uses for an `openWindow` message.
+///
+/// Read from [`read_vocabulary`] rather than hardcoded, for the reason that
+/// function's own doc gives: a literal `"url"` is a guess that holds until
+/// Roblox renames the field, and then fails by opening a window with an
+/// empty address and no explanation. [`OpenWindowKeys::from_vocabulary`] is
+/// the only constructor, so a caller cannot assemble one from guessed
+/// strings by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenWindowKeys {
+    pub url: String,
+    pub title: String,
+    pub hide_header: String,
+    pub back_button_visible: String,
+    pub show_domain_as_title: String,
+}
+
+impl OpenWindowKeys {
+    /// Pull the five keys `openWindow` needs out of a vocabulary already read
+    /// from the running engine. `Err` names every getter that was missing
+    /// rather than the first one, because a build missing several of these is
+    /// a different fact from a build missing one, and the difference is worth
+    /// seeing in a single log line rather than one `arm()` retry at a time.
+    pub fn from_vocabulary(v: &Vocabulary) -> Result<Self, Vec<&'static str>> {
+        let get = |label: &'static str| {
+            v.entries.iter().find(|(l, _)| *l == label).map(|(_, value)| value.clone())
+        };
+        let fields: [(&'static str, Option<String>); 5] = [
+            ("key:url", get("key:url")),
+            ("key:title", get("key:title")),
+            ("key:hide-header", get("key:hide-header")),
+            ("key:back-button-visible", get("key:back-button-visible")),
+            ("key:show-domain-as-title", get("key:show-domain-as-title")),
+        ];
+        let missing: Vec<&'static str> =
+            fields.iter().filter(|(_, v)| v.is_none()).map(|(label, _)| *label).collect();
+        if !missing.is_empty() {
+            return Err(missing);
+        }
+        Ok(OpenWindowKeys {
+            url: fields[0].1.clone().expect("checked above"),
+            title: fields[1].1.clone().expect("checked above"),
+            hide_header: fields[2].1.clone().expect("checked above"),
+            back_button_visible: fields[3].1.clone().expect("checked above"),
+            show_domain_as_title: fields[4].1.clone().expect("checked above"),
+        })
+    }
+}
+
+/// An `openWindow` request, parsed and ready to become a
+/// `cordial_shell::webview::WindowRequest` — kept as this crate's own type
+/// rather than that one directly, so [`parse_open_window`] and its tests
+/// compile without `webkitgtk6.0-devel` even when the `webview` feature is
+/// off (see `Cargo.toml`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenWindowRequest {
+    pub url: String,
+    pub title: Option<String>,
+    pub hide_header: bool,
+    pub back_button_visible: bool,
+    pub show_domain_as_title: bool,
+}
+
+/// Parse one `openWindow` payload against this build's own key names.
+///
+/// `url` is the one field a window cannot open without, so a payload missing
+/// it — or carrying it empty — is refused outright rather than opening a
+/// blank window that says nothing about why. The three booleans default to
+/// `false` when absent, which is [`cordial_shell::webview::WindowRequest`]'s
+/// own conservative default (see that type's test): a flag the engine did not
+/// send is a flag Cordial should not invent an opinion about.
+pub fn parse_open_window(json: &str, keys: &OpenWindowKeys) -> Result<OpenWindowRequest, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("openWindow payload is not JSON: {e}"))?;
+    let object = value.as_object().ok_or_else(|| "openWindow payload is not a JSON object".to_string())?;
+    let url = object
+        .get(&keys.url)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("openWindow payload has no non-empty {:?} field", keys.url))?;
+    let flag = |key: &str| object.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    Ok(OpenWindowRequest {
+        url: url.to_string(),
+        title: object.get(&keys.title).and_then(|v| v.as_str()).map(str::to_string),
+        hide_header: flag(&keys.hide_header),
+        back_button_visible: flag(&keys.back_button_visible),
+        show_domain_as_title: flag(&keys.show_domain_as_title),
+    })
+}
+
+/// The largest `.ROBLOSECURITY` value this window will accept.
+///
+/// Cordial's own bound, not mocktail's copied — `webview_roblox_cookie.h`,
+/// which would declare their equivalent constant, is not among the vendored
+/// files (`third_party/mocktail-webview/README.md` lists exactly five `.cc`
+/// files and one `.h`, and it is not this one), so only their reasoning
+/// transfers: a bearer token about to become part of a `Set-Cookie` header
+/// needs a ceiling before an oversized one is a bug rather than a feature.
+pub const MAX_ROBLOSECURITY_COOKIE_BYTES: usize = 4096;
+
+/// Whether `byte` is an RFC 6265 `cookie-octet`.
+fn is_cookie_octet(byte: u8) -> bool {
+    byte == 0x21
+        || (0x23..=0x2b).contains(&byte)
+        || (0x2d..=0x3a).contains(&byte)
+        || (0x3c..=0x5b).contains(&byte)
+        || (0x5d..=0x7e).contains(&byte)
+}
+
+/// Pull `.ROBLOSECURITY`'s value out of one jar.
+///
+/// Derived from mocktail's `webview_roblox_cookie.cc`
+/// (`PrepareWebViewRobloxCookie`), Copyright 2026 komaruworld, Apache-2.0 —
+/// see `NOTICE` and `third_party/mocktail-webview/`. Rewritten against
+/// Cordial's own store rather than translated: mocktail strips a fixed
+/// `.ROBLOSECURITY=` prefix off one canonical header read from Android's
+/// credential manager, while `crate::cookies::load` hands back a `Jar` whose
+/// `expose()`d form is `name=value; name2=value2` for a whole host (see that
+/// module's `to_settable`), so this scans for the pair instead of a prefix.
+/// What is kept unmodified is the reason for the character-class check: the
+/// value is headed for a `Set-Cookie` header WebKit will send over the wire,
+/// and a byte outside `cookie-octet` there is a header-injection surface, not
+/// a display bug.
+pub fn extract_roblosecurity(jar: &str) -> Result<String, &'static str> {
+    for pair in jar.split(';') {
+        let Some((name, value)) = pair.trim().split_once('=') else { continue };
+        if name != ".ROBLOSECURITY" {
+            continue;
+        }
+        if value.is_empty() {
+            return Err(".ROBLOSECURITY is present but empty");
+        }
+        if value.len() > MAX_ROBLOSECURITY_COOKIE_BYTES {
+            return Err(".ROBLOSECURITY is larger than this window will accept");
+        }
+        if !value.bytes().all(is_cookie_octet) {
+            return Err(".ROBLOSECURITY contains a byte outside cookie-octet");
+        }
+        return Ok(value.to_string());
+    }
+    Err("no .ROBLOSECURITY pair in this jar")
+}
+
+/// The signed-in session's `.ROBLOSECURITY`, for the profile stored at `dir`,
+/// or `None` for "signed out" and "the store could not be read" alike — both
+/// mean the window opens without a session, the same conservative default
+/// [`crate::cookies::load`] already uses when there is nothing to restore.
+///
+/// Deliberately not called from [`on_open_window`]. That callback runs on
+/// whichever thread the engine published `openWindow` from, which this crate
+/// has never established is safe to block on a Secret Service round trip
+/// (`secrets.rs`'s own `CALL_TIMEOUT` is five seconds) — reading a stored
+/// cookie belongs at the point something is about to call
+/// `cordial_shell::webview::open`, on whatever thread that turns out to be,
+/// not folded into message receipt on a thread this module does not own.
+///
+/// Never logs the value — only [`extract_roblosecurity`]'s error strings,
+/// which name a reason and never a byte of the cookie, are fit to print, the
+/// same discipline `secrets.rs` and `cookies.rs` already hold themselves to.
+pub fn roblox_session_cookie(dir: &std::path::Path) -> Option<String> {
+    let jars = crate::cookies::load(dir);
+    let (_, jar) = jars.iter().find(|(host, _)| host == "roblox.com" || host == ".roblox.com")?;
+    match extract_roblosecurity(jar.expose()) {
+        Ok(value) => Some(value),
+        Err(reason) => {
+            println!("  webview: stored session is unusable for the web window: {reason}");
+            None
+        }
+    }
+}
+
+/// What actually presents a parsed request as a window, installed once by
+/// whoever owns a live `cordial_shell::host_window::HostWindow` to attach it
+/// to.
+///
+/// **Nothing in this crate installs one**, and that is the honest state of
+/// this change rather than an oversight. Every place that owns a
+/// `HostWindow` — `crates/cordial-runtime/src/android/wayland.rs`'s
+/// `HostWindowCell`, and `crates/cordial-runtime/src/bin/load.rs`, which
+/// calls [`arm`] in the first place — was off limits to edit for the change
+/// that added this module's parsing and cookie handling, so the one call this
+/// needed to actually render a window could not be made here. What is
+/// missing is exactly one line, added at that ownership site once it is not
+/// off limits: `cordial_runtime::webview::set_presenter(...)`, with a closure
+/// that marshals onto the GTK thread — a `glib::MainContext::channel` whose
+/// receiver is `.attach()`ed once works, and needs no new call site of its
+/// own, because `HostWindow::pump` already iterates that context every
+/// engine loop tick — and then calls `cordial_shell::webview::open` with a
+/// [`OpenWindowRequest`] converted by hand (its fields map onto
+/// `WindowRequest`'s one for one) and, if wanted, a cookie from
+/// [`roblox_session_cookie`].
+///
+/// Until that line exists, [`on_open_window`] logs that a request arrived and
+/// was not presented, which is the true state of the feature rather than a
+/// claim it works.
+type Presenter = dyn Fn(OpenWindowRequest) + Send + Sync;
+static PRESENTER: OnceLock<std::sync::Arc<Presenter>> = OnceLock::new();
+
+/// Install the presenter [`on_open_window`] hands parsed requests to. See
+/// that type's doc for what a presenter has to do and why nothing here
+/// installs one. Only the first call takes effect — later ones are reported,
+/// not silently dropped, because two presenters racing to open the same
+/// request is a bug worth seeing rather than one that quietly resolves itself
+/// in whichever order closures happened to run.
+pub fn set_presenter(f: impl Fn(OpenWindowRequest) + Send + Sync + 'static) {
+    if PRESENTER.set(std::sync::Arc::new(f)).is_err() {
+        println!("  webview: set_presenter called twice; the first presenter installed is the one in effect");
+    }
+}
+
+static KEYS: OnceLock<OpenWindowKeys> = OnceLock::new();
+
 static CONNECTION: AtomicI64 = AtomicI64::new(0);
 static IS_CONNECTED_NATIVE: OnceLock<usize> = OnceLock::new();
 
@@ -237,29 +456,63 @@ static IS_CONNECTED_NATIVE: OnceLock<usize> = OnceLock::new();
 /// `openWindow`.
 ///
 /// Runs on whichever thread the engine published from, same as clipboard's
-/// `on_payload`. Unlike clipboard, there is nothing here that needs the GTK
-/// thread — this prints and returns, it does not touch a window or a
-/// clipboard — so there is no pending slot to park into and no pump to drain
-/// it.
+/// `on_payload`. Parsing is safe there — it touches no GTK object, only
+/// `serde_json` — but presenting the result is not, which is why the parsed
+/// request is handed to whatever [`set_presenter`] installed rather than
+/// acted on directly here.
 ///
-/// **The JSON is measured, never read.** Scope for this change is receiving
-/// the message, not acting on it — opening a window is `cordial-shell`'s, out
-/// of reach here — and the payload may carry a URL with a session token in
-/// it, so only its size is fit to print. `text_from_payload` in
-/// `android::clipboard` is the pattern for a module that does need the
-/// content: it exists, and this module deliberately does not call anything
-/// like it yet.
+/// **The URL itself is never printed**, only what
+/// `cordial_shell::webview_policy::evaluate` says about it — a scheme and a
+/// host — because a Roblox web-view URL can carry a one-time authentication
+/// ticket in its query string (`docs/analysis/webview-surface.md` §4's rule,
+/// applied here). That module needs no `webkitgtk6.0-devel` and is always
+/// compiled, so this call does not need the `webview` feature either.
 extern "C" fn on_open_window(json: *const c_char) {
     if json.is_null() {
         println!("[webview] openWindow published with a null payload");
         return;
     }
     // SAFETY: the C side passes a NUL-terminated string that outlives the
-    // call. Measured as raw bytes rather than decoded to `str`: a byte count
-    // is all this prints, so there is no reason to reject a payload over a
-    // UTF-8 question this module has no use for the answer to.
-    let json = unsafe { CStr::from_ptr(json) };
-    println!("[webview] openWindow message arrived: {} bytes", json.to_bytes().len());
+    // call.
+    let bytes = unsafe { CStr::from_ptr(json) }.to_bytes();
+    let Ok(json) = std::str::from_utf8(bytes) else {
+        println!("[webview] openWindow message arrived: {} bytes, not valid UTF-8", bytes.len());
+        return;
+    };
+    let Some(keys) = KEYS.get() else {
+        println!(
+            "[webview] openWindow message arrived: {} bytes, but this build's key vocabulary was \
+             never read (arm() must run first, and must find getUrlKey and friends)",
+            bytes.len()
+        );
+        return;
+    };
+    match parse_open_window(json, keys) {
+        Ok(request) => {
+            let verdict = cordial_shell::webview_policy::evaluate(&request.url);
+            println!(
+                "[webview] openWindow message arrived: {} bytes, host {} (scheme {}), privileged \
+                 {}, hideHeader {}, backButtonVisible {}, showDomainAsTitle {}",
+                bytes.len(),
+                verdict.host,
+                verdict.scheme,
+                verdict.privileged_bridge_allowed,
+                request.hide_header,
+                request.back_button_visible,
+                request.show_domain_as_title,
+            );
+            match PRESENTER.get() {
+                Some(present) => present(request),
+                None => println!(
+                    "[webview] no presenter installed; nothing will render this window. See \
+                     `set_presenter`'s doc in this module for the one remaining call site."
+                ),
+            }
+        }
+        Err(reason) => {
+            println!("[webview] openWindow message arrived: {} bytes, but could not be parsed: {reason}", bytes.len());
+        }
+    }
 }
 
 /// Subscribe to the engine's `openWindow` message.
@@ -281,6 +534,19 @@ extern "C" fn on_open_window(json: *const c_char) {
 /// right before it hands control to that pump.
 pub fn arm(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) {
     let vocabulary = read_vocabulary(&mut symbol);
+    match OpenWindowKeys::from_vocabulary(&vocabulary) {
+        Ok(keys) => {
+            if KEYS.set(keys).is_err() {
+                println!("  webview: arm() called twice; keeping the first build's key vocabulary");
+            }
+        }
+        Err(missing) => println!(
+            "  webview: this build is missing {} of openWindow's key getters ({}); a message will \
+             arrive and cannot be parsed until they are",
+            missing.len(),
+            missing.join(", ")
+        ),
+    }
     let get = |label: &str| {
         vocabulary
             .entries
@@ -389,6 +655,31 @@ pub fn connected() -> Option<bool> {
     (rc == 0).then_some(out != 0)
 }
 
+/// Convert a parsed request into what `cordial_shell::webview::open` takes.
+///
+/// A one-for-one field mapping, kept as an explicit function rather than
+/// inlined at the one call site that needs it (see [`set_presenter`]'s doc)
+/// so that call site is a conversion plus an `open()` call and nothing more.
+/// `roblox_session_cookie` is threaded through rather than looked up here,
+/// because [`roblox_session_cookie`] and this conversion have different
+/// callers in mind — a presenter fetches the cookie itself, on whatever
+/// thread it decided was safe to do a Secret Service round trip on, and
+/// passes the result in.
+#[cfg(feature = "webview")]
+pub fn to_shell_request(
+    request: &OpenWindowRequest,
+    roblox_session_cookie: Option<String>,
+) -> cordial_shell::webview::WindowRequest {
+    cordial_shell::webview::WindowRequest {
+        url: request.url.clone(),
+        title: request.title.clone(),
+        hide_header: request.hide_header,
+        show_domain_as_title: request.show_domain_as_title,
+        back_button_visible: request.back_button_visible,
+        roblox_session_cookie,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +762,160 @@ mod tests {
     fn arm_does_nothing_when_the_vocabulary_is_not_exported() {
         arm(|_| None);
         assert!(connected().is_none(), "a bare arm() with nothing exported must not connect");
+    }
+
+    /// A stand-in vocabulary for the parsing tests below. **Not a claim about
+    /// what any real build's `getUrlKey` and friends return** — nobody has
+    /// run a signed-in client and watched `openWindow` fire (see this
+    /// module's doc and `docs/analysis/webview-surface.md` §6, "not
+    /// established"), so the true key strings are unknown here. What is
+    /// tested is [`parse_open_window`]'s behaviour given *some* self-
+    /// consistent vocabulary, which is everything a unit test can honestly
+    /// claim without a running engine.
+    fn stand_in_keys() -> OpenWindowKeys {
+        OpenWindowKeys {
+            url: "url".into(),
+            title: "title".into(),
+            hide_header: "hideHeader".into(),
+            back_button_visible: "backButtonVisible".into(),
+            show_domain_as_title: "showDomainAsTitle".into(),
+        }
+    }
+
+    #[test]
+    fn from_vocabulary_reads_every_key_by_its_label() {
+        let v = Vocabulary {
+            entries: vec![
+                ("key:url", "u".into()),
+                ("key:title", "t".into()),
+                ("key:hide-header", "hh".into()),
+                ("key:back-button-visible", "bbv".into()),
+                ("key:show-domain-as-title", "sdat".into()),
+            ],
+            missing: Vec::new(),
+        };
+        let keys = OpenWindowKeys::from_vocabulary(&v).expect("all five present");
+        assert_eq!(keys.url, "u");
+        assert_eq!(keys.title, "t");
+        assert_eq!(keys.hide_header, "hh");
+        assert_eq!(keys.back_button_visible, "bbv");
+        assert_eq!(keys.show_domain_as_title, "sdat");
+    }
+
+    /// Every missing getter must be named, not just the first — see the
+    /// function's own doc for why a partial vocabulary is a different fact
+    /// from a single hole in it.
+    #[test]
+    fn from_vocabulary_names_every_missing_getter() {
+        let v = Vocabulary { entries: vec![("key:url", "u".into())], missing: Vec::new() };
+        let missing = OpenWindowKeys::from_vocabulary(&v).unwrap_err();
+        assert_eq!(missing.len(), 4);
+        assert!(!missing.contains(&"key:url"));
+        assert!(missing.contains(&"key:title"));
+    }
+
+    /// A constructed payload shaped like a real `openWindow` message under
+    /// `stand_in_keys()` — **not a captured one**. Reproducing a real one
+    /// needs a click in a signed-in client, which this session could not do
+    /// (AGENTS.md's caution on synthesised input, and the task's own
+    /// instruction not to sign in). The one real observation on record is a
+    /// log line reading "90 bytes" with no field-level content in it, so
+    /// this cannot even be checked against that shape beyond order of
+    /// magnitude. It is included because it is the honest version of what
+    /// was asked for, not a stand-in for the real thing.
+    #[test]
+    fn a_constructed_open_window_payload_parses() {
+        let json = r#"{"url":"https://www.roblox.com/games/mock","hideHeader":false}"#;
+        // Recorded rather than asserted to a specific figure: the point is
+        // that this is the same order of magnitude as the one real capture
+        // ("90 bytes"), not that it reproduces it.
+        assert!(json.len() > 40 && json.len() < 200, "payload should be a small JSON object, was {} bytes", json.len());
+        let request = parse_open_window(json, &stand_in_keys()).expect("a well-formed payload parses");
+        assert_eq!(request.url, "https://www.roblox.com/games/mock");
+        assert!(!request.hide_header);
+        assert!(!request.back_button_visible, "absent fields default to false");
+        assert!(request.title.is_none());
+    }
+
+    #[test]
+    fn a_payload_with_no_url_is_refused() {
+        let err = parse_open_window(r#"{"title":"Marketplace"}"#, &stand_in_keys()).unwrap_err();
+        assert!(err.contains("url"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_url_is_refused_the_same_as_a_missing_one() {
+        let err = parse_open_window(r#"{"url":""}"#, &stand_in_keys()).unwrap_err();
+        assert!(err.contains("url"), "{err}");
+    }
+
+    #[test]
+    fn malformed_json_is_refused_rather_than_panicking() {
+        assert!(parse_open_window("not json", &stand_in_keys()).is_err());
+        assert!(parse_open_window("[]", &stand_in_keys()).is_err(), "an array is not an object");
+    }
+
+    #[test]
+    fn a_valid_roblosecurity_pair_is_extracted() {
+        let jar = ".ROBLOSECURITY=abc123-value; other=1";
+        assert_eq!(extract_roblosecurity(jar).unwrap(), "abc123-value");
+    }
+
+    #[test]
+    fn a_jar_with_no_roblosecurity_pair_is_refused() {
+        assert!(extract_roblosecurity("other=1; another=2").is_err());
+    }
+
+    #[test]
+    fn an_empty_roblosecurity_value_is_refused() {
+        assert_eq!(
+            extract_roblosecurity(".ROBLOSECURITY=; other=1").unwrap_err(),
+            ".ROBLOSECURITY is present but empty"
+        );
+    }
+
+    /// The header-injection shape: a control byte or a semicolon-adjacent
+    /// character smuggled into the value would land inside a `Set-Cookie`
+    /// header WebKit sends verbatim.
+    #[test]
+    fn a_roblosecurity_value_with_an_unsafe_byte_is_refused() {
+        assert!(extract_roblosecurity(".ROBLOSECURITY=abc\ndef").is_err());
+        assert!(extract_roblosecurity(".ROBLOSECURITY=abc\"def").is_err());
+    }
+
+    #[test]
+    fn an_oversized_roblosecurity_value_is_refused() {
+        let huge = "a".repeat(MAX_ROBLOSECURITY_COOKIE_BYTES + 1);
+        assert!(extract_roblosecurity(&format!(".ROBLOSECURITY={huge}")).is_err());
+    }
+
+    /// `set_presenter` records only the first installation, deterministically
+    /// — a second one is reported rather than silently replacing or being
+    /// silently ignored. Run in isolation from the other `PRESENTER` state
+    /// this file's tests might otherwise race on: this is the only test that
+    /// touches it, so no lock is needed beyond that.
+    #[test]
+    fn set_presenter_keeps_the_first_installation() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        set_presenter(|_req| {
+            CALLS.fetch_add(1, O::SeqCst);
+        });
+        // A second installation must not panic and must not replace the
+        // first -- there is no second `CALLS` counter to prove it changed,
+        // which is the point: nothing observable here should change.
+        set_presenter(|_req| {
+            CALLS.fetch_add(100, O::SeqCst);
+        });
+        if let Some(present) = PRESENTER.get() {
+            present(OpenWindowRequest {
+                url: "https://www.roblox.com/".into(),
+                title: None,
+                hide_header: false,
+                back_button_visible: false,
+                show_domain_as_title: false,
+            });
+        }
+        assert_eq!(CALLS.load(O::SeqCst), 1, "the second presenter must never run");
     }
 }

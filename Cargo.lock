@@ -303,6 +303,7 @@ dependencies = [
  "cordial-plugins",
  "cordial-shell",
  "gtk4",
+ "libadwaita",
  "libmimalloc-sys",
  "serde_json",
  "ureq",

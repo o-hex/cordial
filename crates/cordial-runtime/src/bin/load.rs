@@ -779,6 +779,64 @@ fn wire_refresh_rate(lib: linker::Library) {
     }
 }
 
+/// Install what `cordial_runtime::webview::on_open_window` hands a parsed
+/// request to, so an `openWindow` message actually opens something instead of
+/// only being logged.
+///
+/// Called once, right after `webview::arm`, from the same thread that owns
+/// GTK's `MainContext` -- the looper thread, which is where every other GTK
+/// call this file makes already happens. That matters for *this* call, the
+/// one that registers the closure, but not for the closure's own body: the
+/// engine can publish `openWindow` from any of its own threads (see
+/// `webview::on_open_window`'s doc), so the closure re-enters the GTK thread
+/// itself on every call, via `MainContext::default().invoke`, rather than
+/// assuming it is already there.
+///
+/// `#[cfg(feature = "webview")]` because the closure's body ends in
+/// `cordial_shell::webview::open`, an actual `WebKitWebView` -- see that
+/// feature's own comment in `Cargo.toml`. The `#[cfg(not(...))]` twin below
+/// keeps the call site at the top of this function unconditional and says
+/// plainly, once, why nothing will render: a build without the feature must
+/// not silently swallow every `openWindow` with no explanation, which is
+/// exactly the failure this whole module exists to end.
+#[cfg(feature = "webview")]
+fn install_webview_presenter() {
+    cordial_runtime::webview::set_presenter(|request| {
+        gtk4::glib::MainContext::default().invoke(move || {
+            let Some(window) = cordial_runtime::android::wayland::current() else {
+                println!(
+                    "[webview] presenter ran with no Wayland host window open; nothing to attach \
+                     the web window to"
+                );
+                return;
+            };
+            // Fetched here, on the GTK thread, right before it is needed --
+            // not inside `on_open_window`, which runs on a thread this crate
+            // has never established is safe to block on a Secret Service
+            // round trip. See `webview::roblox_session_cookie`'s own doc.
+            let cookie =
+                cordial_runtime::webview::roblox_session_cookie(&cordial_runtime::profile::active());
+            let shell_request = cordial_runtime::webview::to_shell_request(&request, cookie);
+            match cordial_shell::webview::open(window.window(), &shell_request) {
+                Some(_dialog) => println!("[webview] presented an openWindow request"),
+                None => println!(
+                    "[webview] openWindow request was refused by policy before it could be presented"
+                ),
+            }
+        });
+    });
+    println!("  webview: presenter installed; an openWindow request will now be attached to the host window");
+}
+
+#[cfg(not(feature = "webview"))]
+fn install_webview_presenter() {
+    println!(
+        "  webview: built without the `webview` feature (needs webkitgtk6.0-devel); an \
+         openWindow request will be parsed and logged but nothing will be shown -- see \
+         `just build toolbox`"
+    );
+}
+
 /// The engine's own version, read out of `libroblox.so` rather than hardcoded.
 ///
 /// This existed as a hardcoded `"2.732.0.1043"` with a comment claiming it was
@@ -3125,6 +3183,7 @@ fn main() -> ExitCode {
                                                 // clipboard's but after the
                                                 // same precondition holds.
                                                 cordial_runtime::webview::arm(|name| lib.symbol(name));
+                                                install_webview_presenter();
 
                                                 cordial_runtime::android::looper::pump(
                                                     std::time::Duration::from_secs(secs),

@@ -152,6 +152,8 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use libadwaita as adw;
+
 // ------------------------------------------------------------- wire layout
 //
 // `struct wl_interface`, from `wayland-util.h`. Only the type is needed now,
@@ -1615,6 +1617,23 @@ impl WaylandWindow {
     pub fn geometry(&self) -> (i32, i32, i32) {
         let g = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         (g.width, g.height, g.format)
+    }
+
+    /// The `adw::Window` `HostWindowCell` wraps.
+    ///
+    /// Two callers were both blocked on this and neither invented a second
+    /// way to reach the window: `load.rs`'s `wire_refresh_rate` names it in
+    /// its own doc comment as the one thing missing before
+    /// `gdk::Display::monitor_at_surface` can say which output the window is
+    /// actually on, and `cordial_runtime::webview`'s presenter (installed
+    /// from `load.rs`, right after `webview::arm`) needs exactly this to
+    /// attach an opened web window to. Reading it is safe under the same
+    /// rule `HostWindowCell`'s own `unsafe impl Send`/`Sync` already states:
+    /// everything that reaches this window runs on the thread that called
+    /// `open`, and both callers above only ever do so from inside a
+    /// `glib::MainContext` closure that main thread itself runs.
+    pub fn window(&self) -> &adw::Window {
+        self.host.0.window()
     }
 
     pub fn connection_fd(&self) -> c_int {

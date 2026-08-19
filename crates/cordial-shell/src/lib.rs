@@ -35,3 +35,19 @@ pub mod pvpn;
 // `crates/cordial-runtime/src/bin/load.rs`'s `wire_refresh_rate` for what
 // that still needs and does not yet have.
 pub mod refresh_watch;
+// `webview_policy` needs nothing beyond `gtk4::glib::Uri`, so it is always
+// compiled and always under test -- see its own header on why it is the part
+// that has to be right. `webview` needs `webkitgtk6.0-devel`, which is the
+// `webview` feature's whole reason for existing (see `Cargo.toml`).
+//
+// Both used to be `mod`, private to the `cordial-shell` binary, and nothing
+// else in that binary ever called `webview::open`. That made the module dead
+// code in the strongest sense: not merely unused but unreachable from
+// `cordial-runtime`, which is the crate that actually receives Roblox's
+// `openWindow` request (`crates/cordial-runtime/src/webview.rs`). Declaring
+// both here, the way `host_window` already is, is what makes that crate able
+// to call them at all -- `main.rs` no longer declares its own copies, and
+// nothing there used to reference them either.
+pub mod webview_policy;
+#[cfg(feature = "webview")]
+pub mod webview;

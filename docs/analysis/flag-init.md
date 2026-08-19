@@ -4268,3 +4268,105 @@ headroom, and four simulated crashes) against exactly one positive — this
 session confirmed that positive is real (independently reopened `rbx-storage.db`,
 9 rows, real content, matches §36.3) — now attributed to `08d78` rather than
 `ec3a3`. The trigger is still not known.
+
+## §38. The empty value is written twice: a working `./appData` is built, then wiped, with no host call between
+
+§35's own next step, taken literally: `RbxStorage::init`'s entry (`0x23121ae`,
+bounds from `.eh_frame`, per the brief that opened this) is a real function
+boundary, so poking it directly needs no disassembly. It fires exactly once per
+run, on the same pool-spawned thread the three `stat("")` calls already put on
+record, `eStopReasonSignal` as §10 says a manual poke reports — never
+`eStopReasonBreakpoint`, checked explicitly this time rather than assumed.
+
+**The buffer's address is fixed relative to the stack pointer at that instant.**
+`path_ptr − sp_at_init_entry = −0x3b7`, measured on two calibration runs and then
+used as a predictor on two more: in every case the address it names is exactly
+the one the three `stat("")` breakpoints (§26's own sites, `0x226eea1` etc.,
+reproduced here unchanged) later read as `real`. So a write watchpoint can be
+armed on the right byte *before RbxStorage::init's body has executed a single
+instruction of its own* — earlier than any of this document's previous
+watchpoints, which could only be placed once the empty value was already
+observed.
+
+**Two writes happen before the first `stat("")`, both on the pool thread, both
+inside the same immediate caller frame (`0x23125ef`, called from `0x230c3b4` ←
+`0x230bd04` — frames #6/#7 already on record from §26/§28):**
+
+    0x226ea27  (via 0x2315dd0 ← 0x23125ef)   writes "./appData\0"
+    0x23160ec  (directly in 0x23125ef, right after the call above returns)
+                                              overwrites it with zero
+
+The first write is not a guess at content — it is the literal bytes read off the
+watched address, byte-identical across three separate runs:
+`12 2e 2f 61 70 70 44 61 74 61 00 …`, nine characters plus terminator, and the
+byte immediately before the data pointer reads `0x12` — `9 << 1`, the libc++
+short-string-optimisation size tag for a 9-byte string in the "short" (non-heap)
+representation. This is the *same string* Cordial's `stat("./appData")` already
+succeeds on twice in this same function (§25). A correct candidate is built and
+then discarded, in the same frame, by the very next thing that frame does.
+
+Only after both writes does control reach the three `stat("")` sites this
+document has had since §26. All three confirm the buffer is empty by the time
+it is used — consistent with everything §26–§37 already measured, now with the
+write that produces the emptiness identified rather than inferred from its
+absence.
+
+### No Cordial-owned filesystem shim runs between the write and the wipe
+
+`s_stat`, `s_lstat`, `s_access`, `s_opendir`, `s_realpath`, `s_readlink`,
+`s_open` and `s_statvfs` were all breakpointed — host code, so these resolve
+normally, unlike anything inside `libroblox.so` — armed the instant
+`RbxStorage::init`'s entry was caught, before either write happens. Two full
+runs recorded the whole sequence end to end: the earliest host call of any kind
+(an unrelated `s_lstat`, on a different thread entirely) fires roughly ninety log
+lines *after* the wipe, never inside the window. Whatever discards `./appData`
+does so without asking the host anything Cordial answers through the symbol
+table — not `getAllocatableBytes` (already ruled out, §37), not a path check,
+not a directory setter, nothing that would show up as a call out of
+`libroblox.so` at all in this window.
+
+**Measured four times.** Three clean runs reproduce the write-then-wipe
+sequence byte-for-byte and address-for-address once the ASLR base is subtracted
+out (two of them additionally confirmed the no-host-call result). A fourth run
+took an unrelated signal before ever reaching `RbxStorage::init`
+(`roblox_off 0x226e947`, a different address family, not the poke) — not scored,
+consistent with the occasional crash this document has always set aside without
+characterising rather than a new finding about the poke itself.
+
+### What this settles, and what it does not
+
+This is §35's contradiction addressed from the write side rather than the read
+side. Sober's engine text is byte-identical to Cordial's (§31) because nothing
+here is a missing instruction: the code that builds a correct `./appData`
+candidate runs in both, measured directly for the first time rather than assumed
+from binary equality. What differs is that something immediately downstream
+discards it, and that discarding is not conditioned — in this window, by this
+measurement — on anything Cordial supplies. Disk headroom (§37), the storage
+flags (§36.1) and content activity (§36.2) were already ruled out as gating
+variables; none of them appear as a call here either, which is a second,
+independent way of ruling them out for this specific step.
+
+**Engine-internal, not a host input Cordial withholds — for this step
+specifically.** The question §35 left open — does the empty value come from
+something Cordial can supply, or is it discarded inside the engine with nothing
+to hand it — is now measured rather than inferred: the wipe happens with no
+observable host call in the window, on two independently instrumented runs. Per
+the rule this document has needed nine times already, that is not proof against
+*any* earlier host influence at all — something read before `RbxStorage::init`'s
+own entry could still have set a flag the wipe branches on, and this measurement
+cannot see back past the function boundary it started at — but it is a direct
+answer to the specific question this section set out to ask, not another
+channel-absence argument.
+
+No fix follows from this, and none should be attempted: the wipe is a write
+inside `libroblox.so`'s own text, and
+[ADR-001](../adr/ADR-001-in-process-hooking.md)/[ADR-003](../adr/ADR-003-plugin-isolation.md)
+keep patching it out of scope for the same reason a script executor is out of
+scope — the absence is deliberate, and this finding does not change that. What
+this section adds is that the "twenty-sixth candidate" §35 predicted was not a
+missing host answer: it is a specific, located, four-times-reproduced pair of
+writes inside the engine, and nobody needs to guess at its shape again. Whoever
+continues from here and wants to go further has one narrower, harder question
+left: what, read *before* `0x23121ae`, the branch at `0x23160ec` is conditioned
+on — which means placing a watchpoint on whatever that branch reads, not on the
+path buffer, and accepting that the read may predate this function entirely.

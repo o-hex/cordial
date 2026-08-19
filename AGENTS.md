@@ -135,7 +135,12 @@ cargo test --workspace
 
 Both must pass. Run them; do not assume.
 
-Running the client needs an APK the user supplies — Cordial ships none:
+Running the client needs an APK the user supplies — Cordial ships none. On this
+machine it is at
+`~/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk`,
+downloaded by Sober, with the extracted library at `~/.cache/cordial/lib/x86_64`.
+**Three agents in succession have concluded no APK exists here and lost a session
+each to it.** Look there before searching:
 
 ```bash
 cargo run --release --bin cordial-run -- \

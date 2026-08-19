@@ -3871,3 +3871,45 @@ which is as likely to be a channel difference as a behavioural one.
 
 None of this is a candidate yet. It is the shape of the successful path recorded
 properly, so the next attempt starts from a comparison rather than from a guess.
+
+### §35.2 Cordial's block skips three steps in the middle, not at the end
+
+Channel sets compared over the window from process start to Sober's
+`RbxStorage::init`. Exactly three channels appear on Sober and never in Cordial:
+
+    [DFLog::AppPlatformQoSEmergency]
+    [FLog::IxpStorageManager]
+    [DFLog::RbxStorage]
+
+The third is the failure itself. The other two matter because of *where* they sit.
+Sober's order is ClientRunInfo → **QoS handler instanced** → Mimalloc → Build
+system id → AppMemUsageStatus → **IxpStorageManager** → tombstone **read** →
+holdout → LocalStorageHandler → storage. Cordial produces ClientRunInfo →
+Mimalloc → Build system id → AppMemUsageStatus → holdout → LocalStorageHandler,
+and then fails.
+
+**So the block is not truncated at the end. It is missing three steps from the
+middle** and completing everything around them, which is a different fault from
+anything assumed so far.
+
+And it is not a flag. `DFFlagEnableAppPlatformQoSEmergencyOnStartup3` is **True**
+in the live document, alongside `DFIntPlatformQoSEmergencyType = 1` and a
+`DFStringPlatformQoSEmergencyEndpointList` carrying about thirty endpoint
+patterns. The QoS handler is enabled and Cordial still never instantiates it.
+
+Two readings, and nothing here separates them:
+
+* the three steps are attempted and each fails silently, in which case whatever
+  they have in common is the lead — all three touch storage or the network, and
+  the endpoint list is by far the largest single string in the settings document;
+* or they are logged on channels Cordial's build has quiet, in which case this is
+  a fourth instrument fault of the same family as the seven already recorded and
+  the block is fine.
+
+**Distinguishing them is the next measurement**, and it is cheap: the asset and
+path tracers now cover misses, so instrument whether the QoS handler's
+constructor and the Ixp cache open are *attempted* at all. §22.3's finding that
+channel values are heterogeneous — a bare number silences a channel that wants a
+severity name — makes the second reading more plausible than it looks, and the
+tombstone case is the tell: Cordial demonstrably *does* open
+`cache/tombstone.dat` (it is in the path trace) while never logging a read.

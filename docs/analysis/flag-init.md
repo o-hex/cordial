@@ -1885,3 +1885,52 @@ The mechanism is now observed. The engine says which texture manager it chose,
 and it chose the one the flag leaves available. Whether the resulting textures
 look better is still a judgement nobody has made side by side — but "the flag
 reaches the engine and changes which manager runs" is no longer inferred.
+
+## §21. Settings before `initializeNativeCode`, with the bootstrap intact: no change
+
+The early `nativeInitClientSettings` call was added because the first
+`flags FAILED` was seen arriving before settings had been delivered at all — the
+answer arriving after the question it was meant to inform. It was then wired
+behind `CORDIAL_NO_BOOTSTRAP`, so "settings early" and "no bootstrap" have only
+ever been true together and the useful half was never tested alone.
+
+`CORDIAL_EARLY_SETTINGS=1` decouples them. Controlled on the same build:
+
+    baseline                   early=0  onFlagsFailed=2  RbxStorage=0  ClientRunInfo=0
+    CORDIAL_EARLY_SETTINGS=1   early=1  onFlagsFailed=2  RbxStorage=0  ClientRunInfo=0
+
+The call fires and nothing moves. **Candidate ten, eliminated.**
+
+That one mattered more than the others because §12 measured the verdict being
+reached inside `initializeNativeCode` before any settings call, which made "the
+engine wants its flags already present when that runs" the obvious reading. It is
+wrong: the flags can be present and the verdict is the same.
+
+The switch stays, off by default, because it is now the only way to vary that
+ordering without also changing the bootstrap and it will be wanted again.
+
+### The eliminated list, in one place
+
+Ten now. The empty `ArrayList`; `channelPlatformName`; the device identity; every
+flag routing `RbxStorage`'s construction; four settings-document variants; a
+missing call in mocktail's pre-settings path; Cordial's early settings call as
+originally wired; the `Configuration` object being empty; delivering settings
+before `initializeNativeCode` with the bootstrap intact; and — from §17 —
+`bootstrapTheApp` needing to deliver anything, which mocktail disproves by
+reaching `flagLoaded` with a one-line no-op.
+
+### What is left that has not been tried
+
+Two things, and both are larger than a flag.
+
+**The `_IO_fflush` crashes are fixed but their consequences are not explored.**
+§19 turned three segfaults into named errors, and one of them said
+`Can't initialize the TaskScheduler before flags have been loaded`. §19.1 pinned
+that to the late-settings ordering only. Nobody has yet asked what *does* bring
+the scheduler up on the default path, or whether the flags machinery runs behind
+it there too, quietly, without the fatal error.
+
+**Loud logging is exhausted as a technique.** 135 channels at maximum produce
+5961 lines and not one about the verdict — before or after the stdio fix, which
+was the last hope that the engine had been trying to tell us and could not. It
+had not. Whatever decides this does not log.

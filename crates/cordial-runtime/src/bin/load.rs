@@ -1117,8 +1117,31 @@ fn main() -> ExitCode {
                             .symbol(
                                 "Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings",
                             )
+                            // `CORDIAL_EARLY_SETTINGS=1` decouples this from
+                            // the bootstrap switch, which is a combination
+                            // nobody has run.
+                            //
+                            // The early call was added because the first
+                            // `flags FAILED` was seen arriving before
+                            // `nativeInitClientSettings` had been called at
+                            // all — the settings were being delivered after
+                            // the decision they were meant to inform. But it
+                            // was wired behind `CORDIAL_NO_BOOTSTRAP`, so
+                            // "settings before `initializeNativeCode`" and
+                            // "no bootstrap" have only ever been true together,
+                            // and the useful half has never been tested alone.
+                            //
+                            // §12 measured the verdict being reached inside
+                            // `initializeNativeCode`, before any settings call.
+                            // If the engine wants its flags already present when
+                            // that runs, this is the shape of the fix and the
+                            // coupling is why it looked like it had been ruled
+                            // out. Off by default: it is an experiment, and
+                            // shipping an inference as a default is a mistake
+                            // this file has made once already.
                             .filter(|_| {
-                                std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_some()
+                                (std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_some()
+                                    || std::env::var_os("CORDIAL_EARLY_SETTINGS").is_some())
                                     && std::env::var_os("CORDIAL_LATE_SETTINGS").is_none()
                             })
                         {

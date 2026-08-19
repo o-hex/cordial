@@ -1810,3 +1810,36 @@ weeks on one that did not.
 The TaskScheduler line is the thread to pull. It is the first statement from the
 engine itself about *why* flags are not loaded, as opposed to *that* they are
 not, and everything in §§12–17 was working without it.
+
+### §19.1 What the TaskScheduler line does and does not explain
+
+Chased, and the scope is narrower than §19 implied. Worth pinning before anyone
+builds on it.
+
+**In a working default run the TaskScheduler is fine.** The only mention in the
+engine log of a 90-second join is
+
+    [FLog::AndroidGLView] rbx.datamodel: setTaskSchedulerBackgroundMode()
+                          enable:false context:ASMA.start
+
+which is background mode, not initialisation, and no error accompanies it. So the
+gate is satisfied on the path Cordial actually uses.
+
+`Can't initialize the TaskScheduler before flags have been loaded` therefore
+explains **why the late-settings ordering cannot work**, and nothing more. It is
+not an account of `onFlagsFailed`, which still fires twice on the default path
+where the scheduler comes up cleanly.
+
+That is still worth having. §17 named §11.8's crash as the strongest remaining
+lead precisely because mocktail succeeds with an ordering that killed Cordial,
+and the answer turns out to be that the ordering is unavailable rather than
+mysterious: something on Cordial's `initializeNativeCode` path brings the
+scheduler up, and the engine will not load flags behind it. Adopting mocktail's
+ordering would mean also deferring whatever does that, which is a different and
+larger change than reordering two calls.
+
+**So the lead is narrowed, not closed.** `onFlagsFailed` on the default path
+remains unexplained after eight eliminated candidates, and the honest position is
+that §19's framing — "the answer this document has been looking for" — was one
+step ahead of the evidence. The engine named the cause of a crash, not the cause
+of the verdict.

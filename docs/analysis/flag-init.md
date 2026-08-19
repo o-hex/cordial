@@ -3913,3 +3913,52 @@ channel values are heterogeneous — a bare number silences a channel that wants
 severity name — makes the second reading more plausible than it looks, and the
 tombstone case is the tell: Cordial demonstrably *does* open
 `cache/tombstone.dat` (it is in the path trace) while never logging a read.
+
+### §35.3 The three missing steps are not missing. Eighth instrument fault
+
+§35.2 proposed two readings and named the measurement. It is already in the path
+trace from §29, and it settles it against §35.2's more interesting reading:
+
+    fopen("./appData/ClientSettings/IxpSettings.json")  = null
+    fopen("/…/appData/ClientSettings/IxpSettings.json") = null
+    fopen("cache/tombstone.dat")                         = null
+    fopen("cache/tombstone.dat")                         = ok
+
+**Both steps are attempted.** The Ixp cache open happens twice — once relative,
+once absolute — and fails both times because the file genuinely does not exist,
+which is precisely what Sober logs as `Failed to open cache file for reading`.
+The tombstone is opened and one of those opens succeeds. Cordial does the work
+and says nothing; Sober does the same work and logs it.
+
+So `[FLog::IxpStorageManager]` and the tombstone read are absent from Cordial's
+log because **those channels are quiet in this build**, not because the steps are
+skipped. §35.2's framing — "the block is missing three steps from the middle" —
+is wrong, and the only genuinely missing thing in that sequence is
+`RbxStorage::init` itself.
+
+That is the **eighth** instrument fault recorded here, and the fastest one to
+appear and die: proposed and disproved inside an hour, by data that already
+existed. The pattern is now unambiguous enough to state as a rule for this
+codebase:
+
+> **An absence in a log is not an absence in the engine.** Eight times, over
+> months, every single wrong conclusion in this document has been the
+> measurement rather than the thing measured — and channel absence specifically
+> has produced three of them.
+
+Which also retires channel comparison as a diagnostic here. Sober and Cordial
+having different channel sets says something about which channels are enabled and
+nothing about what either client did.
+
+### The position, unchanged and now better supported
+
+Storage is entered, on a pool-spawned thread, after `nativeInitClientSettings`
+returns. It fails on a root that is empty, having done every neighbouring step
+the working client does. Twenty-five candidates are eliminated with controls, the
+host-application surface is exhausted, and the remaining route is the memory
+write [ADR-001](../adr/ADR-001-in-process-hooking.md) makes absent — against
+which stands §31's measurement that Sober reaches this state with byte-identical
+engine text, so *something* gets there without rewriting instructions.
+
+That contradiction is the whole remaining question, and it is a real one rather
+than a gap in effort.

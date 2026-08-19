@@ -118,8 +118,16 @@ build where="host":
             echo "create it with the commands in this recipe's comment" >&2
             exit 1
         fi
+        # Both crates' `webview` features, not only the shell's. The shell holds
+        # the WebKit window and `cordial-runtime` holds the presenter that calls
+        # it, so enabling one leaves the caller cfg'd out, nothing references
+        # `webview::open`, the linker collects it, and the binary carries no
+        # libwebkitgtk at all. That is the same dead-code shape that made web
+        # views silently do nothing for months, reappearing one layer up.
+        # `readelf -d target-toolbox/release/cordial-run | grep -i webkit` is the
+        # check that it actually linked.
         distrobox enter "$box" -- bash -lc \
-          'CARGO_TARGET_DIR=target-toolbox cargo build --release --features cordial-shell/webview'
+          'CARGO_TARGET_DIR=target-toolbox cargo build --release --features cordial-shell/webview,cordial-runtime/webview'
         echo "built into target-toolbox/release"
         ;;
       nix)

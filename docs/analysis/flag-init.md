@@ -3634,3 +3634,70 @@ a live `Context` object (`getApplicationInfo().dataDir`, `getFilesDir()` by
 method call rather than by the field contents already tried and eliminated),
 rather than anything the native library can discover about itself — remains
 untested and is candidate twenty-two.
+
+## §33. Candidate twenty-two is dead too: the engine never asks for `ApplicationInfo.dataDir`
+
+§32 narrowed candidate twenty-two to a JNI route: `Context.getApplicationInfo()`
+called and `dataDir` read off the result, cached before `RbxStorage::init`'s
+first attempt. `getApplicationInfo` is declared in the shipping dex
+(`tools/dex_method.py`), Cordial hooks nothing for it, and a field read on an
+unresolved placeholder is the exact shape of four earlier bugs here. That made
+it worth asking directly, before writing a single line of implementation:
+does the engine ever call it?
+
+`native/jni_shim.cpp` and `third_party/libjnivm`'s `GetFieldID`/`GetMethodID`
+log every resolution attempt — `Found symbol`, `Unresolved symbol` and
+`Constructed Unresolved symbol` — when built with
+`-DCORDIAL_JNI_TRACE=ON`/`-DJNIVM_ENABLE_TRACE=ON`, and log every dispatched
+call besides. That is a full record of everything the engine asked libjnivm
+for, not a sample.
+
+Built with `CORDIAL_JNI_TRACE=1 cargo build --release --bin cordial-run`
+(confirmed in the build log: `CORDIAL_JNI_TRACE:BOOL=ON`,
+`JNIVM_ENABLE_TRACE:BOOL=ON`, and libjnivm's `internal/field.cpp` and
+`internal/method.cpp` recompiled), then run twice against Sober's real APK
+with `CORDIAL_JNI_TRACE=1 ./cordial-run --host-libc --game-activity --run
+25` (and `--run 30` on the repeat), own data root, `stdbuf -o0 -e0` per the
+buffering warning. Both runs are clean and reach `app ready: Landing`, the
+same late-startup marker §32 used as its measurement window; `onFlagsFailed`
+fires twice in each, matching every other run captured in this document. The
+two runs' `[JNIVM]:` lines are identical as sets (606 and 603 raw lines, zero
+diff after dedup) — this is deterministic, not a fluke of one run.
+
+Across both full traces, from `JNI_OnLoad` to `Landing`:
+
+    grep -ni 'getApplicationInfo\|ApplicationInfo\|dataDir' run.log
+        -> zero real hits. The only substring matches are
+           `nativeSetBaseDataDirectories` (a distinct, already-hooked
+           Cordial-side call) and `ApplicationExitInfoCpp` (an unrelated
+           crash-reporting class the engine does FindClass on).
+
+    grep -n 'android/content/Context\b\|android/content/pm/ApplicationInfo' run.log
+        -> zero. FindClass is never called for either class, at any point.
+
+The 15 "did not answer" method/field constructions logged each run (listed
+in full in the run output — `GameActivity.finish`, `getWaterfallInsets`,
+`getWindowInsets`, `syncCookiesFromEngine`, `getAppUpgradeKey`, four
+`NativeGLJavaInterface` statics, `NetworkUtils.getPublicIPv4Addresseses`,
+`Class.getClassLoader`, `List.get`) contain nothing from
+`android/content/pm/ApplicationInfo` or `android/content/Context`. This
+matches, rather than merely fails to contradict, `docs/analysis/undefined-
+symbols.tsv`, `unresolved-jni.tsv`, `unanswered-jni-observed.tsv` and
+`unresolved-java.md`, none of which have ever listed it either.
+
+**So candidate twenty-two is dead, cleanly, without implementing anything.**
+The engine does not read its data directory from `Context.getApplicationInfo
+().dataDir` over JNI in this build, this launch path, in either the ELF-
+constructor-time attempt or any later one reached by `Landing`. Per the
+project's own rule against a stub that lies, nothing was implemented for
+`getApplicationInfo` — there is no observed call for it to answer, and
+stubbing an unasked-for method would be exactly the kind of plausible-looking
+guess this document exists to avoid.
+
+What remains of §32's list is `getFilesDir()` by method call — a live call
+on a `Context`/`Activity` object, as opposed to the field contents §23–§29
+already traced and eliminated. `Context` is never even `FindClass`'d in
+these runs, so if the engine reaches for its data directory by calling
+`getFilesDir()`, it does so on some other object shape, or not before
+`Landing`, or not by this route either. That is candidate twenty-three,
+untested.

@@ -863,3 +863,79 @@ SDL3/CMake linkage, the FreeBSD port, system-proxy auto-detect,
 `--force-run-latest`, cross-launcher cookie borrowing they added and then removed,
 their logging rewrite, and twenty-two packaging, CI, AUR, release and website
 commits. One line each is the correct treatment.
+
+---
+
+## Two input bugs, with mechanisms and the diagnostic for each
+
+Both reported from real play, both with a named candidate mechanism and neither
+confirmed. Written down because guessing at input in this file has cost time
+before.
+
+### I1. WASD dead when launched from a job, working when launched interactively
+
+Reported: launched through the join script, camera and space work and WASD does
+not. Launched interactively and used normally, everything works. **The difference
+is in how it starts, not in-game state** — which rules out the first theory
+(a focused text box swallowing the letters) because that would not care how the
+process was started.
+
+**The candidate.** `wayland.rs`'s `dispatch_key` delivers each key down *two*
+paths, and only one is conditional:
+
+```rust
+if handle != 0 {
+    super::input::deliver_key(handle, down, keycode, ...);   // AGDK
+}
+super::input::pass_key_event(down, evdev_key as i32, meta);  // NativeInputInterface
+```
+
+`handle` is `active_handle`, stored by `WaylandWindow::pump`. And `load.rs`
+already documents a startup path that pumps with `None`:
+
+    // No AGDK handle on this path — it drives the app bridge directly and
+    // never calls initializeNativeCode, so onTouchEventNative etc. are never
+    // registered to deliver input to.
+
+So there is a real, already-known configuration in which the AGDK half of key
+delivery does not happen and the `NativeInputInterface` half does. If Roblox
+routes character movement through one and jump through the other, "space works,
+WASD does not" is exactly what that looks like.
+
+**Not confirmed**, and one thing argues against it: that documented path is the
+app-bridge one, and the join script passes `--game-activity`, which should take
+the other. So either the handle is zero for a different reason on that path, or
+the mechanism is elsewhere. **Do not change the input code on this until the
+trace says which.**
+
+    CORDIAL_TRACE_TEXT=1 tools/join-run.sh input 2>&1 | grep 'wayland key'
+
+Every line ends with `focus=…`. Run it once reproducing the bug and once not, and
+compare — whether keys arrive at all, whether `focus` differs, and whether the
+two runs take different pump sites.
+
+### I2. Camera sensitivity spikes through a full revolution, then settles
+
+Reported: turning the camera a full revolution makes it briefly over-sensitive
+and then correct itself. The user's own guess — the cursor moving and being
+reset — is close to the mechanism the code already guards.
+
+`wayland.rs:2023` bails out of `dispatch_relative_motion` unless
+`POINTER_LOCK_ACTIVE`, and says why: *"acting on it unlocked would double every
+ordinary mouse movement."* So the doubling is known and defended against.
+
+**The candidate is a race on that flag.** `sync_pointer_lock` runs once per pump,
+so there is a window in which the flag and the compositor's actual lock state
+disagree, and in that window both the absolute `wl_pointer.motion` path and the
+relative path deliver for the same physical movement. Doubled input, then it
+settles — which is the reported symptom, and a full revolution is when a lock
+boundary is most likely crossed.
+
+**Not measured.** The confirmation is two `nativePassMouseMove` calls for one
+movement during the spike:
+
+    CORDIAL_TRACE_MOUSE=1 tools/join-run.sh camera 2>&1 | grep nativePassMouseMove
+
+If they appear in pairs while the sensitivity is wrong, that is it. Worth having
+before touching the lock logic — this file has a history of fixes that addressed
+the wrong half.

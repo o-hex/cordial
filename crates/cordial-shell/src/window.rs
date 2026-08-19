@@ -382,10 +382,38 @@ pub fn build(
         profile_row_for_action.grab_focus();
     });
 
+    // Fullscreen, on F11, because until now there was no way for a user to ask
+    // for it at all. `HostWindow::set_fullscreen` has existed throughout and its
+    // only callers were `looper.rs`'s CORDIAL_SCRIPT timeline and the probes
+    // under examples/ -- instrumentation, reachable by a test and by nobody
+    // playing the game. A window that can be fullscreened only by a script is
+    // not a window that can be fullscreened.
+    //
+    // F11 rather than a header-bar button: the shell's chrome is what a
+    // fullscreen player is trying to get rid of, so putting the control there
+    // means it disappears at the moment it is needed to come back. The
+    // compositor's own binding still works and is not replaced by this; this is
+    // the one that survives being told the window is a game.
+    let fullscreen_action = gtk::gio::SimpleAction::new("fullscreen", None);
+    let window_for_fullscreen = window.clone();
+    fullscreen_action.connect_activate(move |_, _| {
+        let on = !window_for_fullscreen.is_fullscreen();
+        if on {
+            window_for_fullscreen.fullscreen();
+        } else {
+            window_for_fullscreen.unfullscreen();
+        }
+    });
+
     let actions = gtk::gio::SimpleActionGroup::new();
     actions.add_action(&settings_action);
     actions.add_action(&profile_action);
+    actions.add_action(&fullscreen_action);
     window.insert_action_group("win", Some(&actions));
+    if let Some(app) = window.application() {
+        use gtk::prelude::GtkApplicationExt;
+        app.set_accels_for_action("win.fullscreen", &["F11"]);
+    }
     // The target before the name, and in that order deliberately: GTK's action
     // helper re-checks the pair every time either changes, and naming a
     // string-taking action while the target is still unset logs "can't be

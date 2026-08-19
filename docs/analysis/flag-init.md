@@ -2965,3 +2965,70 @@ sections mean, and because a channel read during ELF construction — before
 Cordial's settings document is delivered at all — would be unreachable by any
 flag, which would explain six clean negatives on `DFLogRbxStorage` that were read
 as "storage is not running".
+
+## §26. Storage init runs. It has been running all along, and the log was silent
+
+`0x2312fbc` fires. Five runs, three of them fresh against a wiped data root, all
+clean, all in the same order on the same thread:
+
+    0x23121ae   RbxStorage::init entry
+    0x2312fbc   [INIT] log emit          <- executed
+    0x2312fe3   helper -> 3x stat("")    <- executed, fails
+
+A backward `lea` scan confirms `0x2312fbc`'s argument is exactly
+`"[DFLog::RbxStorage] RbxStorage::init [INIT] user: {}, availableDiskSpace: {} bytes, elapsed: {:.3f} ms"`,
+so this is the `[INIT]` emit and not a coincidentally nearby address. The call
+just before `0x2312fe3` loads the literal `"rbx-storage"`.
+
+**So `RbxStorage::init` executes, emits its `[INIT]` line, and continues into the
+empty-path failure.** The line never reaches the log.
+
+### Why the log is silent, and why six flag runs could never have found it
+
+Measured ordering, every run:
+
+    loading libroblox.so …        <- RbxStorage::init runs here, in ELF constructors
+    LOADED in N ms
+    JNI_OnLoad
+    calling GameActivity.initializeNativeCode
+    bootstrapTheApp: delivering settings and flags
+    nativeInitClientSettings
+
+Settings delivery is unambiguously later than the point where storage init
+already ran and failed. **No `DFLogRbxStorage` override at any value could ever
+have reached it**, because the mechanism that carries flag values into the engine
+fires strictly afterwards. The six clean negatives on that channel were reading a
+line that had already been emitted before the flag existed.
+
+`INFERRED` for the gating mechanism itself — that would mean reading Roblox's
+logging internals — but the timing underneath it is directly measured.
+
+### What this retracts, and it is most of the document
+
+Every statement in §§12–24 that storage "is never asked for", "is never
+attempted" or "is never reached" is wrong. It runs, on every launch, during
+library load. Nineteen candidates were eliminated against a question that was
+never the right one: they all asked why storage does not start, and it starts.
+
+The three earlier retractions were each an instrument artefact — a path trace
+blind to `statvfs`, a channel sweep using the wrong value shape, a function
+boundary from a prologue scan, and twice an `lldb` attach that arrived too late.
+This is the fourth and largest, and it has the same shape: **an absence in a log
+was read as an absence in the engine.**
+
+### The one thing left
+
+`RbxStorage::init` fails on a path component that is empty at ELF-constructor
+time, immediately after loading the literal `"rbx-storage"`. It is a memoising
+singleton, so that failure is cached and the later `flagLoaded` caller is handed
+the broken object.
+
+On Android the winner is `flagLoaded` and it succeeds, so the constructor-time
+call either does not happen there or finds that component populated. Which of
+those is the question, and it decides the fix: either stop the early call, or
+make the component non-empty before `dlopen` — the only window that exists,
+since every directory Cordial sets is set after `dlopen` returns.
+
+The `[DONE]` emit site was not located; two mechanical scans found no reference,
+and pushing further would have crossed from observing into reading. So how far
+init gets past the empty stats is still unknown.

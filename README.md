@@ -152,7 +152,7 @@ will be declined.
 | Window — libadwaita header bar, engine as a subsurface | ✅ |
 | Launching from the shell | ✅ finds a build, or explains how to get one |
 | Choosing a profile | ✅ a chooser above the Launch button; creates one, and shows a profile another window holds as unavailable |
-| Audio | 🟡 sound leaves the OpenSL ES bridge into PipeWire, measured with a control; never yet verified inside an experience, and FMOD may take a Java path that bypasses it entirely |
+| Audio | ✅ sound in an experience, reported from real play; the OpenSL ES bridge into PipeWire was measured with a control before that |
 | Web views (Marketplace, Profile, Communities…) | ❌ the request now *arrives* — Cordial subscribes to `WebView.openWindow` over the engine's own MessageBus and logs the payload — but nothing renders it yet, and opening one blanks the window |
 | **Asset overlays** (custom textures, sounds, fonts) | ✅ drop a file mirroring the APK's `assets/` tree into `~/.config/cordial/overlay` and it is served instead; nothing is modified, remove the file and the original returns |
 | Fullscreen | 🟡 F11 with the header bar hidden, and the choice persists per profile — but on the launcher window, not the one you play in |

@@ -86,12 +86,22 @@ pub fn function_overrides() -> Vec<(&'static str, *mut c_void)> {
     // OpenSL ES. Data symbols, so a missing one fails the DT_NEEDED walk rather
     // than the first audio call — see `opensles_overrides`.
     v.extend(opensles_overrides());
+    // `pthread_create`, forwarded untouched unless `CORDIAL_TRACE_THREADS=1` —
+    // see `thread_overrides` and `native/thread_trace.cpp`.
+    v.extend(thread_overrides());
     if std::env::var_os("CORDIAL_TRACE_PATHS").is_some() {
         extern "C" {
             fn cordial_set_path_trace(on: c_int);
         }
         // SAFETY: sets one bool in system_paths.cpp.
         unsafe { cordial_set_path_trace(1) };
+    }
+    if std::env::var_os("CORDIAL_TRACE_THREADS").is_some() {
+        extern "C" {
+            fn cordial_set_thread_trace(on: c_int);
+        }
+        // SAFETY: sets one bool in thread_trace.cpp.
+        unsafe { cordial_set_thread_trace(1) };
     }
     // A silent abort costs more debugging time than these wrappers cost anything.
     v.extend(trace::always_on());
@@ -509,6 +519,42 @@ pub fn system_path_overrides() -> Vec<(&'static str, *mut c_void)> {
         .iter()
         .map(|e| {
             // SAFETY: each `name` is a string literal in system_paths.cpp.
+            let name = unsafe { CStr::from_ptr(e.name) }.to_str().unwrap_or("");
+            (name, e.addr)
+        })
+        .collect()
+}
+
+/// `pthread_create` — `native/thread_trace.cpp`.
+///
+/// Off by default and behaviourally identical to the unwrapped host function
+/// either way; the flag only decides whether the new thread announces its
+/// creator, its start routine and its own tid before running anything else.
+/// See `docs/analysis/flag-init.md` §29 for why this exists: the thread that
+/// runs `RbxStorage::init`'s failing `stat("")` calls was never traced back to
+/// whoever spawned it.
+pub fn thread_overrides() -> Vec<(&'static str, *mut c_void)> {
+    #[repr(C)]
+    struct Symbol {
+        name: *const c_char,
+        addr: *mut c_void,
+    }
+    extern "C" {
+        fn cordial_thread_symbols(count: *mut usize) -> *const Symbol;
+    }
+
+    let mut count = 0usize;
+    // SAFETY: the table is a static in thread_trace.cpp and outlives the process.
+    let table = unsafe { cordial_thread_symbols(&mut count) };
+    if table.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: `table` points at `count` initialised entries with static names.
+    let entries = unsafe { std::slice::from_raw_parts(table, count) };
+    entries
+        .iter()
+        .map(|e| {
+            // SAFETY: each `name` is a string literal in thread_trace.cpp.
             let name = unsafe { CStr::from_ptr(e.name) }.to_str().unwrap_or("");
             (name, e.addr)
         })

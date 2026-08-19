@@ -3449,3 +3449,72 @@ reached about the flags gate and had to un-reach: this may not be reachable
 through the interface Roblox exposes to a host application, and the remaining
 option is the memory write [ADR-001](../adr/ADR-001-in-process-hooking.md) makes
 absent. That is a decision for the project owner, not a measurement.
+
+## §30. The thread is a pool worker, and the answer is that this is not reachable
+
+§29 left one observational angle untried: who creates the thread storage fails
+on, and what runs on it first. `native/thread_trace.cpp` answers it — an
+`pthread_create` interception behind `CORDIAL_TRACE_THREADS=1`, inert otherwise,
+logging the caller and start routine as `libroblox.so+offset` read from
+`/proc/self/maps`. Three fresh runs, three wiped data roots, identical shape:
+
+    [threads] tid=… spawned by caller=libroblox.so+0x22e7935 start_routine=libroblox.so+0x230bcc2
+    [paths]   tid=… stat("./appData") = 0
+    [paths]   tid=… stat("./appData") = 0
+    [paths]   tid=… statvfs("./appData") = 0
+    [paths]   tid=… stat("") = -1        (x3)
+
+**The thread's very first traced libc call is that `./appData` pair.** Nothing
+runs on it before, which matches §29's separate finding that zero JNI calls
+happen on it in the same window.
+
+**It is a thread pool, not a storage constructor.** The same
+`caller=+0x22e7935 → start_routine=+0x230bcc2` pair spawns three different
+threads at three different points in one run, and only the first runs the storage
+sequence; the other two produce no further path activity. That is a generic
+worker-spawn site handing out a queued task — which corroborates §24's
+"storage initialisation is a scheduled task" with a mechanism rather than an
+inference.
+
+Control, same session: with `CORDIAL_TRACE_THREADS` unset, zero `[threads]` lines
+and the identical failure sequence. The interception neither hides nor alters it.
+
+### The conclusion, stated with evidence rather than as a guess
+
+Neither `+0x22e7935` nor `+0x230bcc2` is a JNI entry point, a registered native,
+an exported symbol, or anything named in `docs/analysis/jni-natives.tsv`. They are
+anonymous engine-internal functions reached only by address. Combined with §29's
+zero-JNI-calls result, and with twenty-one candidates eliminated with controls:
+
+**The empty value is produced and consumed entirely inside engine-internal code,
+on an engine-internal pool thread, and nothing in the interface Roblox exposes to
+a host application names, reaches or influences it.**
+
+That is the ADR-001 decision point §22.1 first reached about the flags gate — and
+had to withdraw, because the flags gate turned out to be reachable after all and
+§23 fixed it. This time it is not a guess: every route the interface offers has
+been tried and measured, and the last one was instrumented by intercepting a libc
+symbol in Cordial's own shim rather than by inferring.
+
+So the remaining option is the memory write
+[ADR-001](../adr/ADR-001-in-process-hooking.md) and
+[ADR-003](../adr/ADR-003-plugin-isolation.md) make deliberately *absent* — the
+same thing mocktail does, one of its 98 patch functions. **That is a decision for
+the project owner about Cordial's security posture, not a measurement**, and it
+carries more than storage: a fork is building a script executor on this codebase,
+and the primitive is absent precisely so there is nothing to extract.
+
+### What the investigation is worth even so
+
+Twenty-one candidates eliminated with controls, and **six wrong conclusions
+retracted — every one of them an instrument rather than the engine**: a path
+trace blind to `statvfs`, a channel sweep with the wrong value shape, a function
+boundary from a prologue scan, two `lldb` attaches arriving too late, a halting
+harness untrustworthy for timing, and two output streams with different buffering
+read as one timeline.
+
+The flags half of the same investigation *was* reachable and is fixed:
+`onFlagsLoaded` fires, `areFlagsLoaded:true`, and the `NativeDataModelManager`
+chain runs to `startLuaApp_`. The difference between the two halves is the whole
+lesson — one gate was an ordering mistake in Cordial, the other is inside the
+engine, and only measurement told them apart.

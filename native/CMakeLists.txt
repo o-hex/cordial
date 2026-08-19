@@ -137,7 +137,7 @@ endif()
 # Android liblog. Roblox narrates its own startup through it, so this is the
 # runtime layer's most valuable diagnostic — and the source of onLogLine/onJoin.
 add_library(cordial_liblog STATIC
-  liblog.cpp system_paths.cpp netdb_compat.cpp opensles.cpp pipewire_backend.cpp)
+  liblog.cpp system_paths.cpp netdb_compat.cpp opensles.cpp pipewire_backend.cpp thread_trace.cpp)
 if(PIPEWIRE_FOUND)
   target_include_directories(cordial_liblog PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
   target_compile_definitions(cordial_liblog PRIVATE CORDIAL_HAVE_PIPEWIRE=1)

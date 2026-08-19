@@ -604,6 +604,16 @@ Reasoning in [ADR-001](docs/adr/ADR-001-in-process-hooking.md).
 
 Also out: client-side integrity flags or watermarks, and obfuscation-as-security.
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=luohoa97%2Fcordial&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=luohoa97/cordial&type=date&theme=dark&legend=top-left&sealed_token=k2BpUmlDBarFv8DEaibONMzIVqR354Y0p6GxcrH9umRfO7ofVa2KNYn9t5BypPU7oGyVHGS8s0wnGiRbLNDvNDI2nYv9wRglmTifqAQZ0fBdsKEKT6d6K9S4QIFhx3VwlQzJOrjE0yCpaHWX23qzsM4zS7CE4ted0uz1KxgK4fW7eZLA-NRhPifkQPqL" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=luohoa97/cordial&type=date&legend=top-left&sealed_token=k2BpUmlDBarFv8DEaibONMzIVqR354Y0p6GxcrH9umRfO7ofVa2KNYn9t5BypPU7oGyVHGS8s0wnGiRbLNDvNDI2nYv9wRglmTifqAQZ0fBdsKEKT6d6K9S4QIFhx3VwlQzJOrjE0yCpaHWX23qzsM4zS7CE4ted0uz1KxgK4fW7eZLA-NRhPifkQPqL" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=luohoa97/cordial&type=date&legend=top-left&sealed_token=k2BpUmlDBarFv8DEaibONMzIVqR354Y0p6GxcrH9umRfO7ofVa2KNYn9t5BypPU7oGyVHGS8s0wnGiRbLNDvNDI2nYv9wRglmTifqAQZ0fBdsKEKT6d6K9S4QIFhx3VwlQzJOrjE0yCpaHWX23qzsM4zS7CE4ted0uz1KxgK4fW7eZLA-NRhPifkQPqL" />
+ </picture>
+</a>
+
 ## Licence
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).

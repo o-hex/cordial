@@ -2253,3 +2253,93 @@ initialisation and dies on the gate, and the default ordering does not attempt
 it. Which of `Flag::areFlagsLoaded()` and NativeDM's `Flags-Not-Received` is
 false on the default path is **not established**, and the two are not known to be
 the same bit.
+
+## §23. The answer: the post-settings call was made too early
+
+`nativePostClientSettingsLoadedInitialization3` called once more, after the
+surface is handed to the engine, followed by `nativeRetryInit`. That is the whole
+fix, and it produces what nineteen sections of this document were looking for:
+
+    [FLog::NativeDM] initialize: state:11. areFlagsLoaded:true.
+    [FLog::NativeDM] getFlagsFromEngine_:
+    [FLog::NativeDM] bootstrapTheApp_:
+    [FLog::Output] settingsUrl: https://clientsettingscdn.roblox.com/v2/settings-compressed/application/GoogleAndroidApp.zst
+    [FLog::NativeDM] ... getFlags: success = true, payload's size = 1300800.
+    [FLog::NativeDM] continueAfterFlagsLoaded_:
+    [FLog::NativeDM] initEngine_:
+    [FLog::NativeDM] initializeLuaApp_:
+    [FLog::NativeDM] startLuaApp_:
+
+and on Cordial's side `[roblox] flags loaded (1300800 bytes)` —
+`gameActivity_onFlagsLoaded`, with a real `ByteBuffer`, for the first time.
+
+Controlled on one build, three consecutive runs each:
+
+| | `flagsLoaded` | `continueAfterFlagsLoaded_` | `Flags-Not-Received` |
+|---|---|---|---|
+| default | 1 | 1 | 1 |
+| `CORDIAL_LATE_POST_MS=off CORDIAL_LATE_RETRY=off` | 0 | 0 | 4 |
+
+### Why fifteen eliminations missed it
+
+Every one of them moved the settings call and the post call **together**. §11
+recorded the symptom exactly — "Cordial's call to
+`nativePostClientSettingsLoadedInitialization3` returns without the engine's own
+body of it having run" — and then spent five sections looking for a missing
+argument, a missing prerequisite call, or a wrong document. The body was fine.
+The call was early. Nothing that moved both could ever show that, because moving
+them together late is `CORDIAL_LATE_SETTINGS`, which dies on the TaskScheduler
+gate before the post call matters.
+
+### Three claims in this document were wrong
+
+**§19.1 and §22 on the TaskScheduler.** §19.1 said the gate is satisfied on the
+default path; §22 retracted that as reasoning from an absence and declined to
+claim the opposite. The engine now states it: `areFlagsLoaded:true`, on the
+default path, before anything here changed. The gate was never the blocker.
+`NativeDataModelManager` not being told was.
+
+**`client_settings.rs` on the engine never fetching.** It says so on the strength
+of breakpoints on `getaddrinfo`, `connect` and `SSL_connect` never being hit
+during startup. The engine fetches
+`clientsettingscdn.roblox.com/v2/settings-compressed/application/GoogleAndroidApp.zst`
+itself, from `bootstrapTheApp_`. Those breakpoints never fired because this code
+path had never run. Cordial supplying the document is still correct and still
+what makes `areFlagsLoaded` true — but "the engine does not fetch" is false.
+
+**§22 on logging.** It said the verbose `NativeDM` lines were open but not
+raised. They were open all along and print at the default level. They never
+appeared because the code emitting them never ran. The §22 measurement that
+naming an `FLog` channel in `flags.json` can silence it still stands and is still
+worth knowing; the conclusion drawn from it was wrong.
+
+### What is still not done
+
+**`RbxStorage::init` is still zero**, on every run, including a real 100-second
+join. So the content store is still down and every asset still comes off the
+network each session. What is different is that it is now localised rather than
+mysterious:
+
+    [DFLog::CaptureStorage] RbxStorage is not initialized, cannot access storage interface
+    [DFLog::RbxmFileManager] LocalStorageManager is not available.
+    [FLog::LocalStorageHandler] Not available on the current platform.
+
+Storage waits on the platform local-storage handler, which Cordial implements in
+`native/local_storage.cpp` but installs only behind
+`CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL`. With that on, `setPlatformImpl ok` now
+succeeds where §19 recorded it crashing — and the process then dies `SIGTRAP`
+after repeated `djinni (djinni_support.cpp:529): weakRef`.
+
+**It is not `NewWeakGlobalRef`.** That was the obvious reading and it is wrong:
+instrumenting libjnivm's `NewWeakGlobalRef` to print whenever it returns null
+produced **no output at all** across a full run, while the djinni exceptions
+carried on. libjnivm implements weak global references and has a test covering
+expiry. Whatever djinni asserts on at that line, it is something else, and the
+instrument is recorded here as a disproof rather than left in the tree.
+
+Sober logs `LocalStorageHandler] Not available on the current platform.` too and
+still reaches `RbxStorage::init`, so that message is not the blocker either.
+
+**The delay is unfinished work, not a constant.** 250 ms, because at 0 ms the run
+reaches `Flags-Not-Received=0` — better than any other value tried — and then
+segfaults. Something is still racing and the delay hides it.

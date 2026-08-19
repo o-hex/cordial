@@ -1562,3 +1562,80 @@ things that were visible from the outside, and reading mocktail's source has
 removed candidates rather than supplied the answer. That is progress of the
 cheaper kind, and it is worth having written down before somebody spends another
 day re-testing the same seven things.
+
+## §17. The premise behind Cordial's bootstrap was wrong, and §11.8's crash is the real lead
+
+mocktail's pre-`initializeNativeCode` stretch has now been read — the last part of
+its startup nobody had looked at. It does not contain the answer §16 was hoping
+for. It contains something more useful: evidence that a theory this project built
+on is not true.
+
+### `bootstrapTheApp` does not have to deliver anything
+
+mocktail's implementation, `src/jnivm/jnivm.cc:1702`, in full:
+
+    if (std::strcmp(name, "bootstrapTheApp") == 0) {
+      SetBooleanFieldRaw(obj, "bootstrapStarted", JNI_TRUE);
+      ... log ...
+      return;
+    }
+
+**One boolean. Nothing else.** And mocktail reaches
+`RbxStorage::init [INIT] user: flagLoaded` regardless.
+
+Cordial's `run_bootstrap` exists on the theory that an unresolved
+`bootstrapTheApp` causes an immediate `onFlagsFailed`. §7 established that for the
+*unresolved-symbol* case, which is real. What is now clear is that the converse
+does not follow: a resolved-but-empty `bootstrapTheApp` does not reproduce the
+failure for mocktail, so "deliver enough through bootstrap" was never the shape of
+the fix.
+
+### Which puts §11.8's abandoned crash back at the front
+
+mocktail delivers client settings **after `initializeNativeCode` returns**,
+sequentially, the ordinary way. Cordial tried exactly that — `CORDIAL_LATE_SETTINGS=1`
+— and **crashed twice out of two**, which is why it delivers early instead. §11.8
+records the crash and says plainly it was never root-caused.
+
+So the open question is not "what does mocktail do before `initializeNativeCode`".
+It is **why does Cordial segfault doing what mocktail does after it**. The client
+that works runs through the ordering that kills ours, and that crash was set aside
+rather than understood.
+
+**And the crash is worth re-testing before anything else.** It was recorded on
+2.730.0.790. The engine is now 2.734.0.917 — a build that also needed `hypotf`
+before it would load at all. A crash on an engine two versions old is not evidence
+about this one.
+
+    CORDIAL_LATE_SETTINGS=1 tools/join-run.sh late
+
+That is the next experiment, and it is one command.
+
+### Also untried, cheaper, lower odds
+
+Cordial's `Configuration` object is registered and populated with nothing
+(`native/game_activity.cpp:128`). It is handed to the same `initializeNativeCode`
+call whose next line decides the verdict. mocktail's `CreateAndroidConfiguration`
+fills fifteen fields — orientation, touchscreen, keyboard, densityDpi, screen
+dimensions, layout, uiMode, colorMode, mcc/mnc, navigation, fontWeightAdjustment.
+
+Never examined; not among §16's seven. **Plausibility honestly moderate-to-low** —
+AGDK usually derives its internal `AConfiguration` from the `AssetManager` rather
+than reading this object's fields, so it may be inert. Cheap to try, and if it
+changes nothing, populate only `orientation` and `touchscreen` rather than
+restoring a whole struct of guesses.
+
+### Closed
+
+BrowserTracker is non-fatal in mocktail too — `src/main.cc:711` logs the failure
+and continues. It structurally cannot be a hard gate on either side, which
+confirms §13.1's own caution and settles that it should stay unwired while the
+endpoint returns 500.
+
+### Recorded as better, so nobody "fixes" it
+
+Cordial's `AssetManager`, `Configuration` and window-insets classes are
+deliberately stateless with a documented reason each. mocktail populates its Java
+objects with synthetic hardware descriptions it cannot verify — `mcc`/`mnc` zero,
+`colorMode` zero, `navigation` one, guesses throughout. Keep the minimalism unless
+the experiment above proves a specific field load-bearing.

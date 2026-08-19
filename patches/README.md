@@ -89,3 +89,40 @@ inside the native itself, not the calling code) — that native depends on
 state only libroblox.so's own constructors set up, so Android's actual
 ordering (settings before storage) cannot be reproduced this way from
 outside the engine.
+
+## 0004 — an Android-shaped library path, and tracing `dladdr`/`dl_iterate_phdr`
+
+Two additions, both inert unless something calls the new export or sets the
+new trace variable. `linker.cpp` gets `mcpelauncher_set_realpath`, which
+overwrites a loaded library's `soinfo::realpath_` — pure metadata, no
+reopening, no remapping — callable between `mcpelauncher_defer_next_ctors`
+and `mcpelauncher_run_deferred_ctors` from patch 0003, so the override is in
+place before any constructor-time code that asks the linker "what is my own
+path". `libdl.cpp` gets `CORDIAL_TRACE_DLADDR=1`, tracing every `dladdr()`
+call with its argument and result, and every `dl_iterate_phdr()` call (call
+site only — the per-entry `dlpi_name` goes to the caller's own callback,
+which this does not intercept).
+
+Exists to test `docs/analysis/flag-init.md` §31: whether the engine derives
+its private data directory by walking up from its own library path the way
+an Android app locates `/data/user/0/<pkg>` from `/data/app/<pkg>/lib/<abi>/`.
+`crates/cordial-runtime/src/bin/load.rs` wires both together behind
+`CORDIAL_ANDROID_LIBPATH=1`: defer `libroblox.so`'s constructors, override its
+realpath to an Android-shaped `/data/app/~~.../com.roblox.client-.../lib/
+x86_64/libroblox.so`, then run the deferred constructors.
+
+**What it established, §32 of `docs/analysis/flag-init.md` has the full
+record: the hypothesis is wrong, and not for lack of trying the right lever.**
+`dladdr()` is called **zero** times across two complete 25-second runs to
+`app ready: Landing` — the engine never asks the linker this question at all.
+`dl_iterate_phdr()` is called, but its first invocation in either run comes
+strictly *after* `RbxStorage::init`'s three failing `stat("")` calls, in a
+burst of about twenty back-to-back calls consistent with C++ exception
+unwinding walking a stack, not with computing a directory beforehand — and
+`CORDIAL_TRACE_PATHS=1` shows zero reads of `/proc/self/maps` or
+`/proc/self/exe` anywhere in either run, the third route named in the
+hypothesis. With the override applied and constructors demonstrably run under
+it (no crash, two clean repeats), the failing `stat("")` triple is
+byte-for-byte identical to the unmodified baseline. None of the three ways
+native code can ask the linker "where am I" are used before, during, or in
+place of the failure.

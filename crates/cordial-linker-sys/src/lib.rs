@@ -24,6 +24,9 @@ mod ffi {
         // §26 and patches/README.md. Not called from the default load path.
         pub fn cordial_linker_defer_next_ctors(defer: c_int);
         pub fn cordial_linker_run_deferred_ctors(handle: *mut c_void);
+        // docs/analysis/flag-init.md §31. Metadata only — see the comment on
+        // the Rust wrapper below.
+        pub fn cordial_linker_set_realpath(handle: *mut c_void, path: *const c_char);
         pub fn cordial_linker_dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         pub fn cordial_linker_dlerror() -> *const c_char;
         pub fn cordial_linker_get_library_base(handle: *mut c_void) -> usize;
@@ -155,6 +158,23 @@ pub fn defer_next_ctors(defer: bool) {
 /// library that was never deferred (or already constructed) is harmless.
 pub fn run_deferred_ctors(lib: Library) {
     unsafe { ffi::cordial_linker_run_deferred_ctors(lib.0) }
+}
+
+/// docs/analysis/flag-init.md §31: overrides what `dladdr()` reports as
+/// `lib`'s own path (`Dl_info::dli_fname`), by writing the linker's internal
+/// `soinfo::realpath_` directly. Nothing is reopened, remapped, or copied —
+/// every byte the engine reads still comes from wherever it was actually
+/// mapped from. Meant to be called after [`defer_next_ctors`] +
+/// [`dlopen`] and before [`run_deferred_ctors`], so the override is visible
+/// to any constructor-time code that asks the linker "what is my own path" —
+/// which is the one form of self-location available before `JNI_OnLoad`,
+/// since `RbxStorage::init`'s failing `stat("")` calls run during ELF
+/// construction, strictly earlier.
+pub fn set_realpath(lib: Library, path: &str) {
+    let Ok(c) = CString::new(path) else { return };
+    // SAFETY: `cordial_linker_set_realpath` copies the string; `c` need not
+    // outlive the call.
+    unsafe { ffi::cordial_linker_set_realpath(lib.0, c.as_ptr()) }
 }
 
 fn last_error() -> String {

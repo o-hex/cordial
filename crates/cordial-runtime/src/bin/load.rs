@@ -1149,7 +1149,18 @@ fn main() -> ExitCode {
     // `dlopen`, and `run_deferred_ctors` below runs whatever it postponed.
     // Off by default. Not part of the ordinary load path.
     let defer_ctors = std::env::var_os("CORDIAL_DEFER_CTORS").is_some();
-    if defer_ctors {
+    // EXPERIMENTAL, cordial-android-libpath: see docs/analysis/flag-init.md
+    // §31. Sober's engine mapped `libroblox.so` from an authentic Android
+    // install path with zero altered bytes; Cordial maps the identical engine
+    // from a cache directory shaped like nothing Android ever produces. This
+    // overrides what `dladdr()` reports for the library's own load address —
+    // the one form of self-location available before `JNI_OnLoad`, since the
+    // failing `stat("")` calls run during ELF construction, strictly earlier
+    // — to test whether the engine derives its private data directory from
+    // it. Also needs constructors deferred, for the same reason as above: the
+    // override has to be in place before whatever reads it runs.
+    let android_libpath = std::env::var_os("CORDIAL_ANDROID_LIBPATH").is_some();
+    if defer_ctors || android_libpath {
         linker::defer_next_ctors(true);
     }
 
@@ -1173,6 +1184,30 @@ fn main() -> ExitCode {
         "  code       {code_base:#x} + {code_size} bytes ({:.1} MB)",
         code_size as f64 / (1024.0 * 1024.0)
     );
+
+    if android_libpath {
+        // Sober's own mapping, for shape reference (flag-init.md §31):
+        //   /data/app/~~<hash>/com.roblox.client-<hash>/lib/x86_64/libroblox.so
+        // The exact hashes are meaningless to the derivation this is testing
+        // — only the directory shape (a `~~`-prefixed app id, a
+        // package-name-plus-hash directory, then `lib/x86_64/`) can matter,
+        // since that is all a string-walk from the tail could look for.
+        let synthetic = std::env::var("CORDIAL_ANDROID_LIBPATH_VALUE").unwrap_or_else(|_| {
+            "/data/app/~~cordialAAAAAAAAAAAAAA==/com.roblox.client-cordialBBBBBBBBBBBB==\
+             /lib/x86_64/libroblox.so"
+                .to_string()
+        });
+        linker::set_realpath(lib, &synthetic);
+        println!("\ncordial-android-libpath: soinfo realpath overridden to {synthetic}");
+        if !defer_ctors {
+            // Nobody else will run the deferred constructors in this case;
+            // do it right after the override, so the override is the only
+            // variable this changes relative to the ordinary load path.
+            println!("cordial-android-libpath: running the deferred constructors now");
+            linker::run_deferred_ctors(lib);
+            println!("cordial-android-libpath: constructors returned without crashing");
+        }
+    }
 
     // EXPERIMENTAL, cordial-agent-defer, continued. Constructors have not
     // run yet if `defer_ctors`: `libroblox.so`'s own global state, including

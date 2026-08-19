@@ -3573,3 +3573,64 @@ measurement, not an argument.
 
 Twenty-one candidates died against the wrong question. This is the first one
 aimed at the right one.
+
+## §32. The self-path hypothesis is wrong — measured, not one route eliminated by assumption but all three tried
+
+§31 named three ways native code can ask "where am I" before `JNI_OnLoad` and
+said to establish which one the engine reads before patching one and hoping.
+`patches/0004-android-libpath-experiment.patch` (applied) makes all three
+observable and one of them controllable: `mcpelauncher_set_realpath`
+overwrites what the linker's `soinfo` reports as a loaded library's own path
+— pure metadata, nothing reopened or remapped — and `CORDIAL_TRACE_DLADDR=1`
+traces every `dladdr()` and `dl_iterate_phdr()` call. Wired into
+`crates/cordial-runtime/src/bin/load.rs` behind `CORDIAL_ANDROID_LIBPATH=1`:
+defer `libroblox.so`'s constructors, overwrite its realpath to
+`/data/app/~~cordialAAAAAAAAAAAAAA==/com.roblox.client-cordialBBBBBBBBBBBB==
+/lib/x86_64/libroblox.so`, run the deferred constructors.
+
+**`dladdr()` is called zero times.** Across two complete runs to `app ready:
+Landing` (`CORDIAL_TRACE_DLADDR=1`, one with the override and one without),
+`grep -c 'dladdr('` on the trace is 0, both times. The engine's guest-facing
+`libdl.so` import — confirmed present via `readelf -d`, so this is not a
+question of whether it could reach the symbol — is simply never called this
+way, for anything, in a run that starts, loads settings, reports
+`onFlagsFailed`, and reaches the third `app ready` stage.
+
+**`dl_iterate_phdr()` is called, but never before the failure.** 698 calls in
+one run, and the first one — in both runs, same log line as the last of the
+three failing `stat("")` calls — comes immediately *after* `RbxStorage::init`
+gives up, not before. It arrives in a burst of about twenty consecutive calls,
+which is the shape of a C++ unwinder walking a stack frame by frame to build a
+backtrace, not of a single lookup computing a directory ahead of time. Nothing
+calls it during library load, during `JNI_OnLoad`, or at any point up to the
+exact log line the empty-path failure already occupies.
+
+**The third route was already closed.** `CORDIAL_TRACE_PATHS=1` intercepts
+`open`, `fopen`, `stat`, `lstat`, `access`, `opendir`, `realpath`, `readlink`
+and `statvfs` — every way to read `/proc/self/maps` or `/proc/self/exe` that
+does not go through `dladdr`/`dl_iterate_phdr`. Across a full run, `/proc/self`
+appears exactly once, as `fopen("/proc/self/oom_score")`, called repeatedly
+for what is visibly a memory-pressure check, never `maps` or `exe`.
+
+**The control.** With the override applied and traced (`CORDIAL_ANDROID_
+LIBPATH=1` together with `CORDIAL_TRACE_DLADDR=1` and `CORDIAL_TRACE_PATHS=1`,
+two repeats, both clean — `soinfo realpath overridden to …` printed, `con
+structors returned without crashing` printed, `app ready: Landing` reached —
+the three `stat("")` calls are byte-for-byte identical to the unmodified
+baseline, same thread role, same surrounding `./appData` context, same `-1`.
+An override that the engine never reads cannot change its output, and it did
+not.
+
+**So §31's specific hypothesis — derive the data directory by walking up from
+a self-reported library path — is retracted.** This does not retract §31's
+own evidence: Sober's engine still maps from a real, unaltered, Android-shaped
+path, and that fact is untouched by this result. What is retracted is the
+explanation offered for *why* the path might matter — none of the three
+channels a native library has for learning its own path are used at the point
+where the failure happens, so the shape of the path Cordial hands the linker
+is, on this evidence, not what `RbxStorage::init` is missing. Something else
+about Sober's environment — most plausibly a value delivered through JNI from
+a live `Context` object (`getApplicationInfo().dataDir`, `getFilesDir()` by
+method call rather than by the field contents already tried and eliminated),
+rather than anything the native library can discover about itself — remains
+untested and is candidate twenty-two.

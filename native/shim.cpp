@@ -75,6 +75,16 @@ void cordial_linker_run_deferred_ctors(void* handle) {
     mcpelauncher_run_deferred_ctors(handle);
 }
 
+// docs/analysis/flag-init.md §31: overrides what dladdr() reports for a
+// loaded library's own path, called between defer_next_ctors and
+// run_deferred_ctors above so the override is visible to constructor-time
+// code. Nothing is reopened; this is metadata only.
+extern "C" void mcpelauncher_set_realpath(void* handle, const char* path);
+
+void cordial_linker_set_realpath(void* handle, const char* path) {
+    mcpelauncher_set_realpath(handle, path);
+}
+
 void* cordial_linker_dlsym(void* handle, const char* symbol) {
     return linker::dlsym(handle, symbol);
 }

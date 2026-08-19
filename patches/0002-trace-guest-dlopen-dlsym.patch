@@ -1,0 +1,53 @@
+diff --git a/libdl/libdl.cpp b/libdl/libdl.cpp
+index 0af8665..68acc94 100644
+--- a/libdl/libdl.cpp
++++ b/libdl/libdl.cpp
+@@ -20,6 +20,18 @@
+ #include <android/dlext.h>
+ #include <unordered_map>
+ #include <string>
++// Cordial addition, not upstream: every guest dlopen()/dlsym() reaching the
++// virtual libdl.so passes through here, which makes this the one place that
++// can answer "what does the engine actually ask for" instead of guessing from
++// strings sitting in the binary -- see native/shim.cpp's CORDIAL_TRACE_DLOPEN
++// for the same idea one layer up, for names resolved via linker::dlopen
++// directly rather than through the guest's own libdl.so import. Established
++// this way: the `mi_option_show_errors`-shaped strings in libroblox.so are
++// option *names* for mimalloc's own log line, not symbols anyone dlsyms, and
++// nothing about the binary says whether the engine ever calls dlopen for
++// mimalloc at all. CORDIAL_TRACE_DLSYM=1 traces every dlsym symbol name.
++#include <cstdio>
++#include <cstring>
+ 
+ // These functions are exported by the loader
+ // TODO(dimitry): replace these with reference to libc.so
+@@ -87,6 +99,10 @@ namespace linker::libdl {
+ __attribute__((__weak__))
+ void* dlopen(const char* filename, int flag) {
+   const void* caller_addr = __builtin_return_address(0);
++  static const bool trace = getenv("CORDIAL_TRACE_DLSYM") != nullptr;
++  if (trace) {
++    fprintf(stderr, "[cordial-dlsym-trace] dlopen(%s, %d)\n", filename ? filename : "(null)", flag);
++  }
+   return __loader_dlopen(filename, flag, caller_addr);
+ }
+ 
+@@ -98,7 +114,17 @@ char* dlerror() {
+ __attribute__((__weak__))
+ void* dlsym(void* handle, const char* symbol) {
+   const void* caller_addr = __builtin_return_address(0);
+-  return __loader_dlsym(handle, symbol, caller_addr);
++  static const bool trace = getenv("CORDIAL_TRACE_DLSYM") != nullptr;
++  void* result = __loader_dlsym(handle, symbol, caller_addr);
++  if (trace) {
++    // Every symbol name, not filtered to a prefix: filtering here is exactly
++    // the guessing this exists to avoid. It found the mimalloc question with
++    // a plain `grep mi_` afterwards rather than deciding what counted as
++    // relevant before running anything.
++    fprintf(stderr, "[cordial-dlsym-trace] dlsym(%p, %s) -> %p\n", handle,
++            symbol ? symbol : "(null)", result);
++  }
++  return result;
+ }
+ 
+ __attribute__((__weak__))

@@ -132,6 +132,33 @@ multi-instance, join notifications. The parity target is met.
 a signal the framework layer is incomplete — not a signal to revisit this decision. Fix it
 at the framework layer.
 
+**Amendment, 2026-08-19:** "no primitive in the binary" turned out to have a gap that had
+nothing to do with the plugin system. `third_party/mcpelauncher-linker`'s port of bionic's
+`ElfReader::LoadSegments()` mapped every `PT_LOAD` segment — including the engine's text —
+with `prot | PROT_WRITE` unconditionally, and the counterpart that is supposed to strip that
+back off after relocation (`phdr_table_protect_segments()`) turned out to have no call site
+reached on `__LP64__` at all: both places that call it are wrapped in `#if !defined(__LP64__)`
+or its own `#if 0`-gated body, legacy scaffolding for the 32-bit `DT_TEXTREL` case. The result,
+observed with `tools/engine-text-diff.py` against a live `cordial-run`, was the engine's ~112 MB
+text mapping sitting `rwxp` for the whole process lifetime — not patched (0 differing bytes
+against the file), but writable the entire time regardless.
+
+That is exactly the foothold this ADR argues against handing over: `mprotect` is the step a
+hooking primitive needs before it can patch anything, and an `rwxp` engine mapping does that
+step for free, pre-armed, for any code already running in the process — including a plugin
+that found its own way in through some future bug, and including any fork that adds the
+executor this ADR was written to keep out. "The primitive is absent" is a claim about the
+loader's behaviour as much as about the plugin API, and the loader was not living up to it.
+
+Fixed by mapping each segment at its real, described protection from the start (matching what
+upstream bionic actually does outside the 32-bit-legacy path), rather than forcing writability
+that nothing later revokes. Verified against Roblox's own x86-64 build: no `DT_TEXTREL`, and
+its 546 `.rela.plt` relocations all target the writable data segment, never text, so there is
+no relocation-time need for the write bit on that mapping at any point. Confirmed with the
+tool: `rwxp` before, `r-xp` after, `DIFFERING BYTES: 0` in both, and the client still reaches
+the landing page on repeated runs. This does not change the decision above — it was already
+the decision — it closes a gap between what the ADR claimed and what the binary did.
+
 ## Revisit criteria
 
 If Roblox ships an official, sanctioned client-extension mechanism, revisit — but as a

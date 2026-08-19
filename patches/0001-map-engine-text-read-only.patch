@@ -1,0 +1,44 @@
+diff --git a/linker/linker_phdr.cpp b/linker/linker_phdr.cpp
+index 6688845..7b945c9 100644
+--- a/linker/linker_phdr.cpp
++++ b/linker/linker_phdr.cpp
+@@ -811,9 +811,23 @@ bool ElfReader::LoadSegments() {
+         add_dlwarning(name_.c_str(), "W+E load segments");
+       }
+ #endif
++      // Map with the segment's real, final protection -- not prot | PROT_WRITE.
++      // That forced write bit is what left the engine's text mapped rwxp for
++      // the whole process lifetime: phdr_table_protect_segments(), the call
++      // meant to strip it back off after relocation, only has a body on
++      // !__LP64__ (see the call sites gated that way in linker.cpp and
++      // linker_relocate.cpp), so nothing ever undid it here. Real bionic maps
++      // each segment at its described permissions from the start and only
++      // grants temporary writability for the legacy 32-bit DT_TEXTREL case,
++      // which needs the (still-present, still-gated-32-bit) unprotect/protect
++      // dance around relocation. Roblox's x86-64 build carries no DT_TEXTREL
++      // (readelf -d: no TEXTREL/DF_TEXTREL) and its only relocations are 546
++      // .rela.plt entries that all land inside the writable data segment, so
++      // this segment -- the read+exec one -- is never written to after this
++      // mmap and does not need the write bit at any point, including here.
+       void* seg_addr = mmap64(reinterpret_cast<void*>(seg_page_start),
+                             file_length,
+-                            prot | PROT_WRITE,
++                            prot,
+                             MAP_FIXED|MAP_PRIVATE,
+                             fd_,
+                             file_offset_ + file_page_start);
+@@ -851,10 +865,13 @@ bool ElfReader::LoadSegments() {
+     // between them. This is done by using a private anonymous
+     // map for all extra pages.
+     if (seg_page_end > seg_file_end) {
++      // Anonymous pages come from the kernel already zeroed, so this needs
++      // no write access to do its job -- see the mmap64 above for why the
++      // write bit does not belong on a non-writable segment at all.
+       size_t zeromap_size = seg_page_end - seg_file_end;
+       void* zeromap = mmap(reinterpret_cast<void*>(seg_file_end),
+                            zeromap_size,
+-                           prot | PROT_WRITE,
++                           prot,
+                            MAP_FIXED|MAP_ANONYMOUS|MAP_PRIVATE,
+                            -1,
+                            0);

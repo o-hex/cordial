@@ -267,6 +267,32 @@ pub fn build(host_libc: bool) -> SymbolTable {
         None => table.missing_host_libs.push("libvulkan.so.1"),
     }
 
+    // mimalloc, the same shape as Vulkan above: `libroblox.so` contributes no
+    // undefined `mi_` symbols (nothing DT_NEEDS it), so it is never reached by
+    // the per-symbol classification loop and has to be registered as its own
+    // virtual library for whatever `dlopen`s it to find. See `mimalloc_lib`
+    // for why this links the real allocator rather than stubbing its option
+    // getters, and for what is and is not confirmed about whether the engine
+    // ever asks for it.
+    {
+        let mimalloc = table
+            .libraries
+            .entry(crate::mimalloc_lib::LIBRARY_NAME)
+            .or_default();
+        for (symbol, address) in crate::mimalloc_lib::overrides() {
+            mimalloc.push(Entry {
+                symbol,
+                address,
+                source: Source::Cordial,
+            });
+            table
+                .stats
+                .entry(crate::mimalloc_lib::LIBRARY_NAME)
+                .or_default()
+                .record(Source::Cordial);
+        }
+    }
+
     table
 }
 

@@ -38,3 +38,11 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Same version cordial-plugins already pins, so this adds an edge to an
 # already-resolved dependency rather than a new one to fetch.
 zbus = { version = "5.18.0", features = ["blocking"] }
+# Roblox's engine detects mimalloc at runtime and logs `[DFLog::Mimalloc]
+# Mimalloc integration detected` when it finds it; libroblox.so does not link
+# it (zero `mi_` symbols in its own undefined-symbols table), so it must be
+# offered as a discoverable library rather than a stub. Sober ships a real
+# `libmimalloc.so` beside its binary for the same reason. `extended` pulls in
+# `mi_option_get`/`mi_option_set`/`mi_version`, which is the shape the option
+# dump in the DFLog line implies the engine queries by.
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }

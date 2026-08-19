@@ -32,6 +32,7 @@ use crate::refresh_watch;
 use crate::settings;
 use crate::shell_config::ShellConfig;
 use crate::updater;
+use crate::window_state;
 use cordial_shell::host_window::HostWindow;
 use cordial_shell::profile;
 
@@ -317,15 +318,28 @@ pub fn build(
     // instead of flickering through a second window creation.
     // -----------------------------------------------------------------------
 
+    // Whatever was last saved for the profile this shell is about to launch,
+    // read before the window exists so a saved size reaches `HostWindow::new`
+    // rather than a resize following on afterwards -- see `window_state.rs`
+    // for where this is stored and why per profile. `profile::dir` refuses an
+    // unusable name outright rather than sanitising it, and an unreadable name
+    // here is the same as one with nothing saved: windowed, at the built-in
+    // default below.
+    let initial_profile = config.borrow().profile.clone();
+    let initial_window =
+        profile::dir(&initial_profile).ok().map(|d| window_state::load(&d)).unwrap_or_default();
+
     // 540x340 was 720x480 while the content was two preference groups pinned to
     // the top of it, which left the lower two thirds empty. This is a launcher's
     // size rather than a settings window's: wide enough that a development
     // build's title — `git describe` output, beside two header-bar buttons —
     // does not ellipsise, and tall enough that the centred column has room
-    // around it without being adrift in it. Only the *default*; the window
-    // resizes, and the runtime passes its own size to this same constructor for
-    // the engine's canvas.
-    let host = HostWindow::new(&cordial_shell::host_window::title(), 540, 340, &toasts);
+    // around it without being adrift in it. Only the *default*, now doubly so:
+    // it is also what a profile with nothing saved yet falls back to. Kept as
+    // a pure function, the same reason `host_window.rs`'s own `fit_within` is
+    // one, so the fallback is testable without a display.
+    let (initial_width, initial_height) = initial_size(&initial_window);
+    let host = HostWindow::new(&cordial_shell::host_window::title(), initial_width, initial_height, &toasts);
 
     let settings_button = gtk::Button::from_icon_name("preferences-system-symbolic");
     settings_button.set_tooltip_text(Some("Settings"));
@@ -362,6 +376,10 @@ pub fn build(
     // string in a config file, so it is copied out once here rather than
     // borrowed later from something that has gone.
     let fullscreen_accel = config.borrow().fullscreen_accel.trim().to_string();
+    // Likewise: everything below that saves window state needs the `Rc`
+    // itself, not merely a value read out of it once, and `config` stops being
+    // usable the moment `settings_action`'s closure below takes it.
+    let config_for_window_state = config.clone();
 
     let settings_action =
         gtk::gio::SimpleAction::new("settings", Some(glib::VariantTy::STRING));
@@ -438,6 +456,69 @@ pub fn build(
     settings_button.set_action_target_value(Some(&"".to_variant()));
     settings_button.set_action_name(Some("win.settings"));
 
+    // Save the fullscreen state the moment it changes, against whichever
+    // profile is selected *at that moment* -- read fresh from `config` in
+    // every handler below rather than captured once, so that switching the
+    // profile row and then pressing F11 saves against the row's new choice
+    // and not the one this window opened with. `window_state.rs`'s own header
+    // is the reasoning for why this happens unconditionally and why that is
+    // safe for this window specifically -- it does not carry over to the
+    // engine's own window without re-deriving it.
+    {
+        let config = config_for_window_state.clone();
+        window.connect_fullscreened_notify(move |w| persist_fullscreen(&config, w));
+    }
+
+    // Size, debounced. GTK fires `notify::default-width`/`notify::default-height`
+    // on every step of an interactive drag, and writing a file on every one of
+    // those would mean tens of writes a second to a profile directory holding a
+    // live session cookie next to it. `pending_size_save` is cancelled and
+    // restarted on each notification, the same shape `starting_dialog`'s own
+    // `pulse` timeout uses for "stop the old one before starting a new one",
+    // so only the settled size after resizing stops is ever written.
+    let pending_size_save: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+    let schedule_size_save: Rc<dyn Fn()> = {
+        let config = config_for_window_state.clone();
+        let window = window.clone();
+        let pending = pending_size_save.clone();
+        Rc::new(move || {
+            if let Some(id) = pending.take() {
+                id.remove();
+            }
+            let config = config.clone();
+            let window = window.clone();
+            let pending_inner = pending.clone();
+            let id = glib::timeout_add_local_once(SIZE_SAVE_DEBOUNCE, move || {
+                pending_inner.set(None);
+                persist_window_size(&config, &window);
+            });
+            pending.set(Some(id));
+        })
+    };
+    {
+        let s = schedule_size_save.clone();
+        window.connect_default_width_notify(move |_| s());
+    }
+    {
+        let s = schedule_size_save.clone();
+        window.connect_default_height_notify(move |_| s());
+    }
+    // Flushed on close rather than left to the debounce: quitting right after
+    // a drag must not lose the last few pixels to a timer that never got to
+    // fire. `Propagation::Proceed` because this only writes a file -- it must
+    // never be what stands between the user and the window actually closing.
+    {
+        let config = config_for_window_state.clone();
+        let pending = pending_size_save.clone();
+        window.connect_close_request(move |w| {
+            if let Some(id) = pending.take() {
+                id.remove();
+                persist_window_size(&config, w);
+            }
+            glib::Propagation::Proceed
+        });
+    }
+
     // Focus starts on the thing the window is for, so that a keyboard launches
     // with Return and nothing else. Left alone it lands on the profile row,
     // which is the first focusable widget and the one control here that is not
@@ -448,6 +529,15 @@ pub fn build(
     GtkWindowExt::set_focus(&window, Some(&chooser_widget));
 
     window.present();
+    // After `present()`, not before: every other place this window is put into
+    // or out of fullscreen (`fullscreen_action` above, `HostWindow::set_fullscreen`)
+    // does it to an already-mapped window, and there is no precedent here for
+    // asking an unmapped one. See `window_state.rs`'s header for why doing this
+    // unconditionally is the right call for this window and must not be copied
+    // uncritically onto the engine's own.
+    if initial_window.fullscreen {
+        window.fullscreen();
+    }
     open_on_start(&window, &update_button);
 
     // This is the shell's own launcher window, not the engine's -- the two
@@ -461,6 +551,67 @@ pub fn build(
     refresh_watch::watch(&window, |_outputs| {});
 
     Shell { window, join }
+}
+
+/// How long to wait after the last `notify::default-width`/`default-height`
+/// before writing the settled size to disk. Long enough that an interactive
+/// drag -- which fires this on every frame the compositor delivers -- settles
+/// well before it, short enough that quitting a couple of seconds after
+/// letting go of the resize still saves it without needing the close-request
+/// flush at all.
+const SIZE_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// This shell's built-in window size, used whenever a profile has nothing
+/// saved yet -- the same 540x340 `window.rs` used before `window_state.rs`
+/// existed at all.
+const DEFAULT_WIDTH: i32 = 540;
+const DEFAULT_HEIGHT: i32 = 340;
+
+/// What size to open the window at, given what was saved for the profile it
+/// is about to run. Pure and separate from the GTK call that uses it, the same
+/// shape `host_window.rs`'s `fit_within` takes for the same reason: the
+/// fallback is worth pinning with a test that does not need a display.
+fn initial_size(state: &window_state::WindowState) -> (i32, i32) {
+    (state.width.unwrap_or(DEFAULT_WIDTH), state.height.unwrap_or(DEFAULT_HEIGHT))
+}
+
+/// Save whether `window` is fullscreen right now, against whichever profile
+/// `config` currently names.
+///
+/// Read-modify-write against the file rather than an in-memory cache, so that
+/// switching the profile row and then resizing, or the reverse, never writes
+/// one profile's geometry into another's record. The cost is a read on every
+/// toggle; `window.json` is a few dozen bytes and this fires on a keypress, not
+/// in a loop.
+fn persist_fullscreen(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) {
+    let name = config.borrow().profile.clone();
+    let Ok(dir) = profile::dir(&name) else { return };
+    let mut state = window_state::load(&dir);
+    state.fullscreen = window.is_fullscreen();
+    if let Err(e) = window_state::save(&dir, &state) {
+        println!("  shell: could not save fullscreen state for {name:?}: {e}");
+    }
+}
+
+/// Save the window's current default size, against whichever profile `config`
+/// currently names -- unless it is fullscreen right now, in which case there
+/// is no windowed size to record: GTK reports the fullscreen extent through
+/// the same `default-width`/`default-height` properties while a fullscreen
+/// transition is in flight, and writing that over the size someone actually
+/// asked to remember would be recording the wrong number under the right
+/// name, which is worse than not recording at all.
+fn persist_window_size(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) {
+    if window.is_fullscreen() {
+        return;
+    }
+    let name = config.borrow().profile.clone();
+    let Ok(dir) = profile::dir(&name) else { return };
+    let mut state = window_state::load(&dir);
+    state.width = Some(window.default_width());
+    state.height = Some(window.default_height());
+    if let Err(e) = window_state::save(&dir, &state) {
+        println!("  shell: could not save window size for {name:?}: {e}");
+    }
 }
 
 /// `CORDIAL_SHELL_PRESENT=settings,settings=updates,update` opens those windows
@@ -822,6 +973,28 @@ mod tests {
             command: command.into(),
             running_for: Some(Duration::from_secs(31 * 60)),
         }
+    }
+
+    #[test]
+    fn a_profile_with_nothing_saved_opens_at_the_built_in_default() {
+        let state = window_state::WindowState::default();
+        assert_eq!(initial_size(&state), (DEFAULT_WIDTH, DEFAULT_HEIGHT));
+    }
+
+    #[test]
+    fn a_profile_with_a_saved_size_opens_at_that_size() {
+        let state = window_state::WindowState { fullscreen: false, width: Some(1024), height: Some(768) };
+        assert_eq!(initial_size(&state), (1024, 768));
+    }
+
+    #[test]
+    fn a_profile_with_only_one_dimension_saved_falls_back_for_the_other() {
+        // Should not happen from this file's own writer, which always sets
+        // both together, but a hand-edited file could carry just one -- and
+        // the fallback per field is simpler and no worse than refusing the
+        // whole saved size over half of it.
+        let state = window_state::WindowState { fullscreen: false, width: Some(1024), height: None };
+        assert_eq!(initial_size(&state), (1024, DEFAULT_HEIGHT));
     }
 
     #[test]

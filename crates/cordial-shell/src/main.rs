@@ -33,6 +33,7 @@ mod updater;
 mod webview;
 mod webview_policy;
 mod window;
+mod window_state;
 
 /// Guards `CORDIAL_PROFILE_ROOT` across every test in this binary that points
 /// it at a scratch directory.

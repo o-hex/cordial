@@ -630,7 +630,7 @@ about refresh and Cordial says nothing.
 - **Scope:** small. Isolated PR. Measure with input flowing, per AGENTS.md, and
   report the input rate beside the frame rate.
 
-### On IME and text: do not copy mocktail here
+### On IME and text: there is nothing to copy — corrected
 
 The question was how mocktail types. The answer is that **it does not call
 `nativePassText` at all** — the name does not appear in its input surface.
@@ -639,10 +639,23 @@ Instead it carries `roblox_text_editor.cc` (788 lines),
 `roblox_text_display_state.cc` (305) and two input routers — **3840 lines**
 reimplementing text editing above the engine.
 
-Cordial hands text to the engine through `nativePassText` and lets the engine own
-the editing. That is the simpler path and it is the engine's own interface. Given
-mocktail's input is reportedly broken, its text stack is the least attractive
-thing in the repository to borrow, not the most.
+Cordial drives `syncTextboxTextAndCursorPosition2` per keystroke, which fills
+whichever box has focus, and keeps `nativePassText` for the finish — on Android
+that is the soft keyboard delivering final text and dismissing itself. Driving
+both per character was tried and produced "type one letter, box blurs", which is
+in `input.rs`'s own comment with the trace that showed it.
+
+**Corrected after this was first written: mocktail does not show text as you type
+either.** So its 3840 lines are not a working implementation Cordial is missing,
+they are a different unfinished attempt at the same problem. There is nothing to
+borrow, and text entry is a shared gap rather than a comparative one — the same
+shape as `AppRtcDeviceWrapper` and voice.
+
+Which means whatever is wrong with typing in a Roblox text box has to be found
+here, from a trace, rather than read off their tree. `CORDIAL_TRACE_TEXT=1` prints
+the focus handle and the text sync per keystroke, and the three failures it
+distinguishes — the box never focuses, it focuses and blurs immediately, or it
+holds focus and the characters do not arrive — want different fixes.
 
 What is worth taking from that area is the gesture and sensor list above, which
 is a list of calls rather than a design.

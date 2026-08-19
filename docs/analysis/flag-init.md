@@ -4060,3 +4060,44 @@ been varied against each other.**
 
 That is a two-by-two matrix, four runs, checked on the filesystem and not on the
 log. It should be the next thing anybody does, and it should have been the first.
+
+### §36.1 The matrix is flat, and so is the flag
+
+§36 named the two-by-two nobody had run. Run, on fresh roots, measured on the
+filesystem rather than the log:
+
+    delay=250   pass=1   db=0  partitions=0
+    delay=250   pass=2   db=0  partitions=0
+    delay=2000  pass=1   db=0  partitions=0
+    delay=2000  pass=2   db=0  partitions=0
+
+Neither the late-post delay nor a second warm pass reproduces it.
+
+The timeline then pointed at the storage flags — the `.db` in the working root
+appeared at 17:46:02, which matches the run that set
+`FFlagStartRbxStorageInitRighAfterFlags` and `DFFlagRbxStorageInitLatch`, a run
+dismissed at the time because its **log** showed nothing, which §36 has just
+established means nothing at all. Retested properly, fresh root, three passes,
+long delay:
+
+    flag+2000  pass=1  db=0  partitions=0
+    flag+2000  pass=2  db=0  partitions=0
+    flag+2000  pass=3  db=0  partitions=0
+
+(The eight `rbx-storage` paths those runs do have are the empty directories
+§23.5's layout creates, not engine output.)
+
+So the reproduction is still not found. What the working root has that none of
+these do is **43 `ContentProvider_*` directories** — the residue of real content
+being fetched across many sessions. Every attempt here has been a short run at
+the landing page, and short runs at the landing page do not fetch much.
+
+**The untested variable is therefore sustained content activity**, not
+configuration: a session that actually loads an experience and pulls assets,
+against a fresh root, checked on the filesystem. That is one join run and nobody
+has done it with the filesystem as the instrument — every join in this
+investigation was scored on `grep -c 'RbxStorage::init'`, which §36 proves is
+blind.
+
+That is the next measurement, it is cheap, and it is the first one in a long
+while that is aimed at something the working case actually has.

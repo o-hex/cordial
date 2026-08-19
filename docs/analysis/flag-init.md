@@ -2916,3 +2916,52 @@ breakpoint technique. `SBTarget.Launch` under a synchronous `SBDebugger` silentl
 free-runs without `eLaunchFlagStopAtEntry`. Any future probe of anything that
 happens during library load must use it; attaching is too late, and this document
 has now drawn a wrong conclusion from that twice.
+
+### §25.1 The empty stats come from inside `RbxStorage::init`, after the `[INIT]` emit site
+
+Walked up from the empty `stat("")` by breakpointing Cordial's own `s_stat`
+shim — no disassembly needed, since Cordial owns that wrapper — and printing a
+backtrace only when the path is empty. Three independent launches, identical
+offsets:
+
+    s_stat <- 0x226eea1 <- [0x226ec71|0x226f571] <- [0x231e52b|0x231e53b|0x231e547]
+           <- 0x2315ced <- 0x2312fe3 <- 0x230c3b4 <- 0x230bd04  (getter slow path)
+
+The three empty calls are three near-identical sites 16–28 bytes apart inside one
+helper, which is exactly the three `stat("")` §25 recorded.
+
+**The control is what makes this trustworthy:** the same thread, in the same
+function, makes two *successful* `stat("./appData")` calls at `0x23125ef` and
+`0x2312c9d`, and they go through the **same** generic leaf utility as the empty
+ones. So this is not a broken subroutine — it is the same "does this path exist"
+helper, called from a different point, with an empty argument. Call counts match
+the original `CORDIAL_TRACE_PATHS=1` trace line for line: two `./appData`, three
+empty, one thread.
+
+### And the ordering raises a bigger question
+
+Those addresses put the observed execution in this order inside
+`RbxStorage::init`:
+
+    0x23125ef   stat("./appData")  = 0        observed
+    0x2312c9d   stat("./appData")  = 0        observed
+    0x2312fbc   [INIT] log emit                not yet checked
+    0x2312fe3   helper -> 3x stat("") = -1    observed
+
+`0x2312fe3` is executed — it is a return address in the backtrace — and it is
+**0x27 bytes past the `[INIT]` emit site**. `[DFLog::RbxStorage] RbxStorage::init
+[INIT]` has never appeared in a Cordial engine log, at any channel setting, in any
+run.
+
+If `0x2312fbc` also executes, then that line is being emitted and swallowed, and
+this project's evidence that storage "never initialises" is really evidence that
+a log channel is silent — with storage in fact running well past that point and
+failing later, on the empty paths.
+
+**Not asserted.** `0x2312fe3` executing does not prove `0x2312fbc` did; a branch
+between them would explain both. It is one breakpoint to settle and it is being
+settled now. Recorded because the possibility changes what several earlier
+sections mean, and because a channel read during ELF construction — before
+Cordial's settings document is delivered at all — would be unreachable by any
+flag, which would explain six clean negatives on `DFLogRbxStorage` that were read
+as "storage is not running".

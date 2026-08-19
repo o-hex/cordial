@@ -897,6 +897,68 @@ public:
                 static_cast<int>(orientation), locked ? "yes" : "no");
     }
 
+    /// The rest of the channel, which was going into unresolved stubs.
+    ///
+    /// The dex declares 23 `gameActivity_*` callbacks on this class and Cordial
+    /// answered seven. The other sixteen were not "unused": libjnivm hands the
+    /// engine a placeholder for a name it has no hook for, and §3 records that
+    /// the engine's template for these is "call the no-arg NativeHelper callback,
+    /// log `FATAL: Java exception occurred in JNI call` if it throws". An
+    /// announcement into a placeholder is the failure mode this project has now
+    /// found four times, so the remaining ones are answered rather than left to
+    /// be discovered a fifth time.
+    ///
+    /// `onEngineInitialized` is the one that prompted this. §3 found it sharing
+    /// a call template with `onFlagsFailed` -- the two reporters sit seven bytes
+    /// apart and are instantiated from the same generic helper -- so it is on the
+    /// same startup path as the verdict this file exists to explain, and it was
+    /// unregistered. **Whether answering it changes the verdict is not
+    /// established**; it is answered because an unanswered callback next to the
+    /// one we are investigating is a variable nobody should be leaving in.
+    static void onEngineInitialized(ENV*, Object*) {
+        fprintf(stderr, "[roblox] engine initialised\n");
+    }
+    static void onDidLogOutReceived(ENV*, Object*) {
+        fprintf(stderr, "[roblox] logged out\n");
+    }
+    static void onDidSwitchAccountReceived(ENV*, Object*) {
+        fprintf(stderr, "[roblox] account switched\n");
+    }
+    static void onLuaAppDidReturn(ENV*, Object*) {
+        fprintf(stderr, "[roblox] lua app returned\n");
+    }
+    static void onRestartLuaApp(ENV*, Object*) {
+        fprintf(stderr, "[roblox] lua app restart requested\n");
+    }
+    static void onScanQrCode(ENV*, Object*) {
+        fprintf(stderr, "[roblox] QR scan requested (Cordial has no camera yet)\n");
+    }
+    /// Counted, not printed, for the same reason as `onDidLogInReceived`: this
+    /// carries a sign-up identifier and log files end up in issues.
+    static void onDidSignUp(ENV*, Object*, std::shared_ptr<String> s) {
+        fprintf(stderr, "[roblox] signed up (%zu bytes, not shown)\n",
+                s ? s->length() : 0u);
+    }
+    static void onGameStreamingStatusChanged(ENV*, Object*, std::shared_ptr<String> s) {
+        fprintf(stderr, "[roblox] game streaming status: %s\n", s ? s->c_str() : "");
+    }
+    static void onScreenshotReady(ENV*, Object*, std::shared_ptr<String> s) {
+        fprintf(stderr, "[roblox] screenshot ready: %s\n", s ? s->c_str() : "");
+    }
+    static void onMotionEventListening(ENV*, Object*, std::shared_ptr<String> s) {
+        fprintf(stderr, "[roblox] motion event listening: %s\n", s ? s->c_str() : "");
+    }
+    static void onExperienceStop(ENV*, Object*, jdouble seconds) {
+        fprintf(stderr, "[roblox] experience stop (%.3f s)\n",
+                static_cast<double>(seconds));
+    }
+    static void setAppUpgradeStatus(ENV*, Object*, jint status, jint flags,
+                                    std::shared_ptr<String> a, std::shared_ptr<String> b) {
+        fprintf(stderr, "[roblox] app upgrade status %d/%d %s %s\n",
+                static_cast<int>(status), static_cast<int>(flags),
+                a ? a->c_str() : "", b ? b->c_str() : "");
+    }
+
     static void Register(ENV* env) {
         env->GetClass<NativeHelper>("com/roblox/client/startup/NativeHelper");
         auto c = env->GetClass("com/roblox/client/startup/NativeHelper");
@@ -908,6 +970,30 @@ public:
         c->HookInstanceFunction(env, "gameActivity_onDidLogInReceived", &NativeHelper::onDidLogInReceived);
         c->HookInstanceFunction(env, "gameActivity_onScreenOrientationChanged",
                                 &NativeHelper::onScreenOrientationChanged);
+        c->HookInstanceFunction(env, "gameActivity_onEngineInitialized",
+                                &NativeHelper::onEngineInitialized);
+        c->HookInstanceFunction(env, "gameActivity_onDidLogOutReceived",
+                                &NativeHelper::onDidLogOutReceived);
+        c->HookInstanceFunction(env, "gameActivity_onDidSwitchAccountReceived",
+                                &NativeHelper::onDidSwitchAccountReceived);
+        c->HookInstanceFunction(env, "gameActivity_onLuaAppDidReturn",
+                                &NativeHelper::onLuaAppDidReturn);
+        c->HookInstanceFunction(env, "gameActivity_onRestartLuaApp",
+                                &NativeHelper::onRestartLuaApp);
+        c->HookInstanceFunction(env, "gameActivity_onScanQrCode",
+                                &NativeHelper::onScanQrCode);
+        c->HookInstanceFunction(env, "gameActivity_onDidSignUp",
+                                &NativeHelper::onDidSignUp);
+        c->HookInstanceFunction(env, "gameActivity_onGameStreamingStatusChanged",
+                                &NativeHelper::onGameStreamingStatusChanged);
+        c->HookInstanceFunction(env, "gameActivity_onScreenshotReady",
+                                &NativeHelper::onScreenshotReady);
+        c->HookInstanceFunction(env, "gameActivity_onMotionEventListening",
+                                &NativeHelper::onMotionEventListening);
+        c->HookInstanceFunction(env, "gameActivity_onExperienceStop",
+                                &NativeHelper::onExperienceStop);
+        c->HookInstanceFunction(env, "gameActivity_setAppUpgradeStatus",
+                                &NativeHelper::setAppUpgradeStatus);
     }
 };
 
@@ -2002,6 +2088,49 @@ int cordial_init_client_settings(void* fn, const char* a, const char* b, const c
             (jstring)cordial::to_jni(env, sa),
             (jstring)cordial::to_jni(env, sb),
             (jstring)cordial::to_jni(env, sc));
+        if (out_result) {
+            *out_result = result;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// `FlagJniInterface.nativeGetFInt(String, int)I` — read a live `FInt` back out
+/// of the engine.
+///
+/// Read-only, and that is the point. This exists because Cordial had no way to
+/// ask the engine what value a flag actually holds, only to push values in and
+/// infer from behaviour. That inference went wrong: setting `FLogNativeDM` in
+/// `flags.json` *silenced* the channel at every value tried, including 100,
+/// while the same mechanism took `FLogAppShellReporter` from 0 to 14 lines. One
+/// of those two readings has to be wrong about what the override does, and
+/// guessing which cost a session. See docs/analysis/flag-init.md §22.
+///
+/// The second argument is the default the engine returns when the flag is not
+/// registered, so passing a sentinel distinguishes "set to zero" from "not a
+/// flag" — a distinction the log alone cannot make.
+int cordial_get_fint(void* fn, const char* name, jint fallback, jint* out_result,
+                     char* err, size_t err_len) {
+    using Call = jint (*)(JNIEnv*, jclass, jstring, jint);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or nativeGetFInt is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/client/flags/FlagJniInterface");
+        auto sname = cordial::S_pub(name ? name : "");
+        jint result = reinterpret_cast<Call>(fn)(
+            env->GetJNIEnv(),
+            (jclass)cordial::to_jni(env, cls),
+            (jstring)cordial::to_jni(env, sname),
+            fallback);
         if (out_result) {
             *out_result = result;
         }

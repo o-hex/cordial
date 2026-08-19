@@ -375,6 +375,15 @@ struct BootstrapPlan {
     settings_native: usize,
     post_native: usize,
     flags_native: usize,
+    /// `MainGameActivity.nativePreloadFlagOverrides(String)V`.
+    ///
+    /// Here rather than only at the diagnostic call site because the engine has
+    /// a `getFlags: ParseFailure on preloaded overrides` error path, which means
+    /// `getFlags` *consumes* preloaded overrides -- and Cordial has never
+    /// supplied any on the bootstrap path. `docs/analysis/unresolved-java.md`
+    /// reads the real Java bootstrap as calling this native on a successful
+    /// fetch. Whether it moves the verdict is what `CORDIAL_PRELOAD` is for.
+    preload_native: usize,
     settings: String,
     flag_names: String,
 }
@@ -386,6 +395,30 @@ static BOOTSTRAP_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 ///
 /// Prints rather than returning a result because there is nobody to return one
 /// to: the caller is the engine, three frames into `initializeNativeCode`.
+/// `nativeGameGlobalInit` and `nativeUpdateAdapterInit`, the pair the engine
+/// wants before the app bridge.
+///
+/// Factored out because where they go is under test: §9's captured stack shows
+/// the flags failure reporter being reached *through* `nativeGameGlobalInit`, so
+/// this pair sits on the path that announces the verdict rather than merely
+/// before it. `when` is printed so a log makes it obvious which position a run
+/// used, which two earlier orderings did not.
+fn call_globals(lib: &linker::Library, when: &str) {
+    for name in [
+        "Java_com_roblox_engine_jni_NativeGLInterface_nativeGameGlobalInit",
+        "Java_com_roblox_engine_jni_NativeGLInterface_nativeUpdateAdapterInit",
+    ] {
+        let short = name.rsplit('_').next().unwrap_or(name);
+        match lib.symbol(name) {
+            None => println!("  {name} not exported"),
+            Some(f) => match linker::game_activity::appbridge_call_bare(f) {
+                Ok(()) => println!("  {short} ok ({when})"),
+                Err(e) => println!("  {short} failed ({when}): {e}"),
+            },
+        }
+    }
+}
+
 extern "C" fn run_bootstrap() {
     let Some(plan) = BOOTSTRAP.get() else {
         eprintln!("  bootstrapTheApp: nothing planned");
@@ -399,6 +432,48 @@ extern "C" fn run_bootstrap() {
         return;
     }
     println!("  bootstrapTheApp: delivering settings and flags");
+
+    // Preloaded overrides first, because "preloaded" is a claim about ordering:
+    // the engine reads them inside `getFlags`, which is upstream of the verdict.
+    //
+    // `CORDIAL_PRELOAD=doc` hands over the same `{"applicationSettings":{...}}`
+    // document the settings call gets; `=flat` unwraps it to the bare map, which
+    // is the other shape the endpoint's output can be read as; `=empty` sends
+    // `{}` to separate "the engine wanted a well-formed document" from "the
+    // engine wanted this particular content". Off unless asked for: this is an
+    // experiment and shipping an inference as a default is a mistake this file
+    // has made once already.
+    if plan.preload_native != 0 {
+        if let Ok(shape) = std::env::var("CORDIAL_PRELOAD") {
+            let body = match shape.as_str() {
+                "empty" => "{}".to_string(),
+                "flat" => plan
+                    .settings
+                    .find("\"applicationSettings\"")
+                    .and_then(|_| plan.settings.find('{').map(|_| ()))
+                    .map(|()| {
+                        // Strip the one wrapper key, leaving the bare map. Done
+                        // textually rather than with a JSON parse because the
+                        // document is 1.2 MB and this is a diagnostic.
+                        let open = plan.settings.find(':').map(|i| i + 1).unwrap_or(0);
+                        let inner = plan.settings[open..].trim();
+                        inner.trim_end_matches('}').trim_end().to_string()
+                    })
+                    .unwrap_or_else(|| plan.settings.clone()),
+                _ => plan.settings.clone(),
+            };
+            match linker::game_activity::preload_flag_overrides(
+                plan.preload_native as *mut std::ffi::c_void,
+                &body,
+            ) {
+                Ok(()) => println!(
+                    "    nativePreloadFlagOverrides ok ({shape}, {} bytes)",
+                    body.len()
+                ),
+                Err(e) => println!("    nativePreloadFlagOverrides failed: {e}"),
+            }
+        }
+    }
     if plan.settings_native != 0 {
         match linker::game_activity::init_client_settings(
             plan.settings_native as *mut std::ffi::c_void,
@@ -1157,6 +1232,24 @@ fn main() -> ExitCode {
                                 }
                                 Err(e) => println!("  early client settings failed: {e}"),
                             }
+
+                            // `CORDIAL_SETTLE_MS=5000` holds here before
+                            // `initializeNativeCode` runs.
+                            //
+                            // This exists to kill a hypothesis rather than to
+                            // ship: the flags verdict arrives 4-6 ms after the
+                            // engine calls `bootstrapTheApp`, and every reading
+                            // of that as "the verdict outran the settings"
+                            // survived because the two were always milliseconds
+                            // apart. Putting seconds between them settles it in
+                            // one run instead of another round of inference.
+                            if let Some(ms) = std::env::var("CORDIAL_SETTLE_MS")
+                                .ok()
+                                .and_then(|v| v.parse::<u64>().ok())
+                            {
+                                println!("  settling for {ms} ms before initializeNativeCode");
+                                std::thread::sleep(std::time::Duration::from_millis(ms));
+                            }
                         }
 
                         // Install the bootstrap before the engine can call it.
@@ -1184,6 +1277,9 @@ fn main() -> ExitCode {
                                     .map_or(0, |p| p as usize),
                                 flags_native: lib
                                     .symbol("Java_com_roblox_client_flags_FlagJniInterface_nativeInitializeNativeFlags")
+                                    .map_or(0, |p| p as usize),
+                                preload_native: lib
+                                    .symbol("Java_com_roblox_client_startup_MainGameActivity_nativePreloadFlagOverrides")
                                     .map_or(0, |p| p as usize),
                                 settings: cordial_runtime::client_settings::load(
                                     opt.client_settings.as_deref(),
@@ -1867,6 +1963,78 @@ fn main() -> ExitCode {
                                                 }
                                             }
 
+                                        // `CORDIAL_GLOBAL_INIT_EARLY=1` moves the
+                                        // globals ahead of the settings
+                                        // handshake, which is where mocktail
+                                        // puts them.
+                                        //
+                                        // The order below -- globals *after*
+                                        // settings -- came from disassembling the
+                                        // ActivityNativeMain chain, and AGENTS.md
+                                        // records nine consecutive conclusions
+                                        // drawn that way being wrong. The reason
+                                        // to doubt this one specifically is §9's
+                                        // captured stack: the failure reporter is
+                                        // reached through `nativeGameGlobalInit`,
+                                        // so the call Cordial makes last is on the
+                                        // path that announces the verdict.
+                                        //
+                                        // Off by default until it is shown to
+                                        // change something. Shipping an inference
+                                        // as a default is a mistake this file has
+                                        // already made once.
+                                        let globals_early =
+                                            std::env::var_os("CORDIAL_GLOBAL_INIT_EARLY").is_some();
+                                        if globals_early {
+                                            call_globals(&lib, "early");
+                                        }
+
+                                        // What the engine actually holds, asked
+                                        // rather than inferred.
+                                        //
+                                        // `CORDIAL_FLOG_PROBE=Name,Name` reads
+                                        // each `FLog<Name>` back through
+                                        // `nativeGetFInt`. It exists because
+                                        // pushing values in and reading the log
+                                        // gave contradictory answers: setting
+                                        // `FLogNativeDM` silenced that channel
+                                        // at every value tried while the same
+                                        // mechanism raised `FLogAppShellReporter`
+                                        // from nothing to fourteen lines. The
+                                        // sentinel separates "set to 0" from
+                                        // "not a registered flag", which the log
+                                        // cannot do. flag-init.md §22.
+                                        if let (Some(probe), Some(f)) = (
+                                            std::env::var("CORDIAL_FLOG_PROBE").ok(),
+                                            lib.symbol(
+                                                "Java_com_roblox_client_flags_FlagJniInterface_nativeGetFInt",
+                                            ),
+                                        ) {
+                                            const ABSENT: i32 = -424242;
+                                            for name in probe.split(',').filter(|n| !n.is_empty()) {
+                                                let full = if name.starts_with("FLog")
+                                                    || name.starts_with("DFLog")
+                                                    || name.starts_with("FInt")
+                                                    || name.starts_with("DFInt")
+                                                {
+                                                    name.to_string()
+                                                } else {
+                                                    format!("FLog{name}")
+                                                };
+                                                match linker::game_activity::get_fint(
+                                                    f, &full, ABSENT,
+                                                ) {
+                                                    Ok(v) if v == ABSENT => {
+                                                        println!("  flog probe: {full} = <not a registered flag>")
+                                                    }
+                                                    Ok(v) => println!("  flog probe: {full} = {v}"),
+                                                    Err(e) => {
+                                                        println!("  flog probe: {full} failed: {e}")
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         // Flags before anything else asks for
                                         // them: bootstrapTheApp's whole job is to
                                         // reach this, and the engine reports
@@ -2162,26 +2330,13 @@ fn main() -> ExitCode {
                                             println!("  activity lifecycle: {fired}/9 fired");
                                         }
 
-                                        // Globals first. Disassembly of the
-                                        // ActivityNativeMain chain gives this
-                                        // order, and calling StartLuaAppDM
-                                        // without them crashes on a null JNIEnv
-                                        // the engine expects to have been stored
-                                        // by the globals init.
-                                        for name in [
-                                            "Java_com_roblox_engine_jni_NativeGLInterface_nativeGameGlobalInit",
-                                            "Java_com_roblox_engine_jni_NativeGLInterface_nativeUpdateAdapterInit",
-                                        ] {
-                                            match lib.symbol(name) {
-                                                None => println!("  {name} not exported"),
-                                                Some(f) => match linker::game_activity::appbridge_call_bare(f) {
-                                                    Ok(()) => println!(
-                                                        "  {} ok",
-                                                        name.rsplit('_').next().unwrap_or(name)
-                                                    ),
-                                                    Err(e) => println!("  {name} failed: {e}"),
-                                                },
-                                            }
+                                        // Globals before the app bridge:
+                                        // StartLuaAppDM without them crashes on a
+                                        // null JNIEnv the engine expects the
+                                        // globals init to have stored. Skipped
+                                        // when they were already run early.
+                                        if !globals_early {
+                                            call_globals(&lib, "late");
                                         }
 
                                         // The app bridge proper. ActivitySplash —

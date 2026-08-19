@@ -381,6 +381,14 @@ pub mod game_activity {
             err: *mut c_char,
             n: usize,
         ) -> c_int;
+        fn cordial_get_fint(
+            f: *mut c_void,
+            name: *const c_char,
+            fallback: c_int,
+            out_result: *mut c_int,
+            err: *mut c_char,
+            n: usize,
+        ) -> c_int;
         fn cordial_post_client_settings_loaded(f: *mut c_void, err: *mut c_char, n: usize)
             -> c_int;
         fn cordial_preload_flag_overrides(
@@ -1083,6 +1091,31 @@ pub mod game_activity {
                 ca.as_ptr(),
                 cb.as_ptr(),
                 cc.as_ptr(),
+                &mut out as *mut c_int,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc == 0 { Ok(out) } else { Err(take_err(err)) }
+    }
+
+    /// `FlagJniInterface.nativeGetFInt(String, int)I` — ask the engine what a
+    /// flag actually holds, rather than inferring it from behaviour.
+    ///
+    /// `fallback` comes back when the name is not a registered flag, so a
+    /// sentinel separates "the engine has this set to 0" from "the engine has
+    /// never heard of it". Cordial spent a session unable to tell those apart
+    /// for `FLogNativeDM`; see docs/analysis/flag-init.md §22.
+    pub fn get_fint(native: *mut c_void, name: &str, fallback: i32) -> Result<i32, String> {
+        let cn = CString::new(name).map_err(|e| e.to_string())?;
+        let mut err = vec![0u8; 512];
+        let mut out: c_int = 0;
+        // SAFETY: `native` is the exported JNI native; all buffers outlive the call.
+        let rc = unsafe {
+            cordial_get_fint(
+                native,
+                cn.as_ptr(),
+                fallback as c_int,
                 &mut out as *mut c_int,
                 err.as_mut_ptr() as *mut c_char,
                 err.len(),

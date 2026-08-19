@@ -774,8 +774,37 @@ fn no_agdk_touch() -> bool {
     *ON.get_or_init(|| std::env::var_os("CORDIAL_NO_AGDK_TOUCH").is_some())
 }
 
-/// `CORDIAL_NO_AGDK_KEY=1` and `CORDIAL_NO_PASS_KEY=1` — send a keystroke down
-/// only one of the two paths that currently both carry it.
+/// Which of the two key paths carries a keystroke. **AGDK's is off by default**,
+/// and `CORDIAL_AGDK_KEY=1` puts it back.
+///
+/// ## Settled by measurement, 2026-08-19
+///
+/// Every key press used to go to the engine twice, and the comment here used to
+/// say that nobody had ever observed one path in isolation. Both have now been
+/// run alone against a real session:
+///
+/// | configuration | result |
+/// |---|---|
+/// | `nativePassKeyEvent` alone | **works** |
+/// | AGDK `onKeyDownNative` alone | **nothing works at all** |
+/// | both, focused at startup | works |
+/// | both, not focused at startup | only `SPACE` arrives |
+///
+/// So the engine reads `NativeInputInterface.nativePassKeyEvent` and does not
+/// read AGDK's key queue — one of the four numbering schemes this file agonises
+/// over was never being consulted. And sending both is not merely redundant: the
+/// last row is the bug it caused, where a client started without keyboard focus
+/// (a scripted launch, `tools/join-run.sh`) lost everything but the one key that
+/// happened to survive.
+///
+/// That also retires the old note above about `D` being the only key that moved
+/// the character and Alt causing a jump. Two deliveries of one press, interpreted
+/// differently, was exactly the variable nobody had removed, and removing it is
+/// the fix rather than another mapping table.
+///
+/// AGDK delivery is kept behind the flag rather than deleted because it is the
+/// standard Android path and a future engine build may start reading it. It is
+/// not carrying anything today.
 ///
 /// **Every key press is delivered to the engine twice**, through AGDK's
 /// `onKeyDownNative` and through `NativeInputInterface.nativePassKeyEvent`, and
@@ -791,11 +820,11 @@ fn no_agdk_touch() -> bool {
 /// numbering schemes in play here, so this is not an off-by-N. Two deliveries
 /// of one press, interpreted differently, is the variable nobody has removed.
 ///
-/// Both default to sending, which is the behaviour every measurement so far was
-/// taken under.
 fn no_agdk_key() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CORDIAL_NO_AGDK_KEY").is_some())
+    // Inverted: the default is now *not* to send. `CORDIAL_NO_AGDK_KEY` is still
+    // honoured so anything scripted against it keeps working.
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_AGDK_KEY").is_none())
 }
 
 fn no_pass_key() -> bool {

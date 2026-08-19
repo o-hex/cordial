@@ -2350,9 +2350,46 @@ unsafe extern "C" fn keyboard_enter(
     // window's worth of surfaces (GTK's dialogs, its cursor surfaces) and
     // "some surface of ours has focus" is not the same claim as "the window
     // the engine is in has focus".
+    // Remembered unconditionally, because this can arrive before the window
+    // exists to compare against. `wl_keyboard.enter` fires on a focus *change*,
+    // so a client whose surface is registered while the compositor already
+    // considers it focused gets exactly one of these and may get it early —
+    // after which no further enter is ever sent, and a flag that missed it stays
+    // false for the life of the process.
+    //
+    // That is the bug where a scripted launch could not walk: every key was
+    // dropped by the gate in `keyboard_key`, permanently, because focus was
+    // never observed rather than never held. Launching interactively hid it,
+    // since clicking the window produces a fresh enter after the window is up.
+    LAST_ENTERED_SURFACE.store(surface as usize, Ordering::Release);
     let Some(w) = current() else { return };
     if std::ptr::eq(surface, w.parent_surface) {
         KEYBOARD_FOCUSED.store(true, Ordering::Release);
+    }
+}
+
+/// The surface `wl_keyboard.enter` last named, whether or not there was a window
+/// to match it against at the time. Reconciled by [`reconcile_keyboard_focus`].
+static LAST_ENTERED_SURFACE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Settle a focus notification that arrived before the window did.
+///
+/// Called from the key path rather than the pump so that it costs nothing until
+/// a key actually needs the answer, and so a client that never receives a key
+/// never touches it.
+fn reconcile_keyboard_focus() {
+    if KEYBOARD_FOCUSED.load(Ordering::Acquire) {
+        return;
+    }
+    let entered = LAST_ENTERED_SURFACE.load(Ordering::Acquire);
+    if entered == 0 {
+        return;
+    }
+    if let Some(w) = current() {
+        if entered == w.parent_surface as usize {
+            KEYBOARD_FOCUSED.store(true, Ordering::Release);
+        }
     }
 }
 /// Whether the compositor currently gives this surface keyboard focus.
@@ -2384,6 +2421,10 @@ unsafe extern "C" fn keyboard_leave(_data: *mut c_void, _kb: *mut c_void, _seria
 unsafe extern "C" fn keyboard_key(_data: *mut c_void, _kb: *mut c_void, _serial: u32, _time: u32, key: u32, state: u32) {
     // Not ours to see. The seat can still deliver events around a focus
     // change; `KEYBOARD_FOCUSED` is what makes that harmless.
+    //
+    // Reconciled first, because "focus was never observed" and "focus is not
+    // held" are different states and only the second should drop a key.
+    reconcile_keyboard_focus();
     if !KEYBOARD_FOCUSED.load(Ordering::Acquire) {
         return;
     }

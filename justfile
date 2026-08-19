@@ -8,6 +8,40 @@
 _default:
     @just --list
 
+# Reclaim disk: just clean [all]   (build artifacts only; never a profile or a cache of Roblox)
+clean what="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Written after a session filled a 728 GB disk to 99% across four target
+    # directories and one Flatpak build tree, and the failure did not look like
+    # a disk failure. Cargo cannot finish writing an rlib, and the next build
+    # reports `can't find crate for winnow` — so it reads as a broken toolchain
+    # or a corrupt registry, and the fix people reach for is reinstalling one of
+    # those. The actual fix is `df` and then deleting a target directory.
+    #
+    # Deliberately NOT touched, however much space they hold:
+    #   ~/.local/share/cordial/profiles/*   a user's saved sessions and identity
+    #   ~/.cache/cordial-known-good/*       the last engine known to work, which
+    #                                       matters more than usual while the
+    #                                       updater has no fallback of its own
+    #                                       (TASKS.md U2)
+    # Both are recoverable only by re-downloading or re-signing-in, and neither
+    # is a build artifact.
+    for d in target-distrobox target-toolbox target-nix target-jnitrace .flatpak-builder; do
+        [ -e "$d" ] || continue
+        printf '  %-18s %s\n' "$d" "$(du -sh "$d" 2>/dev/null | cut -f1)"
+        rm -rf "$d"
+    done
+    # `target` last and only when asked: it is the host build, it is the biggest,
+    # and losing it costs a full rebuild rather than the minute the others cost.
+    if [ "{{ what }}" = "all" ] && [ -e target ]; then
+        printf '  %-18s %s\n' "target" "$(du -sh target 2>/dev/null | cut -f1)"
+        rm -rf target
+    elif [ -e target ]; then
+        echo "  target ($(du -sh target 2>/dev/null | cut -f1)) kept — 'just clean all' removes it too"
+    fi
+    df -h . | tail -1
+
 # Build: just build [host|toolbox|distrobox|nix]  (Clang required; bionic will not build with GCC)
 build where="host":
     #!/usr/bin/env bash

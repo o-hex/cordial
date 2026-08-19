@@ -149,11 +149,23 @@ def main():
             print(f"mapping names its file; using {ref} as the reference")
             found = (pid, lo, hi, line, ref, int(fields[2], 16), size)
             break
-        if abs((hi - lo) - seg_size) <= args.tolerance:
+        # Only when a reference actually exists. With `seg_size` at -1 the
+        # comparison below matches almost any mapping, and it did: the first
+        # run of this inside Sober's namespace selected a 73 KB region and then
+        # died trying to read a reference that was never there.
+        if seg_size > 0 and abs((hi - lo) - seg_size) <= args.tolerance:
             found = (pid, lo, hi, line, args.lib, seg_off, seg_size)
             break
 
     if not found:
+        # Say what *was* mapped, rather than only that nothing matched. Without
+        # a reference the only usable route is a mapping that names its file,
+        # and if none does then that is the thing to report.
+        print("candidate executable mappings over 8 MB, for whoever reads this next:")
+        for pid, fields, line in candidates(args.pid):
+            mb = size_mb(fields[0])
+            if mb >= 8:
+                print(f"  pid {pid}  {fields[0]}  {mb:8.1f}MB  {fields[-1]}")
         print(
             "no readable process has a mapping matching that segment.\n"
             "Sober's engine lives in the Flatpak PID namespace and needs\n"

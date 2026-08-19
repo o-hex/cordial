@@ -2710,3 +2710,77 @@ question, and it is a different one from the last three sections'.
 derived by scanning backwards for a prologue, the build has moved at least once
 underneath those numbers, and one of them was wrong by a whole function. The FDE
 table is authoritative, costs one `readelf`, and is not disassembly.
+
+## §24. Storage initialisation is a scheduled task, which is why this document is about both things
+
+`0x23121ae` — the real `RbxStorage::init`, per §23.7's `.eh_frame` bounds — has
+exactly three direct call sites and no raw pointer anywhere in `.data` or
+`.data.rel.ro`:
+
+* `0x230c3af`, inside the getter, on the branch taken when its pointer is null;
+* `0x6824a78`, in a small function at `0x6824a30`;
+* `0x6824b0e`, in a small function at `0x6824af8`.
+
+And immediately before the first of those, at `0x230c393`, the getter loads a
+pointer to `0x6824af8`, loads the string **`"RbxStorageInit"`** (`0x4ec600`), and
+calls `0x29852f6`. That is a named task being registered, with `0x6824af8` as its
+body — the third call site above. **Storage does not initialise inline. It is
+scheduled.**
+
+That is the connection this document spent twenty sections not seeing. The
+question it opened with was `Can't initialize the TaskScheduler before flags have
+been loaded`; the question it has been stuck on is why the content store never
+comes up. They are the same question. A store whose initialiser is a scheduled
+task cannot come up until something runs the task.
+
+### Live: it never fires
+
+`0xCC` at `0x23121ae`, `probe2.py`, own data root, four full-length runs:
+
+    run 1  real init alone armed                      0 hits, clean exit
+    run 2  real init + getter armed                   getter 22 hits, real init 0
+    run 3  as run 2, repeated                         getter 22 hits, real init 0
+    run 4  real init + both thunks armed              0 hits on all three
+
+The getter's 22 hits per run carry four distinct labels — `AssetProvider`,
+`http-available`, `http-write-init-only`, and **`flagLoaded`**.
+
+**That retracts §23.6's claim that the `flagLoaded` call never happens in
+Cordial.** It does, twice per run. The earlier reading was an attach race: three
+runs missed it because the probe attached after it had already gone past. With
+the getter instrumented for longer it appears every time. The rest of §23.6's
+getter findings stand; that one does not.
+
+So `flagLoaded` *does* reach the getter, and the getter returns its
+already-constructed pointer without ever taking the branch that would register
+the task. §23.6 established that pointer becomes non-null during bionic's own
+`call_constructors`, running `.init_array` as part of loading the library —
+before any caller exists. The slow path is therefore dead from process start.
+
+### What is not established
+
+Neither `0x6824a30` nor `0x6824af8` has a direct caller in `.text` or a raw
+pointer in the data sections; both are reached only through indirect dispatch,
+the same wall `render-gate.md` §2 and §3 already hit. Whether some third path
+reaches storage init was **not found in four runs**, which is not the same as
+proven absent, and is stated that way deliberately.
+
+What would make the getter consider its object not-ready at call time is
+unresolved, and answering it means reading the layout of an object that is
+Roblox's, which is the line AGENTS.md draws.
+
+### The lead this actually opens
+
+mocktail turns the task scheduler on by JNI rather than by patching — two of its
+few non-patch knobs, both on by default:
+`MOCKTAIL_ASMA_START_TASK_SCHEDULER_FOREGROUND` calls
+`setTaskSchedulerBackgroundMode` in foreground mode, and
+`MOCKTAIL_TASK_SCHEDULER_FOREGROUND_ON_MAIN_THREAD` routes that call onto the
+main thread. Cordial makes the same call — its log carries
+`setTaskSchedulerBackgroundMode() enable:false context:ASMA.start` at 0.480s —
+but nothing here has ever checked which thread it runs on, and mocktail
+considered that worth a dedicated switch.
+
+That is a legitimate JNI call, not a memory write, and it is the first lead in
+this document that connects the scheduler to the store by a mechanism rather than
+by proximity.

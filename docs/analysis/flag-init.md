@@ -4101,3 +4101,47 @@ blind.
 
 That is the next measurement, it is cheap, and it is the first one in a long
 while that is aimed at something the working case actually has.
+
+### §36.2 Content activity is not it either, and the reproduction is not found
+
+§36.1 named sustained content activity as the untested variable, on the grounds
+that the working root had 43 `ContentProvider_*` directories where every
+reproduction attempt had almost none. The test profile settles it without another
+run:
+
+    ~/.local/share/cordial/profiles/CordialTest
+      ContentProvider_* directories:  91
+      rbx-storage.db:                  0
+      engine-created partitions:       0
+
+Ninety-one, more than twice the working root, across many real signed-in sessions
+including joins — and no store. **Content activity is not the variable.**
+
+So: the delay is not it, a second warm pass is not it, the storage flags are not
+it, and content activity is not it. The working root's store exists, was created
+at a known second by a known run, and **has not been reproduced** by any
+configuration tried.
+
+What that root has which none of the others do is simply *more of everything* —
+around twenty runs under a dozen different environment combinations, several of
+which crashed partway. A store created by a run that died mid-way through some
+other experiment would explain both the existence and the difficulty of
+reproducing it, and would mean the trigger is a state Cordial reaches
+occasionally rather than a setting.
+
+**That is speculation and is labelled as such.** It is not a candidate, it has no
+measurement behind it, and this document has already recorded nine faults
+produced by exactly this kind of reasoning being written down as though it were
+evidence.
+
+### Where this genuinely stands
+
+`RbxStorage` **is reachable** — §36 is a real store with a real database and
+eight engine-created partitions, made by this client. What is not known is what
+made it happen, and the log channel that would say is silent even on success, so
+every score taken from it across this document is void.
+
+The one instrument that works is the filesystem. It has now been pointed at the
+delay, at warmth, at the storage flags, and at content activity, and all four are
+negative. Whoever continues should keep using it and should not trust a single
+`grep -c 'RbxStorage::init'` in this file.

@@ -152,6 +152,25 @@ jobs:
               "org.freedesktop.Sdk.Extension.rust-stable//$e" \
               "org.freedesktop.Sdk.Extension.llvm20//$e"
 
+      # The build step has no network (issue #3), so every crate arrives through
+      # packaging/cargo-sources.json and is fetched in flatpak-builder's download
+      # phase. That list is generated from Cargo.lock and is the only thing
+      # standing between a dependency bump and a build failure nobody can read,
+      # so check it here rather than fifteen minutes later inside the sandbox.
+      #
+      # The generator is stdlib-only and deterministic: same lock file, same
+      # bytes out. A diff means somebody changed Cargo.lock without rerunning it.
+      - name: The vendored crate list matches Cargo.lock
+        run: |
+          set -euo pipefail
+          python3 packaging/cargo-sources.py
+          git diff --exit-code -- packaging/cargo-sources.json || {
+            echo "::error::packaging/cargo-sources.json is stale. Run"
+            echo "::error::  python3 packaging/cargo-sources.py"
+            echo "::error::and commit the result alongside Cargo.lock."
+            exit 1
+          }
+
       # Crate downloads and the two pinned git clones, which are the same on
       # every run until Cargo.lock or the manifest changes. Not the built
       # objects — restoring a stale build cache is how a package ends up
@@ -160,7 +179,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .flatpak-builder/downloads
-          key: flatpak-downloads-${{ hashFiles('Cargo.lock', 'packaging/io.github.luohoa97.Cordial.yml') }}
+          key: flatpak-downloads-${{ hashFiles('Cargo.lock', 'packaging/io.github.luohoa97.Cordial.yml', 'packaging/cargo-sources.json') }}
           restore-keys: flatpak-downloads-
 
       # Absent secret means an unsigned repository, and the README says so in

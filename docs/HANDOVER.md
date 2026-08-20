@@ -333,13 +333,26 @@ property that makes its claims worth anything.
 the way and are worth fixing regardless, because they are what a self-hosted
 remote wants anyway:
 
-1. **The build needs the network** ([issue #3](https://github.com/luohoa97/cordial/issues/3)).
-   Flathub's builders have none. The submodule half is done — `libjnivm` and
-   `mcpelauncher-linker` are pinned as `git` sources by commit — and the crate
-   half is not. `flatpak-cargo-generator.py` from `flatpak-builder-tools` turns
-   `Cargo.lock` into a `cargo-sources.json`, after which `--share=network` comes
-   out of `build-options.build-args`. This also makes the local build
-   reproducible, which is reason enough on its own.
+1. ~~**The build needs the network**~~ **Done**
+   ([issue #3](https://github.com/luohoa97/cordial/issues/3)). Both halves are
+   pinned now: `libjnivm` and `mcpelauncher-linker` as `git` sources by commit,
+   and all 212 crates as `archive` sources carrying the sha256 that was already
+   in `Cargo.lock`, generated into `packaging/cargo-sources.json` by
+   `packaging/cargo-sources.py`. `--share=network` is gone from
+   `build-options.build-args`, and the compile now runs with the network
+   unshared — measured with a control, as a manifest pair differing only in
+   `build-args`: without it a build-command gets `getaddrinfo` failure, a
+   refused TCP connect and no routes; with it, all three succeed. Note that
+   probing the *build directory* with `flatpak build` answers the wrong
+   question, because that reads the finished `metadata` and the finish-args
+   include `--share=network` for the game itself; that mistake was made here
+   before the manifest pair replaced it.
+   The generator is stdlib-only rather than `flatpak-builder-tools`'
+   `flatpak-cargo-generator.py`, because every dependency here is a registry
+   crate and the checksum for one is the lock file's own; a git dependency
+   would make it exit rather than emit a list quietly missing that crate.
+   A CI step regenerates the list and fails on a diff, which is the guard
+   against the one way this arrangement breaks.
 2. ~~**The application ID.**~~ **Done** — `io.github.luohoa97.Cordial`, see the
    section above.
 3. **No screenshots.** The metainfo has none, and Flathub's linter requires at

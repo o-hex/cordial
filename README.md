@@ -323,10 +323,18 @@ packaging/build-flatpak.sh --install
 ```
 
 That one needs no submodules: the manifest pins `third_party/libjnivm` and
-`third_party/mcpelauncher-linker` by commit and fetches them itself. It still
-wants the network for the crates, which is
-[issue #3](https://github.com/luohoa97/cordial/issues/3) and the reason Cordial
-is not on Flathub.
+`third_party/mcpelauncher-linker` by commit and fetches them itself, and it
+pins every crate by the sha256 already in `Cargo.lock`
+(`packaging/cargo-sources.json`). flatpak-builder downloads the lot up front;
+the compile itself runs with the network unshared, so what comes out is
+reproducible ([issue #3](https://github.com/luohoa97/cordial/issues/3)). If you
+change a dependency, run `python3 packaging/cargo-sources.py` in the same
+commit as the `Cargo.lock` change or the Flatpak build will fail with
+`no matching package`.
+
+That is not what keeps Cordial off Flathub, and this file used to say it was.
+The obstacle is Flathub's generative-AI policy, which Cordial's commit trailers
+put it plainly on the wrong side of; `docs/HANDOVER.md` has the reasoning.
 
 For development, skip Flatpak and build the binaries directly. This one *does*
 want the submodules:

@@ -17,6 +17,176 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// for work shows up here; one that never started does not.
 pub static POLLS: AtomicU64 = AtomicU64::new(0);
 
+/// Who is polling, with what timeout, and what `epoll_wait` hands back.
+///
+/// A single global count said ten million polls a second and could not say
+/// whose they were. Two explanations fit that number and they have opposite
+/// owners: the engine asking for a zero timeout in a loop of its own, which is
+/// the engine's design and not ours to change, or `epoll_wait` returning
+/// instantly because a descriptor is permanently ready and nothing drains it,
+/// which would be ours entirely. Only a breakdown by caller, by requested
+/// timeout, and by which descriptor came back separates them.
+///
+/// Per-thread slots, one writer each, so every counter below is a plain load
+/// and store rather than a locked read-modify-write. At ten million calls a
+/// second on one thread an atomic increment per field would be measuring the
+/// instrument rather than the engine.
+mod census {
+    use super::{c_int, AtomicU64, Ordering};
+
+    /// Enough for every thread the engine has been seen to poll from, with
+    /// room to notice if a run ever exceeds it — `overflow` below counts the
+    /// calls that found no slot, so a full table reports itself rather than
+    /// silently dropping a caller.
+    const SLOTS: usize = 24;
+
+    #[repr(align(64))]
+    pub struct Slot {
+        /// 0 means free. Claimed once, by CAS, by the thread it belongs to.
+        pub tid: AtomicU64,
+        pub calls: AtomicU64,
+        /// Requested timeout, bucketed: negative (block), zero (do not wait),
+        /// 1..=9 ms, 10 ms and over.
+        pub t_block: AtomicU64,
+        pub t_zero: AtomicU64,
+        pub t_short: AtomicU64,
+        pub t_long: AtomicU64,
+        /// `epoll_wait` reported nothing ready — the honest idle answer.
+        pub r_empty: AtomicU64,
+        pub r_wake: AtomicU64,
+        pub r_callback: AtomicU64,
+        pub r_ident: AtomicU64,
+        /// A descriptor came back ready that no registration claims, so
+        /// `pollOnce` returns `POLL_TIMEOUT` without reading it. Level
+        /// triggered, so it is ready again immediately: this is the counter
+        /// that would prove the spin is ours.
+        pub r_unclaimed: AtomicU64,
+        pub last_unclaimed_fd: AtomicU64,
+        /// Nanoseconds spent inside `epoll_wait`, sampled every 1024th call so
+        /// the clock reads do not dominate what they measure.
+        pub ns: AtomicU64,
+        pub ns_samples: AtomicU64,
+        /// What the last report saw, so the pump can print a rate.
+        pub prev_calls: AtomicU64,
+    }
+
+    impl Slot {
+        const fn new() -> Slot {
+            const Z: AtomicU64 = AtomicU64::new(0);
+            Slot {
+                tid: Z,
+                calls: Z,
+                t_block: Z,
+                t_zero: Z,
+                t_short: Z,
+                t_long: Z,
+                r_empty: Z,
+                r_wake: Z,
+                r_callback: Z,
+                r_ident: Z,
+                r_unclaimed: Z,
+                last_unclaimed_fd: Z,
+                ns: Z,
+                ns_samples: Z,
+                prev_calls: Z,
+            }
+        }
+    }
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const FREE: Slot = Slot::new();
+    pub static SLOTS_TABLE: [Slot; SLOTS] = [FREE; SLOTS];
+    pub static OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+    /// One writer per counter, so the read-modify-write does not need to be
+    /// atomic — only the visibility does, which `Relaxed` on both halves gives.
+    #[inline(always)]
+    pub fn bump(c: &AtomicU64) {
+        c.store(c.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+    }
+
+    extern "C" {
+        fn gettid() -> c_int;
+    }
+
+    thread_local! {
+        /// `usize::MAX` until this thread has looked for a slot.
+        static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    }
+
+    /// This thread's slot, claiming one on first use. `None` once the table is
+    /// full, which `OVERFLOW` then records.
+    pub fn slot() -> Option<&'static Slot> {
+        let idx = MINE.with(|m| {
+            let cached = m.get();
+            if cached != usize::MAX {
+                return cached;
+            }
+            // SAFETY: `gettid` takes no arguments and returns the caller's
+            // kernel thread id.
+            let tid = unsafe { gettid() } as u64;
+            for (i, s) in SLOTS_TABLE.iter().enumerate() {
+                if s
+                    .tid
+                    .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    m.set(i);
+                    return i;
+                }
+            }
+            m.set(SLOTS);
+            SLOTS
+        });
+        SLOTS_TABLE.get(idx)
+    }
+
+    /// Whether to account at all. Read once; when off, `pollOnce` pays a
+    /// relaxed load and nothing else.
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("CORDIAL_INSTR").is_some())
+    }
+
+    /// One line per polling thread, rates since the previous call.
+    pub fn report(dt: f64) -> String {
+        let mut out = String::new();
+        for s in SLOTS_TABLE.iter() {
+            let tid = s.tid.load(Ordering::Relaxed);
+            let calls = s.calls.load(Ordering::Relaxed);
+            if tid == 0 || calls == 0 {
+                continue;
+            }
+            let prev = s.prev_calls.swap(calls, Ordering::Relaxed);
+            let rate = (calls - prev) as f64 / dt;
+            let samples = s.ns_samples.load(Ordering::Relaxed).max(1);
+            let name = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "[instr] poll tid={tid} ({}) {rate:.0}/s timeout[block={} zero={} 1-9={} 10+={}] \
+                 ret[empty={} wake={} cb={} ident={} unclaimed={} lastfd={}] epoll_wait~{}ns\n",
+                name.trim(),
+                s.t_block.load(Ordering::Relaxed),
+                s.t_zero.load(Ordering::Relaxed),
+                s.t_short.load(Ordering::Relaxed),
+                s.t_long.load(Ordering::Relaxed),
+                s.r_empty.load(Ordering::Relaxed),
+                s.r_wake.load(Ordering::Relaxed),
+                s.r_callback.load(Ordering::Relaxed),
+                s.r_ident.load(Ordering::Relaxed),
+                s.r_unclaimed.load(Ordering::Relaxed),
+                s.last_unclaimed_fd.load(Ordering::Relaxed) as i64,
+                s.ns.load(Ordering::Relaxed) / samples,
+            ));
+        }
+        let over = OVERFLOW.load(Ordering::Relaxed);
+        if over != 0 {
+            out.push_str(&format!("[instr] poll census table full; {over} calls unattributed\n"));
+        }
+        out
+    }
+}
+
 // Return values from android/looper.h.
 pub const POLL_WAKE: c_int = -1;
 pub const POLL_CALLBACK: c_int = -2;
@@ -572,6 +742,10 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                 super::wayland::instr_toplevel_state(),
                 policy,
             );
+            // Who is doing the polling the line above only counts. See
+            // `census`: the global rate cannot tell the engine's own zero-timeout
+            // loop from an undrained descriptor of ours.
+            eprint!("{}", census::report(dt));
             p0 = p;
             q0 = q;
             i0 = iters;
@@ -877,14 +1051,41 @@ extern "C" fn looper_poll_once(
         return POLL_ERROR;
     };
     POLLS.fetch_add(1, Ordering::Relaxed);
+    let seat = census::on().then(census::slot).flatten();
+    if let Some(s) = seat {
+        census::bump(&s.calls);
+        census::bump(match timeout_millis {
+            t if t < 0 => &s.t_block,
+            0 => &s.t_zero,
+            1..=9 => &s.t_short,
+            _ => &s.t_long,
+        });
+    } else if census::on() {
+        census::bump(&census::OVERFLOW);
+    }
 
     let mut events = [EpollEvent { events: 0, data: 0 }; 16];
+    // Time the syscall on one call in 1024. Timing every call would cost two
+    // clock reads against a syscall that turns out to take about as long as
+    // one, which is the classic way to measure the instrument.
+    let timed = seat.is_some_and(|s| s.calls.load(Ordering::Relaxed) % 1024 == 0);
+    let t0 = timed.then(std::time::Instant::now);
     // SAFETY: `events` is a live array of the length passed.
     let n = unsafe { epoll_wait(l.epoll, events.as_mut_ptr(), events.len() as c_int, timeout_millis) };
+    if let (Some(s), Some(t0)) = (seat, t0) {
+        s.ns.store(
+            s.ns.load(Ordering::Relaxed) + t0.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        census::bump(&s.ns_samples);
+    }
     if n < 0 {
         return POLL_ERROR;
     }
     if n == 0 {
+        if let Some(s) = seat {
+            census::bump(&s.r_empty);
+        }
         return POLL_TIMEOUT;
     }
 
@@ -895,6 +1096,9 @@ extern "C" fn looper_poll_once(
             let mut sink = 0u64;
             // SAFETY: draining the eight bytes written by looper_wake.
             unsafe { read(l.wake, &mut sink as *mut u64 as *mut c_void, 8) };
+            if let Some(s) = seat {
+                census::bump(&s.r_wake);
+            }
             return POLL_WAKE;
         }
 
@@ -902,7 +1106,13 @@ extern "C" fn looper_poll_once(
             let regs = l.registrations.borrow();
             match regs.iter().find(|r| r.fd == fd) {
                 Some(r) => (r.ident, r.callback, r.data),
-                None => continue,
+                None => {
+                    if let Some(s) = seat {
+                        census::bump(&s.r_unclaimed);
+                        s.last_unclaimed_fd.store(fd as u64, Ordering::Relaxed);
+                    }
+                    continue;
+                }
             }
         };
         let looper_events = epoll_to_looper_events(ev.events);
@@ -913,6 +1123,9 @@ extern "C" fn looper_poll_once(
             // panic when it did.
             if cb(fd, looper_events, data) == 0 {
                 looper_remove_fd(l as *const Looper as *mut c_void, fd);
+            }
+            if let Some(s) = seat {
+                census::bump(&s.r_callback);
             }
             return POLL_CALLBACK;
         }
@@ -928,6 +1141,9 @@ extern "C" fn looper_poll_once(
         if !out_data.is_null() {
             // SAFETY: as above.
             unsafe { *out_data = data };
+        }
+        if let Some(s) = seat {
+            census::bump(&s.r_ident);
         }
         return ident;
     }

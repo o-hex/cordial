@@ -258,3 +258,31 @@ Threats to these numbers, in the order I would attack them:
   why it is slowest here while still *feeling* fastest. The reported belief that
   Cordial exits faster is **not confirmed by this measure**, and may simply be
   measuring something this measure does not.
+
+
+## Correction: §3's "3 of 9 never enter the throttle" is not bimodality
+
+Measured afterwards with a per-thread census in `looper_poll_once`, 15 runs.
+
+**The spin is one thread making one syscall.** A single `Main` thread — the AGDK
+looper-service thread, not the pump — holds 99–100% of a core. Across one 40 s
+run it made **123,885,088** `ALooper_pollOnce` calls, **every one with
+`timeout_millis == 0`**, with `empty=123,885,086` and **`unclaimed=0`**. No
+descriptor is permanently ready and nothing is undrained: the engine asks not to
+wait and Cordial does not wait. At ~110 ns a call, 8.9 M/s is 1.0 core, which is
+the number observed.
+
+**It is gated entirely on the focus report, deterministically, both
+directions.** Scripted focus, three runs, 136 one-second samples: focus reported
+true gives 8.90 M polls/s and 102.2% of a core; focus reported false gives 20
+polls/s and 4.3%. Unscripted, 8 of 8 runs split the same way — every run with no
+`focus -> false` transition pinned for its whole length, every run that got one
+collapsed within a pump tick. One run did both, in sequence.
+
+So the split this document recorded as bimodal was **whether Cordial's window
+happened to hold compositor focus during the sample**, not a race in the engine
+and not a lost transition. The earlier framing is withdrawn.
+
+Presents sat at 1.0/s throughout both halves, which is why this reads as "the
+frame rate idles fine but a core is busy": the renderer and the event loop idle
+on different signals.

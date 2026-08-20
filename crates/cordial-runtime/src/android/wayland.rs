@@ -2678,6 +2678,16 @@ impl WaylandWindow {
     /// keysym-driven insert/backspace/delete/move — is therefore correct
     /// rather than a fallback that risks double-entry against
     /// `zwp_text_input_v3`'s own `commit_string`.
+    // Linux evdev codes for the modifier keys, needed because a modifier's own
+    // key event arrives before the compositor's `modifiers` describing it --
+    // see `dispatch_key`'s correction.
+    const KEY_LEFTCTRL: u32 = 29;
+    const KEY_LEFTSHIFT: u32 = 42;
+    const KEY_RIGHTSHIFT: u32 = 54;
+    const KEY_LEFTALT: u32 = 56;
+    const KEY_RIGHTCTRL: u32 = 97;
+    const KEY_RIGHTALT: u32 = 100;
+
     fn dispatch_key(&self, evdev_key: u32, down: bool) {
         // `xkb_keycode_t` is evdev's own code offset by 8 — XKB reserves the
         // low 8 for historical X11 reasons every xkbcommon consumer has to
@@ -2710,6 +2720,41 @@ impl WaylandWindow {
             }
             if is_active(xk.caps_idx) {
                 meta |= super::input::META_CAPS_LOCK_ON;
+            }
+            // **A modifier key's own event carries the mask from before
+            // itself, and this corrects that one case.**
+            //
+            // Wayland sends `key` and then `modifiers`, so when this runs for
+            // Shift-down the compositor has not yet told us Shift is down.
+            // Measured, a Ctrl+Alt+Shift chord as the engine saw it:
+            //
+            //     down CTRL  -> 0x0000   ctrl missing
+            //     down ALT   -> 0x1000   alt missing
+            //     down SHIFT -> 0x1002   shift missing
+            //     up   SHIFT -> 0x1003   shift still set after release
+            //
+            // Every event one behind, in both directions. An ordinary key is
+            // unaffected -- press F5 while Shift is held and the mask already
+            // has Shift from the earlier `modifiers` -- which is why only
+            // modifier keys appeared wrong in the trace.
+            //
+            // The fix is *not* `xkb_state_update_key`: the note beside
+            // `state_update_mask`'s binding is right that re-deriving per
+            // keystroke double-applies a toggle the server already accounted
+            // for. This adjusts only the bit belonging to the key in hand, and
+            // leaves xkb's own state to the compositor as before.
+            let self_bit = match evdev_key {
+                Self::KEY_LEFTSHIFT | Self::KEY_RIGHTSHIFT => super::input::META_SHIFT_ON,
+                Self::KEY_LEFTCTRL | Self::KEY_RIGHTCTRL => super::input::META_CTRL_ON,
+                Self::KEY_LEFTALT | Self::KEY_RIGHTALT => super::input::META_ALT_ON,
+                _ => 0,
+            };
+            if self_bit != 0 {
+                if down {
+                    meta |= self_bit;
+                } else {
+                    meta &= !self_bit;
+                }
             }
             let unicode = if n > 0 { text_buf[0] as i32 } else { 0 };
             (keysym, unicode, n.max(0) as usize, text_buf, meta)

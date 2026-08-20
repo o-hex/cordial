@@ -470,3 +470,74 @@ in this tree.
 
 **This one is not fixed.** It is narrowed: not the present mode, not either
 Choreographer, not a starved fallback, not an undrained descriptor of ours.
+
+## The focused engine spins for events it would otherwise be handed, and it costs a core during play
+
+`CORDIAL_SCRIPT=0:focus-on` forces the report true on a window the compositor
+never focused, which is the `cf1` control made repeatable — the compositor
+refused focus on five consecutive launches on 2026-08-21, so every number below
+is from the override rather than from a granted focus.
+
+Three runs, 60 s each, CPU sampled over t=25–53 s:
+
+    h1  focus report on,  no input     1.0 presents/s   1.98 M polls/s   114.5 %
+    h2  focus report on,  input flowing 59.6 presents/s  1.83 M polls/s   128.1 %
+    h3  focus report off, input flowing 59.6 presents/s  0.00 M polls/s    27.5 %
+
+**h2 against h3 is the control that matters, and it is the first one taken at a
+playable frame rate.** Same rendering, same input, same everything; only the
+focus report differs. **The report costs about a hundred points of CPU — a whole
+core — at 60 fps with input flowing.**
+
+That retires the framing this document has carried since it was written. The
+spin is not an idle-only curiosity that a user would never notice. It is present
+during play, and on a laptop part like the 13620H a core pinned at turbo is
+taking package power and thermal headroom the GPU shares. "Cordial lags worse
+than Sober" and "Cordial burns a core" are one report.
+
+### What the engine is actually doing, from its own counters
+
+    h3  block=3452   zero=518,322       ident=3453   epoll_wait~98,821ns
+    h2  block=6      zero=110,982,683   ident=3473   epoll_wait~507ns
+
+**`ident` is the same in both — about 3,450, one per frame.** The engine is
+handed identical work either way. What the focus report changes is whether it
+blocks for that work or spins for it: unfocused it makes ~3,450 blocking calls
+and sleeps ~98 µs in each, focused it makes six and busy-polls 111 million times
+instead.
+
+So this is a deliberate latency trade inside Roblox — believing itself focused,
+it refuses to sleep so that input is picked up in hundreds of nanoseconds rather
+than at the next frame boundary. It is not a Cordial bug in the sense of
+something answered wrongly, and no amount of feeding the looper better will
+change it: the loop is not starved, it is choosing not to wait.
+
+### What is not the cause, all measured
+
+Present mode (MAILBOX vs FIFO, four runs, within 0.4 %), the NDK Choreographer
+(not imported), `android.view.Choreographer` (not among the 182 classes the
+engine asks for), a starved fallback (`block` and `ident` are equal in every
+run), an undrained descriptor of ours (`unclaimed=0` since the pump fix), and a
+frame-deadline busy-wait (h3 renders 59.6 fps on 0.00 M polls).
+
+The engine's two registered descriptors are its own: `fd 15`/`fd 18` are the read
+ends of two pipes whose write ends are `fd 17`/`fd 19` in the same process. It
+signals itself.
+
+### Where this can go
+
+Not "stop reporting focus" — that is a lie, it breaks input, and h3 is not a
+shippable configuration. The remaining candidates, in the order they are worth
+trying:
+
+1. **A FastFlag.** The spin is the TaskScheduler declining to yield. If Roblox
+   governs that with a flag, this is a one-line fix and the machinery to set it
+   already exists. `docs/traces/native-flag-names.txt` holds 139 names and none
+   of them match; the inventory needs widening before this can be tried, not
+   guessed at.
+2. **A Cordial setting**, if no flag exists — the trade is real and a user on a
+   laptop would take it. It must be described as what it is rather than as a
+   performance toggle, because switching it off means telling Roblox something
+   untrue.
+
+Both need the flag question answered first.

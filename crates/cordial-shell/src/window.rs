@@ -29,6 +29,7 @@ use crate::instructions;
 use crate::launch;
 use crate::profile_switcher;
 use crate::refresh_watch;
+use crate::crash;
 use crate::settings;
 use crate::shell_config::ShellConfig;
 use crate::updater;
@@ -133,14 +134,24 @@ impl Shell {
     }
 }
 
-/// How long to wait before deciding a client that has already exited failed.
+/// How long the "starting" dialog stays up before it is taken away.
 ///
 /// `cordial-run` reaching its first frame takes seconds; failing at load takes
-/// a fraction of one. Anything gone by the time this fires never started, and
-/// the launcher has to say so — the alternative is a toast saying Roblox is
-/// starting and then nothing at all, which is exactly the silent no-op this
-/// whole change exists to remove.
+/// a fraction of one. This used to be the *only* moment the launcher ever asked
+/// whether the client was still alive, which meant a crash ten minutes into a
+/// session produced nothing at all -- the window simply vanished. It is now
+/// only the dialog's timer; [`EXIT_POLL`] is what watches the process.
 const EARLY_EXIT_CHECK: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How often the launcher asks whether the client is still running.
+///
+/// **For the whole session, not for the first three seconds.** A crash is a
+/// crash whenever it happens, and the failure this replaces was a launcher that
+/// could only report one that arrived while it happened to be looking. Half a
+/// second is cheap -- `try_wait` is one `waitpid` with `WNOHANG` -- and is fast
+/// enough that the crash page arrives while the user is still looking at where
+/// the window was.
+const EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The dialog shown while the client starts.
 ///
@@ -327,7 +338,7 @@ pub fn build(
     // default below.
     let initial_profile = config.borrow().profile.clone();
     let initial_window =
-        profile::dir(&initial_profile).ok().map(|d| window_state::load(&d)).unwrap_or_default();
+        profile::dir(&initial_profile).ok().map(|d| window_state::load(&d, window_state::Which::Launcher)).unwrap_or_default();
 
     // 540x340 was 720x480 while the content was two preference groups pinned to
     // the top of it, which left the lower two thirds empty. This is a launcher's
@@ -380,6 +391,8 @@ pub fn build(
     // itself, not merely a value read out of it once, and `config` stops being
     // usable the moment `settings_action`'s closure below takes it.
     let config_for_window_state = config.clone();
+    // And again for `win.launch`, below. Same reason.
+    let config_for_launch = config.clone();
 
     let settings_action =
         gtk::gio::SimpleAction::new("settings", Some(glib::VariantTy::STRING));
@@ -428,7 +441,29 @@ pub fn build(
         }
     });
 
+    // Pressing Roblox, as an action.
+    //
+    // The photograph seam again, one step further than Settings: a crash page
+    // cannot be seen without a launch that fails, and a launch cannot be
+    // started without pressing something. AGENTS.md rules out synthesising the
+    // press, and under ADR-011's Wayland there is nothing to send it to. So
+    // this is the same call the chooser row makes -- `activate_roblox`, with
+    // the same window, toasts, config and pending join -- reachable by name.
+    // Not a second launch path: a seam that went somewhere else would prove
+    // nothing about the button.
+    let launch_action = gtk::gio::SimpleAction::new("launch", None);
+    {
+        let window = window.clone();
+        let toasts = toasts.clone();
+        let config = config_for_launch;
+        let join = join.clone();
+        launch_action.connect_activate(move |_, _| {
+            activate_roblox(&window.clone().upcast(), &toasts, &config, &join);
+        });
+    }
+
     let actions = gtk::gio::SimpleActionGroup::new();
+    actions.add_action(&launch_action);
     actions.add_action(&settings_action);
     actions.add_action(&profile_action);
     actions.add_action(&fullscreen_action);
@@ -467,6 +502,10 @@ pub fn build(
     {
         let config = config_for_window_state.clone();
         window.connect_fullscreened_notify(move |w| persist_fullscreen(&config, w));
+    }
+    {
+        let config = config_for_window_state.clone();
+        window.connect_maximized_notify(move |w| persist_maximised(&config, w));
     }
 
     // Size, debounced. GTK fires `notify::default-width`/`notify::default-height`
@@ -535,6 +574,13 @@ pub fn build(
     // asking an unmapped one. See `window_state.rs`'s header for why doing this
     // unconditionally is the right call for this window and must not be copied
     // uncritically onto the engine's own.
+    // Before fullscreen, so that a window saved as both comes back as both and
+    // leaving fullscreen drops it to maximised rather than to its floating
+    // size -- which is what a user who maximised it and then fullscreened it
+    // is expecting to get back.
+    if initial_window.maximised {
+        window.maximize();
+    }
     if initial_window.fullscreen {
         window.fullscreen();
     }
@@ -586,9 +632,9 @@ fn initial_size(state: &window_state::WindowState) -> (i32, i32) {
 fn persist_fullscreen(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) {
     let name = config.borrow().profile.clone();
     let Ok(dir) = profile::dir(&name) else { return };
-    let mut state = window_state::load(&dir);
+    let mut state = window_state::load(&dir, window_state::Which::Launcher);
     state.fullscreen = window.is_fullscreen();
-    if let Err(e) = window_state::save(&dir, &state) {
+    if let Err(e) = window_state::save(&dir, window_state::Which::Launcher, &state) {
         println!("  shell: could not save fullscreen state for {name:?}: {e}");
     }
 }
@@ -600,22 +646,43 @@ fn persist_fullscreen(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) {
 /// transition is in flight, and writing that over the size someone actually
 /// asked to remember would be recording the wrong number under the right
 /// name, which is worse than not recording at all.
+/// Maximised, saved the same way and for the same reason `persist_fullscreen`
+/// is: GNOME's own list of what a window should remember is width, height,
+/// maximised and fullscreen, and this was the one of the four that was missing.
+fn persist_maximised(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) {
+    let name = config.borrow().profile.clone();
+    let Ok(dir) = profile::dir(&name) else { return };
+    let mut state = window_state::load(&dir, window_state::Which::Launcher);
+    state.maximised = window.is_maximized();
+    if let Err(e) = window_state::save(&dir, window_state::Which::Launcher, &state) {
+        println!("  shell: could not save maximised state for {name:?}: {e}");
+    }
+}
+
 fn persist_window_size(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) {
-    if window.is_fullscreen() {
+    // **Maximised as well as fullscreen, and this is the detail people get
+    // wrong.** The size worth remembering is the one the window returns to when
+    // it is *not* maximised; writing the maximised extent here would restore a
+    // floating window the size of the screen, which is how an application ends
+    // up opening at 3440x1440 with a title bar in the corner. GTK keeps
+    // `default-width`/`default-height` at the unmaximised size once the
+    // transition has settled, but reports the covering extent through them
+    // while one is in flight, and the debounce cannot tell the difference.
+    if window.is_fullscreen() || window.is_maximized() {
         return;
     }
     let name = config.borrow().profile.clone();
     let Ok(dir) = profile::dir(&name) else { return };
-    let mut state = window_state::load(&dir);
+    let mut state = window_state::load(&dir, window_state::Which::Launcher);
     state.width = Some(window.default_width());
     state.height = Some(window.default_height());
-    if let Err(e) = window_state::save(&dir, &state) {
+    if let Err(e) = window_state::save(&dir, window_state::Which::Launcher, &state) {
         println!("  shell: could not save window size for {name:?}: {e}");
     }
 }
 
-/// `CORDIAL_SHELL_PRESENT=settings,settings=updates,update` opens those windows
-/// at startup.
+/// `CORDIAL_SHELL_PRESENT=settings,settings=updates,update,launch,maximise,fullscreen`
+/// opens those windows at startup and puts the launcher into those states.
 ///
 /// A test seam, and it exists because there is no other way to photograph these
 /// windows. AGENTS.md forbids synthesising input at the compositor — it lands on
@@ -654,6 +721,17 @@ fn open_on_start(window: &adw::Window, update_button: &gtk::Button) {
                     let _ = window.activate_action("win.settings", Some(&page.to_variant()));
                 }
                 "update" => update_button.emit_clicked(),
+                "launch" => {
+                    let _ = window.activate_action("win.launch", None);
+                }
+                // Same seam, for the same reason, one property further: a
+                // window-state round trip cannot be checked without putting the
+                // window into a state, and maximising is not something an agent
+                // may synthesise a click for.
+                "maximise" => window.maximize(),
+                "fullscreen" => {
+                    let _ = window.activate_action("win.fullscreen", None);
+                }
                 other => println!("  shell: CORDIAL_SHELL_PRESENT does not know {other:?}"),
             }
         }
@@ -747,23 +825,45 @@ fn try_launch(
 
     let starting = starting_dialog(&window, &profile_name, url.is_some());
 
-    // A client that is already gone a moment later never started. Checked
-    // rather than assumed, because the shell may well have been started from a
-    // desktop icon with nowhere for the loader's own output to go.
+    // One repeating source rather than the single shot this used to be. It owns
+    // the instance, so it is also what keeps the `Child` alive: dropping it
+    // would leave a zombie nobody reaps and no way to learn the exit status.
+    //
+    // The dialog and the crash watch share a timer deliberately. Two sources
+    // would each hold their own reference to the same instance and the ordering
+    // between them -- does the dialog close before or after the crash page
+    // opens? -- would be whatever GLib felt like that run.
     let window = window.clone();
-    glib::timeout_add_local_once(EARLY_EXIT_CHECK, move || {
-        starting.close();
-        if let Some(status) = instance.exited() {
-            alert(
-                &window,
-                "Roblox stopped as soon as it started",
-                &format!(
-                    "cordial-run exited with {status}. Running this in a terminal will show \
-                     what it printed:\n\n{}",
-                    instance.command_line
-                ),
-            );
+    let launched = std::time::Instant::now();
+    let mut dialog_closed = false;
+    glib::timeout_add_local(EXIT_POLL, move || {
+        let exited = instance.exited();
+        if !dialog_closed && (exited.is_some() || launched.elapsed() >= EARLY_EXIT_CHECK) {
+            starting.close();
+            dialog_closed = true;
         }
+        // The launcher being gone is not a crash to report and there is nothing
+        // left to be transient for. Under ADR-012 quitting the launcher while a
+        // client runs is the ordinary case, so this is a normal end for this
+        // source rather than an error.
+        if !window.is_visible() {
+            return glib::ControlFlow::Break;
+        }
+        let Some(status) = exited else {
+            return glib::ControlFlow::Continue;
+        };
+        // Narrated either way, and deliberately without the client's output in
+        // it: this line is how somebody reading a terminal learns which of the
+        // two paths was taken, and the output belongs on the page and nowhere
+        // else. `println!` here would be a second sink for text `launch.rs`
+        // took care to keep in memory.
+        if crash::is_crash(&status) {
+            println!("  shell: the client {status}; showing the crash page");
+            crash::present(&window, &status, &instance.command_line, &instance.recent_output());
+        } else {
+            println!("  shell: the client exited cleanly ({status}); no crash page");
+        }
+        glib::ControlFlow::Break
     });
 
     Outcome::Started
@@ -983,7 +1083,7 @@ mod tests {
 
     #[test]
     fn a_profile_with_a_saved_size_opens_at_that_size() {
-        let state = window_state::WindowState { fullscreen: false, width: Some(1024), height: Some(768) };
+        let state = window_state::WindowState { fullscreen: false, maximised: false, width: Some(1024), height: Some(768) };
         assert_eq!(initial_size(&state), (1024, 768));
     }
 
@@ -993,7 +1093,7 @@ mod tests {
         // both together, but a hand-edited file could carry just one -- and
         // the fallback per field is simpler and no worse than refusing the
         // whole saved size over half of it.
-        let state = window_state::WindowState { fullscreen: false, width: Some(1024), height: None };
+        let state = window_state::WindowState { fullscreen: false, maximised: false, width: Some(1024), height: None };
         assert_eq!(initial_size(&state), (1024, DEFAULT_HEIGHT));
     }
 

@@ -1105,6 +1105,28 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     // doc for why the engine's surface cannot live on a connection of its own.
     cordial_shell::host_window::init_wayland()?;
     let host = cordial_shell::host_window::HostWindow::with_canvas(title, width as i32, height as i32);
+
+    // Size and maximised state from the last session on this profile, applied
+    // before the window is presented so it maps at the remembered geometry
+    // rather than snapping to it a frame later. Everything about the file --
+    // where it lives, why the launcher's record is a separate one, and why the
+    // saved fullscreen is written but not restored here -- is in
+    // `cordial_shell::window_state`, which is also where the handlers that keep
+    // it current are wired.
+    //
+    // **This is the only thing in this file that decides the surface's initial
+    // extent, and that is deliberate.** The engine learns the size through the
+    // ordinary path: the compositor configures the toplevel, `apply_resize`
+    // runs, and `config::set_screen` is called from inside it before the EGL
+    // resize -- the same sequence a fullscreen toggle mid-session goes through.
+    // A restored size that bypassed that would be the letterboxing bug this
+    // file's own history is full of.
+    cordial_shell::window_state::remember(
+        host.window(),
+        crate::profile::active(),
+        cordial_shell::window_state::Which::Game,
+    );
+
     host.present();
     host.wait_until_mapped(std::time::Duration::from_secs(5))?;
 

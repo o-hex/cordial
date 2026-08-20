@@ -17,6 +17,7 @@
 //! colour instead of a flash of white while a resize catches up.
 
 mod chooser;
+mod crash;
 mod deep_link;
 mod install;
 mod instructions;
@@ -33,7 +34,7 @@ mod updater;
 mod webview;
 mod webview_policy;
 mod window;
-mod window_state;
+use cordial_shell::window_state;
 
 /// Guards `CORDIAL_PROFILE_ROOT` across every test in this binary that points
 /// it at a scratch directory.

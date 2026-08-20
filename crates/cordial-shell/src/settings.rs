@@ -62,6 +62,16 @@ use crate::shell_config::{self, AppearanceScheme, ShellConfig, ThrottleWhen};
 /// ADR-003's default deny leaves every freshly installed plugin. *Disabled* does
 /// not run whatever its grants say, and its grants are still shown, because they
 /// are still there: turning something off does not cost the approvals.
+/// **One line now, and it used to be three.** It listed "Requests:", then
+/// "Granted:", then the state, on every row, so a page with four plugins on it
+/// opened as twelve lines of protocol vocabulary before the user had touched
+/// anything. The three things it must still never do are unchanged and are why
+/// this is not simply the word "On": it must not describe an unapproved plugin
+/// as switched off, it must not suggest that switching one off took its
+/// approvals away, and it must never print a capability the plugin merely
+/// asked for as though it had been allowed. The detail lives one click down,
+/// in the expander, where a switch per capability says the same thing and can
+/// act on it.
 pub fn capability_summary(
     plugin: &Plugin,
     granted: Option<&BTreeSet<Capability>>,
@@ -70,24 +80,74 @@ pub fn capability_summary(
     let names = |set: &BTreeSet<Capability>| -> String {
         set.iter().copied().map(Capability::name).collect::<Vec<_>>().join(", ")
     };
-    let requests = if plugin.requested.is_empty() {
-        "Requests no capabilities".to_string()
+    let empty = BTreeSet::new();
+    let granted = granted.unwrap_or(&empty);
+    let allowed: BTreeSet<Capability> =
+        plugin.requested.iter().copied().filter(|c| granted.contains(c)).collect();
+    let withheld: BTreeSet<Capability> =
+        plugin.requested.iter().copied().filter(|c| !granted.contains(c)).collect();
+
+    if !enabled {
+        // Named separately from "Off" alone, because the fear this answers is
+        // that turning something off quietly revoked what you had allowed it.
+        return if allowed.is_empty() {
+            "Off".to_string()
+        } else {
+            "Off. What you allowed it to do is kept.".to_string()
+        };
+    }
+    if plugin.requested.is_empty() {
+        return "On. It asks for no permissions.".to_string();
+    }
+    if allowed.is_empty() {
+        return "On, but you have not allowed it to do anything yet.".to_string();
+    }
+    if withheld.is_empty() {
+        format!("On. Allowed: {}.", names(&allowed))
     } else {
-        format!("Requests: {}", names(&plugin.requested))
-    };
-    let has_grants = granted.is_some_and(|g| !g.is_empty());
-    let grants_line = if has_grants {
-        format!("Granted: {}", names(granted.expect("has_grants implies Some")))
-    } else {
-        "Granted: nothing".to_string()
-    };
-    let state = match (enabled, has_grants) {
-        (false, true) => "Off. Its grants are kept, so turning it back on costs no approvals",
-        (false, false) => "Off",
-        (true, true) => "On",
-        (true, false) => "On, but nothing is approved yet, so it will not do anything",
-    };
-    format!("{requests}\n{grants_line}\n{state}")
+        format!("On. Allowed: {}. Not allowed: {}.", names(&allowed), names(&withheld))
+    }
+}
+
+/// The two tiers, split, with the no-shadowing rule already applied.
+///
+/// Discovery is per-root and the rule between the roots lives here rather than
+/// in `cordial-plugins`, because it is the settings window that has to *show*
+/// the collision: `cordial_runtime::flags::collect` resolves the same conflict
+/// by printing a line to a stdout nobody opening this window is reading. A user
+/// whose plugin silently did not appear has no way to find out why, and "it is
+/// not in the list" is indistinguishable from "it did not install".
+///
+/// Takes both roots rather than calling `manifest::plugin_root` and
+/// `manifest::system_plugin_root` itself so this is testable on scratch
+/// directories, with no display and no environment variables -- the same reason
+/// `host_window.rs`'s `fit_within` is a pure function.
+fn discover_tiers(system_root: &Path, user_root: &Path) -> (Vec<Plugin>, Vec<Plugin>, Vec<String>) {
+    let system = manifest::discover(system_root);
+    let claimed: BTreeSet<String> = system.iter().map(|p| p.manifest.id.clone()).collect();
+    let mut user = Vec::new();
+    let mut shadowed = Vec::new();
+    for plugin in manifest::discover(user_root) {
+        if claimed.contains(&plugin.manifest.id) {
+            shadowed.push(plugin.manifest.id.clone());
+        } else {
+            user.push(plugin);
+        }
+    }
+    (system, user, shadowed)
+}
+
+/// Which of the two directories a plugin was found in.
+///
+/// Only two things differ, and both are about the directory rather than the
+/// plugin: a built-in one has no Remove button because its files are read-only
+/// and not the user's to delete, and it cannot be replaced by a same-id user
+/// directory. It can be switched off exactly like any other, which is the whole
+/// reason enablement is a separate file from grants.
+#[derive(Clone, Copy, PartialEq)]
+enum Tier {
+    BuiltIn,
+    User,
 }
 
 /// "Appearance" — Cordial's own theme preference, independent of anything
@@ -100,20 +160,22 @@ fn build_appearance_page(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathB
         .icon_name("applications-graphics-symbolic")
         .build();
 
-    let group = adw::PreferencesGroup::builder()
-        .title("Theme")
-        .description(
-            "This is Cordial's own preference, not the desktop's. System follows \
-             org.freedesktop.appearance and updates live, and falls back to dark when \
-             nothing answers for it; Light and Dark stay fixed regardless of what the \
-             desktop is doing.",
-        )
-        .build();
+    // No group description. What used to be here explained that this is
+    // Cordial's own preference rather than the desktop's, that System reads
+    // `org.freedesktop.appearance` and updates live, that it falls back to dark
+    // when nothing answers the portal, and that Light and Dark stay put
+    // regardless. All of that is true and none of it is why anyone opened this
+    // page: they came to change the theme. The one consequence a user can act
+    // on -- that System tracks the desktop -- is on the row below, and the rest
+    // is here, next to the code, which is where this project keeps its
+    // reasoning.
+    let group = adw::PreferencesGroup::builder().title("Theme").build();
 
     // Order has to match AppearanceScheme::index/from_index.
     let model = gtk::StringList::new(&["Light", "Dark", "System"]);
     let row = adw::ComboRow::builder()
         .title("Theme")
+        .subtitle("System follows the desktop.")
         .model(&model)
         .selected(config.borrow().appearance.index())
         .build();
@@ -203,10 +265,11 @@ fn build_roblox_page(
 
     let group = adw::PreferencesGroup::builder()
         .title("Roblox build")
-        .description(
-            "Cordial ships no Roblox code and never will, so it needs a build you already \
-             have. Leave these empty and it finds one on its own; choose a file to pin it.",
-        )
+        // Kept, shortened, because it is the one thing on this page a user
+        // cannot work out from the controls: that leaving both empty is a
+        // working state rather than an unfinished one. The "and never will"
+        // half was the project talking about itself.
+        .description("Leave these empty and Cordial finds a build. Choose a file to pin one.")
         .build();
 
     let apk = install::effective_apk(&config.borrow().roblox)
@@ -359,22 +422,22 @@ fn build_performance_group(
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
         .title("Performance")
-        .description(
-            "Applied to the client process at launch rather than written into Roblox's own \
-             settings, so both take effect the next time you press Roblox.",
-        )
+        // Where these are applied -- the client's environment at launch rather
+        // than Roblox's own settings document -- is a fact about the
+        // implementation. What a user needs from it is only the consequence.
+        .description("Takes effect the next time you press Roblox.")
         .build();
 
     let gamemode = adw::SwitchRow::builder()
         .title("Feral GameMode")
-        .subtitle(
-            "Asks gamemoded for the performance CPU governor, higher priority, the GPU's \
-             performance profile and no screensaver while you play. Does nothing at all if \
-             gamemoded is not installed; the client says which way it went.",
-        )
+        // The caveat stays and the inventory goes. Which four knobs gamemoded
+        // turns is its business; that the switch silently does nothing without
+        // it installed is the surprise, and a switch that hides that is the
+        // "stub that returns success" shape in an interface.
+        .subtitle("Performance governor and no screensaver while you play. Needs gamemoded installed.")
         .active(config.borrow().gamemode)
         .build();
-    gamemode.set_subtitle_lines(4);
+    gamemode.set_subtitle_lines(2);
     {
         let config = config.clone();
         let config_path = config_path.clone();
@@ -393,18 +456,19 @@ fn build_performance_group(
     ]);
     let throttle = adw::ComboRow::builder()
         .title("Slow the game down in the background")
-        .subtitle(
-            "Roblox slows itself down when nothing is happening, and Cordial normally keeps \
-             it awake while you play. This is when Cordial stops doing that. Not visible is \
-             the default because a window on a second monitor is one you are still watching. \
-             Not focused saves the most and will slow that window down. Never keeps full \
-             speed everywhere. Roblox is told when the window loses focus either way — this \
-             only changes what Cordial does about it.",
-        )
+        // Six sentences became one, and the one that survived is the
+        // misleading-if-omitted half: **Roblox is told the window lost focus
+        // whichever option is chosen**, so "Never" does not mean the engine
+        // never learns it is in the background. Someone who read only a tidy
+        // label would pick Never expecting that and be wrong. The rest -- that
+        // the three options trade battery against a second-monitor window
+        // staying live, and why "not visible" is the default -- is a design
+        // rationale, and the option names carry enough of it to choose by.
+        .subtitle("Roblox is told when the window loses focus either way; this is only what Cordial does about it.")
         .model(&throttle_model)
         .selected(config.borrow().throttle.index())
         .build();
-    throttle.set_subtitle_lines(7);
+    throttle.set_subtitle_lines(3);
     {
         let config = config.clone();
         let config_path = config_path.clone();
@@ -471,10 +535,9 @@ fn build_general_page(
 
     let group = adw::PreferencesGroup::builder()
         .title("Graphics")
-        .description(
-            "Which backend the client offers the engine. Needs a relaunch: the choice is \
-             settled before Roblox loads its renderer.",
-        )
+        // "The choice is settled before Roblox loads its renderer" is why it
+        // needs a relaunch; the user only needs the "needs a relaunch".
+        .description("Takes effect the next time you press Roblox.")
         .build();
 
     // **Not backed by `FStringDebugGraphicsPreferredBackend` any more.** That
@@ -495,15 +558,17 @@ fn build_general_page(
     };
     let row = adw::ComboRow::builder()
         .title("Renderer")
-        .subtitle(
-            "Automatic lets Roblox take Vulkan and fall back to GLES3 itself, and is the only \
-             setting a plugin may override. Vulkan keeps that fallback. OpenGL ES withholds \
-             Vulkan, and has no fallback of its own.",
-        )
+        // The per-option mechanics (Vulkan keeps the engine's own GLES3
+        // fallback; OpenGL ES withholds the Vulkan loader and has no fallback
+        // of its own; Automatic is the only value a plugin may override,
+        // because an absent `CORDIAL_GRAPHICS` is what leaves it room) are in
+        // `launch.rs` beside the code that sends them. What a user needs is
+        // which one to leave it on.
+        .subtitle("Automatic lets Roblox choose, and is the only setting a plugin may override.")
         .model(&model)
         .selected(selected)
         .build();
-    row.set_subtitle_lines(4);
+    row.set_subtitle_lines(2);
 
     {
         let config = config.clone();
@@ -605,6 +670,7 @@ fn build_plugin_row(
     profile_dir: Option<&PathBuf>,
     root: &Path,
     group: &adw::PreferencesGroup,
+    tier: Tier,
 ) -> adw::ExpanderRow {
     let title = if plugin.manifest.name.is_empty() {
         plugin.manifest.id.clone()
@@ -618,16 +684,30 @@ fn build_plugin_row(
         .title(title.clone())
         .subtitle(capability_summary(plugin, profile_dir.map(|dir| grants::load(&grants::path_in(dir))).unwrap_or_default().get(&id), enabled))
         .build();
-    expander.set_subtitle_lines(4);
+    expander.set_subtitle_lines(2);
 
     // A freshly installed plugin has never been granted anything (ADR-003's
     // default deny), so this button is reachable — and needed — the moment
     // the row appears, not only after a page reload.
+    //
+    // Not offered on a built-in one. Its directory is installed alongside the
+    // binary and is not the user's to delete; a Remove that failed with a
+    // permission error would be a control that looks live and refuses, and the
+    // thing the user actually wants there is the switch below.
+    if tier == Tier::BuiltIn {
+        let tag = gtk::Label::new(Some("Built-in"));
+        tag.add_css_class("dim-label");
+        tag.add_css_class("caption");
+        tag.set_valign(gtk::Align::Center);
+        expander.add_suffix(&tag);
+    }
     let remove = gtk::Button::from_icon_name("user-trash-symbolic");
     remove.set_valign(gtk::Align::Center);
     remove.add_css_class("flat");
     remove.set_tooltip_text(Some("Remove this plugin"));
-    expander.add_suffix(&remove);
+    if tier == Tier::User {
+        expander.add_suffix(&remove);
+    }
     {
         let window = parent.as_ref().clone();
         let root = root.to_path_buf();
@@ -641,9 +721,9 @@ fn build_plugin_row(
                 .modal(true)
                 .heading(format!("Remove {title}?"))
                 .body(
-                    "This deletes the plugin's installed files. Its saved settings and the \
-                     capabilities you granted it in this profile are kept — reinstalling the \
-                     same plugin later finds them again (ADR-013).",
+                    "Its files are deleted. What you allowed it to do, and anything it saved, \
+                     are kept for this profile — install it again later and it picks up where \
+                     it left off.",
                 )
                 .build();
             dialog.add_response("cancel", "Cancel");
@@ -673,6 +753,12 @@ fn build_plugin_row(
     // several, so switching a plugin off sits beside — and does not
     // disturb — the capability switches it does not revoke.
     let enable_row = adw::SwitchRow::builder().title("Enabled").active(enabled).build();
+    // Nothing here can stop a plugin that is already running: the plugin host
+    // is not wired to a running client, and the shell is a separate process
+    // from the instance in any case. The page used to say so in a paragraph at
+    // the top of it; one line on the control it is about is where a user will
+    // actually meet it.
+    enable_row.set_subtitle("Takes effect the next time you press Roblox.");
     {
         let plugin = plugin.clone();
         let dir = profile_dir.cloned();
@@ -759,20 +845,11 @@ fn build_install_group(
     installed_group: &adw::PreferencesGroup,
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
-        .title("Install a plugin")
-        .description(
-            "An archive with plugin.json at its root — the format \
-             `tar --zstd -cf name-1.0.0.tar.zst -C plugins/name .` produces. Unpacking refuses a \
-             symlink, a path that escapes the plugin's own directory, and an oversized or \
-             over-large archive, the same checks an index install goes through (ADR-014). \
-             Installing adds the code only; it grants nothing on its own.",
-        )
+        .title("Install from a file")
+        .description("Installing a plugin does not allow it to do anything. You choose that afterwards.")
         .build();
 
-    let row = adw::ActionRow::builder()
-        .title("Choose an archive…")
-        .subtitle("Nothing is installed until you pick a file.")
-        .build();
+    let row = adw::ActionRow::builder().title("Plugin archive (.tar.zst)").build();
     row.set_subtitle_lines(3);
     let button = gtk::Button::with_label("Choose file…");
     button.set_valign(gtk::Align::Center);
@@ -810,12 +887,17 @@ fn build_install_group(
                         plugin.requested.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")
                     };
                     row.set_subtitle(&format!(
-                        "Installed {name} ({}). It requests {requests} and is granted nothing \
-                         yet — approve what it may do below.",
-                        plugin.manifest.id
+                        "Installed {name}. It asks for {requests}; allow what you want to on \
+                         the Plugins page."
                     ));
-                    let new_row =
-                        build_plugin_row(&window, &plugin, profile_dir.as_ref(), &root, &installed_group);
+                    let new_row = build_plugin_row(
+                        &window,
+                        &plugin,
+                        profile_dir.as_ref(),
+                        &root,
+                        &installed_group,
+                        Tier::User,
+                    );
                     installed_group.add(&new_row);
                 }
                 Err(e) => row.set_subtitle(&format!("Could not install {}: {e}", path.display())),
@@ -1003,6 +1085,7 @@ fn build_marketplace_entry_row(
                                         Some(&profile_dir),
                                         &root,
                                         &installed_group,
+                                        Tier::User,
                                     );
                                     installed_group.add(&new_row);
                                 }
@@ -1056,11 +1139,8 @@ fn build_marketplace_groups(
     let config_group = adw::PreferencesGroup::builder()
         .title("Marketplace")
         .description(
-            "Lists and installs plugins from an index (ADR-014) — a directory holding \
-             index.json, exactly what a git clone of an index repository produces. Cordial \
-             ships no default index and trusts no key by default: point this at one you have, \
-             and paste the minisign public key you trust it under to enable installing, or \
-             leave the key blank to browse without installing anything.",
+            "Cordial comes with no marketplace. Point this at a folder holding an index.json \
+             to browse one. Without a key you can look but not install.",
         )
         .build();
 
@@ -1199,11 +1279,30 @@ fn build_marketplace_groups(
     (config_group, listing_group)
 }
 
+/// "Plugins" — a master switch, then what is installed, in the two tiers that
+/// actually exist on disk.
+///
+/// **Modelled on GNOME's Extensions app, deliberately.** It solves the same
+/// problem with the same materials: one switch that governs the lot with a
+/// one-line caveat under it, System and User-Installed as separate lists, a
+/// switch on every entry, and browsing for more somewhere else entirely. What
+/// was here before was four groups deep in a page that opened with a paragraph
+/// about which document enablement is stored in and which ADR decided that.
+///
+/// **Everything greys out rather than disappearing when the master switch is
+/// off.** Hiding the lists would leave somebody unable to see what they have
+/// installed, or to find the one plugin they wanted to check on, without first
+/// turning plugins back on — and the state they are trying to reason about is
+/// exactly the one where plugins are off.
+/// Returns the page and the Installed group, because "Get Plugins" has to add
+/// a row to that exact group the moment an install succeeds. Handing the group
+/// back is what keeps one `build_plugin_row` serving both — the alternative
+/// this project has already been bitten by is a second, similar-looking row
+/// built in the installer's callback that drifts from this one.
 fn build_plugins_page(
     parent: &impl IsA<gtk::Window>,
     config: Rc<RefCell<ShellConfig>>,
-    config_path: Rc<PathBuf>,
-) -> adw::PreferencesPage {
+) -> (adw::PreferencesPage, adw::PreferencesGroup) {
     let page = adw::PreferencesPage::builder()
         .title("Plugins")
         .name("plugins")
@@ -1211,45 +1310,141 @@ fn build_plugins_page(
         .build();
 
     let root = manifest::plugin_root();
-    let plugins = manifest::discover(&root);
+    let system_root = manifest::system_plugin_root();
+    let (system, user, shadowed) = discover_tiers(&system_root, &root);
 
     let profile_name = config.borrow().profile.clone();
     // A profile whose name will not resolve has no grants and no enablement
     // file to read, and the page still has to render. `None` here means every
-    // row shows "granted nothing", which is what such a profile would in fact
+    // row shows nothing allowed, which is what such a profile would in fact
     // give a plugin.
     let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
 
-    let group = adw::PreferencesGroup::builder()
-        .title("Installed plugins")
-        .description(format!(
-            "Enablement and grants both belong to the profile rather than to the machine \
-             (ADR-013); these are {profile_name}'s. Expand a plugin to approve or withdraw the \
-             capabilities it has asked for — nothing here is granted until you switch it on. \
-             Changes take effect the next time the client starts."
-        ))
+    // ---- the master switch ------------------------------------------------
+    let master_group = adw::PreferencesGroup::new();
+    let master = adw::SwitchRow::builder()
+        .title("Use Plugins")
+        // GNOME's register, and the same honesty: a consequence the user can
+        // weigh in one line. Not a promise that plugins are dangerous, and not
+        // silence either.
+        .subtitle("Plugins can cause performance and stability issues.")
+        .active(profile_dir.as_ref().is_none_or(|d| enablement::plugins_allowed(d)))
         .build();
+    master_group.add(&master);
+    page.add(&master_group);
 
-    if plugins.is_empty() {
-        group.add(
-            &adw::ActionRow::builder()
-                .title("No plugins installed")
-                .subtitle(format!("Cordial looks in\n{}", root.display()))
-                .build(),
-        );
+    // ---- built-in ---------------------------------------------------------
+    let builtin_group = adw::PreferencesGroup::builder().title("Built-In").build();
+    if system.is_empty() {
+        // Said rather than left as an empty group, and said without naming the
+        // path: a user who has never installed Cordial from a package has no
+        // built-in plugins and does not need to know where they would live.
+        builtin_group.add(&adw::ActionRow::builder().title("None").build());
     } else {
-        for plugin in &plugins {
-            let row = build_plugin_row(parent, plugin, profile_dir.as_ref(), &root, &group);
-            group.add(&row);
+        for plugin in &system {
+            let row = build_plugin_row(
+                parent,
+                plugin,
+                profile_dir.as_ref(),
+                &system_root,
+                &builtin_group,
+                Tier::BuiltIn,
+            );
+            builtin_group.add(&row);
         }
     }
 
-    page.add(&build_install_group(parent, &root, profile_dir.clone(), &group));
+    // ---- user-installed ---------------------------------------------------
+    let user_group = adw::PreferencesGroup::builder().title("Installed").build();
+    if user.is_empty() {
+        user_group.add(&adw::ActionRow::builder().title("None yet").build());
+    } else {
+        for plugin in &user {
+            let row =
+                build_plugin_row(parent, plugin, profile_dir.as_ref(), &root, &user_group, Tier::User);
+            user_group.add(&row);
+        }
+    }
+
+    // A user plugin that was dropped for sharing a built-in id is the one thing
+    // on this page a user cannot see the cause of: the plugin is on disk, it
+    // parses, and it is simply not in either list. `flags::collect` reports the
+    // same collision on stdout, which is no use to somebody in a settings
+    // window.
+    for id in &shadowed {
+        user_group.add(
+            &adw::ActionRow::builder()
+                .title(id.clone())
+                .subtitle("Not used: a built-in plugin already has this name. Built-in plugins can be switched off, but not replaced.")
+                .build(),
+        );
+    }
+
+    page.add(&builtin_group);
+    page.add(&user_group);
+
+    // ---- what the master switch governs -----------------------------------
+    let governed = [builtin_group.clone(), user_group.clone()];
+    let apply = move |groups: &[adw::PreferencesGroup], on: bool| {
+        for g in groups {
+            g.set_sensitive(on);
+        }
+    };
+    apply(&governed, master.is_active());
+    {
+        let dir = profile_dir.clone();
+        master.connect_active_notify(move |row| {
+            let on = row.is_active();
+            if let Some(dir) = &dir {
+                if let Err(e) = enablement::set_plugins_allowed(dir, on) {
+                    // Put back to what is on disk, the same posture the
+                    // per-plugin switch takes: a switch resting somewhere the
+                    // file disagrees with is a lie the user cannot see.
+                    eprintln!("shell: could not record that plugins are {}: {e}", if on { "on" } else { "off" });
+                    row.set_active(!on);
+                    return;
+                }
+            }
+            apply(&governed, on);
+        });
+    }
+    if profile_dir.is_none() {
+        master.set_sensitive(false);
+        master.set_subtitle("This profile's directory could not be read, so nothing can be saved.");
+    }
+
+    (page, user_group)
+}
+
+/// "Get Plugins" — installing from a file, and the marketplace.
+///
+/// **Its own page, and that is the point.** These three groups were stacked on
+/// the Plugins page above the list of what is installed, so the first thing the
+/// page showed was a file picker, a directory chooser and a text field for a
+/// signing key — configuration for acquiring plugins, in front of somebody who
+/// came to switch one off. GNOME's Extensions app puts browsing behind its own
+/// entry for the same reason. Nothing here changed except where it lives.
+fn build_get_plugins_page(
+    parent: &impl IsA<gtk::Window>,
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+    installed_group: &adw::PreferencesGroup,
+) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("Get Plugins")
+        .name("get-plugins")
+        .icon_name("folder-download-symbolic")
+        .build();
+
+    let root = manifest::plugin_root();
+    let profile_name = config.borrow().profile.clone();
+    let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
+
+    page.add(&build_install_group(parent, &root, profile_dir.clone(), installed_group));
     let (marketplace_config, marketplace_listing) =
-        build_marketplace_groups(parent, config.clone(), config_path.clone(), &root, profile_dir, &group);
+        build_marketplace_groups(parent, config, config_path, &root, profile_dir, installed_group);
     page.add(&marketplace_config);
     page.add(&marketplace_listing);
-    page.add(&group);
     page
 }
 
@@ -1283,7 +1478,9 @@ pub fn build_preferences_window(
     window.add(&crate::updater::build_update_page(config.clone(), config_path.clone()));
     window.add(&build_appearance_page(config.clone(), config_path.clone()));
     window.add(&build_general_page(config.clone(), config_path.clone()));
-    window.add(&build_plugins_page(&window, config, config_path));
+    let (plugins, installed) = build_plugins_page(&window, config.clone());
+    window.add(&plugins);
+    window.add(&build_get_plugins_page(&window, config, config_path, &installed));
 
     window
 }
@@ -1312,8 +1509,8 @@ mod tests {
         // toggle a switch that is already where they want it.
         let plugin = fixture(r#"{"id":"p","name":"P","entry":"main.ts","capabilities":["flags.read"]}"#);
         let summary = capability_summary(&plugin, None, true);
-        assert!(summary.contains("Granted: nothing"), "{summary}");
-        assert!(summary.contains("nothing is approved yet"), "{summary}");
+        assert!(summary.starts_with("On"), "{summary}");
+        assert!(summary.contains("not allowed it to do anything yet"), "{summary}");
         assert!(!summary.contains("Off"), "an unapproved plugin must not read as switched off: {summary}");
     }
 
@@ -1324,8 +1521,8 @@ mod tests {
         // separate file from grants.
         let plugin = fixture(r#"{"id":"p","name":"P","entry":"main.ts","capabilities":["flags.read"]}"#);
         let summary = capability_summary(&plugin, Some(&granted(&["flags.read"])), false);
-        assert!(summary.contains("Granted: flags.read"), "{summary}");
-        assert!(summary.contains("costs no approvals"), "{summary}");
+        assert!(summary.starts_with("Off"), "{summary}");
+        assert!(summary.contains("kept"), "switching off must not read as revoking: {summary}");
     }
 
     #[test]
@@ -1336,9 +1533,12 @@ mod tests {
         let plugin =
             fixture(r#"{"id":"p","name":"P","entry":"main.ts","capabilities":["flags.read","log"]}"#);
         let summary = capability_summary(&plugin, Some(&granted(&["log"])), true);
-        assert!(summary.contains("Requests: flags.read, log"), "{summary}");
-        assert!(summary.contains("Granted: log"), "{summary}");
-        assert!(!summary.contains("Granted: flags.read"), "{summary}");
+        assert!(summary.contains("Allowed: log"), "{summary}");
+        assert!(summary.contains("Not allowed: flags.read"), "{summary}");
+        assert!(!summary.contains("Allowed: flags.read"), "{summary}");
+        // One line, now and in future: the three-line version is what made the
+        // page unreadable with four plugins on it.
+        assert!(!summary.contains('\n'), "the row summary must stay one line: {summary}");
     }
 
     #[test]
@@ -1353,6 +1553,38 @@ mod tests {
             assert!(!text.trim().is_empty(), "{cap} has no description");
             assert!(text.len() > 10, "{cap}'s description is too short to be real prose: {text:?}");
         }
+    }
+
+    #[test]
+    fn a_user_plugin_may_not_shadow_a_built_in_one_and_the_page_can_say_which() {
+        // The rule `flags::collect` enforces on the flag layers, enforced the
+        // same way on what the window lists -- and, unlike `collect`, reported
+        // somewhere the person affected will see it. A user plugin that simply
+        // vanished from the list is indistinguishable from one that failed to
+        // install.
+        let root = std::env::temp_dir().join("cordial-settings-tiers-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let system = root.join("system");
+        let user = root.join("user");
+        for (dir, id) in [(&system, "builtin-one"), (&user, "builtin-one"), (&user, "mine")] {
+            let d = dir.join(id);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("plugin.json"),
+                format!(r#"{{"id":"{id}","name":"{id}","entry":"main.ts"}}"#),
+            )
+            .unwrap();
+        }
+
+        let (sys, usr, shadowed) = discover_tiers(&system, &user);
+        assert_eq!(sys.iter().map(|p| p.manifest.id.as_str()).collect::<Vec<_>>(), ["builtin-one"]);
+        assert_eq!(
+            usr.iter().map(|p| p.manifest.id.as_str()).collect::<Vec<_>>(),
+            ["mine"],
+            "the shadowing copy must not be listed as installed"
+        );
+        assert_eq!(shadowed, ["builtin-one"], "and it must be reported by name rather than dropped");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `plan_confirmation_text` is what stands between a marketplace click

@@ -181,6 +181,24 @@ pub fn plugin_root() -> PathBuf {
         })
 }
 
+/// Where first-party plugins ship: read-only, installed alongside the binary.
+///
+/// `/app/share/cordial/plugins` inside the Flatpak; `$CORDIAL_SYSTEM_PLUGIN_DIR`
+/// overrides it for a distribution that packages Cordial somewhere else, and
+/// for the tests.
+///
+/// **This is the one definition.** `cordial_runtime::flags::system_plugin_dir`
+/// used to hold its own copy of the path and the variable name, and the shell
+/// has to know the same answer to list built-in plugins beside user ones --
+/// three copies of one path is the pair that drifts and only one of them gets
+/// fixed, which is the argument `is_valid_id` below already makes about path
+/// checks. `flags.rs` now calls this.
+pub fn system_plugin_root() -> PathBuf {
+    std::env::var_os("CORDIAL_SYSTEM_PLUGIN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/app/share/cordial/plugins"))
+}
+
 /// Whether a string may be used as a plugin id.
 ///
 /// An id names directories — the plugin's own installed directory, and the one

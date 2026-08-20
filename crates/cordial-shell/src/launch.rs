@@ -14,8 +14,11 @@
 //! about the engine's `wl_surface` needing to share a connection with the
 //! window it is a subsurface of, and here each process builds its own window.
 
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use cordial_shell::profile::Claim;
 
@@ -91,12 +94,52 @@ pub fn loader_path() -> Result<PathBuf, String> {
     ))
 }
 
+/// How many of the client's last output lines are kept for the crash page.
+///
+/// Enough to carry a panic with its backtrace-less message and the dozen lines
+/// of load narration before it, and few enough that the buffer cannot grow with
+/// a session: a client that runs for an afternoon prints tens of thousands of
+/// lines and this must not be a slow leak in the launcher, which is the process
+/// that has to still be alive to report the crash.
+const KEPT_LINES: usize = 200;
+
+/// The client's own output, most recent last, for the crash page to show.
+///
+/// A `Mutex` rather than a channel because two reader threads write into it and
+/// the GTK main loop reads it, at a moment neither thread knows about.
+type Tail = Arc<Mutex<VecDeque<String>>>;
+
+/// Lines that are never kept, replaced by a marker rather than dropped.
+///
+/// **`[cookies]` and `[identity]` appear in ordinary runs**, carry a signed-in
+/// user and the paths their session is stored at, and are exactly the lines
+/// somebody would paste into a bug report without reading. Redacted here, at
+/// capture, rather than when the copy button is pressed, so that what the crash
+/// page shows and what it copies are the same text -- a copy button that
+/// quietly produced something other than what was on screen is its own trap.
+/// A marker rather than a deletion because a gap in a log is a lie about what
+/// the client printed.
+///
+/// The pass-through below is untouched by this: the shell's own stdout and
+/// stderr get the line verbatim, exactly as they did when the child inherited
+/// them. This adds no new place the text is written; it only decides what the
+/// launcher keeps in memory to put on a screen.
+fn redact(line: &str) -> Option<&'static str> {
+    for marker in ["[cookies]", "[identity]"] {
+        if line.contains(marker) {
+            return Some("    (a line about your saved session was left out)");
+        }
+    }
+    None
+}
+
 /// A client this launcher started.
 pub struct Instance {
     child: Child,
     /// Kept so the command can be quoted back at the user if the process dies
     /// immediately — an exit code on its own says nothing about what was run.
     pub command_line: String,
+    tail: Tail,
 }
 
 impl Instance {
@@ -110,6 +153,52 @@ impl Instance {
     pub fn exited(&mut self) -> Option<std::process::ExitStatus> {
         self.child.try_wait().ok().flatten()
     }
+
+    /// The last lines the client printed, oldest first, redacted.
+    ///
+    /// Read at the moment the crash page is built rather than streamed into it:
+    /// nothing wants a live log window, and by the time this is called the
+    /// process has exited, so the reader threads have seen EOF and there is
+    /// nothing still arriving to miss.
+    pub fn recent_output(&self) -> String {
+        let tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
+        tail.iter().cloned().collect::<Vec<_>>().join("\n")
+    }
+}
+
+/// Read one of the child's pipes to EOF: pass every line through to the
+/// launcher's own matching stream, and keep a redacted copy of the last
+/// [`KEPT_LINES`].
+///
+/// **The pass-through is the point of doing this with threads at all.** The
+/// child's stdout and stderr used to be inherited, so a shell started from a
+/// terminal narrated the whole load, and that is worth keeping -- this project
+/// debugs by reading that narration. Capturing without echoing would have
+/// silently taken it away, which is a regression nobody would notice until they
+/// needed it.
+///
+/// Two threads and one buffer means the relative order of a stdout line and a
+/// stderr line printed at the same instant is whichever thread took the lock
+/// first. Within one stream the order is exact, which is what matters: a panic
+/// message and the lines that led to it are both on stderr.
+fn pump(reader: impl std::io::Read + Send + 'static, tail: Tail, to_stderr: bool) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            let Ok(line) = line else { break };
+            if to_stderr {
+                let mut out = std::io::stderr().lock();
+                let _ = writeln!(out, "{line}");
+            } else {
+                println!("{line}");
+            }
+            let kept = redact(&line).map(str::to_string).unwrap_or(line);
+            let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+            if tail.len() == KEPT_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(kept);
+        }
+    });
 }
 
 /// Start the client on `build`, holding `claim`'s profile.
@@ -275,16 +364,32 @@ pub fn spawn(
         }
     }
 
-    // Inherited rather than captured, so that a shell started from a terminal
-    // still narrates the load the way it always has. Nothing here parses it.
-    command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    // Piped rather than inherited, and echoed straight back out by `pump`, so
+    // a shell started from a terminal still narrates the load the way it always
+    // has. Both streams, not stderr alone: `cordial-run` says almost everything
+    // it has to say with `println!` -- the load order, the missing symbols, the
+    // plugin lines -- and a crash page carrying only stderr would show the
+    // panic with none of what led to it.
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     claim.hand_to(&mut command);
 
     let command_line = describe(&loader, &build.lib_dir, &build.apk, &run, join_url);
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Could not start {}: {e}\n\n{command_line}", loader.display()))?;
+
+    let tail: Tail = Arc::new(Mutex::new(VecDeque::with_capacity(KEPT_LINES)));
+    // Taken out of the `Child` so the pipes close when the reader threads see
+    // EOF rather than being held open by a struct nobody is reading -- a child
+    // whose stdout nothing drains blocks on a full pipe, which for a process
+    // that narrates as much as this one would be a hang rather than a crash.
+    if let Some(out) = child.stdout.take() {
+        pump(out, tail.clone(), false);
+    }
+    if let Some(err) = child.stderr.take() {
+        pump(err, tail.clone(), true);
+    }
 
     // Dropped explicitly rather than left to fall off the end of the function,
     // because the ordering is the whole mechanism: the child now holds the
@@ -292,7 +397,7 @@ pub fn spawn(
     // quitting the shell would be the thing that released it.
     drop(claim);
 
-    Ok(Instance { child, command_line })
+    Ok(Instance { child, command_line, tail })
 }
 
 /// Whether this process is inside a Flatpak sandbox.
@@ -420,6 +525,25 @@ fn describe(loader: &Path, lib_dir: &Path, apk: &Path, run: &str, join_url: Opti
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_session_line_is_replaced_rather_than_kept_or_dropped() {
+        // The two prefixes that appear in ordinary runs and carry a signed-in
+        // user. Neither may reach the buffer the crash page shows and copies,
+        // and neither may vanish silently -- a gap in a log is a lie about what
+        // the client printed.
+        for line in [
+            "  [cookies] roblox.com: saved 4 domain(s), 900 bytes to /home/x/cookies.json",
+            "  [identity] signed in; saved to /home/x/identity.json (username 7 bytes)",
+        ] {
+            let marker = redact(line).expect(line);
+            assert!(marker.contains("left out"), "{marker}");
+            assert!(!marker.contains("roblox.com") && !marker.contains("/home/x"), "{marker}");
+        }
+        // And an ordinary line is untouched, or the page would show nothing
+        // useful at all.
+        assert!(redact("LOAD FAILED after 80us: dlopen failed").is_none());
+    }
     use super::*;
 
     /// `CORDIAL_PVPN_BIN` is only ever touched by this test, in this binary,

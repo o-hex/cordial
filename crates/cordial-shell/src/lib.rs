@@ -48,6 +48,10 @@ pub mod refresh_watch;
 // both here, the way `host_window` already is, is what makes that crate able
 // to call them at all -- `main.rs` no longer declares its own copies, and
 // nothing there used to reference them either.
+/// Remembered window geometry. In the library rather than the shell binary
+/// because the window Roblox runs in is built by `cordial-runtime`, which
+/// depends on this crate and has to read and write the same records.
+pub mod window_state;
 pub mod webview_policy;
 #[cfg(feature = "webview")]
 pub mod webview;

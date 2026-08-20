@@ -1,5 +1,26 @@
-//! Whether the shell's window was fullscreen, and what size it was, kept per
-//! profile: `<profile_dir>/window.json`.
+//! What state a window was left in, kept per profile.
+//!
+//! Two windows, two files, one shape: `<profile_dir>/window.json` for the
+//! launcher and `<profile_dir>/game-window.json` for the one Roblox runs in.
+//!
+//! ## Why two files and not one
+//!
+//! A maximised launcher does not mean a maximised game window and never did.
+//! They are different sizes for different jobs -- the launcher is a 540x340
+//! chooser, the game window is whatever fills a monitor -- and one record would
+//! make the last window closed decide how the next one opens. GNOME does not
+//! share geometry between an application's windows either.
+//!
+//! ## What is remembered, and what GNOME says to remember
+//!
+//! Width, height, maximised, fullscreen. That is the whole of the set the HIG
+//! names, and the *unmaximised* width and height at that: restoring a
+//! maximised window means restoring the size it should return to when it is
+//! unmaximised, not the size of the screen it was covering. GTK does that part
+//! -- `gtk_window_get_default_size` reports the unmaximised size -- and the
+//! save sites in `window.rs` decline to write at all while the window is
+//! maximised or fullscreen, because both states report their own extent through
+//! those same properties while a transition is in flight.
 //!
 //! ## Why per profile, not `shell.json`
 //!
@@ -82,6 +103,11 @@ use std::path::{Path, PathBuf};
 #[serde(default)]
 pub struct WindowState {
     pub fullscreen: bool,
+    /// Maximised, which is a different question from fullscreen and has to be
+    /// stored separately: a window can be neither, either, or -- as far as GTK
+    /// is concerned -- both, and unfullscreening one that was maximised before
+    /// must put it back to maximised rather than to its floating size.
+    pub maximised: bool,
     /// The windowed size to restore -- meaningless while `fullscreen` is
     /// true, but kept regardless of it, because a window has to have *some*
     /// default size to fall back to the moment it leaves fullscreen. `None`
@@ -94,7 +120,7 @@ pub struct WindowState {
 
 impl Default for WindowState {
     fn default() -> Self {
-        Self { fullscreen: false, width: None, height: None }
+        Self { fullscreen: false, maximised: false, width: None, height: None }
     }
 }
 
@@ -113,22 +139,53 @@ impl WindowState {
                                       // floor against nonsense, not a policy.
         Self {
             fullscreen: self.fullscreen,
+            maximised: self.maximised,
             width: self.width.filter(|w| (1..=MAX_SIDE).contains(w)),
             height: self.height.filter(|h| (1..=MAX_SIDE).contains(h)),
         }
     }
 }
 
-/// This profile's window-state file.
+/// Which window a record is about.
+///
+/// An enum rather than a filename passed by the caller, so that the two names
+/// are decided once here and a typo cannot invent a third window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Which {
+    /// The launcher: the chooser, the profile row and the Roblox button.
+    Launcher,
+    /// The window Roblox itself draws into (`android::wayland`).
+    Game,
+}
+
+impl Which {
+    fn file(self) -> &'static str {
+        match self {
+            Which::Launcher => "window.json",
+            Which::Game => "game-window.json",
+        }
+    }
+}
+
+/// This profile's window-state file for `which`.
 ///
 /// `CORDIAL_WINDOW_STATE` overrides it outright -- the same development-switch
 /// shape as `CORDIAL_NETWORK`, `CORDIAL_FLAGS` and `CORDIAL_SHELL_CONFIG`, not
 /// a supported per-profile arrangement, because it makes one file serve every
 /// profile, which is the thing every one of those files exists to stop.
-pub fn path_in(profile_dir: &Path) -> PathBuf {
-    std::env::var_os("CORDIAL_WINDOW_STATE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| profile_dir.join("window.json"))
+///
+/// **The override applies to the launcher only.** Pointing both windows at one
+/// path would make the override do the very thing two files exist to prevent,
+/// and silently: a run under it would look like the game window inheriting the
+/// launcher's geometry, which is a bug somebody would then go looking for in
+/// this file.
+pub fn path_in(profile_dir: &Path, which: Which) -> PathBuf {
+    if which == Which::Launcher {
+        if let Some(override_path) = std::env::var_os("CORDIAL_WINDOW_STATE") {
+            return PathBuf::from(override_path);
+        }
+    }
+    profile_dir.join(which.file())
 }
 
 /// Read a profile's window state, or the default if there is nothing to read.
@@ -140,8 +197,8 @@ pub fn path_in(profile_dir: &Path) -> PathBuf {
 /// [`WindowState::default`] rather than refusing to start. A launcher that
 /// would not open because its own window-geometry file was corrupt would be a
 /// far worse failure than the one this file exists to fix.
-pub fn load(profile_dir: &Path) -> WindowState {
-    let path = path_in(profile_dir);
+pub fn load(profile_dir: &Path, which: Which) -> WindowState {
+    let path = path_in(profile_dir, which);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return WindowState::default();
     };
@@ -166,10 +223,111 @@ pub fn load(profile_dir: &Path) -> WindowState {
 /// own window must work whether or not a client happens to be running against
 /// the profile currently selected in the row above it, and `profile::acquire`
 /// would refuse exactly when one is.
-pub fn save(profile_dir: &Path, state: &WindowState) -> std::io::Result<()> {
+pub fn save(profile_dir: &Path, which: Which, state: &WindowState) -> std::io::Result<()> {
     std::fs::create_dir_all(profile_dir)?;
     let text = serde_json::to_string_pretty(state).expect("WindowState always serialises");
-    std::fs::write(path_in(profile_dir), text)
+    std::fs::write(path_in(profile_dir, which), text)
+}
+
+/// Restore `state` onto `window` before it is shown, and keep the file up to
+/// date for the rest of its life.
+///
+/// One call rather than the handful of handlers `window.rs` wires by hand, and
+/// the difference between the two is worth naming: the launcher re-reads which
+/// profile is selected on every save, because its profile row can change while
+/// the window is open. A window that belongs to one running client cannot, so
+/// this takes the directory once.
+///
+/// **`fullscreen` is written and deliberately not applied.** This module's
+/// header says why at length and says it about this exact caller: the window
+/// Roblox draws into has no accelerator group, no `win.fullscreen`, and a
+/// documented history of fullscreen bugs, so a saved fullscreen restored into a
+/// launch where the renderer is the thing that is broken leaves a black
+/// full-screen surface with no keyboard way out. The state is recorded so that
+/// whoever wires an escape can turn this on in one line; until then, restoring
+/// it would be a trap.
+pub fn remember(window: &libadwaita::Window, profile_dir: PathBuf, which: Which) {
+    use libadwaita::glib;
+    use libadwaita::prelude::*;
+
+    let state = load(&profile_dir, which);
+    if let (Some(w), Some(h)) = (state.width, state.height) {
+        window.set_default_size(w, h);
+    }
+    // Before the window is presented, so it maps maximised rather than being
+    // seen at its floating size for a frame and then snapping.
+    if state.maximised {
+        window.maximize();
+    }
+
+    let write = {
+        let dir = profile_dir.clone();
+        move |f: &dyn Fn(&mut WindowState)| {
+            let mut state = load(&dir, which);
+            f(&mut state);
+            if let Err(e) = save(&dir, which, &state) {
+                println!("  window: could not save {} state: {e}", path_in(&dir, which).display());
+            }
+        }
+    };
+
+    {
+        let write = write.clone();
+        window.connect_maximized_notify(move |w| {
+            let on = w.is_maximized();
+            write(&move |s| s.maximised = on);
+        });
+    }
+    {
+        let write = write.clone();
+        window.connect_fullscreened_notify(move |w| {
+            let on = w.is_fullscreen();
+            write(&move |s| s.fullscreen = on);
+        });
+    }
+
+    // Size, debounced, for the same reason `window.rs` debounces it: GTK fires
+    // these on every step of an interactive drag and a write per step would be
+    // tens of writes a second into a profile directory that has a live session
+    // beside it.
+    let pending: std::rc::Rc<std::cell::Cell<Option<glib::SourceId>>> =
+        std::rc::Rc::new(std::cell::Cell::new(None));
+    let schedule = {
+        let window = window.clone();
+        let pending = pending.clone();
+        let write = write.clone();
+        move || {
+            if let Some(id) = pending.take() {
+                id.remove();
+            }
+            let window = window.clone();
+            let write = write.clone();
+            let pending_inner = pending.clone();
+            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+                pending_inner.set(None);
+                // The unmaximised size is the one worth keeping; both of these
+                // states report their own extent through the same properties
+                // while a transition is in flight.
+                if window.is_fullscreen() || window.is_maximized() {
+                    return;
+                }
+                let (w, h) = (window.default_width(), window.default_height());
+                write(&move |s| {
+                    s.width = Some(w);
+                    s.height = Some(h);
+                });
+            });
+            pending.set(Some(id));
+        }
+    };
+    {
+        let schedule = schedule.clone();
+        window.connect_default_width_notify(move |_| schedule());
+    }
+    {
+        let schedule = schedule.clone();
+        window.connect_default_height_notify(move |_| schedule());
+    }
 }
 
 #[cfg(test)]
@@ -186,7 +344,7 @@ mod tests {
     #[test]
     fn a_profile_with_no_file_starts_windowed_at_no_saved_size() {
         let dir = scratch("absent");
-        let state = load(&dir);
+        let state = load(&dir, Which::Launcher);
         assert!(!state.fullscreen);
         assert_eq!(state.width, None);
         assert_eq!(state.height, None);
@@ -195,22 +353,22 @@ mod tests {
     #[test]
     fn a_malformed_file_falls_back_to_windowed_rather_than_refusing_to_start() {
         let dir = scratch("malformed");
-        std::fs::write(path_in(&dir), "{not json").unwrap();
-        assert!(!load(&dir).fullscreen);
+        std::fs::write(path_in(&dir, Which::Launcher), "{not json").unwrap();
+        assert!(!load(&dir, Which::Launcher).fullscreen);
     }
 
     #[test]
     fn a_saved_fullscreen_choice_round_trips() {
         let dir = scratch("fullscreen-roundtrip");
-        save(&dir, &WindowState { fullscreen: true, width: None, height: None }).unwrap();
-        assert!(load(&dir).fullscreen);
+        save(&dir, Which::Launcher, &WindowState { fullscreen: true, maximised: false, width: None, height: None }).unwrap();
+        assert!(load(&dir, Which::Launcher).fullscreen);
     }
 
     #[test]
     fn a_saved_size_round_trips() {
         let dir = scratch("size-roundtrip");
-        save(&dir, &WindowState { fullscreen: false, width: Some(1024), height: Some(768) }).unwrap();
-        let back = load(&dir);
+        save(&dir, Which::Launcher, &WindowState { fullscreen: false, maximised: false, width: Some(1024), height: Some(768) }).unwrap();
+        let back = load(&dir, Which::Launcher);
         assert_eq!(back.width, Some(1024));
         assert_eq!(back.height, Some(768));
     }
@@ -222,8 +380,8 @@ mod tests {
         // this true; worth a test rather than a note, the same reasoning
         // `shell_config.rs`'s own version of this test gives.
         let dir = scratch("older-schema");
-        std::fs::write(path_in(&dir), r#"{"fullscreen":true}"#).unwrap();
-        let state = load(&dir);
+        std::fs::write(path_in(&dir, Which::Launcher), r#"{"fullscreen":true}"#).unwrap();
+        let state = load(&dir, Which::Launcher);
         assert!(state.fullscreen);
         assert_eq!(state.width, None);
     }
@@ -236,13 +394,13 @@ mod tests {
         // so a tampered or truncated file could otherwise hand GTK a size
         // that clamp does not defend against at all.
         let dir = scratch("out-of-range");
-        std::fs::write(path_in(&dir), r#"{"fullscreen":false,"width":-1,"height":0}"#).unwrap();
-        let state = load(&dir);
+        std::fs::write(path_in(&dir, Which::Launcher), r#"{"fullscreen":false,"width":-1,"height":0}"#).unwrap();
+        let state = load(&dir, Which::Launcher);
         assert_eq!(state.width, None, "a negative width must not reach the window");
         assert_eq!(state.height, None, "a zero height must not reach the window");
 
-        std::fs::write(path_in(&dir), r#"{"fullscreen":false,"width":99999999,"height":600}"#).unwrap();
-        let state = load(&dir);
+        std::fs::write(path_in(&dir, Which::Launcher), r#"{"fullscreen":false,"width":99999999,"height":600}"#).unwrap();
+        let state = load(&dir, Which::Launcher);
         assert_eq!(state.width, None, "an implausibly large width must not reach the window");
         assert_eq!(state.height, Some(600), "a plausible sibling field must survive the check");
     }
@@ -258,11 +416,65 @@ mod tests {
         // The exact scenario the task this file answers named: fullscreen set
         // while poking at a throwaway profile must not follow onto the one
         // somebody actually plays on.
-        save(&testing, &WindowState { fullscreen: true, width: Some(3440), height: Some(1440) })
+        save(&testing, Which::Launcher, &WindowState { fullscreen: true, maximised: false, width: Some(3440), height: Some(1440) })
             .unwrap();
-        assert!(load(&testing).fullscreen);
-        assert!(!load(&main).fullscreen, "a neighbouring profile must not inherit this");
-        assert_eq!(load(&main).width, None);
+        assert!(load(&testing, Which::Launcher).fullscreen);
+        assert!(!load(&main, Which::Launcher).fullscreen, "a neighbouring profile must not inherit this");
+        assert_eq!(load(&main, Which::Launcher).width, None);
+    }
+
+    #[test]
+    fn the_launcher_and_the_game_window_do_not_share_a_record() {
+        // The complaint this answers, in one assertion: a maximised launcher
+        // must not decide how the window somebody plays in opens.
+        let dir = scratch("two-windows");
+        save(
+            &dir,
+            Which::Launcher,
+            &WindowState { fullscreen: false, maximised: true, width: Some(540), height: Some(340) },
+        )
+        .unwrap();
+        save(
+            &dir,
+            Which::Game,
+            &WindowState { fullscreen: true, maximised: false, width: Some(1920), height: Some(1080) },
+        )
+        .unwrap();
+
+        assert_ne!(path_in(&dir, Which::Launcher), path_in(&dir, Which::Game));
+        let launcher = load(&dir, Which::Launcher);
+        let game = load(&dir, Which::Game);
+        assert!(launcher.maximised && !launcher.fullscreen);
+        assert!(game.fullscreen && !game.maximised);
+        assert_eq!(launcher.width, Some(540));
+        assert_eq!(game.width, Some(1920));
+    }
+
+    #[test]
+    fn a_maximised_choice_round_trips() {
+        let dir = scratch("maximised-roundtrip");
+        save(
+            &dir,
+            Which::Game,
+            &WindowState { fullscreen: false, maximised: true, width: Some(800), height: Some(600) },
+        )
+        .unwrap();
+        let back = load(&dir, Which::Game);
+        assert!(back.maximised);
+        assert_eq!(back.width, Some(800));
+    }
+
+    #[test]
+    fn a_file_written_before_maximised_existed_still_loads() {
+        // Every profile that has a `window.json` today has one without this
+        // field. `#[serde(default)]` is what makes that keep working, and this
+        // is the assertion that says so.
+        let dir = scratch("older-schema-maximised");
+        std::fs::write(path_in(&dir, Which::Launcher), r#"{"fullscreen":true,"width":900}"#).unwrap();
+        let state = load(&dir, Which::Launcher);
+        assert!(state.fullscreen);
+        assert!(!state.maximised);
+        assert_eq!(state.width, Some(900));
     }
 
     // No test sets `CORDIAL_WINDOW_STATE` itself: it is process-wide, cargo

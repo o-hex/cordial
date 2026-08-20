@@ -751,7 +751,14 @@ pub fn build_update_page(
 /// guesses metered is the confusion this row exists to pre-empt.
 fn build_source_group() -> adw::PreferencesGroup {
     let group =
-        adw::PreferencesGroup::builder().title("Getting a newer build").description(STORES).build();
+        // `STORES` itself stays as it is and is still what a *refusal* says --
+        // somebody who has just been told Cordial cannot fetch a build needs
+        // the whole explanation. A settings group nobody has been refused
+        // anything on does not, so this one says the actionable half only.
+        adw::PreferencesGroup::builder()
+            .title("Getting a newer build")
+            .description("Cordial cannot download Roblox. Obtain an APK and choose it on the Roblox page.")
+            .build();
 
     let source_row = adw::ActionRow::builder()
         .title("Download source")
@@ -829,10 +836,8 @@ fn build_update_group(
     let metered_row = adw::SwitchRow::builder()
         .title("Download on metered connection")
         .subtitle(
-            "Off by default, so downloads wait for a connection nobody is charging by the \
-             megabyte. Only an explicit unmetered answer counts as unmetered: both of \
-             NetworkManager's guesses are treated as metered, and an ordinary desktop on a LAN \
-             guesses, so this switch is reached more often than it looks.",
+            "A connection NetworkManager only guesses is unmetered counts as metered, which an \
+             ordinary wired desktop often is.",
         )
         .active(config.borrow().download_on.metered)
         .build();
@@ -859,9 +864,8 @@ fn build_update_group(
 
 /// What the dropdown means, in the three sentences the modes differ by.
 const AUTO_UPDATE_SUBTITLE: &str =
-    "Update in background checks and fetches. Ask checks, and opens the changelog when Cordial \
-     starts with an update waiting. Manual makes no request until you press the button in the \
-     header bar, which then checks once.";
+    "Ask opens the changelog when an update is waiting. Manual checks once, when you press the \
+     button in the header bar.";
 
 /// Said on the settings group rather than left for somebody to discover.
 ///
@@ -870,11 +874,9 @@ const AUTO_UPDATE_SUBTITLE: &str =
 /// download from. Leaving that out would put live-looking controls in front of
 /// somebody and let them conclude their updates were handled.
 pub const SETTINGS_DESCRIPTION: &str =
-    "These govern checking for a new Roblox build and downloading it once there is a source to \
-     download from. There is none today: Roblox distributes the Android build through Google \
-     Play and the Amazon Appstore and publishes no file, so nothing here causes a download at \
-     present. Checking still works — Roblox's release notes are published — and so does \
-     choosing a build you obtained yourself.";
+    "Nothing here downloads anything yet. There is none today to download from — Roblox ships \
+     the Android build through Google Play and the Amazon Appstore and publishes no file. \
+     Checking still works.";
 
 /// Where the build is obtainable, named plainly.
 ///
@@ -882,19 +884,16 @@ pub const SETTINGS_DESCRIPTION: &str =
 /// message that only says Cordial cannot reads as Cordial being broken, which is
 /// exactly what ADR-015 says the refusal must not do.
 const STORES: &str =
-    "Roblox publishes no Android build outside app stores: the application comes from Google \
-     Play and the Amazon Appstore, and Roblox's own deployment CDN carries the Windows and Mac \
-     clients only. So there is a file to obtain, and Cordial is not the thing that can fetch it \
-     for you — it will not sign in to a store on your behalf, and it will not take the file from \
-     a mirror and call that Roblox. Obtain an APK and choose it on the Roblox page.";
+    "Roblox publishes no Android build outside Google Play and the Amazon Appstore, and Cordial \
+     will not sign in to a store for you or take the file from a mirror and call it Roblox. \
+     Obtain an APK and choose it on the Roblox page.";
 
 /// Said on the installed-build group, where the picker used to be.
 ///
 /// It names where the picker went. A group that lost its only control and says
 /// nothing about it reads as a control that failed to appear.
 const INSTALLED_DESCRIPTION: &str =
-    "Cordial ships no Roblox code and never will, so this is a build you already have. The APK \
-     is chosen on the Roblox page in Settings, which is the only place it is set.";
+    "The APK is chosen on the Roblox page in Settings, the only place it is set.";
 
 /// The top row: which of the three states this is, and why.
 fn status_lines(checked: &Option<Checked>, automatic: Automatic) -> (String, String) {

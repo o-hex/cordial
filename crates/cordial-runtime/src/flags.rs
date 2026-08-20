@@ -253,13 +253,13 @@ pub fn plugin_dir() -> PathBuf {
 
 /// Where first-party plugins ship, read-only, installed alongside the binary.
 ///
-/// `/app/share/cordial/plugins` inside the Flatpak; `$CORDIAL_SYSTEM_PLUGIN_DIR`
-/// overrides it for a distribution packaging Cordial somewhere else, and for
-/// the tests.
+/// Delegates to [`cordial_plugins::manifest::system_plugin_root`], which is now
+/// the single definition: the settings window has to list built-in plugins
+/// beside user ones, and it reaches `cordial-plugins` rather than this crate.
+/// This wrapper stays so the two-tier search path below still reads as one
+/// idea in one place.
 pub fn system_plugin_dir() -> PathBuf {
-    std::env::var_os("CORDIAL_SYSTEM_PLUGIN_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/app/share/cordial/plugins"))
+    cordial_plugins::manifest::system_plugin_root()
 }
 
 /// Every directory plugins are discovered from, **system first**.
@@ -275,10 +275,11 @@ pub fn system_plugin_dir() -> PathBuf {
 /// customisation. So on a collision the system copy is used and the conflict is
 /// **reported by name** rather than resolved quietly. See [`collect`].
 ///
-/// Disabling a first-party plugin is a different thing and should stay
-/// possible, exactly as GNOME lets a system extension be switched off. That
-/// needs a disable list and a switch in the settings window; it is not built
-/// yet, and refusing to shadow is not a substitute for it.
+/// Disabling a first-party plugin is a different thing and is built:
+/// `cordial_plugins::enablement` records it per profile, the settings window
+/// has a switch for every plugin in both tiers plus a master one, and
+/// [`collect`] below skips a disabled plugin's layer. Refusing to shadow was
+/// never a substitute for that, and no longer has to be.
 pub fn plugin_dirs() -> Vec<PathBuf> {
     vec![system_plugin_dir(), plugin_dir()]
 }
@@ -439,7 +440,20 @@ pub fn collect() -> Vec<Layer> {
         }
     }
 
+    // A plugin switched off in Settings contributes no flags either. This was
+    // the half the disable switch did not cover: `plugin_host::start_all`
+    // consulted `enablement` and refused to spawn the process, while this
+    // function went on reading the same plugin's `flags.json` and handing its
+    // overrides to the engine -- so "off" meant "its code does not run, but its
+    // opinions about the renderer still do". Nobody looking at the switch could
+    // have guessed that, which makes it the same class of defect as a stub that
+    // reports success.
+    let profile = crate::profile::active();
     for (id, root) in seen {
+        if !cordial_plugins::enablement::is_enabled(&profile, &id) {
+            println!("  plugins: {id} is switched off; its flags.json is not read");
+            continue;
+        }
         let path = root.join(&id).join("flags.json");
         if let Some(layer) = read_layer(&path, Source::Plugin(id)) {
             layers.push(layer);

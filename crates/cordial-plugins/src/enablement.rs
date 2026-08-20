@@ -55,9 +55,44 @@ pub fn load(path: &Path) -> BTreeMap<String, bool> {
     }
 }
 
+/// The key under which the master switch is recorded.
+///
+/// **`*` cannot collide with a plugin.** `manifest::is_valid_id` allows only
+/// ASCII alphanumerics, `-` and `_`, so no plugin can ever be called this and
+/// the one document keeps holding one kind of thing: a map from a name to
+/// whether it runs. The alternative was a second file beside this one, and two
+/// files answering "do plugins run here" is the arrangement that ends with a
+/// profile where they disagree.
+pub const ALL: &str = "*";
+
+/// Whether plugins run at all in this profile -- the master switch the settings
+/// window shows above the two lists.
+///
+/// Absent means yes, the same as every other entry, so no existing profile
+/// changes behaviour by this key appearing.
+pub fn plugins_allowed(profile_dir: &Path) -> bool {
+    load(&path_in(profile_dir)).get(ALL).copied().unwrap_or(true)
+}
+
+/// Record whether plugins run at all in this profile.
+pub fn set_plugins_allowed(profile_dir: &Path, on: bool) -> std::io::Result<()> {
+    set_enabled(profile_dir, ALL, on)
+}
+
 /// Whether `id` runs in this profile. Absent means yes; see the module docs.
+///
+/// **The master switch is checked here rather than at every call site**, which
+/// is what makes it honest without a second mechanism: `plugin_host::start_all`
+/// and `flags::collect` already ask this question per plugin, so a master
+/// switch that is a special case of the same answer is one nobody can forget to
+/// consult. A switch labelled "Use Plugins" that left plugin processes running
+/// would be the interface version of a stub returning success.
 pub fn is_enabled(profile_dir: &Path, id: &str) -> bool {
-    load(&path_in(profile_dir)).get(id).copied().unwrap_or(true)
+    let opinions = load(&path_in(profile_dir));
+    if !opinions.get(ALL).copied().unwrap_or(true) {
+        return false;
+    }
+    opinions.get(id).copied().unwrap_or(true)
 }
 
 /// Record that `id` should or should not run in this profile.
@@ -142,6 +177,33 @@ mod tests {
             still.get("flag-inspector").is_some_and(|c| !c.is_empty()),
             "disabling must not touch the grants file"
         );
+    }
+
+    #[test]
+    fn the_master_switch_stops_every_plugin_without_touching_their_own_entries() {
+        // What "Use Plugins" off has to mean: nothing runs, and turning it back
+        // on restores exactly the per-plugin choices that were there before --
+        // including one plugin the user had separately switched off.
+        let dir = scratch("master");
+        set_enabled(&dir, "off-anyway", false).unwrap();
+        assert!(is_enabled(&dir, "ordinary"));
+
+        set_plugins_allowed(&dir, false).unwrap();
+        assert!(!plugins_allowed(&dir));
+        assert!(!is_enabled(&dir, "ordinary"), "the master switch must stop a plugin nobody disabled");
+        assert!(!is_enabled(&dir, "off-anyway"));
+
+        set_plugins_allowed(&dir, true).unwrap();
+        assert!(is_enabled(&dir, "ordinary"));
+        assert!(!is_enabled(&dir, "off-anyway"), "the master switch must not clear an individual choice");
+    }
+
+    #[test]
+    fn the_master_key_cannot_be_mistaken_for_a_plugin() {
+        // The whole reason one document can hold both. If `is_valid_id` ever
+        // grew to allow `*`, a plugin called that would silently become the
+        // master switch.
+        assert!(!crate::manifest::is_valid_id(ALL));
     }
 
     #[test]

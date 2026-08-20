@@ -2007,8 +2007,21 @@ fn main() -> ExitCode {
                                         // change too, which is weak evidence it
                                         // caches. Treat this as correct at
                                         // launch and unproven afterwards.
+                                        // Logged, because "dark mode still does
+                                        // not work" is indistinguishable from
+                                        // three different failures: libadwaita
+                                        // not initialised in this process yet,
+                                        // the portal saying light, or the engine
+                                        // ignoring what it was told. This line
+                                        // separates the first two from the third.
+                                        let adw_up = libadwaita::is_initialized();
+                                        let dark = cordial_shell::prefers_dark();
+                                        println!(
+                                            "  uiMode: night={} (libadwaita initialised: {adw_up})",
+                                            if dark { "yes" } else { "no" }
+                                        );
                                         linker::game_activity::set_ui_mode_night(
-                                            if cordial_shell::prefers_dark() { 1 } else { 0 },
+                                            if dark { 1 } else { 0 },
                                         );
                                         linker::game_activity::set_display_size(
                                             width as i32,

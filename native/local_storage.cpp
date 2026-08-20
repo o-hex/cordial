@@ -89,6 +89,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -180,6 +181,104 @@ jlong current_user_locked() {
     return g_current_user;
 }
 } // namespace
+
+/// `java.lang.ref.WeakReference` and `java.lang.System.identityHashCode`.
+///
+/// **These are djinni's, not local storage's**, and they are the reason
+/// `setPlatformImpl` crashed the process for as long as it was enabled.
+/// `docs/analysis/flag-init.md` §39 inferred that libjnivm's own
+/// `NewWeakGlobalRef` was returning null and djinni was asserting on that.
+/// **That inference is wrong and §40 retracts it.** A `CORDIAL_JNI_TRACE=ON`
+/// run with a print added to `NewWeakGlobalRef` shows it is never called at
+/// all -- not once, in a run that throws `djinni (djinni_support.cpp:529):
+/// weakRef` thirteen times. What the trace shows instead, in the last dozen
+/// lines before the first throw:
+///
+///     FindClass java/lang/ref/WeakReference
+///     Constructed Unresolved symbol, Class=`java/lang/ref/WeakReference`,
+///       StaticMethod=`<init>`, Signature=`(Ljava/lang/Object;)Ljava/lang/ref/WeakReference;`
+///     Constructed Unresolved symbol, Class=`java/lang/ref/WeakReference`,
+///       Method=`get`, Signature=`()Ljava/lang/Object;`
+///     Call Unknown Static Function Class=`java/lang/ref/WeakReference` Method=`<init>`
+///     FindClass java/lang/Error
+///
+/// djinni does not use JNI weak global references for this. It builds a real
+/// `java.lang.ref.WeakReference` **object** and keeps that, which is a class
+/// libjnivm does not implement -- so its `<init>` was an invented stub, the
+/// stub returned null, and `DJINNI_ASSERT(weakRef, ...)` failed on every
+/// subsequent call into the interface. `FindClass java/lang/Error` on the very
+/// next line is djinni fetching the class it is about to throw.
+///
+/// `System.identityHashCode` is in the same window and unresolved for the same
+/// reason; djinni keys its proxy cache on it, and a stub returning 0 for every
+/// object collapses that cache onto one bucket. Both are answered here.
+///
+/// **Why the reference is genuinely weak.** libjnivm has no collector, so a
+/// `WeakReference` that held a strong pointer would never report its referent
+/// gone and would pin every object djinni ever wrapped for the life of the
+/// process. `std::weak_ptr` is the honest mapping: `get()` returns null exactly
+/// when nothing else holds the object, which is what the Java class promises.
+///
+/// The pair lives in this file because this is where the engine first reached
+/// for them and where the failure was measured. They belong to no interface in
+/// particular -- any other djinni-generated surface will want them -- and if a
+/// second one appears they should move somewhere neutral rather than be
+/// duplicated.
+class WeakReference : public Object {
+public:
+    std::weak_ptr<Object> referent;
+
+    /// libjnivm rewrites an instance `<init>` lookup into a static one with
+    /// the return type folded into the signature -- `NativeFlagsInitResult` in
+    /// `init_params.cpp` carries the full explanation, and the trace line
+    /// above shows the rewritten signature this has to match exactly.
+    static std::shared_ptr<WeakReference> ctor(ENV* env, Class*, std::shared_ptr<Object> o) {
+        auto p = std::make_shared<WeakReference>();
+        p->referent = o;
+        to_jni(env, p);
+        return p;
+    }
+
+    std::shared_ptr<Object> get(ENV* env) {
+        auto o = referent.lock();
+        if (o) {
+            to_jni(env, o);
+        }
+        return o;
+    }
+
+    static void Register(ENV* env) {
+        env->GetClass<WeakReference>("java/lang/ref/WeakReference");
+        auto c = env->GetClass("java/lang/ref/WeakReference");
+        c->Hook(env, "<init>", &WeakReference::ctor);
+        c->HookInstanceFunction(env, "get", &WeakReference::get);
+    }
+};
+
+/// `java.lang.System`, only `identityHashCode`.
+///
+/// Java's contract is "distinct for distinct objects, stable for the life of
+/// the object, 0 for null". The object address satisfies all three here
+/// because libjnivm objects do not move. Shifted right by four because glibc
+/// aligns every allocation to sixteen bytes, so the bottom four bits are
+/// always zero and fifteen sixteenths of djinni's buckets would never be used
+/// without the shift.
+class SystemClass : public Object {
+public:
+    static jint identityHashCode(ENV*, Class*, std::shared_ptr<Object> o) {
+        if (!o) {
+            return 0;
+        }
+        auto bits = reinterpret_cast<uintptr_t>(o.get()) >> 4;
+        return static_cast<jint>(bits ^ (bits >> 32));
+    }
+
+    static void Register(ENV* env) {
+        env->GetClass<SystemClass>("java/lang/System");
+        auto c = env->GetClass("java/lang/System");
+        c->Hook(env, "identityHashCode", &SystemClass::identityHashCode);
+    }
+};
 
 /// `java.util.HashSet`, enough of it for `getUsers()`'s return value.
 ///
@@ -380,6 +479,8 @@ private:
 };
 
 void register_local_storage_classes(ENV* env) {
+    WeakReference::Register(env);
+    SystemClass::Register(env);
     UserSet::Register(env);
     PlatformLocalStorageHandler::Register(env);
 }
@@ -398,25 +499,21 @@ extern "C" {
 /// the engine actually reads from and discards the `ILocalStorageHandlerCore`
 /// this returns -- nothing here has found a reason to call anything on it.
 ///
-/// **Measured to crash, and called from `load.rs` behind
-/// `CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL` because of it.** The call
-/// returns cleanly -- this function's own `rc == 0` -- but the engine's own
-/// djinni glue starts throwing `djinni (djinni_support.cpp:529): weakRef`
-/// immediately afterwards, repeatedly, and the process goes on to SIGSEGV a
-/// few calls later inside libc's `_IO_fflush`, fault address `0x8`: the same
-/// crash signature `docs/analysis/flag-init.md` §7.4/§15 records for an
-/// unrelated native, which reads as heap corruption rather than a clean
-/// null-check failure. A control run with only this one call skipped reached
-/// `app ready: Landing` and exited 0; the identical run with only this call
-/// re-enabled crashed under `lldb`. `IPlatformLocalStorageHandler` and
-/// `ILocalStorageHandlerCore` are djinni-generated -- the `$CppProxy`
-/// siblings in the dex are the giveaway -- and djinni's runtime is INFERRED
-/// to need working weak global references to wrap a Java-side implementation,
-/// which libjnivm is not established to provide; this is not confirmed by
-/// reading `djinni_support.cpp`, which is engine code past what AGENTS.md
-/// allows disassembling. Mocktail's own equivalent step defaults off in that
-/// project too, which in hindsight was a warning this file's first version
-/// read as merely a signal.
+/// **This crashed the process until the `WeakReference` and
+/// `System.identityHashCode` classes above existed, and it no longer does.**
+/// The old text here, and `docs/analysis/flag-init.md` §39, both blamed
+/// libjnivm's `NewWeakGlobalRef` returning null. Both were wrong: a trace run
+/// with a print inside that function shows it is never called, once, in a run
+/// that throws `djinni (djinni_support.cpp:529): weakRef` thirteen times. The
+/// class comment on `WeakReference` above has the trace lines that say what
+/// actually happened. Three runs with this call made and three with it skipped,
+/// same build and separate profile roots, now exit 0 with no djinni exception
+/// either way, and the engine's `FLog::LocalStorageHandler` `Not available on
+/// the current platform` warning appears twice a run when it is skipped and
+/// not at all when it is made -- so the implementation is reaching the engine
+/// rather than merely failing quietly. §40 records it.
+///
+/// It does not produce an `rbx-storage.db`; see §40's closing note.
 int cordial_local_storage_set_platform_impl(void* fn, char* err, size_t err_len) {
     using Call = jobject (*)(JNIEnv*, jclass, jobject);
     auto* env = cordial::process_env();

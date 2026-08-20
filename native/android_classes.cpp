@@ -1613,6 +1613,26 @@ void register_shared_preferences(ENV* env) {
         env->GetClass(klass)->HookInstanceFunction(env, "getSharedPreferences",
                                                    &context_get_shared_preferences);
     }
+    // Put `jnivm::Object` back where `VM::VM` left it, and do not remove this.
+    //
+    // libjnivm keeps ONE class per C++ type -- `VM::typecheck`, keyed by
+    // `typeid` -- and `GetClass<T>(name)` overwrites that entry. Every
+    // signature libjnivm derives for a hook is built from it, so after the
+    // loop above the last name registered won, and any `std::shared_ptr<Object>`
+    // or `jobject` in a hook signature came out as `Landroid/app/Application;`
+    // rather than `Ljava/lang/Object;`. A hook registered after this point
+    // could then never match the engine's lookup, and the failure is silent:
+    // the trace says `Constructed Unresolved symbol` with the signature the
+    // engine asked for, which is the correct one, and nothing says the
+    // registered side spelled it differently.
+    //
+    // Measured, not deduced. Registering `java/lang/ref/WeakReference` in
+    // `local_storage.cpp` -- which runs immediately after this function --
+    // produced `<init>` at `(Landroid/app/Application;)Ljava/lang/ref/
+    // WeakReference;` against an engine asking for
+    // `(Ljava/lang/Object;)Ljava/lang/ref/WeakReference;`, printed side by side
+    // out of the class's own method table. See docs/analysis/flag-init.md §40.
+    env->GetClass<Object>("java/lang/Object");
 }
 
 } // namespace cordial

@@ -2318,92 +2318,76 @@ fn main() -> ExitCode {
                                         }
 
                                         // `ILocalStorageHandlerCore.setPlatformImpl`.
-                                        // **Measured to crash, and left off by
-                                        // default because of it.** The call
-                                        // itself returns cleanly -- "setPlatformImpl
-                                        // ok" prints -- but the engine's own
-                                        // djinni glue starts throwing
-                                        // `[JNIVM] Exception ... djinni
-                                        // (djinni_support.cpp:529): weakRef`
-                                        // immediately afterwards, a dozen
-                                        // times in one run, and the process
-                                        // goes on to SIGSEGV inside libc's
-                                        // `_IO_fflush` a few calls later --
-                                        // the same crash SIGNATURE
-                                        // docs/analysis/flag-init.md §7.4/§15
-                                        // records for a different native, a
-                                        // fault at address 0x8, which reads as
-                                        // heap corruption rather than a clean
-                                        // null-check failure. A control run
-                                        // with this call skipped and every
-                                        // other change in this commit intact
-                                        // reached `app ready: Landing` and
-                                        // exited 0; the identical run with
-                                        // only this call re-enabled crashed
-                                        // under `lldb` inside `nativeRetryInit`,
-                                        // which this call precedes but does
-                                        // not touch. That is exactly the
-                                        // asymmetry mocktail's own
-                                        // `MOCKTAIL_LOCAL_STORAGE_SET_PLATFORM_IMPL`
-                                        // defaulting *off* already warned
-                                        // about (see `native/local_storage.cpp`'s
-                                        // header) -- confirmed here rather
-                                        // than taken on trust.
                                         //
-                                        // `IPlatformLocalStorageHandler` and
-                                        // `ILocalStorageHandlerCore` are
-                                        // djinni-generated (the `$CppProxy`
-                                        // siblings in the dex are the
-                                        // giveaway), and djinni's own runtime
-                                        // wraps a Java-side interface
-                                        // implementation in machinery that
-                                        // needs working weak global
-                                        // references -- `NewWeakGlobalRef`
-                                        // and friends -- which is INFERRED to
-                                        // be what libjnivm does not fully
-                                        // provide, since the exception names
-                                        // `weakRef` specifically and starts
-                                        // firing the moment the engine has
-                                        // the object in hand. Not confirmed
-                                        // by reading djinni_support.cpp,
-                                        // which is engine code this project
-                                        // does not disassemble past what
-                                        // AGENTS.md allows.
+                                        // This was skipped by default for as
+                                        // long as it existed, because it
+                                        // crashed the process: the call
+                                        // returned cleanly and then the
+                                        // engine's djinni glue threw
+                                        // `djinni (djinni_support.cpp:529):
+                                        // weakRef` thirteen times and the
+                                        // process died on SIGTRAP, exit 133.
+                                        // Both the old comment here and
+                                        // docs/analysis/flag-init.md §39
+                                        // blamed libjnivm's `NewWeakGlobalRef`
+                                        // handing back a null weak reference.
+                                        // **Both were wrong.** A trace run
+                                        // with a print inside
+                                        // `NewWeakGlobalRef` shows it is never
+                                        // called once. djinni does not use JNI
+                                        // weak references here at all -- it
+                                        // constructs a real
+                                        // `java.lang.ref.WeakReference` object,
+                                        // which libjnivm had no implementation
+                                        // for, so the constructor was an
+                                        // invented stub returning null and
+                                        // every later call asserted on it.
+                                        // `native/local_storage.cpp` now
+                                        // answers `WeakReference` and
+                                        // `System.identityHashCode`, and
+                                        // `native/android_classes.cpp` no
+                                        // longer leaves `jnivm::Object` mapped
+                                        // to `android/app/Application`, which
+                                        // was corrupting the signature every
+                                        // such hook is registered under. §40
+                                        // records the measurement.
                                         //
-                                        // The C++ side (`PlatformLocalStorageHandler`
-                                        // in `native/local_storage.cpp`) is
-                                        // left in place and registered either
-                                        // way -- registering a class costs
-                                        // nothing until something calls a
-                                        // method on it -- so
-                                        // `CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL=1`
-                                        // is enough to pick the investigation
-                                        // back up without touching code.
-                                        if std::env::var_os(
-                                            "CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL",
-                                        )
-                                        .is_some()
-                                        {
-                                            match lib.symbol(
-                                                "Java_com_roblox_protocols_localstorageplatforminterface_generated_ILocalStorageHandlerCore_setPlatformImpl",
-                                            ) {
-                                                None => println!(
-                                                    "  setPlatformImpl not exported"
-                                                ),
-                                                Some(f) => match local_storage_set_platform_impl(f) {
-                                                    Ok(()) => println!("  setPlatformImpl ok"),
-                                                    Err(e) => {
-                                                        println!("  setPlatformImpl failed: {e}")
-                                                    }
-                                                },
-                                            }
-                                        } else {
-                                            println!(
-                                                "  setPlatformImpl skipped (measured to crash \
-                                                 the process a few calls later; set \
-                                                 CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL=1 to \
-                                                 try it anyway)"
-                                            );
+                                        // Three runs with the call made and
+                                        // three with it skipped, same build,
+                                        // separate profile roots: exit 0 and
+                                        // zero djinni exceptions either way,
+                                        // and the engine's own
+                                        // `FLog::LocalStorageHandler`
+                                        // `Not available on the current
+                                        // platform` warning appears twice per
+                                        // run when it is skipped and not at
+                                        // all when it is made. That warning
+                                        // disappearing is the only direct
+                                        // evidence the engine accepted the
+                                        // implementation, and it is why this
+                                        // is now unconditional.
+                                        //
+                                        // It does **not** produce an
+                                        // `rbx-storage.db`. The engine still
+                                        // reports `DFLog::RbxmFileManager`
+                                        // `LocalStorageManager is not
+                                        // available` twice a run either way,
+                                        // and that is a different class from
+                                        // the interface this hands over -- see
+                                        // §40's closing note, which also
+                                        // records that the engine never asks
+                                        // libjnivm for `LocalStorageManager`
+                                        // at all in a full trace.
+                                        match lib.symbol(
+                                            "Java_com_roblox_protocols_localstorageplatforminterface_generated_ILocalStorageHandlerCore_setPlatformImpl",
+                                        ) {
+                                            None => println!("  setPlatformImpl not exported"),
+                                            Some(f) => match local_storage_set_platform_impl(f) {
+                                                Ok(()) => println!("  setPlatformImpl ok"),
+                                                Err(e) => {
+                                                    println!("  setPlatformImpl failed: {e}")
+                                                }
+                                            },
                                         }
 
                                         if let Some(p) = lib.symbol(

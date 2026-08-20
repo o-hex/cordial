@@ -4435,6 +4435,13 @@ return are consistent, but nobody has yet watched that cast fail on the specific
 object `setPlatformImpl` passes. Establishing that is the next step, and it is a
 question about libjnivm and djinni, not about `libroblox.so`'s text.
 
+> **Retracted by §40.** That inference is wrong. `NewWeakGlobalRef` is never
+> called in a run that throws `weakRef` thirteen times, which a print inside it
+> showed on the first attempt. djinni builds a real `java.lang.ref.WeakReference`
+> object instead, and libjnivm had no implementation of that class. The
+> paragraph is left standing because the reasoning in it is the exact shape this
+> document keeps warning about: consistent, plausible, and never run.
+
 ### What this changes for whoever continues
 
 The remaining question is no longer "what condition byte selects the wipe". It is
@@ -4449,3 +4456,115 @@ Whether fixing it produces a store is not established and should not be assumed.
 Forty-odd negatives say the trigger has resisted every explanation offered so
 far, and "the platform impl was missing" is an explanation for the *warnings*,
 measured, not yet an explanation for the *store*.
+
+## §40. `setPlatformImpl` works and is now on by default; the weak reference was a missing `java.lang.ref.WeakReference`, not a broken `NewWeakGlobalRef`; storage still does not initialise and the engine says why
+
+§39 left one question: "why does djinni's weak reference to Cordial's platform
+impl come back null". It also offered an answer, labelled `INFERRED` —
+`third_party/libjnivm/src/jnivm/vm.cpp:313`'s `NewWeakGlobalRef` returning
+`(jweak)nullptr`. **That inference is wrong, and this section retracts it.**
+
+The way to find out was to put a print in `NewWeakGlobalRef` and run. In a run
+that threw `djinni (djinni_support.cpp:529): weakRef` thirteen times and died on
+SIGTRAP, **that function was never called once**. Neither was the other place a
+dead weak reference surfaces — `UnpackJObject`'s `weak->wrapped.lock()` failing —
+which was instrumented in the same build. libjnivm's weak-reference support is
+not involved in this failure at all.
+
+What is involved is visible in a `CORDIAL_JNI_TRACE=ON` run, in the twelve lines
+between the last `IPlatformLocalStorageHandler` method binding and the first
+throw:
+
+    FindClass java/lang/System
+    Constructed Unresolved symbol, Class=`java/lang/System`,
+      StaticMethod=`identityHashCode`, Signature=`(Ljava/lang/Object;)I`
+    Call Unknown Static Function Class=`java/lang/System` Method=`identityHashCode`
+    Call Unknown Static Function Class=`java/lang/System` Method=`identityHashCode`
+    FindClass com/roblox/.../ILocalStorageHandlerCore$CppProxy
+    ...
+    FindClass java/lang/ref/WeakReference
+    Constructed Unresolved symbol, Class=`java/lang/ref/WeakReference`,
+      StaticMethod=`<init>`, Signature=`(Ljava/lang/Object;)Ljava/lang/ref/WeakReference;`
+    Constructed Unresolved symbol, Class=`java/lang/ref/WeakReference`,
+      Method=`get`, Signature=`()Ljava/lang/Object;`
+    Call Unknown Static Function Class=`java/lang/ref/WeakReference` Method=`<init>`
+    FindClass java/lang/Error
+
+djinni does not reach for JNI weak global references here. It builds a real
+`java.lang.ref.WeakReference` **object** and keeps that — a class libjnivm does
+not implement, so its constructor was an invented stub, the stub returned null,
+and `DJINNI_ASSERT(weakRef, ...)` failed on every later call into the interface.
+`FindClass java/lang/Error` on the next line is djinni fetching the class it is
+about to throw. `System.identityHashCode` is unresolved in the same window for
+the same reason; djinni keys its proxy cache on it, and a stub answering 0 for
+every object collapses that cache onto one bucket.
+
+Both are now answered in `native/local_storage.cpp`. The reference is a genuine
+`std::weak_ptr`: libjnivm has no collector, so a `WeakReference` holding a strong
+pointer would pin every object djinni ever wrapped and would never report a
+referent gone.
+
+### The second bug, which is general and was silent
+
+Registering those two classes did not work at first, and the reason is worth more
+than the fix. libjnivm keeps **one class per C++ type** — `VM::typecheck`, keyed
+by `typeid` — and every signature it derives for a hook is built from that map.
+`register_shared_preferences` in `native/android_classes.cpp` calls
+`env->GetClass<Object>(klass)` for three names in a loop, so the last one won and
+`typeid(jnivm::Object)` was left pointing at `android/app/Application`. Printing
+the registered method table straight out of the class showed it:
+
+    method static=1 native=0 name=<init> sig=(Landroid/app/Application;)Ljava/lang/ref/WeakReference;
+    method static=1 native=0 name=identityHashCode sig=(Landroid/app/Application;)I
+
+against an engine asking for `(Ljava/lang/Object;)...` in both cases. **This
+failure mode is silent by construction**: the trace reports `Constructed
+Unresolved symbol` with the signature the *engine* asked for, which is the
+correct one, and nothing anywhere says the registered side spelled it
+differently. Any hook taking or returning a plain `Object` and registered after
+`register_shared_preferences` was affected. `register_shared_preferences` now
+puts `java/lang/Object` back at the end.
+
+### What it changed, with a control
+
+Same build, six runs, one profile root each, 25 s apiece.
+
+| | djinni `weakRef` | `FLog::LocalStorageHandler` "Not available on the current platform" | `DFLog::RbxmFileManager` "LocalStorageManager is not available" | exit | `rbx-storage.db` |
+|---|---|---|---|---|---|
+| `setPlatformImpl` made, x3 | 0 | **0** | 2 | 0 | none |
+| `setPlatformImpl` skipped, x3 | 0 | **2** | 2 | 0 | none |
+
+Before the fix, the same call on the same tree gave 13 `weakRef` exceptions and
+exit 133, reproduced twice. That warning disappearing is the only direct evidence
+the engine accepted the implementation rather than taking it and failing quietly,
+and it is why `crates/cordial-runtime/src/bin/load.rs` now makes the call
+unconditionally instead of behind `CORDIAL_LOCAL_STORAGE_SET_PLATFORM_IMPL`.
+Three further runs on the new default path: exit 0, `setPlatformImpl ok`, no
+djinni exception, no `LocalStorageHandler` warning.
+
+### And it does not produce a store
+
+**Read this before treating §39 or this section as progress on `RbxStorage`.**
+There is still no `.db` anywhere under the profile root, on any of the nine runs
+above. `DFLog::RbxmFileManager` `LocalStorageManager is not available` appears
+twice a run whether the platform impl is handed over or not — unchanged, which
+is the point. That message names `com.roblox.client.LocalStorageManager`, a
+different class from the `ILocalStorageHandlerCore`/`IPlatformLocalStorageHandler`
+pair this section fixes, exactly as `native/local_storage.cpp`'s own header has
+said since it was written.
+
+One more measurement narrows it. In a full `CORDIAL_JNI_TRACE=ON` run that
+reached `engine initialised` and `app ready: Startup` — well past both
+`RbxmFileManager` warnings, which land at t≈1.1 s and t≈3.4 s — the engine never
+asks libjnivm for `com/roblox/client/LocalStorageManager` at all. Not
+`getAllocatableBytes`, which Cordial hooks; not a constructor; nothing. Thirty-nine
+distinct classes are looked up in that run and it is not among them. So whatever
+decides "LocalStorageManager is not available" decides it without asking the
+platform, and **adding methods to that class cannot be the fix**. That is a
+negative result and it closes off the most obvious next thing to try.
+
+The count of negatives is now forty-something plus nine. What §39 and §40
+together establish is that two of them had causes, both in Cordial, both
+findable by running the thing rather than reading the binary — and that the
+store's own gate is still unexplained and is no longer where anyone has been
+looking.

@@ -600,14 +600,28 @@ extern "C" fn run_bootstrap() {
     // `post` landed after the verdict had already been reported.
     // `CORDIAL_NO_EARLY_POST=1` leaves this to the late call site.
     //
-    // The early call was always a no-op: the engine's own
-    // `[FLog::AndroidGLView] nativePostClientSettingsLoadedInitialization3` line
-    // never appeared and none of the block that follows it on Android ever ran.
-    // Repeating the call after the surface is up produces the whole block, so the
-    // body does run -- just not this early. That leaves the question of whether
-    // the wasted early call is merely useless or actively harmful, which nobody
-    // can answer while both calls are made.
-    if plan.post_native != 0 && std::env::var_os("CORDIAL_NO_EARLY_POST").is_none() {
+    // **The question this comment used to leave open is answered: the early call
+    // is actively harmful, and it is now off by default.** It asked "whether the
+    // wasted early call is merely useless or actively harmful, which nobody can
+    // answer while both calls are made". Making it optional answered it.
+    //
+    // It costs `IxpStorageManager`. Same binary, one environment variable apart,
+    // arms interleaved in one session: with the early call skipped, the
+    // subsystem runs and writes its `ixp_cache_random_id` 10 times out of 10;
+    // with it made, 0 out of 50. Both arms still reach `app ready: Landing` and
+    // both still build a 45,056-byte `rbx-storage.db`, so the early call costs a
+    // subsystem and buys nothing observable.
+    //
+    // The earlier note that it "was always a no-op" is withdrawn: a call that
+    // suppresses a subsystem is not a no-op, it is a side effect nobody had
+    // looked for. It produced no `[FLog::AndroidGLView]` line, which is all that
+    // was ever established, and absence of a log line was read as absence of an
+    // effect -- the same mistake `docs/analysis/flag-init.md` records ten times.
+    //
+    // `CORDIAL_EARLY_POST=1` restores it for anyone bisecting this. The late
+    // call site, which predates the early one and is what actually produces the
+    // block, is untouched.
+    if plan.post_native != 0 && std::env::var_os("CORDIAL_EARLY_POST").is_some() {
         match linker::game_activity::post_client_settings_loaded(
             plan.post_native as *mut std::ffi::c_void,
         ) {

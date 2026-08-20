@@ -100,22 +100,6 @@
        startup. No config file with a “don’t edit this by hand” warning at the top.</p>
   </div>
 
-  <h2>Status</h2>
-
-  <p class="n">Honest about the gaps, because finding out after installing is worse.</p>
-
-  <table>
-    <tr><td>✅</td><td>Signing in, staying signed in, browsing and launching experiences</td></tr>
-    <tr><td>✅</td><td>Graphics, audio, mouse look and keyboard</td></tr>
-    <tr><td>✅</td><td>Web views — servers, profiles, marketplace</td></tr>
-    <tr><td>✅</td><td>Asset caching between sessions</td></tr>
-    <tr><td>⚠️</td><td>Text entry is incomplete in some in-experience fields</td></tr>
-    <tr><td>❌</td><td><strong>Passkey sign-in.</strong> If your account uses a passkey for
-        two-factor, you can’t sign in yet — WebKitGTK has no WebAuthn support and
-        that isn’t something Cordial can work around</td></tr>
-    <tr><td>❌</td><td>Voice chat</td></tr>
-  </table>
-
   <h2 id="install">Install</h2>
 
   <pre><code>flatpak remote-add --if-not-exists --no-gpg-verify \
@@ -127,6 +111,13 @@ flatpak install cordial io.github.luohoa97.Cordial</code></pre>
     Then launch it, sign in, and press play. Nothing from Roblox is bundled or
     redistributed — Cordial downloads the official build to your machine and
     never re-serves it.
+  </p>
+
+  <p class="n">
+    One thing to know first: if your account uses a <strong>passkey</strong> for
+    two-factor, you cannot sign in yet. That is a missing piece in WebKitGTK
+    rather than something Cordial can work around.
+    <a href="https://github.com/luohoa97/cordial#status">Full status on GitHub</a>.
   </p>
 
   <footer>

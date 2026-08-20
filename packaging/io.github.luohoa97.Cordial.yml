@@ -99,6 +99,15 @@ finish-args:
   # An online game.
   - --share=network
   - --socket=pulseaudio
+  # **The native PipeWire socket, and without it the Flatpak has no sound.**
+  #
+  # `--socket=pulseaudio` grants only the PulseAudio compatibility socket.
+  # `native/pipewire_backend.cpp` dlopens `libpipewire-0.3.so.0` -- which the
+  # runtime does provide, so the load succeeds -- and then speaks the native
+  # protocol to a socket the sandbox does not expose. The library is there, the
+  # backend is compiled in, and the connection fails: no error a user sees,
+  # just silence. Reported as "the flatpak build has no sound".
+  - --filesystem=xdg-run/pipewire-0:ro
   # Roblox's own data lives under the app's data directory, per instance.
   - --persist=.cordial
   # Discord's IPC socket, for the presence.set/presence.clear broker

@@ -1389,6 +1389,13 @@ fn main() -> ExitCode {
                 "files/appData", "files/appData/LocalStorage", "files/appData/OTAPatchBackups",
                 "files/appData/rbx-storage", "cache/ContentProvider_2", "cache/rbx-storage",
                 "cache/sounds",
+                // The external-storage tree. mocktail creates these three and
+                // Cordial did not, which made this an incomplete adoption of a
+                // list that was otherwise copied wholesale -- see the other
+                // call site for what the rest are for.
+                "sdcard/Android/data/com.roblox.client",
+                "sdcard/Android/data/com.roblox.client/files",
+                "sdcard/Android/data/com.roblox.client/cache",
             ] {
                 let _ = std::fs::create_dir_all(format!("{base}/{rel}"));
             }
@@ -1894,6 +1901,27 @@ fn main() -> ExitCode {
                                                 "cache/ContentProvider_2",
                                                 "cache/rbx-storage",
                                                 "cache/sounds",
+                                                // The external-storage tree,
+                                                // the three of mocktail's list
+                                                // Cordial had not taken. The
+                                                // engine reaches external
+                                                // storage through
+                                                // `nativeSetExternalDirectory`,
+                                                // which Cordial answers, but
+                                                // answering with a path whose
+                                                // directories do not exist is
+                                                // the same shape of bug as the
+                                                // failed opens above: the call
+                                                // succeeds and the first write
+                                                // under it does not. Whether
+                                                // anything writes there on a
+                                                // landing-page run is not
+                                                // established; these cost three
+                                                // mkdirs and remove the
+                                                // question.
+                                                "sdcard/Android/data/com.roblox.client",
+                                                "sdcard/Android/data/com.roblox.client/files",
+                                                "sdcard/Android/data/com.roblox.client/cache",
                                             ] {
                                                 let _ = std::fs::create_dir_all(
                                                     format!("{base}/{rel}"),

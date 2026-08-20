@@ -37,11 +37,33 @@
 // and separately, the signature-verification tail of that chain
 // (`SigningInfo.getSigningCertificateHistory` -> `Signature.toByteArray`) is
 // exactly the territory AGENTS.md's hard rule covers: "never make a stub lie".
-// Cordial has no genuine APK signing certificate to hand back for this build,
-// and building the plumbing to answer `getPackageInfo` at all — even
-// truthfully, even only as far as a version code — is the first half of
-// infrastructure a signature check would also use. Rather than build it
-// unobserved and half-finished, this is left unimplemented and reported so;
+//
+// **The second reason as originally written is now wrong, and is corrected
+// here rather than left to mislead.** It said Cordial "has no genuine APK
+// signing certificate to hand back for this build". It has one: the APK the
+// user already supplies carries the real certificate in its v2 and v3 signing
+// blocks — `O=Roblox Corporation, OU=Mobile`, self-signed, valid 2014 to 2039,
+// DER SHA-256 `44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477`,
+// identical in both blocks. Extracting it needs no key material and no
+// network: parse the End of Central Directory, walk back to the `APK Sig Block
+// 42` footer, and read the first signer's first certificate. So if this chain
+// were ever implemented there would be a truthful answer available, and
+// nothing here would have to invent one.
+//
+// **What has not changed is the reason that actually decides it**: nothing has
+// ever been observed asking. Building an unobserved chain is speculative work
+// whichever way it would answer, and this project has paid for speculative
+// work before. If it is ever built, the certificate must be read out of the
+// supplied APK at the time of the call — never hardcoded from the constant
+// above, which is a record of what was measured on one build and not a value
+// to assert about another.
+//
+// Note also which side of the line this sits on. Answering a platform call
+// truthfully is Cordial's job; deciding whether the client is tampered with is
+// Roblox's, and AGENTS.md puts client-side integrity flags permanently out of
+// scope. Cordial hands over the facts and forms no opinion about them.
+//
+// Rather than build it unobserved and half-finished, this is left unimplemented and reported so;
 // see the task's own final report for the class-by-class account. `BatteryStatus`
 // and `RobloxTelemetryEvent` were checked the same way and are absent for a
 // different reason -- see the report, not this file, for why.

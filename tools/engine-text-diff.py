@@ -10,8 +10,18 @@ does -- but it does rule out the 116 `PatchCode` sites that sit beside it there.
 Written for one question `docs/analysis/flag-init.md` §22.1 could not answer: is
 the engine's flags-loaded state reachable through the interface Roblox exposes to
 its host application, or does every implementation that reaches it force it?
-Cordial cannot reach it, after fifteen eliminated candidates. mocktail forces it.
-Sober reaches it and is the only existence proof that it is reachable at all.
+Cordial cannot reach it, after fifteen eliminated candidates. Sober reaches it.
+
+**"mocktail forces it" was wrong on this build, and this docstring said so for
+months.** `ForceNativeFlagsLoadedForTaskScheduler` is gated behind
+`MOCKTAIL_PATCH_NATIVE_FLAGS_LOADED`, which `IsEnabled` refuses unless
+`g_allow_legacy_binary_patches` is set, and that comes from a per-Build-ID
+profile enabling it for 2.721.1108 only. On 2.734.917 -- the build in
+`~/.cache/cordial/lib/x86_64`, byte-identical Build ID -- mocktail prints
+`legacy binary patches: disabled` and its store comes up anyway. So there are
+three implementations reaching this state legitimately, not two, and mocktail
+is a *better* control than Sober for Cordial's purposes: same Build ID, same
+host, not an Android environment. See `docs/analysis/flag-init.md` §45.
 
 Usage:
 

@@ -5080,3 +5080,164 @@ is the cause or another symptom of the same early ordering is not established.
 Whoever takes it should score on `grep -c RbxmFileManager` and the tombstone
 path form rather than on the filesystem, run enough times to see the rate, and
 report the rate rather than a single outcome.
+
+## §45. mocktail does not force the flags-loaded byte on this build; all four working captures run `postClientSettingsLoadedInitialization3` *before* `nativeAppBridgeV2Init` and Cordial runs it after, in 109 logs out of 109
+
+Build `0.6.0-13-gd5eb7e2-dirty` for the two runs at the end; the `-dirty` is
+another session's `CORDIAL_EARLY_DIRS` and cacert work in `load.rs` and this
+section changed no code. Everything before those two runs is read off files
+already on this disk and cost nothing.
+
+### §45.1 The experiment this section was commissioned to run is moot, because its premise is false
+
+The brief was: mocktail's store works and mocktail *forces* the engine's
+flags-loaded byte at `g_libroblox_base + 0x75a8250`
+(`ForceNativeFlagsLoadedForTaskScheduler`, `src/legacy/legacy_runtime.cc`), so
+read that byte in a live Cordial process and find out whether Cordial reaches
+the same state.
+
+mocktail does not force it on this build. The write is gated three deep:
+
+    ForceNativeFlagsLoadedForTaskScheduler
+      -> IsEnabled("MOCKTAIL_PATCH_NATIVE_FLAGS_LOADED")
+        -> returns false for every MOCKTAIL_PATCH_* name unless
+           g_allow_legacy_binary_patches
+             <- build_profile.allow_legacy_binary_patches, looked up by ELF Build ID
+
+`config/roblox_compatibility.json` carries three profiles.
+`allow_legacy_binary_patches` is **true only for 2.721.1108** — the one marked
+`legacy-researched`, `default_allowed: false`. Both `supported` builds have it
+false, and Cordial's build is not in the manifest at all -- mocktail runs it
+as `(experimental)`, which is precisely the state in which the legacy patches
+stay off.
+
+The installed Flatpak says so at runtime, in a session whose store works:
+
+    [compat] Roblox 2.734.917 Build ID 63c5109637b7d7b2bdb8ed8f858023ff5ef49326 (experimental)
+    [compat] legacy binary patches: disabled
+    ...
+    Critical [DFLog::RbxStorage] RbxStorage::init [INIT] user: flagLoaded, ...
+    Critical [DFLog::RbxStorage] RbxStorage::init [DONE] ... dbOpenCount: 3
+
+That Build ID is byte-identical to the one in `~/.cache/cordial/lib/x86_64/libroblox.so`
+(`readelf -n`). All three mocktail session logs on this machine print
+`legacy binary patches: disabled` and all three print two `RbxStorage::init`
+lines. **mocktail's store comes up with the forcing function inert**, so
+"flags-loaded satisfied by force" was never the mechanism, and a byte read
+would have been answering a question nobody had.
+
+### §45.2 The offset could not have been validated anyway, and no value from it is reported
+
+Recorded so the next person does not spend the session on it.
+`libroblox.so` for 2.734.0.917 is fully stripped: no `.symtab`, and **zero**
+dynamic symbols with an address anywhere in `.bss` (which spans
+`0x6fd9d00`–`0x7ad4abc`, so `0x75a8250` is at least *inside* it). No
+relocation names it. mocktail derived it for a build thirteen releases older
+and its own compatibility gate refuses to use it here. There is no way to show
+the address means anything on this build short of a differential against a
+live known-good process, and per the brief's own caution no value is reported.
+
+### §45.3 mocktail is a third working control, and the most useful one yet
+
+Same Build ID, same host, same `libroblox.so`, and — like Cordial and unlike
+Sober — not an Android environment. Its logs are at
+`~/.var/app/space.bigrat.mocktail/.local/state/mocktail/logs/`, its store at
+`.../data/mocktail/android/data/files/appData/rbx-storage.db`. It prints an
+`[engine] <call>` marker for every native it drives, so the whole startup
+sequence is readable without instrumenting anything.
+
+### §45.4 The signature: post-settings init runs before the app bridge in every capture where the store works, and after it in every Cordial run on this disk
+
+Three landmarks, from four captures, all read off logs already present:
+
+    capture                        post3     RbxStorage::init   AppBridgeV2Init
+    docs/traces/waydroid-...       0.4114    0.4158             0.5045
+    Sober, 2026-08-20_14-38-41     7.5676    7.5770             7.5873
+    mocktail, 2026-08-19 02:20     2.0976    2.1113             3.2502
+    Cordial, ef907 (typical)       2.5938    absent             0.2277
+
+The three working captures have the same shape to the millisecond-pattern:
+`nativePostClientSettingsLoadedInitialization3`, then `RbxStorage::init` 4–14 ms
+later on a different thread, then `nativeAppBridgeV2Init`. Cordial inverts it —
+the bridge is up first and the post-settings block arrives one to three seconds
+afterwards, by which time the Lua app is running and Vulkan has a swapchain.
+
+Scored across every current-engine log on this machine (`CordialTest`
+excluded), 109 logs, of which 75 carry both timestamps:
+
+    BRIDGE_FIRST  75 / 75
+    POST_FIRST     0 / 75
+    RbxStorage::init present   0 / 109
+
+`FFlagStartRbxStorageInitRighAfterFlags = True` is in the very settings
+document Cordial hands the engine, which is consistent with the trigger the
+working captures name in their own line (`user: flagLoaded`). That the
+ordering is the *cause* rather than another symptom is **`INFERRED`** — what is
+measured is that the two populations separate perfectly on it.
+
+### §45.5 The existing knob does not move it, with a control in the same session
+
+`CORDIAL_EARLY_SETTINGS=1` is the closest thing already in the tree: it calls
+`nativeInitClientSettings` before `initializeNativeCode`. One control and one
+arm, same binary, same reused data root, minutes apart:
+
+    control              bridge 1.3429   post3 3.3509   BRIDGE_FIRST   rbxinit 0   warn 2   db 0
+    CORDIAL_EARLY_SETTINGS=1
+                         bridge 1.5683   post3 3.5012   BRIDGE_FIRST   rbxinit 0   warn 2   db 0
+
+The early call reports `early client settings (1274772 bytes) -> 0`, so it is
+made and accepted, and the engine still runs its post-settings block after the
+bridge. Two runs is not a rate and is not offered as one — ordering is a
+deterministic per-run observable and two runs is what it takes to see it did
+not change. Reaching the working shape needs
+`nativePostClientSettingsLoadedInitialization3` to run its *body* before the
+bridge, and §44's note that the early `post` call is "always a no-op" (no
+`[FLog::AndroidGLView]` line) is the obstacle, not the call site.
+
+### §45.6 Three things that are not the variable, closed cheaply
+
+**Being signed in is not it.** The maintainer's real signed-in profile has 14
+current-engine runs: `RbxStorage::init` 0/14, the `RbxmFileManager` warning
+present in all 14. All four working captures are signed in and it does not
+distinguish them.
+
+**§44.8's four silent runs are four, not five.** A fifth log with no warning
+(`bcba4`, 11 lines) never reached the patch fetch. Of the 109, 104 reached the
+fetch and warned, 4 reached it and did not, 1 did not reach it — so the warning
+is not simply "did the run get that far".
+
+**`grep -c RbxmFileManager` is the wrong scorer by a hair.** mocktail prints
+two `Warning [DFLog::RbxmFileManager] Caching for rbxasset://...InExperience.rbxm
+is not enabled` lines in a session whose store works. Score on
+`LocalStorageManager is not available`, which is the message §44 meant.
+
+### §45.7 A correction §41 needs, which I cannot resolve
+
+**The historical positive contains no `RbxStorage::init` line.** `ec3a3` ran
+21.1 s, exited cleanly, is 263 lines, and has zero `RbxStorage` lines at any
+severity — yet the eight partition directories under
+`~/.cache/cordial-agent-t/.../appData/rbx-storage/` carry mtimes of
+07:45:25.902Z, 0.66 s into that run, and `rbx-storage.db` is a real 49,152-byte
+`SQLite format 3` file stamped 07:46:02.73Z, inside `08d78`, which also has zero
+`RbxStorage` lines. Only one log file exists per run, so nothing is truncated.
+
+Either the store came up twice without logging the line — which contradicts
+§41's "Sober logs it at Critical, so absence means it is not called", the
+premise every section since §41 has rested on — or those artefacts were not
+made by `RbxStorage::init` and §36/§37/§44.7 have been crediting the wrong
+thing for three sections. **I have not established which**, and it should be
+settled before anyone builds on §41 again. One candidate worth checking rather
+than assuming: `DFIntRbxStorageInitHundredthsPercent = 1000` appears in the
+settings document Cordial feeds the engine, and the neighbouring
+`...HundredthsPercent` names in that file are sampling rates. Whether it gates
+this log line is **`INFERRED` and untested** — and it would have to be
+reconciled with all four working captures printing the line.
+
+### Where this leaves it
+
+The byte branch is closed for the reason that it was never open. The ordering
+signature is the first thing that separates every working capture from every
+Cordial run on this disk with no exceptions on either side, it was established
+entirely offline, and it is testable by making the engine's post-settings body
+run before `nativeAppBridgeV2Init` — which is what mocktail does by driving the
+sequence itself rather than waiting to be asked.

@@ -169,6 +169,35 @@ cargo build --release      # Clang required; AOSP bionic does not build with GCC
 cargo test --release
 ```
 
+### If you cannot build or test locally
+
+**Send the patch anyway.** A contribution that says "I could not run the tests,
+here is why" is welcome and will be reviewed. It is not a lesser contribution and
+you do not need to apologise for it — that assumption has already cost this
+project one perfectly good patch from someone who made it.
+
+This matters more here than in most repositories. The build wants Clang, GTK4,
+libadwaita and, for the web view, `webkitgtk6.0-devel`, and an immutable or
+sandboxed host will not give you those without layering packages and rebooting.
+If that is your situation, say so in the pull request and a maintainer will run
+the suite for you.
+
+What is asked instead is the thing this project actually cares about: **be
+explicit about what you did and did not verify.** "Builds here, tests not run,
+reasoning checked against the dex" is a good pull request. "Should work" is not,
+and that is true whether or not you could run anything.
+
+The recommended way to get a complete environment, if you can, is the container
+this project builds in — it pins Fedora 44 and installs the pieces most hosts
+lack:
+
+```bash
+just build toolbox     # the recipe's comment has how to create the container
+```
+
+`just build host` works too if you have the headers listed above. Neither is
+required to open a pull request.
+
 Install `pipewire-devel` (`libpipewire-0.3-dev` on Debian/Ubuntu) before
 building if you want to work on OpenSL ES audio — `native/CMakeLists.txt`
 detects it with `pkg-config` at configure time and prints which way it went.

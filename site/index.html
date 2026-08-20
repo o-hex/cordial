@@ -3,582 +3,141 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cordial — Roblox's Android engine, natively on Linux</title>
-<meta name="description" content="Cordial loads Roblox's official Android x86-64 engine directly on Linux: a ported AOSP bionic linker, a bionic/glibc ABI shim, and a JNI VM in place of ART. No emulator, no container. GPL-3.0, and looking for a maintainer.">
-<!--
-  Both icons are copied into the deployment by .github/workflows/flatpak.yml
-  out of packaging/icons/, so there is exactly one drawing of each in the tree.
-  They are relative hrefs because this site is served from /cordial/ rather
-  than a domain root, and an absolute /favicon.svg would 404 there.
-
-  favicon.svg is the square application icon; cordial.svg is the 680x480
-  banner the README uses. Opening site/index.html straight off disk shows
-  neither, which is the cost of not keeping a second copy here.
--->
-<link rel="icon" type="image/svg+xml" href="favicon.svg">
-<meta property="og:image" content="https://luohoa97.github.io/cordial/cordial.svg">
+<title>Cordial — Roblox on Linux</title>
+<meta name="description" content="Play Roblox on Linux. No Wine, no emulator, no Android container.">
+<link rel="icon" href="favicon.svg">
 <style>
   :root {
-    --ground:      #131519;
-    --surface:     #1a1d24;
-    --surface-2:   #21252d;
-    --line:        #2a2f39;
-    --line-soft:   #22262e;
-    --ink:         #e3e7ee;
-    --ink-muted:   #8d95a4;
-    --ink-faint:   #626b7a;
-    --amber:       #dfa45c;
-    --amber-weak:  #4a3a22;
-    --measured:    #7fb0a5;
-    --link:        #9db6d4;
-
-    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "IBM Plex Mono", Menlo, Consolas, monospace;
-    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-
-    --step--1: 0.8125rem;
-    --step-0:  1rem;
-    --step-1:  1.1875rem;
-    --step-2:  1.5rem;
-    --step-3:  2rem;
-    --step-4:  clamp(2.25rem, 1.4rem + 3.6vw, 3.75rem);
-
-    --measure: 68ch;
-    --wide: 1080px;
+    --bg: #ffffff; --fg: #1b1b1f; --muted: #5c5c66; --line: #e3e3e6;
+    --accent: #3584e4; --card: #f7f7f9; --ok: #2ec27e; --part: #e5a50a; --no: #c01c28;
   }
-
-  @media (prefers-color-scheme: light) {
-    :root {
-      --ground:     #f4f5f7;
-      --surface:    #ffffff;
-      --surface-2:  #eceef2;
-      --line:       #d9dde4;
-      --line-soft:  #e6e9ee;
-      --ink:        #191c22;
-      --ink-muted:  #58606e;
-      --ink-faint:  #7d8593;
-      --amber:      #8a5510;
-      --amber-weak: #efdcc0;
-      --measured:   #256a5c;
-      --link:       #2f5d8f;
+  :root:not([data-theme="light"]) { }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1b1b1f; --fg: #f2f2f4; --muted: #9a9aa2; --line: #35353a;
+      --accent: #78aeed; --card: #242429;
     }
   }
-  :root[data-theme="light"] {
-    --ground:     #f4f5f7;
-    --surface:    #ffffff;
-    --surface-2:  #eceef2;
-    --line:       #d9dde4;
-    --line-soft:  #e6e9ee;
-    --ink:        #191c22;
-    --ink-muted:  #58606e;
-    --ink-faint:  #7d8593;
-    --amber:      #8a5510;
-    --amber-weak: #efdcc0;
-    --measured:   #256a5c;
-    --link:       #2f5d8f;
-  }
   :root[data-theme="dark"] {
-    --ground:     #131519;
-    --surface:    #1a1d24;
-    --surface-2:  #21252d;
-    --line:       #2a2f39;
-    --line-soft:  #22262e;
-    --ink:        #e3e7ee;
-    --ink-muted:  #8d95a4;
-    --ink-faint:  #626b7a;
-    --amber:      #dfa45c;
-    --amber-weak: #4a3a22;
-    --measured:   #7fb0a5;
-    --link:       #9db6d4;
+    --bg: #1b1b1f; --fg: #f2f2f4; --muted: #9a9aa2; --line: #35353a;
+    --accent: #78aeed; --card: #242429;
   }
-
-  *, *::before, *::after { box-sizing: border-box; }
-
+  * { box-sizing: border-box; }
   body {
-    margin: 0;
-    background: var(--ground);
-    color: var(--ink);
-    font-family: var(--sans);
-    font-size: var(--step-0);
-    line-height: 1.65;
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 system-ui, -apple-system, "Cantarell", "Segoe UI", sans-serif;
     -webkit-font-smoothing: antialiased;
   }
-
-  .wrap {
-    max-width: var(--wide);
-    margin-inline: auto;
-    padding-inline: clamp(1.25rem, 5vw, 3rem);
+  .wrap { max-width: 46rem; margin: 0 auto; padding: 0 1.25rem; }
+  header { text-align: center; padding: 5rem 0 3.5rem; }
+  header img { width: 96px; height: 96px; }
+  h1 { font-size: 2.6rem; margin: 1rem 0 .4rem; letter-spacing: -0.02em; }
+  .tag { font-size: 1.2rem; color: var(--muted); margin: 0 0 2rem; }
+  .cta {
+    display: inline-block; background: var(--accent); color: #fff; text-decoration: none;
+    padding: .8rem 1.6rem; border-radius: 999px; font-weight: 600;
   }
-
-  .col { max-width: var(--measure); }
-
-  a { color: var(--link); text-decoration-thickness: 1px; text-underline-offset: 0.2em; }
-  a:hover { color: var(--ink); }
-  a:focus-visible {
-    outline: 2px solid var(--amber);
-    outline-offset: 3px;
-    border-radius: 2px;
+  .cta:hover { filter: brightness(1.08); }
+  .under { display: block; margin-top: .75rem; font-size: .9rem; color: var(--muted); }
+  h2 { font-size: 1.35rem; margin: 3rem 0 1rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 1.1rem 1.3rem; }
+  .card + .card { margin-top: .7rem; }
+  .card h3 { margin: 0 0 .3rem; font-size: 1rem; }
+  .card p { margin: 0; color: var(--muted); font-size: .95rem; }
+  code {
+    background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+    padding: .15rem .4rem; font-size: .9em;
   }
-
-  code, kbd, pre { font-family: var(--mono); }
-
-  .eyebrow {
-    font-family: var(--mono);
-    font-size: var(--step--1);
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-    color: var(--ink-faint);
-    margin: 0;
-  }
-
-  /* ---------- hero ---------- */
-
-  .hero {
-    padding-block: clamp(4rem, 12vh, 8rem) clamp(3rem, 8vh, 5rem);
-    border-bottom: 1px solid var(--line);
-  }
-  .hero__grid { display: flex; flex-direction: column; gap: 2rem; }
-  /* The README banner, at size. `height: auto` with both attributes set on the
-     element keeps the box reserved before it loads, so the hero does not jump.
-     Capped rather than full-bleed: it is 680x480 artwork and stretching it past
-     that only makes the strokes thin. */
-  .hero__mark {
-    display: block;
-    width: min(100%, 30rem);
-    height: auto;
-    margin-bottom: -0.5rem;
-  }
-
-  h1 {
-    font-family: var(--mono);
-    font-size: var(--step-4);
-    font-weight: 600;
-    letter-spacing: -0.035em;
-    line-height: 1.02;
-    margin: 0;
-    text-wrap: balance;
-  }
-  h1 .dot { color: var(--amber); }
-
-  .lede {
-    font-size: var(--step-1);
-    line-height: 1.55;
-    color: var(--ink-muted);
-    margin: 0;
-    max-width: var(--measure);
-    text-wrap: pretty;
-  }
-  .lede strong { color: var(--ink); font-weight: 550; }
-
-  /* the one orchestrated moment: the thesis strikes itself out */
-  .thesis {
-    border-left: 2px solid var(--amber);
-    padding: 0.85rem 0 0.85rem 1.25rem;
-    max-width: 60ch;
-    font-size: var(--step-1);
-    line-height: 1.5;
-    margin: 0;
-  }
-  .thesis .struck {
-    position: relative;
-    color: var(--ink-faint);
-    white-space: nowrap;
-  }
-  .thesis .struck::after {
-    content: "";
-    position: absolute;
-    left: 0; right: 100%;
-    top: 0.62em;
-    height: 1.5px;
-    background: var(--amber);
-    animation: strike 620ms cubic-bezier(.6,.05,.3,1) 900ms forwards;
-  }
-  @keyframes strike { to { right: 0; } }
-  .thesis .held { color: var(--measured); }
-
-  @media (prefers-reduced-motion: reduce) {
-    .thesis .struck::after { animation: none; right: 0; }
-  }
-
-  .actions { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
-  .btn {
-    font-family: var(--mono);
-    font-size: var(--step--1);
-    letter-spacing: 0.02em;
-    padding: 0.6rem 1.1rem;
-    border: 1px solid var(--line);
-    background: var(--surface);
-    color: var(--ink);
-    text-decoration: none;
-    transition: border-color 120ms ease, background 120ms ease;
-  }
-  .btn:hover { border-color: var(--ink-faint); background: var(--surface-2); color: var(--ink); }
-  .btn--key { border-color: var(--amber); color: var(--amber); }
-  .btn--key:hover { background: var(--amber-weak); color: var(--ink); border-color: var(--amber); }
-
-  /* ---------- sections ---------- */
-
-  section { padding-block: clamp(3rem, 8vh, 5rem); border-bottom: 1px solid var(--line-soft); }
-
-  h2 {
-    font-family: var(--mono);
-    font-size: var(--step-2);
-    font-weight: 600;
-    letter-spacing: -0.02em;
-    margin: 0 0 0.5rem;
-    text-wrap: balance;
-  }
-  .section__intro { color: var(--ink-muted); margin: 0 0 2rem; max-width: var(--measure); text-wrap: pretty; }
-
-  p { margin: 0 0 1.1rem; }
-  p:last-child { margin-bottom: 0; }
-
-  /* ---------- stack (what it is) ---------- */
-
-  .stack { display: grid; gap: 1px; background: var(--line-soft); border: 1px solid var(--line-soft); }
-  @media (min-width: 720px) { .stack { grid-template-columns: repeat(2, 1fr); } }
-  .layer { background: var(--surface); padding: 1.25rem 1.4rem; }
-  .layer h3 {
-    font-family: var(--mono);
-    font-size: var(--step-0);
-    font-weight: 600;
-    margin: 0 0 0.35rem;
-    letter-spacing: -0.01em;
-  }
-  .layer p { font-size: var(--step--1); color: var(--ink-muted); line-height: 1.55; margin: 0; }
-
-  /* ---------- status ---------- */
-
-  .table-scroll { overflow-x: auto; }
-  table { border-collapse: collapse; width: 100%; font-size: var(--step--1); min-width: 34rem; }
-  caption { text-align: left; color: var(--ink-faint); font-size: var(--step--1); padding-bottom: 0.75rem; }
-  th, td { text-align: left; padding: 0.6rem 0.9rem 0.6rem 0; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
-  th {
-    font-family: var(--mono);
-    font-weight: 600;
-    color: var(--ink-faint);
-    text-transform: uppercase;
-    font-size: 0.6875rem;
-    letter-spacing: 0.09em;
-  }
-  td:first-child { font-family: var(--mono); white-space: nowrap; padding-right: 1.5rem; }
-  .state { font-family: var(--mono); font-size: 0.6875rem; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
-  .state--yes { color: var(--measured); }
-  .state--no { color: var(--ink-faint); }
-  .state--part { color: var(--amber); }
-  td.note { color: var(--ink-muted); }
-
-  /* ---------- corrections ---------- */
-
-  .records { display: grid; gap: 1px; background: var(--line-soft); border: 1px solid var(--line-soft); }
-  .record { background: var(--surface); display: grid; gap: 0.35rem; padding: 1.15rem 1.4rem; }
-  @media (min-width: 860px) {
-    .record { grid-template-columns: 1fr 1fr; gap: 0 2.5rem; align-items: start; }
-  }
-  .record__claim, .record__truth { margin: 0; font-size: var(--step--1); line-height: 1.6; }
-  .record__claim { color: var(--ink-faint); text-decoration: line-through; text-decoration-color: var(--amber); text-decoration-thickness: 1px; }
-  .record__truth { color: var(--ink); }
-  .record__truth b { color: var(--measured); font-weight: 600; }
-  .record__tag {
-    font-family: var(--mono);
-    font-size: 0.6875rem;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--ink-faint);
-    grid-column: 1 / -1;
-  }
-
-  /* ---------- code ---------- */
-
   pre {
-    background: var(--surface);
-    border: 1px solid var(--line-soft);
-    padding: 1rem 1.15rem;
-    overflow-x: auto;
-    font-size: var(--step--1);
-    line-height: 1.6;
-    margin: 0 0 1rem;
-    color: var(--ink);
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 1rem; overflow-x: auto;
   }
-  pre .c { color: var(--ink-faint); }
-
-  ul { padding-left: 1.15rem; margin: 0 0 1.1rem; }
-  li { margin-bottom: 0.4rem; }
-  li::marker { color: var(--ink-faint); }
-
-  .callout {
-    border: 1px solid var(--line);
-    border-left: 2px solid var(--amber);
-    background: var(--surface);
-    padding: 1.15rem 1.4rem;
-    max-width: var(--measure);
+  pre code { border: 0; padding: 0; background: none; }
+  table { width: 100%; border-collapse: collapse; font-size: .95rem; }
+  td { padding: .55rem .4rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td:first-child { width: 1.6rem; }
+  .n { color: var(--muted); }
+  footer {
+    margin: 4rem 0 3rem; padding-top: 1.5rem; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: .9rem; text-align: center;
   }
-  .callout p { font-size: var(--step--1); color: var(--ink-muted); }
-  .callout p:first-child { color: var(--ink); }
-
-  footer { padding-block: 3rem 4rem; }
-  .foot { display: flex; flex-wrap: wrap; gap: 1.5rem; justify-content: space-between; align-items: baseline; }
-  .foot__links { display: flex; flex-wrap: wrap; gap: 1.25rem; font-family: var(--mono); font-size: var(--step--1); }
-  .foot__note { color: var(--ink-faint); font-size: var(--step--1); max-width: 46ch; }
+  footer a { color: var(--accent); }
+  a { color: var(--accent); }
 </style>
 </head>
 <body>
+<div class="wrap">
 
-<header class="hero">
-  <div class="wrap hero__grid">
-    <img class="hero__mark" src="cordial.svg" width="680" height="480"
-         alt="Cordial">
-    <p class="eyebrow">GPL-3.0 · Rust · x86-64 Linux</p>
-    <h1>Cordial<span class="dot">.</span></h1>
-    <p class="lede">
-      Roblox's official Android engine, loaded <strong>natively on Linux</strong>. A ported AOSP
-      bionic linker, a bionic/glibc ABI shim, and a JNI VM standing in for Android's ART.
-      No emulator, no container, no virtual machine — it talks to the GPU through Vulkan
-      like any native application.
-    </p>
-    <p class="thesis">
-      <span class="struck">Nine consecutive conclusions drawn from reading the stripped binary were wrong.</span><br>
-      <span class="held">Every conclusion drawn from running something held up.</span>
-    </p>
-    <div class="actions">
-      <a class="btn btn--key" href="https://github.com/luohoa97/cordial">Source on GitHub</a>
-      <a class="btn" href="https://discord.gg/qJzU3Xfr9b">Official Discord server</a>
-      <a class="btn" href="https://github.com/luohoa97/cordial/blob/main/docs/HANDOVER.md">Handover document</a>
-      <a class="btn" href="https://github.com/luohoa97/cordial/labels/good%20first%20issue">Good first issues</a>
-    </div>
+  <header>
+    <img src="cordial.svg" alt="">
+    <h1>Cordial</h1>
+    <p class="tag">Play Roblox on Linux.</p>
+    <a class="cta" href="#install">Install</a>
+    <span class="under">Flatpak · x86-64 · needs a Vulkan GPU</span>
+  </header>
+
+  <p>
+    Cordial runs Roblox’s official Android build natively on your machine —
+    no Wine, no emulator, no Android container. It fetches the build from
+    Roblox itself the first time you launch it.
+  </p>
+
+  <h2>What you get</h2>
+
+  <div class="card">
+    <h3>Profiles</h3>
+    <p>Separate sign-ins, settings and caches. Each one is locked to a single
+       running instance, so two windows can’t corrupt each other’s data.</p>
   </div>
-</header>
-
-<main>
-
-<section>
-  <div class="wrap">
-    <h2>What is actually underneath</h2>
-    <p class="section__intro">
-      Roblox ships no Linux client. Cordial does not emulate one — it replaces the platform
-      the Android engine expects to find, and lets the engine itself run unmodified.
-    </p>
-    <div class="stack">
-      <div class="layer">
-        <h3>Bionic linker</h3>
-        <p>AOSP's dynamic linker, ported to run on glibc Linux. It loads <code>libroblox.so</code> the way Android would, resolving the same symbols in the same order.</p>
-      </div>
-      <div class="layer">
-        <h3>ABI shim</h3>
-        <p>Bionic and glibc disagree in ways that corrupt memory silently. <code>struct addrinfo</code> has its last two pointers transposed; <code>sem_t</code> is 16 bytes against 32.</p>
-      </div>
-      <div class="layer">
-        <h3>libjnivm</h3>
-        <p>A JNI virtual machine in place of ART. The engine calls into Java expecting Android's framework; Cordial answers those calls without an Android runtime.</p>
-      </div>
-      <div class="layer">
-        <h3>Framework layer</h3>
-        <p>The Android surface the client actually uses — GameActivity, input, OpenSL ES, the settings and flag services — implemented against Wayland, PipeWire and D-Bus.</p>
-      </div>
-    </div>
+  <div class="card">
+    <h3>Plugins</h3>
+    <p>Discord presence, custom textures and sounds, and more. A plugin never
+       gets a socket or a file — it asks, and Cordial does it.</p>
   </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <h2>Status, including what does not work</h2>
-    <p class="section__intro">
-      This table is the most useful thing on the page, and the rows marked <span class="state state--no">no</span>
-      are why. A project that only lists its wins is telling you nothing.
-    </p>
-    <div class="table-scroll">
-      <table>
-        <caption>Observed on an Intel iGPU under GNOME/Wayland, Fedora 44.</caption>
-        <thead>
-          <tr><th scope="col">Area</th><th scope="col">State</th><th scope="col">Detail</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>Sign in</td><td class="state state--yes">yes</td><td class="note">Session persists across restarts, stored in the desktop keyring.</td></tr>
-          <tr><td>Play a game</td><td class="state state--yes">yes</td><td class="note">Load in, move, turn the camera. Reported smooth on integrated graphics.</td></tr>
-          <tr><td>Keyboard</td><td class="state state--yes">yes</td><td class="note">The engine wants evdev codes, not Android keycodes. Four theories died before that surfaced.</td></tr>
-          <tr><td>Pointer capture</td><td class="state state--part">partial</td><td class="note">Locked pointer and relative motion are wired; that a granted lock turns the camera is <code>INFERRED</code>.</td></tr>
-          <tr><td>Audio</td><td class="state state--part">partial</td><td class="note">Sound leaves the OpenSL ES bridge into PipeWire, measured. Never yet verified inside an experience.</td></tr>
-          <tr><td>Profiles</td><td class="state state--yes">yes</td><td class="note">Multiple accounts, one <code>flock</code> per profile, several instances at once.</td></tr>
-          <tr><td>Plugins</td><td class="state state--yes">yes</td><td class="note">Separate processes, named capabilities, default-deny. Two ship in-tree.</td></tr>
-          <tr><td>Text fields</td><td class="state state--no">no</td><td class="note">Characters do not paint until the field loses focus. Needs an EditText-equivalent overlay.</td></tr>
-          <tr><td>Fullscreen</td><td class="state state--no">no</td><td class="note">Clips and letterboxes until you switch workspaces and back.</td></tr>
-          <tr><td>Web views</td><td class="state state--no">no</td><td class="note">Unimplemented, which is why a good deal of Roblox's own UI does nothing.</td></tr>
-        </tbody>
-      </table>
-    </div>
+  <div class="card">
+    <h3>Settings that tell you what happened</h3>
+    <p>Every Roblox flag you set, and every conflict between them, printed at
+       startup. No config file with a “don’t edit this by hand” warning at the top.</p>
   </div>
-</section>
 
-<section>
-  <div class="wrap col">
-    <h2>A plugin never gets the socket</h2>
-    <p class="section__intro">
-      Discord Rich Presence ships in the tree, and it is the worked example for how every
-      host resource is meant to reach a plugin &mdash; which is to say, not by being handed over.
+  <h2>Status</h2>
+
+  <p class="n">Honest about the gaps, because finding out after installing is worse.</p>
+
+  <table>
+    <tr><td>✅</td><td>Signing in, staying signed in, browsing and launching experiences</td></tr>
+    <tr><td>✅</td><td>Graphics, audio, mouse look and keyboard</td></tr>
+    <tr><td>✅</td><td>Web views — servers, profiles, marketplace</td></tr>
+    <tr><td>✅</td><td>Asset caching between sessions</td></tr>
+    <tr><td>⚠️</td><td>Text entry is incomplete in some in-experience fields</td></tr>
+    <tr><td>❌</td><td><strong>Passkey sign-in.</strong> If your account uses a passkey for
+        two-factor, you can’t sign in yet — WebKitGTK has no WebAuthn support and
+        that isn’t something Cordial can work around</td></tr>
+    <tr><td>❌</td><td>Voice chat</td></tr>
+  </table>
+
+  <h2 id="install">Install</h2>
+
+  <pre><code>flatpak remote-add --if-not-exists --no-gpg-verify \
+    cordial https://luohoa97.github.io/cordial/repo
+
+flatpak install cordial io.github.luohoa97.Cordial</code></pre>
+
+  <p class="n">
+    Then launch it, sign in, and press play. Nothing from Roblox is bundled or
+    redistributed — Cordial downloads the official build to your machine and
+    never re-serves it.
+  </p>
+
+  <footer>
+    <p>
+      <a href="https://github.com/luohoa97/cordial">Source, issues and documentation on GitHub</a>
     </p>
     <p>
-      <code>plugins/discord-presence/</code> is first-party in the sense that it comes with
-      Cordial and in no other: an ordinary manifest, ordinary grants, the same isolation as
-      anything you write. It requests three capabilities &mdash; <code>lifecycle.read</code>,
-      <code>presence.set</code>, <code>log</code> &mdash; and holds nothing else. It publishes a
-      presence when the client launches and again when it is ready, and clears it on shutdown.
+      GPL-3.0. Not affiliated with, endorsed by, or connected to Roblox Corporation.
     </p>
-    <p>
-      What it never learns is where Discord&rsquo;s IPC socket is. The plugin sends a presence
-      payload; Cordial searches the socket paths, performs Discord&rsquo;s handshake and writes
-      the frames. The payload is a closed structure that refuses any field Discord does not
-      define, so nothing a plugin invents crosses the wire, and it cannot read Discord&rsquo;s
-      state or send anything else down the connection. A Flatpak permission is app-wide and
-      permanent; a capability is per-plugin and revocable. If installing a plugin could add a
-      permission, uninstalling it could not take one away &mdash; which is the whole argument
-      for brokering the effect rather than granting the channel.
-    </p>
-    <p>
-      Installing it is a copy into the plugin directory. Approving it is a file, per profile,
-      because default deny means the grants file is the only thing that grants:
-    </p>
-<pre><span class="c"># ~/.local/share/cordial/profiles/&lt;profile&gt;/plugin-grants.json</span>
-{ "discord-presence": ["lifecycle.read", "presence.set", "log"] }</pre>
-    <div class="callout">
-      <p><strong>None of it reaches Discord in a real session yet.</strong> The broker, the
-      payload validation and Discord&rsquo;s wire framing are covered end to end by a test that
-      spawns the shipped plugin as a real Deno process and watches the frames land on a
-      stand-in socket.</p>
-      <p>But the plugin host the <em>client</em> runs serves settings, flags and logging, and
-      answers everything else with <code>not implemented yet</code> &mdash; and nothing outside
-      that test pushes a lifecycle event. So a granted plugin starts, asks to subscribe, and is
-      told the method is not implemented. That is read from the source rather than measured in
-      a session, and joining the two hosts up is the first thing to do if you want this
-      working.</p>
-    </div>
-  </div>
-</section>
+  </footer>
 
-<section>
-  <div class="wrap">
-    <h2>Things this project got wrong, and corrected</h2>
-    <p class="section__intro">
-      Commits exist here whose only purpose is to withdraw an earlier claim. They are the good
-      ones. If you are evaluating whether this codebase can be trusted, read these rather than
-      the feature list.
-    </p>
-    <div class="records">
-      <div class="record">
-        <p class="record__tag">Frame rate</p>
-        <p class="record__claim">Presents per second is the frame rate, and it collapses after thirteen seconds.</p>
-        <p class="record__truth">It was an <b>idle throttle</b>. Presents drop to exactly 1.0/s when nothing is happening. Every figure recorded before this was that curve integrated, and several had been quoted as evidence.</p>
-      </div>
-      <div class="record">
-        <p class="record__tag">Keyboard</p>
-        <p class="record__claim">nativePassKeyEvent takes Android keycodes; the mapping table must be wrong.</p>
-        <p class="record__truth">It takes <b>evdev codes</b>. Four theories failed because each assumed a wrong number when the vocabulary was wrong. One logcat capture answered it in a minute.</p>
-      </div>
-      <div class="record">
-        <p class="record__tag">ABI</p>
-        <p class="record__claim">pthread_cond_t is 32 bytes in bionic.</p>
-        <p class="record__truth">It is <b>48</b>. 32 is <code>pthread_barrier_t</code>. The wrong number sat in the record for months.</p>
-      </div>
-      <div class="record">
-        <p class="record__tag">Distribution</p>
-        <p class="record__claim">Sober fetches the same build from the same place, in the open.</p>
-        <p class="record__truth">It does not. Sober routes through <b>Google Play</b>. Roblox publishes no Android artefact at all — three endpoints checked, absent from every one. That sentence is struck through in the ADR rather than deleted.</p>
-      </div>
-      <div class="record">
-        <p class="record__tag">Diagnosis</p>
-        <p class="record__claim">The system is thrashing on swap; that is the performance problem.</p>
-        <p class="record__truth">A cumulative counter read as a rate. Sampled live, swap-out was <b>zero</b>. The reported slowdown was unrelated software on the same desktop.</p>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap col">
-    <h2>Running it</h2>
-    <p class="section__intro">
-      Cordial ships no Roblox code and never will, so you supply the build. There is no download
-      button, because Roblox publishes no Android file to download — it distributes through
-      Google Play and the Amazon Appstore.
-    </p>
-<pre><span class="c"># Add the remote and install. This is the way to install Cordial.</span>
-flatpak remote-add --if-not-exists cordial \
-  https://luohoa97.github.io/cordial/cordial.flatpakrepo
-flatpak install cordial io.github.luohoa97.Cordial</pre>
-    <p>
-      Then launch it from your application list, or <code>flatpak run
-      io.github.luohoa97.Cordial</code>. <code>flatpak update</code> picks up new builds.
-    </p>
-    <div class="callout">
-      <p><strong>Cordial is not on Flathub, and on current policy it cannot be.</strong>
-      Flathub does not allow applications containing AI-generated or AI-assisted code,
-      documentation or content, and Cordial contains a great deal of both &mdash; its git
-      history records that in <code>Co-Authored-By</code> trailers rather than hiding it.
-      So this remote is the distribution channel, not a stopgap until a better one arrives.</p>
-      <p><strong>The remote is unsigned.</strong> <code>flatpak install</code> checks that what
-      it downloaded matches the repository&rsquo;s own checksums, and nothing beyond that &mdash;
-      it does not prove who built it. Anyone who can write to this GitHub&nbsp;Pages site can
-      serve a different package under the same name. That is a weaker guarantee than
-      Flathub&rsquo;s, and you should know which one you are taking.</p>
-    </div>
-    <p class="section__intro">
-      Building from source is for changing Cordial rather than for running it:
-    </p>
-<pre><span class="c"># Clang is required; AOSP bionic does not build with GCC.</span>
-cargo build --release
-cargo test --workspace
-
-<span class="c"># Point it at an APK you already have.</span>
-cargo run --release --bin cordial-run -- \
-  --lib-dir /path/to/lib/x86_64 --apk /path/to/base.apk \
-  --host-libc --game-activity</pre>
-  </div>
-</section>
-
-<section>
-  <div class="wrap col">
-    <h2>This project needs a maintainer</h2>
-    <p>
-      Its author has stepped back and intends to return to hand it over rather than to resume
-      work on it. That is stated here for the same reason it is stated at the top of the README:
-      finding out after investing a weekend would be worse.
-    </p>
-    <p>
-      It is not abandoned mid-collapse. It works, it is documented, and
-      <a href="https://github.com/luohoa97/cordial/blob/main/docs/HANDOVER.md">docs/HANDOVER.md</a>
-      was written for whoever takes it on — every open thread with what is genuinely known about
-      it, which claims are <code>INFERRED</code> and why, and the measurement traps that have
-      already cost people afternoons.
-    </p>
-    <p>
-      If you would rather start small, the good first issues are real, and
-      <strong>none of them needs a Roblox account</strong> — worth saying, because a good deal
-      of the remaining work does.
-    </p>
-    <p>
-      And if you fork it: please open a pull request as well. Not instead. A change that lives
-      only in a fork becomes archaeology; a change that exists as a pull request can be merged
-      in ten minutes by whoever picks this up.
-    </p>
-  </div>
-</section>
-
-</main>
-
-<footer>
-  <div class="wrap foot">
-    <p class="foot__note">
-      Cordial is not affiliated with, endorsed by, or connected to Roblox Corporation.
-      It ships no Roblox code: no APK, no assets, nothing vendored or redistributed.
-    </p>
-    <nav class="foot__links" aria-label="Project links">
-      <a href="https://github.com/luohoa97/cordial">GitHub</a>
-      <a href="https://discord.gg/qJzU3Xfr9b">Discord</a>
-      <a href="https://github.com/luohoa97/cordial/issues">Issues</a>
-      <a href="https://github.com/luohoa97/cordial/tree/main/docs/adr">Decisions</a>
-      <a href="https://github.com/luohoa97/cordial/blob/main/AGENTS.md">Contributing</a>
-      <a href="https://github.com/luohoa97/cordial/blob/main/LICENSE">GPL-3.0</a>
-    </nav>
-  </div>
-</footer>
-
+</div>
 </body>
 </html>

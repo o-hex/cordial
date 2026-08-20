@@ -50,12 +50,30 @@ char priority_letter(int prio) {
     }
 }
 
-/// Minimum priority actually printed. Roblox is extremely chatty at VERBOSE and
-/// DEBUG; the default keeps the useful half.
+/// Minimum priority actually printed.
+///
+/// **The default was INFO, and that cost a whole investigation.** The comment
+/// here used to say Roblox is extremely chatty at VERBOSE and DEBUG and that
+/// INFO "keeps the useful half". The chattiness claim is wrong for DEBUG:
+/// measured on a landing-page run, INFO prints 872 lines and DEBUG prints 960
+/// — eighty-seven more, not a flood. What those eighty-seven contained was
+/// `nativeInitializeNativeFlags: Registered Flag Provider ID from Java: 0` and
+/// `flagCount = 139`, the two lines that tell you the flag provider registered
+/// exactly as the real client's Waydroid capture shows it registering.
+///
+/// Because they were hidden, their absence was read as Cordial failing to
+/// register a flag provider at all, and `docs/analysis/flag-init.md` §41 had to
+/// warn in writing against building on that absence before someone did. This
+/// project has mistaken an absence for evidence nine times; a logger whose
+/// default silently drops a whole severity is a machine for producing the tenth.
+///
+/// VERBOSE is still off by default, and that one is genuinely chatty. Anything
+/// hidden by default should be cheap to reveal and loudly documented, which is
+/// what `CORDIAL_LOG_LEVEL` is for.
 int minimum_priority() {
     static const int level = [] {
         const char* v = getenv("CORDIAL_LOG_LEVEL");
-        if (!v) return (int)ANDROID_LOG_INFO;
+        if (!v) return (int)ANDROID_LOG_DEBUG;
         switch (v[0]) {
             case 'v': case 'V': return (int)ANDROID_LOG_VERBOSE;
             case 'd': case 'D': return (int)ANDROID_LOG_DEBUG;

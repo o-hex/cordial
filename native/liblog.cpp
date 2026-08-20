@@ -12,6 +12,8 @@
 // variadic, and forwarding a C variadic to a real `vsnprintf` is the one thing
 // C does better here.
 
+#include <chrono>
+#include <ctime>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -86,11 +88,45 @@ int minimum_priority() {
     return level;
 }
 
+/// Wall-clock, to millisecond precision, in front of every line.
+///
+/// **Cordial's logs carried no clock at all.** All 265 log files on the
+/// development machine, not one timestamped line -- which meant "is startup
+/// getting slower?" could not be answered from the corpus, and no startup
+/// regression here has ever been caught by reading a log. Sober and mocktail
+/// both stamp theirs, which is why an engine-phase comparison was possible
+/// between those two and not with us.
+///
+/// ISO-8601 with a `T` and milliseconds, matching the engine's own FLog lines
+/// so a reader can sort the two together. Local time rather than UTC because
+/// the audience is somebody comparing a log against when they pressed a
+/// button; the engine's own lines carry `Z` and are distinguishable.
+///
+/// Built with `localtime_r` and `snprintf` rather than `std::format` or
+/// `put_time`: this runs on every log line, including inside the engine's
+/// startup, and it must not allocate.
+static void stamp(char* out, size_t n) {
+    auto now = std::chrono::system_clock::now();
+    auto since = now.time_since_epoch();
+    auto secs = std::chrono::duration_cast<std::chrono::seconds>(since);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(since - secs);
+    std::time_t t = static_cast<std::time_t>(secs.count());
+    struct tm tmv {};
+    if (!localtime_r(&t, &tmv)) {
+        snprintf(out, n, "??:??:??.???");
+        return;
+    }
+    snprintf(out, n, "%02d:%02d:%02d.%03d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+             static_cast<int>(ms.count()));
+}
+
 void emit(int prio, const char* tag, const char* text) {
     if (prio < minimum_priority()) {
         return;
     }
-    fprintf(stderr, "%c/%-24s %s\n", priority_letter(prio), tag ? tag : "(no tag)",
+    char ts[16];
+    stamp(ts, sizeof(ts));
+    fprintf(stderr, "%s %c/%-24s %s\n", ts, priority_letter(prio), tag ? tag : "(no tag)",
             text ? text : "(null)");
 }
 

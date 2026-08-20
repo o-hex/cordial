@@ -5526,3 +5526,36 @@ everything downstream of that.
 **A valid delivery probe needs an effect that is not a log line** — something
 visible on screen, in a counter, or in a timing. Finding one is the next task,
 and every flag experiment in this repository is blocked behind it.
+
+### §48b: a non-log probe, and where the delivery path actually runs
+
+§48a asked for a probe whose effect is not a log line. `FIntTaskSchedulerAutoThreadLimit`
+is durable and its effect is countable in `/proc/<pid>/task`. Published value 8;
+set to 1, alongside `FIntTaskSchedulerAsyncTasksMinimumThreadCount=1`:
+
+    baseline   threads=60   12 Main, 4 "RBX Worker A", 3 HttpClient, ...
+    limit=1    threads=60   12 Main, 4 "RBX Worker A", 3 HttpClient, ...
+
+Identical, composition included. **This is not yet proof that delivery is
+broken**, because the probe has no positive control: "no change" is also what a
+flag that does not govern thread count in this build would produce. It wants a
+flag known to work before it can carry weight — which is the same missing piece
+§48a named.
+
+What the read did establish is where overrides are merged. `client_settings::load`
+is `load_base(explicit).map(apply_overrides)`, and `apply_overrides` resolves
+every layer and merges it into the settings document. So the override path runs
+**inside `client_settings::load` and nowhere else.**
+
+`load.rs` calls that function in exactly one place, and it is gated behind
+`CORDIAL_DEFER_PAST_SETTINGS` — an experiment, off by default. The ordinary path
+hands `plan.settings` to `nativeInitClientSettings` instead.
+
+**Whether `plan.settings` is built through `client_settings::load` is the open
+question, and it decides everything.** If it is not, then no flag override has
+ever reached the engine by the default path, every null result in this file is
+uninterpretable, and the fix is small. That is a code read rather than another
+run, and it is the next thing anyone should do here.
+
+Four independent nulls are consistent with it: two TaskScheduler flags, two log
+flags, and now a thread-count probe.

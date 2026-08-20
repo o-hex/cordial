@@ -414,3 +414,59 @@ and mocktail — which idles at 8 % — has no way to send one. Note what that m
 mocktail's 8 %: not a target Cordial should match, but the cost of an engine that
 was never told it has focus. Whether that state is one a client can ship is a
 separate question from whether it is cheap.
+
+## The two spinning `Main` threads are two different things, and only one is ours
+
+Both threads are named `Main`, which is most of why they read as one problem.
+
+### The pump's, which was not a blackhole and is now fixed
+
+    before   ret[empty=842  cb=2  ident=0    unclaimed=829  lastfd=26]
+    after    ret[empty=635  cb=2  ident=679  unclaimed=0    lastfd=0]
+
+`unclaimed` is the census's name for the expensive bug it exists to catch: a
+descriptor that keeps reporting ready and that nothing drains, which turns any
+zero-timeout caller into a spin. Half this thread's returns were counted that
+way, naming fd 26.
+
+**It was never that.** fd 26 is the display connection, added to epoll by
+`watch_input_fd` so a keypress ends the wait immediately, and drained by GTK
+inside `pump_input_events` one call later in the same loop iteration. What was
+missing was the `Registration`, so `pollOnce` could not find an owner for the
+descriptor it had just been handed and counted it as nobody's. `watch_input_fd`
+now registers it under `IDENT_DISPLAY_CONNECTION`; nothing reads that ident (the
+pump passes three null out-parameters and ignores the return, and the engine's
+thread has its own looper and its own epoll), so this changes the accounting and
+nothing else. Verified on two runs: `unclaimed=0`, `lastfd=0`.
+
+A false positive in the one instrument built to catch real blackholes costs more
+than it saves, and this one had already been written up here as a latent spin.
+
+### The engine's, which is not a fallback from being starved
+
+The hypothesis was that Roblox asks with a timeout, gets no answer, and retries
+without one. The counters say no, in both directions:
+
+    block=7   zero=586,520      ident=7
+    block=6   zero=537,689,701  ident=6   (the 60 s focused run)
+
+The engine passes a blocking timeout six or seven times in an entire run and a
+zero timeout for everything else, so it is not falling back to spinning — it
+spins by construction. And every blocking call it did make was answered: `block`
+and `ident` are equal in every run recorded here. Nothing is being starved into
+a spin.
+
+`ALooper_addFd` now prints unconditionally, and the engine registers exactly two
+descriptors for the life of the process:
+
+    ALooper_addFd(fd=16, ident=0, events=1, callback=yes)
+    ALooper_addFd(fd=18, ident=1, events=1, callback=no)
+
+`ident=1` with no callback is the shape of AGDK's `LOOPER_ID_MAIN`, the pipe the
+Java side writes app commands into. What writes to these two in Cordial, and
+what Android would write to them that Cordial does not, is the next thing to
+establish — and it is a lookup rather than an inference, because both ends are
+in this tree.
+
+**This one is not fixed.** It is narrowed: not the present mode, not either
+Choreographer, not a starved fallback, not an undrained descriptor of ours.

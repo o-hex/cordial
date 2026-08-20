@@ -938,8 +938,37 @@ fn watch_input_fd(fd: c_int) -> bool {
     // SAFETY: `l.epoll` is this looper's epoll descriptor and `ev` is live for
     // the call. Re-registering an already-watched fd fails harmlessly.
     let rc = unsafe { epoll_ctl(l.epoll, EPOLL_CTL_ADD, fd, &mut ev) };
-    rc == 0
+    if rc != 0 {
+        return false;
+    }
+    // Registered as well as watched, and the reason is the instrument rather
+    // than the behaviour. Adding the descriptor to epoll alone left `pollOnce`
+    // unable to find a registration for it, so it counted the return as
+    // `unclaimed` -- 829 of them in a 60 s run, naming fd 26. `unclaimed` is
+    // the census's name for the expensive bug it exists to catch: a descriptor
+    // that keeps reporting ready and that nothing ever drains, which turns any
+    // zero-timeout caller into a spin. This descriptor is not that. It is the
+    // display connection, and GTK drains it inside `pump_input_events` one call
+    // later in the same loop iteration.
+    //
+    // A false positive in the one instrument built to catch real blackholes
+    // costs more than it saves, and this one already cost a session's worth of
+    // suspicion. Claiming the registration makes the count mean what it says.
+    l.registrations.borrow_mut().push(Registration {
+        fd,
+        ident: IDENT_DISPLAY_CONNECTION,
+        callback: None,
+        data: std::ptr::null_mut(),
+    });
+    true
 }
+
+/// The ident `pollOnce` reports for the display connection registered by
+/// [`watch_input_fd`]. Distinctive rather than meaningful: nothing reads it.
+/// The pump calls `pollOnce` with three null out-parameters and ignores the
+/// return, and the engine's own thread has its own looper and its own epoll, so
+/// this ident is never visible to Roblox.
+const IDENT_DISPLAY_CONNECTION: c_int = 0x436f_7264;
 
 // ------------------------------------------------------------------- the API
 
@@ -983,7 +1012,16 @@ extern "C" fn looper_add_fd(
     callback: Option<extern "C" fn(c_int, c_int, *mut c_void) -> c_int>,
     data: *mut c_void,
 ) -> c_int {
-    super::trace(format_args!("ALooper_addFd(fd={fd}, ident={ident})"));
+    // Unconditionally, on the same argument the display backend and the Vulkan
+    // present mode are printed on: this is once per registration for the life
+    // of the process, and "which descriptors does the engine expect to hear
+    // from" is exactly what a report about a starved or spinning loop needs.
+    // The census can then be read against it -- an ident that never comes back
+    // is a descriptor the engine is waiting on and Cordial never feeds.
+    println!(
+        "[android] ALooper_addFd(fd={fd}, ident={ident}, events={events}, callback={})",
+        if callback.is_some() { "yes" } else { "no" },
+    );
     let Some(l) = as_looper(looper) else {
         return -1;
     };

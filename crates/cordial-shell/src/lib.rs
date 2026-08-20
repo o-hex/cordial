@@ -51,3 +51,26 @@ pub mod refresh_watch;
 pub mod webview_policy;
 #[cfg(feature = "webview")]
 pub mod webview;
+
+/// Whether the desktop is asking for a dark appearance.
+///
+/// Read from libadwaita's style manager, which is driven by
+/// `org.freedesktop.appearance`'s `color-scheme` — the same source the rest of
+/// the session uses, rather than a second opinion invented here.
+///
+/// This exists because `native/init_params.cpp` hardcoded Android's `uiMode`
+/// night field to "no" and Roblox believed it, so the client stayed light
+/// however the desktop was set. The engine was never ignoring the setting; it
+/// was being told the wrong one.
+///
+/// **False when libadwaita is not initialised**, which is the honest answer for
+/// a runtime started without the shell: no style manager means nobody has said,
+/// and guessing dark would be as wrong as guessing light. `is_initialized`
+/// rather than an unwrap, because this is called from the engine bring-up path
+/// where a panic would take the client down over a colour.
+pub fn prefers_dark() -> bool {
+    if !libadwaita::is_initialized() {
+        return false;
+    }
+    libadwaita::StyleManager::default().is_dark()
+}

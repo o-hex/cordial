@@ -441,6 +441,7 @@ pub mod game_activity {
             n: usize,
         ) -> c_int;
         fn cordial_set_display_size(width: c_int, height: c_int);
+        fn cordial_set_ui_mode_night(night: c_int);
         fn cordial_get_fint(
             f: *mut c_void,
             name: *const c_char,
@@ -1386,6 +1387,18 @@ pub mod game_activity {
     /// `AConfiguration` screen size have all been reporting the compiled
     /// 1280x720 regardless of the window. Call it as soon as the window's
     /// geometry is known, and again whenever it changes.
+    /// The desktop's dark/light preference, as Android's `uiMode` night field.
+    ///
+    /// Cordial hardcoded "night: no" and Roblox believed it, which is why the
+    /// client stayed light however the desktop was set. Anything above zero
+    /// reports night mode on; `-1` means nobody said and leaves the old
+    /// behaviour, because a runtime started without the shell has no better
+    /// answer and guessing dark would be as wrong as guessing light.
+    pub fn set_ui_mode_night(night: i32) {
+        // SAFETY: stores an int into an atomic on the C++ side; no ownership.
+        unsafe { cordial_set_ui_mode_night(night as c_int) }
+    }
+
     pub fn set_display_size(width: i32, height: i32) {
         // SAFETY: writes two ints behind a mutex-free but single-threaded
         // startup path, the same one `set_init_params` already runs on.

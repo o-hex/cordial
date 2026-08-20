@@ -28,6 +28,7 @@
 #include <vector>
 #include <sys/statvfs.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -358,6 +359,12 @@ public:
 /// a phone: a desktop has a hardware keyboard, no touchscreen, and no D-pad.
 /// Their values are Android's own documented constants, named below so the
 /// numbers are readable rather than magic.
+namespace cordial {
+/// Defined below, beside its setter. Declared here because the Configuration
+/// field that uses it is built above that point.
+jint ui_mode_night_bits();
+} // namespace cordial
+
 class Configuration : public Object {
 public:
     // Android constants, spelled out so a reader does not have to trust a bare
@@ -386,7 +393,22 @@ public:
     /// than XLarge because the window is resizable and usually well under a
     /// tablet's dimensions.
     jint screenLayout = kScreenlayoutSizeLarge | kScreenlayoutLongNo;
-    jint uiMode = kUiModeTypeNormal | kUiModeNightNo;
+    /// **Was hardcoded to `kUiModeNightNo`, and Roblox believed it.**
+    ///
+    /// Reported as "Roblox does not read our dark mode setting; it just stays
+    /// on light". It was not ignoring anything -- this told it, on every
+    /// launch, that night mode is off. The engine did as it was told. Sober
+    /// reports the real value, which is why the same account renders dark
+    /// there after a restart and light here forever.
+    ///
+    /// `cordial_set_ui_mode_night` carries the desktop's actual preference in
+    /// from the Rust side, which reads it from libadwaita's style manager and
+    /// therefore from `org.freedesktop.appearance`'s `color-scheme` -- the
+    /// same source the rest of the desktop uses, rather than a second opinion
+    /// invented here. Unset leaves `kUiModeNightNo`, because a runtime started
+    /// without the shell has nothing better to say and guessing dark would be
+    /// as wrong as guessing light.
+    jint uiMode = kUiModeTypeNormal | cordial::ui_mode_night_bits();
     jint colorMode = kColorModeWideCgNo;
     /// Mouse and keyboard, no touch panel. Saying otherwise would ask Roblox
     /// for touch controls on a machine that cannot produce a touch event.
@@ -2210,6 +2232,27 @@ int cordial_init_client_settings(void* fn, const char* a, const char* b, const c
 /// is being chased separately. It is wired regardless, because an answer Cordial
 /// gives the engine should be true whether or not the current bug turns out to
 /// depend on it.
+/// The desktop's dark/light preference, as an `android.content.res.Configuration`
+/// `uiMode` night field.
+///
+/// Set from Rust before the init params are built. -1 means "nobody said",
+/// which reports `kUiModeNightNo` -- see the field's own comment for why that
+/// is the honest default rather than a guess.
+static std::atomic<int> g_ui_mode_night{-1};
+
+extern "C" void cordial_set_ui_mode_night(int night) {
+    g_ui_mode_night.store(night, std::memory_order_relaxed);
+}
+
+namespace cordial {
+jint ui_mode_night_bits() {
+    // `Configuration.UI_MODE_NIGHT_YES`/`_NO`. Spelled as literals because the
+    // named constants are class-scoped members of the InitParams builder above
+    // and are not reachable from here; they carry the same two values.
+    return g_ui_mode_night.load(std::memory_order_relaxed) > 0 ? 0x20 : 0x10;
+}
+} // namespace cordial
+
 extern "C" void cordial_set_display_size(int width, int height) {
     if (width > 0 && height > 0) {
         cordial::set_display_size(width, height);

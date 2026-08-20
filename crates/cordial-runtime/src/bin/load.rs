@@ -1991,6 +1991,25 @@ fn main() -> ExitCode {
                                         // resolution, which is why it survived
                                         // this long, and wrong by the whole
                                         // difference once anyone goes fullscreen.
+                                        // The desktop's dark/light preference,
+                                        // read from libadwaita's style manager --
+                                        // which is driven by
+                                        // `org.freedesktop.appearance`'s
+                                        // `color-scheme`, the same source the
+                                        // rest of the session uses. Sent before
+                                        // the init params are built, because
+                                        // `uiMode` is baked into the
+                                        // Configuration there.
+                                        //
+                                        // Whether the engine re-reads this
+                                        // mid-session is NOT established --
+                                        // Sober needs a restart for a theme
+                                        // change too, which is weak evidence it
+                                        // caches. Treat this as correct at
+                                        // launch and unproven afterwards.
+                                        linker::game_activity::set_ui_mode_night(
+                                            if cordial_shell::prefers_dark() { 1 } else { 0 },
+                                        );
                                         linker::game_activity::set_display_size(
                                             width as i32,
                                             height as i32,

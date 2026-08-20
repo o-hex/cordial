@@ -238,13 +238,49 @@ pub fn migrate_legacy_user_file(profile_dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// The directory each plugin's own overrides live under, one subdirectory per
-/// plugin id. A plugin owns its file and nothing else writes to it, so removing
-/// the plugin removes its flags.
+/// The **writable** plugin directory: where a plugin's own overrides live, one
+/// subdirectory per plugin id. A plugin owns its file and nothing else writes
+/// to it, so removing the plugin removes its flags.
+///
+/// This is the user's directory specifically, and the write path uses it
+/// directly rather than searching — [`plugin_dirs`] is for *discovery*, and its
+/// first entry is read-only.
 pub fn plugin_dir() -> PathBuf {
     std::env::var_os("CORDIAL_PLUGIN_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| data_dir().join("cordial/plugins"))
+}
+
+/// Where first-party plugins ship, read-only, installed alongside the binary.
+///
+/// `/app/share/cordial/plugins` inside the Flatpak; `$CORDIAL_SYSTEM_PLUGIN_DIR`
+/// overrides it for a distribution packaging Cordial somewhere else, and for
+/// the tests.
+pub fn system_plugin_dir() -> PathBuf {
+    std::env::var_os("CORDIAL_SYSTEM_PLUGIN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/app/share/cordial/plugins"))
+}
+
+/// Every directory plugins are discovered from, **system first**.
+///
+/// The same two-tier arrangement GNOME Shell shows as "System Extensions" and
+/// "User-Installed Extensions", and Flatpak as system and user installations.
+///
+/// **A user plugin may not shadow a first-party one, and this is deliberate.**
+/// The usual XDG convention lets the user directory win, but a first-party
+/// plugin ships a trusted opinion — the built-in web-view interceptor decides
+/// that a Studio link means the software centre — and a same-id directory in a
+/// writable location silently replacing that is an impersonation route, not a
+/// customisation. So on a collision the system copy is used and the conflict is
+/// **reported by name** rather than resolved quietly. See [`collect`].
+///
+/// Disabling a first-party plugin is a different thing and should stay
+/// possible, exactly as GNOME lets a system extension be switched off. That
+/// needs a disable list and a switch in the settings window; it is not built
+/// yet, and refusing to shadow is not a substitute for it.
+pub fn plugin_dirs() -> Vec<PathBuf> {
+    vec![system_plugin_dir(), plugin_dir()]
 }
 
 /// How large one plugin's own `flags.json` may grow.
@@ -373,17 +409,38 @@ pub fn collect() -> Vec<Layer> {
 
     let mut layers = vec![builtin_layer()];
 
-    let mut ids: Vec<String> = std::fs::read_dir(plugin_dir())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-    ids.sort();
+    // System first, so a first-party id is claimed before the user directory is
+    // read and a same-id user directory cannot take it. Sorted within each root
+    // so the outcome does not depend on directory iteration order.
+    let mut seen: std::collections::BTreeMap<String, PathBuf> = Default::default();
+    for root in plugin_dirs() {
+        let mut ids: Vec<String> = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        ids.sort();
+        for id in ids {
+            if let Some(kept) = seen.get(&id) {
+                // Loud, and naming both paths, because the quiet version of
+                // this is indistinguishable from the plugin simply working.
+                println!(
+                    "  plugins: ignoring {} because the id {id} is already \
+                     provided by {} -- a user plugin may not replace a \
+                     first-party one, only be disabled",
+                    root.join(&id).display(),
+                    kept.display()
+                );
+                continue;
+            }
+            seen.insert(id, root.clone());
+        }
+    }
 
-    for id in ids {
-        let path = plugin_dir().join(&id).join("flags.json");
+    for (id, root) in seen {
+        let path = root.join(&id).join("flags.json");
         if let Some(layer) = read_layer(&path, Source::Plugin(id)) {
             layers.push(layer);
         }
@@ -825,4 +882,45 @@ pub(crate) mod tests {
         assert!(layer_a.values.get("FFlagB").is_none());
         assert!(layer_b.values.get("FFlagA").is_none());
     }
+
+    /// A user plugin may not take an id a first-party plugin already provides.
+    ///
+    /// The failure guarded here is not a wrong flag value; it is a plugin the
+    /// user did not install answering as one they trust. Cordial ships the
+    /// web-view interceptor that decides a Studio link means the software
+    /// centre, and a same-id directory in a writable location must not become
+    /// that. Disabling a first-party plugin stays a separate, legitimate thing.
+    #[test]
+    fn a_user_plugin_cannot_shadow_a_first_party_id() {
+        let (root, _g) = scratch("shadow");
+        let sys = root.join("sys");
+        let usr = root.join("usr");
+        std::fs::create_dir_all(sys.join("studio-links")).unwrap();
+        std::fs::create_dir_all(usr.join("studio-links")).unwrap();
+        std::fs::create_dir_all(usr.join("mine")).unwrap();
+        std::fs::write(sys.join("studio-links/flags.json"), r#"{"FFlagFirstParty":"true"}"#)
+            .unwrap();
+        std::fs::write(usr.join("studio-links/flags.json"), r#"{"FFlagImposter":"true"}"#)
+            .unwrap();
+        std::fs::write(usr.join("mine/flags.json"), r#"{"FFlagMine":"true"}"#).unwrap();
+        // SAFETY: `scratch` holds the lock these tests share for process env.
+        unsafe {
+            std::env::set_var("CORDIAL_SYSTEM_PLUGIN_DIR", &sys);
+            std::env::set_var("CORDIAL_PLUGIN_DIR", &usr);
+        }
+
+        let resolved = resolve(collect());
+
+        unsafe {
+            std::env::remove_var("CORDIAL_SYSTEM_PLUGIN_DIR");
+            std::env::remove_var("CORDIAL_PLUGIN_DIR");
+        }
+        assert!(resolved.contains_key("FFlagFirstParty"), "the system plugin should load");
+        assert!(
+            !resolved.contains_key("FFlagImposter"),
+            "a user plugin must not take a first-party id"
+        );
+        assert!(resolved.contains_key("FFlagMine"), "a user plugin with its own id still loads");
+    }
+
 }

@@ -186,9 +186,20 @@ public:
     }
 };
 
+// Declared here rather than in a header because `native/` has no shared
+// header for these registrations and adding one for a single symbol would be
+// a bigger change than the thing it carries. See `unanswered_classes.cpp` for
+// what it registers and, more importantly, for why most of those classes have
+// no methods hooked.
+void register_unanswered_classes(ENV* env);
+
 void register_platform_classes(ENV* env) {
     Application::Register(env);
     ActivityThread::Register(env);
+    // Piggy-backed on this call site rather than given its own in
+    // `android_classes.cpp`, because that file was being edited by other work
+    // in flight and parallel agents have collided in `native/` more than once.
+    register_unanswered_classes(env);
 }
 
 } // namespace cordial

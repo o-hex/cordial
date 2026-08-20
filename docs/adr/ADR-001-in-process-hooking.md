@@ -159,6 +159,61 @@ tool: `rwxp` before, `r-xp` after, `DIFFERING BYTES: 0` in both, and the client 
 the landing page on repeated runs. This does not change the decision above — it was already
 the decision — it closes a gap between what the ADR claimed and what the binary did.
 
+## What mocktail did, and what it actually cost us
+
+Recorded 2026-08-20, because this decision was twice described wrongly in this
+project's own commits and the correction is only useful with the reasoning
+attached.
+
+mocktail patches the engine's flags-loaded byte —
+`ForceNativeFlagsLoadedForTaskScheduler`, writing to
+`g_libroblox_base + 0x75a8250`. Reading that function and stopping there, as I
+did, gives the impression of a project that routinely rewrites engine memory
+and a decision here that costs Cordial capability. Both impressions are wrong.
+
+**It is scaffolding, and it is switched off.** The write is gated behind
+`MOCKTAIL_PATCH_NATIVE_FLAGS_LOADED`, which their `IsEnabled` refuses unless
+`allow_legacy_binary_patches` is set, and their `config/roblox_compatibility.json`
+sets that for exactly one build:
+
+    2.721.1108  status "legacy-researched"  allow_legacy_binary_patches: true
+                default_allowed: false
+                reason: "Reverse-engineered startup baseline; no verified real frame."
+
+    2.725.1142  status "supported"          allow_legacy_binary_patches: false
+                default_allowed: true
+
+On 2.721.1108 they had never got a verified frame. Forcing the byte let them
+push past a gate they did not yet understand and watch what happened downstream.
+The whole apparatus around it — `MOCKTAIL_PATCH_`, `MOCKTAIL_RECOVER_`,
+`MOCKTAIL_STAGE6_`, `MOCKTAIL_TRACE_STAGE6_`, `MOCKTAIL_SEED_STAGE6_` — is a lab
+bench, not a shipping mechanism. From `supported` builds onward it is off. On
+2.734.917, the build in `~/.cache/cordial/lib/x86_64`, mocktail prints `legacy
+binary patches: disabled` and its content store still initialises.
+
+### This strengthens the decision rather than testing it
+
+The legitimate path exists and mocktail is the demonstration: same Build ID,
+patches inert, storage working. So the answer to "does refusing this cost
+capability" is, for this case, no. Sober was already an existence proof; mocktail
+is a better one, because it runs on this host rather than inside Android.
+
+### And the cost that is real, stated plainly
+
+mocktail had a phase in which it could force the engine forward in order to learn
+from it. Cordial has never had that phase and by this decision never will. That
+is not free. `docs/analysis/flag-init.md` runs to forty-five sections and roughly
+fifty failed reproductions of a single storage bug, much of it inferring
+behaviour that a research patch would have let somebody observe directly in an
+afternoon.
+
+That is the honest trade: this project pays in investigation time for a property
+it will not give up, and the two approaches were never equivalent. Anyone
+arguing this ADR should note that the argument is not "patching is harmless" —
+it is "the research phase is cheaper with it", which is true, and still loses to
+the reasoning above. What it should not be met with is the claim that mocktail
+proves patching is required. It proves the opposite.
+
 ## Revisit criteria
 
 If Roblox ships an official, sanctioned client-extension mechanism, revisit — but as a

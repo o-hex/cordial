@@ -5501,3 +5501,28 @@ after it.** Set a flag whose effect is loud and unmistakable, confirm it lands,
 and only then read a null result as a null result. Until that exists, any
 "flag X does nothing" claim from this codebase is untestable — including the two
 above, and including this project's older ones.
+
+### §48a: log flags are the wrong probe, and the reason matters
+
+The obvious delivery probe was a log flag, and it failed to distinguish
+anything: 339 lines without overrides, 337 with `DFLogHttpTrace=7` and
+`FLogNetwork=7`, no HTTP or network tracing in either.
+
+That is not evidence about delivery, because the probe was invalid two ways.
+**Roblox already ships `FLogNetwork = 7`**, so setting it to 7 asks for a state
+the engine is in already — the null was guaranteed before the run started. And
+no network logging appears in *either* arm despite that upstream value, so the
+engine's `FLog` output is not reaching Cordial's log at all. Log routing is the
+confound, and no log flag can probe past it until that is understood.
+
+`DFLogHttpTrace` is genuinely not shipped by Roblox, which is what made it look
+attractive — an unshipped key survives the reloader (§47). It still produced
+nothing, for the same routing reason.
+
+Cordial's own half is working: `flags: 2 override(s) applied` against `0` in the
+control, so resolution and reporting are fine. What is unestablished is
+everything downstream of that.
+
+**A valid delivery probe needs an effect that is not a log line** — something
+visible on screen, in a counter, or in a timing. Finding one is the next task,
+and every flag experiment in this repository is blocked behind it.

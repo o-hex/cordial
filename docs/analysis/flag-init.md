@@ -4568,3 +4568,77 @@ together establish is that two of them had causes, both in Cordial, both
 findable by running the thing rather than reading the binary — and that the
 store's own gate is still unexplained and is no longer where anyone has been
 looking.
+
+## §41. `RbxStorage::init` is never called under Cordial, and two things this file believed are wrong
+
+Sober is on this machine, its store works, and nobody had read its log. Doing
+that answers in one line what §26–§40 approached from the inside:
+
+    5.460278  Critical [DFLog::RbxStorage] RbxStorage::init [INIT]
+              user: flagLoaded, availableDiskSpace: 20957790208 bytes, elapsed: 0.038 ms
+    5.520204  Critical [DFLog::RbxStorage] RbxStorage::init [DONE]
+              name: MultiCache(TelemetryCache(SqliteCache+TelemetryCache(FileCache(temp))),
+              TelemetryCache(FileCache(perm)), TelemetryCache(FileCache(session_scoped))),
+              duration: 57.007 ms, dbOpenCount: 130
+
+**Two corrections fall straight out of that, both to claims this file and
+AGENTS.md have been relying on.**
+
+**`DFLog::RbxStorage` is not silent on success.** AGENTS.md states it is, and
+that claim is what "voids every `grep -c 'RbxStorage::init'` in the repo".
+Sober logs both ends of a successful init at **Critical**, which prints
+irrespective of channel level. The claim came from Cordial's one working run
+logging nothing, and one silent success does not establish that the channel is
+silent — it establishes that that run did not log, which is a different and
+much smaller fact. Greps for `RbxStorage::init` are meaningful after all.
+
+**"Not available on the current platform" is a red herring.** §39 built a case
+around it and §40 fixed the crash that lifting the skip caused. Sober's log
+contains that same `FLog::LocalStorageHandler` warning, once, in a run whose
+storage initialises correctly 2 ms later. So the warning does not gate storage
+and never did. §40's work stands on its own — `setPlatformImpl` genuinely
+crashed, the djinni `WeakReference` gap and the stolen `typeid` are real bugs
+now fixed, and the fifth name-and-descriptor instance was worth finding — but
+none of it was the storage blocker, and §39's framing of that warning as the
+cause is withdrawn.
+
+### What is now established
+
+Cordial's engine log contains **zero** `RbxStorage` lines, at any severity, in
+a run with `DFLogRbxStorage` forced to 7 as well as in runs without it. Since
+Sober's init logs at Critical, absence here is not a channel-level artifact:
+**`RbxStorage::init` is not being called at all.** Every section from §26
+onward measured the behaviour of a function that never runs, which is why the
+write-then-wipe sequence looked unconditional — it was reached, four times, on
+a path that does not lead to initialisation.
+
+Sober's trigger is named in its own line: `user: flagLoaded`. The two lines
+before it are `nativeInitializeNativeFlags: Registered Flag Provider ID from
+Java: 0` and `flagCount = 0`, on a different thread from the init itself.
+
+### What is not established, and must not be assumed
+
+Cordial calls `FlagJniInterface.nativeInitializeNativeFlags` — same exported
+symbol, confirmed present — and its log shows 59 `... N: <name> not found.`
+lines but **no** `Registered Flag Provider ID from Java` and no `flagCount =`.
+It is tempting to read that as "Cordial never registers a provider, so
+flagLoaded never fires". **Do not.** Sober's two lines are captured at debug
+level and Cordial's at Info, so their absence here may be a logging artifact
+rather than a behavioural difference. This file has read an absence as
+evidence nine times and been wrong; establish it with something that does not
+depend on log level before building on it.
+
+Note also that "not found" is normal: `docs/traces/native-flag-names.txt`
+records the real Android client passing 139 names and getting misses among
+them. Sober passes zero and its storage still works, so the count is not the
+variable either.
+
+### The next step
+
+Find what emits the engine's internal flags-loaded notification that
+`RbxStorage::init` subscribes to, and establish whether Cordial emits it —
+by a means independent of log level. Cordial reaches `[roblox] flags loaded
+(1305506 bytes)` and `areFlagsLoaded:true`, so the flags themselves arrive;
+what is unknown is whether the *notification* Sober's init hangs off is
+raised. That is a question about one signal, not about storage, and it is the
+first time this investigation has had a working control to compare against.

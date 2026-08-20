@@ -27,6 +27,7 @@ use crate::chooser;
 use crate::deep_link;
 use crate::install::{self, NotFound};
 use crate::instructions;
+use crate::root_warning;
 use crate::launch;
 use crate::profile_switcher;
 use crate::refresh_watch;
@@ -741,6 +742,31 @@ fn open_on_start(window: &adw::Window, update_button: &gtk::Button) {
 /// arrangement produces is a retry button that succeeds where the row does not,
 /// or the reverse, and neither is discoverable from the outside.
 fn activate_roblox(
+    window: &gtk::Window,
+    toasts: &adw::ToastOverlay,
+    config: &Rc<RefCell<ShellConfig>>,
+    join: &PendingJoin,
+) {
+    // Root gets one warning before it costs an hour. See `root_warning`: no
+    // session bus means no PipeWire, and the engine calls `abort()` at
+    // experience start rather than playing silence -- which presents as a
+    // crash, not as an audio problem. Not a refusal: on FreeBSD's linuxulator
+    // there is no other user, so refusing would refuse the platform.
+    if root_warning::running_as_root() {
+        let window = window.clone();
+        let toasts = toasts.clone();
+        let config = config.clone();
+        let join = join.clone();
+        root_warning::confirm(&window.clone(), move || {
+            launch_now(&window, &toasts, &config, &join);
+        });
+        return;
+    }
+    launch_now(window, toasts, config, join);
+}
+
+/// The launch itself, once anything that had to be asked has been.
+fn launch_now(
     window: &gtk::Window,
     toasts: &adw::ToastOverlay,
     config: &Rc<RefCell<ShellConfig>>,

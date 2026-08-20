@@ -47,6 +47,16 @@
 //! starts*. Only the `DFFlag`/`DFInt`/`DFString` family is re-read while the
 //! client runs. A plugin loaded on demand, part-way through a session, cannot
 //! change a startup flag no matter what it writes.
+//!
+//! **Being re-read is a cost, not a capability, and this paragraph used to read
+//! as though it were the other way round.** The engine fetches Roblox's settings
+//! document itself about two seconds in and applies it over the top, so a
+//! `DF*` override of a key Roblox also sets is reverted to Roblox's value while
+//! the client is still starting; see `client_settings::apply_overrides` for the
+//! two-directional control that establishes it. The durable family is the one
+//! read once. An override in either family is still worth writing — this layer
+//! is how it reaches the engine at all — but a `DF*` one governs the first
+//! couple of seconds and a measurement resting on it has to fall inside them.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

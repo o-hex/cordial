@@ -1,11 +1,29 @@
 //! Roblox's client settings — the FastFlag set the engine runs on.
 //!
 //! On Android the *application* fetches this document and hands it to the engine
-//! through `NativeGLInterface.nativeInitClientSettings`. The engine never
-//! fetches it itself: breakpoints on `getaddrinfo`, `connect` and `SSL_connect`
-//! are never hit during startup, so there is no request of the engine's own to
-//! fix or proxy. Cordial is the host application here, so doing the fetch is the
-//! job, not a workaround.
+//! through `NativeGLInterface.nativeInitClientSettings`. Cordial is the host
+//! application here, so doing that fetch is the job, not a workaround.
+//!
+//! **"The engine never fetches it itself" was the rest of this paragraph, and it
+//! is wrong.** It rested on breakpoints on `getaddrinfo`, `connect` and
+//! `SSL_connect` never being hit during startup, which is a statement about the
+//! first second and was read as a statement about the process. The engine runs a
+//! `DynamicFastVariableReloader` of its own. Turning the engine's own HTTP
+//! tracing on (`DFLogHttpTraceLight`) shows it, on 2.734.0.917, signed in:
+//!
+//! ```text
+//! 2.251  HttpResponse(#22) status:200 bodySize:1305506
+//!        url:{ "https://clientsettingscdn.roblox.com/v2/settings-compressed/application/GoogleAndroidApp.zst" }
+//! 4.150  [FlagCache] writeFlagCache: Successfully wrote 372673 bytes
+//! 120.11 [FLog::DynamicFastVariableReloader] DynamicFastVariableReloader finished flag fetch
+//! ```
+//!
+//! Note the application name: the engine asks for **`GoogleAndroidApp`**, where
+//! this file asks for `AndroidApp`. Whether the two documents differ in anything
+//! Cordial cares about is **not established**; nobody has diffed them.
+//!
+//! What that reloader costs is written up on [`apply_overrides`], because it is
+//! the thing that decides how long an override survives.
 //!
 //! ## The call contract, established by experiment
 //!
@@ -134,6 +152,39 @@ fn is_roblox_flag(key: &str) -> bool {
 /// and the same run without it has that line. `nativePreloadFlagOverrides` is
 /// *not* the mechanism despite the name — it was tried with several document
 /// shapes and changed nothing observable.
+///
+/// **It works for about two seconds, and that control only held because the
+/// line it watches is printed at 0.375 s.** The engine's own settings fetch
+/// (see the module note) lands at 1.6–2.3 s on this machine and *reapplies
+/// Roblox's document over the top*, so every `DF*` value Cordial merged in is
+/// reverted to Roblox's for any key the fetched document contains. Keys the
+/// document does not contain keep Cordial's value for the whole run.
+///
+/// Measured both directions inside one run (2026-08-20, 2.734.0.917, signed
+/// in), which is what makes it a control rather than an anecdote:
+///
+/// ```text
+/// override                     Roblox's value   observed
+/// DFLogHttpTraceLight = "7"    "0"              logs 0.65 s .. 2.25 s, then silent
+/// DFLogHttpTraceError = "0"    "12"             silent .. 2.25 s, logging again from 4.86 s
+/// DFLogHttpTrace      = "7"    absent           logs 0.86 s .. 120.1 s
+/// ```
+///
+/// The middle row is the one that settles it: an override asking for *silence*
+/// on a key Roblox sets went loud again, at Roblox's own level, part-way
+/// through the run. Nothing Cordial does can be the cause of that.
+///
+/// Two consequences worth having in mind before trusting a flag experiment
+/// here. A `DFFlag`/`DFInt`/`DFString`/`DFLog` override only reliably governs
+/// the first couple of seconds, so a claim resting on one needs the effect to
+/// be visible in that window or it is measuring Roblox's value. And an
+/// `FFlag`/`FInt`/`FString` override is read once at startup and is *not*
+/// reverted — the family this file's own module doc, and [`crate::flags`],
+/// present as the harder one to influence is in fact the durable one.
+///
+/// **Not established:** whether the reloader merges or replaces, and whether a
+/// later fetch (one was seen at 120.1 s) reverts an override a second time
+/// after something else had changed it. Neither was tested.
 fn apply_overrides(doc: String) -> String {
     let resolved = crate::flags::resolve(crate::flags::collect());
     if resolved.is_empty() {

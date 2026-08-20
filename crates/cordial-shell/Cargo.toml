@@ -37,6 +37,7 @@ name = "webauthn_probe"
 required-features = ["webview"]
 
 [dependencies]
+libc = "0.2"
 cordial-plugins = { path = "../cordial-plugins" }
 # The engine cache's stamp (ADR-015). `install.rs` used to test presence alone,
 # so a new Roblox build left the old engine in place and Cordial ran it against

@@ -122,6 +122,36 @@ std::shared_ptr<String> S(const char* v) {
 }
 } // namespace
 
+/// `CORDIAL_TRACE_LOCAL_STORAGE=1` -- did the engine ever call this interface?
+///
+/// `docs/analysis/flag-init.md` §40 established that handing the platform
+/// implementation over stops the engine's "Not available on the current
+/// platform" warning, and read that as the engine having accepted it. That is
+/// evidence about the *registration*, not about any later call: an interface
+/// can be accepted and then never used, and nothing in this file could tell
+/// the two apart. This is the probe that can. Off by default, because the
+/// ordinary client should not print a line every time the engine reads a
+/// platform token.
+///
+/// **Never a value, never a user id**, per this file's header and
+/// `secrets.rs`'s. Key names and byte counts only, which is the same line the
+/// Rust side draws.
+static bool trace_local_storage() {
+    static const bool on = getenv("CORDIAL_TRACE_LOCAL_STORAGE") != nullptr;
+    return on;
+}
+
+static void note_call(const char* method, const char* key) {
+    if (!trace_local_storage()) {
+        return;
+    }
+    if (key) {
+        fprintf(stderr, "[cordial] local storage: %s key=%s\n", method, key);
+    } else {
+        fprintf(stderr, "[cordial] local storage: %s\n", method);
+    }
+}
+
 // Defined in `android_classes.cpp`, beside `NativeUserJavaInterface` --
 // `init_params.cpp` already forward-declares the same four for
 // `StartAppParams`, with the comment explaining why this project has one
@@ -318,11 +348,13 @@ public:
 class PlatformLocalStorageHandler : public Object {
 public:
     jlong getCurrentUser(ENV*) {
+        note_call("getCurrentUser", nullptr);
         std::lock_guard<std::mutex> lock(g_users_mutex);
         return current_user_locked();
     }
 
     jboolean setCurrentUser(ENV*, jlong userId) {
+        note_call("setCurrentUser", nullptr);
         std::lock_guard<std::mutex> lock(g_users_mutex);
         g_current_user = userId;
         g_current_user_set = true;
@@ -331,6 +363,7 @@ public:
     }
 
     std::shared_ptr<UserSet> getUsers(ENV* env) {
+        note_call("getUsers", nullptr);
         std::lock_guard<std::mutex> lock(g_users_mutex);
         current_user_locked();
         auto set = std::make_shared<UserSet>();
@@ -340,53 +373,47 @@ public:
     }
 
     std::shared_ptr<String> getSecureValue(ENV* env, std::shared_ptr<String> key) {
-        jlong user;
-        {
-            std::lock_guard<std::mutex> lock(g_users_mutex);
-            user = current_user_locked();
-        }
-        return read(env, user, key);
+        note_call("getSecureValue", key ? std::string(*key).c_str() : nullptr);
+        return read(env, current_user(), key);
     }
     std::shared_ptr<String> getSecureValueForCurrentUser(ENV* env, std::shared_ptr<String> key) {
-        return getSecureValue(env, key);
+        note_call("getSecureValueForCurrentUser", key ? std::string(*key).c_str() : nullptr);
+        return read(env, current_user(), key);
     }
     std::shared_ptr<String> getSecureValueForUser(ENV* env, std::shared_ptr<String> key,
                                                   jlong userId) {
+        note_call("getSecureValueForUser", key ? std::string(*key).c_str() : nullptr);
         return read(env, userId, key);
     }
 
     jboolean setSecureValue(ENV*, std::shared_ptr<String> key, std::shared_ptr<String> value) {
-        jlong user;
-        {
-            std::lock_guard<std::mutex> lock(g_users_mutex);
-            user = current_user_locked();
-        }
-        return write(user, key, value);
+        note_call("setSecureValue", key ? std::string(*key).c_str() : nullptr);
+        return write(current_user(), key, value);
     }
-    jboolean setSecureValueForCurrentUser(ENV* env, std::shared_ptr<String> key,
+    jboolean setSecureValueForCurrentUser(ENV*, std::shared_ptr<String> key,
                                           std::shared_ptr<String> value) {
-        return setSecureValue(env, key, value);
+        note_call("setSecureValueForCurrentUser", key ? std::string(*key).c_str() : nullptr);
+        return write(current_user(), key, value);
     }
     jboolean setSecureValueForUser(ENV*, std::shared_ptr<String> key,
                                    std::shared_ptr<String> value, jlong userId) {
+        note_call("setSecureValueForUser", key ? std::string(*key).c_str() : nullptr);
         return write(userId, key, value);
     }
 
     jboolean deleteSecureValue(ENV*, std::shared_ptr<String> key) {
+        note_call("deleteSecureValue", key ? std::string(*key).c_str() : nullptr);
         if (!key) {
             return JNI_FALSE;
         }
-        jlong user;
-        {
-            std::lock_guard<std::mutex> lock(g_users_mutex);
-            user = current_user_locked();
-        }
+        jlong user = current_user();
         std::string k(*key);
         int rc = cordial_local_storage_delete(static_cast<long long>(user), k.c_str());
         return rc == 0 ? JNI_TRUE : JNI_FALSE;
     }
 
     jboolean deleteUserValues(ENV*, jlong userId) {
+        note_call("deleteUserValues", nullptr);
         int rc = cordial_local_storage_delete_user(static_cast<long long>(userId));
         std::lock_guard<std::mutex> lock(g_users_mutex);
         g_known_users.erase(userId);
@@ -394,12 +421,8 @@ public:
     }
 
     jboolean deleteCurrentUserValues(ENV* env) {
-        jlong user;
-        {
-            std::lock_guard<std::mutex> lock(g_users_mutex);
-            user = current_user_locked();
-        }
-        return deleteUserValues(env, user);
+        note_call("deleteCurrentUserValues", nullptr);
+        return deleteUserValues(env, current_user());
     }
 
     static void Register(ENV* env) {
@@ -430,6 +453,11 @@ public:
     }
 
 private:
+    static jlong current_user() {
+        std::lock_guard<std::mutex> lock(g_users_mutex);
+        return current_user_locked();
+    }
+
     /// A single fixed-size buffer rather than the usual libjnivm two-call
     /// growth protocol: these are credentials and small platform tokens, not
     /// documents, and `secrets.rs`'s own bodies (a cookie jar, a whole
@@ -478,11 +506,88 @@ private:
     }
 };
 
+/// The descriptors this file actually registered, printed under
+/// `CORDIAL_TRACE_LOCAL_STORAGE=1`.
+///
+/// Not decoration. libjnivm derives every hook's signature from the C++ types
+/// of the function it is handed, by way of a `typeid`-keyed map that any other
+/// registration can move out from under it -- which is exactly the bug §40
+/// found, where `jnivm::Object` was left pointing at `android/app/Application`
+/// and every `Object`-taking hook here registered under a descriptor the
+/// engine would never ask for. **That failure is silent in both directions**:
+/// the JNI trace prints the descriptor the *engine* asked for, which is always
+/// the right one, and nothing prints what the registered side spelled. This
+/// does. Compare it against `tools/dex_method.py --class
+/// localstorageplatforminterface`, which is the ground truth.
+static void dump_registered(ENV* env, const char* name) {
+    if (!trace_local_storage()) {
+        return;
+    }
+    auto c = env->GetClass(name);
+    if (!c) {
+        fprintf(stderr, "[cordial] local storage: no class %s\n", name);
+        return;
+    }
+    for (auto& m : c->methods) {
+        fprintf(stderr, "[cordial] local storage: registered %s.%s%s%s\n", name, m->name.data(),
+                m->signature.data(), m->_static ? "  (static)" : "");
+    }
+}
+
+/// `com.roblox.protocols.localstorageplatforminterface.generated.ILocalStorageHandlerCore$CppProxy`
+///
+/// **The reverse direction of the djinni scaffolding, registered only so a
+/// null answer can be read.** `setPlatformImpl` returns an
+/// `ILocalStorageHandlerCore`, and under Cordial it returns null every run --
+/// measured, with the return value printed rather than discarded as it was
+/// until now. Two things produce that null and they mean opposite things:
+/// djinni's `fromCpp` hands back `nullptr` without touching JNI when the C++
+/// side gave it no core, and libjnivm hands back whatever it invents when
+/// `NewObject` names a class nobody implemented. This class separates them.
+/// If the constructor below is reached, the engine built a core and the null
+/// was libjnivm's; if it is never reached, the engine built none.
+///
+/// `nativeRef` exists because djinni's `JniInterface` constructor looks the
+/// field up on the proxy class and asserts on a null id. libjnivm invents
+/// field ids rather than failing, so the assert never fired -- but a real
+/// field is the honest shape and costs nothing.
+class LocalStorageHandlerCoreProxy : public Object {
+public:
+    jlong nativeRef = 0;
+
+    static std::shared_ptr<LocalStorageHandlerCoreProxy> ctor(ENV* env, Class*, jlong ref) {
+        auto p = std::make_shared<LocalStorageHandlerCoreProxy>();
+        p->nativeRef = ref;
+        to_jni(env, p);
+        if (trace_local_storage()) {
+            fprintf(stderr, "[cordial] local storage: ILocalStorageHandlerCore$CppProxy built\n");
+        }
+        return p;
+    }
+
+    static void Register(ENV* env) {
+        const char* name =
+            "com/roblox/protocols/localstorageplatforminterface/generated/"
+            "ILocalStorageHandlerCore$CppProxy";
+        env->GetClass<LocalStorageHandlerCoreProxy>(name);
+        auto c = env->GetClass(name);
+        c->Hook(env, "<init>", &LocalStorageHandlerCoreProxy::ctor);
+        c->HookInstanceProperty(env, "nativeRef", &LocalStorageHandlerCoreProxy::nativeRef);
+    }
+};
+
 void register_local_storage_classes(ENV* env) {
     WeakReference::Register(env);
     SystemClass::Register(env);
     UserSet::Register(env);
     PlatformLocalStorageHandler::Register(env);
+    LocalStorageHandlerCoreProxy::Register(env);
+    dump_registered(env,
+                    "com/roblox/protocols/localstorageplatforminterface/generated/"
+                    "IPlatformLocalStorageHandler");
+    dump_registered(env, "java/lang/ref/WeakReference");
+    dump_registered(env, "java/lang/System");
+    dump_registered(env, "java/util/HashSet");
 }
 
 } // namespace cordial
@@ -526,9 +631,29 @@ int cordial_local_storage_set_platform_impl(void* fn, char* err, size_t err_len)
             "com/roblox/protocols/localstorageplatforminterface/generated/ILocalStorageHandlerCore");
         auto handler = std::make_shared<cordial::PlatformLocalStorageHandler>();
         cordial::to_jni(env, handler);
-        reinterpret_cast<Call>(fn)(env->GetJNIEnv(),
-                                   (jclass)cordial::to_jni(env, cls),
-                                   (jobject)cordial::to_jni(env, handler));
+        jobject core = reinterpret_cast<Call>(fn)(env->GetJNIEnv(),
+                                                  (jclass)cordial::to_jni(env, cls),
+                                                  (jobject)cordial::to_jni(env, handler));
+        // The return was discarded until now and the discard hid a fact worth
+        // having: djinni's `setPlatformImpl` returns the core it built, so a
+        // null here means the engine declined to build one and everything
+        // downstream is moot. Reported rather than acted on -- nothing has
+        // found a use for the object itself.
+        // A Java exception left pending here would be djinni's, thrown out of
+        // the call and never looked at by anybody -- which is how §40's
+        // `weakRef` failure went unnoticed for as long as it did. Cleared as
+        // well as reported: libjnivm keeps it on the ENV, and the next thing
+        // to make a JNI call on this thread would otherwise inherit it.
+        auto* jni = env->GetJNIEnv();
+        bool pending = jni->ExceptionCheck() == JNI_TRUE;
+        if (pending) {
+            jni->ExceptionDescribe();
+            jni->ExceptionClear();
+        }
+        if (getenv("CORDIAL_TRACE_LOCAL_STORAGE")) {
+            fprintf(stderr, "[cordial] local storage: setPlatformImpl returned %s%s\n",
+                    core ? "a core" : "null", pending ? ", exception pending" : "");
+        }
         return 0;
     } catch (const std::exception& e) {
         snprintf(err, err_len, "%s", e.what());

@@ -4867,3 +4867,186 @@ not go through it.
 The better thread is the one §41 opened and could not name: what raises
 `flagLoaded`. Waydroid says it is not the Java flag registration. Nothing else
 in either capture names it.
+
+## §44. The djinni local-storage surface is complete and is not the gate; `RbxmFileManager` is not new, is not silent on success, and is the per-run instrument §36 said did not exist
+
+Two threads here. The first closes the `localstorageplatforminterface` branch
+§39–§40 opened. The second is a correction to §43 that turns a datum it
+dismissed into the cheapest scoring instrument this investigation has had.
+
+Build `v0.6.0-9-gaf6e108-dirty` throughout, and `-dirty` is not incidental:
+`third_party/mcpelauncher-linker`'s `bionic` carries another session's
+`CORDIAL_TRACE_DLSYM` additions, and `native/platform_classes.cpp` and
+`native/CMakeLists.txt` were being edited by a parallel agent while these runs
+were taken. Nothing measured below is in those files.
+
+### §44.1 What the engine expects, read out of the dex rather than assumed
+
+`setPlatformImpl` is `ILocalStorageHandlerCore`'s, confirmed rather than
+inferred — `tools/dex_method.py --class localstorageplatforminterface` gives
+
+    ILocalStorageHandlerCore.setPlatformImpl(
+        Lcom/roblox/protocols/localstorageplatforminterface/generated/IPlatformLocalStorageHandler;)
+        Lcom/roblox/protocols/localstorageplatforminterface/generated/ILocalStorageHandlerCore;
+
+and that class declares nothing else but `<init>`. `IPlatformLocalStorageHandler`
+declares twelve methods. The dex also shows both interfaces carrying a
+`$CppProxy` with the `native_*` family, which `readelf --dyn-syms` confirms
+`libroblox.so` exports — so the scaffolding runs in both directions and only the
+`IPlatformLocalStorageHandler` direction is Cordial's to answer.
+
+### §44.2 What Cordial hands over, printed from the registered side
+
+`CORDIAL_TRACE_LOCAL_STORAGE=1` now dumps the descriptors
+`native/local_storage.cpp` actually registered, rather than the ones the engine
+asks for. That distinction is the whole point: §40's stolen `typeid` was silent
+because the JNI trace prints the *engine's* descriptor, which is always correct,
+and nothing printed the other side. All twelve match the dex exactly, including
+`getUsers()Ljava/util/HashSet;`.
+
+### §44.3 The engine does call through it — measured, not inferred
+
+`deleteSecureValue key=CookieManagerExperiment`, twice a run, on every run taken
+here (six, across three builds). Nothing else on the interface is called on a
+landing-page run: no `getSecureValue`, no `getCurrentUser`, no `getUsers`.
+
+So the answer to "does anything call through" is yes, and the platform
+implementation is live rather than accepted-and-forgotten. **It is also not the
+storage gate**: those same runs have no `rbx-storage.db`, no engine-created
+partitions and zero `RbxStorage` lines.
+
+### §44.4 `setPlatformImpl` returned null for a reason that was not the engine's
+
+The return value had been discarded since the call was written. Printed, it is
+`null` — which reads as "the engine declined to build a core" and is worth
+nothing until the two ways to get a null are separated. djinni's `fromCpp`
+returns `nullptr` without touching JNI when C++ handed it no object; libjnivm
+returns whatever it invents when `NewObject` names a class nobody implemented,
+and `ILocalStorageHandlerCore$CppProxy` was exactly such a class.
+
+Registering it settles it, with the control in the same session and one edit
+between the arms:
+
+    CppProxy unregistered, x2 runs:   setPlatformImpl returned null
+    CppProxy registered,   x4 runs:   ILocalStorageHandlerCore$CppProxy built
+                                      setPlatformImpl returned a core
+
+**The null was libjnivm's, not the engine's.** The engine built a core all along,
+which the `deleteSecureValue` calls already implied. The registration stays
+because an invented stub is the failure mode §40 was bitten by, not because it
+changes anything: all four runs still exit 0, still reach `app ready: Landing`,
+still produce no store, and still print `RbxmFileManager` twice.
+
+Worth recording against the parallel survey of unanswered classes, which lists
+`ILocalStorageHandlerCore$CppProxy` among the `FindClass`-only set: it is not.
+It is constructed, once per run, as soon as something implements it. A class the
+engine only looks up may still be one the engine would use if it worked.
+
+### §44.5 `DFLog::RbxmFileManager` is not new, and §43's dating of it is withdrawn
+
+§43 recorded `Warning [DFLog::RbxmFileManager] LocalStorageManager is not
+available.` as "new as of today and absent on 2026-08-19". It is neither. Every
+engine log on this machine, scored (399 of them, `CordialTest` excluded):
+
+    2.730.0.790   64 warned   183 silent
+    2.732.0.1043   0 warned    44 silent
+    2.734.0.917  105 warned     4 silent
+
+On 2026-08-19 alone it appears in 98 of 103 logs. §43 compared today's run
+against two `cordial-agent-t` runs and generalised from a pair; those two happen
+to be members of the four-run exception below, which is the least representative
+sample on the disk.
+
+### §44.6 It is absent from both working controls, and it is not a channel artifact
+
+    Sober, 2.734.0.917, store works:        0 RbxmFileManager lines
+    docs/traces/waydroid-roblox-startup:    0 RbxmFileManager lines
+    Cordial, current build, 6 runs:         2 per run
+
+The ordering in the two working captures says what the line means. On Waydroid
+`RbxStorage::init [DONE]` lands at 0.4445 and `getCachedPatch: get patch from
+content provider for Model` at 0.5135, followed immediately by
+`deserializeAndVerifyPatch` with nothing between them. Sober is the same shape,
+`[DONE]` at 5.520 and the patch fetch at 5.579. Under Cordial the patch fetch is
+at 1.4637 and the warning lands 83 microseconds later, in the slot the working
+captures pass through silently.
+
+So `RbxmFileManager` asks for the content store at the moment it needs it, gets
+it in both controls, and does not here. That the store it asks for is
+`RbxStorage` is **`INFERRED`** — the message names a C++ `LocalStorageManager`
+and §40 established the engine never asks libjnivm for
+`com/roblox/client/LocalStorageManager`, so the name in the message is not the
+Java class. What is measured is that the line is present exactly when the store
+is absent, in every capture available.
+
+### §44.7 The four exceptions are the working run and its neighbours
+
+Of 105 current-engine runs that reach the patch fetch, four do not print the
+warning. All four are in `~/.cache/cordial-agent-t`, and two of them are
+`ec3a3` and `08d78` — §36/§37's one positive.
+
+    062512Z   silent
+    063001Z   silent
+    074525Z   silent   <- ec3a3
+    074547Z   silent   <- 08d78
+
+**This corrects §37's attribution again, in the other direction.** §36 credited
+`ec3a3`; §37 moved the credit to `08d78` because `files.atime` = 07:46:02.730Z
+falls in `08d78`'s window. Both are half right. The eight partition directories
+and `rbx-storage-sc/` carry mtimes of **07:45:25.902Z**, 0.66 s into `ec3a3` —
+so `ec3a3` initialised the store and `08d78` wrote the nine rows into it the
+following launch. §37's correction is right about the rows and wrong about the
+initialisation; §36's original attribution was right about the initialisation.
+
+That is the finding that matters for everyone who continues: **§36's "the log
+channel that would say is silent even on success" is true of `DFLog::RbxStorage`
+and false of the engine as a whole.** There is a one-line, on-by-default,
+t≈0.3–1.5 s marker for whether the content store came up, it needs no
+filesystem poll, and it retro-scores every log already on this disk. Forty-odd
+negative reproductions in §36–§37 were scored the expensive way for want of it.
+
+### §44.8 What separates the four, and three things that do not reproduce it
+
+The four silent runs share one other property, and it is a clean partition —
+where the engine wrote its tombstone:
+
+    silent, x4     .../profiles/default/data/cache/cache/tombstone.dat   absolute
+    warned, x101   cache/tombstone.dat                                   relative
+    warned, x4     no tombstone line at all
+
+Relative resolves against the process working directory, which is
+`<profile>/run` (`load.rs` `set_current_dir`), so the two forms are two
+different files and the engine had a cache directory in one case and an empty
+one in the other. Cordial calls `nativeSetCacheDirectory` with an absolute path
+on every run and prints `ok`, so the value is delivered; in 101 runs out of 105
+it is not in effect by the time the flag cache resolves its paths.
+
+Three attempts to reproduce the silent state, all negative, all scored on the
+marker and the filesystem together:
+
+    CORDIAL_DEFER_CTORS=1, fresh roots, x3         warned, tombstone REL, db=0
+    CORDIAL_LATE_POST_MS=2000 CORDIAL_LATE_RETRY=1,
+      one root, three warm passes, --run 35, x3    warned, tombstone REL, db=0
+    plain landing-page, fresh roots, x7            warned, tombstone REL, db=0
+
+The second of those is the configuration §36 named for the working run, run
+warm rather than fresh this time, and it does not do it. `CORDIAL_DEFER_CTORS`
+sets the four directory setters before `libroblox.so`'s constructors run, which
+is the most direct way to give the engine a cache directory early, and it does
+not do it either — consistent with §27, and now measured on an instrument §27
+did not have.
+
+### Where this leaves it
+
+The djinni branch is closed: the surface is complete, correct against the dex,
+called by the engine, and unrelated to `RbxStorage`. §39's and §40's work stands
+as two real libjnivm bugs fixed, and §44.4 adds a third and smaller one, none of
+which was the gate.
+
+The open question is unchanged in substance and much cheaper to attack:
+**something makes the engine's cache directory effective early in roughly one
+run in twenty-six, and the store comes up exactly then.** Whether the directory
+is the cause or another symptom of the same early ordering is not established.
+Whoever takes it should score on `grep -c RbxmFileManager` and the tombstone
+path form rather than on the filesystem, run enough times to see the rate, and
+report the rate rather than a single outcome.

@@ -181,10 +181,67 @@ impl Instance {
 /// stderr line printed at the same instant is whichever thread took the lock
 /// first. Within one stream the order is exact, which is what matters: a panic
 /// message and the lines that led to it are both on stderr.
+/// Local wall-clock to the millisecond, in the same shape `native/liblog.cpp`
+/// uses, so a reader can sort both together.
+fn stamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let ms = now.subsec_millis();
+    // Local offset via `localtime`, not UTC: the reader is comparing this
+    // against when they pressed something.
+    // Plain arithmetic on the local offset rather than a date library: this
+    // runs on every line the runtime prints and must not allocate more than
+    // the string it returns.
+    let offset: i64 = gtk4::glib::DateTime::now_local()
+        // `utc_offset` is a `TimeSpan`, microseconds, not a bare integer.
+        .map(|d: gtk4::glib::DateTime| d.utc_offset().0 / 1_000_000)
+        .unwrap_or(0);
+    let local = secs as i64 + offset;
+    let secs_today = local.rem_euclid(86_400);
+    let (h, m, sec) = (secs_today / 3600, (secs_today % 3600) / 60, secs_today % 60);
+    format!("{h:02}:{m:02}:{sec:02}.{ms:03}")
+}
+
+/// Whether a line already begins with a `HH:MM:SS` stamp.
+///
+/// `liblog` stamps its own output, and doubling it would be worse than not
+/// stamping at all -- a reader who sees two clocks stops trusting either.
+fn already_stamped(line: &str) -> bool {
+    let b = line.as_bytes();
+    b.len() >= 8
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2] == b':'
+        && b[3].is_ascii_digit()
+        && b[4].is_ascii_digit()
+        && b[5] == b':'
+}
+
 fn pump(reader: impl std::io::Read + Send + 'static, tail: Tail, to_stderr: bool) {
     std::thread::spawn(move || {
         for line in BufReader::new(reader).lines() {
             let Ok(line) = line else { break };
+            // **A clock on every line the runtime prints.**
+            //
+            // `native/liblog.cpp` stamps the Android log, but Cordial's own
+            // `[roblox]`/`[cordial]` narration -- `app ready: Startup` among it
+            // -- is scattered `println!` with no shared emitter, so there was
+            // nowhere to stamp it at the source without touching every site.
+            // This is that one place: every line the child writes passes
+            // through here on its way back out.
+            //
+            // It matters because all 265 log files on the development machine
+            // carried no clock at all, which made "is startup getting slower"
+            // unanswerable from history and is why no startup regression here
+            // has ever been caught by reading a log.
+            //
+            // A line that already carries a stamp is left alone -- `liblog`'s
+            // own output arrives pre-stamped and two clocks on one line is
+            // worse than none. The check is the cheap one: a digit pair, a
+            // colon, and the shape of a time.
+            let line = if already_stamped(&line) { line } else { format!("{} {line}", stamp()) };
             if to_stderr {
                 let mut out = std::io::stderr().lock();
                 let _ = writeln!(out, "{line}");

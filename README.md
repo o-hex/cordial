@@ -153,10 +153,10 @@ will be declined.
 | Launching from the shell | ✅ finds a build, or explains how to get one |
 | Choosing a profile | ✅ a chooser above the Launch button; creates one, and shows a profile another window holds as unavailable |
 | Audio | ✅ sound in an experience, reported from real play; the OpenSL ES bridge into PipeWire was measured with a control before that |
-| Web views (Marketplace, Profile, Communities…) | ❌ the request now *arrives* — Cordial subscribes to `WebView.openWindow` over the engine's own MessageBus and logs the payload — but nothing renders it yet, and opening one blanks the window |
+| Web views (Marketplace, Profile, Communities…) | 🟡 they render — a real WebKitGTK window, signed in, with the engine's canvas correctly lowered behind it and raised again on close. Pressing **Join** inside one does not yet reach the engine |
 | **Asset overlays** (custom textures, sounds, fonts) | ✅ drop a file mirroring the APK's `assets/` tree into `~/.config/cordial/overlay` and it is served instead; nothing is modified, remove the file and the original returns |
 | Fullscreen | 🟡 F11 with the header bar hidden, and the choice persists per profile — but on the launcher window, not the one you play in |
-| **The engine's content store** | ❌ `RbxStorage` never initialises, so every asset is fetched from the network every session; this is why loading is sometimes slow-and-complete and sometimes fast-and-untextured |
+| **The engine's content store** | ✅ `RbxStorage` initialises and is read back — a real SQLite database, the engine's own `files` table, eight engine-created partitions, and cache hits rising across launches. Assets are no longer refetched every session |
 | Clean shutdown | ✅ full pause/stop/destroy sequence, observed in the engine's own log |
 | Plugins | 🟡 host, broker and per-profile grants now enforce every capability, not only `flags.*`/`presence.*` as before — notify, url.open, asset overlays, `flags.write` and cross-plugin events all reach a real effect; Settings can grant or revoke a capability, and install or remove a plugin from a local `.tar.zst` archive; still no in-app fetch from a remote index, so the marketplace half of the registry is unbuilt |
 
@@ -165,25 +165,32 @@ presents drop to exactly 1/s when nothing is happening and every earlier figure
 in this repository was that idle throttle integrated: a flat 60.0 on MAILBOX
 against a variable 35–50 on FIFO, four runs of 120 s.
 
-**What is left is polish and three real gaps.** Text fields take the characters
+**What is left is polish and two real gaps.** Text fields take the characters
 and do not draw them until focus leaves, because on Android a transparent
 `EditText` draws a focused box and there is none here — mocktail does not manage
-this either. Roblox is never told it may capture the pointer, so in first person
-the cursor walks off the window; the native that says so is exported and has
-never been called. And the content store does not come up, so nothing is cached
-between sessions.
+this either. And pressing **Join** inside a web view does not yet reach the
+engine: the page finds Cordial's bridge and stops falling back to a link, but
+the command does not complete a launch.
 
-**The content store is the one worth knowing about**, because it is the reason
-loading is inconsistent rather than slow. `RbxStorage::init` does run — on every
-launch, during the engine's own ELF constructors, before `JNI_OnLoad` — and it
-fails on a path that is empty that early, then *memoises* the failure, so the
-later caller that succeeds on Android is handed the broken object and never
-retries. Twenty candidate explanations were eliminated with controls before that
-was established, and most of this repository's analysis of it had to be
-retracted: for weeks the evidence said storage was never asked for, and the
-evidence was a log channel that could not be configured until after the code had
-already run. See [`docs/analysis/flag-init.md`](docs/analysis/flag-init.md) §25
-onwards.
+Pointer capture and the content store were both on this list and are not any
+more.
+
+**The content store took fifty attempts and forty-six sections, and the answer
+was a call made too late.** The engine wants `nativeSetCacheDirectory` before
+`GameActivity.initializeNativeCode`, not after it. That is the whole of it.
+
+The paragraph that stood here described a different mechanism — init running
+during the engine's ELF constructors and memoising a failure — and it was
+wrong. So were several of the explanations before it. Nearly every scoring
+method used along the way turned out to be measuring something else: a log
+channel believed silent that is not, a marker that fires in working runs too,
+and an ordering signature that could not have come out any other way. The
+corrections are in [`docs/analysis/flag-init.md`](docs/analysis/flag-init.md)
+§41 onwards, and they are more useful than the fix.
+
+The store is verified rather than assumed: three runs producing a database
+against a control producing none, and hit counts rising on a second launch
+against the same profile.
 
 **The keyboard took a week and the answer was one number.**
 `nativePassKeyEvent` wants Linux evdev codes; it was being handed Android

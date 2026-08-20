@@ -189,10 +189,34 @@ pub fn window_closed() -> bool {
 /// `FocusChangeMask` and ADR-011 makes X11 the diagnostic fallback, so it keeps
 /// the behaviour it has always had rather than growing a second implementation
 /// of this.
+/// **A window that is not visible does not have focus, whatever the compositor
+/// says about activation.**
+///
+/// Measured over 15 runs: in two of them mutter reported `FOCUSED | SUSPENDED`
+/// -- covered, not being drawn, still activated -- for 20 s and 7 s. Throughout,
+/// this returned `true`, no `onWindowFocusChangedNative(false)` was sent, and
+/// the engine's looper thread spun at 8.5-10 M `ALooper_pollOnce` calls a second
+/// for 105% of a core. That is the whole of the "idle at 100% while unfocused"
+/// report, and it is the one part of that spin which is ours.
+///
+/// Folding visibility in is *more* faithful to Android rather than less: an
+/// activity that is not visible is stopped and does not hold window focus, so
+/// an engine written against that lifecycle is being told the truth by this and
+/// was being told something Android would never say by the version before it.
+///
+/// `None` from either signal still means "not known" and is not collapsed into
+/// `Some(false)` -- telling the engine it lost focus because nothing was
+/// watching would throttle a window the user is looking at. Only a definite
+/// `Some(false)` from visibility overrides a definite `Some(true)` from focus.
+/// X11 answers `None` for both and keeps the behaviour it has always had.
 pub fn backend_focused() -> Option<bool> {
-    match backend() {
+    let focused = match backend() {
         Backend::Wayland => wayland::focused(),
         Backend::X11 => None,
+    };
+    match (focused, backend_visible()) {
+        (Some(true), Some(false)) => Some(false),
+        (f, _) => f,
     }
 }
 

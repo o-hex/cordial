@@ -20,6 +20,14 @@ webview = ["cordial-shell/webview"]
 [dependencies]
 cordial-linker-sys = { path = "../cordial-linker-sys" }
 cordial-plugins = { path = "../cordial-plugins" }
+# `engine::version_of`, which reads the engine's own version out of
+# `libroblox.so`. That scan lived in `load.rs`, where it was a binary's private
+# function and therefore unreachable by the updater -- which then had to report
+# that it could not tell which build was installed. One copy, in the crate that
+# needs to compare it against what Roblox has published. The dependency is new
+# only as a direct edge: this crate already pulls `cordial-update` in through
+# `cordial-shell`.
+cordial-update = { path = "../cordial-update" }
 # The window. ADR-011 makes it GTK4/libadwaita and says of the shell's window
 # and the engine's host window that they "are the same window"; the engine's
 # `wl_surface` is a subsurface of the one `cordial_shell::host_window` builds,

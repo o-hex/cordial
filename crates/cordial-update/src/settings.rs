@@ -150,19 +150,16 @@ impl Default for DownloadOn {
 
 /// The sentence shown where a download is being held back by the connection.
 ///
-/// A constant rather than a formatted string, so the shell's warning row and the
-/// refusal a held download reports are demonstrably the same words.
+/// A constant rather than a formatted string, so every place that explains the
+/// switch is demonstrably the same words.
 ///
-/// It no longer describes a settings combination that never downloads, because
-/// there is no such combination any more: with one switch, off means "wait for
-/// an unmetered connection" rather than "never". That is the point of collapsing
-/// the pair — the state that had to be warned about was an artefact of asking
-/// one question twice.
+/// It was four lines and it is now one. The three that went explained *why* a
+/// guess counts as metered and what the switch does not govern — true, and
+/// reasoning, and now in [`DownloadOn::metered`]'s comment where reasoning
+/// belongs. What survives is the half that changes what somebody does: their
+/// download is waiting, and there is a button that ignores the wait.
 pub const NEVER_DOWNLOADS: &str =
-    "With Download on metered connection off, nothing is downloaded on its own while \
-     NetworkManager reports the link as metered — and every answer it is unsure about counts as \
-     metered. Pressing Update yourself still works: this switch governs what happens without \
-     being asked.";
+    "Downloads wait for an unmetered connection. Pressing Update always works.";
 
 /// All three controls. Serialised into whatever document the shell keeps its own
 /// preferences in; nothing here reads or writes a file, because where Cordial's
@@ -223,7 +220,10 @@ impl UpdateSettings {
         if self.download_on.metered {
             return Ok(());
         }
-        Err(format!("{}, and Download on metered connection is off", metered.describe()))
+        Err(format!(
+            "{}, and Download on metered connection is off.",
+            metered.describe()
+        ))
     }
 }
 
@@ -260,7 +260,10 @@ mod tests {
         match s.plan(Metered::GuessYes) {
             Plan::CheckAndAsk { why: Some(why) } => {
                 assert!(why.contains("Download on metered connection"), "{why}");
-                assert!(why.contains("guess"), "{why}");
+                // Which of the four answers it got, without the hedge being
+                // dropped: guess-yes is a guess and saying so flatly is what
+                // makes somebody on a wired desktop think Cordial is wrong.
+                assert!(why.contains("looks metered"), "{why}");
             }
             other => panic!("expected a reason, got {other:?}"),
         }
@@ -285,11 +288,15 @@ mod tests {
         // called Never.
         assert_eq!(s.may_download(Metered::No), Ok(()));
 
-        assert!(NEVER_DOWNLOADS.contains("Download on metered connection"), "{NEVER_DOWNLOADS}");
+        // One line, and both halves of it earn their place: the download is
+        // waiting rather than refused, and there is a button that ignores the
+        // wait. The reasoning that used to sit here is in `DownloadOn::metered`.
+        assert!(NEVER_DOWNLOADS.contains("unmetered"), "{NEVER_DOWNLOADS}");
+        assert!(NEVER_DOWNLOADS.len() < 120, "{NEVER_DOWNLOADS}");
         // It does not overstate itself: an Update the user presses is not what
         // this switch is about, and saying otherwise would be a second wrong
         // sentence rather than a fix for the first.
-        assert!(NEVER_DOWNLOADS.contains("Pressing Update yourself still works"), "{NEVER_DOWNLOADS}");
+        assert!(NEVER_DOWNLOADS.contains("Pressing Update always works"), "{NEVER_DOWNLOADS}");
     }
 
     #[test]

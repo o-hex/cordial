@@ -143,15 +143,22 @@ pub struct Instance {
 }
 
 impl Instance {
-    /// Whether the client is already gone, and with what status.
+    /// The client's process id, for the launcher's `SIGCHLD` watch.
     ///
-    /// Polled a moment after launch rather than waited on. A `cordial-run`
-    /// that exits within seconds has failed at load — a missing symbol, an APK
-    /// it cannot read — and the launcher has to say so, because the only other
-    /// evidence is on a stdout nobody is looking at when the shell was started
-    /// from a desktop icon.
-    pub fn exited(&mut self) -> Option<std::process::ExitStatus> {
-        self.child.try_wait().ok().flatten()
+    /// **This type deliberately offers no `try_wait`.** It used to have an
+    /// `exited()` that called one, polled twice a second by `window.rs`, and
+    /// that is now `glib::child_watch_add_local` — which reaps the child
+    /// itself, out of GLib's own `SIGCHLD` handling. Two reapers is not a
+    /// tidiness question: whichever `waitpid` loses the race gets `ECHILD`,
+    /// and the exit status the crash page exists to report is gone with it.
+    /// So the launcher hands the pid to GLib and never waits on the child
+    /// again, and there is no method here through which it could.
+    ///
+    /// Dropping the `Child` is still safe and still does not reap — Rust's
+    /// `Drop` for it is a no-op by design — so GLib remains the only waiter
+    /// even if this `Instance` outlives its watch or dies before it.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// The last lines the client printed, oldest first, redacted.
@@ -828,7 +835,14 @@ mod tests {
         // without it the engine would be writing into the shared default and
         // the profile would be a directory name and nothing more.
         std::thread::sleep(std::time::Duration::from_secs(25));
-        assert!(instance.exited().is_none(), "the client must still be up after 27 seconds");
+        // `try_wait` directly rather than through a method on `Instance`: this
+        // test is the only reaper in this process — there is no GTK main loop
+        // here and so no child watch — and `Instance::pid`'s doc explains why
+        // the type no longer offers one to the launcher.
+        assert!(
+            instance.child.try_wait().expect("waiting on the client works").is_none(),
+            "the client must still be up after 27 seconds"
+        );
 
         let logs = profile_dir.join("data/files/appData/logs");
         let wrote = std::fs::read_dir(&logs).map(|d| d.count()).unwrap_or(0);

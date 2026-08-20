@@ -1028,38 +1028,15 @@ fn install_webview_presenter() {
 /// shape of thing a server-side check rejects, and the value had gone stale
 /// silently across an APK update with nothing to catch it.
 ///
-/// Reading it back out is a plain string search, not disassembly: the version
-/// is stored as an ASCII literal and `strings` finds exactly one match for the
-/// four-part shape. Returning `None` when that is not true is deliberate —
-/// skipping the call is honest, and inventing a version is what caused this.
+/// The scan itself moved to [`cordial_update::engine`]. It was thirty lines
+/// here, in a binary, which meant the updater could not call it and had to
+/// report that it did not know which build was installed — while this function
+/// printed the answer at every launch. One copy, in the crate that compares it
+/// against what Roblox has published; the rules are unchanged, including
+/// returning `None` when the four-part shape is not unique, because skipping
+/// the call is honest and inventing a version is what caused the bug above.
 fn engine_version(lib_dir: &str) -> Option<String> {
-    let bytes = std::fs::read(std::path::Path::new(lib_dir).join("libroblox.so")).ok()?;
-    let mut found: Option<String> = None;
-    let mut run = Vec::new();
-    for &b in bytes.iter().chain(std::iter::once(&0u8)) {
-        if b.is_ascii_digit() || b == b'.' {
-            run.push(b);
-            continue;
-        }
-        if run.len() >= 9 && run.len() <= 20 {
-            let s = String::from_utf8_lossy(&run).to_string();
-            let parts: Vec<&str> = s.split('.').collect();
-            if parts.len() == 4
-                && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
-                && parts[0] == "2"
-            {
-                // More than one distinct candidate means the shape is not
-                // unique in this build and the assumption behind reading it
-                // has stopped holding. Say so rather than pick one.
-                match &found {
-                    Some(prev) if *prev != s => return None,
-                    _ => found = Some(s),
-                }
-            }
-        }
-        run.clear();
-    }
-    found
+    cordial_update::engine::installed_version(std::path::Path::new(lib_dir))
 }
 
 // `native/local_storage.cpp`'s two exported callers. Declared directly here

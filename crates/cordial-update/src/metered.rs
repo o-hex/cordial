@@ -95,20 +95,32 @@ impl Metered {
     }
 
     /// What to put in front of a user who is being told their download is
-    /// waiting. "Metered" on its own invites "no it isn't".
+    /// waiting.
+    ///
+    /// Plain, and deliberately does not say "NetworkManager" — every one of
+    /// these used to, which put the name of a system service in front of
+    /// somebody who wanted to know whether their update was going to cost them
+    /// anything. The service is still the source and the source is still worth
+    /// knowing: [`Display`](std::fmt::Display) is the diagnostic token, this is
+    /// the sentence.
+    ///
+    /// The two guesses keep their hedge. "Metered" on its own invites "no it
+    /// isn't", and a user who is told flatly that a wired desktop is metered
+    /// concludes Cordial is wrong rather than that the answer is a guess.
     pub fn describe(self) -> String {
         match self {
-            Metered::Unknown => "NetworkManager does not know whether this connection is metered".into(),
-            Metered::Yes => "NetworkManager reports this connection as metered".into(),
-            Metered::No => "NetworkManager reports this connection as unmetered".into(),
-            Metered::GuessYes => {
-                "NetworkManager guesses this connection is metered — a phone hotspot usually reads this way".into()
-            }
+            Metered::Unknown => "Cordial cannot tell whether this connection is metered".into(),
+            Metered::Yes => "This connection is metered".into(),
+            Metered::No => "This connection is not metered".into(),
+            Metered::GuessYes => "This connection looks metered, such as a phone hotspot".into(),
             Metered::GuessNo => {
-                "NetworkManager guesses this connection is unmetered, which is a guess rather than an answer".into()
+                "This connection is probably not metered, but that is a guess".into()
             }
+            // Still carries the number. Somebody meeting this has hit a value
+            // added to NetworkManager since this was written, and the number is
+            // the whole of what they need to fix it.
             Metered::Unrecognised(n) => {
-                format!("NetworkManager reported Metered = {n}, which this Cordial does not recognise")
+                format!("Cordial does not recognise what this connection reported ({n})")
             }
         }
     }
@@ -216,5 +228,11 @@ mod tests {
         // lean".
         assert!(Metered::GuessNo.is_metered());
         assert!(Metered::GuessNo.describe().contains("guess"));
+        // And it says so without naming a system service at somebody who asked
+        // about their data allowance.
+        for m in [Metered::Unknown, Metered::Yes, Metered::No, Metered::GuessYes, Metered::GuessNo]
+        {
+            assert!(!m.describe().contains("NetworkManager"), "{}", m.describe());
+        }
     }
 }

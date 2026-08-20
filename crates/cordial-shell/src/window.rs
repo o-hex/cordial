@@ -19,6 +19,7 @@ use libadwaita::gtk;
 use libadwaita::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
+use std::os::unix::process::ExitStatusExt;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -140,18 +141,13 @@ impl Shell {
 /// a fraction of one. This used to be the *only* moment the launcher ever asked
 /// whether the client was still alive, which meant a crash ten minutes into a
 /// session produced nothing at all -- the window simply vanished. It is now
-/// only the dialog's timer; [`EXIT_POLL`] is what watches the process.
-const EARLY_EXIT_CHECK: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// How often the launcher asks whether the client is still running.
+/// only the dialog's timer, and the one timer left in this path: the process is
+/// watched by `SIGCHLD` (see [`try_launch`]) and not by a clock at all.
 ///
-/// **For the whole session, not for the first three seconds.** A crash is a
-/// crash whenever it happens, and the failure this replaces was a launcher that
-/// could only report one that arrived while it happened to be looking. Half a
-/// second is cheap -- `try_wait` is one `waitpid` with `WNOHANG` -- and is fast
-/// enough that the crash page arrives while the user is still looking at where
-/// the window was.
-const EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// It is a one-shot rather than a deadline the watch also has to respect, which
+/// is what makes it safe to have two sources here -- see [`try_launch`] for the
+/// ordering argument.
+const EARLY_EXIT_CHECK: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The dialog shown while the client starts.
 ///
@@ -817,7 +813,7 @@ fn try_launch(
     // busy profile that also cost the user their link would be two failures for
     // one press. It is cleared below, once there is a process holding it.
     let url = join.peek();
-    let mut instance = match launch::spawn(&build, claim, run_seconds_override(), url.as_deref()) {
+    let instance = match launch::spawn(&build, claim, run_seconds_override(), url.as_deref()) {
         Ok(instance) => instance,
         Err(message) => return Outcome::Failed(message),
     };
@@ -825,33 +821,61 @@ fn try_launch(
 
     let starting = starting_dialog(&window, &profile_name, url.is_some());
 
-    // One repeating source rather than the single shot this used to be. It owns
-    // the instance, so it is also what keeps the `Child` alive: dropping it
-    // would leave a zombie nobody reaps and no way to learn the exit status.
+    // **`SIGCHLD`, not a clock.** This was `timeout_add_local` at 500 ms for
+    // the whole session -- two wakeups a second, forever, to ask a question
+    // whose answer is no for hours at a time. `child_watch_add_local` is GLib's
+    // own `SIGCHLD` handling and fires once, when the process actually dies.
     //
-    // The dialog and the crash watch share a timer deliberately. Two sources
-    // would each hold their own reference to the same instance and the ordering
-    // between them -- does the dialog close before or after the crash page
-    // opens? -- would be whatever GLib felt like that run.
+    // **GLib owns the reap now, and it has to be the only one.** The child
+    // watch calls `waitpid` itself; the `Instance::exited` this replaced called
+    // `try_wait`, which is also a `waitpid`. Two of those and one loses with
+    // `ECHILD` -- either the status the crash page exists to report is gone, or
+    // nobody reaps and a zombie stays. So `Instance` no longer offers a wait at
+    // all (see `launch::Instance::pid`), and the closure below holds the
+    // `Instance` only for its command line and its captured output. Dropping a
+    // `Child` does not reap, so GLib stays the sole waiter either way.
+    //
+    // **The ordering the single timer used to enforce is now enforced by
+    // program order.** The old comment was right that two sources racing over
+    // "does the dialog close before or after the crash page opens" would be
+    // whatever GLib felt like -- so the crash page is not a second source. The
+    // one-shot below can *only* close the dialog; the child watch closes the
+    // dialog and then, in the same callback, decides about the crash page. The
+    // two are therefore ordered by the statements in one function rather than
+    // by source priority, and the shared `Cell` only has to make the close
+    // idempotent. A `Cell` suffices for that because both callbacks run on the
+    // GTK main context, on this thread, one at a time.
+    let dialog_closed = Rc::new(Cell::new(false));
+    {
+        let starting = starting.clone();
+        let dialog_closed = dialog_closed.clone();
+        glib::timeout_add_local_once(EARLY_EXIT_CHECK, move || {
+            if !dialog_closed.replace(true) {
+                starting.close();
+            }
+        });
+    }
+
     let window = window.clone();
-    let launched = std::time::Instant::now();
-    let mut dialog_closed = false;
-    glib::timeout_add_local(EXIT_POLL, move || {
-        let exited = instance.exited();
-        if !dialog_closed && (exited.is_some() || launched.elapsed() >= EARLY_EXIT_CHECK) {
+    let pid = glib::Pid(instance.pid() as i32);
+    glib::child_watch_add_local(pid, move |_, wait_status| {
+        if !dialog_closed.replace(true) {
             starting.close();
-            dialog_closed = true;
         }
         // The launcher being gone is not a crash to report and there is nothing
         // left to be transient for. Under ADR-012 quitting the launcher while a
-        // client runs is the ordinary case, so this is a normal end for this
-        // source rather than an error.
+        // client runs is the ordinary case, so a closed launcher must not pop a
+        // crash page on top of a desktop the user went back to. The poll this
+        // replaces returned `Break` here; a child watch has no equivalent, and
+        // it does not need one -- the source removes itself once the child has
+        // exited, and until then the only thing this check costs is the branch.
         if !window.is_visible() {
-            return glib::ControlFlow::Break;
+            return;
         }
-        let Some(status) = exited else {
-            return glib::ControlFlow::Continue;
-        };
+        // GLib hands back the raw `waitpid` status, which is exactly what
+        // `ExitStatusExt::from_raw` takes, so signal deaths keep their signal
+        // and `crash::is_crash` sees the same value `try_wait` used to give it.
+        let status = std::process::ExitStatus::from_raw(wait_status);
         // Narrated either way, and deliberately without the client's output in
         // it: this line is how somebody reading a terminal learns which of the
         // two paths was taken, and the output belongs on the page and nowhere
@@ -863,7 +887,6 @@ fn try_launch(
         } else {
             println!("  shell: the client exited cleanly ({status}); no crash page");
         }
-        glib::ControlFlow::Break
     });
 
     Outcome::Started

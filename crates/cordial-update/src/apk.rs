@@ -159,6 +159,32 @@ pub fn inspect(path: &Path, limits: Limits) -> Result<Summary, Refusal> {
     Ok(Summary { entries: archive.len(), declared_bytes: declared })
 }
 
+/// Whether `apk` holds `wanted`, without taking anything out of it.
+///
+/// The two-APK question, asked rather than assumed: `base.apk` has no
+/// `lib/x86_64/libroblox.so` on a split build and does have one on a universal
+/// build, and there is no way to tell which kind of build arrived except by
+/// looking. [`crate::install`] asks this before it swaps anything into place, so
+/// "the wrong half was downloaded" is a refusal rather than a client that fails
+/// to start.
+///
+/// [`inspect`] runs first here as well. An archive that breaks one of ADR-014's
+/// rules is not an archive to answer questions about.
+pub fn holds(apk: &Path, wanted: &str) -> Result<bool, Refusal> {
+    holds_with(apk, wanted, Limits::default())
+}
+
+pub fn holds_with(apk: &Path, wanted: &str, limits: Limits) -> Result<bool, Refusal> {
+    inspect(apk, limits)?;
+    let file = std::fs::File::open(apk)
+        .map_err(|e| Refusal::Io { path: apk.display().to_string(), why: e.to_string() })?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| {
+        Refusal::NotAZip { path: apk.display().to_string(), why: e.to_string() }
+    })?;
+    let held = archive.by_name(wanted).is_ok();
+    Ok(held)
+}
+
 /// Take one named entry out of `apk` and write it into `into`.
 ///
 /// Everything in [`inspect`] runs first, over the whole archive. Taking the one

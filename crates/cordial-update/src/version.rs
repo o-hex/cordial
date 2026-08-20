@@ -40,6 +40,17 @@
 //! [`changelog`](crate::changelog) is the half that does work for Android:
 //! Roblox's release notes name the engine major, and the engine major is the
 //! number the client reports about itself.
+//!
+//! **Re-measured 2026-08-20.** `AndroidApp` still answers 500 with the same
+//! body; `WindowsPlayer` now answers `0.735.0.7351131`, so the endpoint is live
+//! and this is not an outage that happened to be caught twice.
+//!
+//! What has changed is the *other* operand. [`engine`](crate::engine) reads the
+//! installed engine's version out of `libroblox.so`, so "which build is here"
+//! no longer depends on this endpoint answering — on the build in this cache it
+//! reads 2.734.0.917 against release notes for 734. This endpoint would still be
+//! the better answer if it worked, because it names what Roblox is serving
+//! rather than what is installed, and it is left wired for the day it does.
 
 use crate::http;
 use crate::Unreachable;

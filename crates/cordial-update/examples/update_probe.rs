@@ -15,7 +15,7 @@
 //! not fetch, deliberately: a probe that pulls 115 MB is a probe nobody runs
 //! twice.
 
-use cordial_update::{changelog, download, http, metered, settings, version};
+use cordial_update::{changelog, download, engine, http, install, metered, settings, version};
 
 fn main() {
     println!("== NetworkManager");
@@ -79,7 +79,44 @@ fn main() {
         }
     }
 
+    // The half of "is there an update" that has no network in it, and the one
+    // that was missing until `engine` existed: the updater used to compare a
+    // published major against `None` and report that it could not tell.
+    println!("== the build on this machine");
+    let build = install::build_dir();
+    let lib = install::engine_dir();
+    println!("  managed build: {}", match install::managed_base() {
+        Some(base) => base.display().to_string(),
+        None => format!("none yet in {}", build.display()),
+    });
+    match engine::installed_version(&lib) {
+        Some(version) => println!(
+            "  engine {version} (major {:?}), read out of {}",
+            engine::major_of(&version),
+            engine::library_in(&lib).display()
+        ),
+        None => println!("  no engine version readable from {}", engine::library_in(&lib).display()),
+    }
+
     println!("== download source");
+    match download::Parts::configured() {
+        Ok(parts) => {
+            for (name, source) in parts.named() {
+                println!("  {name}: {} ({})", source.url, source.hash);
+            }
+            if parts.split.is_none() {
+                println!(
+                    "  no split source set. On a split build the engine is in \
+                     {} and not in {}",
+                    install::SPLIT_APK,
+                    install::BASE_APK
+                );
+            }
+        }
+        Err(e) => println!("  {e}"),
+    }
+
+    println!("== one part, streamed");
     match download::Source::configured() {
         Ok(source) => {
             println!("  {} ({})", source.url, source.hash);

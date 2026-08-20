@@ -15,13 +15,16 @@
 //! because then a slow or absent network delays the window rather than the
 //! answer. [`changelog`] fetches the release notes so the header-bar button has
 //! something to show. Neither is governed by anything: they are cheap.
+//! [`engine`] answers the other half of the same question without a network at
+//! all, by reading the installed engine's version out of `libroblox.so`.
 //!
 //! [`download`] is the expensive half and the only part [`settings`] governs,
 //! together with [`metered`], which asks NetworkManager whether this connection
 //! is one somebody pays for by the megabyte. [`apk`] applies ADR-014's
-//! extraction refusals to what arrived, and [`cache`] stamps the extracted
-//! engine with the APK it came from so a new build re-extracts and an unchanged
-//! one does not.
+//! extraction refusals to what arrived, [`install`] owns the directory the
+//! result goes into and the order that keeps a working build working, and
+//! [`cache`] stamps the extracted engine with the APK it came from so a new
+//! build re-extracts and an unchanged one does not.
 //!
 //! ## What was measured, and when
 //!
@@ -37,6 +40,22 @@
 //! Roblox-hosted download for the Android build that this crate could find, so
 //! it ships no URL for one and says so rather than guessing at a shape.
 //!
+//! **Re-measured 2026-08-20**, with `cargo run -p cordial-update --example
+//! update_probe`, and every one of those answers still holds:
+//!
+//! ```text
+//! AndroidApp                                  500, same body
+//! WindowsPlayer                               200, 0.735.0.7351131
+//! setup.rbxcdn.com/DeployHistory.txt          200, 7230 lines, no android/apk
+//! setup.rbxcdn.com/android/DeployHistory.txt  403 AccessDenied
+//! newest release notes                        Release Notes for 734
+//! engine in this cache                        2.734.0.917
+//! ```
+//!
+//! The last two lines are the ones that changed what this crate can do. They are
+//! the same number, from two places that have never been compared before,
+//! because until [`engine`] existed the second one could not be read.
+//!
 //! ## Failure names what it could not reach
 //!
 //! Every fallible entry point here returns a value that carries the URL, the
@@ -50,6 +69,8 @@ pub mod apk;
 pub mod cache;
 pub mod changelog;
 pub mod download;
+pub mod engine;
+pub mod install;
 pub mod metered;
 pub mod settings;
 pub mod version;
@@ -98,7 +119,7 @@ impl std::fmt::Display for Unreachable {
                 }
             }
             Unreachable::Malformed { url, why } => {
-                write!(f, "{url} answered with something this Cordial cannot read: {why}")
+                write!(f, "{url} sent a reply Cordial could not read: {why}")
             }
         }
     }

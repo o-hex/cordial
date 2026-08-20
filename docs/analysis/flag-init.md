@@ -5547,15 +5547,57 @@ is `load_base(explicit).map(apply_overrides)`, and `apply_overrides` resolves
 every layer and merges it into the settings document. So the override path runs
 **inside `client_settings::load` and nowhere else.**
 
-`load.rs` calls that function in exactly one place, and it is gated behind
-`CORDIAL_DEFER_PAST_SETTINGS` — an experiment, off by default. The ordinary path
-hands `plan.settings` to `nativeInitClientSettings` instead.
+An earlier draft of this section said `load.rs` calls that function in exactly
+one place, gated behind `CORDIAL_DEFER_PAST_SETTINGS`, and asked whether
+`plan.settings` was built through it — calling that the open question that
+decided everything. **Both halves were wrong, and the correction is §48c.**
 
-**Whether `plan.settings` is built through `client_settings::load` is the open
-question, and it decides everything.** If it is not, then no flag override has
-ever reached the engine by the default path, every null result in this file is
-uninterpretable, and the fix is small. That is a code read rather than another
-run, and it is the next thing anyone should do here.
+Four independent nulls are consistent with a delivery failure: two TaskScheduler
+flags, two log flags, and now a thread-count probe. What they are not consistent
+with is the particular delivery failure guessed at here.
 
-Four independent nulls are consistent with it: two TaskScheduler flags, two log
-flags, and now a thread-count probe.
+### §48c: the override path does run by default, so the nulls stand unexplained
+
+`plan.settings` is built by `client_settings::load`, on the ordinary path, with
+no environment variable involved:
+
+    load.rs:1912   if CORDIAL_NO_BOOTSTRAP unset && CORDIAL_LATE_SETTINGS unset
+    load.rs:1930       settings: client_settings::load(opt.client_settings…)
+    load.rs:582        init_client_settings(…, &plan.settings, "", "")
+
+There are five calls to `client_settings::load` in `load.rs`, not one, and the
+gates are complementary rather than nested — `:1463` behind
+`CORDIAL_DEFER_PAST_SETTINGS`, `:1714` behind `CORDIAL_EARLY_SETTINGS`, `:2716`
+and `:3581` behind others, and `:1930` behind the absence of all of them. Exactly
+one runs per launch and by default it is `:1930`. Reading only the first grep hit
+and taking it for the whole is how the earlier claim was reached; the file is
+long enough that this will happen again to somebody.
+
+So the merge is on the default path. `apply_overrides` has one definition and one
+caller, so §48b's other half — that overrides are merged there and nowhere else —
+survives.
+
+This also rehabilitates a log line that was written off too fast. Earlier in this
+session `flags: 1 override(s) applied` was called "Cordial's own resolution, a
+layer above delivery", and refused as evidence. That was too harsh:
+`flags::report` is called only from the `Ok` branch of `merge`, so the line means
+the settings document parsed, `applicationSettings` was present, and the override
+went into the copy handed to `nativeInitClientSettings`. It still does not say the
+engine honoured the value — that remains the gap — but it does establish that the
+document reaching the engine contained it, which is a great deal more than was
+being credited.
+
+One caveat on reading that line: it prints `resolved.len()`, the count before
+`is_roblox_flag` filtering, while the merge uses the filtered map. A
+Cordial-internal key such as `CordialGraphicsBackend` is therefore counted in the
+number but not merged. The number is a resolution count printed at a delivery
+moment, so treat it as "the merge ran", not as "this many Roblox flags landed".
+
+**What is now open is narrower and harder.** The document carries the override
+and the engine still shows nothing, on five separate probes. That points at the
+engine side — the settings reloader at t≈1.6–2.3 s (§47), a flag read before the
+document is installed, or `FInt` values that simply do not govern what was being
+counted. None of those is distinguishable without a positive control: a flag with
+a known, observable effect on this build. **That control is the blocker, and it
+has now been the blocker three sections running.** Nothing else here is worth
+running until it exists.

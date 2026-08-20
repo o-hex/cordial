@@ -253,64 +253,58 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
         }
     }
 
-    // **Both bridge shapes, because the page is an Android app's page and
-    // WebKitGTK only offers the WebKit one.**
+    // **The global the page actually looks for is `__globalRobloxAndroidBridge__`.**
     //
-    // `register_script_message_handler` above exposes these as
-    // `window.webkit.messageHandlers.<name>.postMessage(...)`. That is the
-    // shape WKWebView gives an iOS app -- `RobloxWKHybrid` is named for it --
-    // and it is the only shape WebKitGTK has. An Android WebView instead
-    // injects a *named object* through `addJavascriptInterface`, which the page
-    // reaches as `window.executeRoblox.someMethod(...)`.
+    // `register_script_message_handler` above exposes the handler as
+    // `window.webkit.messageHandlers.executeRoblox.postMessage(...)`, which is
+    // WebKitGTK's only shape. The page never touches that directly. It looks
+    // for a global object holding an `executeRoblox` **function that takes a
+    // JSON string**, and calls it as
     //
-    // `executeRoblox` is a real string in the shipping dex, so the name is
-    // right. What was missing is the object: a page probing for the Android
-    // shape found nothing, concluded it was not inside an app, and fell back to
-    // ordinary navigation. Reported as "pressing Join in the Servers window
-    // opens the game's detail page instead of joining", which read as a bridge
-    // that was not delivering when in fact nothing ever called it.
+    //     window.__globalRobloxAndroidBridge__.executeRoblox(jsonString)
     //
-    // The shim is a `Proxy`, not a fixed method list, because **nothing here
-    // knows which methods the page calls.** Enumerating guesses would be a
-    // stub that lies about what it accepts; a proxy forwards whatever arrives
-    // and says so. `method` travels with the payload so the receiving side can
-    // tell `join` from anything else once somebody has observed one.
+    // Two earlier attempts missed for different reasons and both are worth
+    // recording. The first shipped the message handler alone and nothing ever
+    // called it, which read as a bridge failing to deliver when in fact the
+    // page had concluded it was not inside an app and used an ordinary link --
+    // reported as "pressing Join opens the game's detail page instead of
+    // joining". The second guessed the Android `addJavascriptInterface` shape,
+    // `window.executeRoblox.someMethod(args)`, and was wrong in both the name
+    // and the calling convention: it is one function taking a string, not an
+    // object with methods.
     //
-    // It runs in the page's own world, not an isolated one -- unavoidable,
-    // since the point is for the page's own scripts to find it. That is why
-    // `webview_policy::bridge_message_acceptable` is re-checked against the
-    // *live* uri on every message rather than trusted from here.
+    // The shape is adapted from mocktail (`src/webview/webview_helper_policy.cc`,
+    // Apache-2.0), which is the third implementation this project has learned
+    // the platform's own vocabulary from rather than inferring it. Guessing at
+    // a JS calling convention is exactly as unreliable as guessing at a JNI
+    // descriptor, and this file now has two instances of each.
     //
-    // **Never log the payload**, only that a call happened and its method name.
-    // A bridge command carries whatever the page and the engine are
-    // mid-conversation about; `docs/analysis/webview-surface.md` §4's rule
-    // about one-time tickets applies to this direction too.
+    // `writable: false, configurable: false` so a page-defined object can never
+    // replace the native bridge, and the whole thing is a no-op when the
+    // handler is absent rather than installing a global that silently swallows
+    // calls. Policy is still re-checked against the live uri on every message,
+    // because this necessarily runs in the page's own world.
+    //
+    // **Never log the payload** -- it carries whatever the page and the engine
+    // are mid-conversation about.
     let shim = format!(
-        r#"(function () {{
-  var post = function (name, method, args) {{
-    try {{
-      var h = window.webkit && window.webkit.messageHandlers
-              && window.webkit.messageHandlers[name];
-      if (!h) {{ return undefined; }}
-      return h.postMessage({{ bridge: name, method: method, args: args }});
-    }} catch (e) {{ return undefined; }}
-  }};
-  ['{a}', '{b}'].forEach(function (name) {{
-    if (window[name]) {{ return; }}
-    try {{
-      window[name] = new Proxy({{}}, {{
-        get: function (_t, prop) {{
-          if (typeof prop !== 'string') {{ return undefined; }}
-          return function () {{
-            return post(name, prop, Array.prototype.slice.call(arguments));
-          }};
-        }}
-      }});
-    }} catch (e) {{ /* no Proxy: leave the WebKit shape as the only one */ }}
+        r#"(() => {{
+  "use strict";
+  const handlers = window.webkit && window.webkit.messageHandlers;
+  const handler = handlers && handlers.{a};
+  if (!handler) {{ return; }}
+  const bridge = {{}};
+  Object.defineProperty(bridge, "{a}", {{
+    value: (query) => handler.postMessage(JSON.parse(query)),
+    enumerable: true, writable: false, configurable: false
   }});
+  try {{
+    Object.defineProperty(window, "__globalRobloxAndroidBridge__", {{
+      value: bridge, enumerable: true, writable: false, configurable: false
+    }});
+  }} catch (_) {{ /* a page may not replace the native bridge */ }}
 }})();"#,
         a = BRIDGE_EXECUTE_ROBLOX,
-        b = BRIDGE_ROBLOX_WK_HYBRID,
     );
     user_content.add_script(&webkit6::UserScript::new(
         &shim,

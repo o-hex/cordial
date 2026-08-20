@@ -5464,3 +5464,40 @@ A key absent from Roblox's document survives the reloader, which is why
 The engine asks for **`GoogleAndroidApp`**. `client_settings.rs` asks for
 **`AndroidApp`**. Nobody has diffed the two documents. Cordial may be merging
 overrides into a different settings set from the one the engine reloads.
+
+## §48: the flag inventory was three orders of magnitude short, and delivery is unverified
+
+`docs/traces/native-flag-names.txt` holds 139 names, and a search across it for
+a TaskScheduler lever returned nothing. That was read as "no such flag exists".
+It meant the inventory was short.
+
+Roblox publishes the real list over a public endpoint — the same document the
+engine fetches for itself at t≈1.6–2.3 s, which is what §47 is about:
+
+    curl -s https://clientsettingscdn.roblox.com/v2/settings/application/GoogleAndroidApp
+
+**22,739 names for `GoogleAndroidApp`, 22,329 for `AndroidApp`, 22,741 together**,
+now in `docs/traces/client-settings-flag-names.txt`. Names only; values move
+under Roblox continuously and a snapshot here would be a stale claim about live
+configuration within days. Seventeen of them carry `TaskScheduler`, including
+`DFFlagTaskSchedulerRescheduleAsForeground`, `DFFlagTaskSchedulerMeasuresScheduledRestTime`
+and `FFlagTaskSchedulerRescheduleAllowed`; `FFlagEnableAndroidVsync` sits in the
+same area. `DFStringTaskSchedulerUnreliableSleepManufacturers` is published
+empty, and Cordial reports its manufacturer as `Cordial`, so it is not in play.
+
+**Two were tried against the h2 spin and neither moved it** — 125.5 % baseline,
+126.5 % with `FFlagEnableAndroidVsync=false`, 124.8 % with
+`FFlagTaskSchedulerRescheduleAllowed=false`, all at 59.6 presents/s.
+
+**Those are not yet negative results and must not be quoted as any.** Nothing in
+that run establishes that an override reaches the engine. `flags: 1 override(s)
+applied` is `flags::report` printing what Cordial *resolved*, one layer above
+delivery, and the `flagCount = 139` enumeration is a different path entirely —
+`nativeInitializeNativeFlags` takes a list of names whose *values* the engine
+loads itself, so an override would never appear in it whether it worked or not.
+
+**The next thing to establish is delivery, and it blocks every flag experiment
+after it.** Set a flag whose effect is loud and unmistakable, confirm it lands,
+and only then read a null result as a null result. Until that exists, any
+"flag X does nothing" claim from this codebase is untestable — including the two
+above, and including this project's older ones.

@@ -316,9 +316,22 @@ jobs:
     # Two gates on purpose. The ref gate keeps pull requests from publishing;
     # the variable gate keeps *anything* from publishing until someone sets it,
     # which is the point at which they have also turned Pages on.
+    # Tags are deliberately NOT listed, and that is a correction rather than a
+    # restriction. This condition used to invite them, and every tagged release
+    # then failed here after `build` had already succeeded: the `github-pages`
+    # environment carries a deployment branch policy naming `main` and nothing
+    # else, so a `v*` ref is refused by the environment no matter what this
+    # file says. v0.6.0 is the run that showed it -- build green, deploy red,
+    # for a reason invisible in the workflow.
+    #
+    # Publishing from `main` is not a workaround: a release commit is on main
+    # too, so tagging still publishes, one run earlier. If tagged deploys are
+    # ever wanted, the fix is a `v*` tag policy on the environment in repository
+    # settings, and this condition should only start naming tags once that
+    # exists -- a workflow that promises what the environment forbids is how
+    # this stayed hidden.
     if: >-
-      vars.PUBLISH_PAGES == 'true' &&
-      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      vars.PUBLISH_PAGES == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

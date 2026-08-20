@@ -338,11 +338,34 @@ fn enter_run_dir(opt: &mut Options) {
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir)
         .join("cordial/assets/ssl/cacert.pem");
-    let dest = root.join("exe/cacert.pem");
-    if ca.exists() && std::fs::read_link(&dest).ok().as_deref() != Some(ca.as_path()) {
-        let _ = std::fs::remove_file(&dest);
-        let _ = std::os::unix::fs::symlink(&ca, &dest);
-    }
+    let link_ca = |dest: std::path::PathBuf| {
+        if !ca.exists() {
+            return;
+        }
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::read_link(&dest).ok().as_deref() != Some(ca.as_path()) {
+            let _ = std::fs::remove_file(&dest);
+            let _ = std::os::unix::fs::symlink(&ca, &dest);
+        }
+    };
+    link_ca(root.join("exe/cacert.pem"));
+    // And under the engine's *files* directory, because `exe/cacert.pem` is
+    // relative to whatever root the engine has at the moment curl asks for it.
+    // With `nativeSetFilesDirectory` called late that is the working directory
+    // and the link above answers it; call the setter early and the engine builds
+    // `<filesDir>/exe/cacert.pem` instead, finds nothing, and reports `error
+    // adding trust anchors from file` on every HTTPS request -- which surfaces
+    // as `fetch flag exception: HttpError: Unknown` and `getFlags: success =
+    // false`, i.e. as a flags bug rather than a certificate one. Measured:
+    // `CORDIAL_EARLY_DIRS=files` produces exactly that, and the control in the
+    // same session does not. One symlink removes the dependency on which root
+    // wins the race.
+    let files_root = std::env::var("CORDIAL_FILES_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| cordial_runtime::profile::active().join("data"));
+    link_ca(files_root.join("files/exe/cacert.pem"));
 
     if let Err(e) = std::env::set_current_dir(&root) {
         println!("  could not enter {}: {e}", root.display());
@@ -1729,6 +1752,144 @@ fn main() -> ExitCode {
                             }
                         }
 
+                        // EXPERIMENTAL, `CORDIAL_EARLY_DIRS=1`: the four
+                        // `NativeSettingsInterface` directory setters here,
+                        // rather than only after `initializeNativeCode` has
+                        // returned.
+                        //
+                        // The engine composes the flag cache's tombstone path
+                        // once, during `postClientSettingsLoadedInitialization3`
+                        // — which the engine calls from `bootstrapTheApp`,
+                        // inside the `initializeNativeCode` below — and then
+                        // keeps it. A `CORDIAL_TRACE_PATHS=1` run shows
+                        // `fopen("cache/tombstone.dat") = null` 667 ms before
+                        // `nativeSetCacheDirectory ok`, and that same relative
+                        // path written again 5.2 s after it, while
+                        // `flag_cache.dat` in the same run is absolute because
+                        // the writer rebuilds that path per call. So the
+                        // tombstone records what the engine's cache directory
+                        // was at bootstrap time, and under Cordial that is the
+                        // empty string.
+                        //
+                        // **This is what finally brings `RbxStorage` up.**
+                        // `files` and `cache` both set here, and a real
+                        // `rbx-storage.db` with rows appears: five runs out of
+                        // five, against eight in the same session that produced
+                        // none — four with this off, two with only `cache`
+                        // early and two with only `files` early
+                        // (docs/analysis/flag-init.md §46). Neither directory
+                        // alone does it. The engine builds its content store
+                        // out of a permanent cache under the files directory
+                        // and a temporary one under the cache directory, so
+                        // being handed one of the two is being handed neither.
+                        //
+                        // Defaults to `files,cache` for that reason.
+                        // `CORDIAL_EARLY_DIRS=off` is the control; `all` (or
+                        // `1`) moves all four; a comma-separated subset of
+                        // `files`, `cache`, `external`, `base` picks them
+                        // individually, which is how the attribution above was
+                        // made.
+                        //
+                        // The earlier note here claimed 25 runs with only
+                        // `cache` early produced a store and that `cache` was
+                        // "the only one of the four that storage needs". Both
+                        // halves are withdrawn: no data root on this machine
+                        // holds a store from such a run, and `cache` alone was
+                        // re-run twice here and produced none. What `cache`
+                        // alone does produce is the absolute tombstone path,
+                        // which is what §44.8 partitioned on -- so the
+                        // tombstone form is a co-symptom of an early cache
+                        // directory and not a marker for the store, and a run
+                        // with `tomb=ABS` and no database is now on record.
+                        //
+                        // Why the tombstone moves at all, kept because it is
+                        // measured and still true: the engine composes that
+                        // path once, during
+                        // `postClientSettingsLoadedInitialization3` inside the
+                        // `initializeNativeCode` below, and then keeps it. A
+                        // `CORDIAL_TRACE_PATHS=1` run shows
+                        // `fopen("cache/tombstone.dat") = null` 667 ms before
+                        // `nativeSetCacheDirectory ok`, and the same relative
+                        // path written again 5.2 s after it, while
+                        // `flag_cache.dat` in that run is absolute because its
+                        // writer rebuilds the path per call.
+                        //
+                        // **`files` early needs the trust store**, which is why
+                        // `enter_run_dir` links `cacert.pem` under the files
+                        // directory as well as the run directory. Measured, in
+                        // this session, by gating that one link off and
+                        // changing nothing else: `error adding trust anchors
+                        // from file`, a hundred HTTP error lines, and a run
+                        // that never reaches the landing page. So the early
+                        // `files` call is skipped when that link is not in
+                        // place rather than silently taking HTTPS down with it
+                        // -- the bundle is extracted from the APK by
+                        // `asset_folder`, which does not run until the app
+                        // bridge, so a first launch into an empty asset cache
+                        // has no `cacert.pem` to link at all.
+                        let which = std::env::var("CORDIAL_EARLY_DIRS")
+                            .unwrap_or_else(|_| "files,cache".to_string());
+                        if which != "off" && which != "0" {
+                            let want = |k: &str| {
+                                which == "1" || which == "all"
+                                    || which.split(',').any(|p| p.trim() == k)
+                            };
+                            const SETTINGS: &str =
+                                "com/roblox/engine/jni/NativeSettingsInterface";
+                            let external = format!("{root}/external");
+                            if let Err(e) = std::fs::create_dir_all(&external) {
+                                println!("  could not create {external}: {e}");
+                            }
+                            let early: &[(&str, Vec<&str>)] = &[
+                                ("nativeSetFilesDirectory", vec![files.as_str()]),
+                                ("nativeSetCacheDirectory", vec![cache.as_str()]),
+                                ("nativeSetExternalDirectory", vec![external.as_str()]),
+                                (
+                                    "nativeSetBaseDataDirectories",
+                                    vec![files.as_str(), cache.as_str()],
+                                ),
+                            ];
+                            for (name, args) in early {
+                                let key = name
+                                    .strip_prefix("nativeSet")
+                                    .unwrap_or(name)
+                                    .split("Director")
+                                    .next()
+                                    .unwrap_or(name)
+                                    .to_ascii_lowercase();
+                                let key = key.strip_suffix("data").unwrap_or(&key);
+                                if !want(key) {
+                                    continue;
+                                }
+                                // See the note above: the files directory early
+                                // moves where curl looks for its CA bundle, so
+                                // without the link there this call is the
+                                // difference between a working client and one
+                                // whose every HTTPS request fails.
+                                if key == "files"
+                                    && !std::path::Path::new(&format!("{files}/exe/cacert.pem"))
+                                        .exists()
+                                {
+                                    println!(
+                                        "  nativeSetFilesDirectory NOT set early: no {files}/exe/cacert.pem, and early would break HTTPS"
+                                    );
+                                    continue;
+                                }
+                                let sym = format!(
+                                    "Java_com_roblox_engine_jni_NativeSettingsInterface_{name}"
+                                );
+                                match lib.symbol(&sym) {
+                                    None => println!("  {name} not exported (early)"),
+                                    Some(f) => match linker::game_activity::call_static_strings(
+                                        f, SETTINGS, args,
+                                    ) {
+                                        Ok(()) => println!("  {name} ok (early)"),
+                                        Err(e) => println!("  {name} failed (early): {e}"),
+                                    },
+                                }
+                            }
+                        }
+
                         // Install the bootstrap before the engine can call it.
                         // `initializeNativeCode` calls `bootstrapTheApp` and
                         // reads the flags verdict immediately after, so this is
@@ -1738,10 +1899,23 @@ fn main() -> ExitCode {
                         // hook installed but with nothing behind it, which
                         // reproduces the old behaviour in the same session.
                         // `CORDIAL_LATE_SETTINGS=1` moves the whole handshake
-                        // to after the app bridge, where Sober does it. Sober's
-                        // FLog file has nativeAppBridgeV2Init at 3.901, 200ms
-                        // AFTER RbxStorage::init; Cordial's has it at 1.781 as
-                        // the first line in the file. See flag-init.md §11.7.
+                        // to after the app bridge, which is **not** where Sober
+                        // does it -- that half of this note was wrong and is
+                        // corrected here rather than left to mislead the next
+                        // person into thinking the switch reproduces Sober.
+                        // Sober's own log, read today, has
+                        // `nativeInitClientSettings` at 7.5499,
+                        // `postClientSettingsLoadedInitialization3` at 7.5676,
+                        // `RbxStorage::init [INIT]` at 7.5770 and
+                        // `nativeAppBridgeV2Init` at 7.5873: the handshake runs
+                        // *before* the bridge, by 20 ms, and the store comes up
+                        // between them. mocktail and the Waydroid capture have
+                        // the same order. The rest of the note stands -- Sober's
+                        // bridge does follow `RbxStorage::init`, and Cordial's
+                        // is the first line in its own log file. See
+                        // flag-init.md §45.4 for the three captures side by
+                        // side, and §46 for why that ordering turned out not to
+                        // be the thing that was missing.
                         let late = std::env::var_os("CORDIAL_LATE_SETTINGS").is_some();
                         if std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_none() && !late {
                             const FLAG_NAMES: &str = include_str!("../native-flag-names.txt");
@@ -2972,6 +3146,75 @@ fn main() -> ExitCode {
                                         // when they were already run early.
                                         if !globals_early {
                                             call_globals(&lib, "late");
+                                        }
+
+                                        // EXPERIMENTAL, `CORDIAL_POST_BEFORE_BRIDGE=<ms>`:
+                                        // the post-settings call here, with the
+                                        // bridge held back for <ms> afterwards.
+                                        //
+                                        // All three working captures on this
+                                        // machine run
+                                        // `nativePostClientSettingsLoadedInitialization3`
+                                        // and then `RbxStorage::init` 4-14 ms
+                                        // later on another thread, and only then
+                                        // `nativeAppBridgeV2Init`
+                                        // (docs/analysis/flag-init.md §45.4).
+                                        // Cordial's *effective* post is the one
+                                        // after the surface handoff, seconds
+                                        // after the bridge. This is the only
+                                        // site that is both after the four
+                                        // directory setters, the storage
+                                        // manager and the init params -- all of
+                                        // which the engine plainly wants before
+                                        // it can build a store -- and before the
+                                        // bridge.
+                                        //
+                                        // The delay exists because
+                                        // `RbxStorage::init` runs on a different
+                                        // thread than the post call in every
+                                        // working capture, so going straight on
+                                        // to the bridge would race it.
+                                        //
+                                        // **It works and it does not help**, and
+                                        // both halves are worth keeping. The
+                                        // call here logs -- `2.183367` against a
+                                        // bridge at `2.725852` in one run and
+                                        // `1.632804` against `2.176352` in
+                                        // another -- so these are the first two
+                                        // Cordial logs on this machine in which
+                                        // `postClientSettingsLoadedInitialization3`
+                                        // precedes `nativeAppBridgeV2Init`, the
+                                        // ordering §45.4 found in all three
+                                        // working captures and in none of 106
+                                        // Cordial runs. Neither produced a
+                                        // store. With `CORDIAL_EARLY_DIRS=off`
+                                        // to isolate it, the shape the working
+                                        // captures share is reproducible and
+                                        // buys nothing; the directories are what
+                                        // the store was waiting for. See §46.
+                                        //
+                                        // Note that the whole
+                                        // `[FLog::ClientRunInfo]` block follows
+                                        // it here as it does on Android, except
+                                        // that `The base url is` prints empty --
+                                        // the post body runs before Cordial has
+                                        // told the engine its base URL, which is
+                                        // a difference nobody has chased.
+                                        if let Some(ms) = std::env::var("CORDIAL_POST_BEFORE_BRIDGE")
+                                            .ok()
+                                            .and_then(|v| v.parse::<u64>().ok())
+                                        {
+                                            match lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3") {
+                                                None => println!("  pre-bridge post: not exported"),
+                                                Some(f) => match linker::game_activity::post_client_settings_loaded(f) {
+                                                    Ok(()) => println!("  pre-bridge post: postClientSettingsLoadedInitialization3 ok"),
+                                                    Err(e) => println!("  pre-bridge post failed: {e}"),
+                                                },
+                                            }
+                                            if ms > 0 {
+                                                println!("  pre-bridge post: holding the bridge for {ms} ms");
+                                                std::thread::sleep(std::time::Duration::from_millis(ms));
+                                            }
                                         }
 
                                         // The app bridge proper. ActivitySplash —

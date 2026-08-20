@@ -5241,3 +5241,183 @@ Cordial run on this disk with no exceptions on either side, it was established
 entirely offline, and it is testable by making the engine's post-settings body
 run before `nativeAppBridgeV2Init` — which is what mocktail does by driving the
 sequence itself rather than waiting to be asked.
+
+## §46. `RbxStorage` initialises. It wanted the files *and* cache directories before `initializeNativeCode`, not a different ordering — twelve stores out of twelve, ten controls out of ten with none, and §45's ordering signature was measured with an instrument that could not have shown otherwise
+
+Build `0.6.0-15-g8784c1e-dirty` for every run in §46.2–§46.5 and
+`0.6.0-16-ge76e4df-dirty` for the cold-root run in §46.6; the tree was dirty
+throughout with the `CORDIAL_EARLY_DIRS`/cacert work §45 also ran against, plus
+this section's own edits, and from 15:49 with a parallel session's
+`native/init_params.cpp` and `flags.rs` changes, which land after every run
+except the cold one.
+
+### §46.1 The result
+
+`CORDIAL_EARLY_DIRS=files,cache` — both `nativeSetFilesDirectory` and
+`nativeSetCacheDirectory` called before `GameActivity.initializeNativeCode`
+rather than only after it returns — brings the content store up. A real
+`SQLite format 3` file at `<filesDir>/appData/rbx-storage.db` with the engine's
+own schema
+
+    CREATE TABLE files (id BLOB PRIMARY KEY NOT NULL, content BLOB,
+      size INTEGER DEFAULT 0 NOT NULL, hits INTEGER DEFAULT 0 NOT NULL,
+      atime INTEGER DEFAULT 0 NOT NULL, category INTEGER DEFAULT 0 NOT NULL,
+      score INTEGER DEFAULT 0 NOT NULL, ttl INTEGER DEFAULT 0 NOT NULL)
+
+carrying nine to eleven rows of `RBXH`-framed cached responses, beside the eight
+`rbx-storage/p*` partition directories and `rbx-storage-sc/`. Cordial pre-creates
+the empty `appData/rbx-storage` directory itself; the partitions, the
+session-scoped directory and the database are the engine's.
+
+One session, one data root, the store deleted before each run, arms and controls
+interleaved:
+
+    files,cache early    store 12 / 12    (incl. two on the plain default and one cold root)
+    nothing early        store  0 /  6
+    cache only early     store  0 /  2
+    files only early     store  0 /  2
+
+Neither directory alone does it, which is the part worth keeping: the engine
+builds a `MultiCache` out of a permanent cache under the files directory and a
+temporary one under the cache directory, and being handed one of the two is
+being handed neither. Against a base rate of roughly one store in twenty-six
+launches, twelve for twelve is not the base rate.
+
+`CORDIAL_EARLY_DIRS` now defaults to `files,cache`. It defaulted to `cache`,
+which is measured here to do nothing for storage.
+
+### §46.2 The ordering hypothesis was testable, was tested, and is wrong
+
+§45.4's signature — `postClientSettingsLoadedInitialization3` before
+`nativeAppBridgeV2Init` in all three working captures and in none of 109 Cordial
+logs — is real as a description and is not the mechanism.
+
+`CORDIAL_POST_BEFORE_BRIDGE=<ms>` calls the post-settings native immediately
+before the app bridge and then holds the bridge for `<ms>`. It works: the
+`[FLog::AndroidGLView] nativePostClientSettingsLoadedInitialization3` line lands
+at 2.183367 against a bridge at 2.725852 in one run and 1.632804 against
+2.176352 in another, the full `[FLog::ClientRunInfo]`/`Mimalloc` block follows it
+exactly as on Android, and these are the first two Cordial logs on this machine
+that are POST_FIRST. **Neither produced a store**, with `CORDIAL_EARLY_DIRS=off`
+so that nothing else was in play.
+
+The converse holds too: the twelve runs that *did* produce a store are, on the
+same scoring, BRIDGE_FIRST — their logged post is the late one at ~2.9 s. So the
+store appears without the ordering and the ordering appears without the store.
+The two are independent, and §45.4's `INFERRED` causal note is withdrawn.
+
+One curiosity from the pre-bridge site, not chased: the block prints
+`The base url is` with nothing after it, where the late call prints
+`https://www.roblox.com`.
+
+### §46.3 §45.4's separation could not have come out any other way
+
+**In 104 of the 106 current-engine logs on this machine the first line in the
+file is `nativeAppBridgeV2Init`.** Not the first interesting line — the first
+line. Cordial calls `nativeOverrideChannelPlatformName`,
+`nativeSetRobloxChannel`, the four directory setters, `initStorageManagerNativeV3`,
+`setPlatformImpl`, the init params and `nativeReadLocalFlags` before the bridge,
+and none of them writes anything to the engine's log file. Sober's log opens on
+`RobloxChannel has been set to production` and mocktail's on
+`nativeInitClientSettings`, both well before their bridge.
+
+So a Cordial log cannot show POST_FIRST unless something arranges for the log
+file to exist earlier, and the score of BRIDGE_FIRST 75/75, POST_FIRST 0/75 was
+guaranteed before any run was taken. §45 established a property of Cordial's
+logging, not of Cordial's ordering. (The two exceptions are in
+`~/.cache/cordial-agent-t`: `b2c9c`, whose log opens on `readLocalFlags` at
+0.3275 with a broken `https:///v2/...` settings URL, and `29325`, which opens on
+a `RobloxTelemetryFactory` warning.)
+
+Cordial has in fact called `postClientSettingsLoadedInitialization3` before the
+bridge on every default run since the bootstrap was written — inside
+`bootstrapTheApp`, at around 0.2 s. §44's "the early call was always a no-op"
+rests on the absence of a log line it could not have produced. Whether that
+early call's body runs is still not established; what is established is that the
+absence of the line is not evidence either way.
+
+### §46.4 §45.7 is resolved: the store comes up before the log file exists
+
+In all twelve positive runs the `rbx-storage/p*` partitions are born **before**
+the engine's log file:
+
+    files,cache early, early post on     store ~0.93–1.03 s before the log file
+    early post off, or post before bridge  store ~10–12 ms before the log file
+
+and every one of those runs has zero `RbxStorage::init` lines. So the answer to
+§45.7's "either the store can come up without logging, or earlier sections
+credit the wrong run" is the first, with a mechanism: `RbxStorage::init` logs at
+Critical, but Critical to a file that does not exist yet goes nowhere. §41's
+"absence means it is not called" is therefore only sound for the window after
+the bridge, and §36's original instinct that the channel was silent was right
+for the wrong reason. `ec3a3` keeps its credit.
+
+This also means nobody has yet *seen* `RbxStorage::init` under Cordial. Getting
+the log open before ~0.2 s would settle the last of it; the pre-bridge post is
+one way in (it opens the log where it runs) but the store beats it by 10 ms even
+then.
+
+### §46.5 Three scorers this file has recommended, and what they are actually worth
+
+**`LocalStorageManager is not available` does not mean the store is absent.**
+Ten of the twelve positive runs print it — twice in eight of them. §44.6 flagged
+"the store it asks for is `RbxStorage`" as `INFERRED`; it is now refuted. It does
+partition something: the two positives that print it *zero* times are the two
+where the store came up within 12 ms of the log opening, so it looks like a
+timing marker for whether the store was up before whatever asks. As a storage
+scorer it is wrong, and §45.6's advice to use it is withdrawn.
+
+**The tombstone path form is a co-symptom of the cache directory, not a marker
+for the store.** `cache` alone early gives `tomb=ABS` and no database, twice. It
+tracks `nativeSetCacheDirectory` being early and nothing else, so §44.8's clean
+four-run partition was a coincidence of those four runs having been taken with
+an early cache directory.
+
+**`gameActivity_onFlagsFailed` still fires twice in runs whose store is up.** The
+message in `native/init_params.cpp:873` tells the reader "this does not block
+startup but it does block the content store", and that is now false. That file
+was out of scope for this session; it should be corrected.
+
+The scorer that does work is the filesystem: `rbx-storage.db` exists, is
+`SQLite format 3`, and `select count(*) from files` is non-zero.
+
+### §46.6 The uncommitted CA-certificate work: keep it, it is load-bearing
+
+`load.rs` carried an unattributed 126-line diff — the `CORDIAL_EARLY_DIRS` switch
+itself and a second `cacert.pem` symlink under the files directory. It builds
+(`just build toolbox`, exit 0), and the symlink is not optional for the
+configuration that fixes storage. Gating that one link off and changing nothing
+else, with `files,cache` early:
+
+    link present    landing reached, store 45,056 bytes, 9 rows
+    link absent     `error adding trust anchors from file`, 100 HTTP/flag error
+                    lines, landing never reached, store 28,672 bytes with 1 row
+
+So its own comment was right. The store still comes up without the network,
+which is worth knowing separately.
+
+Two claims in that diff's comment are withdrawn, both corrected in place: that
+25 runs with only `cache` early produced a store against 14 controls that did not
+— no data root on this disk holds a store from such a run, and `cache` alone was
+re-run twice here with none — and that `cache` is "the only one of the four that
+storage needs".
+
+The early `files` call is now skipped, loudly, when `<filesDir>/exe/cacert.pem`
+is missing. The bundle is extracted from the APK by `asset_folder`, which does
+not run until the app bridge, so a first launch into an empty asset cache has
+nothing to link; without the guard that launch would lose HTTPS entirely. A cold
+root with the asset cache already populated — the ordinary case — reaches the
+landing page and produces a store.
+
+### Where this leaves it
+
+Storage is up. `cargo test --workspace` in the toolbox: 604 passed, 0 failed, 19
+suites.
+
+What is not established: why the two directories are needed *before*
+`initializeNativeCode` rather than a second later, given that §27 set all four
+before `libroblox.so`'s constructors and got nothing; what opens the engine's log
+file, and therefore how much of every Cordial run so far has been invisible;
+whether the early post inside `bootstrapTheApp` runs its body; and whether the
+store is actually *used* for anything beyond the eleven rows a 30-second landing
+run puts in it — nobody has yet watched an asset come back out of it.

@@ -879,13 +879,29 @@ public:
 /// as "your flag data failed to load", and that is not what happened — the
 /// flags did load. Whatever this verdict is actually testing remains unknown;
 /// only that it is not "do I have flags".
+///
+/// **And it does not block the content store either — that claim is withdrawn
+/// as of 2026-08-20.** The message used to say it did, which was the best guess
+/// available while `RbxStorage` had never once initialised. It has now
+/// initialised: `onFlagsFailed` fires twice in the same runs that produce a
+/// 45,056-byte `rbx-storage.db` with the engine's own `files` table and eight
+/// engine-created partitions, measured three times over. Both facts in one run
+/// is as direct a refutation as this question can get.
+///
+/// The cause of the store never appearing was `nativeSetCacheDirectory` being
+/// called after `GameActivity.initializeNativeCode` instead of before it
+/// (`CORDIAL_EARLY_DIRS`, flag-init.md §46) and had nothing to do with this
+/// verdict. Naming a second symptom as the consequence of a first, when both
+/// were merely present together, is how this became load-bearing for two
+/// investigations that went nowhere.
 class NativeHelper : public Object {
 public:
     static void onFlagsFailed(ENV*, Object*) {
         fprintf(stderr,
             "[roblox] flags: engine reported onFlagsFailed (the flag data did "
-            "load; this does not block startup but it does block the content "
-            "store — see docs/analysis/flag-init.md)\n");
+            "load, and this blocks neither startup nor the content store — "
+            "what the verdict actually tests is still unknown; see "
+            "docs/analysis/flag-init.md)\n");
     }
     /// The buffer is the flag cache the engine hands back for the app to keep.
     /// On Android that is where `flag_cache.dat` comes from — Sober's log writes

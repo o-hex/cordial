@@ -1837,14 +1837,35 @@ int cordial_init_storage_manager(void* fn, const char* a, const char* b, char* e
         return -1;
     }
     try {
+        // **An instance, not the class.** The dex declares this as
+        // `LocalStorageManager.initStorageManagerNativeV3(AssetManager, String,
+        // String)V` with no ACC_STATIC, so JNI's second argument is `this`.
+        // This used to pass `to_jni(env, cls)` -- the `Class` object itself --
+        // which is what a *static* native expects and is a different thing
+        // entirely from an instance of that class.
+        //
+        // Nothing threw, so `cordial_init_storage_manager` returned 0 and
+        // Cordial has been logging `initStorageManagerNativeV3 ok` on every
+        // run while handing the engine a receiver of the wrong kind. That is
+        // the same failure as the static-vs-instance mismatch on
+        // `NetworkUtils.getPublicIPv4Addresseses` found hours earlier, and the
+        // reason it survives is always the same: an exception would have been
+        // noticed, and there isn't one.
+        //
+        // mocktail, whose store works, passes `NewObject(env,
+        // "com/roblox/client/LocalStorageManager")` here. Reading that is what
+        // exposed this; `docs/analysis/flag-init.md` had spent nine sections
+        // downstream of a call that was being made wrongly.
         auto cls = env->GetClass("com/roblox/client/LocalStorageManager");
+        auto self = std::make_shared<jnivm::Object>();
+        self->clazz = cls;
         auto am_cls = env->GetClass("android/content/res/AssetManager");
         auto am = std::make_shared<jnivm::Object>();
         am->clazz = am_cls;
         auto sa = cordial::S_pub(a ? a : "");
         auto sb = cordial::S_pub(b ? b : "");
         reinterpret_cast<Call>(fn)(env->GetJNIEnv(),
-                                   (jobject)cordial::to_jni(env, cls),
+                                   (jobject)cordial::to_jni(env, self),
                                    (jobject)cordial::to_jni(env, am),
                                    (jstring)cordial::to_jni(env, sa),
                                    (jstring)cordial::to_jni(env, sb));

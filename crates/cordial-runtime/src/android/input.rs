@@ -79,6 +79,12 @@ pub fn keysym_to_android(keysym: c_ulong) -> Option<i32> {
         0x30..=0x39 => 7 + (k - 0x30) as i32,  // 0..9 -> AKEYCODE_0..9
         0x61..=0x7a => 29 + (k - 0x61) as i32, // a..z -> AKEYCODE_A..Z
         0x41..=0x5a => 29 + (k - 0x41) as i32, // A..Z (shifted) -> the same keycodes
+        // F1..F12. `XK_F1` is 0xffbe and `AKEYCODE_F1` is 131, both
+        // contiguous, so one range covers the row. Absent until now, and their
+        // absence dropped the whole function row before it reached the engine
+        // -- see `dispatch_key`, where the evdev call used to sit inside the
+        // `if let` this returns `None` to.
+        0xffbe..=0xffc9 => 131 + (k - 0xffbe) as i32,
         0x0020 => 62,                          // space
         0xff0d | 0xff8d => 66,                 // Return, KP_Enter
         0xff08 => 67,                          // BackSpace

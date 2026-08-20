@@ -2791,16 +2791,29 @@ impl WaylandWindow {
             );
         }
 
+        // **`pass_key_event` is deliberately outside the `if let`.** It takes
+        // the evdev code, which is always in hand, and needs nothing from the
+        // Android table -- the comment below has said so for as long as the
+        // call has existed, while the call itself sat inside a branch that
+        // required a successful Android mapping anyway.
+        //
+        // The cost was the entire function row. `keysym_to_android` had no
+        // entry for F1..F12, so every one of them took the `else` and reached
+        // the engine through neither path. Reported as "combos work, just not
+        // the function row", and two `CORDIAL_ANDROID_TRACE` captures contain
+        // no F5 and no F11 at all. The `else` branch did say so on every press
+        // -- `wayland: unmapped keysym` -- but it is a trace line, and the
+        // greps that were run looked for `passKeyEvent`.
         if let Some(keycode) = super::input::keysym_to_android(keysym) {
             if handle != 0 {
                 super::input::deliver_key(handle, down, keycode, evdev_key as i32, meta, 0, unicode, now, now);
             }
-            // The evdev code, not the Android keycode: this native speaks the
-            // platform's own vocabulary. See `pass_key_event`.
-            super::input::pass_key_event(down, evdev_key as i32, meta);
         } else {
             super::trace(format_args!("wayland: unmapped keysym {keysym:#x}"));
         }
+        // The evdev code, not the Android keycode: this native speaks the
+        // platform's own vocabulary. See `pass_key_event`.
+        super::input::pass_key_event(down, evdev_key as i32, meta);
 
         if !down {
             return;

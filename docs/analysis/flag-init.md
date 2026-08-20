@@ -4706,3 +4706,164 @@ does not cross. `tools/engine-text-diff.py` already recorded the distinction:
 mocktail forces the state, Sober reaches it, and Sober is therefore the only
 model worth copying. Ideas from mocktail remain fair game — its
 `EnsureDefaultDataLayout` is already adopted — but not this one.
+
+## §43. IXP is not the lead. The two absences are separate facts, and §42's adjacency argument is refuted by a capture already in the repository
+
+§42 asked whether `FLog::IxpStorageManager`'s absence and `RbxStorage::init`
+never running are one fact or two. They are two, and the evidence that settles
+it needed no new instrument — `docs/traces/waydroid-roblox-startup.log.gz` has
+been in the repository the whole time and contains both lines.
+
+### The Sober ordering §42 reasoned from is a race, not a sequence
+
+Sober puts `IxpStorageManager` four lines above `RbxStorage::init`. The real
+Android client puts them the other way round:
+
+    0.415087  Critical [FLog::Output]           Build system id: 1
+    0.415765  Info     [FLog::AppMemUsageStatus] 923286370
+    0.415828  Critical [DFLog::RbxStorage]      RbxStorage::init [INIT] user: flagLoaded   <- tid 10025
+    0.417668  Warning  [FLog::IxpStorageManager] Failed to open cache file for reading     <- tid 9880
+    0.417709  Warning  [FLog::IxpStorageManager] Failed to open random ID file for reading
+    0.417866  Error    [FLog::TombstoneCache]   Failed to open tombstone file for reading
+    0.417891  Warning  [FLog::LocalStorageHandler] Not available on the current platform.
+    0.420     D rbx.JNIRobloxSettings           Registered Flag Provider ID from Java: 0
+    0.444492  Critical [DFLog::RbxStorage]      RbxStorage::init [DONE]
+
+`RbxStorage::init` is on a pool thread in both captures — `b5b31cf0` here,
+`d1b0b6c0` in Sober — while the block around it is on the main thread. It lands
+1.8 ms *before* `IxpStorageManager` on Waydroid and 2.5 ms *after* it on Sober.
+The main-thread order is identical in the two (`Build system id` →
+`AppMemUsageStatus` → `IxpStorageManager` → tombstone → `LocalStorageHandler`);
+only the worker moves. **Proximity in Sober's log is the scheduler, not a
+dependency**, which is what §42 warned about and then reasoned from anyway.
+
+The same three lines kill a second inherited belief. §41 read Sober's ordering
+as "the two lines before it are `Registered Flag Provider ID from Java: 0` and
+`flagCount`". On Waydroid `RbxStorage::init [INIT] user: flagLoaded` fires
+**4.5 ms before** the Java flag provider registers. Whatever `flagLoaded` is, it
+is not downstream of `nativeInitializeNativeFlags`, and looking for the
+notification on that side is looking in the wrong place.
+
+### `IxpStorageManager` hangs off the Lua app, not the flags path
+
+Two of the 223 Cordial engine logs on this machine contain the channel, both in
+`~/.cache/cordial-agent-t`, `2.734.0.917_20260819T0745{25,47}Z`. In the second:
+
+    0.281692  Warning [FLog::DataModelPatchConfigurer] getCachedPatch: get patch from content provider for Model
+    0.293493          [FLog::DataModelPatchConfigurer] deserializeAndVerifyPatch with blake3
+    0.370555  Warning [FLog::IxpStorageManager]        Failed to open cache file for reading
+    0.492239  Warning [FLog::SingleSurfaceApp]         Register rendering frequency during startup.
+    ...
+    1.384317  Critical [FLog::Output]                  Build system id: 1
+    1.384453  Info     [FLog::AppMemUsageStatus]       923286370
+
+IXP initialises inside `initializeLuaAppWithLoggedInUser`, **a full second
+before that run's post-settings block**. On Android the Lua app starts and the
+settings post lands within the same two milliseconds, so the two appear
+adjacent; under Cordial they are a second apart and the adjacency dissolves.
+`IxpStorageManager` was never in the post-settings block, and §42's table put it
+there because Sober's timing put it there.
+
+### §35.3 identified the wrong file, and its conclusion is withdrawn
+
+§35.3 closed the IXP question by pointing at a path trace —
+`fopen("./appData/ClientSettings/IxpSettings.json") = null` — and concluding the
+Ixp cache open is attempted and the channel is merely quiet. It is not the same
+file. A path trace taken today shows that open happening between
+`fopen("./exe/ClientSettings/ClientAppSettings.json")` and
+`nativeInitClientSettings -> 0`; it belongs to the settings loader, which the
+engine logs on `[FLog::ClientSettings]` as `LoadIxpSettingsFromLocal`. The
+strings in `libroblox.so` keep the two apart plainly: `IxpSettings.json` sits
+beside `LoadIxpSettingsFromLocal path: "{}"`, while `IxpStorageManager`'s own
+files are `ixp_cache_v1` and `ixp_cache_random_id`, with
+`success_random_id_file_write` and `fail_open_random_id_file_write` beside them.
+
+So §35.3's "eighth instrument fault" was itself a misreading. The rule it
+derived — an absence in a log is not an absence in the engine — is still right,
+and is what the next paragraph rests on. Only the file identification was wrong.
+
+### The subsystem has run under Cordial many times, and said nothing
+
+`ixp_cache_random_id` appears as a literal in `libroblox.so` and nowhere else:
+not in the APK's dex (`unzip -p base.apk '*.dex' | strings | grep -c` is 0) and
+not in Cordial's own source. Only the engine writes it. Eleven Cordial profiles
+have one, each holding a distinct 36-byte UUID, at
+`<profile>/data/files/ixp_cache_random_id` — the same shape as Sober's, which
+lives at `data/sober/assets/ixp_cache_random_id` and has held one UUID since
+Sober's first launch on 2026-07-24. In `cordial-agent-policy` and
+`cordial-agent-crash`, both single-run profiles, the file's mtime is inside the
+same second as the profile's only engine log, and neither log mentions the
+channel.
+
+**So `IxpStorageManager` ran, generated an ID and wrote it, in runs whose logs
+carry no `IxpStorageManager` line at all.** §42's "0 vs 1" was never evidence
+that the subsystem does not run here.
+
+### In today's build it does not run, and that is a separate regression
+
+Five runs today, all on fresh data roots, build `v0.6.0-7-ga483b01-dirty`
+(the tree gained `a19b945` and `a483b01` from another session between run 1 and
+run 3; all five agree):
+
+    run  flags.json                                    Ixp  Tombstone  RbxStorage  ixp_cache_random_id
+    1    none                                            0      6           0      not written
+    2    FLogIxpStorageManager=7, FLogTombstoneCache=7   0      0           0      not written
+    3    both = "Verbose"                                0      3           0      not written
+    4    both = "Verbose"                                0      3           0      not written
+    5    both = "Verbose"                                0      3           0      not written
+
+`find /var/home/neilluo -name ixp_cache_random_id -newermt 2026-08-20` returns
+nothing: no run today wrote one anywhere on this machine, inside a profile or
+out of it.
+
+Run 2 is the control that makes the rest readable, and it repeats §22.3 exactly:
+setting `FLogTombstoneCache` to the bare number `7` **silences** the channel that
+run 1 printed six lines on, and the severity name `Verbose` restores it. So the
+value does reach the engine through `flags.json` and does change what it logs —
+and `FLogIxpStorageManager` set the same way, in the same runs, produces
+nothing. Neither channel is configured in the live settings document
+(`FLogIxpStorageManager`, `DFLogRbxStorage`, `FLogTombstoneCache`,
+`FLogLocalStorageHandler` are all absent from it), so both were at their engine
+default on 2026-08-19 as well, when the line did print.
+
+The window is otherwise unchanged. Today's run 5 reaches
+`getCachedPatch: get patch from content provider for Model` at 1.2055 and
+`deserializeAndVerifyPatch with blake3` at 1.2218, exactly as 2026-08-19 did at
+0.2817 and 0.2935 — and then goes straight to `Register rendering frequency` at
+1.9693 with nothing in between, where the older run had the IXP line. One line
+did appear in that gap that was absent on 2026-08-19:
+`Warning [DFLog::RbxmFileManager] LocalStorageManager is not available.` at
+1.2056. Whether that displaced IXP or merely arrived alongside it is **not
+established** and is a question for the local-storage thread, not this one.
+
+`FLog::LocalStorageHandler` also stopped appearing today, and that one is
+already explained: §40 made `setPlatformImpl` unconditional, and the code
+comment records the control — the warning appears twice a run when the call is
+skipped and not at all when it is made. §42's table listing Cordial as producing
+it was measured before that landed. Not a regression.
+
+### The answer, and the branch this closes
+
+The two absences are **not the same fact**:
+
+* they are raised from different call sites — IXP from
+  `initializeLuaAppWithLoggedInUser`, `RbxStorage::init` from a pool worker
+  answering `flagLoaded`;
+* they are not ordered with respect to each other in the working control, so
+  neither can be upstream of the other;
+* they dissociate in Cordial's own history. Two of 223 logs carry
+  `IxpStorageManager` and eleven profiles carry IXP's own file; **not one log,
+  and no profile, has ever carried `RbxStorage::init`**. A shared dependency
+  cannot produce that.
+
+**IXP is a dead end for storage.** It is worth writing down that today's build
+also stopped running it, because that is a real behavioural change with a date
+range around it — between the `cordial-agent-t` run at 2026-08-19 07:45Z and the
+`cordial-agent-repro` runs at 2026-08-19 20:50Z, which is the window holding
+`5c5266a`, `e8badbb`, `9a0de84` and the 06:39-onwards batch. But it is a
+different bug from the one this document is about, and the storage question does
+not go through it.
+
+The better thread is the one §41 opened and could not name: what raises
+`flagLoaded`. Waydroid says it is not the Java flag registration. Nothing else
+in either capture names it.

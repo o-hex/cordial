@@ -4034,6 +4034,16 @@ one line on `DFLog::RbxStorage`. So every conclusion of the form "storage never
 runs, because no `RbxStorage::init` line appears" was reasoning from an absence
 on a channel that is silent **even when storage succeeds**.
 
+> **Superseded by §41 and §44.** The claim in this paragraph that the channel is
+> silent even on success is wrong, and it was load-bearing for a lot of scoring.
+> `DFLog::RbxStorage` logs both ends of a successful init at **Critical**, which
+> prints irrespective of channel level — Sober's log shows it. The belief came
+> from Cordial's one working run logging nothing, and one silent success does not
+> establish a silent channel. Separately, §44 identifies `DFLog::RbxmFileManager`
+> as an on-by-default one-line-per-run marker that scores whether the store came
+> up, and it retro-scores every engine log already on disk.
+
+
 That includes the framing of §§12–24 and the confident negatives in §29–§35. The
 *mechanical* findings survive — the empty `stat("")` triple is real and observed,
 the timing in §28 is measured, the eliminations of `getenv`, system properties,
@@ -4141,6 +4151,16 @@ eight engine-created partitions, made by this client. What is not known is what
 made it happen, and the log channel that would say is silent even on success, so
 every score taken from it across this document is void.
 
+> **Superseded by §41 and §44.** The claim in this paragraph that the channel is
+> silent even on success is wrong, and it was load-bearing for a lot of scoring.
+> `DFLog::RbxStorage` logs both ends of a successful init at **Critical**, which
+> prints irrespective of channel level — Sober's log shows it. The belief came
+> from Cordial's one working run logging nothing, and one silent success does not
+> establish a silent channel. Separately, §44 identifies `DFLog::RbxmFileManager`
+> as an on-by-default one-line-per-run marker that scores whether the store came
+> up, and it retro-scores every engine log already on disk.
+
+
 The one instrument that works is the filesystem. It has now been pointed at the
 delay, at warmth, at the storage flags, and at content activity, and all four are
 negative. Whoever continues should keep using it and should not trust a single
@@ -4177,6 +4197,16 @@ Reachable — proven twice over now, by structure and by contents. Not reproduce
 against the delay, warmth, the storage flags and content activity, all measured
 on the filesystem. And the log channel that would say what happened is silent
 even on success, which voids most of the scoring in this document.
+
+> **Superseded by §41 and §44.** The claim in this paragraph that the channel is
+> silent even on success is wrong, and it was load-bearing for a lot of scoring.
+> `DFLog::RbxStorage` logs both ends of a successful init at **Critical**, which
+> prints irrespective of channel level — Sober's log shows it. The belief came
+> from Cordial's one working run logging nothing, and one silent success does not
+> establish a silent channel. Separately, §44 identifies `DFLog::RbxmFileManager`
+> as an on-by-default one-line-per-run marker that scores whether the store came
+> up, and it retro-scores every engine log already on disk.
+
 
 Nine instrument faults, eight of them an absence read as evidence. That is the
 finding this file is actually worth, more than any individual candidate: **in

@@ -5601,3 +5601,85 @@ counted. None of those is distinguishable without a positive control: a flag wit
 a known, observable effect on this build. **That control is the blocker, and it
 has now been the blocker three sections running.** Nothing else here is worth
 running until it exists.
+
+## §49: a positive control at last — `DFIntTaskSchedulerTargetFps`
+
+Three sections have ended by saying the blocker is a flag with a known,
+observable effect. There is one, and it is unambiguous.
+
+`DFIntTaskSchedulerTargetFps` caps the frame rate, and the cap lands on the
+requested number. Measured with input driven for the whole run
+(`CORDIAL_SCRIPT=0:focus-on,0:motion-on`, `CORDIAL_INSTR=1`), which is the only
+present-rate measurement this project trusts, on `0.6.0-52-gd0469e7-dirty`
+(dirty is `Cargo.lock` and the `mcpelauncher-linker` submodule; no tracked source
+differs):
+
+    override      last presents/s samples                       runs
+    (none)        36.5 47.0 42.0 42.3 47.2 41.6 / 34.8 41.8 34.6    2
+    ...=10        10.5  9.9 10.5  9.6  9.5 10.9 / 9.8 9.5 9.7       2
+    ...=15        16.0 14.4 14.9 14.9 15.9 15.0                     1
+    ...=20        20.0 19.3 20.7 20.0 20.0 20.0 / 20.0 20.5 19.5    3
+
+The control is the uncapped arm in the same session, twice, and it is nowhere
+near any of the capped numbers. The effect tracks the *value*, not merely the
+presence of an override: 10, 15 and 20 each produce their own number. Six runs.
+
+`FIntTaskSchedulerTargetFps` — the same name with the durable prefix — does
+nothing (44.0 40.1 54.1 39.0 39.7, indistinguishable from uncapped). That is the
+right answer and it is worth having: it shows the prefix is load-bearing and that
+the engine is matching the whole name, so a null from a misspelled flag is
+detectable rather than silent.
+
+`DFIntTaskSchedulerTargetFps=45` also showed nothing (36.0 38.8 30.6 28.9 38.0),
+and that is **not** a contradiction: the uncapped arm only reaches 35–47, so a
+cap at 45 has almost nothing to bind on. It is uninformative, not negative. A
+positive control has to be set below what the machine already delivers.
+
+### What this settles
+
+**Flag delivery works.** Overrides written to `CORDIAL_FLAGS` are merged by
+`apply_overrides`, carried in `plan.settings`, handed to
+`nativeInitClientSettings`, and *acted upon by the engine*. §48c established the
+route by reading; this establishes it by running. The theory that no override
+had ever reached the engine — which §48b advanced and §48c retracted on a code
+read — is now dead on evidence as well.
+
+**A `DFInt` override survives the settings reloader.** §47 records that `DF*`
+values are re-read and reverted at t≈1.6–2.3 s, and that was taken to mean a
+`DF*` override could not hold. This cap held for all 25 seconds of every run.
+The reloader evidently re-reads the same document Cordial supplied, so an
+override placed in that document is what it reverts *to*. `DF*` flags are
+therefore usable, and §47 should be read as describing where the value comes
+from rather than as a reason to avoid the family.
+
+**Every earlier null is now a real null.** The TaskScheduler pair, the two log
+flags, the thread-count probe and `FIntGraphicsVulkanMinAndroidVersion` (tested
+here at 99 against a reported `SDK_INT` of 33, no effect on Vulkan bring-up —
+three swapchains either way) are statements about those flags on this build, not
+about the delivery path. They were uninterpretable; they are now interpretable
+and they are negative.
+
+### Two instruments retired
+
+`onFlagsLoaded`'s byte count is **a constant, not a measurement.** It reported
+1,308,253 bytes identically across every arm tried: an `FInt` lengthened by six
+characters, an `FString` lengthened by 1,001, and a document with 903 keys and
+87 KB removed. Whatever `buf->capacity` describes, it does not vary with the
+document. `native/init_params.cpp:940` prints it, and it reads like a delivery
+readout, which is exactly why this is written down.
+
+Handing the engine a 58-byte settings document **segfaults it**, reproducibly
+(exit 139, 139, 133 on three runs), at renderer bring-up — it reaches
+`game loaded: place 0` and dies where the full-document run creates its
+swapchain. Tempting as a control, it is not one: a bisection over the 22,326
+keys crashed on *both* halves at the first split, so the engine requires many
+flags rather than any single one, and there is no culprit to name. Dropping all
+440 `Graphics`/`Vulkan`/`Render` keys, by contrast, runs clean.
+
+### The next thing
+
+The pinned core now has a testable route. The h2/h3 pair — focus-on with motion
+at 128.1% CPU against focus-off with motion at 27.5%, both at 59.6 presents/s —
+can be re-run against TaskScheduler flag candidates with `DFIntTaskSchedulerTargetFps`
+alongside as the control that proves delivery in that same session. That is the
+first time the spin has been approachable by flag at all.

@@ -73,8 +73,29 @@ pub mod webview;
 /// rather than an unwrap, because this is called from the engine bring-up path
 /// where a panic would take the client down over a colour.
 pub fn prefers_dark() -> bool {
-    if !libadwaita::is_initialized() {
+    // **`libadwaita::is_initialized()` panics if GTK is not up**, so it cannot
+    // be used as the guard -- calling it early takes the process down with
+    // "Gtk has to be initialized before using libadwaita". That is exactly what
+    // happened when this was first called before `initializeNativeCode`, which
+    // is where it has to be called from: the engine bakes `uiMode` into its
+    // Configuration there, so anything read afterwards is read too late.
+    //
+    // So the setting is read through `gio`, which needs no display connection
+    // and no `gtk_init`. `org.gnome.desktop.interface color-scheme` is the same
+    // key the desktop's own appearance follows and the one libadwaita's style
+    // manager watches, so this is the same answer from one layer down rather
+    // than a second opinion.
+    //
+    // False when the schema is absent -- a desktop that does not publish it has
+    // not said, and guessing dark would be as wrong as guessing light.
+    use gtk4::gio;
+    use gtk4::prelude::SettingsExt;
+    const SCHEMA: &str = "org.gnome.desktop.interface";
+    let Some(source) = gio::SettingsSchemaSource::default() else {
+        return false;
+    };
+    if source.lookup(SCHEMA, true).is_none() {
         return false;
     }
-    libadwaita::StyleManager::default().is_dark()
+    gio::Settings::new(SCHEMA).string("color-scheme") == "prefer-dark"
 }

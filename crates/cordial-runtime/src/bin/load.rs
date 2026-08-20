@@ -1963,6 +1963,32 @@ fn main() -> ExitCode {
                             println!("  bootstrapTheApp NOT installed (CORDIAL_NO_BOOTSTRAP)");
                         }
 
+                        // **Before `initializeNativeCode`, not after it.**
+                        //
+                        // This sat beside `set_display_size` and ran 153 log
+                        // lines too late: the engine builds its Configuration
+                        // during `initializeNativeCode`, so it had already
+                        // decided night mode was off. The value was correct
+                        // and arrived after the only reader.
+                        //
+                        // Reported as "system preferences for dark is still
+                        // not making roblox dark" after the value itself was
+                        // fixed -- the third ordering bug of the day, after the
+                        // cache directory and the early post, all three being
+                        // the right answer at the wrong moment.
+                        //
+                        // Read from libadwaita's style manager, so from
+                        // `org.freedesktop.appearance`'s `color-scheme`. Logged
+                        // because "dark mode does not work" is three different
+                        // failures and this line separates them.
+                        // No `libadwaita::is_initialized()` here: that call
+                        // panics when GTK is not up, and at this point it is
+                        // not. It was in the first version of this line and
+                        // took the process down twice.
+                        let dark = cordial_shell::prefers_dark();
+                        println!("  uiMode: night={}", if dark { "yes" } else { "no" });
+                        linker::game_activity::set_ui_mode_night(if dark { 1 } else { 0 });
+
                         println!("\ncalling GameActivity.initializeNativeCode");
                         match linker::game_activity::initialize(f, &files, &files, &files) {
                             Ok(handle) => {
@@ -1991,38 +2017,6 @@ fn main() -> ExitCode {
                                         // resolution, which is why it survived
                                         // this long, and wrong by the whole
                                         // difference once anyone goes fullscreen.
-                                        // The desktop's dark/light preference,
-                                        // read from libadwaita's style manager --
-                                        // which is driven by
-                                        // `org.freedesktop.appearance`'s
-                                        // `color-scheme`, the same source the
-                                        // rest of the session uses. Sent before
-                                        // the init params are built, because
-                                        // `uiMode` is baked into the
-                                        // Configuration there.
-                                        //
-                                        // Whether the engine re-reads this
-                                        // mid-session is NOT established --
-                                        // Sober needs a restart for a theme
-                                        // change too, which is weak evidence it
-                                        // caches. Treat this as correct at
-                                        // launch and unproven afterwards.
-                                        // Logged, because "dark mode still does
-                                        // not work" is indistinguishable from
-                                        // three different failures: libadwaita
-                                        // not initialised in this process yet,
-                                        // the portal saying light, or the engine
-                                        // ignoring what it was told. This line
-                                        // separates the first two from the third.
-                                        let adw_up = libadwaita::is_initialized();
-                                        let dark = cordial_shell::prefers_dark();
-                                        println!(
-                                            "  uiMode: night={} (libadwaita initialised: {adw_up})",
-                                            if dark { "yes" } else { "no" }
-                                        );
-                                        linker::game_activity::set_ui_mode_night(
-                                            if dark { 1 } else { 0 },
-                                        );
                                         linker::game_activity::set_display_size(
                                             width as i32,
                                             height as i32,

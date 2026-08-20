@@ -158,6 +158,84 @@ fn portal_colour_scheme() -> Option<u32> {
     None
 }
 
+/// When Cordial stops holding the engine at full rate.
+///
+/// **The engine has an idle throttle of its own and this decides when to stop
+/// defeating it.** `input::idle_keepalive` sends `nativePassMouseMove` on every
+/// pump tick while a key is held, because without it the engine collapses from
+/// about sixty presents a second to exactly one about thirteen seconds after
+/// the last mouse movement — a player walking in a straight line gets throttled
+/// mid-play. That workaround used to run unconditionally, so Cordial held the
+/// engine at full rate in the background on purpose.
+///
+/// **This governs Cordial's own keepalive and nothing else.**
+/// `onWindowFocusChangedNative` is reported to the engine truthfully on every
+/// real transition whatever this is set to; answering a platform question
+/// honestly is not a setting. On [`ThrottleWhen::Off`] the engine still knows
+/// it is unfocused and Cordial simply carries on driving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThrottleWhen {
+    /// Throttle only when the window is not visible — minimised, on another
+    /// workspace, or fully covered.
+    ///
+    /// The default, and deliberately not `Unfocused`. A second monitor with
+    /// Roblox running on it while the user types in Discord on the first is an
+    /// unfocused window somebody is watching, and throttling it would be worse
+    /// than the problem this setting exists to fix; so is alt-tabbing away from
+    /// a load screen, which is when a stream most wants the frames. Visibility
+    /// is the question actually being asked and Wayland answers it directly —
+    /// `xdg_toplevel`'s `suspended` state, which reaches this process as
+    /// `GdkToplevelState::SUSPENDED`.
+    Visible,
+    /// Throttle whenever the window loses focus. The most saving, and wrong for
+    /// anyone who watches Cordial while working in another window.
+    Unfocused,
+    /// Never throttle. Full rate in the background, which is what a recording
+    /// or a long download inside the client wants.
+    Off,
+}
+
+impl Default for ThrottleWhen {
+    fn default() -> Self {
+        ThrottleWhen::Visible
+    }
+}
+
+impl ThrottleWhen {
+    /// Order matches the `AdwComboRow` model in `settings.rs`, on the same
+    /// footing as [`AppearanceScheme::index`] — see that comment for why the
+    /// seam is a position rather than a name.
+    pub fn index(self) -> u32 {
+        match self {
+            ThrottleWhen::Visible => 0,
+            ThrottleWhen::Unfocused => 1,
+            ThrottleWhen::Off => 2,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            0 => ThrottleWhen::Visible,
+            1 => ThrottleWhen::Unfocused,
+            _ => ThrottleWhen::Off,
+        }
+    }
+
+    /// The word the client parses out of `CORDIAL_THROTTLE`. Passed through the
+    /// environment rather than read from `shell.json` for the same reason
+    /// `graphics` is: the client is a separate process with its own idea of
+    /// where configuration lives, and the launch is the one place that already
+    /// knows both.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThrottleWhen::Visible => "visible",
+            ThrottleWhen::Unfocused => "unfocused",
+            ThrottleWhen::Off => "off",
+        }
+    }
+}
+
 /// The profile a launch runs against when nobody has chosen otherwise.
 ///
 /// ADR-012's migration lands the pre-existing storage at `profiles/default`, so
@@ -188,6 +266,10 @@ pub struct ShellConfig {
     /// population this default hurts. `false` here becomes `CORDIAL_GAMEMODE=0`
     /// on the client, which is also the control for measuring what it does.
     pub gamemode: bool,
+    /// When Cordial stops defeating the engine's idle throttle. See
+    /// [`ThrottleWhen`], which carries the whole of the reasoning.
+    #[serde(default)]
+    pub throttle: ThrottleWhen,
     /// What Cordial does about a new Roblox build without being asked, and over
     /// which connections it may fetch one.
     ///
@@ -284,6 +366,7 @@ impl Default for ShellConfig {
             automatic_updates: cordial_update::settings::Automatic::default(),
             download_on: cordial_update::settings::DownloadOn::default(),
             gamemode: true,
+            throttle: ThrottleWhen::default(),
             graphics: "automatic".to_string(),
             mangohud: false,
             fullscreen_accel: default_fullscreen_accel(),
@@ -339,6 +422,30 @@ mod tests {
         let dir = std::env::temp_dir().join("cordial-shell-config-test");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    #[test]
+    fn the_throttle_row_and_the_stored_word_agree() {
+        // The `AdwComboRow` seam, and the word the client parses, checked
+        // together — they are two encodings of the same three states and
+        // nothing else would notice them drifting apart.
+        for w in [ThrottleWhen::Visible, ThrottleWhen::Unfocused, ThrottleWhen::Off] {
+            assert_eq!(ThrottleWhen::from_index(w.index()), w);
+        }
+        assert_eq!(ThrottleWhen::default(), ThrottleWhen::Visible);
+        assert_eq!(ThrottleWhen::Visible.as_str(), "visible");
+        assert_eq!(ThrottleWhen::Unfocused.as_str(), "unfocused");
+        assert_eq!(ThrottleWhen::Off.as_str(), "off");
+    }
+
+    #[test]
+    fn an_older_config_without_a_throttle_row_gets_the_visible_default() {
+        // The row is new, so every existing shell.json lacks it. Landing on
+        // anything but Visible would change behaviour for people who never
+        // opened the setting.
+        let p = scratch("no-throttle.json");
+        std::fs::write(&p, br#"{"appearance":"dark","gamemode":true}"#).unwrap();
+        assert_eq!(load(&p).throttle, ThrottleWhen::Visible);
     }
 
     #[test]

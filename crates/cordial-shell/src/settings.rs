@@ -40,7 +40,7 @@ use cordial_plugins::source::LocalFileSource;
 use cordial_plugins::unpack;
 
 use crate::install;
-use crate::shell_config::{self, AppearanceScheme, ShellConfig};
+use crate::shell_config::{self, AppearanceScheme, ShellConfig, ThrottleWhen};
 
 /// What a plugin asks for, and what this profile has actually given it.
 ///
@@ -384,6 +384,36 @@ fn build_performance_group(
         });
     }
     group.add(&gamemode);
+
+    // Order has to match ThrottleWhen::index/from_index.
+    let throttle_model = gtk::StringList::new(&[
+        "When the window is not visible",
+        "When the window is not focused",
+        "Never",
+    ]);
+    let throttle = adw::ComboRow::builder()
+        .title("Slow the game down in the background")
+        .subtitle(
+            "Roblox slows itself down when nothing is happening, and Cordial normally keeps \
+             it awake while you play. This is when Cordial stops doing that. Not visible is \
+             the default because a window on a second monitor is one you are still watching. \
+             Not focused saves the most and will slow that window down. Never keeps full \
+             speed everywhere. Roblox is told when the window loses focus either way — this \
+             only changes what Cordial does about it.",
+        )
+        .model(&throttle_model)
+        .selected(config.borrow().throttle.index())
+        .build();
+    throttle.set_subtitle_lines(7);
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        throttle.connect_selected_notify(move |row| {
+            config.borrow_mut().throttle = ThrottleWhen::from_index(row.selected());
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&throttle);
 
     let layer = crate::launch::mangohud_layer();
     let mangohud = adw::SwitchRow::builder()

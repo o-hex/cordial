@@ -2593,6 +2593,21 @@ static KEYBOARD_FOCUSED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn keyboard_leave(_data: *mut c_void, _kb: *mut c_void, _serial: u32, _surface: *mut c_void) {
     KEYBOARD_FOCUSED.store(false, Ordering::Release);
+    // **And forget the surface `enter` named, or the gate above undoes
+    // itself.** `reconcile_keyboard_focus` re-asserts focus from
+    // `LAST_ENTERED_SURFACE` whenever `KEYBOARD_FOCUSED` is false — which is
+    // exactly the state a `leave` has just produced — so the next thing to
+    // call it set the flag straight back to true. `keyboard_key` calls it
+    // before checking the gate, so the privacy fix the gate exists for was
+    // defeated by its own reconciliation: a key delivered after focus moved
+    // away re-armed the gate and was then processed.
+    //
+    // Found while wiring focus through to the engine: `focused()` reported
+    // `Some(true)` on every tick of a run in which the window had been
+    // minimised twenty seconds earlier and `GdkToplevelState` had long since
+    // dropped `FOCUSED`. An `enter` that has been followed by a `leave` is not
+    // an unsettled notification, and there is nothing left to reconcile.
+    LAST_ENTERED_SURFACE.store(0, Ordering::Release);
     // A window that does not have focus has no business holding the cursor.
     // The compositor deactivates the lock by itself here — that is what
     // `unlocked` is for — but the *request* would survive, and with a
@@ -3386,6 +3401,63 @@ static DISPLAY_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 pub fn pump_input_events(handle: i64) {
     if let Some(w) = current() {
         w.pump(handle);
+    }
+}
+
+/// Whether the compositor currently gives this window keyboard focus, for the
+/// pump to hand on to the engine.
+///
+/// The engine was never told. `onWindowFocusChangedNative` reached it exactly
+/// twice in a session — `true` inline in `cordial_game_activity_start`, and
+/// `false` in `looper::teardown` — so for the whole of the run in between,
+/// Roblox believed it was the focused window whatever the user was actually
+/// looking at, and kept rendering and simulating at full rate behind whatever
+/// they had switched to. That is the "takes away your resources from your
+/// other programs when you are unfocused" report.
+///
+/// **`GdkToplevelState::FOCUSED`, not this file's own `KEYBOARD_FOCUSED`.**
+/// The first attempt used the latter and it reported `Some(true)` on every
+/// tick of a run in which the window had been minimised twenty seconds
+/// earlier: `reconcile_keyboard_focus` was re-asserting focus from a stale
+/// `LAST_ENTERED_SURFACE`, which is a bug in its own right and is fixed at
+/// [`keyboard_leave`]. Even with that fixed the toplevel's state is the better
+/// source — it is what `xdg_toplevel.configure` said, which is what Android's
+/// `hasWindowFocus` corresponds to, and it comes from the same place as
+/// [`visible`] rather than from a second seat object tracking a related but
+/// different question. Measured against the `minimise` script action it drops
+/// `FOCUSED` within one pump tick, where `SUSPENDED` takes about four seconds.
+///
+/// `None` until GTK has a toplevel — see [`visible`] for why that is not
+/// `Some(false)`.
+pub fn focused() -> Option<bool> {
+    current().and_then(|w| w.host.0.focused())
+}
+
+/// Whether the compositor still considers this window visible, for the pump's
+/// throttle policy.
+///
+/// `None` is "not known yet" and must not be read as "not visible" — see
+/// [`cordial_shell::host_window::HostWindow::visible`], which carries the
+/// protocol detail and the note about what was measured rather than assumed.
+pub fn visible() -> Option<bool> {
+    current().and_then(|w| w.host.0.visible())
+}
+
+/// The toplevel's whole state as a string, for the run that established what
+/// [`visible`] can see. `CORDIAL_INSTR=1` prints it beside the geometry.
+pub fn instr_toplevel_state() -> String {
+    match current().and_then(|w| w.host.0.toplevel_state()) {
+        Some(s) => format!("{s:?}"),
+        None => "no-toplevel".to_string(),
+    }
+}
+
+/// Minimise or restore from a scripted run. See
+/// [`cordial_shell::host_window::HostWindow::set_minimised`] for why this is
+/// the only honest way to exercise the visibility path here.
+pub fn instr_set_minimised(on: bool) {
+    if let Some(w) = current() {
+        w.host.0.set_minimised(on);
     }
 }
 

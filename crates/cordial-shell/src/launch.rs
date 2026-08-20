@@ -226,6 +226,13 @@ pub fn spawn(
         command.env("CORDIAL_GAMEMODE", "0");
     }
 
+    // When Cordial stops holding the engine awake in the background. Passed
+    // unconditionally, unlike `CORDIAL_GRAPHICS` above: there is no plugin
+    // opinion for an absent variable to leave room for, and the client's own
+    // default has to match the shell's or the two disagree about what a fresh
+    // install does.
+    command.env("CORDIAL_THROTTLE", config.throttle.as_str());
+
     // The Graphics row, and **only when it is not Automatic**. That is not a
     // micro-optimisation: an absent variable is what tells the runtime the user
     // has no opinion, which is the one state in which a plugin's request is

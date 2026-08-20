@@ -284,6 +284,22 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
         .filter_map(|(t, a)| Some((t.trim().parse().ok()?, a.trim().to_string())))
         .collect();
     script.reverse();
+    // The focus state last handed to the engine, so a transition can be told
+    // from a repeat. Seeded `Some(true)` and not `None` because
+    // `cordial_game_activity_start` has already driven
+    // `onWindowFocusChangedNative(true)` inline by the time the pump runs --
+    // seeding `None` would send a duplicate `true` on the first tick of every
+    // launch.
+    let mut focus_reported: Option<bool> = Some(true);
+    // `focus-off`/`focus-on` -- see the override's own comment at the call site.
+    let mut focus_override: Option<bool> = None;
+    // `visible-off`/`visible-on` -- the same override as `focus_override`, for
+    // the other half of the policy. See the call site.
+    let mut visible_override: Option<bool> = None;
+    // Read once here rather than per tick. `CORDIAL_THROTTLE=off` is also the
+    // control for every measurement of what this gate saves: it restores the
+    // unconditional keepalive in the same binary and the same session.
+    let policy = super::input::throttle_policy();
     let mut motion = false;
     // `touch-on`/`touch-off` and `look-on`/`look-off` isolate the two halves
     // `motion-on` drives together, to find which one the idle throttle
@@ -329,6 +345,19 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                 match action.as_str() {
                     "fullscreen" => super::backend_set_fullscreen(true),
                     "windowed" => super::backend_set_fullscreen(false),
+                    // `minimise`/`unminimise` ask GTK about Cordial's own
+                    // window -- the only honest way to make the compositor
+                    // change this window's visibility, since every route that
+                    // would click the real control injects at the compositor
+                    // and lands on the developer's session.
+                    "minimise" => super::wayland::instr_set_minimised(true),
+                    "unminimise" => super::wayland::instr_set_minimised(false),
+                    "visible-off" => visible_override = Some(false),
+                    "visible-on" => visible_override = Some(true),
+                    "visible-real" => visible_override = None,
+                    "focus-off" => focus_override = Some(false),
+                    "focus-on" => focus_override = Some(true),
+                    "focus-real" => focus_override = None,
                     "motion-on" => motion = true,
                     "motion-off" => motion = false,
                     "touch-on" => motion_touch = true,
@@ -535,17 +564,87 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                 (iters - i0) as f64 / dt,
                 super::backend_instr_geometry(),
             );
+            eprintln!(
+                "[instr] t={:5.1}s focus={:?} visible={:?} toplevel={} policy={:?}",
+                start.elapsed().as_secs_f64(),
+                super::backend_focused(),
+                super::backend_visible(),
+                super::wayland::instr_toplevel_state(),
+                policy,
+            );
             p0 = p;
             q0 = q;
             i0 = iters;
         }
         if let Some(handle) = game_activity_handle {
             super::pump_input_events(handle);
+            // Tell the engine when the user has switched away, and when they
+            // have come back.
+            //
+            // `onWindowFocusChangedNative` used to reach the engine exactly
+            // twice: `true` inline in `cordial_game_activity_start`, and
+            // `false` from `teardown` below. Nothing in between, so Roblox
+            // spent the whole session believing it was the focused window and
+            // kept simulating and rendering at full rate behind whatever the
+            // user had switched to -- the "takes away your resources from your
+            // other programs when you are unfocused" report.
+            //
+            // Only on a genuine transition. `window_focus` crosses into the
+            // engine through JNI and Android itself only sends this on a
+            // change; driving it every tick would be a call the engine has
+            // never seen at that rate, which is the shape of change this
+            // codebase's history says to avoid making casually.
+            //
+            // `None` from the backend means "not known" and leaves the last
+            // reported state alone -- see `backend_focused`.
+            // `CORDIAL_SCRIPT=...,60:focus-off,120:focus-on` overrides what
+            // the backend reports, so the two states can be measured against
+            // each other inside one run without going near the compositor --
+            // AGENTS.md forbids synthesising input at one, and alt-tabbing by
+            // hand mid-measurement is not a control. It overrides the *report*
+            // and nothing else, so what the engine is told is the same call it
+            // would get from a real switch away.
+            let observed = match focus_override {
+                Some(f) => Some(f),
+                None => super::backend_focused(),
+            };
+            if let Some(now) = observed {
+                if focus_reported != Some(now) {
+                    if let Err(e) = cordial_linker_sys::game_activity::window_focus(handle, now) {
+                        eprintln!("[android] onWindowFocusChangedNative({now}) failed: {e}");
+                    }
+                    if instr {
+                        eprintln!(
+                            "[instr] t={:5.1}s focus -> {now}",
+                            start.elapsed().as_secs_f64()
+                        );
+                    }
+                    focus_reported = Some(now);
+                }
+            }
             // See `input::idle_keepalive`'s own comment: the engine's idle
             // throttle answers to `nativePassMouseMove` landing, not to a key
             // being held, so a player walking without touching the mouse gets
             // throttled mid-play unless something keeps sending that call.
-            super::input::idle_keepalive();
+            //
+            // Gated, because the background is precisely where the engine's
+            // own throttle is wanted. Without a gate this defeats it
+            // unconditionally, so a key still held at the moment the user
+            // switched away kept the engine at full rate behind them for as
+            // long as it stayed held -- and `wl_keyboard.leave` delivers no
+            // key-up, so a key held across a focus change stays held in
+            // `KEYS_HELD` for the rest of the run.
+            //
+            // What counts as "the background" is the user's to choose and
+            // defaults to "not visible" rather than "not focused"; see
+            // `input::ThrottleWhen`.
+            let visible = match visible_override {
+                Some(v) => Some(v),
+                None => super::backend_visible(),
+            };
+            if super::input::keepalive_wanted(policy, observed, visible) {
+                super::input::idle_keepalive();
+            }
         }
         looper_poll_once(
             if watching { 50 } else { 8 },

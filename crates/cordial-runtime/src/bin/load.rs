@@ -3773,6 +3773,15 @@ fn main() -> ExitCode {
         }
     }
 
+    // Whether Roblox's own storage came up, which the engine's `RbxStorage::init
+    // [INIT]` line would say if it were not logged before the log file exists.
+    // The same `files` directory the tree above was created under.
+    cordial_runtime::storage::report(std::path::Path::new(&format!(
+        "{}/files",
+        std::env::var("CORDIAL_FILES_DIR")
+            .unwrap_or_else(|_| format!("{}/data", cordial_runtime::profile::active().display()))
+    )));
+
     stubs::report();
 
     // Everything the engine asked for that Cordial could not answer, in one

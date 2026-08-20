@@ -563,6 +563,60 @@ fn track_key_held(down: bool, evdev_code: i32) {
 /// call when the interface native is not registered yet, since
 /// [`pass_mouse_move_delta`] already falls through to
 /// [`report_unregistered`]'s deduplicated logging rather than spamming.
+/// When Cordial stops sending [`idle_keepalive`], from `CORDIAL_THROTTLE`.
+///
+/// The shell's "Slow the game down in the background" row sets this; see
+/// `cordial_shell::shell_config::ThrottleWhen`, which holds the reasoning for
+/// why `Visible` is the default rather than `Unfocused`. Parsed once, because
+/// the launch settles it and nothing changes it mid-run.
+///
+/// **This governs the keepalive only.** `onWindowFocusChangedNative` is driven
+/// on every genuine transition whatever this says — the engine is told the
+/// truth about focus and this decides what Cordial does about it. Anything
+/// unrecognised, including the variable being absent, is `Visible`: an old
+/// shell launching a new client, or a client started by hand, gets the default
+/// rather than a refusal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThrottleWhen {
+    Visible,
+    Unfocused,
+    Off,
+}
+
+pub fn throttle_policy() -> ThrottleWhen {
+    static POLICY: std::sync::OnceLock<ThrottleWhen> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var("CORDIAL_THROTTLE").as_deref() {
+        Ok("unfocused") => ThrottleWhen::Unfocused,
+        Ok("off") => ThrottleWhen::Off,
+        _ => ThrottleWhen::Visible,
+    })
+}
+
+/// Whether the keepalive should run this tick.
+///
+/// `focused` and `visible` are `None` when the backend does not track them —
+/// X11 tracks neither — and `None` keeps the keepalive running. That is
+/// deliberate and is the whole reason these are three-valued: throttling a
+/// window because nothing was watching it would be the same class of bug as
+/// never throttling at all, arriving from the other side.
+///
+/// Pure, and separate from [`idle_keepalive`], so the policy table is testable
+/// without a window, a compositor or a loaded engine.
+pub fn keepalive_wanted(policy: ThrottleWhen, focused: Option<bool>, visible: Option<bool>) -> bool {
+    match policy {
+        ThrottleWhen::Off => true,
+        ThrottleWhen::Unfocused => focused != Some(false),
+        // Not `visible != Some(false)` alone. A minimised window reports both
+        // unfocused and not visible, but a compositor that reports neither
+        // `SUSPENDED` nor `MINIMIZED` for a window it has hidden would leave
+        // this setting doing nothing at all; losing focus is the weaker
+        // signal and is not sufficient on its own, so it is not consulted
+        // here. If that compositor turns up, this is where the second
+        // condition goes.
+        ThrottleWhen::Visible => visible != Some(false),
+    }
+}
+
 pub fn idle_keepalive() {
     let any_held = !KEYS_HELD.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
     if !any_held {
@@ -1370,6 +1424,32 @@ pub fn script_type(handle: i64, text: &str, now_ms: i64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole policy table, because the interesting cases are the ones
+    /// nobody thinks about: a backend that does not know, and a window that is
+    /// unfocused but plainly visible on the other monitor.
+    #[test]
+    fn the_keepalive_stops_only_where_the_setting_says_it_should() {
+        use ThrottleWhen::*;
+        // Off never throttles, whatever the window is doing.
+        for f in [None, Some(true), Some(false)] {
+            for v in [None, Some(true), Some(false)] {
+                assert!(keepalive_wanted(Off, f, v), "Off must keep going: {f:?} {v:?}");
+            }
+        }
+        // Unfocused throttles on lost focus and ignores visibility.
+        assert!(!keepalive_wanted(Unfocused, Some(false), Some(true)));
+        assert!(keepalive_wanted(Unfocused, Some(true), Some(false)));
+        // Visible is the default, and the case it exists for: a window on the
+        // second monitor, not focused, still being watched.
+        assert!(keepalive_wanted(Visible, Some(false), Some(true)));
+        assert!(!keepalive_wanted(Visible, Some(false), Some(false)));
+        assert!(!keepalive_wanted(Visible, Some(true), Some(false)));
+        // "Not known" is not "not visible". X11 tracks neither and must keep
+        // the behaviour it has always had rather than throttling itself.
+        assert!(keepalive_wanted(Visible, None, None));
+        assert!(keepalive_wanted(Unfocused, None, None));
+    }
 
     #[test]
     fn paste_is_ctrl_v_and_not_its_neighbours() {

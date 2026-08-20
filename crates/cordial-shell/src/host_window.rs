@@ -340,6 +340,62 @@ impl HostWindow {
         surface.wl_surface_raw().map(std::ptr::NonNull::as_ptr)
     }
 
+    /// Whether the compositor currently considers this window focused.
+    ///
+    /// `xdg_toplevel`'s `activated` state, which GDK reports as
+    /// `GdkToplevelState::FOCUSED`. `None` means there is no toplevel yet, on
+    /// the same footing as [`Self::visible`].
+    pub fn focused(&self) -> Option<bool> {
+        let surface = self.window.surface()?;
+        let toplevel = surface.downcast::<gtk::gdk::Toplevel>().ok()?;
+        Some(toplevel.state().contains(gtk::gdk::ToplevelState::FOCUSED))
+    }
+
+    /// Whether the compositor still considers this window visible.
+    ///
+    /// `None` means there is no toplevel to ask yet, which is not `Some(false)`
+    /// — the caller throttles on this, and treating "not realised" as "not
+    /// visible" would throttle a window during its own bring-up.
+    ///
+    /// `SUSPENDED` is the interesting half and it is a real protocol answer
+    /// rather than a guess: `xdg_toplevel`'s `suspended` state, added in
+    /// xdg-shell version 6, is the compositor saying the surface's content is
+    /// not visible and the client may stop drawing it. GDK surfaces it as
+    /// `GdkToplevelState::SUSPENDED`. `MINIMIZED` is included because a
+    /// minimised window is not visible either and a compositor is free to
+    /// report only that.
+    ///
+    /// **Measured on this desktop rather than taken from the protocol text** —
+    /// see `looper::pump`'s `minimise` script action and the report that used
+    /// it. What a compositor does for a *covered* window is its own choice and
+    /// is not established here.
+    pub fn visible(&self) -> Option<bool> {
+        let surface = self.window.surface()?;
+        let toplevel = surface.downcast::<gtk::gdk::Toplevel>().ok()?;
+        let hidden = gtk::gdk::ToplevelState::MINIMIZED | gtk::gdk::ToplevelState::SUSPENDED;
+        Some(!toplevel.state().intersects(hidden))
+    }
+
+    /// The toplevel's whole state, for the instrumented run that established
+    /// what [`Self::visible`] can actually see. Not used by anything else.
+    pub fn toplevel_state(&self) -> Option<gtk::gdk::ToplevelState> {
+        let surface = self.window.surface()?;
+        Some(surface.downcast::<gtk::gdk::Toplevel>().ok()?.state())
+    }
+
+    /// Minimise or restore the window from code, for the same reason
+    /// [`Self::set_fullscreen`] exists and under the same rule: the visibility
+    /// signal cannot be tested by clicking the real control, because every
+    /// route that would do the clicking injects at the compositor and lands on
+    /// the developer's session.
+    pub fn set_minimised(&self, on: bool) {
+        if on {
+            self.window.minimize();
+        } else {
+            self.window.present();
+        }
+    }
+
     /// Where the content slot sits inside the toplevel's surface, in surface
     /// coordinates: `(x, y, width, height)`.
     ///

@@ -179,6 +179,36 @@ pub fn window_closed() -> bool {
     }
 }
 
+/// Whether the engine's window currently has focus, for the active backend.
+///
+/// `None` means "this backend does not know", which is not the same answer as
+/// `Some(false)` and must not be collapsed into one: the caller drives
+/// `onWindowFocusChangedNative` off this, and telling the engine it has lost
+/// focus because nothing was watching would throttle a window the user is
+/// looking at. X11 answers `None` for that reason — `window.rs` selects no
+/// `FocusChangeMask` and ADR-011 makes X11 the diagnostic fallback, so it keeps
+/// the behaviour it has always had rather than growing a second implementation
+/// of this.
+pub fn backend_focused() -> Option<bool> {
+    match backend() {
+        Backend::Wayland => wayland::focused(),
+        Backend::X11 => None,
+    }
+}
+
+/// Whether the engine's window is visible, for the active backend.
+///
+/// `None` means "not known", on the same footing and for the same reason as
+/// [`backend_focused`]. X11 answers `None`: `window.rs` tracks no visibility
+/// and a `_NET_WM_STATE_HIDDEN` reader would be a second implementation of
+/// something ADR-011 makes the fallback.
+pub fn backend_visible() -> Option<bool> {
+    match backend() {
+        Backend::Wayland => wayland::visible(),
+        Backend::X11 => None,
+    }
+}
+
 /// Drain and deliver whatever host input is queued, for the active backend.
 pub fn pump_input_events(handle: i64) {
     match backend() {

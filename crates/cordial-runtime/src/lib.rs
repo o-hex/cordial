@@ -31,6 +31,7 @@ pub mod refresh;
 pub mod secrets;
 pub mod bionic;
 pub mod mimalloc_lib;
+pub mod storage;
 pub mod stubs;
 pub mod symtab;
 pub mod unimplemented;

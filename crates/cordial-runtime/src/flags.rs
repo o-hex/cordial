@@ -463,8 +463,16 @@ impl DeviceProfile {
 }
 
 impl Default for DeviceProfile {
+    /// **PC since 2026-08-20**, previously `AndroidTablet`.
+    ///
+    /// This must stay in step with `presenting_as_pc()` in
+    /// `native/init_params.cpp`, which is the one that actually reaches the
+    /// engine -- see [`DEVICE_PROFILE_KEY`] for why the flag layer does not.
+    /// Two defaults that disagree is the same drift `cordial_build_user_agent`
+    /// exists to prevent, and it would be invisible: this side would report one
+    /// identity in the log while the engine sent the other.
     fn default() -> Self {
-        DeviceProfile::AndroidTablet
+        DeviceProfile::PcWindows11
     }
 }
 

@@ -133,12 +133,25 @@ std::shared_ptr<Object> cordial_make_zero_insets(ENV* env);
 /// which is out of scope for this change. So the environment variable read
 /// here is, for now, the only thing that actually reaches the engine; see
 /// `flags.rs`'s module doc on `DEVICE_PROFILE_KEY` for the rest of this gap.
+/// **The default is the PC identity as of 2026-08-20**, where it was the
+/// Android tablet before. `CORDIAL_DEVICE_PROFILE=android-tablet` selects the
+/// old behaviour, and the parsing is deliberately generous in both directions
+/// so a reasonable spelling does not silently land on the opposite profile --
+/// an unrecognised value is reported by `flags.rs` rather than guessed at.
+///
+/// Worth knowing before changing this back or forth: the engine being loaded is
+/// still Roblox's **Android** build, whatever this says. This switch changes the
+/// platform words the client sends, not what it is, and the two are now
+/// deliberately different. `osVersion` stays "33" in both profiles -- see the
+/// comment at that field for why -- so the identity is not internally uniform
+/// and nobody should read it as a complete disguise.
 static bool presenting_as_pc() {
     static const bool v = [] {
         const char* e = getenv("CORDIAL_DEVICE_PROFILE");
-        if (!e) return false;
+        if (!e) return true;
         std::string s(e);
-        return s == "pc-windows-11" || s == "pc" || s == "windows" || s == "windows-11";
+        if (s == "android-tablet" || s == "android" || s == "tablet") return false;
+        return true;
     }();
     return v;
 }

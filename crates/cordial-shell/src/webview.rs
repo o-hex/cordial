@@ -253,6 +253,73 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
         }
     }
 
+    // **Both bridge shapes, because the page is an Android app's page and
+    // WebKitGTK only offers the WebKit one.**
+    //
+    // `register_script_message_handler` above exposes these as
+    // `window.webkit.messageHandlers.<name>.postMessage(...)`. That is the
+    // shape WKWebView gives an iOS app -- `RobloxWKHybrid` is named for it --
+    // and it is the only shape WebKitGTK has. An Android WebView instead
+    // injects a *named object* through `addJavascriptInterface`, which the page
+    // reaches as `window.executeRoblox.someMethod(...)`.
+    //
+    // `executeRoblox` is a real string in the shipping dex, so the name is
+    // right. What was missing is the object: a page probing for the Android
+    // shape found nothing, concluded it was not inside an app, and fell back to
+    // ordinary navigation. Reported as "pressing Join in the Servers window
+    // opens the game's detail page instead of joining", which read as a bridge
+    // that was not delivering when in fact nothing ever called it.
+    //
+    // The shim is a `Proxy`, not a fixed method list, because **nothing here
+    // knows which methods the page calls.** Enumerating guesses would be a
+    // stub that lies about what it accepts; a proxy forwards whatever arrives
+    // and says so. `method` travels with the payload so the receiving side can
+    // tell `join` from anything else once somebody has observed one.
+    //
+    // It runs in the page's own world, not an isolated one -- unavoidable,
+    // since the point is for the page's own scripts to find it. That is why
+    // `webview_policy::bridge_message_acceptable` is re-checked against the
+    // *live* uri on every message rather than trusted from here.
+    //
+    // **Never log the payload**, only that a call happened and its method name.
+    // A bridge command carries whatever the page and the engine are
+    // mid-conversation about; `docs/analysis/webview-surface.md` §4's rule
+    // about one-time tickets applies to this direction too.
+    let shim = format!(
+        r#"(function () {{
+  var post = function (name, method, args) {{
+    try {{
+      var h = window.webkit && window.webkit.messageHandlers
+              && window.webkit.messageHandlers[name];
+      if (!h) {{ return undefined; }}
+      return h.postMessage({{ bridge: name, method: method, args: args }});
+    }} catch (e) {{ return undefined; }}
+  }};
+  ['{a}', '{b}'].forEach(function (name) {{
+    if (window[name]) {{ return; }}
+    try {{
+      window[name] = new Proxy({{}}, {{
+        get: function (_t, prop) {{
+          if (typeof prop !== 'string') {{ return undefined; }}
+          return function () {{
+            return post(name, prop, Array.prototype.slice.call(arguments));
+          }};
+        }}
+      }});
+    }} catch (e) {{ /* no Proxy: leave the WebKit shape as the only one */ }}
+  }});
+}})();"#,
+        a = BRIDGE_EXECUTE_ROBLOX,
+        b = BRIDGE_ROBLOX_WK_HYBRID,
+    );
+    user_content.add_script(&webkit6::UserScript::new(
+        &shim,
+        webkit6::UserContentInjectedFrames::TopFrame,
+        webkit6::UserScriptInjectionTime::Start,
+        &[],
+        &[],
+    ));
+
     // With no User-Agent set, WebKitGTK sends its own, and roblox.com reads
     // that as an ordinary desktop browser rather than the app it is -- and
     // serves the full desktop site, complete with the site's own navigation

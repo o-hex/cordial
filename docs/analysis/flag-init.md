@@ -4642,3 +4642,67 @@ by a means independent of log level. Cordial reaches `[roblox] flags loaded
 what is unknown is whether the *notification* Sober's init hangs off is
 raised. That is a question about one signal, not about storage, and it is the
 first time this investigation has had a working control to compare against.
+
+## §42. The post-settings block is nearly complete; `IxpStorageManager` and `RbxStorage` are the two that never appear
+
+§41 established that `RbxStorage::init` is never called. This narrows where to
+look, by comparing Cordial's engine log against Sober's on the same machine.
+
+**A caveat that must travel with the table.** Sober's `latest.log` covers a much
+longer session than an 18-second Cordial run, so the *counts* are not
+comparable and no conclusion is drawn from a count difference. Presence versus
+absence is what this reads:
+
+    marker              cordial   sober
+    Mimalloc                 43      43
+    Build system id           1       1
+    ClientRunInfo             3       3
+    AppMemUsageStatus         1       3
+    TombstoneCache            1      20
+    IxpStorageManager         0       1     <- absent
+    RbxStorage                0      10     <- absent
+
+Cordial produces the block the `CORDIAL_LATE_POST_MS` comment describes almost
+in full. Mimalloc's forty-three option lines match exactly, `Build system id`
+matches, and `ClientRunInfo` — which this document spent sections on — is
+present three times in both. So the late post is doing its job and the block
+is not missing wholesale.
+
+**Two markers are absent rather than merely rarer**, and in Sober's log they
+are four lines apart:
+
+    Info    [FLog::AppMemUsageStatus]  923286370
+    Warning [FLog::IxpStorageManager]  Failed to open cache file for reading
+    Info    [FLog::TombstoneCache]     [FlagCache] Tombstone 1, expiry 360 ...
+    Warning [FLog::LocalStorageHandler] Not available on the current platform.
+    D       nativeInitializeNativeFlags: Registered Flag Provider ID from Java: 0
+    Critical[DFLog::RbxStorage]        RbxStorage::init [INIT] user: flagLoaded
+
+Cordial reaches `AppMemUsageStatus`, `TombstoneCache` and the
+`LocalStorageHandler` warning, and registers the flag provider identically
+(§41, and the registration is confirmed byte-for-byte against the Waydroid
+capture). It does not produce the `IxpStorageManager` line, and it does not
+produce `RbxStorage::init`.
+
+**Whether those two absences are one fact or two is not established.** IXP is
+Roblox's experiment platform and `FIntIxpStorageManagerXxhashSeed` is among the
+flags; a shared dependency is plausible and unproven. Proximity in a log is not
+causation, and this file has been wrong about exactly that kind of adjacency
+before. The value here is that the search has gone from "somewhere in engine
+startup" to one named subsystem that is present in a working control and absent
+here.
+
+### mocktail is not a source for this, and that is worth writing down
+
+The maintainer suggested taking code from mocktail. For this specific problem
+it cannot be done. `src/legacy/legacy_runtime.cc`'s
+`ForceNativeFlagsLoadedForTaskScheduler` writes to
+`g_libroblox_base + 0x75a8250` — it patches the flags-loaded byte in the
+engine's own memory. That is precisely what
+[ADR-001](../adr/ADR-001-in-process-hooking.md) and
+[ADR-003](../adr/ADR-003-plugin-isolation.md) make *absent* rather than
+disabled, so adopting it is not a trade-off to weigh but a line this project
+does not cross. `tools/engine-text-diff.py` already recorded the distinction:
+mocktail forces the state, Sober reaches it, and Sober is therefore the only
+model worth copying. Ideas from mocktail remain fair game — its
+`EnsureDefaultDataLayout` is already adopted — but not this one.

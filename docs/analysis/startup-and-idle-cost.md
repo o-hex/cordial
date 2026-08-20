@@ -286,3 +286,63 @@ and not a lost transition. The earlier framing is withdrawn.
 Presents sat at 1.0/s throughout both halves, which is why this reads as "the
 frame rate idles fine but a core is busy": the renderer and the event loop idle
 on different signals.
+
+## The controls idle at 8%. Cordial burns a core. The difference is one call
+
+Measured in one session, three clients, 143 s each, 2 Hz, median over t=60–140 s
+(160 samples), as percent of one core of sixteen. System busy 0.057–0.112
+throughout. Two independent instruments — `/proc/<pid>/stat` and cgroup
+`cpu.stat` — agree within one point on both Flatpaks.
+
+    cordial c1                    103.3 %      focus reported true 146/146
+    cordial c2                    103.8 %      focus reported true 138/138
+    cordial cf1 (report forced)   103.5 %      window genuinely unfocused
+    cordial V-instr                 4.0 %      unfocused 142/146
+    mocktail m1 / m2            8.1 / 9.9 %
+    sober    s1 / s2            8.0 / 8.0 %
+
+`cf1` is the control that settles Cordial's half: a genuinely unfocused window
+with only the *report* forced true still costs 103.5 %. Same compositor state as
+the 4.0 % run, opposite CPU. **It is the report, not occlusion and not
+visibility.**
+
+### Why the controls are cheap, read from mocktail's source
+
+**`onWindowFocusChangedNative` appears nowhere in mocktail** — not in `src/`,
+not in `include/`, not in `stubs/`. Nothing in mocktail can tell the engine that
+focus changed, ever. Cordial calls it at `native/game_activity.cpp:818`, plus
+`true` inline at start and on every transition since today's work.
+
+**So the engine state that costs Cordial a core is one mocktail never puts its
+engine into.** `INFERRED` — read from source, not yet measured — but it is the
+only behavioural difference left standing after the obvious ones were checked
+and eliminated:
+
+- **The looper is not it.** mocktail's `ALooper_pollOnce` is a bare stub
+  (`stubs/libandroid_stub.cc:491`, `return -2`), returning immediately exactly
+  as Cordial's does. There is nothing cleverer to copy.
+- **AGDK glue is not it.** Neither project links Google's; `game_activity.cpp`
+  is Cordial's own. The spinning `Main` thread — 11.8 M polls/s against the
+  pump's 36/s — is inside `libroblox` in both.
+
+### The next experiment, and it is a measurement rather than a fix
+
+Stop reporting `focus = true` at `cordial_game_activity_start` and see whether
+Cordial idles like mocktail. **It will probably break input**, so it answers the
+question without being shippable. If it does idle, the honest fix is not to stop
+telling the engine the truth but to find what the engine does with that truth
+that costs a core, and whether the two can be separated.
+
+### Focus is granted stochastically, which is why this was not caught earlier
+
+A background-launched window took focus in 2 of 3 identically-launched runs on
+this session. "Left alone means unfocused" is not safe, and the original
+comparison's silence about focus state is not recoverable after the fact —
+which is why its idle column read as bimodal rather than as two different
+conditions.
+
+Sober's and mocktail's own focus state could not be observed at all: GNOME's
+`Introspect` returns `AccessDenied`, and neither Flatpak appears in the
+accessibility tree (Cordial does). So their 8 % is *not* known to be a focused
+figure, and the comparison against Cordial's 103 % is suggestive rather than
+like-for-like.

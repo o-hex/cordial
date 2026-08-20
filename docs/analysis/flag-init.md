@@ -5421,3 +5421,46 @@ file, and therefore how much of every Cordial run so far has been invisible;
 whether the early post inside `bootstrapTheApp` runs its body; and whether the
 store is actually *used* for anything beyond the eleven rows a 30-second landing
 run puts in it — nobody has yet watched an asset come back out of it.
+
+## §47. The engine re-fetches client settings itself, and DF* overrides last about two seconds
+
+`client_settings.rs` said "The engine never fetches it itself". **That is wrong**,
+and it has been quietly limiting every flag experiment in this document.
+
+The engine runs a `DynamicFastVariableReloader` which fetches
+`https://clientsettingscdn.roblox.com/v2/settings-compressed/application/GoogleAndroidApp.zst`
+— 1,305,506 bytes — at t≈1.6–2.3 s and applies it over the top, reverting every
+`DF*` override Cordial merged for any key that document contains.
+
+Measured two-directionally inside one run, which is what makes it a result
+rather than an observation:
+
+    override                        Roblox's value   observed
+    DFLogHttpTraceLight = "7"       "0"              logs 0.65 s -> 2.25 s, then silent
+    DFLogHttpTraceError = "0"       "12"             silent -> 2.25 s, logging again from 4.86 s
+    DFLogHttpTrace      = "7"       absent           logs 0.86 s -> 120.1 s
+
+The middle row settles it. An override asking for **silence** went loud again,
+at Roblox's own level, mid-run. Nothing Cordial does could cause that.
+
+### What this means for every flag experiment here
+
+**`DFFlag`/`DFInt`/`DFString`/`DFLog` overrides govern roughly the first two
+seconds. `FFlag`/`FInt`/`FString` are the durable ones.** That is the opposite
+of how `flags.rs`'s module doc framed it, and it means **any experiment whose
+effect is not visible inside that window was measuring Roblox's value, not
+ours.** Several negatives in this document are `DF*` overrides scored well after
+two seconds; they should be re-read with that in mind rather than trusted.
+
+The `RtcIoRna` control that `apply_overrides` cites as proof the mechanism works
+only held because its line prints at 0.375 s — inside the window, by luck.
+
+A key absent from Roblox's document survives the reloader, which is why
+`DFLogHttpTrace` logged for the full 120 s. That is the reliable way to run a
+`DF*` experiment: pick a key Roblox does not ship.
+
+### And the application name differs
+
+The engine asks for **`GoogleAndroidApp`**. `client_settings.rs` asks for
+**`AndroidApp`**. Nobody has diffed the two documents. Cordial may be merging
+overrides into a different settings set from the one the engine reloads.

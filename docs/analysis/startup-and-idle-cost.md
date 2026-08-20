@@ -346,3 +346,71 @@ Sober's and mocktail's own focus state could not be observed at all: GNOME's
 accessibility tree (Cordial does). So their 8 % is *not* known to be a focused
 figure, and the comparison against Cordial's 103 % is suggestive rather than
 like-for-like.
+
+## Two candidates checked and killed: the present mode, and the Choreographer
+
+Both were proposed here as the mechanism that paces the engine's loop on real
+Android and is missing on this one. Neither survived. Recorded because the
+reasoning behind each was plausible, which is exactly why an unrun version of it
+would have been believed.
+
+### The present mode is not it
+
+`vk_create_swapchain_khr` substitutes `VK_PRESENT_MODE_MAILBOX_KHR` for the
+`VK_PRESENT_MODE_FIFO_KHR` the engine asks for, and that is the one place
+Cordial overrides a choice the engine made explicitly. The argument was that
+FIFO blocks and MAILBOX does not, so a loop built to be paced by the display
+would free-run here and spin — which would have made the spin ours, and the fix
+a reversal rather than an addition.
+
+Four runs, alternating, 60 s each, focus held for every sample in all four
+(`focus=Some(true)`, 58/58, 58/58, 58/58, 54/54):
+
+    a1  FIFO -> MAILBOX (the override)   9.37 M polls/s   105.2 %
+    b1  FIFO (CORDIAL_PRESENT_MODE=fifo) 9.36 M polls/s   105.3 %
+    a2  FIFO -> MAILBOX                  9.31 M polls/s   105.2 %
+    b2  FIFO                             9.33 M polls/s   105.0 %
+
+Within 0.4 % of each other on both instruments. **The override is not the
+cause.**
+
+The reason is in the same logs and should have been read before the hypothesis
+was formed: **presents sit at 1.0/s in every run, in both modes.** FIFO only
+blocks when the queue is full, and a loop presenting once a second never fills
+it, so `vkQueuePresentKHR` returns immediately under FIFO exactly as it does
+under MAILBOX. There was never a vsync block here to restore. The renderer and
+the spinning loop idle on different signals — as this document already said two
+sections above.
+
+**`minImageCount` was the one real defect the hypothesis turned up, and it turned
+out not to exist either.** Substituting a replacement mode into a swapchain
+sized for a queue would leave two images where three are needed, and the
+renderer would stall in `vkAcquireNextImageKHR` waiting for the refresh the
+substitution exists to skip. Logged rather than assumed: the engine asks for
+`minImageCount 3` on every swapchain it creates here, including the recreation
+after the first resize. `vk_create_swapchain_khr` now raises it anyway when a
+replacement mode is chosen and the engine asked for fewer, and says so; on
+today's build that branch is not taken.
+
+### The Choreographer is not it either
+
+`docs/NEXT.md` records "frame-callback starvation is not it — `AChoreographer_*`
+is not imported at all", which is true of the NDK entry points and says nothing
+about `android.view.Choreographer` reached through JNI. Those are different
+paths and only the first had been checked. `Landroid/view/Choreographer;` and
+`Landroid/view/Choreographer$FrameCallback;` both appear in
+`docs/analysis/framework-classes.txt`, which read like the engine asking for
+them.
+
+It is not. That file is a framework inventory of 3466 classes, not a request
+log. `--dump-classes` is the request log, and in a 30 s run the engine reaches
+for **182 classes, none of them Choreographer**. Nothing here is starving a
+frame callback because nothing here is asked for one.
+
+### What is left
+
+Unchanged from the section above: the focus report is the only known difference,
+and mocktail — which idles at 8 % — has no way to send one. Note what that makes
+mocktail's 8 %: not a target Cordial should match, but the cost of an engine that
+was never told it has focus. Whether that state is one a client can ship is a
+separate question from whether it is cheap.

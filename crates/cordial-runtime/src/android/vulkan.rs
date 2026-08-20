@@ -728,6 +728,51 @@ fn supported_present_modes(surface: u64) -> Option<Vec<i32>> {
     Some(modes)
 }
 
+/// What the driver will let this surface hold, as `(minImageCount,
+/// maxImageCount)`, with `0` for max meaning "no limit" exactly as the
+/// specification defines it.
+///
+/// `None` on the same terms as [`supported_present_modes`]: the question could
+/// not be asked, so the caller changes nothing rather than guessing.
+fn surface_image_count_limits(surface: u64) -> Option<(u32, u32)> {
+    let h = host()?;
+    let instance = HOST_INSTANCE.load(std::sync::atomic::Ordering::Relaxed);
+    let physical_device = PHYSICAL_DEVICE.load(std::sync::atomic::Ordering::Relaxed);
+    if instance == 0 || physical_device == 0 {
+        return None;
+    }
+    // SAFETY: `instance` is the real host `VkInstance` this shim created, and
+    // the name is the WSI extension's own documented export.
+    let f = unsafe {
+        (h.get_instance_proc_addr)(
+            instance as *mut c_void,
+            c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR".as_ptr(),
+        )
+    };
+    if f.is_null() {
+        return None;
+    }
+    type Fn_ = extern "C" fn(*mut c_void, u64, *mut VkSurfaceCapabilitiesKHR) -> i32;
+    // SAFETY: resolved from the host loader for exactly this name.
+    let f: Fn_ = unsafe { std::mem::transmute(f) };
+    let mut caps = VkSurfaceCapabilitiesKHR {
+        min_image_count: 0,
+        max_image_count: 0,
+        current_extent: VkExtent2D { width: 0, height: 0 },
+        min_image_extent: VkExtent2D { width: 0, height: 0 },
+        max_image_extent: VkExtent2D { width: 0, height: 0 },
+        max_image_array_layers: 0,
+        supported_transforms: 0,
+        current_transform: 0,
+        supported_composite_alpha: 0,
+        supported_usage_flags: 0,
+    };
+    if f(physical_device as *mut c_void, surface, &mut caps) != VK_SUCCESS {
+        return None;
+    }
+    Some((caps.min_image_count, caps.max_image_count))
+}
+
 static HOST_CREATE_SWAPCHAIN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -784,9 +829,10 @@ extern "C" fn vk_create_swapchain_khr(
     // painting into was built at, and whether it was ever built again. It is one
     // line per swapchain, not per frame.
     println!(
-        "[android] vulkan: vkCreateSwapchainKHR extent {}x{} (old swapchain {})",
+        "[android] vulkan: vkCreateSwapchainKHR extent {}x{}, minImageCount {} (old swapchain {})",
         info.image_extent.width,
         info.image_extent.height,
+        info.min_image_count,
         if info.old_swapchain == 0 { "none" } else { "recreated" },
     );
     let asked = info.present_mode;
@@ -826,8 +872,55 @@ extern "C" fn vk_create_swapchain_khr(
         present_mode_name(chosen),
         advertised.join(", ")
     );
-    let patched = VkSwapchainCreateInfoKHR { present_mode: chosen, ..*info };
-    // SAFETY: `patched` differs from the caller's struct in one scalar field
+    // Substituting the mode alone leaves the swapchain sized for the mode the
+    // engine asked for, and that is not the same swapchain. FIFO is a queue:
+    // two images is enough, because the presentation engine hands one back
+    // every refresh. MAILBOX and IMMEDIATE are not queues -- the pending image
+    // is *replaced*, so with two images the only spare is the one on screen and
+    // the renderer stalls in `vkAcquireNextImageKHR` waiting for a refresh it
+    // was substituted in specifically to stop waiting for. Three is the count
+    // that makes the substitution mean anything.
+    //
+    // Raised, never lowered, and clamped to what the driver will hold:
+    // `maxImageCount == 0` is the specification's own "no limit" and not a
+    // limit of zero.
+    //
+    // Measured on 2026-08-20 rather than assumed, and the answer was that this
+    // has never fired: the engine asks for `minImageCount 3` on every swapchain
+    // it creates here, including the recreation after the first resize. So the
+    // MAILBOX substitution was already getting a swapchain that could hold a
+    // spare. Kept because the substitution is what makes three a *requirement*
+    // rather than the engine's preference, and a build that asked for two would
+    // otherwise stall silently -- but nobody should go looking here for a
+    // present-mode bug on today's build, because on today's build this branch
+    // is not taken.
+    let mut images = info.min_image_count;
+    if !matches!(chosen, VK_PRESENT_MODE_FIFO_KHR | VK_PRESENT_MODE_FIFO_RELAXED_KHR)
+        && images < 3
+    {
+        match surface_image_count_limits(info.surface) {
+            Some((_, max)) if max != 0 && max < 3 => println!(
+                "[android] vulkan: minImageCount stays {images}; {} wants three and the driver \
+                 caps this surface at {max}",
+                present_mode_name(chosen),
+            ),
+            Some(_) => {
+                println!(
+                    "[android] vulkan: minImageCount {images} -> 3 (a replacement mode needs a \
+                     spare image; two would stall the renderer on the refresh {} exists to skip)",
+                    present_mode_name(chosen),
+                );
+                images = 3;
+            }
+            None => println!(
+                "[android] vulkan: minImageCount stays {images}; could not ask the driver how \
+                 many images this surface allows"
+            ),
+        }
+    }
+    let patched =
+        VkSwapchainCreateInfoKHR { present_mode: chosen, min_image_count: images, ..*info };
+    // SAFETY: `patched` differs from the caller's struct in two scalar fields
     // and matches the host's layout exactly (see the module doc on Vulkan's ABI
     // being the same struct on Android and desktop Linux); every pointer inside
     // it is the caller's own and outlives this call.

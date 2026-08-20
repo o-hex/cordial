@@ -1618,7 +1618,13 @@ Each was tested and each cost time. The evidence is the point.
 **The frame rate**
 - Window focus is not it. `onWindowFocusChangedNative(true)` and
   `onContentRectChangedNative` are both sent; the rate did not move.
-- Frame-callback starvation is not it. `AChoreographer_*` is not imported at all.
+- Frame-callback starvation is not it. `AChoreographer_*` is not imported at
+  all, and — checked separately on 2026-08-20, because the NDK entry points and
+  `android.view.Choreographer` reached through JNI are different paths and only
+  the first had been ruled out — the engine does not ask for the Java one
+  either. `--dump-classes` over a 30 s run lists 182 classes and no
+  Choreographer. (`docs/analysis/framework-classes.txt` does list it; that file
+  is a framework inventory, not a request log.)
 - `FIntReactSchedulerMinFrameRate` set to 60 changed nothing.
 - The render job binds its DataModel fine — `No DM yet` appears exactly twice,
   transiently, around 2.0 s.

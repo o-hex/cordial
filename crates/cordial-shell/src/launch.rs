@@ -349,16 +349,20 @@ pub fn spawn(
         command.arg("--join-url").arg(url);
     }
 
-    // ADR-011 makes Wayland the display backend and says X11 "is not developed
-    // further", but `cordial-run` still defaults to X11 and takes Wayland only
-    // on `CORDIAL_WAYLAND=1` — deliberately, from when that backend was not
-    // real yet. It is real now: it is what the engine reached the landing page
-    // and a signed-in session on. A launcher that quietly started the
-    // superseded backend would mean the window this crate builds, its header
-    // bar and its monitor fitting were all bypassed. `backend()` still needs
-    // `WAYLAND_DISPLAY` as well, so on a host without a compositor this asks
-    // for nothing and X11 is used anyway.
-    command.env("CORDIAL_WAYLAND", "1");
+    // This used to set `CORDIAL_WAYLAND=1`, because `cordial-run` defaulted to
+    // X11 and took Wayland only on that variable. It no longer does:
+    // `android::backend()` prefers Wayland whenever `WAYLAND_DISPLAY` is set,
+    // which is what ADR-011 specifies, so there is nothing left for a launcher
+    // to opt into and the variable is not read anywhere.
+    //
+    // Deleted rather than left in place as a harmless no-op. A variable a
+    // launcher sets deliberately, with a paragraph explaining why, reads as
+    // load-bearing to the next person; one that no longer does anything is a
+    // comment that lies, which this codebase treats as costing more than no
+    // comment. What the paragraph used to argue -- that a launcher must not
+    // quietly start the superseded backend, or the window this crate builds,
+    // its header bar and its monitor fitting are all bypassed -- is now the
+    // runtime's own default rather than something this call site enforces.
 
     // Read from disk here rather than handed in, and that is a compromise
     // worth naming: the caller in `window.rs` already holds a live

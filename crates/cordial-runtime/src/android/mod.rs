@@ -74,23 +74,48 @@ pub enum Backend {
 pub fn backend() -> Backend {
     static CHOSEN: OnceLock<Backend> = OnceLock::new();
     *CHOSEN.get_or_init(|| {
-        // Opt-in, not automatic, until `wayland.rs` is real. `WAYLAND_DISPLAY`
-        // is set on every modern desktop, so preferring Wayland on its presence
-        // alone would make the client refuse to start for everyone the moment
-        // the unimplemented backend merged. Once it works, this reverts to
-        // preferring Wayland whenever a compositor is there — which is what
-        // ADR-011 actually specifies.
-        let b = if std::env::var_os("CORDIAL_WAYLAND").is_some()
-            && std::env::var_os("WAYLAND_DISPLAY").is_some()
-        {
+        // **This is the reversion the previous comment here promised.** It used
+        // to require `CORDIAL_WAYLAND` as well as `WAYLAND_DISPLAY`, opt-in
+        // "until `wayland.rs` is real", because preferring Wayland on the
+        // presence of a compositor alone would have made the client refuse to
+        // start for everyone the moment an unimplemented backend merged. The
+        // backend is real now -- it is the one the shell has spawned every
+        // client with since `launch.rs` started setting the variable
+        // unconditionally, so it is also the only one with any recent mileage
+        // on it. Preferring Wayland whenever a compositor is there is what
+        // ADR-011 specifies, and the doc comment above this function has been
+        // describing that behaviour rather than the code's for some time.
+        //
+        // What the opt-in actually cost, and why this is a bug fix rather than
+        // a preference: the whole web view feature is inert on X11. The
+        // presenter attaches an `AdwDialog` to the GTK host window, which only
+        // the Wayland backend creates, so on X11 every openWindow the engine
+        // sends -- Join, sign-in, Robux -- was dropped. A hand-run
+        // `cordial-run`, which is the invocation AGENTS.md documents, took the
+        // X11 path by default and therefore had no web views at all, while the
+        // same build launched through `just dev` had them. That difference was
+        // read as the web view being broken.
+        //
+        // `CORDIAL_X11=1` forces the old path back, because a reversion with no
+        // escape hatch is how a regression becomes unreportable: anyone whose
+        // session breaks on Wayland needs a way to say so from a working
+        // client rather than from a bisect.
+        let b = if std::env::var_os("CORDIAL_X11").is_some() {
+            Backend::X11
+        } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             Backend::Wayland
         } else {
             Backend::X11
         };
         match b {
-            Backend::Wayland => println!("[android] display backend: Wayland (CORDIAL_WAYLAND=1)"),
+            Backend::Wayland => {
+                println!("[android] display backend: Wayland (set CORDIAL_X11=1 to force X11)")
+            }
+            Backend::X11 if std::env::var_os("CORDIAL_X11").is_some() => {
+                println!("[android] display backend: X11 (forced by CORDIAL_X11; web views cannot be attached on this backend)")
+            }
             Backend::X11 => println!(
-                "[android] display backend: X11 (see ADR-011 — the fallback until the Wayland backend lands)"
+                "[android] display backend: X11 (no WAYLAND_DISPLAY; web views cannot be attached on this backend)"
             ),
         }
         b

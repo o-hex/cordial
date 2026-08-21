@@ -1012,6 +1012,39 @@ fn install_webview_presenter() {
     // looking at when Join navigated instead of joining.
     cordial_shell::webview::set_bridge_sink(cordial_runtime::webview::forward_bridge_message);
     println!("  webview: presenter installed; an openWindow request will now be attached to the host window");
+
+    // Said here, at startup, rather than left for the first `openWindow` to
+    // discover. The presenter attaches an `AdwDialog` to the GTK host window,
+    // and that window only exists on the Wayland backend. On X11 there is no
+    // host window to attach to, so every openWindow the engine ever sends is
+    // dropped.
+    //
+    // This is a much narrower case than it was an hour ago, and the history is
+    // the reason the warning stays. `android::backend()` used to require an
+    // opt-in `CORDIAL_WAYLAND=1`, which `launch.rs` set and a hand-run
+    // `cordial-run` did not -- so the invocation AGENTS.md documents defaulted
+    // to a backend where the entire web view feature was inert, while the same
+    // build launched through `just dev` had it. Running that command and
+    // reading "presenter ran with no Wayland host window open" as a bug in the
+    // presenter is what cost the time; the presenter was fine and the backend
+    // was X11. `backend()` now prefers Wayland whenever `WAYLAND_DISPLAY` is
+    // set, so the only ways left to be here are a genuinely display-less host
+    // or an explicit `CORDIAL_X11=1` -- both of which someone chose, and
+    // neither of which should silently cost them Join.
+    //
+    // A line at the point of failure is not enough on its own: it names
+    // Wayland rather than naming X11, it arrives only once a user has already
+    // pressed something, and by then it reads as the button being broken.
+    // AGENTS.md's rule against a stub that lies applies to a diagnostic too --
+    // reporting the gap up front is what keeps it findable.
+    if cordial_runtime::android::wayland::current().is_none() {
+        println!(
+            "  webview: WARNING -- there is no Wayland host window, so nothing can be attached \
+             to and every openWindow (Join, sign-in, Robux) will be dropped. This run is on the \
+             X11 backend -- either CORDIAL_X11 is set, or there is no WAYLAND_DISPLAY to use. \
+             Web views need the Wayland backend."
+        );
+    }
 }
 
 #[cfg(not(feature = "webview"))]

@@ -239,8 +239,11 @@ the file, says that anything which can read their files can take the account,
 and says how to refuse it, on every launch. `CORDIAL_SECRET_STORE` is the
 setting — `auto` (default), `keyring` (refuse the fallback and accept no saved
 session), `file` (skip the service) — in the same spirit as Sober's
-`use_libsecret`, and the shell should surface it and pass it the way
-`launch.rs` already passes `CORDIAL_WAYLAND`.
+`use_libsecret`, and the shell should surface it and pass it in the
+environment `launch.rs` builds for the client. (This cited `CORDIAL_WAYLAND`
+as the example until that variable was removed: `android::backend()` now
+prefers Wayland whenever a compositor is there, per ADR-011, so there is
+nothing for a launcher to opt into.)
 
 **Keyed by the profile's full path, not its name.** Every agent and every test
 in this repository is told to run under its own `XDG_DATA_HOME`, and every one

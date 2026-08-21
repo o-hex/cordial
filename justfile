@@ -80,8 +80,15 @@ build where="host":
             distrobox list 2>/dev/null >&2 || true
             exit 1
         fi
+        # The `webview` features, for the same reason `toolbox` below passes
+        # them: this recipe's own comment says the web views are the point of
+        # building in a container, and it then built without them for as long
+        # as it has existed. A container that carries webkitgtk6.0-devel and
+        # produces a binary with no libwebkitgtk in it is the worst of both --
+        # the dependency was installed, the build succeeded, and `openWindow`
+        # still did nothing.
         distrobox enter "$box" -- bash -lc \
-          'CARGO_TARGET_DIR=target-distrobox cargo build --release'
+          'CARGO_TARGET_DIR=target-distrobox cargo build --release --features cordial-shell/webview,cordial-runtime/webview'
         echo "built into target-distrobox/release"
         ;;
       toolbox)
@@ -247,8 +254,13 @@ client *args:
     # `just client` ran DIFFERENT display backends, and every fix verified through
     # one was being tested through the other. X11 is still reachable with --x11
     # until ADR-011's removal trigger fires.
-    if [ "${x11:-0}" != 1 ]; then
-        export CORDIAL_WAYLAND=1
+    # Inverted, because the runtime's default inverted. `backend()` now prefers
+    # Wayland whenever `WAYLAND_DISPLAY` is set, so *not* exporting
+    # CORDIAL_WAYLAND no longer selects X11 -- it selects nothing, and --x11
+    # would have silently kept giving you Wayland. Asking for X11 is now an
+    # explicit CORDIAL_X11, which is the only thing that still forces it.
+    if [ "${x11:-0}" = 1 ]; then
+        export CORDIAL_X11=1
     fi
     # Cordial ships no Roblox build. Sober downloads the same official Android
     # one this runtime loads, so checking there first means a debugging run needs

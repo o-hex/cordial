@@ -164,9 +164,12 @@ pub enum Store {
 /// refuses the fallback. `file` skips the service outright, which is also how
 /// the tests get a deterministic backend without touching anybody's keyring.
 ///
-/// The shell should expose this as a preference and pass it here the way
-/// `launch.rs` already passes `CORDIAL_WAYLAND`; the runtime deliberately has
-/// no opinion about where the shell keeps it.
+/// The shell should expose this as a preference and pass it here in the
+/// environment `launch.rs` builds for the client; the runtime deliberately has
+/// no opinion about where the shell keeps it. (This used to cite
+/// `CORDIAL_WAYLAND` as the example to copy. That variable is gone --
+/// `android::backend()` prefers Wayland on its own now -- and an example that
+/// names a setting nobody reads is worse than none.)
 const SETTING: &str = "CORDIAL_SECRET_STORE";
 
 /// Decide once, say so once.

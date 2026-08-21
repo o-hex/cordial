@@ -158,12 +158,13 @@ fn subtitle(name: &str, availability: Option<&Availability>) -> String {
     match availability {
         None => format!("{name} will be created when you launch"),
         Some(Availability::Free) => String::new(),
-        // Not "{name} is open in another window". The row's own value is showing
-        // that name a couple of centimetres to the right, so repeating it only
-        // cost width — and width is what this line has least of, sharing the row
-        // with the combo and the create button. Said in full it ellipsised
-        // before reaching "refused", which is the half that matters.
-        Some(Availability::Running) => "Open in another window; launching it again will be refused".into(),
+        // Four words, because the row has least of all things width -- it
+        // shares its line with the combo and the create button, and the longer
+        // version ellipsised before reaching the half that mattered. What
+        // happens if you press Roblox anyway is not this line's job: the
+        // button stays live on purpose, and the dialog it raises offers to
+        // close the other client, which is the useful thing to be offered.
+        Some(Availability::Running) => "Open in another window".into(),
         Some(Availability::Unusable(message)) => message.clone(),
     }
 }
@@ -343,13 +344,29 @@ fn list_factory() -> gtk::SignalListItemFactory {
                 line.set_sensitive(true);
                 note_label.set_visible(false);
             }
+            // Selectable on purpose, unlike `Unusable` below.
+            //
+            // Refusing to select a busy profile looks protective and is the
+            // opposite: pressing Roblox on one raises a dialog that offers to
+            // close the client holding it, and that dialog is the only way to
+            // clear a stray client from inside Cordial. Greyed out, the profile
+            // most in need of the fix was the one profile that could not reach
+            // it -- the case that found this was a client left running on a
+            // profile for twenty-three hours, unreachable from the launcher
+            // and closable only from a terminal.
+            //
+            // The note stays, so the row still says what it is; it is the
+            // dialog's job to say what pressing the button will do about it.
             Availability::Running => {
-                item.set_selectable(false);
-                item.set_activatable(false);
-                line.set_sensitive(false);
+                item.set_selectable(true);
+                item.set_activatable(true);
+                line.set_sensitive(true);
                 note_label.set_text("Open in another window");
                 note_label.set_visible(true);
             }
+            // Still refused: an unusable profile has nothing to offer and no
+            // dialog that could fix it, so selecting it would only produce a
+            // failure with no recovery attached.
             Availability::Unusable(message) => {
                 item.set_selectable(false);
                 item.set_activatable(false);
@@ -559,8 +576,12 @@ mod tests {
         // Dropping the definition must not drop the three that are worth
         // reading. Each of these changes what pressing Roblox will do.
         assert!(subtitle("alt", None).contains("will be created"), "an uncreated profile has to say so");
+        // No longer asserts "refused": the row does not promise that any more,
+        // because the button is live for a busy profile on purpose and the
+        // dialog behind it offers to close the other client. What the row still
+        // has to say is that the profile is in use somewhere.
         let running = subtitle("alt", Some(&Availability::Running));
-        assert!(running.contains("another window") && running.contains("refused"), "{running}");
+        assert!(running.contains("another window"), "{running}");
         // Verbatim, for the same reason `check_name` quotes `profile::dir`: the
         // sentence a user meets is the one the operating system produced.
         assert_eq!(subtitle("alt", Some(&Availability::Unusable("permission denied".into()))), "permission denied");

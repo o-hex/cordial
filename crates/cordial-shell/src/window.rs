@@ -1000,7 +1000,13 @@ fn profile_busy(
     let toasts = toasts.clone();
     let config = config.clone();
     let join = join.clone();
-    dialog.connect_response(None, move |_, response| match response {
+    dialog.connect_response(None, move |_, response| {
+        // Take focus back explicitly. A transient dialog closing does not
+        // reliably return it under this compositor, and it landed on whatever
+        // was behind Cordial -- so dismissing this meant alt-tabbing back to
+        // the window you were already using.
+        parent_window.present();
+        match response {
         // The switcher is the combo row above the launch button; activating the
         // window's action rather than building a second chooser here keeps one
         // construction site.
@@ -1019,6 +1025,7 @@ fn profile_busy(
             }
         }
         _ => {}
+        }
     });
     dialog.present();
 }
@@ -1026,40 +1033,28 @@ fn profile_busy(
 /// What the refusal says, given who is holding the profile.
 ///
 /// Pulled out of the dialog and made pure so the wording can be pinned by
-/// tests. These three paragraphs are the entire recovery path for somebody who
-/// cannot find a window to close, and the previous version of this text was
-/// wrong in a way nobody noticed for months — a widget that has to be built and
-/// clicked to inspect is a widget whose text drifts.
+/// tests: a widget that has to be built and clicked to inspect is a widget
+/// whose text drifts, and this one was wrong for months without anyone noticing.
 fn busy_body(holder: Option<&profile::Holder>) -> String {
-    // The reason is the same in every branch, so it is written once.
-    const WHY: &str = "A profile opens in one client at a time. Roblox keeps its session and \
-                       its storage in there, and two clients writing to it at once corrupts \
-                       both.";
-
+    // Short on purpose. This dialog is in the way of pressing play, and the
+    // buttons under it already say what can be done -- "Close It and Launch"
+    // is the whole answer for the common case. The long version explained the
+    // storage model, why one client at a time, and where a stray client comes
+    // from; all true, none of it changing which button to press. Someone who
+    // wants that can find it on ADR-012.
     match holder {
         Some(h) if h.is_cordial() => {
             let started =
-                h.running_for_text().map(|t| format!(", running for {t}")).unwrap_or_default();
-            format!(
-                "Cordial is already running on this profile as process {}{started}.\n\n{WHY}\n\n\
-                 If you cannot find a Cordial window anywhere, that is expected rather than \
-                 strange. Closing the Roblox window does not end the client yet, so one left \
-                 over from an earlier session keeps running — and keeps this profile — until \
-                 its own timer runs out. Closing it here is safe.",
-                h.pid
-            )
+                h.running_for_text().map(|t| format!(", up {t}")).unwrap_or_default();
+            format!("Another Cordial client has it open (process {}{started}).", h.pid)
         }
+        // Kept longer than the others, because this is the one case Cordial
+        // will not act on and the user has to go and find the process itself.
         Some(h) => format!(
-            "Process {} has this profile's lock file open, and it is not a Cordial client:\n\n\
-             {}\n\n{WHY}\n\nCordial will not close a process it did not start. Close it \
-             yourself, or launch against a different profile.",
+            "Process {} has it open, and it is not a Cordial client:\n\n{}",
             h.pid, h.command
         ),
-        None => format!(
-            "{WHY}\n\nCordial could not tell which process is holding it. That usually means \
-             the other client belongs to a different user account, or is running inside a \
-             container this one cannot see into. Launch against a different profile."
-        ),
+        None => "Something else has it open, and Cordial cannot tell what.".to_string(),
     }
 }
 
@@ -1167,14 +1162,14 @@ mod tests {
 
     #[test]
     fn the_no_window_case_is_explained_rather_than_left_a_mystery() {
-        // The sentence this pins is the whole point of the dialog. Somebody
-        // hunting for a Cordial window that does not exist needs to be told
-        // that is expected, and told which process to close instead -- the old
-        // text sent them looking for a window and had nothing else to offer.
+        // What must survive is the identification: which process, and how long
+        // it has been up, because that is what tells somebody whether it is the
+        // window in front of them or a leftover. The paragraph explaining that
+        // a missing window is expected has gone -- the "Close It and Launch"
+        // button makes the point without needing a window to be found at all.
         let body = busy_body(Some(&holder("/app/bin/cordial-run --profile default")));
         assert!(body.contains("process 649889"), "{body}");
-        assert!(body.contains("running for 31 minutes"), "{body}");
-        assert!(body.contains("cannot find a Cordial window"), "{body}");
+        assert!(body.contains("31 minutes"), "{body}");
         assert!(!body.contains("close the window that already has it"), "{body}");
     }
 
@@ -1184,9 +1179,12 @@ mod tests {
         // a process Cordial did not start must not imply it can be closed from
         // here. It says what has the file open and stops.
         let body = busy_body(Some(&holder("/usr/bin/grep -r something")));
+        // The naming is the load-bearing part and it stays. The sentence about
+        // not closing what Cordial did not start went with the rest of the
+        // prose: the dialog simply does not offer a "Close It" button in this
+        // case, which says the same thing in the place people actually look.
         assert!(body.contains("not a Cordial client"), "{body}");
         assert!(body.contains("/usr/bin/grep"), "{body}");
-        assert!(body.contains("will not close a process it did not start"), "{body}");
     }
 
     #[test]
@@ -1228,7 +1226,7 @@ mod tests {
         // preserve that distinction or it becomes a message claiming the
         // profile is both taken and free.
         let body = busy_body(None);
-        assert!(body.contains("could not tell which process"), "{body}");
+        assert!(body.contains("cannot tell what"), "{body}");
         assert!(!body.contains("process 649889"), "{body}");
     }
 }

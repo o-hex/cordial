@@ -465,6 +465,25 @@ pub fn build(
     actions.add_action(&profile_action);
     actions.add_action(&fullscreen_action);
     window.insert_action_group("win", Some(&actions));
+
+    // Start playing without a human pressing anything, for `just dev --play`.
+    //
+    // Deliberately the `win.launch` action rather than a second launch path or
+    // a synthesised click: AGENTS.md rules out synthesising the press, ADR-011's
+    // Wayland leaves nothing to send one to, and a separate path would prove
+    // nothing about the button people actually use. This is why that action was
+    // made reachable by name in the first place.
+    //
+    // A short delay rather than zero because the launch reads configuration and
+    // may put a dialog up, and doing that before the window has been presented
+    // gives a modal with nothing behind it. 400ms matches the deep-link path
+    // just below, which had the same problem first.
+    if std::env::var_os("CORDIAL_AUTOSTART").is_some() {
+        let window = window.clone();
+        glib::timeout_add_local_once(Duration::from_millis(400), move || {
+            WidgetExt::activate_action(&window, "win.launch", None).ok();
+        });
+    }
     // Whatever the user configured, defaulting to F11 but not insisting on it —
     // see `ShellConfig::fullscreen_accel` for why a hardcoded F11 is unreachable
     // on some laptops. An empty string leaves the action registered and

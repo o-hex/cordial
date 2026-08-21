@@ -150,7 +150,7 @@ test:
 # Build and test, the pre-pull-request gate
 check: build test
 
-# Start Cordial: just dev [--in host|distrobox|nix] [--apk /path/to/base.apk]
+# Start Cordial: just dev [--in host|toolbox|distrobox|nix] [--apk PATH] [--play]
 dev *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -169,6 +169,11 @@ dev *args:
             # `--apk` as its value — which it did, the first time this was written.
             --in)    env="${2:-}"; shift 2 ;;
             --in=*)  env="${1#*=}"; shift ;;
+            # Start playing straight away, so a harness or an agent gets a
+            # running client without a human pressing Roblox. Goes through the
+            # window's own `win.launch` action, which is the same thing the
+            # button does.
+            --play)  export CORDIAL_AUTOSTART=1; shift ;;
             *)       extra+=("$1"); shift ;;
         esac
     done

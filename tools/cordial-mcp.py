@@ -308,6 +308,24 @@ TOOLS = [
         },
     },
     {
+        "name": "cordial_fps",
+        "description": (
+            "Measure the frame rate honestly. Drives pointer motion for the WHOLE measurement "
+            "and counts presents across it, then reports the frame rate with the input rate "
+            "beside it. This matters: without input the engine's idle throttle drops presents "
+            "to exactly 1.0/s after about thirteen seconds, and every frame-rate figure in this "
+            "project recorded before 2026-08-02 is that curve integrated. A result with an input "
+            "rate near zero is not a frame rate. Expect a hard vsync lock to the output refresh."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "seconds": {"type": "number", "description": "Measurement window. Default 10."},
+                "input_hz": {"type": "number", "description": "Pointer motions per second. Default 60."},
+            },
+        },
+    },
+    {
         "name": "cordial_backtrace",
         "description": (
             "Attach gdb and dump every thread's stack. The first thing to reach for when the "
@@ -410,6 +428,67 @@ def process_cpu(pid, window=1.0):
     return 100.0 * ((ticks() - a) / hz) / (time.monotonic() - t0)
 
 
+def tool_fps(c, args):
+    """Drive input across the whole window, then divide presents by wall time.
+
+    The motion is a small square rather than a single repeated point because
+    `pass_mouse_move` derives its delta from the previous position, so sending
+    the same coordinate twice reports that the mouse did not move -- which the
+    idle throttle reads as idle, which is the thing this measurement exists to
+    avoid.
+    """
+    seconds = float(args.get("seconds", 10))
+    hz = float(args.get("input_hz", 60))
+    w, h = 640, 360
+    for field in c.send("info").split():
+        if field.startswith("extent="):
+            try:
+                dims = field.split("=", 1)[1].split("x")
+                w, h = int(dims[0]) // 2, int(dims[1]) // 2
+            except Exception:
+                pass
+
+    def presents():
+        for f in c.send("info").split():
+            if f.startswith("presents="):
+                return int(f.split("=", 1)[1])
+        raise RuntimeError("info did not report a present count")
+
+    start = presents()
+    t0 = time.monotonic()
+    sent = 0
+    step = 1.0 / hz if hz > 0 else 0
+    box = [(w - 40, h - 40), (w + 40, h - 40), (w + 40, h + 40), (w - 40, h + 40)]
+    while time.monotonic() - t0 < seconds:
+        x, y = box[sent % 4]
+        try:
+            c.send(f"move {x} {y}", timeout=5)
+            sent += 1
+        except Exception:
+            break
+        remaining = step - ((time.monotonic() - t0) % step if step else 0)
+        if step:
+            time.sleep(max(0.0, min(step, remaining)))
+    elapsed = time.monotonic() - t0
+    end = presents()
+    fps = (end - start) / elapsed if elapsed > 0 else 0.0
+    input_hz = sent / elapsed if elapsed > 0 else 0.0
+    verdict = ""
+    if fps < 2.0:
+        verdict = ("\nAt about one present a second with input flowing, the engine is not "
+                   "throttling -- it is wedged. Take a backtrace.")
+    elif input_hz < 5:
+        verdict = "\nInput barely moved, so this number is not a frame rate. Ignore it."
+    return [{
+        "type": "text",
+        "text": (
+            f"{fps:.1f} presents/s over {elapsed:.1f}s, with input driven at "
+            f"{input_hz:.1f}/s throughout ({end - start} presents, {sent} motions)."
+            + verdict
+        ),
+    }]
+
+
 def tool_backtrace(c, args):
     pid = c.pid()
     frames = int(args.get("frames", 12))
@@ -436,6 +515,7 @@ HANDLERS = {
     "cordial_key": tool_key,
     "cordial_text": tool_text,
     "cordial_scroll": tool_scroll,
+    "cordial_fps": tool_fps,
     "cordial_backtrace": tool_backtrace,
     "cordial_debugger": tool_gdb,
 }

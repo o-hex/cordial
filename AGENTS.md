@@ -9,6 +9,55 @@ a ported AOSP bionic linker, a bionic/glibc shim, libjnivm in place of Android's
 ART, and a framework layer that answers the calls the client makes into the
 platform.
 
+## Reach for the MCP first
+
+**`tools/cordial-mcp.py` is how this client is driven, inspected and debugged.
+Prefer it to anything you would otherwise write yourself.** Start the client and
+attach:
+
+```bash
+just dev --play      # opens the window and starts playing, no button press
+just mcp             # what an agent's MCP configuration runs; finds the socket itself
+```
+
+`just dev` and `just client` turn the control surface on by default, and `just
+mcp` finds whichever client bound a socket most recently. There is no pid to
+look up and nothing to configure.
+
+What it gives you, and why each one exists:
+
+- **`cordial_screenshot`** reads the frame out of Cordial's own Vulkan
+  swapchain, so it is unaffected by occlusion, by another window covering the
+  client, or by the window being off-screen. It is also the only thing on this
+  host that can photograph a Wayland window at all — five other routes were
+  tried and every one was refused by the compositor or the kernel.
+- **`cordial_info`** returns the present count. **Called twice a few seconds
+  apart it is the single best test for a wedged client**, because a wedged
+  engine leaves it fixed while everything else keeps running. That reading — 42
+  presents against 74 million polls — is what finally characterised the
+  2026-08-21 freeze, in seconds, after a day of guessing.
+- **`cordial_click` / `cordial_move` / `cordial_key` / `cordial_text` /
+  `cordial_scroll`** drive Cordial's own input entry points. Never synthesise
+  input at the compositor; see the caution near the end of this file.
+- **`cordial_backtrace`** attaches lldb and quotes the process CPU beside the
+  stacks, because a spinning pump and a blocked one produce identical
+  backtraces. **`cordial_debugger`** runs arbitrary debugger commands.
+
+**Write a bespoke harness only when the MCP genuinely cannot answer the
+question, and say why in the commit.** Every ad-hoc script written here in one
+day scored something that turned out to be constant across all runs —
+`mainWorkCallback`, which fires exactly twice in healthy runs too;
+`onFlagsLoaded`'s byte count, which never varies; present counts taken without
+input, which the idle throttle pins to 1.0/s. The MCP's tools are the ones whose
+readings have been checked against a control.
+
+It works in coordinates and pixels. There is no element tree, because Roblox
+publishes no accessibility tree at all — measured four ways, see
+`native/accessibility.cpp` — and getting one would mean engine introspection,
+which ADR-001 and ADR-003 rule out permanently.
+[ADR-019](docs/adr/ADR-019-development-control-surface.md) records the whole
+design.
+
 ## The one rule
 
 **Grep `docs/traces/` before disassembling anything.** It holds a logcat capture

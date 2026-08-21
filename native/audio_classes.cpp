@@ -988,22 +988,38 @@ public:
             return JNI_FALSE;
         }
 
-        std::lock_guard<std::mutex> guard(lock_);
-        // S16 interleaved: what `write([BI)V` hands over as bytes, and what
-        // every Android AudioTrack path FMOD has produces.
         // FMOD's own buffer count, not a number of ours. It sized its mixer
         // for this depth; a shallower queue drops what it legitimately wrote
         // and a deeper one adds latency it did not ask for.
-        pending_depth_ = buffer_count > 0 ? static_cast<uint32_t>(buffer_count) : 4;
+        //
+        // Computed into a local first because the three `stream_` calls below
+        // must not run under `lock_` -- see `close`'s doc for the deadlock that
+        // rule exists to prevent. `init` is the narrower case of it: a
+        // re-`init` over a stream that is still live would have
+        // `stream_.open()` take PipeWire's loop lock while `drained` waits on
+        // ours. That path was never observed hanging, which is exactly why it
+        // is worth closing now rather than after somebody catches it too.
+        const uint32_t depth = buffer_count > 0 ? static_cast<uint32_t>(buffer_count) : 4;
+
+        // S16 interleaved: what `write([BI)V` hands over as bytes, and what
+        // every Android AudioTrack path FMOD has produces.
         if (!stream_.open(static_cast<uint32_t>(rate), static_cast<uint32_t>(channels),
-                          16, 16, false, pending_depth_)) {
+                          16, 16, false, depth)) {
             std::fprintf(stderr,
                 "E/Cordial-FMOD            AudioDevice.init: PipeWire refused a %d Hz, %d "
                 "channel S16 stream; reporting failure to FMOD.\n", rate, channels);
             return JNI_FALSE;
         }
+        // Registered before the stream is activated, so there is no window in
+        // which PipeWire can process a buffer with no callback to report it.
         stream_.set_drain_callback(&AudioDevice::drained, this);
         stream_.set_active(true);
+
+        // Taken only once the stream is up. `write` and `drained` both gate on
+        // `open_`, so publishing it last is what makes them safe rather than
+        // merely serialised.
+        std::lock_guard<std::mutex> guard(lock_);
+        pending_depth_ = depth;
         open_ = true;
         std::fprintf(stderr,
             "I/Cordial-FMOD            AudioDevice.init: PipeWire playback open at %d Hz, %d "
@@ -1058,15 +1074,60 @@ public:
         owned_.emplace_back(std::move(owned));
     }
 
+    /// **Never call into `stream_` while holding `lock_`.** That is the whole
+    /// of this function's shape, and it is not a style preference -- it is the
+    /// fix for a deadlock that froze the client whenever a player left a game.
+    ///
+    /// Observed on 2026-08-22, with gdb on a live specimen the user caught by
+    /// exiting a game and reporting the window had stopped. Two threads, each
+    /// holding what the other wanted:
+    ///
+    ///   RBX Worker B   AudioDevice::close  -> holds lock_
+    ///                  PlaybackStream::set_active -> pw_thread_loop_lock, waits
+    ///   cordial-pipewire  loop_iterate -> Impl::process -> holds the loop lock
+    ///                  AudioDevice::drained -> lock_, waits
+    ///
+    /// Every `stream_` entry point takes PipeWire's thread-loop lock, and the
+    /// loop thread calls `drained`, which takes `lock_`. So holding `lock_`
+    /// across any `stream_` call is an AB-BA against PipeWire's own loop, and
+    /// it never recovers.
+    ///
+    /// It cost two days pointed at the wrong component. Cordial's pump stays
+    /// perfectly healthy through this -- `epoll_wait` in `looper::pump` at 1%
+    /// CPU, 74 million polls on an earlier specimen -- because nothing is wrong
+    /// with the pump. The engine's audio worker is blocked, so the engine stops
+    /// feeding frames, and the client looks wedged from outside. Anyone
+    /// debugging a freeze here should read the *engine's* threads before the
+    /// looper's; see `docs/NEXT.md`.
+    ///
+    /// The race window is why it reproduced roughly one launch in twenty: the
+    /// loop thread has to be inside `drained` at the moment `close` runs.
     void close(jnivm::ENV*) {
-        std::lock_guard<std::mutex> guard(lock_);
-        if (!open_) return;
-        open_ = false;
+        {
+            std::lock_guard<std::mutex> guard(lock_);
+            if (!open_) return;
+            // Cleared first, and under the lock, so a `write` blocked on
+            // `space_` wakes, sees `!open_` and returns instead of enqueueing
+            // into a stream that is about to be torn down. It also makes the
+            // teardown below single-entry: a second `close` returns here.
+            open_ = false;
+            space_.notify_all();
+        }
+
+        // Deliberately outside the lock. `drained` may be running right now on
+        // PipeWire's thread and may take `lock_`; it must be able to finish,
+        // because these three calls each wait for that thread.
         stream_.set_active(false);
         stream_.clear();
         stream_.close();
-        owned_.clear();
-        space_.notify_all();
+
+        // Only now, with the stream closed and no further callback possible,
+        // is it safe to drop the buffers `drained` erases from. Retaken rather
+        // than held across the teardown, which is the entire point.
+        {
+            std::lock_guard<std::mutex> guard(lock_);
+            owned_.clear();
+        }
         std::fprintf(stderr, "I/Cordial-FMOD            AudioDevice.close: playback stream closed.\n");
     }
 
@@ -1089,7 +1150,17 @@ private:
     /// same depth FMOD's own buffering expects rather than growing without end.
     uint32_t pending_depth_ = 4;
 
-    /// Called from PipeWire's realtime thread with our own mutex released.
+    /// Called from PipeWire's realtime thread, which holds that loop's own
+    /// lock, and takes ours. **That direction is fixed, so no caller may ever
+    /// hold `lock_` and then enter `stream_`** -- doing so is an AB-BA against
+    /// PipeWire's loop and hangs the client for good. `close` used to, and
+    /// froze the client every time a player left a game; its doc has the
+    /// captured stacks.
+    ///
+    /// This comment previously read "with our own mutex released", stating the
+    /// invariant as though it were guaranteed. It was true of `write` and false
+    /// of `close`, and asserting it here is part of why the bug survived being
+    /// read past.
     static void drained(void* buffer_context, void* user) {
         auto* self = static_cast<AudioDevice*>(user);
         std::lock_guard<std::mutex> guard(self->lock_);

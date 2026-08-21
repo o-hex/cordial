@@ -186,6 +186,55 @@ agents were editing is otherwise indistinguishable from a committed one, which
 cost an afternoon of chasing an input regression nobody could attribute to a
 tree.
 
+## Ask a debugger before you theorise
+
+**gdb attaches to a running Cordial, and on a frozen one it is the fastest
+answer in this repository.** A stuck client took most of a session of guessing
+on 2026-08-21 -- four theories, three of them scored with instruments that were
+constant across every run -- and one `thread apply all bt` settled more in
+thirty seconds than any of it.
+
+```bash
+export PATH=/home/linuxbrew/.linuxbrew/bin:$PATH
+gdb -p $(pgrep -f 'cordial-run.*--profile <yours>') -batch \
+    -ex 'set pagination off' -ex 'thread apply all bt 12'
+```
+
+Installation is the part worth writing down, because two other routes look
+obvious and both fail. This host is immutable ostree, so `dnf install gdb` needs
+`rpm-ostree` and a reboot. Containerised gdb is worse: it installs fine and then
+cannot attach at all -- `ptrace: Operation not permitted` even with `--pid=host
+--privileged --cap-add=SYS_PTRACE --security-opt seccomp=unconfined`, because
+rootless podman puts the tracer in a user namespace that is not an ancestor of
+the tracee's, and no flag fixes that. `yama/ptrace_scope` is already 0 here, so
+that is not the obstacle either. **Homebrew is, and it needs neither root nor a
+reboot:** `brew install gdb` drops a working gdb 17.2 in `$HOME`. `eu-stack`
+comes from the same place and is a decent second best -- it needs no symbols and
+is a single command -- but it leaves libroblox frames as bare addresses and, more
+importantly, printed the async-io reactor's lock as an unresolved frame where gdb
+named `Mutex<polling::Events>` and the source line.
+
+What to read first, and what each answer means:
+
+- **The main thread.** Healthy, it sits in `epoll_wait` inside
+  `looper::pump` and spins -- about 2.5 M polls a second with the census on. The
+  same stack at 0.4% CPU means it is *blocking* rather than polling, so the
+  engine asked for a blocking wait and nothing woke it. That distinction is
+  invisible in a backtrace alone: **always quote the process's CPU beside the
+  stack**, or the two states look identical.
+- **A thread in `Mutex::lock_contended`** is worth a second look and usually
+  innocent. `async_io::driver::main_loop` waiting on `Mutex<polling::Events>`
+  while a `zbus::Connection` thread sits in `polling::Poller::wait` on the same
+  `REACTOR` singleton is async-io working exactly as designed -- any thread may
+  become the poller and the driver waits its turn. Check the addresses match the
+  same reactor before calling it a deadlock.
+- **Zero CPU does not disprove a deadlock.** A thread blocked on a futex burns
+  nothing; that is what blocking is. This was got backwards once already, and it
+  killed a live lead for an afternoon.
+
+Sample twice. A single `bt` catches transient states, and a lock that is still
+held sixty seconds later is a different claim from one seen once.
+
 ## Two practical cautions
 
 **Never synthesise input with `XTestFake*`, `ydotool`, `wlr-virtual-keyboard`,

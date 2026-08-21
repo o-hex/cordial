@@ -541,3 +541,41 @@ trying:
    untrue.
 
 Both need the flag question answered first.
+
+## The syscall was the pacing, not the cost
+
+The attribution above — 9.3 M `epoll_wait` calls a second at about 99 ns each,
+0.92 of a core, some 88% of the idle cost "inside the syscall" — is **wrong**,
+and the arithmetic is not where it fails. It assumes that removing the syscall
+removes the work.
+
+Tested by removing it. `looper_poll_once` was made to answer up to sixteen
+consecutive zero-timeout polls from the previous empty `epoll_wait` rather than
+entering the kernel, counted rather than timed because the census timing already
+records that a clock read costs about what the syscall costs. Four arms,
+alternating with the control in one session, input driven throughout:
+
+    coalescing on    cpu 121.5%  fps 40.6  polls/s 10,650,735
+    control (off)    cpu 123.6%  fps 39.9  polls/s  2,534,844
+    coalescing on    cpu 124.4%  fps 35.9  polls/s 10,719,074
+    control (off)    cpu 124.2%  fps 39.6  polls/s  2,267,928
+
+The change did what it was built to do: one call in seventeen reached the
+kernel. **CPU did not move** — 121.5% to 124.4% across every arm, which is
+noise. The poll rate went *up* fourfold instead. With the syscall gone the
+engine's loop completes each iteration sooner and spins harder for exactly the
+same money.
+
+So the loop is CPU-bound and will consume whatever it is given. Nothing done to
+the cost of one iteration can help, because the iteration count is not fixed —
+it is whatever fits in the time. That retires the whole family of "make
+`pollOnce` cheaper" ideas, which is worth more than the two points of noise this
+measurement bought.
+
+What remains is the only thing that has ever moved this number: the focus
+report. Focused with input costs 128.1%; unfocused with input costs 27.5% at the
+same 59.6 presents a second and the same `ident` count. The engine renders
+identically and only decides whether to wait or spin. Reporting a focused window
+as unfocused would recover a core and would be a lie told to the engine, so it
+is a user-facing trade about input latency rather than an optimisation, and it
+is not one to make quietly.

@@ -14,36 +14,6 @@
   <em>Roblox <strong>DOORS</strong>, unmodified, on Cordial 0.5.2 — Fedora, GNOME, no Android device involved.</em>
 </p>
 
-> [!IMPORTANT]
-> **This project is dormant and looking for a maintainer.** Its author has
-> stepped back for a while and intends to return to hand it over rather than to
-> resume work on it. Saying so at the top is fairer than letting anyone discover
-> it after investing a weekend.
->
-> It is not abandoned mid-collapse — it works. You can sign in, stay signed in,
-> load a game, move around and turn the camera.
-> [**docs/HANDOVER.md**](docs/HANDOVER.md) is written for whoever takes it on:
-> every open thread with what is genuinely known about it, which claims are
-> `INFERRED` and why, and the measurement traps that have already cost people
-> afternoons.
->
-> **If you fork this, please open a pull request as well.** Not instead — as
-> well. Run your fork, ship it, do what you like with it; the licence is GPL-3.0
-> and that is the point. But a change that exists only in a fork is a change
-> that has to be archaeology later, and a change that exists as a PR can be
-> merged in ten minutes by whoever picks this up.
->
-> Pull requests opened during the dormant period **will** be read when a
-> maintainer is assigned. They will sit for a while first, and that is worth
-> knowing before you spend an evening — but they are not going into a void, and
-> the queue is the first thing a new maintainer inherits. Keeping your branch
-> rebased on `main` is the single most useful thing you can do to make that
-> merge cheap.
->
-> If you want to start smaller, the [good first
-> issues](https://github.com/luohoa97/cordial/labels/good%20first%20issue) are
-> real ones, and none of them needs a Roblox account.
-
 Cordial loads Roblox's official Android x86-64 engine directly on Linux through a
 purpose-built runtime: the AOSP bionic linker, a bionic/glibc shim, a JNI VM in
 place of Android's, and a framework layer that answers the client's calls. No

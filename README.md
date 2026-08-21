@@ -12,7 +12,8 @@
 
 <p align="center">
   <em>Roblox <strong>DOORS</strong>, unmodified, on Cordial — Fedora, GNOME, no Android device involved.<br>
-  More footage in <a href="docs/media">docs/media</a>, including an hour of Rivals cut down to its eliminations.</em>
+  <a href="https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-doors.mp4">This clip at full size</a>,
+  and more in <a href="docs/media">docs/media</a> — including an hour of Rivals cut down to its eliminations.</em>
 </p>
 
 Cordial loads Roblox's official Android x86-64 engine directly on Linux through a

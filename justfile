@@ -197,6 +197,20 @@ dev *args:
     if [ -n "$apk" ]; then
         export CORDIAL_APK="$apk"
     fi
+    # The development control surface, on by default for `just dev` because
+    # that is what `just dev` is for. It costs a socket in the profile
+    # directory and nothing else until something connects, and having it off
+    # by default here would mean every investigation started by restarting the
+    # client -- which is exactly the friction it was built to remove. Set
+    # CORDIAL_DEV_CONTROL=0 to run without it.
+    #
+    # Exported rather than passed as a flag because the shell launches the
+    # client as a child and the child inherits the environment; `launch.rs`
+    # adds to that environment rather than clearing it.
+    export CORDIAL_DEV_CONTROL="${CORDIAL_DEV_CONTROL:-1}"
+    if [ "$CORDIAL_DEV_CONTROL" != 0 ]; then
+        echo "dev control on; attach with: just mcp" >&2
+    fi
     exec "./$bindir/cordial-shell" ${extra+"${extra[@]}"}
 
 # Run the engine directly: just client [--in host|distrobox|nix] [--apk PATH] [--run SECS]
@@ -295,12 +309,38 @@ client *args:
         echo "no cordial-run in $bindir — did 'just build $env' succeed?" >&2
         exit 1
     fi
+    # On for the same reason as in `just dev`: this recipe exists to be poked at.
+    export CORDIAL_DEV_CONTROL="${CORDIAL_DEV_CONTROL:-1}"
+    if [ "$CORDIAL_DEV_CONTROL" != 0 ]; then
+        echo "dev control on; attach with: just mcp" >&2
+    fi
     # A long default timer on purpose: a run that ends on its own while somebody
     # is still reading the screen looks exactly like a crash, and that has
     # already cost one debugging session here.
     exec "./$bindir/cordial-run" \
         --lib-dir "$lib" --apk "$apk" \
         --host-libc --game-activity --run "$run" ${extra+"${extra[@]}"}
+
+# Attach the development MCP to whichever running client has a control socket
+mcp *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Speaks MCP on stdin/stdout, so this is what an agent's MCP configuration
+    # runs rather than something to type at a prompt. Register it once with
+    #
+    #     claude mcp add cordial -- just mcp
+    #
+    # It finds the socket itself rather than being told where it is: the most
+    # recently bound devctl.sock wins, so it lands on whichever client was
+    # started last, whether that was `just dev`, `just client`, or a bare
+    # cordial-run with CORDIAL_DEV_CONTROL=1. There is no pid to look up either
+    # -- the debugger tools ask the client for its own over the socket.
+    #
+    # XDG_DATA_HOME is honoured because AGENTS.md asks agents to set it so
+    # parallel runs do not collide on one profile lock, and such a run puts its
+    # profile somewhere else entirely.
+    root="${XDG_DATA_HOME:-$HOME/.local/share}/cordial"
+    exec python3 tools/cordial-mcp.py --profile-root "$root" {{ args }}
 
 # `just client` with text-entry tracing, which is the one wanted most often
 client-text *args:

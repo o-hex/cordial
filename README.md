@@ -5,13 +5,16 @@
 # Run Roblox on Linux natively — Plugins, all yours. (Please don't DMCA take down this hobby project)
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-doors.gif"
-       alt="Roblox DOORS running under Cordial on Linux: first-person corridor, candle in hand"
-       width="560">
+  <a href="https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-rivals.mp4">
+    <img src="https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-rivals.gif"
+         alt="Roblox Rivals running under Cordial on Linux: three first-person eliminations across three maps"
+         width="560">
+  </a>
 </p>
 
 <p align="center">
-  <em>Roblox <strong>DOORS</strong>, unmodified, on Cordial 0.5.2 — Fedora, GNOME, no Android device involved.</em>
+  <em>Roblox <strong>Rivals</strong>, unmodified, on Cordial — Fedora, GNOME, no Android device involved.<br>
+  Cut from an hour of ordinary play. <a href="https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-rivals.mp4">The full clip</a> runs eight eliminations at 1376&times;576.</em>
 </p>
 
 Cordial loads Roblox's official Android x86-64 engine directly on Linux through a

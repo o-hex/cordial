@@ -47,7 +47,13 @@ pub fn hit(index: usize) -> i64 {
     // Once per symbol into the central register, so the end-of-run report can
     // put libc stubs beside the JNI and framework gaps rather than in a table of
     // their own that has to be correlated by hand.
-    if first {
+    //
+    // Except where returning zero *is* the documented answer. That report exists
+    // to name gaps, and a symbol whose contract says zero means "not enabled" is
+    // not a gap -- listing it sends whoever reads the log to implement something
+    // that is already correct, which is how ZSTD_trace_compress_begin came to be
+    // reported as missing when it was answering properly.
+    if first && !answering_correctly(SYMBOLS[index].0) {
         crate::unimplemented::record(crate::unimplemented::Kind::LibcStub, SYMBOLS[index].0);
     }
     if first && !quiet() {
@@ -126,6 +132,29 @@ extern "C" {
 }
 
 /// Every stub called at least once, most-called first. This is the work queue.
+/// Symbols where a zero return is the contract rather than a shortfall.
+///
+/// zstd's tracing hooks are the whole list today. `zstd_trace.h` says of
+/// `ZSTD_trace_compress_begin` and `ZSTD_trace_decompress_begin`: "@returns
+/// Non-zero if tracing is enabled". Zero therefore means tracing is off, and
+/// zstd skips the matching `_end` call entirely. Implementing them to return
+/// non-zero would oblige us to produce `ZSTD_Trace` records that nothing here
+/// consumes -- the stub would start lying, which is the failure AGENTS.md's rule
+/// about stubs is written to prevent, arriving from the unusual direction.
+///
+/// They stay in the stub table so the symbol still resolves and the call still
+/// gets an answer; what changes is that the end-of-run report stops calling that
+/// answer a gap.
+fn answering_correctly(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        "ZSTD_trace_compress_begin"
+            | "ZSTD_trace_decompress_begin"
+            | "ZSTD_trace_compress_end"
+            | "ZSTD_trace_decompress_end"
+    )
+}
+
 pub fn report() {
     let guard = HITS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(hits) = guard.as_ref() else {

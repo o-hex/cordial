@@ -4,6 +4,16 @@
 
 # Run Roblox on Linux natively — Plugins, all yours. (Please don't DMCA take down this hobby project)
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-doors.gif"
+       alt="Roblox DOORS running under Cordial on Linux: first-person corridor, candle in hand"
+       width="560">
+</p>
+
+<p align="center">
+  <em>Roblox <strong>DOORS</strong>, unmodified, on Cordial 0.5.2 — Fedora, GNOME, no Android device involved.</em>
+</p>
+
 > [!IMPORTANT]
 > **This project is dormant and looking for a maintainer.** Its author has
 > stepped back for a while and intends to return to hand it over rather than to

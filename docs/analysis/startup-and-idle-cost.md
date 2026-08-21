@@ -579,3 +579,66 @@ identically and only decides whether to wait or spin. Reporting a focused window
 as unfocused would recover a core and would be a lie told to the engine, so it
 is a user-facing trade about input latency rather than an optimisation, and it
 is not one to make quietly.
+
+## Sober burns the same core, so the comparison this file was built on is wrong
+
+`088e69c` is titled "Sober and mocktail idle at 8%; Cordial burns a core, and it
+is one call", and that framing has driven a great deal of work here. It is not a
+like-for-like comparison. The 8% was measured on an **idle** Sober; Cordial's
+core was measured while **rendering with input driven**. Put both in the same
+state and the difference disappears.
+
+Measured 2026-08-21, per-thread from `/proc/<pid>/task/*/stat`:
+
+    Cordial, signed out      111% total   99.7% in one thread named "Main"
+    Cordial, signed in       117% total   99.2% in one thread named "Main"
+    Sober                    120% total   99.5% in one thread named "Main"
+    Sober, two more samples  193%, 197%   99.5%, 99.3% -- same tid throughout
+
+**Sober has not solved this, and Cordial is not worse at it.** The same
+single-thread spin is present in both, in a thread with the same name, and
+Sober's total was higher in every sample taken. Three samples, one tid,
+consistent to a fifth of a percent, with Sober's own log showing live session
+heartbeats so it was running rather than parked.
+
+One caveat, stated rather than glossed: the two clients were not in identical
+states. Cordial was driven with synthetic input at a known rate; Sober was left
+on its own home screen. So the *totals* are not strictly comparable. What is
+comparable, and what matters, is the shape: one thread at 100% in both.
+
+### What that thread actually is
+
+`lldb`, on Cordial's hot thread:
+
+    frame #0-3  epoll_wait
+    frame #4    looper_poll_once(timeout_millis=0, out_fd=0x0,
+                                 out_events=0x7f005fffe184,
+                                 out_data=0x7f005fffe178)   looper.rs:1159
+    frame #5-7  libroblox, unsymbolised
+    frame #8    __clone3
+
+It is **not Cordial's pump**, which calls with a 50 ms timeout and three null
+out-parameters. This one passes non-null `out_events` and `out_data` and bottoms
+out in `__clone3` under libroblox frames: a thread Roblox created, calling
+`ALooper_pollOnce(0, ...)` in a tight loop.
+
+That is the documented Android idiom rather than a defect.
+`while ((ident = ALooper_pollOnce(animating ? 0 : -1, ...)) >= 0) { ... }` is
+Google's own `native-activity` sample, and a zero timeout while animating means
+"drain what is pending, do not block, then draw". It costs nothing on a phone
+because presentation paces the loop.
+
+### Two more hypotheses that died
+
+**The display-connection registration is not it.** Removing it entirely -- so
+Cordial registers nothing with the looper, as mocktail does -- gives 111.3% at
+60 fps, against 111% with it. mocktail's `ALooper_pollOnce` returns a constant
+and its `ALooper_addFd` registers nothing, and that is not a fix to copy: a
+looper which answers without listening cannot deliver an input event, a wake or
+a surface change, which is precisely the shape AGENTS.md's rule about stubs
+returning success exists to prevent.
+
+**The present mode is not it either.** `CORDIAL_PRESENT_MODE=fifo` gives 110.2%,
+with the frame rate correctly following the output down to 50 Hz -- so
+presentation *is* pacing the outer loop, and the core is burned between frames
+rather than by unpaced drawing.

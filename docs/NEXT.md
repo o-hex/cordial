@@ -1503,7 +1503,24 @@ are two capabilities.
 
 ---
 
-## 4. Accessibility — the AT-SPI bridge is built and verified live; whether Roblox ever reaches it is not
+## 4. Accessibility — SETTLED 2026-08-21: Roblox exposes no tree, so the bridge is unreachable
+
+**The open question below is answered and the answer is negative.** Roblox's
+Android client publishes no accessibility tree by any mechanism. `libroblox.so`
+has 517 `Java_*` exports and none mention accessibility; no `com/roblox/**`
+class in the dex is named `*Accessib*` or implements a provider; and a 40 s run
+with the AT-SPI bridge genuinely attached — so the `isEnabled` gate answered
+true honestly — produced zero calls into `native/accessibility.cpp`. The
+inference that the engine "was built with TalkBack support compiled in" came
+from the dex *referencing* those classes, and a referenced class is not a used
+class. Full working in the header comment of `native/accessibility.cpp`.
+
+Consequence worth carrying: any development or automation surface for Cordial
+has to work in coordinates and pixels. There is no semantic element tree to
+read, and getting one would mean engine introspection, which ADR-001/ADR-003
+place permanently out of scope.
+
+The original entry follows, retained for its reasoning.
 
 New in this change: `native/accessibility.cpp` hooks
 `android.view.accessibility.{AccessibilityManager,AccessibilityNodeInfo,

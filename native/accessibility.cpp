@@ -40,6 +40,48 @@
 // `android_classes.cpp` — a native-to-Java push, no app-side subclass
 // involved. Only a live run distinguishes the two; this file assumes the
 // second and is honest scaffolding either way.
+//
+// ---------------------------------------------------------------------------
+// MEASURED 2026-08-21, and the answer is neither: Roblox exposes no
+// accessibility tree on Android at all, so nothing below is ever reached.
+//
+// The premise above -- "the engine was built with TalkBack support compiled
+// in", inferred from the dex referencing these classes -- does not hold. A
+// referenced class is not a used class, which is the same error this project
+// made reading `framework-classes.txt` as a request log. Four independent
+// checks against the shipping APK and a live run, all negative:
+//
+//   - `readelf --dyn-syms libroblox.so` has 517 `Java_*` exports across 20
+//     engine interfaces (flags, GL, input, settings, video, audio, storage,
+//     purchase, reporting). **None mention accessibility.** There is no native
+//     entry point for a provider shim to call, so the pull model has nothing
+//     to pull even if a JVM existed.
+//   - No class anywhere in `classes{,2,3}.dex` is named `*Accessib*` under
+//     `com/roblox/`, and none implements a provider. The only hits are one
+//     `Landroid/view/accessibility/AccessibilityNodeProvider;` type reference
+//     and the method name `getAccessibilityNodeProvider` -- AndroidX
+//     boilerplate, not an implementation.
+//   - The dex contains no `com/roblox/**` `View` or `Surface` subclass, which
+//     is what a virtual-descendant provider would have to hang off.
+//   - A 40 s run with `CORDIAL_ACCESSIBILITY=1`, reaching the Home screen,
+//     with the AT-SPI bridge genuinely attached (`connected to the AT-SPI bus
+//     as :1.2069`, so the `isEnabled` gate below answered true honestly) made
+//     **zero** calls into this file: no `obtain`, no `setBoundsInScreen`, no
+//     `setContentDescription`, no `sendAccessibilityEvent`.
+//
+// So this file is not blocked on the JVM, and it is not blocked on the gate.
+// It is unreachable because the producer does not exist. It is kept rather
+// than deleted for two reasons: it is a faithful implementation of the public
+// AOSP contract, so it costs nothing and answers correctly if a future Roblox
+// build ever does populate a tree; and the AT-SPI half in `accessibility.rs`
+// is independently useful for exposing *Cordial's own* interface, which is
+// GTK and already has a real accessibility tree.
+//
+// What this closes: a semantic UI-element route for any test harness or
+// automation. There is no tree to read, so element-level access would require
+// engine introspection, which ADR-001 and ADR-003 put permanently out of
+// scope. A development control surface has to work in coordinates and pixels.
+// ---------------------------------------------------------------------------
 
 #include <jnivm.h>
 

@@ -40,6 +40,116 @@ had looked in `appData/`.
 
 # What is blocking
 
+## 0. What 2026-08-21 settled, and what it retracted
+
+A long session with one theme: **every number trusted without a control turned
+out to be wrong, and every control caught it.** Four mechanisms and two of this
+project's own instruments died here. Read this before re-opening any of it.
+
+### Cordial does not have a CPU problem. Sober has the same one
+
+`088e69c` ("Sober and mocktail idle at 8%; Cordial burns a core") compared an
+**idle** Sober against a **rendering** Cordial. In the same state there is no
+difference. Per-thread from `/proc/<pid>/task/*/stat`:
+
+    Cordial, signed out      111%   99.7% in one thread named "Main"
+    Cordial, signed in       117%   99.2% in one thread named "Main"
+    Sober                    120%   99.5% in one thread named "Main"
+    Sober, two more samples   193%, 197%   99.5%, 99.3%, same tid throughout
+
+Sober's total was higher in every sample. `lldb` names the thread:
+`ALooper_pollOnce(timeout_millis=0, out_events/out_data non-null)` at
+`looper.rs:1159`, under three unsymbolised libroblox frames and `__clone3` --
+a thread **Roblox** created, not Cordial's pump, which passes a 50 ms timeout
+and three nulls. That is Google's own `native-activity` idiom, where a zero
+timeout while animating means drain-then-draw, and it costs nothing on a phone
+because presentation paces the loop.
+
+Dead, all measured rather than argued: the present-mode substitution
+(`CORDIAL_PRESENT_MODE=fifo` gives 110.2%, with the frame rate correctly
+following the output to 50 Hz -- so presentation *is* pacing the outer loop);
+the display-connection registration (removing it entirely, so Cordial registers
+nothing as mocktail does, gives 111.3% at 60 fps); all eight TaskScheduler flags
+(108.9-112.2% against a 111.4% control); and making the syscall cheaper --
+coalescing sixteen zero-timeout polls per real `epoll_wait` moved CPU not at all
+and raised the poll rate fourfold, because the loop is CPU-bound and simply
+spins faster. Full working in `docs/analysis/startup-and-idle-cost.md`.
+
+**Do not copy mocktail here.** Its `ALooper_pollOnce` returns a constant and its
+`ALooper_addFd` registers nothing. That is an amputation, not a fix: a looper
+which answers without listening can never deliver an input event, a wake or a
+surface change.
+
+Two levers remain and both are trades rather than fixes. The focus report
+(128% focused against 27.5% unfocused, at the same frame rate and the same
+`ident` count) means telling the engine a focused window is unfocused. Making
+`pollOnce(0)` actually wait would work where coalescing did not -- it reduces
+iterations rather than their cost -- but a zero timeout is the caller saying
+"do not wait", so honouring it with a sleep is the platform lying. Given Sober
+ships with this, neither looks worth it.
+
+### Flag delivery works, and there is finally a positive control
+
+`DFIntTaskSchedulerTargetFps` caps the frame rate on the requested number:
+10 -> 9.5-10.9, 15 -> 14.4-16.0, 20 -> 19.3-20.7, against an uncapped 36.5-47.2,
+six runs, measured with input driven throughout. It tracks the *value*, not the
+presence of an override. `FIntTaskSchedulerTargetFps` -- same name, durable
+prefix -- does nothing, which shows the engine matches the whole name so a
+misspelling fails detectably.
+
+Consequences: overrides written to `CORDIAL_FLAGS` reach the engine and are acted
+on; a `DFInt` override survives the settings reloader §47 describes; and every
+earlier null result is now a real statement about its flag rather than an
+uninterpretable one. See `flag-init.md` §49.
+
+### Instruments retired -- check this list before trusting a number
+
+- **`mainWorkCallback` fires exactly twice in healthy runs.** "It stopped after
+  two" is not a symptom.
+- **`onFlagsLoaded`'s byte count is a constant.** 1,308,253 for an `FInt` six
+  characters longer, an `FString` 1,001 longer, and a document with 903 keys and
+  87 KB removed.
+- **Present counts without input are the idle throttle**, pinned at exactly
+  1.0/s. A wedged client leaves the counter *fixed*; a throttled one ticks at
+  1.0/s and wakes on input. `cordial_info` twice, a few seconds apart, is the
+  test.
+- **Zero CPU does not disprove a deadlock.** A futex-blocked thread burns
+  nothing. Quote the process CPU beside every backtrace.
+- **A screenshot that reads the recorded swapchain instead of the presented one
+  returns a stale, never-drawn image** -- a uniform field, identical to six
+  decimal places between runs that looked nothing alike. That was very nearly
+  written up as "the engine presents blank frames". Fixed in `7d85816`; both the
+  swapchain and the image index now come from `VkPresentInfoKHR`.
+
+### The freeze is characterised but not fixed
+
+Cordial is healthy throughout: 74 million polls, the pump ticking at its normal
+20 Hz cadence, main thread in `epoll_wait` inside `looper::pump`. The engine
+stops presenting -- 42 frames in one case, 92 in another -- with **zero** Vulkan
+errors, no thread blocked in the driver, and every thread idle.
+
+It reproduced once in about twenty launches here against a machine where it
+happened reliably, which is not enough to bisect with and nowhere near enough to
+verify a fix against. Cold-start and warm-start rates were the same (0/6 and
+0/6 with the present-mode substitution on and off).
+
+One instance examined in detail turned out **not** to be this bug at all: it had
+a 60-second connection timeout to a private address, no `AssetsManifestManager`,
+no `JNINativeHelper`, and one frame drawn -- a client that never finished
+starting because it could not reach the network, sitting on the one frame it
+managed. Check the engine's own player log for those subsystems before calling
+an instance frozen.
+
+The pump now reports its own stall: no present for five seconds while the pump
+is still running prints the geometry, the pid and the backtrace command, once,
+ungated. Verified negative (an idle run produces none across 35 s); the positive
+branch is `INFERRED` -- no wedge occurred while it was compiled in.
+
+### Roblox exposes no accessibility tree
+
+Settled four ways, see §4 and `native/accessibility.cpp`. Any development or
+automation surface has to work in coordinates and pixels.
+
 ## 1. Text entry — the last step before you can sign in
 
 **The login form works.** Clicking Sign In on the landing page opens Roblox's
@@ -1789,6 +1899,12 @@ It is left in place because removing it changes what runs at every
 
 ## 5. System time equals user time — and it is almost all the engine's
 
+> **2026-08-21:** still true, and §0 now says what the engine is doing with it —
+> one thread on `ALooper_pollOnce(0, ...)`, which Sober also has. The attribution
+> below stands; the conclusion once drawn from it, that Cordial is unusually
+> expensive, does not.
+
+
 A 30s run spends about as long in the kernel as in userland (17.3s user, 16.8s
 system) and racks up roughly 49,000 voluntary context switches. That looked like
 Cordial's pump loop thrashing. It is not.
@@ -1827,6 +1943,20 @@ read fault counts taken on a thrashing machine as a property of the client.
 
 ## Debugging facts that cost real time
 
+- **Reach for `tools/cordial-mcp.py` first.** `just dev --play` starts a client
+  and `just mcp` attaches; it screenshots out of the swapchain (unaffected by
+  occlusion, and the only thing on this host that can photograph a Wayland
+  window -- five other routes were tried and every one was refused), drives
+  Cordial's own input, and attaches lldb with the process CPU quoted beside the
+  stacks. `cordial_info` twice is the wedged-or-throttled test. Written up in
+  [ADR-019](adr/ADR-019-development-control-surface.md).
+- **lldb is installed through Homebrew, not `dnf` or a container.** This host is
+  immutable ostree, so `dnf` needs `rpm-ostree` and a reboot; a containerised
+  debugger installs cleanly and then cannot attach at all, because rootless
+  podman puts the tracer in a user namespace that is not an ancestor of the
+  tracee's and no combination of `--privileged`, `--pid=host` and `SYS_PTRACE`
+  repairs that. `yama/ptrace_scope` is already 0 here, so that is not it either.
+  `brew install llvm` needs neither root nor a reboot.
 - **lldb breakpoints inside `libroblox.so` do not work and fail silently.**
   Cordial `mmap`s it outside the system linker, so lldb never lists the image and
   every breakpoint stays unresolved with hit count 0. Use `memory write` of

@@ -979,9 +979,14 @@ fn profile_busy(
     let ours = holder.as_ref().filter(|h| h.is_cordial()).cloned();
     let body = busy_body(holder.as_ref());
 
-    let dialog = adw::MessageDialog::builder()
-        .transient_for(parent)
-        .modal(true)
+    // `AlertDialog`, not `MessageDialog`: it draws inside the parent window
+    // rather than opening a toplevel of its own. That is what libadwaita
+    // replaced `MessageDialog` with, and `root_warning` already uses it. It
+    // also removes the focus problem at the source rather than working around
+    // it -- a separate toplevel handed focus to whatever was behind Cordial on
+    // dismissal, so closing this meant alt-tabbing back to the window you were
+    // already in. A dialog that never was a window cannot do that.
+    let dialog = adw::AlertDialog::builder()
         .heading(format!("Profile {name} is already in use"))
         .body(body)
         .build();
@@ -1001,11 +1006,6 @@ fn profile_busy(
     let config = config.clone();
     let join = join.clone();
     dialog.connect_response(None, move |_, response| {
-        // Take focus back explicitly. A transient dialog closing does not
-        // reliably return it under this compositor, and it landed on whatever
-        // was behind Cordial -- so dismissing this meant alt-tabbing back to
-        // the window you were already using.
-        parent_window.present();
         match response {
         // The switcher is the combo row above the launch button; activating the
         // window's action rather than building a second chooser here keeps one
@@ -1027,7 +1027,7 @@ fn profile_busy(
         _ => {}
         }
     });
-    dialog.present();
+    dialog.present(Some(parent));
 }
 
 /// What the refusal says, given who is holding the profile.
@@ -1115,14 +1115,11 @@ const STOP_GIVE_UP: Duration = Duration::from_secs(10);
 /// user, and a message that fades after four seconds is barely better than no
 /// message. The toast is for the good case.
 pub fn alert(parent: &gtk::Window, heading: &str, body: &str) {
-    let dialog = adw::MessageDialog::builder()
-        .transient_for(parent)
-        .modal(true)
-        .heading(heading)
-        .body(body)
-        .build();
+    // In-window, for the reason `profile_busy` gives: a toplevel dialog gives
+    // focus away when it closes.
+    let dialog = adw::AlertDialog::builder().heading(heading).body(body).build();
     dialog.add_response("ok", "Close");
-    dialog.present();
+    dialog.present(Some(parent));
 }
 
 #[cfg(test)]

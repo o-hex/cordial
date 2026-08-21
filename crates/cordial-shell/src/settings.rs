@@ -750,10 +750,9 @@ fn build_plugin_row(
         let title = title.clone();
         let group = group.clone();
         let expander = expander.clone();
+        let window = window.clone();
         remove.connect_clicked(move |_| {
-            let dialog = adw::MessageDialog::builder()
-                .transient_for(&window)
-                .modal(true)
+            let dialog = adw::AlertDialog::builder()
                 .heading(format!("Remove {title}?"))
                 .body(
                     "Its files are deleted. What you allowed it to do, and anything it saved, \
@@ -780,7 +779,7 @@ fn build_plugin_row(
                 }
                 dialog.close();
             });
-            dialog.present();
+            dialog.present(Some(&window));
         });
     }
 
@@ -1057,9 +1056,7 @@ fn build_marketplace_entry_row(
             }
         };
 
-        let dialog = adw::MessageDialog::builder()
-            .transient_for(&window)
-            .modal(true)
+        let dialog = adw::AlertDialog::builder()
             .heading(format!("Install {entry_id} {entry_version}?"))
             .body(body)
             .build();
@@ -1079,6 +1076,8 @@ fn build_marketplace_entry_row(
         let window = window.clone();
         let row_for_status = row_for_status.clone();
         let button = button.clone();
+        // The closure consumes its copy, and `present` below still needs one.
+        let present_parent = window.clone();
         dialog.connect_response(None, move |dialog, response| {
             if response == "install" {
                 // Resolved again, now that the user has agreed to the plan
@@ -1138,7 +1137,7 @@ fn build_marketplace_entry_row(
             }
             dialog.close();
         });
-        dialog.present();
+        dialog.present(Some(&present_parent));
     });
 
     row

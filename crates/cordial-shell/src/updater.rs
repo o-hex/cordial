@@ -701,14 +701,12 @@ fn action_label(checked: &Option<Checked>) -> &'static str {
 /// place a build could be chosen; that is now the Roblox page in Settings, and
 /// the text says so rather than growing a shortcut back to it.
 fn update_dialog(parent: &adw::Window) {
-    let dialog = adw::MessageDialog::builder()
-        .transient_for(parent)
-        .modal(true)
+    let dialog = adw::AlertDialog::builder()
         .heading("Cordial cannot download this build")
         .body(update_body(&Source::configured()))
         .build();
     dialog.add_response("close", "Close");
-    dialog.present();
+    dialog.present(Some(parent));
 }
 
 /// "Updates" — a page of its own, and what it says about a download it cannot

@@ -158,13 +158,15 @@ fn subtitle(name: &str, availability: Option<&Availability>) -> String {
     match availability {
         None => format!("{name} will be created when you launch"),
         Some(Availability::Free) => String::new(),
-        // Four words, because the row has least of all things width -- it
-        // shares its line with the combo and the create button, and the longer
-        // version ellipsised before reaching the half that mattered. What
-        // happens if you press Roblox anyway is not this line's job: the
-        // button stays live on purpose, and the dialog it raises offers to
-        // close the other client, which is the useful thing to be offered.
-        Some(Availability::Running) => "Open in another window".into(),
+        // "Opened", not "Open". The imperative reading of "Open in another
+        // window" is an instruction -- press this to open it over there -- and
+        // the row is describing a state, not offering an action. Four words
+        // because this line shares its width with the combo and the create
+        // button, and the version that also explained the refusal ellipsised
+        // before reaching the half that mattered. What pressing Roblox will do
+        // is not this line's job: the button stays live on purpose, and the
+        // dialog it raises offers to close the other client.
+        Some(Availability::Running) => "Opened in another window".into(),
         Some(Availability::Unusable(message)) => message.clone(),
     }
 }
@@ -361,7 +363,7 @@ fn list_factory() -> gtk::SignalListItemFactory {
                 item.set_selectable(true);
                 item.set_activatable(true);
                 line.set_sensitive(true);
-                note_label.set_text("Open in another window");
+                note_label.set_text("Opened in another window");
                 note_label.set_visible(true);
             }
             // Still refused: an unusable profile has nothing to offer and no
@@ -402,9 +404,7 @@ fn create(parent: &gtk::Window, switcher: &Switcher) {
     body.append(&group);
     body.append(&hint);
 
-    let dialog = adw::MessageDialog::builder()
-        .transient_for(parent)
-        .modal(true)
+    let dialog = adw::AlertDialog::builder()
         .heading("New profile")
         .body(
             "A profile is one account's Roblox storage: its own session, settings, flag \
@@ -454,6 +454,9 @@ fn create(parent: &gtk::Window, switcher: &Switcher) {
         });
     }
 
+    // Kept for `present`, which needs the parent after the closure below has
+    // taken its own copy.
+    let present_parent = parent.clone();
     let switcher = switcher.clone();
     let parent = parent.clone();
     // The entry itself is captured, rather than found again from the dialog's
@@ -481,7 +484,7 @@ fn create(parent: &gtk::Window, switcher: &Switcher) {
         }
     });
 
-    dialog.present();
+    dialog.present(Some(&present_parent));
 }
 
 #[cfg(test)]

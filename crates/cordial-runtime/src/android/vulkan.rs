@@ -383,7 +383,22 @@ pub fn get_instance_proc_addr_symbol() -> Option<*mut c_void> {
 
 // -------------------------------------------------------------- interposition
 
+/// The engine's `VkInstance`, kept because instance-level commands cannot be
+/// resolved without one.
+///
+/// Recorded here rather than in `vk_create_instance` because this function
+/// sees it on every later lookup and the creation path has several returns;
+/// one store on a hot-ish path is cheaper than another way to miss it. The
+/// capture in `take_capture` needs `vkGetPhysicalDeviceMemoryProperties`,
+/// which a null instance does not resolve -- that mistake cost a run whose log
+/// said only "driver has no vkGetPhysicalDeviceMemoryProperties", which is
+/// true of every driver when you ask without an instance.
+static INSTANCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 extern "C" fn vk_get_instance_proc_addr(instance: *mut c_void, name: *const c_char) -> *mut c_void {
+    if !instance.is_null() {
+        INSTANCE.store(instance as usize, std::sync::atomic::Ordering::Relaxed);
+    }
     let Some(h) = host() else {
         return std::ptr::null_mut();
     };
@@ -521,6 +536,16 @@ extern "C" fn vk_queue_present_khr(queue: *mut c_void, info: *const c_void) -> i
     if f == 0 {
         return 0;
     }
+    // A capture, if one was asked for, before the frame goes anywhere.
+    //
+    // Here rather than after the present because this is the only moment the
+    // image is both complete and in a layout the copy can name: the engine has
+    // finished rendering it and left it in `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR`.
+    // Once the present has been forwarded the image belongs to the driver and
+    // reading it is a race.
+    if super::capture::pending() {
+        take_capture(queue, info);
+    }
     // SAFETY: resolved from the host loader for exactly this name.
     let f: extern "C" fn(*mut c_void, *const c_void) -> i32 = unsafe { std::mem::transmute(f) };
     let rc = f(queue, info);
@@ -528,6 +553,93 @@ extern "C" fn vk_queue_present_khr(queue: *mut c_void, info: *const c_void) -> i
         report_present_result(rc);
     }
     rc
+}
+
+/// Pull the image index out of `VkPresentInfoKHR` and hand the copy off.
+///
+/// `pImageIndices` sits 48 bytes in, by the specification's C layout, after
+/// `sType`, `pNext`, the wait-semaphore pair and the swapchain pair. Read
+/// unaligned because nothing guarantees the caller's struct alignment matches
+/// ours, and a misaligned read is undefined behaviour rather than a slow one.
+fn take_capture(queue: *mut c_void, info: *const c_void) {
+    if info.is_null() {
+        return;
+    }
+    // SAFETY: the caller passes a valid `VkPresentInfoKHR`; only the image
+    // index array is read, and only its first element, which the count above
+    // it guarantees exists for any present that names a swapchain.
+    let image_index = unsafe {
+        let indices = std::ptr::read_unaligned((info as *const u8).add(48) as *const *const u32);
+        if indices.is_null() {
+            return;
+        }
+        std::ptr::read_unaligned(indices)
+    };
+    let Some(h) = host() else { return };
+    let gdpa = HOST_GET_DEVICE_PROC_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    if gdpa == 0 {
+        println!("[android] vulkan: capture needs vkGetDeviceProcAddr and it was never resolved");
+        return;
+    }
+    let phys = PHYSICAL_DEVICE.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
+    if phys.is_null() {
+        println!("[android] vulkan: capture needs the physical device and vkCreateDevice never ran");
+        return;
+    }
+    let name = c"vkGetPhysicalDeviceMemoryProperties";
+    let inst = INSTANCE.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
+    // SAFETY: the instance getter is the host's, called with the engine's own
+    // instance, for a core instance-level command.
+    let gpdmp = unsafe { (h.get_instance_proc_addr)(inst, name.as_ptr()) };
+    if gpdmp.is_null() {
+        // Once. This runs inside a present, so a per-frame complaint would
+        // bury the run at sixty lines a second -- which is exactly what the
+        // first version of this did.
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            println!("[android] vulkan: no vkGetPhysicalDeviceMemoryProperties, so no capture");
+        }
+        super::capture::abandon("vkGetPhysicalDeviceMemoryProperties is unavailable");
+        return;
+    }
+    // SAFETY: both were resolved from the loader for exactly these names, and
+    // are called with the signatures the specification gives them.
+    unsafe {
+        super::capture::capture(
+            queue as u64,
+            image_index,
+            std::mem::transmute::<usize, extern "C" fn(u64, *const c_char) -> *mut c_void>(gdpa),
+            std::mem::transmute::<
+                *mut c_void,
+                extern "C" fn(*mut c_void, *mut super::capture::PhysicalDeviceMemoryProperties),
+            >(gpdmp),
+            phys,
+        );
+    }
+}
+
+/// Ask for the next presented frame to be written to `path`, and wait for it.
+///
+/// Blocking, with a bound, because the caller is a socket handler answering a
+/// harness that wants the file to exist by the time it is told `ok`. The bound
+/// matters more than the wait: a client whose engine has stopped presenting --
+/// which is the exact failure this whole surface was built to investigate --
+/// would otherwise hang the harness that came to look at it.
+pub fn request_capture(path: &str) -> Result<String, String> {
+    super::capture::request(path);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if let Some(r) = super::capture::take_result() {
+            return r;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Err("no frame was presented within three seconds (the engine may be wedged)".into())
+}
+
+/// The extent of the most recent swapchain, for callers reporting state.
+pub fn last_extent() -> (u32, u32) {
+    super::capture::extent()
 }
 
 /// Say when a present came back as anything other than `VK_SUCCESS`, at the
@@ -630,6 +742,25 @@ extern "C" fn vk_create_device(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     PHYSICAL_DEVICE.store(physical_device as usize, std::sync::atomic::Ordering::Relaxed);
+    // The queue family the engine asked for, read out of its own
+    // `VkDeviceCreateInfo`. A capture needs a command pool, a command pool is
+    // per family, and assuming family zero would be a guess that happens to be
+    // right on this driver and wrong on the next one. Offsets are the
+    // specification's C layout: `queueCreateInfoCount` at 20, the array
+    // pointer at 24, and `queueFamilyIndex` 20 bytes into the first element.
+    if !create_info.is_null() {
+        // SAFETY: the caller passes a valid `VkDeviceCreateInfo`, and only the
+        // two documented fields are read.
+        unsafe {
+            let base = create_info as *const u8;
+            let count = std::ptr::read_unaligned(base.add(20) as *const u32);
+            let infos = std::ptr::read_unaligned(base.add(24) as *const *const u8);
+            if count > 0 && !infos.is_null() {
+                let family = std::ptr::read_unaligned(infos.add(20) as *const u32);
+                super::capture::QUEUE_FAMILY.store(family as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
     type Fn_ = extern "C" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> i32;
     // SAFETY: resolved from the host loader for exactly this name, and called
     // with the caller's own arguments unchanged.
@@ -802,7 +933,38 @@ static HOST_CREATE_SWAPCHAIN: std::sync::atomic::AtomicUsize =
 /// FIFO stays the fallback on every path through here, because FIFO is the only
 /// present mode the specification requires an implementation to support. A
 /// client that assumes MAILBOX exists works on Mesa and breaks on some drivers.
+/// Records what a capture needs, then creates the swapchain as before.
+///
+/// A wrapper rather than an edit to each of the inner function's several early
+/// returns, so that "what was created" is recorded in exactly one place no
+/// matter which path produced it. The alternative reliably grows a route that
+/// forgets, and a capture against a stale swapchain handle is a driver crash
+/// rather than a wrong picture.
 extern "C" fn vk_create_swapchain_khr(
+    device: *mut c_void,
+    create_info: *const VkSwapchainCreateInfoKHR,
+    allocator: *const c_void,
+    swapchain_out: *mut u64,
+) -> i32 {
+    let rc = vk_create_swapchain_inner(device, create_info, allocator, swapchain_out);
+    if rc == VK_SUCCESS && !create_info.is_null() && !swapchain_out.is_null() {
+        // SAFETY: both pointers are the caller's, checked for null, and the
+        // driver has just reported success so `swapchain_out` is written.
+        unsafe {
+            let info = &*create_info;
+            super::capture::DEVICE.store(device as usize, std::sync::atomic::Ordering::Relaxed);
+            super::capture::note_swapchain(
+                *swapchain_out,
+                info.image_extent.width,
+                info.image_extent.height,
+                info.image_format as u32,
+            );
+        }
+    }
+    rc
+}
+
+extern "C" fn vk_create_swapchain_inner(
     device: *mut c_void,
     create_info: *const VkSwapchainCreateInfoKHR,
     allocator: *const c_void,

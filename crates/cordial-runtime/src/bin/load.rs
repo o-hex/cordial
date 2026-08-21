@@ -325,6 +325,11 @@ fn enter_run_dir(opt: &mut Options) {
     // given. This used to compute `instances/default` by hand while the rest of
     // the process had moved to `profiles/<name>`, which put the run directory and
     // the data directory in different trees.
+    // The development control socket, if this run asked for one. Started here
+    // because `profile::active()` has latched by now, and the socket belongs
+    // inside the profile so ADR-012's one-instance lock already covers it.
+    cordial_runtime::devctl::start();
+
     let root = cordial_runtime::profile::active().join("run");
     if let Err(e) = std::fs::create_dir_all(root.join("exe")) {
         println!("  could not create {}: {e}", root.display());

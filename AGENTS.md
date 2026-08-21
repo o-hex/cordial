@@ -188,7 +188,7 @@ tree.
 
 ## Ask a debugger before you theorise
 
-**gdb attaches to a running Cordial, and on a frozen one it is the fastest
+**lldb attaches to a running Cordial, and on a frozen one it is the fastest
 answer in this repository.** A stuck client took most of a session of guessing
 on 2026-08-21 -- four theories, three of them scored with instruments that were
 constant across every run -- and one `thread apply all bt` settled more in
@@ -196,9 +196,23 @@ thirty seconds than any of it.
 
 ```bash
 export PATH=/home/linuxbrew/.linuxbrew/bin:$PATH
-gdb -p $(pgrep -f 'cordial-run.*--profile <yours>') -batch \
-    -ex 'set pagination off' -ex 'thread apply all bt 12'
+lldb -p $(pgrep -f 'cordial-run.*--profile <yours>') -b \
+     -o 'thread backtrace all -c 12'
 ```
+
+lldb rather than gdb because Cordial is a Clang project by necessity -- AOSP's
+bionic does not build with GCC -- so it is the toolchain already required.
+**Not for speed:** attach-and-backtrace measured 1.63 s and 1.56 s against gdb's
+1.64 s and 1.65 s here, which is a tie, and both resolved Cordial frames to file
+and line. gdb still works and the equivalent is
+`gdb -p PID -batch -ex 'thread apply all bt 12'`.
+
+Easier still, and preferred, is to let the development MCP do it:
+`tools/cordial-mcp.py` exposes `cordial_backtrace` (which quotes the process's
+CPU beside the stack, because that is the reading everyone gets wrong) and
+`cordial_debugger` for arbitrary commands. It also screenshots the client out of
+its own swapchain and drives its input, which is how a freeze should be
+investigated now -- see [ADR-019](docs/adr/ADR-019-development-control-surface.md).
 
 Installation is the part worth writing down, because two other routes look
 obvious and both fail. This host is immutable ostree, so `dnf install gdb` needs

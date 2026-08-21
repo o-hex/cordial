@@ -22,6 +22,7 @@ pub mod browser_tracker;
 pub mod client_settings;
 pub mod cookies;
 pub mod deeplink;
+pub mod devctl;
 pub mod flags;
 pub mod graphics;
 pub mod identity;

@@ -752,6 +752,12 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
         }
         if let Some(handle) = game_activity_handle {
             super::pump_input_events(handle);
+            // Whatever the development control socket has queued, applied on
+            // this thread for the same reason `CORDIAL_SCRIPT`'s actions are:
+            // the engine's input natives have only ever been called from the
+            // pump, and a socket handler is not the place to find out whether
+            // they mind. A no-op unless `CORDIAL_DEV_CONTROL` was set.
+            crate::devctl::apply_queued(handle);
             // Tell the engine when the user has switched away, and when they
             // have come back.
             //

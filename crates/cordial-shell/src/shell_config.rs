@@ -236,6 +236,72 @@ impl ThrottleWhen {
     }
 }
 
+/// Whether the desktop's own pointer acceleration reaches the camera.
+///
+/// `zwp_relative_pointer_v1` delivers two deltas per event: one the
+/// compositor has run through the desktop's pointer profile, and one it has
+/// not. While Roblox holds the cursor -- first person, shift lock, right-drag
+/// -- Cordial chooses between them, and unaccelerated is right for a camera:
+/// acceleration is superlinear in speed, so a fast sweep turns further than a
+/// slow one covering the same distance, and in-game sensitivity would
+/// otherwise follow whatever pointer speed the desktop happens to be set to.
+///
+/// **There is deliberately no `Never`.** With the cursor unlocked, Cordial is
+/// handed an absolute position the compositor has *already* accelerated;
+/// there is no unaccelerated absolute to fall back to, so the desktop's
+/// setting applies whether Cordial likes it or not. Offering "never" would be
+/// a switch that silently does nothing outside the lock, which is the same
+/// shape as a stub that returns success. Naming the default after what
+/// actually happens says the true thing instead.
+///
+/// Keyed on the pointer lock rather than on "first person" because first
+/// person is engine state and Cordial cannot see it -- Roblox exposes no
+/// accessibility tree, and reading it any other way is out of scope under
+/// ADR-001. The lock is Cordial's own, and Roblox takes it for exactly the
+/// three camera cases that want raw movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PointerAcceleration {
+    /// The desktop's setting moves the cursor, and camera movement is raw.
+    /// The default, and the only honest description of the status quo.
+    UnlockedCursor,
+    /// The desktop's setting moves the camera too, for anyone who has tuned
+    /// their pointer profile and wants the client to obey it.
+    Always,
+}
+
+impl Default for PointerAcceleration {
+    fn default() -> Self {
+        PointerAcceleration::UnlockedCursor
+    }
+}
+
+impl PointerAcceleration {
+    /// Order matches the `AdwComboRow` model in `settings.rs`, as
+    /// [`ThrottleWhen::index`] does.
+    pub fn index(self) -> u32 {
+        match self {
+            PointerAcceleration::UnlockedCursor => 0,
+            PointerAcceleration::Always => 1,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            0 => PointerAcceleration::UnlockedCursor,
+            _ => PointerAcceleration::Always,
+        }
+    }
+
+    /// The word the client parses out of `CORDIAL_POINTER_ACCEL`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PointerAcceleration::UnlockedCursor => "unlocked",
+            PointerAcceleration::Always => "always",
+        }
+    }
+}
+
 /// The profile a launch runs against when nobody has chosen otherwise.
 ///
 /// ADR-012's migration lands the pre-existing storage at `profiles/default`, so
@@ -270,6 +336,11 @@ pub struct ShellConfig {
     /// [`ThrottleWhen`], which carries the whole of the reasoning.
     #[serde(default)]
     pub throttle: ThrottleWhen,
+    /// Whether the desktop's pointer acceleration reaches the camera. See
+    /// [`PointerAcceleration`], which carries the reasoning and the reason
+    /// there is no "never".
+    #[serde(default)]
+    pub pointer_acceleration: PointerAcceleration,
     /// What Cordial does about a new Roblox build without being asked, and over
     /// which connections it may fetch one.
     ///
@@ -367,6 +438,7 @@ impl Default for ShellConfig {
             download_on: cordial_update::settings::DownloadOn::default(),
             gamemode: true,
             throttle: ThrottleWhen::default(),
+            pointer_acceleration: PointerAcceleration::default(),
             graphics: "automatic".to_string(),
             mangohud: false,
             fullscreen_accel: default_fullscreen_accel(),

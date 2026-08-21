@@ -479,6 +479,41 @@ fn build_performance_group(
     }
     group.add(&throttle);
 
+    // Order has to match PointerAcceleration::index/from_index.
+    //
+    // Two options rather than three, and the missing one is "never". While the
+    // cursor is unlocked Cordial is handed an absolute position the compositor
+    // has already accelerated, so there is no unaccelerated absolute to fall
+    // back to and the desktop's setting applies regardless. A "never" entry
+    // would be a menu item that silently does nothing, which is the interface
+    // shape of a stub that returns success. Naming the default after what
+    // actually happens -- the cursor follows the system, the camera does not --
+    // says the true thing in the same space.
+    let accel_model = gtk::StringList::new(&["Only the cursor", "Cursor and camera"]);
+    let accel = adw::ComboRow::builder()
+        .title("Use system mouse acceleration settings")
+        // The half that is misleading if omitted: this is not an "add
+        // acceleration" switch. It decides whether the desktop's own pointer
+        // profile reaches the camera, so somebody who has already turned
+        // acceleration off system-wide will find it changes only speed. Said
+        // here because the obvious reading of the title is that turning it on
+        // introduces acceleration from nowhere.
+        .subtitle("Camera movement is raw by default, which is what a camera wants. Choosing both follows your desktop pointer profile instead — so if acceleration is already off system-wide, only speed changes.")
+        .model(&accel_model)
+        .selected(config.borrow().pointer_acceleration.index())
+        .build();
+    accel.set_subtitle_lines(4);
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        accel.connect_selected_notify(move |row| {
+            config.borrow_mut().pointer_acceleration =
+                crate::shell_config::PointerAcceleration::from_index(row.selected());
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&accel);
+
     let layer = crate::launch::mangohud_layer();
     let mangohud = adw::SwitchRow::builder()
         .title("MangoHUD overlay")

@@ -385,6 +385,7 @@ pub fn spawn(
     // default has to match the shell's or the two disagree about what a fresh
     // install does.
     command.env("CORDIAL_THROTTLE", config.throttle.as_str());
+    command.env("CORDIAL_POINTER_ACCEL", config.pointer_acceleration.as_str());
 
     // The Graphics row, and **only when it is not Automatic**. That is not a
     // micro-optimisation: an absent variable is what tells the runtime the user

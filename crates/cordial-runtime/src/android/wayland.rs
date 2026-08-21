@@ -823,9 +823,13 @@ struct LockedPointerListener {
 
 /// The four `wl_fixed_t` arguments are two pairs, not four numbers: the
 /// accelerated delta the compositor's pointer profile produced, then the raw
-/// unaccelerated one. Cordial uses the accelerated pair, because that is what
-/// every other application on the desktop moves by and a camera that ignores
-/// the user's own pointer-speed setting is a bug report.
+/// unaccelerated one.
+///
+/// Cordial uses the **unaccelerated** pair by default, and which pair it uses
+/// is now a setting -- see [`relative_pointer_motion`]. This comment said the
+/// opposite until 2026-08-21, having outlived commit 6cb9ed7 which changed the
+/// behaviour and left the description behind. A comment that contradicts the
+/// code twenty lines below it costs more than no comment.
 #[repr(C)]
 struct RelativePointerListener {
     relative_motion: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32, i32, i32, i32, i32),
@@ -2233,9 +2237,37 @@ unsafe extern "C" fn relative_pointer_motion(
     // reasoned from what the two fields are documented to mean — but it is not
     // inferred that Cordial was sending the wrong pair: that part is read
     // straight off the protocol's own field names.
+    //
+    // Which pair is used is a setting rather than a decision, because the
+    // argument above is strong for a first-person camera and not universal: a
+    // player who has tuned their desktop pointer profile and wants the client
+    // to obey it is not wrong, and neither is one who wants raw input. The
+    // default is unaccelerated because that is what a camera wants and what
+    // the reported bug was about; `CORDIAL_POINTER_ACCEL=1` restores the
+    // accelerated pair, and the settings window offers it as a switch.
+    let (dx, dy) =
+        if pointer_acceleration() { (_dx, _dy) } else { (dx_unaccel, dy_unaccel) };
     if let Some(w) = current() {
-        w.dispatch_relative_motion(fixed_to_f32(dx_unaccel), fixed_to_f32(dy_unaccel));
+        w.dispatch_relative_motion(fixed_to_f32(dx), fixed_to_f32(dy));
     }
+}
+
+/// Whether to pass the compositor's accelerated deltas through to the camera.
+///
+/// Read once. This is consulted on every relative-motion event, which arrives
+/// at the pointer's full report rate while the pointer is locked, so an
+/// environment lookup per event would be a syscall-free but still needless cost
+/// on the hottest input path there is.
+fn pointer_acceleration() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        // "always" is the only value that turns this on. Anything else,
+        // including the variable being absent, leaves the camera on raw
+        // movement -- the shell sends "unlocked" for that, which names what
+        // happens rather than pretending Cordial can disable acceleration for
+        // the unlocked cursor, because it cannot.
+        matches!(std::env::var("CORDIAL_POINTER_ACCEL").as_deref(), Ok("always"))
+    })
 }
 
 static RELATIVE_POINTER_LISTENER: RelativePointerListener =

@@ -396,6 +396,96 @@ fn data_dir() -> PathBuf {
 /// can set it in `flags.json` — so nothing is lost except the default.
 const BUILTIN: &[(&str, &str)] = &[];
 
+/// How hard to push the engine's own worker pools, as a choice rather than a
+/// default.
+///
+/// Roblox exposes several thread-count and pipeline flags that mocktail's
+/// `src/runtime/performance_policy.cc` scales to the machine (Apache-2.0; the
+/// policy shape is adapted here, not its code). They are offered as modes for
+/// the reason [`BUILTIN`] gives at length: an inference belongs behind a switch
+/// somebody chooses, where being wrong costs that person an experiment, rather
+/// than as a default where it costs everybody a worse client and nobody knows
+/// why.
+///
+/// **None of these are measured on this project's hardware yet.** Two of them --
+/// `FIntTaskSchedulerAutoThreadLimit` and `FIntTaskSchedulerThreadMin` -- were
+/// tested against CPU on 2026-08-21 and moved it not at all, but CPU is not what
+/// they are for and the frame rate was never measured. Until somebody runs the
+/// comparison, [`Performance::Balanced`] sets nothing and is the default, so the
+/// shipped behaviour is exactly what it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Performance {
+    /// Sets nothing. What Cordial has always done.
+    #[default]
+    Balanced,
+    /// More worker threads and parallel prerender, at the cost of using more of
+    /// the machine. Aimed at a desktop with cores to spare.
+    Throughput,
+    /// Fewer threads and a smaller physics batch, for a machine where latency
+    /// matters more than throughput or where cores are scarce.
+    Latency,
+}
+
+/// The flags a mode asks for, given how many *physical* cores the machine has.
+///
+/// Physical rather than logical, and that distinction is not pedantry: on a
+/// hybrid part -- six performance cores and eight efficiency cores reporting
+/// sixteen threads, which is the machine this was written on -- sizing a render
+/// worker pool by thread count spreads work onto cores that are slower per
+/// thread, which is the opposite of the intent.
+///
+/// Pure, so the table can be tested without a machine to run it on.
+pub fn performance_flags(mode: Performance, physical_cores: usize) -> Vec<(String, String)> {
+    let workers = physical_cores.max(1);
+    let owned = |k: &str, v: String| (k.to_string(), v);
+    match mode {
+        Performance::Balanced => Vec::new(),
+        // The async minimum is capped at three in mocktail's policy; kept,
+        // because a floor that rises with core count would put a large machine's
+        // async pool above what the scheduler is asked to allow.
+        Performance::Throughput => vec![
+            owned("FIntTaskSchedulerThreadMin", "0".into()),
+            owned("FIntTaskSchedulerAsyncTasksMinimumThreadCount", workers.min(3).to_string()),
+            owned("FIntTaskSchedulerAutoThreadLimit", workers.to_string()),
+            owned("FIntSmoothClusterTaskQueueMaxParallelTasks", workers.to_string()),
+            owned("FIntOcclusionWorkerThreadCount", workers.div_ceil(2).max(1).to_string()),
+            owned("FFlagMovePrerenderV2", "True".into()),
+            owned("FFlagGcInParallelWithRenderPrepare3", "True".into()),
+            owned("DFIntSimMidPhaseContactPipelineBatchSize", "128".into()),
+        ],
+        Performance::Latency => vec![
+            owned("DFIntSimMidPhaseContactPipelineBatchSize", "128".into()),
+            owned("FIntTaskSchedulerThreadMin", "0".into()),
+        ],
+    }
+}
+
+/// Physical cores, counted from the kernel's own topology.
+///
+/// `available_parallelism` reports threads, which is the wrong number here. Each
+/// CPU's `topology/core_id` is unique per physical core within a package, so the
+/// distinct (package, core) pairs are the count. Falls back to the thread count
+/// when `sysfs` is unreadable, which is the only honest answer available then.
+pub fn physical_cores() -> usize {
+    let mut seen = std::collections::BTreeSet::new();
+    if let Ok(dir) = std::fs::read_dir("/sys/devices/system/cpu") {
+        for entry in dir.flatten() {
+            let base = entry.path().join("topology");
+            let read = |name: &str| std::fs::read_to_string(base.join(name)).ok();
+            if let (Some(pkg), Some(core)) =
+                (read("physical_package_id"), read("core_id"))
+            {
+                seen.insert((pkg.trim().to_string(), core.trim().to_string()));
+            }
+        }
+    }
+    if seen.is_empty() {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    } else {
+        seen.len()
+    }
+}
+
 fn builtin_layer() -> Layer {
     Layer {
         source: Source::Builtin,
@@ -947,4 +1037,61 @@ pub(crate) mod tests {
         assert!(resolved.contains_key("FFlagMine"), "a user plugin with its own id still loads");
     }
 
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+
+    #[test]
+    fn balanced_changes_nothing_at_all() {
+        // The default has to be a no-op until somebody measures the others,
+        // or shipping this silently changes every user's client.
+        assert!(performance_flags(Performance::Balanced, 8).is_empty());
+        assert_eq!(Performance::default(), Performance::Balanced);
+    }
+
+    #[test]
+    fn throughput_scales_with_cores_and_caps_the_async_floor() {
+        let small = performance_flags(Performance::Throughput, 2);
+        let big = performance_flags(Performance::Throughput, 16);
+        let get = |v: &[(String, String)], k: &str| {
+            v.iter().find(|(a, _)| a == k).map(|(_, b)| b.clone()).unwrap()
+        };
+        assert_eq!(get(&small, "FIntTaskSchedulerAutoThreadLimit"), "2");
+        assert_eq!(get(&big, "FIntTaskSchedulerAutoThreadLimit"), "16");
+        // Capped at three however many cores there are.
+        assert_eq!(get(&small, "FIntTaskSchedulerAsyncTasksMinimumThreadCount"), "2");
+        assert_eq!(get(&big, "FIntTaskSchedulerAsyncTasksMinimumThreadCount"), "3");
+    }
+
+    #[test]
+    fn a_machine_reporting_no_cores_still_gets_a_usable_number() {
+        // A pool sized zero would ask the engine for no threads at all, which
+        // is a worse failure than a small pool. Every *sized* pool therefore
+        // floors at one.
+        //
+        // `FIntTaskSchedulerThreadMin` is exempt and its zero is deliberate:
+        // it is a floor rather than a size, and zero means "no floor, let the
+        // scheduler decide", which is what mocktail's throughput policy sets.
+        // This test asserted otherwise on its first run and was wrong -- the
+        // distinction between a pool size and a pool floor is exactly the kind
+        // of thing a copied table loses.
+        let v = performance_flags(Performance::Throughput, 0);
+        for (k, val) in &v {
+            if k.starts_with("FInt") && k != "FIntTaskSchedulerThreadMin" {
+                assert_ne!(val, "0", "{k} sizes a pool and must not be zero");
+            }
+        }
+        let min = v.iter().find(|(k, _)| k == "FIntTaskSchedulerThreadMin").unwrap();
+        assert_eq!(min.1, "0", "the floor stays zero on purpose");
+    }
+
+    #[test]
+    fn physical_cores_is_at_least_one_and_no_more_than_the_thread_count() {
+        let p = physical_cores();
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        assert!(p >= 1, "{p}");
+        assert!(p <= threads, "physical {p} cannot exceed threads {threads}");
+    }
 }

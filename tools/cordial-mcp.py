@@ -111,6 +111,23 @@ class Cordial:
 
 # ------------------------------------------------------------------- gdb
 
+# Preference order, and the paths each may live at. Homebrew first because this
+# host is immutable ostree and that is the route that works without a reboot.
+DEBUGGERS = (
+    ("lldb", ("/home/linuxbrew/.linuxbrew/bin/lldb", "lldb")),
+    ("gdb", ("/home/linuxbrew/.linuxbrew/bin/gdb", "gdb")),
+)
+
+
+def resolve_debugger(candidates):
+    """First of `candidates` that exists, as an absolute path, or None."""
+    for c in candidates:
+        found = shutil.which(c) or (c if os.path.exists(c) else None)
+        if found:
+            return found
+    return None
+
+
 def debugger():
     """Which debugger to drive, and where it is.
 
@@ -128,14 +145,10 @@ def debugger():
     tracer in a user namespace that is not an ancestor of the tracee's, which
     no combination of --privileged, --pid=host and SYS_PTRACE repairs.
     """
-    for kind, cands in (
-        ("lldb", ("/home/linuxbrew/.linuxbrew/bin/lldb", "lldb")),
-        ("gdb", ("/home/linuxbrew/.linuxbrew/bin/gdb", "gdb")),
-    ):
-        for c in cands:
-            found = shutil.which(c) or (c if os.path.exists(c) else None)
-            if found:
-                return kind, found
+    for kind, cands in DEBUGGERS:
+        found = resolve_debugger(cands)
+        if found:
+            return kind, found
     return None, None
 
 
@@ -147,6 +160,18 @@ def run_debugger(pid, commands, timeout=60, kind_hint=None):
     `cordial_lldb` is the caller's to get right.
     """
     kind, path = debugger()
+    # `kind_hint` was accepted and ignored until 2026-08-22, when `tool_backtrace`
+    # needed to ask for gdb specifically after lldb returned a stack it could not
+    # unwind. Honoured now: name a debugger and you get that one, or a plain
+    # refusal saying it is absent -- never a silent substitution, because a
+    # caller asking for a particular debugger is doing so precisely because the
+    # other one just failed it.
+    if kind_hint and kind_hint != kind:
+        wanted = dict(DEBUGGERS).get(kind_hint)
+        found = resolve_debugger(wanted) if wanted else None
+        if not found:
+            return f"{kind_hint} was asked for specifically and is not available here"
+        kind, path = kind_hint, found
     if not path:
         return (
             "No debugger found. On this host the working route is Homebrew, which needs "
@@ -489,15 +514,69 @@ def tool_fps(c, args):
     }]
 
 
+def unwound(out):
+    """Whether a backtrace actually walked past the innermost frame.
+
+    lldb terminates a stack silently rather than reporting that it could not
+    unwind, and a one-frame answer looks like a real one to anybody skimming.
+    On 2026-08-22 that nearly cost the diagnosis of a live freeze: every thread
+    came back as
+
+        frame #0: libc.so.6`__syscall_cancel_arch_end
+
+    and nothing else. The engine was deadlocked between `AudioDevice::close`
+    and PipeWire's thread loop, which is only visible three frames up.
+
+    The cause is specific, and worth writing down because "lldb is broken" is
+    the wrong lesson. lldb unwinds libc perfectly well from an ordinary
+    address: a `sleep(300)` stopped at `__internal_syscall_cancel+126` gives
+    five correct frames, one more than gdb managed on the same process. What
+    it cannot do is unwind from `__syscall_cancel_arch_end+0` -- a bare,
+    zero-size label marking the end of the cancellable-syscall region. At
+    offset zero of a symbol with no size there are no function bounds and so no
+    unwind plan, and the walk stops. gdb gets past it on its own heuristics.
+
+    Neither debuginfod nor glibc debuginfo is the difference: gdb reports
+    debuginfod off, this host has no glibc debuginfo installed, and gdb still
+    unwound from `.eh_frame` alone.
+    """
+    return sum(1 for l in out.split("\n") if "frame #" in l or l.lstrip().startswith("#")) > 2
+
+
 def tool_backtrace(c, args):
     pid = c.pid()
     frames = int(args.get("frames", 12))
     cpu = process_cpu(pid)
+    kind, _ = debugger()
     out = run_debugger(pid, backtrace_command(frames))
+
+    # lldb stays the default -- Cordial is a Clang project by necessity, so it
+    # is the toolchain already required. But a stack that did not unwind is not
+    # an answer, and handing one back as though it were is exactly the broken
+    # instrument this whole tool exists to stop. Retry rather than report it.
+    fallback = ""
+    if kind == "lldb" and not unwound(out):
+        second = run_debugger(pid, [f"thread apply all bt {frames}"], kind_hint="gdb")
+        if unwound(second):
+            fallback = (
+                "\nlldb returned a stack it could not unwind (see `unwound`'s note: a return "
+                "address landing on a zero-size label has no unwind plan). Retried with gdb, "
+                "which walked it. The lldb attempt follows the gdb one below.\n"
+            )
+            return [{"type": "text", "text": (
+                f"pid {pid}, {cpu:.1f}% CPU over one second.\n"
+                "Near 0% with the main thread in epoll_wait means it is blocked, not polling; "
+                "a healthy pump spins at millions of polls a second from the same stack.\n"
+                + fallback + "\n" + second + "\n\n--- lldb's truncated attempt ---\n" + out
+            )}]
+        fallback = ("\nlldb could not unwind this stack and gdb did no better, so the frames "
+                    "below are all there are -- treat them as incomplete, not as the answer.\n")
+
     header = (
         f"pid {pid}, {cpu:.1f}% CPU over one second.\n"
         "Near 0% with the main thread in epoll_wait means it is blocked, not polling; "
         "a healthy pump spins at millions of polls a second from the same stack.\n"
+        + fallback
     )
     return [{"type": "text", "text": header + "\n" + out}]
 

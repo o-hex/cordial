@@ -460,6 +460,10 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
     // `onWindowFocusChangedNative(true)` inline by the time the pump runs --
     // seeding `None` would send a duplicate `true` on the first tick of every
     // launch.
+    // Stall detection state; see the block that uses it, below.
+    let mut stall_presents: u64 = 0;
+    let mut stall_since = std::time::Instant::now();
+    let mut stall_reported = false;
     let mut focus_reported: Option<bool> = Some(true);
     // `focus-off`/`focus-on` -- see the override's own comment at the call site.
     let mut focus_override: Option<bool> = None;
@@ -719,6 +723,43 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                     super::input::deliver_key(handle, true, 51, 17, 0, repeat, 'w' as i32, ms, down_ms);
                     super::input::pass_key_event(true, 17, 0);
                 }
+            }
+        }
+        // Catch the engine going quiet, and say everything about the moment it
+        // did -- once, unconditionally, whether or not anything is tracing.
+        //
+        // This exists because the freeze it watches for reproduces on one
+        // machine and roughly one launch in twenty on another. Twenty cold and
+        // warm runs here produced one, which is not enough to bisect against
+        // and not enough to test a fix with; the state at the moment it stops
+        // is what would settle it, and by the time anybody looks the run is
+        // usually over. So the client reports it itself.
+        //
+        // Deliberately not gated on `CORDIAL_INSTR`: the whole difficulty is
+        // that this happens when nobody was measuring. It is one line, at most
+        // once per run, and only when presents have genuinely stopped.
+        //
+        // "Stopped" means no present at all for five seconds *while the pump is
+        // still running*. It is not the idle throttle, which holds a steady
+        // 1.0/s and therefore keeps this counter moving -- distinguishing those
+        // two is the entire point, and reading 1.0/s as a freeze has already
+        // wasted a day here.
+        {
+            let now = super::glcount::QUEUE_PRESENT.load(Ordering::Relaxed);
+            if now != stall_presents {
+                stall_presents = now;
+                stall_since = std::time::Instant::now();
+            } else if now > 0
+                && !stall_reported
+                && stall_since.elapsed() >= std::time::Duration::from_secs(5)
+            {
+                stall_reported = true;
+                println!(
+                    "[android] the engine has presented nothing for {:.0}s after {now} frames;                      {}. The pump is still running, so this is not the idle throttle.                      Take a backtrace -- `just mcp` then cordial_backtrace, or                      `lldb -p {} -b -o 'thread backtrace all -c 16'`.",
+                    stall_since.elapsed().as_secs_f64(),
+                    super::backend_instr_geometry(),
+                    std::process::id(),
+                );
             }
         }
         if instr && tick.elapsed() >= std::time::Duration::from_secs(1) {

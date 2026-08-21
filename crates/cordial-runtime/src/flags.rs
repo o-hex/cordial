@@ -429,10 +429,23 @@ pub enum Performance {
 /// The flags a mode asks for, given how many *physical* cores the machine has.
 ///
 /// Physical rather than logical, and that distinction is not pedantry: on a
-/// hybrid part -- six performance cores and eight efficiency cores reporting
-/// sixteen threads, which is the machine this was written on -- sizing a render
-/// worker pool by thread count spreads work onto cores that are slower per
-/// thread, which is the opposite of the intent.
+/// hybrid part, sizing a render worker pool by thread count spreads work onto
+/// cores that are slower per thread, which is the opposite of the intent.
+///
+/// **Corrected.** This used to describe the machine it was written on as "six
+/// performance cores and eight efficiency cores reporting sixteen threads".
+/// That part is an i7-13620H and it is 6P+**4**E: twelve threads from six
+/// hyperthreaded P-cores plus four unshared E-cores, so **ten** physical cores
+/// and sixteen threads. Established by walking the same sysfs topology
+/// [`physical_cores`] itself reads -- `cpu0..cpu11` give core_ids 0,4,8,12,16,20
+/// twice each and `cpu12..cpu15` give 24,25,26,27 once each, ten distinct
+/// (package, core) pairs -- and confirmed against `lscpu`, which reports
+/// `Core(s) per socket: 10` and `CPU(s): 16`.
+///
+/// The function was always right; only this comment was wrong, and it was wrong
+/// by four cores in the direction that matters, because every mode below sizes
+/// its worker pools off this number. Anyone reasoning about those tables from
+/// the comment rather than from the machine was reasoning from 14.
 ///
 /// Pure, so the table can be tested without a machine to run it on.
 pub fn performance_flags(mode: Performance, physical_cores: usize) -> Vec<(String, String)> {

@@ -568,12 +568,30 @@ fn take_capture(queue: *mut c_void, info: *const c_void) {
     // SAFETY: the caller passes a valid `VkPresentInfoKHR`; only the image
     // index array is read, and only its first element, which the count above
     // it guarantees exists for any present that names a swapchain.
-    let image_index = unsafe {
-        let indices = std::ptr::read_unaligned((info as *const u8).add(48) as *const *const u32);
-        if indices.is_null() {
+    // Take BOTH the swapchain and the image index from the present itself.
+    //
+    // The first version took only the index here and used the swapchain
+    // recorded at creation time, which is wrong whenever the engine presents on
+    // anything other than the most recently created one -- after a recreate, or
+    // with more than one alive. The image then came from a swapchain that had
+    // been created and never drawn into, so every capture was the clear colour:
+    // a uniform field, identical to six decimal places between runs that looked
+    // nothing alike on screen. That was very nearly written up as "Roblox
+    // presents blank frames".
+    //
+    // `pSwapchains` is at offset 40 and `pImageIndices` at 48, by the
+    // specification's C layout: sType, pNext, the wait-semaphore pair, then the
+    // swapchain count and array, then the indices. Read unaligned because
+    // nothing guarantees the caller's struct shares our alignment.
+    let (swapchain, image_index) = unsafe {
+        let base = info as *const u8;
+        let count = std::ptr::read_unaligned(base.add(32) as *const u32);
+        let chains = std::ptr::read_unaligned(base.add(40) as *const *const u64);
+        let indices = std::ptr::read_unaligned(base.add(48) as *const *const u32);
+        if count == 0 || chains.is_null() || indices.is_null() {
             return;
         }
-        std::ptr::read_unaligned(indices)
+        (std::ptr::read_unaligned(chains), std::ptr::read_unaligned(indices))
     };
     let Some(h) = host() else { return };
     let gdpa = HOST_GET_DEVICE_PROC_ADDR.load(std::sync::atomic::Ordering::Relaxed);
@@ -607,6 +625,7 @@ fn take_capture(queue: *mut c_void, info: *const c_void) {
     unsafe {
         super::capture::capture(
             queue as u64,
+            swapchain,
             image_index,
             std::mem::transmute::<usize, extern "C" fn(u64, *const c_char) -> *mut c_void>(gdpa),
             std::mem::transmute::<

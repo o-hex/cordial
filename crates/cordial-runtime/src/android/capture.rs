@@ -318,6 +318,7 @@ macro_rules! load {
 /// engine is presenting on and the image it is presenting.
 pub fn capture(
     queue: u64,
+    swapchain: u64,
     image_index: u32,
     get_device_proc_addr: extern "C" fn(u64, *const std::ffi::c_char) -> *mut c_void,
     get_physical_device_memory_properties: extern "C" fn(
@@ -329,6 +330,7 @@ pub fn capture(
     let Some(path) = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
     let r = do_capture(
         queue,
+        swapchain,
         image_index,
         get_device_proc_addr,
         get_physical_device_memory_properties,
@@ -343,6 +345,7 @@ pub fn capture(
 
 fn do_capture(
     queue: u64,
+    swapchain: u64,
     image_index: u32,
     gdpa: extern "C" fn(u64, *const std::ffi::c_char) -> *mut c_void,
     gpdmp: extern "C" fn(*mut c_void, *mut PhysicalDeviceMemoryProperties),
@@ -350,7 +353,6 @@ fn do_capture(
     path: &str,
 ) -> Result<String, String> {
     let device = DEVICE.load(Ordering::Relaxed) as u64;
-    let swapchain = SWAPCHAIN.load(Ordering::Relaxed);
     let (width, height) = extent();
     if device == 0 || swapchain == 0 || width == 0 || height == 0 {
         return Err("no swapchain has been created yet".into());

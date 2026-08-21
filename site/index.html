@@ -149,9 +149,13 @@ flatpak install cordial io.github.luohoa97.Cordial</code></pre>
 // the flatpak remote, the repository name. Renaming those would turn a joke
 // into a broken instruction.
 (function () {
+  // ?brand=frostbite previews it at any time, matching CORDIAL_BRAND on the
+  // client. Without it, looking at this means changing the machine's clock,
+  // which is a bad thing to ask of anyone for a joke.
+  var forced = /[?&]brand=frostbite\b/i.test(location.search);
   var now = new Date();                       // local time: the visitor's calendar
   var m = now.getMonth() + 1, d = now.getDate();
-  var frostbite = (m === 4 && d === 1) || (m === 12 && d === 21);
+  var frostbite = forced || (m === 4 && d === 1) || (m === 12 && d === 21);
   if (!frostbite) return;
 
   document.title = document.title.replace(/^Cordial/, 'Frostbite');

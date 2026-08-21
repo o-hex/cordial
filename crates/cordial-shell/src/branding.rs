@@ -28,6 +28,9 @@
 //! observable benefit. The cost is that a session running across midnight into
 //! the first of April keeps its old name until it is restarted, which is the
 //! correct trade for a gag.
+//!
+//! `CORDIAL_BRAND=frostbite` forces it on at any time, which is how you look at
+//! it without setting your machine's clock to April.
 
 use std::sync::OnceLock;
 
@@ -47,16 +50,27 @@ impl Brand {
         }
     }
 
-    /// The icon name, in the freedesktop sense: both are installed under
-    /// `hicolor/scalable/apps`, so either resolves the same way and the theme
-    /// does the work. Shipping the second icon unconditionally is what makes
-    /// this safe -- an icon name that resolves to nothing gives a blank window
-    /// in the switcher, and the day it would happen is the one day nobody is
-    /// watching for it.
+    /// The icon name, in the freedesktop sense.
+    ///
+    /// **Frostbite's icon is a suffix of Cordial's id, not a name of its own,
+    /// and that is a hard requirement rather than a naming preference.** Flatpak
+    /// exports only files whose names begin with the application id, so
+    /// `io.github.luohoa97.Frostbite` could never be exported and would never
+    /// resolve for an installed build; `io.github.luohoa97.Cordial.Frostbite`
+    /// is exported like any other of the app's own files.
+    ///
+    /// The application id itself does not change, on either day. It is the
+    /// published identity -- the Flatpak ref, the update channel, the remote and
+    /// the deep-link registration all key off it -- and renaming it for a joke
+    /// would break installs for the sake of two days a year.
+    ///
+    /// Both icons ship, so this always resolves. A name that resolved to nothing
+    /// would leave a blank window in the switcher on the one day nobody is
+    /// watching for it, and a test asserts both files are present.
     pub fn icon(self) -> &'static str {
         match self {
             Brand::Cordial => "io.github.luohoa97.Cordial",
-            Brand::Frostbite => "io.github.luohoa97.Frostbite",
+            Brand::Frostbite => "io.github.luohoa97.Cordial.Frostbite",
         }
     }
 }
@@ -72,16 +86,50 @@ pub fn frostbite_on(month: u32, day: u32) -> bool {
     matches!((month, day), (12, 21) | (4, 1))
 }
 
+/// The environment variable that forces a brand, for looking at it.
+///
+/// Without this, previewing a twice-a-year joke means changing the system
+/// clock, which is a genuinely bad thing to ask anyone to do to their machine
+/// -- it perturbs TLS validation, cron, file timestamps and the profile lock's
+/// own age reporting, and one of those will be blamed on Cordial later.
+///
+/// `CORDIAL_BRAND=frostbite` forces it on, `=cordial` forces it off, and
+/// anything else -- including the variable being absent -- lets the calendar
+/// decide. Unset-means-normal is what keeps this out of the way of everybody
+/// who is not looking at it.
+pub const BRAND_ENV: &str = "CORDIAL_BRAND";
+
+/// Which brand, given the override and the date. Pure, so both the override
+/// and the calendar can be tested without touching either.
+///
+/// Separate from [`current`] because `std::env::set_var` is process-global and
+/// this workspace already runs its tests in parallel threads of one process;
+/// `flags.rs` keeps a mutex for exactly that hazard, and not needing one here
+/// is better than sharing it.
+pub fn resolve(override_value: Option<&str>, month: u32, day: u32) -> Brand {
+    match override_value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("frostbite") => Brand::Frostbite,
+        Some(v) if v.eq_ignore_ascii_case("cordial") => Brand::Cordial,
+        // A value nobody recognises is not an error worth refusing a launch
+        // over. It falls through to the date, which is what an unset variable
+        // does, so a typo behaves like not having asked.
+        _ => {
+            if frostbite_on(month, day) {
+                Brand::Frostbite
+            } else {
+                Brand::Cordial
+            }
+        }
+    }
+}
+
 /// The brand for this process, decided once.
 pub fn current() -> Brand {
     static BRAND: OnceLock<Brand> = OnceLock::new();
     *BRAND.get_or_init(|| {
+        let forced = std::env::var(BRAND_ENV).ok();
         let (month, day) = local_month_day();
-        if frostbite_on(month, day) {
-            Brand::Frostbite
-        } else {
-            Brand::Cordial
-        }
+        resolve(forced.as_deref(), month, day)
     })
 }
 
@@ -173,6 +221,26 @@ mod tests {
         assert_eq!(civil_from_days(365), (1, 1)); // 1971-01-01
         // 2024-02-29 -- a leap day, which is where a naive conversion slips.
         assert_eq!(civil_from_days(19_782), (2, 29));
+    }
+
+    #[test]
+    fn the_override_wins_over_the_calendar_in_both_directions() {
+        // On an ordinary day, asked for the joke.
+        assert_eq!(resolve(Some("frostbite"), 6, 15), Brand::Frostbite);
+        // On the day itself, asked for the ordinary thing -- which is what
+        // somebody debugging a screenshot on April 1st needs.
+        assert_eq!(resolve(Some("cordial"), 4, 1), Brand::Cordial);
+        // Case and whitespace, because this gets typed by hand.
+        assert_eq!(resolve(Some("  FrostBite "), 6, 15), Brand::Frostbite);
+    }
+
+    #[test]
+    fn an_unset_or_unrecognised_value_leaves_the_calendar_in_charge() {
+        assert_eq!(resolve(None, 4, 1), Brand::Frostbite);
+        assert_eq!(resolve(None, 6, 15), Brand::Cordial);
+        // A typo behaves like not having asked, rather than refusing to launch.
+        assert_eq!(resolve(Some("frostbight"), 6, 15), Brand::Cordial);
+        assert_eq!(resolve(Some(""), 12, 21), Brand::Frostbite);
     }
 
     #[test]

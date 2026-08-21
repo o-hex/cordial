@@ -326,6 +326,26 @@ client *args:
         --lib-dir "$lib" --apk "$apk" \
         --host-libc --game-activity --run "$run" ${extra+"${extra[@]}"}
 
+# Put the app icons where a development build can actually resolve them: just icons
+icons:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # A `just dev` build installs nothing, so its window borrows whatever icon
+    # the *installed* Flatpak exported -- which is why a dev build titled
+    # Frostbite still wore the Cordial mango, and why that looked like a code
+    # bug rather than a missing file.
+    #
+    # On Wayland the compositor resolves a window's icon by name through the
+    # icon theme, so the fix is to have the names on disk. Both go in, because
+    # a name that resolves to nothing gives a blank window in the switcher.
+    dest="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+    mkdir -p "$dest"
+    cp packaging/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.svg "$dest/"
+    cp packaging/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.Frostbite.svg "$dest/"
+    # Harmless if absent, and GTK re-reads scalable icons without it anyway.
+    gtk-update-icon-cache -q -t -f "$(dirname "$(dirname "$dest")")" 2>/dev/null || true
+    echo "installed both icons into $dest"
+
 # Attach the development MCP to whichever running client has a control socket
 mcp *args:
     #!/usr/bin/env bash

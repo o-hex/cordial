@@ -121,7 +121,58 @@ uninterpretable one. See `flag-init.md` §49.
   written up as "the engine presents blank frames". Fixed in `7d85816`; both the
   swapchain and the image index now come from `VkPresentInfoKHR`.
 
-### The freeze is characterised but not fixed
+### The freeze was an audio deadlock. Fixed and confirmed 2026-08-22
+
+**Everything in this subsection below was written while the freeze was
+attributed to the looper, and the looper had nothing to do with it.** Kept
+rather than deleted, because the observations in it are all correct and it is a
+good record of how a well-instrumented investigation can point steadily at the
+wrong component: every fact here about Cordial being healthy was true, and it
+was true because Cordial *was* healthy.
+
+The cause was an AB-BA deadlock between Cordial's own audio teardown and
+PipeWire's thread loop, caught live with gdb on a client the user reported
+frozen after leaving a game:
+
+    Thread 53 " RBX Worker B"        Thread 16 "cordial-pipewire"
+      AudioDevice::close               loop_iterate -> Impl::process
+        holds lock_                      holds PipeWire's loop lock
+      PlaybackStream::set_active       AudioDevice::drained
+        -> pw_thread_loop_lock, waits    -> lock_, waits
+
+Every `stream_` entry point takes the thread-loop lock, and the loop thread
+calls `drained`, which takes `lock_`. So holding `lock_` across any `stream_`
+call is an AB-BA against PipeWire's own loop, and it never recovers. `close()`
+did exactly that. Leaving a game is what calls `close()`, which is why it fired
+on game exit, and the roughly one-in-twenty rate is the race window -- the loop
+thread has to be inside `drained` at that moment.
+
+Fixed in `c7215eb` by never holding `lock_` across a call into `stream_`, and
+**confirmed by reproduction**: on the user's own game exit,
+`AudioDevice.close: playback stream closed.` now completes in 549 ms, where in
+the frozen run that line never appeared at all. Its absence in the log, next to
+a gdb stack showing a thread *inside* `AudioDevice::close`, is what proved the
+diagnosis from the other side.
+
+Three things worth carrying forward:
+
+* **The stall detector's positive branch is no longer `INFERRED`.** It fired
+  correctly on the real thing -- "the engine has presented nothing for 5s after
+  5966 frames ... The pump is still running, so this is not the idle throttle"
+  -- and explicitly ruled out the throttle, which is exactly what it was written
+  to do.
+* **Read the engine's threads before the looper's.** The pump being healthy is
+  not evidence about the pump; it is evidence the fault is elsewhere. Two days
+  went into the wrong half of the process because a healthy pump kept being
+  re-measured.
+* **lldb could not unwind this stack and gdb could.** The return address landed
+  on `__syscall_cancel_arch_end+0`, a zero-size label with no unwind plan, and
+  lldb stopped at frame #0. `cordial_backtrace` now detects that and retries
+  with gdb (`bc04085`). lldb is not broken in general -- it out-unwinds gdb on
+  an ordinary address -- but a one-frame stack is not an answer and must not be
+  reported as one.
+
+### How it was characterised while still unfixed
 
 Cordial is healthy throughout: 74 million polls, the pump ticking at its normal
 20 Hz cadence, main thread in `epoll_wait` inside `looper::pump`. The engine

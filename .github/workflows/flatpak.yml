@@ -146,11 +146,41 @@ jobs:
           echo "runtime version: $v; sdk extension version: $e"
           flatpak remote-add --user --if-not-exists flathub \
               https://dl.flathub.org/repo/flathub.flatpakrepo
-          flatpak install --user --noninteractive flathub \
-              "org.gnome.Platform//$v" \
-              "org.gnome.Sdk//$v" \
-              "org.freedesktop.Sdk.Extension.rust-stable//$e" \
-              "org.freedesktop.Sdk.Extension.llvm20//$e"
+          # `--no-static-deltas`, and a retry, because this step failed three
+          # consecutive runs on 2026-08-22 with
+          #
+          #   Failed to install org.freedesktop.Sdk.Extension.rust-stable:
+          #   While pulling .../rust-stable/x86_64/25.08 from remote flathub:
+          #   Server returned HTTP 404
+          #
+          # The ref is not missing. `flatpak remote-info --system flathub
+          # org.freedesktop.Sdk.Extension.rust-stable//25.08` answers from a
+          # developer machine, as do 24.08 and 23.08 and the llvm20 extension
+          # that installed successfully on the line above. So the manifest is
+          # right and flatpak is 404ing on an object rather than on the ref --
+          # which is what a static delta that was never generated looks like
+          # from the client side. Plain object pulls are slower and cannot 404
+          # on something that does not exist.
+          #
+          # The retry is separate and covers the other reading, that Flathub's
+          # CDN was simply unwell for a few hours. If this recurs with
+          # `--no-static-deltas` already in place, that is the answer and this
+          # comment is wrong -- say so here rather than adding a third retry.
+          for attempt in 1 2 3; do
+              if flatpak install --user --noninteractive --no-static-deltas flathub \
+                  "org.gnome.Platform//$v" \
+                  "org.gnome.Sdk//$v" \
+                  "org.freedesktop.Sdk.Extension.rust-stable//$e" \
+                  "org.freedesktop.Sdk.Extension.llvm20//$e"; then
+                  break
+              fi
+              if [ "$attempt" = 3 ]; then
+                  echo "::error::runtime install failed three times; see the comment above this step"
+                  exit 1
+              fi
+              echo "install attempt $attempt failed; retrying in $((attempt * 15))s"
+              sleep $((attempt * 15))
+          done
 
       # The build step has no network (issue #3), so every crate arrives through
       # packaging/cargo-sources.json and is fetched in flatpak-builder's download

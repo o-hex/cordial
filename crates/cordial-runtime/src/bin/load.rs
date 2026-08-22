@@ -21,6 +21,11 @@ struct Options {
     lib_dir: String,
     library: String,
     apk: Option<String>,
+    /// The `--profile` name, kept as well as resolved. `parse` hands the
+    /// directory to `profile::set_active` immediately, but `main` has to claim
+    /// the profile by name — see [`claim_profile`] — and re-deriving the name
+    /// from the path afterwards is one more place for the two to disagree.
+    profile: Option<String>,
     read_asset: Option<String>,
     client_settings: Option<String>,
     flag_overrides: Option<String>,
@@ -51,6 +56,11 @@ usage: cordial-load --lib-dir <dir> [options]
   --gl-probe        bring up GLES2 through the symbol table and read a pixel back
   --window <secs>   GL PROBE ONLY: open a window and draw a gradient for <secs>.
                     This is Cordial's own test pattern, not Roblox rendering.
+  --profile <name>  which profile's storage, flags and plugin grants to run
+                    against; the one named default when this is not given.
+                    One client at a time per profile, held by a lock for the
+                    life of the process (ADR-012); a second is refused rather
+                    than allowed to write over the first one's Roblox storage
   --host-libc       also resolve libc from the host (ABI-unsafe; diagnostic only)
   --jni-onload      stand up a JavaVM and call JNI_OnLoad
   --game-activity   implies --jni-onload; bring Roblox up and hand it a surface
@@ -146,6 +156,7 @@ fn parse() -> Result<Options, String> {
         lib_dir: String::new(),
         library: "libroblox.so".into(),
         apk: None,
+        profile: None,
         read_asset: None,
         client_settings: None,
         flag_overrides: None,
@@ -188,6 +199,7 @@ fn parse() -> Result<Options, String> {
                 let name = args.next().ok_or("--profile needs a name")?;
                 let dir = cordial_runtime::profile::dir(&name)?;
                 cordial_runtime::profile::set_active(dir)?;
+                opt.profile = Some(name);
             }
             "--read-asset" => {
                 opt.read_asset = Some(args.next().ok_or("--read-asset needs a name")?)
@@ -1138,6 +1150,44 @@ fn update_screen_orientation(f: *mut std::ffi::c_void, width: i32, height: i32) 
     if rc == 0 { Ok(()) } else { Err(take_c_err(err)) }
 }
 
+/// Take this instance's claim on its profile, or produce the refusal that says
+/// why the client is not starting.
+///
+/// **ADR-012 says a profile is held by at most one instance at a time, and
+/// until 2026-08-22 that was only true of clients the shell launched.**
+/// `launch.rs` builds a claim and `Claim::hand_to` passes it down; `cordial-run`
+/// had no claim code at all, so `cordial-run --profile X` — the invocation
+/// AGENTS.md documents — took no lock whatsoever. Four of them ran against one
+/// profile that day and not one was refused, which is precisely the two-writers
+/// corruption the ADR exists to prevent, in the command every contributor here
+/// is told to type.
+///
+/// `claim_for_instance` rather than `acquire` because both entry points have to
+/// work. A `flock` belongs to the open file description, so a client that
+/// always opened the lock file and locked it would be refused by the lock it
+/// had just inherited from the shell — every shell launch would fail. See that
+/// function for the adoption path and what it verifies before believing it.
+///
+/// The name, not `profile::active()`: `active()` is a path, and the shell's
+/// `acquire` wants the name it validates. They cannot disagree about where that
+/// lands — `cordial_runtime::profile::root()` is now the shell's own `root()`
+/// rather than a second copy of the same environment walk.
+fn claim_profile(opt: &Options) -> Result<cordial_shell::profile::Claim, String> {
+    let name = opt.profile.as_deref().unwrap_or(cordial_runtime::profile::DEFAULT_NAME);
+    match cordial_shell::profile::claim_for_instance(name) {
+        Ok(claim) => Ok(claim),
+        Err(e) => Err(match e.advice() {
+            // A refusal, not a crash, and it has to read as one. Everybody who
+            // has been running two clients against `default` starts being
+            // stopped here, so the message carries its own explanation and the
+            // separate-data-root recipe from AGENTS.md rather than a bare line
+            // about a lock.
+            Some(advice) => format!("{e}\n\n{advice}"),
+            None => e.to_string(),
+        }),
+    }
+}
+
 fn main() -> ExitCode {
     let mut opt = match parse() {
         Ok(o) => o,
@@ -1147,6 +1197,23 @@ fn main() -> ExitCode {
             }
             eprint!("{USAGE}");
             return ExitCode::from(2);
+        }
+    };
+
+    // Before anything reads or writes the profile at all, and before the
+    // network gate below, which reads a setting out of it.
+    //
+    // Held in a binding for the rest of `main`: the lock belongs to the open
+    // file description, so this value *is* the claim, and dropping it early
+    // would release the profile with the engine still running against it. The
+    // process exiting — cleanly, by panic, or by SIGKILL — closes the
+    // descriptor and releases it, which is the property a lock file holding a
+    // PID would not have.
+    let _claim = match claim_profile(&opt) {
+        Ok(claim) => claim,
+        Err(refusal) => {
+            eprintln!("error: {refusal}");
+            return ExitCode::from(3);
         }
     };
 

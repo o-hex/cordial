@@ -340,24 +340,28 @@ headless compositor on its own `WAYLAND_DISPLAY` and inject inside that.
 separate IP. The risk is collateral rather than causal: enforcement is automated,
 runs in waves, and associates accounts sharing an address.
 
-**Give your runs their own data root, and do not rely on the lock to save
-you.** ADR-012 says a profile is held by one instance at a time by `flock`, and
-that is true of clients the *shell* launches: `launch.rs` builds the claim and
-`Claim::hand_to` passes it to the child.
+**Give your runs their own data root.** A profile is held by one instance at a
+time, by `flock`, so a second launch against it is refused rather than allowed
+to corrupt Roblox's storage ([ADR-012](docs/adr/ADR-012-profiles-and-instances.md)).
 
-**A hand-run `cordial-run --profile X` takes no lock at all.** There is no claim
-code in `cordial-run`; the only caller of `hand_to` is the shell. Measured on
-2026-08-22: four `--profile CordialTest` engines ran at once and not one was
-refused. So the invocation this file documents — the one an agent will actually
-type — has exactly the corruption exposure ADR-012 exists to prevent, and every
-agent has been told the opposite.
+**That became true of `cordial-run` on 2026-08-22, and was not before.** This
+file said it for three weeks while only shell-launched clients took a claim; a
+hand-run `cordial-run --profile X` took none, and four `--profile CordialTest`
+engines were measured running at once with nothing refused. If you are reading a
+report or a comment written before that date which relies on the lock, it is
+wrong. `cordial-run` now claims the profile before it touches anything in it,
+and hands it back by exiting, however it exits.
 
-Until that is fixed, **the separate data root is the only protection there is**,
-and two agents pointed at the same profile will write over each other's Roblox
-storage without either of them being told.
+**So expect to start being refused where you were not.** A second client on the
+same profile now stops with `profile "default" is already open in another
+Cordial client`, names the process holding it, and exits 3. That is the lock
+working, not a regression — but everyone here has been running several clients
+against `default` without knowing it was unprotected, so the habit breaks
+before the message is read.
 
 Everything defaults to the `default` profile, so several agents testing at once
-collide on it and read the result as a bug in whatever they were working on:
+collide on that lock and read the refusal as a bug in whatever they were
+working on:
 
 ```bash
 XDG_DATA_HOME=~/.cache/cordial-agent-<yours> just client --run 30

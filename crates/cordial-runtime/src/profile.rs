@@ -1,10 +1,24 @@
-//! Profiles: one account's storage, and the lock that keeps one window on it.
+//! Profiles: which one this instance runs, and where it lives.
 //!
 //! See [ADR-012](../../../docs/adr/ADR-012-profiles-and-instances.md) for the
 //! vocabulary, which matters here. An *instance* is a running Cordial process —
 //! a window, which is what Roblox means by the word. A *profile* is the
 //! directory this module resolves: one account's Roblox storage, plugin set and
 //! flag overrides. An instance runs a profile.
+//!
+//! **The lock that makes "one instance per profile" true is not here.** It was,
+//! in a `Lock`/`acquire` pair that read almost identically to
+//! `cordial_shell::profile`'s and that nothing ever called: `cordial-run` used
+//! this module for `set_active` and `active` and took no lock at all, so four
+//! `--profile CordialTest` engines ran at once on 2026-08-22 and not one was
+//! refused. Deleting the copy rather than wiring it up was the fix, because the
+//! shell's version already carries the two things the client needs and this one
+//! never grew — holder detection for the refusal message, and
+//! `Claim::hand_to`'s descriptor inheritance, without which a shell-launched
+//! client would be refused its own profile by its own lock. `main` in
+//! `bin/load.rs` now calls `cordial_shell::profile::claim_for_instance` before
+//! anything touches the directory. This module still decides *which* directory
+//! that is.
 //!
 //! Nothing structurally prevents two Cordial processes opening the same profile.
 //! Unlike Fishstrap on Windows there is no singleton mutex to defeat, because
@@ -31,34 +45,19 @@
 //! what goes in it is resolved by `flags.rs` and by `cordial_plugins`, both of
 //! which take the directory rather than looking it up for themselves.
 
-use std::ffi::c_int;
-use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-extern "C" {
-    fn flock(fd: c_int, operation: c_int) -> c_int;
-}
-
-/// `LOCK_EX | LOCK_NB` from `sys/file.h`. Non-blocking on purpose: a second
-/// launch should say so immediately rather than hang waiting for the first to
-/// exit, which reads as the client failing to start.
-const LOCK_EX_NB: c_int = 2 | 4;
-
 /// Where profiles live. `$XDG_DATA_HOME/cordial/profiles`, falling back the way
 /// the rest of the tree does.
+///
+/// One implementation, in the shell, rather than the same environment walk
+/// written twice. The client claims its profile through
+/// `cordial_shell::profile`, so a second copy of this that drifted by a
+/// character would lock one directory and write to another.
 pub fn root() -> PathBuf {
-    std::env::var_os("CORDIAL_PROFILE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-                .unwrap_or_else(std::env::temp_dir)
-                .join("cordial/profiles")
-        })
+    cordial_shell::profile::root()
 }
 
 /// The profile an instance runs when it was told nothing else.
@@ -70,9 +69,10 @@ pub const DEFAULT_NAME: &str = "default";
 /// The profile this instance is running, once something has said which.
 ///
 /// One process runs one profile for its whole life — that is ADR-012's
-/// definition of an instance, and the `flock` in [`acquire`] is what makes it
-/// true rather than a convention — so this is a fact about the process and is
-/// recorded once as one.
+/// definition of an instance, and the `flock`
+/// `cordial_shell::profile::claim_for_instance` takes in `main` is what makes
+/// it true rather than a convention — so this is a fact about the process and
+/// is recorded once as one.
 static ACTIVE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Record which profile this instance runs.
@@ -91,9 +91,10 @@ static ACTIVE: OnceLock<PathBuf> = OnceLock::new();
 /// which is the corruption ADR-012's lock exists to prevent — arriving by a
 /// different door.
 pub fn set_active(dir: PathBuf) -> Result<(), String> {
-    // Create and tighten here as well as in `acquire`, because they are not the
-    // same door. The launcher calls `acquire`, which does both; a hand-started
-    // `cordial-run --profile <name>` calls only this, and so ran against a
+    // Create and tighten here as well as in the shell's `acquire`, because they
+    // are not the same door and this one runs first: `parse()` resolves
+    // `--profile` before `main` claims anything. A hand-started `cordial-run
+    // --profile <name>` used to reach only this, and so ran against a
     // directory `create_dir_all` had left at the umask's `0755`. That was
     // survivable while the profile only held Roblox's own storage. It is not
     // now that Cordial writes a session token into it — see `cookies.rs` and
@@ -126,63 +127,14 @@ pub fn active() -> PathBuf {
 /// so `../` and absolute paths are refused rather than sanitised — quietly
 /// rewriting a name would mean the profile a user selected is not the one they
 /// get. Same reasoning as the zip-slip defence in `android::asset`.
+///
+/// The rule itself lives with the lock that enforces the directory it protects.
 pub fn is_valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    cordial_shell::profile::is_valid_name(name)
 }
 
 pub fn dir(name: &str) -> Result<PathBuf, String> {
-    if !is_valid_name(name) {
-        return Err(format!(
-            "{name:?} is not a usable profile name; use letters, digits, - and _"
-        ));
-    }
-    Ok(root().join(name))
-}
-
-/// An instance's claim on a profile, released when this is dropped.
-///
-/// The file is deliberately held open: `flock` is tied to the open description,
-/// so closing the handle releases the lock. Storing it here means the lock lives
-/// exactly as long as the value, and the process exiting — cleanly or not —
-/// releases it, which a lock file containing a PID would not.
-#[derive(Debug)]
-pub struct Lock {
-    _file: File,
-    path: PathBuf,
-}
-
-impl Lock {
-    pub fn profile_dir(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// Take this instance's claim on `name`, creating the profile if it is new.
-///
-/// Fails immediately if another instance holds it. **Advisory, and honestly so:**
-/// `flock` does not stop a process that never asks. It stops Cordial doing this
-/// by accident, which is the actual failure mode — someone launching twice, not
-/// someone defeating a lock.
-pub fn acquire(name: &str) -> Result<Lock, String> {
-    let path = dir(name)?;
-    std::fs::create_dir_all(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    restrict_to_owner(&path);
-
-    let lock_path = path.join(".lock");
-    let file = File::create(&lock_path).map_err(|e| format!("{}: {e}", lock_path.display()))?;
-
-    // SAFETY: `file` is open for the duration of the call and outlives it.
-    if unsafe { flock(file.as_raw_fd(), LOCK_EX_NB) } != 0 {
-        return Err(format!(
-            "profile {name:?} is already open in another Cordial window; \
-             use a different profile, or close that one first"
-        ));
-    }
-    Ok(Lock { _file: file, path })
+    cordial_shell::profile::dir(name)
 }
 
 /// Make a profile directory readable only by its owner.
@@ -241,6 +193,15 @@ fn restrict_to_owner(path: &Path) {
 ///
 /// Runs only when the old path exists and the new one does not, so it cannot
 /// clobber a profile someone has already used.
+///
+/// **Not delegated to `cordial_shell::profile`'s copy, unlike everything else
+/// in this module, and the reason is not obvious enough to leave unwritten.**
+/// The shell's version defers the rename while any `cordial-run` is up, because
+/// a rename can land underneath a live engine holding paths inside the old
+/// directory. Called from `cordial-run` that check finds *itself* in `/proc`
+/// and would defer for ever, so the migration would never happen for a client
+/// started any way but through the launcher — which is exactly the case it was
+/// added for. Two functions, one guard, on purpose.
 pub fn migrate_legacy_layout() -> Option<PathBuf> {
     let legacy = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -281,17 +242,7 @@ pub fn migrate_legacy_layout() -> Option<PathBuf> {
 
 /// Profiles that exist, for the launcher's switcher.
 pub fn list() -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(root()) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| is_valid_name(n))
-        .collect();
-    names.sort();
-    names
+    cordial_shell::profile::list()
 }
 
 #[cfg(test)]
@@ -328,47 +279,11 @@ mod tests {
         assert!(is_valid_name("alt_account-2"));
     }
 
-    #[test]
-    fn a_second_instance_cannot_take_a_held_profile() {
-        // The whole point of ADR-012's lock: two instances on one profile are
-        // two processes writing one cookie store, and the corruption that
-        // follows presents as a Cordial bug rather than as unsupported use.
-        let (_root, _g) = scratch("held");
-        let first = acquire("default").expect("first instance takes the profile");
-        let second = acquire("default");
-        assert!(second.is_err(), "a second instance must be refused");
-        assert!(second.unwrap_err().contains("already open"));
-        drop(first);
-    }
-
-    #[test]
-    fn releasing_a_profile_lets_the_next_instance_have_it() {
-        // flock is tied to the open file description, so dropping the Lock must
-        // actually release it — including when the process died rather than
-        // exited, which a PID file would not handle.
-        let (_root, _g) = scratch("released");
-        let first = acquire("default").unwrap();
-        drop(first);
-        assert!(acquire("default").is_ok(), "the profile must be reusable");
-    }
-
-    #[test]
-    fn a_profile_is_not_readable_by_other_users() {
-        // create_dir_all applies the umask, which on a normal desktop gives
-        // 0755 — another account on the machine could read everything in here.
-        // This comment used to end "this is the whole of Cordial's credential
-        // protection", which was true and is the reason it no longer is: the
-        // session moved to the secret service. The mode still matters for the
-        // flag overrides, the plugin grants, Roblox's own appData, and for the
-        // fallback store on a machine with no service.
-        let (_root, _g) = scratch("perms");
-        let lock = acquire("default").unwrap();
-        let mode = std::fs::metadata(lock.profile_dir())
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o077, 0, "profile must not be group- or world-accessible");
-    }
+    // The lock's own tests — refusal, inheritance across `exec`, release on
+    // exit — live with the lock, in `cordial_shell::profile`. They used to be
+    // duplicated here against a duplicate implementation that no caller
+    // reached, which is how this module came to pass its tests while
+    // `cordial-run` took no lock at all.
 
     #[test]
     fn the_active_profile_is_decided_once_and_defaults_to_the_migrated_one() {
@@ -387,6 +302,19 @@ mod tests {
         set_active(chosen.clone()).unwrap();
         assert_eq!(active(), chosen);
 
+        // And the directory it just made is `0700`. Asserted here rather than
+        // in a test of its own because `ACTIVE` is a `OnceLock`: a second test
+        // calling `set_active` would be refused by whichever ran first, and a
+        // test that passes because of test ordering is worse than no test.
+        // `create_dir_all` applies the umask, which on a normal desktop gives
+        // `0755` — another account could read the flag overrides, the plugin
+        // grants, Roblox's own appData, and the fallback session store on a
+        // machine with no secret service. This is the door a hand-run
+        // `cordial-run --profile <name>` comes through, and it has to hold
+        // whether or not the lock is taken afterwards.
+        let mode = std::fs::metadata(&chosen).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "profile must not be group- or world-accessible");
+
         // Saying yes to the same answer twice is not a conflict; the launcher
         // and the client both resolving the same argument is ordinary.
         assert!(set_active(chosen.clone()).is_ok());
@@ -397,15 +325,5 @@ mod tests {
         let refused = set_active(dir("main").unwrap());
         assert!(refused.is_err(), "a second, different profile must be refused");
         assert_eq!(active(), chosen, "and the first answer must still stand");
-    }
-
-    #[test]
-    fn different_profiles_do_not_contend() {
-        // Multi-instance is the point: two windows on two profiles is the
-        // supported shape and must not block.
-        let (_root, _g) = scratch("distinct");
-        let a = acquire("main").unwrap();
-        let b = acquire("alt").unwrap();
-        assert_ne!(a.profile_dir(), b.profile_dir());
     }
 }

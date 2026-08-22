@@ -61,6 +61,79 @@ that never asks. It stops *Cordial* from doing it by accident, which is the
 actual failure mode — a user double-clicking the launcher twice, not an adversary
 bypassing a lock.
 
+### Correction: for three weeks only the launcher took it
+
+> Everything above described the intent. From the day this was written
+> (2026-08-01) to 2026-08-22 it was half implemented, and the missing half was
+> the half this project's own instructions tell people to use. Kept in place
+> rather than rewritten, because "the decision was right and the code did not do
+> it" is a different failure from "the decision was wrong", and only one of them
+> is fixed by editing a paragraph.
+
+`launch.rs` built a claim and `Claim::hand_to` passed it to the client it
+spawned, so a shell launch was protected. **`cordial-run` contained no claim
+code at all.** A hand-run `cordial-run --profile X` — the invocation AGENTS.md
+documents, and the one every agent working in this repository is told to type —
+took no lock whatsoever. Measured 2026-08-22: four `--profile CordialTest`
+engines running at once, not one refused. Found while investigating something
+else, and confirmed in the source afterwards rather than the other way round.
+
+So the guarantee this ADR is mostly about held for the launcher's users and not
+for its developers, and AGENTS.md meanwhile assured the developers a second
+launch "is refused rather than allowed to corrupt Roblox's storage". A
+protection that is documented and absent is worse than one nobody claimed: it
+is what made the separate data root read as belt-and-braces when it was in fact
+the only thing standing between two agents and each other's Roblox storage.
+
+**Fixed by giving the client the other end of the same lock, not a second
+lock.** `cordial_shell::profile::claim_for_instance` is what `cordial-run` calls
+now, before anything reads or writes the profile:
+
+- handed a descriptor by a launcher, it **adopts** it — verifying against
+  `/proc/self/fd` that the descriptor really is this profile's lock file,
+  re-asserting the `flock` so the kernel rather than an environment variable is
+  the authority, and putting `FD_CLOEXEC` back on;
+- handed nothing, it **takes** the lock itself, and a second hand-run client is
+  refused by name and by holding process.
+
+The adoption step is not a nicety, and the reason is the one thing about `flock`
+that has to be internalised to read any of this code: **a lock belongs to the
+open file description, not to the file and not to the process.** A client that
+simply called `acquire` would open the lock file a second time and be refused by
+the lock it had just inherited — by itself, on every shell launch. Demonstrated
+rather than reasoned: with adoption removed, the test that spawns a real client
+process reports `profile "default" is already open in another Cordial client`,
+and the client it is talking about is itself.
+
+Restoring `FD_CLOEXEC` matters for a reason nobody had noticed. `hand_to` clears
+it to get the lock across one `exec`, and nothing had ever put it back, so the
+descriptor kept crossing every later one — including the `bwrap` and `deno`
+execs `cordial_plugins::sandbox` makes. With the restore removed, the test
+observes exactly that: a bare `sleep` grandchild holds the profile after the
+client has exited, and the refusal names `sleep 10` as the holder. Whether a
+real `deno` sandbox outlives a client long enough to matter is **`INFERRED`** —
+what is measured is that *any* process the client execs inherits the lock, and
+the sandbox is the client's one exec. Fixed here as a consequence of adopting
+the descriptor properly rather than by design.
+
+**Rejected: an escape hatch for running two clients on one profile.** It was
+considered, because the case is real — somebody testing wants two windows on one
+account. It is refused on this ADR's own terms and on AGENTS.md's. The two
+supported ways to run several clients at once already exist, cost nothing, and
+are *safe* rather than merely permitted: another profile, or another
+`XDG_DATA_HOME`. A `--force` beside them would buy only the unsafe shape, and a
+flag that disables a correctness guarantee is copied out of a wiki by people who
+do not know what it turns off — at which point the corruption it permits still
+presents as a Cordial bug, and the lock has become documentation. The
+refusal message therefore spends its space naming the two safe recipes instead.
+
+**Accepted: contributors will experience this as a regression.** Several
+clients against `default` has silently worked for as long as anyone here has
+been running them, and it stops working now. That is the point, and the refusal
+says so in full — what a profile is, that two writers corrupt it, both recipes,
+and how to take the profile back — because a one-line "already open" would read
+as the tool breaking rather than as the tool doing its job.
+
 ## Why not OAuth
 
 Roblox's OAuth 2.0 grants API scopes to third-party applications through the

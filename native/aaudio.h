@@ -17,6 +17,9 @@ extern "C" {
 /// path or the refuse-every-stream control. Both register `libaaudio.so` and
 /// both make `org.fmod.FMOD.supportsAAudio()` answer true, because the
 /// control is only a control if FMOD takes the same route to reach it.
+///
+/// **AAudio is the default**, so this answers non-zero for an unset
+/// `CORDIAL_AUDIO`; `CORDIAL_AUDIO=java` is what makes it zero.
 int cordial_audio_backend_is_aaudio(void);
 
 /// Forces the one-time selection and its log line to happen now, so that the

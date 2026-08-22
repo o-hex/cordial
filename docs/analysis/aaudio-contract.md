@@ -215,13 +215,186 @@ in a game with audio playing. `pidof cordial-run` matches on the executable and
 works. A safety check that quietly answers "nothing is running" is worse than
 no check.
 
-## How it should land
+## Measured, 2026-08-22: capture, and the microphone rule under it
 
-Behind `CORDIAL_AUDIO=aaudio`, off by default, measured against the Java path
-in one session on `getXRunCount` and on whether a game plays sound at all,
-and only then made default in its own commit quoting the numbers. The
-`Performance` modes in `crates/cordial-runtime/src/flags.rs` are the precedent:
-`Balanced` sets nothing and is the default until something is measured.
+`AAudioStream_read` is implemented. Capture reuses `CaptureStream` — the same
+class `android.media.AudioRecord` and `SLRecordItf` already record through —
+and the whole of the design is *when* that class is asked to open:
+
+| AAudio call | PipeWire capture stream |
+|---|---|
+| `openStream(direction=INPUT)` | **none created** |
+| `requestStart` | created |
+| `requestPause` | destroyed |
+| `requestStop` | destroyed |
+| `close` | destroyed |
+
+Pause destroys rather than deactivates, deliberately. AAudio's pause means
+"stop consuming, keep the stream", and for output that is a flag nobody can
+see; for input it would be a node left in the graph with the desktop's
+microphone indicator still lit. The rule at the top of `native/audio_classes.cpp`
+does not admit that state, so an AAudio input pause is a stop.
+
+The reading is not callback-driven because the engine's own symbol set says it
+is not: `AAudioStream_read` is among the 25 and `AAudioStream_write` is not.
+An input stream that arrives carrying a data callback is refused with
+`AAUDIO_ERROR_UNIMPLEMENTED` and a line saying why, rather than opened and
+never fed.
+
+### Checked from outside, not asserted
+
+`native/audio_probe.cpp` gained `aaudio-record` and `aaudio-record-never`,
+which reach the bridge through `cordial_aaudio_symbols` — the same table the
+bionic linker turns into the virtual `libaaudio.so`, so what runs is the real
+path. `pw-cli ls Node | grep -c cordial-audiorecord`, sampled once a second
+from another process for the whole run:
+
+```text
+T+1s audiorecord-nodes: 0     <- openStream(INPUT) has returned; nothing is open
+T+2s audiorecord-nodes: 0
+T+3s audiorecord-nodes: 0
+T+4s audiorecord-nodes: 1     <- requestStart
+T+5s audiorecord-nodes: 1
+T+6s audiorecord-nodes: 1
+T+7s audiorecord-nodes: 0     <- requestPause
+T+8s audiorecord-nodes: 0
+T+9s audiorecord-nodes: 0
+T+10s audiorecord-nodes: 1    <- requestStart again
+T+11s audiorecord-nodes: 1
+T+12s audiorecord-nodes: 1
+T+13s audiorecord-nodes: 0    <- requestStop, then close
+... 0 for the remaining nine samples
+```
+
+and the run's own log:
+
+```text
+openStream(INPUT) -> 0  (capture streams open: 0)
+reported: 48000 Hz, 1 channel(s), format 1 (1 == PCM_I16), burst 480 frames,
+          capacity 24000 frames, state 2
+read before requestStart -> -895 (must be negative: -895 is INVALID_STATE)
+MIC-OPEN requestStart -> 0  (capture streams open: 1)
+RECORDED 142560 frame(s) in 3.0 s, peak 0.06644 of full scale, xruns 0
+MIC-PAUSE requestPause -> 0  (capture streams open: 0)
+MIC-REOPEN requestStart -> 0  (capture streams open: 1)
+RE-RECORDED 143520 frame(s), peak 0.08679 of full scale
+MIC-STOP requestStop -> 0  (capture streams open: 0)
+read after requestStop -> -895 (must be negative)
+MIC-CLOSED close -> 0  (capture streams open: 0)
+AAUDIO-CAPTURE-LIFETIME PASS
+```
+
+`aaudio-record-never` — open an input stream, wait, close it, never record —
+held zero capture streams throughout and left zero behind.
+
+### The peak meter, and the control that makes it mean something
+
+A connected capture node proves as little as a connected playback one: a
+stream linked to the wrong place, or to a muted source, delivers frames
+forever and every one of them is zero. So the read path carries the same peak
+meter the fill callback does, and it was scored against a *known* signal
+rather than against a room.
+
+`audio_probe play` puts a 440 Hz tone at 1/512 of full scale (0.001953) into
+one sink; `aaudio-record` captures that sink's monitor via `PIPEWIRE_NODE` and
+`stream.capture.sink=true`. Same command, same node, twice, with the only
+difference being whether the tone was playing:
+
+| monitor of the same sink | frames in 2.0 s | peak of full scale |
+|---|---|---|
+| 440 Hz tone at 0.001953 playing | 95 520 | **0.00192** |
+| nothing playing | 95 520 | **0.00000** |
+
+0.00192 against 0.001953 played is 98% of the amplitude, which is the sine's
+crest falling between sample instants and S16 quantisation, and it is the
+reading that says the path carries the signal at the right scale rather than
+merely carrying something. The zero row is the control: identical frame count,
+identical everything, and exactly digital silence.
+
+Against the machine's actual microphone the two recording windows read 0.06644
+and 0.08679 — different from each other, which a constant artefact would not
+be. `xruns` (now `CaptureStream::dropped_bytes` in frames, which unlike the
+output side is a number Cordial can honestly see) was 0 in every run.
+
+### Playback, after the capture work, on the same harness
+
+`audio_probe aaudio-play` installs a data callback and lets `CallbackStream`
+pull it, which is the shape FMOD's own callback has. It exists because the
+output path now shares a `Stream` struct and four getters with the input one,
+and finding out that a getter changed by waiting for a signed-in client to
+sound wrong is a slow way to find out. Twice, five seconds each:
+
+```text
+negotiated 48000 Hz, 2 channel(s), format 2 (2 == PCM_FLOAT), burst 1024, capacity 1024
+PLAYED 239616 frame(s) in 5.0 s (47923 a second; the negotiated rate is 48000), xruns 0
+AAUDIO-PLAYBACK PASS
+```
+
+identical to the digit on both runs, and identical to the format and burst the
+four signed-in runs above negotiated.
+
+### One thing is still not measured, and it is the one to measure next
+
+**Nothing here shows what FMOD does with a capture stream that opens.** The
+earlier runs measured FMOD asking for one input stream and carrying on when it
+was refused. Whether it then calls `requestStart`, when, and whether it ever
+stops, is unmeasured. A signed-out client cannot answer it: a 45-second run to
+the Landing screen on 2026-08-22 logged no `openStream` of any direction and no
+`AudioDevice.init` either, because FMOD is not initialised until there is
+something to play. It takes a signed-in run into a place, and on the day this
+was written the only signed-in profile was held by a client that was in one for
+the whole session ([ADR-012](../adr/ADR-012-profiles-and-instances.md): one
+instance per profile, by `flock`).
+
+So, precisely:
+
+* Opening the microphone without an explicit `requestStart` is structurally
+  impossible, and the registry table above is the check on that from outside
+  the process.
+* "FMOD cannot open it by accident" is a different claim from "FMOD does not
+  start it and leave it started", and only the first is established. The
+  second is **`INFERRED`**, on this: the input stream FMOD opens has
+  `bufferCapacity=0` and `dataCallback=no`, which is the same signature as the
+  two *output* probes in the same log — both of which were closed immediately
+  — and reading `getSampleRate`/`getChannelCount` off a probe needs no
+  `requestStart` at all.
+
+The next signed-in run answers it with no extra instrumentation, because every
+transition already prints. One grep does it:
+
+```bash
+grep -E "input stream opened|microphone opened|microphone closed|recording (paused|stopped)" run.log
+```
+
+A `microphone opened` with no `microphone closed` behind it, in a run where
+nobody spoke, is the failure this paragraph exists to look for, and it would
+mean the default has to go back.
+
+**Why the default was flipped anyway, rather than waiting for that run.** The
+exposure is created by implementing capture, not by making it the default:
+anyone following `CORDIAL_AUDIO=aaudio` — which is what the documentation has
+told people to do since AAudio landed — has exactly the same behaviour from
+exactly the same code. Leaving the switch off by default would not protect
+them; it would only make the gap harder to find. Whereas an unset variable now
+takes the path that gets the most use, which is the path this question gets
+answered on soonest.
+
+## How it landed
+
+The plan was: behind `CORDIAL_AUDIO=aaudio`, off by default, measured against
+the Java path in one session, and only then made default in its own commit
+quoting the numbers. That is what happened, with one substitution — the
+measurement is `pw-top`'s `ERR` column and a peak meter, not `getXRunCount`,
+for the reason two sections above.
+
+**AAudio is now the default**, and the honest summary of why is not that it is
+better. On this machine it is not measurably better: zero `ERR` on both paths,
+same rate, same clean teardown. What it is, is structurally different — no JNI
+hop, no `jbyteArray` copy, no `std::deque`, no mutex between the engine and
+PipeWire's callback, F32 end to end — and, since capture was implemented, the
+only one of the two that can record at all. The Java path is
+`CORDIAL_AUDIO=java` and remains what a host with no PipeWire session gets,
+because `supportsAAudio()` answers false there regardless of this switch.
 
 **`CORDIAL_AUDIO` now exists**, with three values — `java` (the default, and
 what an unset variable means), `aaudio`, and `aaudio-refuse` — and it

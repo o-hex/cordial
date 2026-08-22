@@ -19,8 +19,8 @@
 //
 //     clang++ -std=c++17 -DCORDIAL_HAVE_PIPEWIRE=1 \
 //         -I/usr/include/pipewire-0.3 -I/usr/include/spa-0.2 \
-//         native/opensles.cpp native/pipewire_backend.cpp native/audio_probe.cpp \
-//         -ldl -lpthread -o /tmp/audio_probe
+//         native/opensles.cpp native/pipewire_backend.cpp native/aaudio.cpp \
+//         native/audio_probe.cpp -ldl -lpthread -o /tmp/audio_probe
 //
 // It needs a running PipeWire session and it makes a real stream appear in it,
 // which is exactly why it must not run as part of an ordinary build.
@@ -642,6 +642,366 @@ int cmd_record_selfstop() {
     return (g_selfstop.done.load() && cordial::audio::active_capture_streams() == 0) ? 0 : 1;
 }
 
+// ----------------------------------------------------- the AAudio capture path
+//
+// Reached the way the guest reaches it: `aaudio.cpp` exports nothing as an ELF
+// symbol, only a name/address table that `symtab.rs` turns into a virtual
+// `libaaudio.so`, so this looks its entry points up in that same table. What
+// runs below is therefore the real bridge and not a friendlier copy of it.
+//
+// The questions this answers, none of which can be answered by reading the
+// code, and two of which no Roblox run can answer either — voice chat has
+// never worked on this client, so waiting for FMOD to open an input stream is
+// waiting for a thing that may never happen:
+//
+//   1. Does a PipeWire capture node exist between `openStream` and
+//      `requestStart`? It must not.
+//   2. Does it go away on `requestStop`, and on `requestPause`? It must.
+//   3. Do the frames that come back contain anything? A capture stream linked
+//      to the wrong node, or to a muted source, delivers zeroes forever and
+//      every other reading in this list is perfectly happy about it.
+//
+// Run it with `pw-cli ls Node` or `wpctl status` in another terminal; the
+// IDLE/RECORDING/STOPPED marks are spaced so a once-a-second sampler catches
+// each state.
+
+extern "C" {
+struct CordialAAudioSymbol {
+    const char* name;
+    void* address;
+};
+const CordialAAudioSymbol* cordial_aaudio_symbols(size_t* count);
+}
+
+namespace aa {
+
+using result_t = int32_t;
+using stream_t = void;
+using builder_t = void;
+
+constexpr int32_t DIRECTION_INPUT = 1;
+constexpr int32_t FORMAT_UNSPECIFIED = 0;
+constexpr int32_t FORMAT_PCM_I16 = 1;
+/// `AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION`, which is what a voice chat asks
+/// for on Android. Nothing downstream reads it yet; it is set so that the log
+/// line `openStream` prints shows a realistic request rather than a zero.
+constexpr int32_t INPUT_PRESET_VOICE_COMMUNICATION = 7;
+
+result_t (*createStreamBuilder)(builder_t**) = nullptr;
+result_t (*builderDelete)(builder_t*) = nullptr;
+void (*setDirection)(builder_t*, int32_t) = nullptr;
+void (*setFormat)(builder_t*, int32_t) = nullptr;
+void (*setInputPreset)(builder_t*, int32_t) = nullptr;
+result_t (*openStream)(builder_t*, stream_t**) = nullptr;
+result_t (*closeStream)(stream_t*) = nullptr;
+result_t (*requestStart)(stream_t*) = nullptr;
+result_t (*requestPause)(stream_t*) = nullptr;
+result_t (*requestStop)(stream_t*) = nullptr;
+result_t (*readStream)(stream_t*, void*, int32_t, int64_t) = nullptr;
+int32_t (*getSampleRate)(stream_t*) = nullptr;
+int32_t (*getChannelCount)(stream_t*) = nullptr;
+int32_t (*getFormat)(stream_t*) = nullptr;
+int32_t (*getFramesPerBurst)(stream_t*) = nullptr;
+int32_t (*getBufferCapacityInFrames)(stream_t*) = nullptr;
+int32_t (*getState)(stream_t*) = nullptr;
+int32_t (*getXRunCount)(stream_t*) = nullptr;
+
+void* find(const char* name) {
+    size_t count = 0;
+    const CordialAAudioSymbol* table = cordial_aaudio_symbols(&count);
+    for (size_t i = 0; i < count; ++i) {
+        if (std::strcmp(table[i].name, name) == 0) return table[i].address;
+    }
+    return nullptr;
+}
+
+template <typename Fn>
+bool bind(Fn& slot, const char* name) {
+    slot = reinterpret_cast<Fn>(find(name));
+    if (!slot) mark("MISSING SYMBOL %s", name);
+    return slot != nullptr;
+}
+
+bool resolve() {
+    bool ok = true;
+    ok &= bind(createStreamBuilder, "AAudio_createStreamBuilder");
+    ok &= bind(builderDelete, "AAudioStreamBuilder_delete");
+    ok &= bind(setDirection, "AAudioStreamBuilder_setDirection");
+    ok &= bind(setFormat, "AAudioStreamBuilder_setFormat");
+    ok &= bind(setInputPreset, "AAudioStreamBuilder_setInputPreset");
+    ok &= bind(openStream, "AAudioStreamBuilder_openStream");
+    ok &= bind(closeStream, "AAudioStream_close");
+    ok &= bind(requestStart, "AAudioStream_requestStart");
+    ok &= bind(requestPause, "AAudioStream_requestPause");
+    ok &= bind(requestStop, "AAudioStream_requestStop");
+    ok &= bind(readStream, "AAudioStream_read");
+    ok &= bind(getSampleRate, "AAudioStream_getSampleRate");
+    ok &= bind(getChannelCount, "AAudioStream_getChannelCount");
+    ok &= bind(getFormat, "AAudioStream_getFormat");
+    ok &= bind(getFramesPerBurst, "AAudioStream_getFramesPerBurst");
+    ok &= bind(getBufferCapacityInFrames, "AAudioStream_getBufferCapacityInFrames");
+    ok &= bind(getState, "AAudioStream_getState");
+    ok &= bind(getXRunCount, "AAudioStream_getXRunCount");
+    return ok;
+}
+
+} // namespace aa
+
+/// Pulls `seconds` of audio and returns the largest absolute sample seen, or a
+/// negative number if the read path itself failed.
+double aaudio_drain(void* stream, double seconds, int32_t burst, uint64_t* frames_out) {
+    std::vector<int16_t> buf(static_cast<size_t>(burst) * 2, 0);
+    const auto until = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(static_cast<int>(seconds * 1000));
+    double peak = 0.0;
+    uint64_t frames = 0;
+    while (std::chrono::steady_clock::now() < until) {
+        // 100 ms is far longer than the 10 ms burst asks for, so a read that
+        // comes back short is a read that had nothing to give rather than one
+        // that was not waited for.
+        int32_t got = aa::readStream(stream, buf.data(), burst, 100LL * 1000 * 1000);
+        if (got < 0) {
+            mark("READ FAILED -> %d", got);
+            return -1.0;
+        }
+        frames += static_cast<uint64_t>(got);
+        for (int32_t i = 0; i < got; ++i) {
+            double v = std::fabs(static_cast<double>(buf[static_cast<size_t>(i)])) / 32768.0;
+            if (v > peak) peak = v;
+        }
+    }
+    if (frames_out) *frames_out = frames;
+    return peak;
+}
+
+int cmd_aaudio_record(double seconds) {
+    if (!aa::resolve()) return 1;
+
+    void* builder = nullptr;
+    int32_t r = aa::createStreamBuilder(&builder);
+    mark("AAudio_createStreamBuilder -> %d", r);
+    if (r != 0 || !builder) return 1;
+    aa::setDirection(builder, aa::DIRECTION_INPUT);
+    aa::setFormat(builder, aa::FORMAT_UNSPECIFIED);
+    aa::setInputPreset(builder, aa::INPUT_PRESET_VOICE_COMMUNICATION);
+
+    void* stream = nullptr;
+    r = aa::openStream(builder, &stream);
+    aa::builderDelete(builder);
+    mark("openStream(INPUT) -> %d  (capture streams open: %u)", r,
+         cordial::audio::active_capture_streams());
+    if (r != 0 || !stream) return 1;
+
+    bool ok = true;
+    if (cordial::audio::active_capture_streams() != 0) {
+        mark("FAIL openStream opened a microphone; it must not");
+        ok = false;
+    }
+
+    mark("reported: %d Hz, %d channel(s), format %d (1 == PCM_I16), burst %d frames, capacity "
+         "%d frames, state %d",
+         aa::getSampleRate(stream), aa::getChannelCount(stream), aa::getFormat(stream),
+         aa::getFramesPerBurst(stream), aa::getBufferCapacityInFrames(stream),
+         aa::getState(stream));
+
+    // Reading before starting must fail rather than hand back a quiet room.
+    int16_t probe[64];
+    int32_t before = aa::readStream(stream, probe, 32, 0);
+    mark("read before requestStart -> %d (must be negative: -895 is INVALID_STATE)", before);
+    if (before >= 0) {
+        mark("FAIL a stream that is not recording returned frames");
+        ok = false;
+    }
+
+    mark("IDLE-BEGIN opened, not started (capture streams open: %u)",
+         cordial::audio::active_capture_streams());
+    sleep_ms(3000);
+    mark("IDLE-END (capture streams open: %u)", cordial::audio::active_capture_streams());
+    if (cordial::audio::active_capture_streams() != 0) {
+        mark("FAIL a microphone appeared while the stream was merely open");
+        ok = false;
+    }
+
+    r = aa::requestStart(stream);
+    mark("MIC-OPEN requestStart -> %d  (capture streams open: %u)", r,
+         cordial::audio::active_capture_streams());
+    if (r != 0 || cordial::audio::active_capture_streams() != 1) {
+        mark("FAIL requestStart did not open exactly one capture stream");
+        ok = false;
+    }
+
+    uint64_t frames = 0;
+    double peak = aaudio_drain(stream, seconds, aa::getFramesPerBurst(stream), &frames);
+    mark("RECORDED %llu frame(s) in %.1f s, peak %.5f of full scale, xruns %d",
+         static_cast<unsigned long long>(frames), seconds, peak, aa::getXRunCount(stream));
+    if (peak < 0.0) ok = false;
+    // 48000 frames a second is what the stream reports; anything under half of
+    // that is a stream that is connected and not being fed.
+    if (frames < static_cast<uint64_t>(seconds * 48000 / 2)) {
+        mark("FAIL far fewer frames than the reported rate implies");
+        ok = false;
+    }
+    // Reported separately from the pass/fail below, and deliberately not
+    // folded into it. The lifetime invariants are the thing this command can
+    // decide on its own; whether anything was making a noise is a fact about
+    // the room, and a quiet room is not a bug. Say the number and let the
+    // reader judge it — with the caveat that a *connected* stream reads
+    // exactly 0.00000 when its source is silent, so a zero here answers
+    // nothing about whether samples are being carried.
+    mark("SIGNAL peak %.5f of full scale (0.00000 means the source was silent, which is not "
+         "the same as the path working)", peak);
+
+    r = aa::requestPause(stream);
+    mark("MIC-PAUSE requestPause -> %d  (capture streams open: %u)", r,
+         cordial::audio::active_capture_streams());
+    sleep_ms(3000);
+    mark("PAUSED-SETTLED (capture streams open: %u)", cordial::audio::active_capture_streams());
+    if (cordial::audio::active_capture_streams() != 0) {
+        mark("FAIL pause left the microphone open");
+        ok = false;
+    }
+
+    r = aa::requestStart(stream);
+    mark("MIC-REOPEN requestStart -> %d  (capture streams open: %u)", r,
+         cordial::audio::active_capture_streams());
+    frames = 0;
+    peak = aaudio_drain(stream, seconds, aa::getFramesPerBurst(stream), &frames);
+    mark("RE-RECORDED %llu frame(s), peak %.5f of full scale", 
+         static_cast<unsigned long long>(frames), peak);
+    if (peak < 0.0 || frames == 0) {
+        mark("FAIL nothing came back after re-starting");
+        ok = false;
+    }
+
+    r = aa::requestStop(stream);
+    mark("MIC-STOP requestStop -> %d  (capture streams open: %u)", r,
+         cordial::audio::active_capture_streams());
+    sleep_ms(3000);
+    mark("STOPPED-SETTLED (capture streams open: %u)", cordial::audio::active_capture_streams());
+    if (cordial::audio::active_capture_streams() != 0) {
+        mark("FAIL stop left the microphone open");
+        ok = false;
+    }
+
+    int32_t after = aa::readStream(stream, probe, 32, 0);
+    mark("read after requestStop -> %d (must be negative)", after);
+    if (after >= 0) {
+        mark("FAIL a stopped stream returned frames");
+        ok = false;
+    }
+
+    r = aa::closeStream(stream);
+    mark("MIC-CLOSED close -> %d  (capture streams open: %u)", r,
+         cordial::audio::active_capture_streams());
+    if (cordial::audio::active_capture_streams() != 0) {
+        mark("FAIL close left the microphone open");
+        ok = false;
+    }
+
+    mark(ok ? "AAUDIO-CAPTURE-LIFETIME PASS" : "AAUDIO-CAPTURE-LIFETIME FAIL");
+    return ok ? 0 : 1;
+}
+
+/// The output half, so that a change to the capture side cannot quietly break
+/// playback without anything noticing.
+///
+/// Roblox's own AAudio playback needs a signed-in client in a place, which is
+/// a slow and occasionally unavailable way to find out that a getter started
+/// returning the wrong number. This installs a data callback that generates a
+/// tone at the amplitude the header argues for and lets `CallbackStream` pull
+/// it, which is the same path FMOD's callback takes.
+struct AAudioTone {
+    double phase = 0.0;
+    double step = 0.0;
+    double amplitude = 0.0;
+    int32_t channels = 0;
+    std::atomic<uint64_t> frames{0};
+};
+
+AAudioTone g_aaudio_tone;
+
+int32_t aaudio_tone_callback(void*, void*, void* audioData, int32_t numFrames) {
+    auto* out = static_cast<float*>(audioData);
+    for (int32_t f = 0; f < numFrames; ++f) {
+        const float v = static_cast<float>(std::sin(g_aaudio_tone.phase) * g_aaudio_tone.amplitude);
+        for (int32_t c = 0; c < g_aaudio_tone.channels; ++c) {
+            out[f * g_aaudio_tone.channels + c] = v;
+        }
+        g_aaudio_tone.phase += g_aaudio_tone.step;
+        if (g_aaudio_tone.phase > 2.0 * M_PI) g_aaudio_tone.phase -= 2.0 * M_PI;
+    }
+    g_aaudio_tone.frames.fetch_add(static_cast<uint64_t>(numFrames));
+    return 0; // AAUDIO_CALLBACK_RESULT_CONTINUE
+}
+
+int cmd_aaudio_play(double seconds, double amplitude, double hz) {
+    if (!aa::resolve()) return 1;
+    void* set_cb = aa::find("AAudioStreamBuilder_setDataCallback");
+    if (!set_cb) return 1;
+    auto setDataCallback =
+        reinterpret_cast<void (*)(void*, int32_t (*)(void*, void*, void*, int32_t), void*)>(set_cb);
+
+    void* builder = nullptr;
+    if (aa::createStreamBuilder(&builder) != 0) return 1;
+    setDataCallback(builder, &aaudio_tone_callback, nullptr);
+    void* stream = nullptr;
+    int32_t r = aa::openStream(builder, &stream);
+    aa::builderDelete(builder);
+    mark("openStream(OUTPUT, dataCallback) -> %d", r);
+    if (r != 0 || !stream) return 1;
+
+    const int32_t rate = aa::getSampleRate(stream);
+    g_aaudio_tone.channels = aa::getChannelCount(stream);
+    g_aaudio_tone.amplitude = amplitude;
+    g_aaudio_tone.step = 2.0 * M_PI * hz / (rate > 0 ? rate : 48000);
+    mark("negotiated %d Hz, %d channel(s), format %d (2 == PCM_FLOAT), burst %d, capacity %d",
+         rate, g_aaudio_tone.channels, aa::getFormat(stream), aa::getFramesPerBurst(stream),
+         aa::getBufferCapacityInFrames(stream));
+
+    r = aa::requestStart(stream);
+    mark("requestStart -> %d", r);
+    sleep_ms(static_cast<int>(seconds * 1000));
+    const uint64_t frames = g_aaudio_tone.frames.load();
+    mark("PLAYED %llu frame(s) in %.1f s (%.0f a second; the negotiated rate is %d), xruns %d",
+         static_cast<unsigned long long>(frames), seconds, frames / seconds, rate,
+         aa::getXRunCount(stream));
+    aa::requestStop(stream);
+    r = aa::closeStream(stream);
+    mark("close -> %d", r);
+
+    // Within 5% of the negotiated rate. A callback that is never called, or
+    // called at some other cadence, is the regression this exists to catch.
+    const bool ok = rate > 0 && frames > 0 &&
+                     std::fabs(frames / seconds - rate) < rate * 0.05;
+    mark(ok ? "AAUDIO-PLAYBACK PASS" : "AAUDIO-PLAYBACK FAIL");
+    return ok ? 0 : 1;
+}
+
+/// The case that matters most and is easiest to get wrong: a stream that is
+/// opened and then closed without ever recording must never have touched the
+/// microphone, and must not leak one on the way out.
+int cmd_aaudio_record_never() {
+    if (!aa::resolve()) return 1;
+    void* builder = nullptr;
+    if (aa::createStreamBuilder(&builder) != 0) return 1;
+    aa::setDirection(builder, aa::DIRECTION_INPUT);
+    aa::setFormat(builder, aa::FORMAT_PCM_I16);
+    void* stream = nullptr;
+    int32_t r = aa::openStream(builder, &stream);
+    aa::builderDelete(builder);
+    if (r != 0 || !stream) return 1;
+    mark("NEVER-RECORD opened (capture streams open: %u)",
+         cordial::audio::active_capture_streams());
+    sleep_ms(2000);
+    const uint32_t during = cordial::audio::active_capture_streams();
+    aa::closeStream(stream);
+    const uint32_t after = cordial::audio::active_capture_streams();
+    mark("NEVER-RECORD closed (during: %u, after: %u)", during, after);
+    const bool ok = during == 0 && after == 0;
+    mark(ok ? "MIC-NEVER-OPENED PASS" : "MIC-NEVER-OPENED FAIL");
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -661,7 +1021,12 @@ int main(int argc, char** argv) {
     if (cmd == "silence") return cmd_play(seconds, amplitude, hz, true);
     if (cmd == "record") return cmd_record(seconds);
     if (cmd == "record-selfstop") return cmd_record_selfstop();
-    std::fprintf(stderr, "usage: audio_probe devices|play|silence|record|record-selfstop [--seconds N] "
-                          "[--amplitude A] [--hz F]\n");
+    if (cmd == "aaudio-record") return cmd_aaudio_record(seconds);
+    if (cmd == "aaudio-record-never") return cmd_aaudio_record_never();
+    if (cmd == "aaudio-play") return cmd_aaudio_play(seconds, amplitude, hz);
+    std::fprintf(stderr,
+                  "usage: audio_probe devices|play|silence|record|record-selfstop|"
+                  "aaudio-play|aaudio-record|aaudio-record-never "
+                  "[--seconds N] [--amplitude A] [--hz F]\n");
     return 2;
 }

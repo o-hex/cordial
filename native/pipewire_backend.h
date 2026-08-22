@@ -342,6 +342,18 @@ public:
     /// failure mode this whole file exists to avoid.
     uint32_t read(void* dst, uint32_t size);
 
+    /// Bytes the ring had to drop because the reader was too slow, since
+    /// `open`. This is the capture side's *real* overrun count, and unlike
+    /// the playback side's it is one Cordial can see for itself: the ring is
+    /// ours, the reader is ours, and a reader that falls half a second behind
+    /// loses samples here rather than at the server.
+    ///
+    /// `AAudioStream_getXRunCount` on an input stream reports this, converted
+    /// to frames. See the note beside that function in `aaudio.cpp` for why
+    /// the *output* side has nothing equivalent to offer and returns a number
+    /// that is structurally always zero.
+    uint64_t dropped_bytes() const;
+
 private:
     struct Impl;
     Impl* impl_;

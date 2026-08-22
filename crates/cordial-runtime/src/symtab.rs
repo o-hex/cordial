@@ -305,14 +305,16 @@ pub fn build(host_libc: bool) -> SymbolTable {
     // `AAudio*` symbols, so nothing here is reached by the per-symbol loop
     // above and the library has to be registered whole.
     //
-    // **Registered only when `CORDIAL_AUDIO` asked for it**, which is what
-    // keeps this off by default. An audio backend nobody has measured must
-    // not arrive with an update and take everyone's sound with it if it is
-    // wrong; `flags::Performance::Balanced` is the precedent, setting nothing
-    // and staying the default until a number exists. The condition is read
-    // out of `native/aaudio.cpp` rather than from the environment here so
-    // that this and `org.fmod.FMOD.supportsAAudio()` cannot disagree — see
-    // `bionic::aaudio_selected`.
+    // **Registered unless `CORDIAL_AUDIO=java` asked otherwise.** This was off
+    // by default while nothing had been measured — an audio backend nobody has
+    // numbers for must not arrive with an update and take everyone's sound
+    // with it — and the numbers now exist in
+    // `docs/analysis/aaudio-contract.md`. Registering the library is still not
+    // on its own enough to route anything: `org.fmod.FMOD.supportsAAudio()`
+    // is the gate FMOD actually asks, and it answers false on a host with no
+    // PipeWire session whatever this does. The condition is read out of
+    // `native/aaudio.cpp` rather than from the environment here so that this
+    // and that predicate cannot disagree — see `bionic::aaudio_selected`.
     if crate::bionic::aaudio_selected() {
         let aaudio = table.libraries.entry(AAUDIO_LIBRARY_NAME).or_default();
         for (symbol, address) in crate::bionic::aaudio_overrides() {

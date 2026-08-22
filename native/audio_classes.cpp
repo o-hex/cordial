@@ -920,18 +920,22 @@ public:
     /// latency produces underruns rather than an error anybody can trace.
     static jboolean supportsLowLatency(jnivm::ENV*, jnivm::Class*) { return JNI_FALSE; }
 
-    /// **AAudio: true only when `CORDIAL_AUDIO` asked for it, false otherwise.**
+    /// **AAudio: true unless `CORDIAL_AUDIO=java` asked otherwise, or there is
+    /// no PipeWire session to be true about.**
     ///
     /// This used to be an unconditional false, with a comment saying to flip
-    /// it "the day `libaaudio.so` is real, not before". That day has come
-    /// halfway: `native/aaudio.cpp` implements the 25 entry points this build
-    /// looks up, over PipeWire, and `symtab.rs` registers them as a virtual
-    /// `libaaudio.so` — but only under `CORDIAL_AUDIO=aaudio`, because an
+    /// it "the day `libaaudio.so` is real, not before". That day came in two
+    /// halves. First `native/aaudio.cpp` implemented the 25 entry points this
+    /// build looks up, over PipeWire, and `symtab.rs` registered them as a
+    /// virtual `libaaudio.so` — behind `CORDIAL_AUDIO=aaudio`, because an
     /// audio backend nobody has measured must not become the default on an
-    /// update. So the honest answer is now conditional, and it is conditional
-    /// on exactly the same reading of `CORDIAL_AUDIO` that decides whether
-    /// the library exists at all. The two cannot disagree: both call
-    /// `cordial_audio_backend_is_aaudio`, and there is one definition of it.
+    /// update. Then it was measured, capture was implemented, and it became
+    /// the default; `CORDIAL_AUDIO=java` is the way back.
+    ///
+    /// Either way the answer is conditional on exactly the same reading of
+    /// `CORDIAL_AUDIO` that decides whether the library exists at all. The two
+    /// cannot disagree: both call `cordial_audio_backend_is_aaudio`, and there
+    /// is one definition of it.
     ///
     /// **This predicate, not `dlopen`, is the real gate**, and that was worth
     /// measuring rather than assuming. `docs/analysis/aaudio-contract.md` had
@@ -967,8 +971,8 @@ public:
         if (!cordial_audio_backend_is_aaudio()) return JNI_FALSE;
         if (!audio::pipewire_available()) {
             std::fprintf(stderr,
-                "W/Cordial-FMOD            CORDIAL_AUDIO asked for AAudio but no PipeWire "
-                "session is reachable; answering supportsAAudio() false so FMOD keeps its "
+                "W/Cordial-FMOD            AAudio is selected but no PipeWire session is "
+                "reachable; answering supportsAAudio() false so FMOD keeps its "
                 "AudioDevice fallback. Claiming AAudio here would cost all audio, not just "
                 "the low-latency path -- FMOD does not fall back once a stream it opened "
                 "through AAudio refuses.\n");

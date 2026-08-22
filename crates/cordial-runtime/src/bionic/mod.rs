@@ -491,7 +491,8 @@ pub fn opensles_overrides() -> Vec<(&'static str, *mut c_void)> {
 
 // -------------------------------------------------------------------- AAudio
 
-/// Whether `CORDIAL_AUDIO` selected an AAudio mode.
+/// Whether `CORDIAL_AUDIO` selected an AAudio mode. True for an unset
+/// variable: AAudio is the default.
 ///
 /// Read from `native/aaudio.cpp` rather than from `std::env` here so that
 /// there is exactly one parser of the variable in the process. The failure
@@ -534,7 +535,8 @@ pub fn announce_audio_backend() {
 /// and which was measured, not assumed; see the comment on that method.
 ///
 /// So this is registered the way `android::vulkan` and `mimalloc_lib` are, as
-/// a virtual library of its own, and only when `CORDIAL_AUDIO` asked for it.
+/// a virtual library of its own — by default, since 2026-08-22, with
+/// `CORDIAL_AUDIO=java` the way back to FMOD's Java `AudioDevice` path.
 pub fn aaudio_overrides() -> Vec<(&'static str, *mut c_void)> {
     #[repr(C)]
     struct Symbol {

@@ -1338,6 +1338,12 @@ uint32_t CaptureStream::read(void* dst, uint32_t size) {
     return n;
 }
 
+uint64_t CaptureStream::dropped_bytes() const {
+    if (!impl_) return 0;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->dropped_bytes;
+}
+
 // --------------------------------------------------------------- interface
 
 bool pipewire_available() { return get_session() != nullptr; }
@@ -1600,6 +1606,7 @@ bool CaptureStream::open(uint32_t, uint32_t, const std::string&) { return false;
 void CaptureStream::close() {}
 bool CaptureStream::is_open() const { return false; }
 uint32_t CaptureStream::read(void*, uint32_t) { return 0; }
+uint64_t CaptureStream::dropped_bytes() const { return 0; }
 
 struct CallbackStream::Impl {};
 

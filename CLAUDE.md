@@ -81,8 +81,19 @@ an intermittent bug.
 
 **Never match your own command line.** `pkill -f cordial-run` and
 `pgrep -f 'cordial.*profile'` both match the shell running them, and both have
-killed the session that issued them — five times in one day. Match on
-`pgrep -x`, or on `os.path.basename(os.readlink('/proc/<pid>/exe'))`.
+killed the session that issued them — five times in one day.
+
+**And `pgrep -x cordial-run` is not the fix, because it does not work.** The
+engine renames the main thread, so `/proc/<pid>/comm` reads `Main` and an
+exact-name match finds nothing for a client that is in a game with audio
+playing. It handed a subagent a false "nothing is running" mid-session, on
+2026-08-22, hours after this very paragraph recommended it. Today's own gdb
+capture shows the same thing from the other side: `Thread 1 (LWP 1452113)
+"Main"`.
+
+Use `pidof cordial-run`, which matches the executable rather than the thread
+name, or read it directly with
+`os.path.basename(os.readlink('/proc/<pid>/exe'))`.
 
 ## Read mocktail before guessing
 

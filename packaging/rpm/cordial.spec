@@ -26,6 +26,15 @@
 %global snapinfo 108.20260822git9d9c980
 %global commit   9d9c9800000000000000000000000000000000000
 
+# The exact `git describe` string, passed to the build so the title bar agrees
+# with `rpm -q`. Without it the tarball has no .git, crates/cordial-shell/build.rs
+# falls back to the bare Cargo version, and the client calls itself "Cordial
+# 0.6.0" while the package it came from is 0.6.0-1.108.20260822git9d9c980. It
+# also stops git walking up out of an unpacked tarball and stamping the tag of
+# whatever unrelated repository happens to sit above it, which is the same bug
+# wearing a convincing number.
+%global describe 0.6.0-108-g9d9c980
+
 %global archivename %{name}-%{version}-%{snapinfo}
 
 Name:           cordial
@@ -135,6 +144,10 @@ measured and how.
 # to be lost when somebody adapts this spec, and the failure it prevents lands
 # deep inside a *-sys build script naming neither the tool nor the cause.
 export CC=clang CXX=clang++
+
+# See the %%describe comment at the top: the tarball has no .git, so the stamp
+# has to be handed in or the client misreports its own version.
+export CORDIAL_BUILD_VERSION=%{describe}
 
 # Both crates' `webview` features, and one without the other is the trap. The
 # shell holds the WebKit window and cordial-runtime holds the presenter that

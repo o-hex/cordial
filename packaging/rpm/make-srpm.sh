@@ -114,6 +114,7 @@ echo "==> writing the spec"
 spec="$work/cordial.spec"
 sed -e "s|^%global snapinfo .*|%global snapinfo ${snapinfo}|" \
     -e "s|^%global commit   .*|%global commit   ${commit}|" \
+    -e "s|^%global describe .*|%global describe ${describe#v}|" \
     -e "s|^Version: *.*|Version:        ${version}|" \
     -e "s|^Release: *.*|Release:        ${release}|" \
     "$here/cordial.spec" > "$spec"

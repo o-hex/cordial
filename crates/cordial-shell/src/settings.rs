@@ -728,6 +728,53 @@ fn build_general_page(
     }
 
     group.add(&row);
+
+    // Order has to match GraphicsOptimization::index/from_index.
+    //
+    // Five entries rather than a device dropdown beside a CPU dropdown. The
+    // reasoning is in `GraphicsOptimization`'s own doc: they are two
+    // parameters and one question, and a cross product of them would be six
+    // rows for combinations nobody has measured. Each label here names what it
+    // actually sets.
+    let optimisation_model = gtk::StringList::new(&[
+        "Windows PC (default)",
+        "Roblox app",
+        "Android tablet",
+        "Windows PC, more CPU cores",
+        "Windows PC, fewer CPU cores",
+    ]);
+    let optimisation = adw::ComboRow::builder()
+        .title("Graphics optimisation")
+        // **The honest half, and the half that would be misleading if left
+        // out.** It would be easy to write this row as though picking a
+        // different device made Roblox draw less, and nothing has shown that.
+        // What is established is what each identity makes roblox.com serve
+        // (`native/init_params.cpp`'s `device_identity`) and that `isTablet` is
+        // a field the engine reads; the step from there to a frame rate is an
+        // inference, and a settings page is the last place it should be stated
+        // as fact.
+        .subtitle(
+            "What Cordial tells Roblox it is, and how many of your cores the engine's worker \
+             pools may use. Roblox app is the only one that claims no particular device; \
+             Android tablet is the only one that claims a mobile screen, and has been \
+             reported to break some features. None of them has been measured to change the \
+             frame rate, so treat them as experiments and see whether they help you.",
+        )
+        .model(&optimisation_model)
+        .selected(config.borrow().graphics_optimization_mode.index())
+        .build();
+    optimisation.set_subtitle_lines(5);
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        optimisation.connect_selected_notify(move |row| {
+            config.borrow_mut().graphics_optimization_mode =
+                crate::shell_config::GraphicsOptimization::from_index(row.selected());
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&optimisation);
+
     page.add(&group);
     page.add(&build_audio_group(config.clone(), config_path.clone()));
     page.add(&build_performance_group(config, config_path));

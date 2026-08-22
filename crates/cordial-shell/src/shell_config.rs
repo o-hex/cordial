@@ -398,6 +398,128 @@ impl AudioOutput {
     }
 }
 
+/// One choice that settles both of the things Cordial can ask the engine to do
+/// differently about graphics: which device it says it is, and how many of the
+/// machine's cores the engine's own worker pools may use.
+///
+/// **Why one setting and not two.** They are genuinely two parameters, and a
+/// cross product of them would be six rows describing combinations nobody has
+/// measured. But they are the same question to the person asking it — "make
+/// this run better" — and a Settings page with two graphics dropdowns whose
+/// interaction is undocumented is worse than one list of named intents. So the
+/// list below is intents, each naming exactly what it sets, and the
+/// combinations that make no sense are simply not offered.
+///
+/// **What the device identity is and is not.** It decides the `User-Agent` the
+/// engine sends and `InitParams.isTablet` — see `native/init_params.cpp`'s
+/// `device_identity`, which carries the measurement of what roblox.com serves
+/// for each. It is **not** established that Roblox tiers graphics defaults off
+/// any of it; `isTablet` is the only field here the engine has been seen to
+/// read, and only [`GraphicsOptimization::MobileTier`] sets it. Anyone
+/// choosing a mode expecting a frame rate to move should measure it, and the
+/// row's subtitle says so rather than implying an effect nothing has shown.
+///
+/// **The CPU modes are unmeasured too**, and that is `cordial_runtime::flags`'s
+/// own admission about `Performance`: its tables are adapted from mocktail's
+/// policy and nothing on this project's hardware has compared them. They are
+/// offered because an inference belongs behind a switch somebody chooses, which
+/// is exactly the argument `flags::BUILTIN`'s comment makes at length — and for
+/// the same reason the default sets neither of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GraphicsOptimization {
+    /// The client's own defaults: the `pc-windows-11` identity, and the
+    /// engine's thread sizing left alone. What Cordial has shipped since
+    /// 2026-08-20.
+    ///
+    /// **Still the default, deliberately.** A tablet identity was tried by a
+    /// user and reported breaking PC features, and nothing has measured what
+    /// the bare app token does to a frame rate either. The position when
+    /// nothing has been measured is that the working default keeps working
+    /// and the alternatives become choices.
+    #[default]
+    Balanced,
+    /// `roblox-app`: the bare `RobloxApp/<version>(GlobalDist; Cordial)` token
+    /// and nothing else — no platform words, no device block.
+    ///
+    /// The only identity that claims no form factor at all, which is the one
+    /// Cordial can make honestly. Choosing it is safe for the in-experience
+    /// web view: roblox.com serves the embedded app layout for this token as
+    /// readily as for the other two, measured in
+    /// `native/init_params.cpp`'s `device_identity`.
+    RobloxApp,
+    /// Claim an Android tablet, which is the only thing Cordial can say that
+    /// asserts a mobile form factor to the engine (`InitParams.isTablet`).
+    ///
+    /// **Reported to break PC features** by the user who tried it. Offered
+    /// because it is the only route to mobile-tier defaults if they exist,
+    /// not because it is recommended.
+    MobileTier,
+    /// The default `pc-windows-11` identity, plus
+    /// [`cordial_runtime::flags::Performance::Throughput`]:
+    /// more engine worker threads and parallel prerender.
+    MoreCores,
+    /// The default `pc-windows-11` identity, plus
+    /// [`cordial_runtime::flags::Performance::Latency`]:
+    /// fewer threads and a smaller physics batch, for a machine short of cores.
+    FewerCores,
+}
+
+impl GraphicsOptimization {
+    /// Order matches the `AdwComboRow` model in `settings.rs`, on the same
+    /// footing as [`ThrottleWhen::index`].
+    pub fn index(self) -> u32 {
+        match self {
+            GraphicsOptimization::Balanced => 0,
+            GraphicsOptimization::RobloxApp => 1,
+            GraphicsOptimization::MobileTier => 2,
+            GraphicsOptimization::MoreCores => 3,
+            GraphicsOptimization::FewerCores => 4,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            0 => GraphicsOptimization::Balanced,
+            1 => GraphicsOptimization::RobloxApp,
+            2 => GraphicsOptimization::MobileTier,
+            3 => GraphicsOptimization::MoreCores,
+            _ => GraphicsOptimization::FewerCores,
+        }
+    }
+
+    /// The `CORDIAL_DEVICE_PROFILE` value this mode wants, or `None` when it
+    /// wants the client's own default.
+    ///
+    /// `None` rather than `Some("roblox-app")` for the default, on exactly the
+    /// argument `launch.rs` makes about `CORDIAL_GRAPHICS`: an absent variable
+    /// is what tells the runtime the user expressed no opinion, which is the
+    /// one state in which a plugin's `CordialDeviceProfile` entry is allowed
+    /// to count. Sending the default explicitly would be the user silently
+    /// outvoting every plugin while the row says the default.
+    pub fn device_profile_env(self) -> Option<&'static str> {
+        match self {
+            GraphicsOptimization::Balanced
+            | GraphicsOptimization::MoreCores
+            | GraphicsOptimization::FewerCores => None,
+            GraphicsOptimization::RobloxApp => Some("roblox-app"),
+            GraphicsOptimization::MobileTier => Some("android-tablet"),
+        }
+    }
+
+    /// The `CORDIAL_PERFORMANCE` value this mode wants, or `None` for the
+    /// client's own default. Same reasoning as [`Self::device_profile_env`].
+    pub fn performance_env(self) -> Option<&'static str> {
+        match self {
+            GraphicsOptimization::Balanced
+            | GraphicsOptimization::RobloxApp
+            | GraphicsOptimization::MobileTier => None,
+            GraphicsOptimization::MoreCores => Some("throughput"),
+            GraphicsOptimization::FewerCores => Some("latency"),
+        }
+    }
+}
+
 /// The profile a launch runs against when nobody has chosen otherwise.
 ///
 /// ADR-012's migration lands the pre-existing storage at `profiles/default`, so
@@ -472,6 +594,16 @@ pub struct ShellConfig {
     /// it is the absence of a user opinion, which is what lets a plugin have
     /// one. See `graphics::resolve`.
     pub graphics: String,
+    /// Which device Cordial says it is, and how hard the engine may push the
+    /// machine's cores. See [`GraphicsOptimization`], which carries the whole
+    /// of the reasoning and the reason the default sets neither.
+    ///
+    /// Separate from `graphics` above and deliberately so: that row picks
+    /// which renderer Cordial offers the engine, which is a question about
+    /// this machine's drivers. This one is about what Cordial claims to be and
+    /// how many threads it asks for, and the two do not interact.
+    #[serde(default)]
+    pub graphics_optimization_mode: GraphicsOptimization,
     pub mangohud: bool,
     /// Which audio device Roblox plays through. See [`AudioOutput`], which
     /// carries the whole of the reasoning, including why the stored form is a
@@ -541,6 +673,7 @@ impl Default for ShellConfig {
             throttle: ThrottleWhen::default(),
             pointer_acceleration: PointerAcceleration::default(),
             graphics: "automatic".to_string(),
+            graphics_optimization_mode: GraphicsOptimization::default(),
             audio_output: AudioOutput::default(),
             mangohud: false,
             fullscreen_accel: default_fullscreen_accel(),

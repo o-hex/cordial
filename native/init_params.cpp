@@ -29,6 +29,7 @@
 #include <sys/statvfs.h>
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -110,51 +111,126 @@ std::shared_ptr<Object> make_display_metrics(ENV* env);
 /// return one without duplicating the class.
 std::shared_ptr<Object> cordial_make_zero_insets(ENV* env);
 
-/// Whether Cordial should present itself to the engine as a Windows 11 PC
-/// rather than the Android tablet identity 6d8c280 built.
+/// Which device identity Cordial presents to the engine and to roblox.com.
 ///
-/// `docs/analysis/flag-init.md` §13: mocktail, a comparable third-party
-/// client, stays connected to a place Cordial is disconnected from at 60.6s
-/// with reason 304, and mocktail's own startup log reports `device
-/// profile=pc-windows-11 class=pc model="Windows 11 PC"` where Cordial
-/// reports an Android tablet. **Whether that causes the 304 is not
-/// established.** It is a difference between a client that works and one
-/// that does not, so this makes it a switch rather than a rewrite: the
-/// default stays the tablet identity, and this experiment is opt-in.
+/// Three, not two. **The default is unchanged: `pc-windows-11`.** The third
+/// identity is shipped as a choice, not as a new default -- a tablet identity
+/// was tried by a user and reported breaking PC features, `roblox-app` has no
+/// number behind it either way, and the position this project takes when
+/// nothing has been measured is that the working default keeps working while
+/// the alternatives become things somebody can choose. See the closing
+/// paragraph for what would justify moving it.
 ///
-/// `CORDIAL_DEVICE_PROFILE=pc-windows-11` turns it on; anything else,
-/// including unset, keeps current behaviour. The name and accepted spelling
-/// match `crates/cordial-runtime/src/flags.rs`'s `DeviceProfile` — that file
-/// resolves the same choice from a `Cordial`-prefixed flag-layer entry, for a
-/// user who wants to opt in from `flags.json` rather than the environment.
-/// **They are not wired together.** This translation unit has no live call
-/// into Rust for this value; the one existing bridge for a comparable case —
-/// `CORDIAL_ENGINE_VERSION`, exported with `std::env::set_var` just before
-/// the init-params call — lives in `crates/cordial-runtime/src/bin/load.rs`,
-/// which is out of scope for this change. So the environment variable read
-/// here is, for now, the only thing that actually reaches the engine; see
-/// `flags.rs`'s module doc on `DEVICE_PROFILE_KEY` for the rest of this gap.
-/// **The default is the PC identity as of 2026-08-20**, where it was the
-/// Android tablet before. `CORDIAL_DEVICE_PROFILE=android-tablet` selects the
-/// old behaviour, and the parsing is deliberately generous in both directions
-/// so a reasonable spelling does not silently land on the opposite profile --
-/// an unrecognised value is reported by `flags.rs` rather than guessed at.
+/// **What was measured, on 2026-08-22, before any of this moved.** roblox.com
+/// was fetched four times with four `User-Agent` strings and nothing else
+/// different, and the served HTML compared. The site's own attributes, off
+/// `https://www.roblox.com/games/1818`:
 ///
-/// Worth knowing before changing this back or forth: the engine being loaded is
-/// still Roblox's **Android** build, whatever this says. This switch changes the
-/// platform words the client sends, not what it is, and the two are now
-/// deliberately different. `osVersion` stays "33" in both profiles -- see the
-/// comment at that field for why -- so the identity is not internally uniform
-/// and nobody should read it as a complete disguise.
-static bool presenting_as_pc() {
-    static const bool v = [] {
+/// ```text
+/// User-Agent shape             data-app-type  data-device-type  data-is-desktop  site nav bar
+/// ROBLOX Windows App .. Desktop uwp            computer          true             absent
+/// ROBLOX Android App .. Tablet  android        tablet            false            absent
+/// RobloxApp/<v>(GlobalDist;..)  universalapp   computer          true             absent
+/// an ordinary browser           unknown        computer          true             PRESENT
+/// ```
+///
+/// That settles the thing this switch was previously afraid of. The
+/// in-experience web view gets the site's embedded layout for **every**
+/// identity here, and the full desktop site with its own navigation bar only
+/// for a browser `User-Agent` -- the branch roblox.com makes is app against
+/// browser, not PC against Android. `crates/cordial-shell/src/webview.rs` said
+/// the right thing about the browser case and was read as though the *PC*
+/// identity were what preserved the in-app layout; it is not, and nothing here
+/// trades the web view for a graphics tier.
+///
+/// [`RobloxApp`] is the bare app token, the shape Sober sends. Read out of
+/// Sober's own `appData/LocalStorage/appStorage.json`, key `WebViewUserAgent`,
+/// on this machine, rather than inferred:
+///
+/// ```text
+/// Mozilla/5.0 AppleWebKit/605.1.15 (KHTML, like Gecko)  ROBLOX Android App
+/// 2.730.790 Tablet Hybrid()  GooglePlayStore RobloxApp/2.730.790(GlobalDist;
+/// GooglePlayStore)
+/// ```
+///
+/// **Worth being exact about, because a shorter reading of that same file
+/// caused a wrong brief:** Sober does send `ROBLOX Android App` and `Tablet
+/// Hybrid()`. What it does *not* send is the parenthesised device block --
+/// no memory, no resolution, no DPI, no API level -- and its WebKit token is
+/// WebKitGTK's own. Only the trailing `RobloxApp/...(GlobalDist; ...)` clause
+/// is what "the bare token" means, and that clause alone is enough for
+/// roblox.com to serve the app layout, which the table above is the control
+/// for.
+///
+/// So `roblox-app` claims to be the Roblox app and declines to claim a form
+/// factor at all: no phone, no tablet, no Windows PC, and no device block full
+/// of numbers whose only purpose is to look like hardware Cordial is not. The
+/// channel stays `Cordial` rather than borrowing `GooglePlayStore`, on the same
+/// rule every other identity field in this file follows.
+///
+/// **What this does not do, and must not be read as doing.** It is an identity,
+/// not a graphics-quality request. Nothing here has established that Roblox
+/// tiers its graphics defaults off the `User-Agent` at all -- the engine builds
+/// its picture of the machine from `InitParams` (memory, resolution, density,
+/// `isTablet`), which is a different set of values reaching it by a different
+/// route. [`AndroidTablet`] is the only identity that asserts a mobile form
+/// factor, through `InitParams.isTablet`, and it is the one to reach for if
+/// mobile-tier defaults are what is wanted.
+///
+/// Worth knowing before changing this: the engine being loaded is Roblox's
+/// **Android** build whatever this says. `osVersion` stays "33" in all three
+/// profiles -- see the comment at that field, which records the engine
+/// refusing Vulkan when it was lowered -- so the identity is not internally
+/// uniform and nobody should read it as a complete disguise.
+///
+/// The accepted spellings match `crates/cordial-runtime/src/flags.rs`'s
+/// `DeviceProfile::parse` exactly, **including what an unrecognised value
+/// does**. That agreement is new. This function used to treat anything it did
+/// not recognise as `pc-windows-11` while `flags.rs` treated the same string
+/// as `android-tablet` -- not even its own default -- so
+/// `CORDIAL_DEVICE_PROFILE=tablett` produced a client reporting one identity
+/// in its log while sending the other to the engine, silently. Both sides now
+/// fall back to `pc-windows-11` and both say so.
+enum class DeviceIdentity { RobloxApp, AndroidTablet, PcWindows11 };
+
+static DeviceIdentity device_identity() {
+    static const DeviceIdentity v = [] {
         const char* e = getenv("CORDIAL_DEVICE_PROFILE");
-        if (!e) return true;
+        if (!e) return DeviceIdentity::PcWindows11;
         std::string s(e);
-        if (s == "android-tablet" || s == "android" || s == "tablet") return false;
-        return true;
+        for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        while (!s.empty() && isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+        while (!s.empty() && isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+        if (s.empty()) return DeviceIdentity::PcWindows11;
+        if (s == "roblox-app" || s == "app" || s == "roblox") {
+            return DeviceIdentity::RobloxApp;
+        }
+        if (s == "android-tablet" || s == "android" || s == "tablet") {
+            return DeviceIdentity::AndroidTablet;
+        }
+        if (s == "pc" || s == "pc-windows-11" || s == "windows" || s == "windows-11") {
+            return DeviceIdentity::PcWindows11;
+        }
+        // Reported rather than guessed at, and reported here rather than only
+        // in `flags.rs`: this translation unit is the one that actually
+        // reaches the engine, so a value it did not understand has to be
+        // visible from a run of the client alone.
+        fprintf(stderr,
+                "[cordial] CORDIAL_DEVICE_PROFILE=\"%s\" is not a device profile; using "
+                "pc-windows-11. Known: roblox-app, android-tablet, pc-windows-11\n",
+                e);
+        return DeviceIdentity::PcWindows11;
     }();
     return v;
+}
+
+static const char* device_identity_label() {
+    switch (device_identity()) {
+        case DeviceIdentity::AndroidTablet: return "android-tablet";
+        case DeviceIdentity::PcWindows11:   return "pc-windows-11";
+        case DeviceIdentity::RobloxApp:     break;
+    }
+    return "roblox-app";
 }
 
 /// The `User-Agent` the engine puts on every HTTP request it makes.
@@ -189,20 +265,34 @@ static bool presenting_as_pc() {
 /// client, not because a server-side check has been observed. If it turns out
 /// to be inert, the string is still right and the old one was still invented.
 ///
-/// **`presenting_as_pc()`, opt-in, swaps the platform words for mocktail's.**
-/// Nobody here has captured what Roblox's actual Windows client sends — only
+/// **[`device_identity`] chooses between three shapes**, and that function's
+/// own doc carries the measurement that says what each one makes roblox.com
+/// serve. Summarised here, because this is where the strings actually are:
+///
+/// `PcWindows11` swaps exactly the two words that would otherwise contradict
+/// `isTablet` below (`Android` and `Tablet`, for `Windows` and `Desktop`),
+/// drops the trailing Android API-level slot rather than filling it with a
+/// guess, and replaces the two `GooglePlayStore` tokens with `Cordial`. Nobody
+/// here has captured what Roblox's actual Windows client sends — only
 /// mocktail's own `class=pc model="Windows 11 PC"` line
-/// (`docs/analysis/flag-init.md` §13) — so this does not invent a Windows
-/// build number, an NT version, or any other syntax nothing here has seen. It
-/// swaps exactly the two words that would otherwise contradict `isTablet`
-/// below (`Android` and `Tablet`, for `Windows` and `Desktop`), drops the
-/// trailing Android API-level slot rather than filling it with a guess, and
-/// replaces the two `GooglePlayStore` tokens with `Cordial` — honest about
-/// who actually built and is distributing this client, on a desktop that
-/// installs from neither Google Play nor a Windows store this project has
-/// evidence for. Everything else — memory, resolution, density, engine
-/// version — is unchanged, because none of it is Android- or Windows-specific
-/// in the first place.
+/// (`docs/analysis/flag-init.md` §13) — so it invents no Windows build number,
+/// no NT version, and no other syntax nothing here has seen. **It is also the
+/// one identity roblox.com reads as `data-app-type="uwp"`**, i.e. a Microsoft
+/// Store app, which Cordial is not; that is a cost of the shape rather than
+/// something chosen, and it is part of why it is no longer the default.
+///
+/// `RobloxApp` is the bare app token and nothing else: no `Mozilla`, no WebKit
+/// clause, no `Windows App`/`Android App`, no `Desktop Hybrid`/`Tablet Hybrid`,
+/// and **no parenthesised device block at all** — no memory, no resolution, no
+/// density, no API level. That last omission is the substantive one. Every
+/// number in the other two arms is a description of this machine that Roblox
+/// may tier on, and none of it is information the server needs from a
+/// `User-Agent` when `InitParams` already carries the same facts on a route the
+/// engine actually reads. Dropping it is the smaller claim, not the larger one.
+///
+/// Everything shared between the arms — memory, resolution, density, engine
+/// version, where those appear at all — is unchanged, because none of it is
+/// Android- or Windows-specific in the first place.
 static std::string build_user_agent() {
     long ram_mb = 0;
     if (FILE* f = fopen("/proc/meminfo", "re")) {
@@ -239,18 +329,38 @@ static std::string build_user_agent() {
     }
 
     char buf[512];
-    if (presenting_as_pc()) {
-        snprintf(buf, sizeof buf,
-                 "Mozilla/5.0 (%ldMB; %dx%d; 160x160; %dx%d; Cordial) "
-                 "AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Windows App %s Desktop Hybrid()  "
-                 "Cordial RobloxApp/%s (GlobalDist; Cordial)",
-                 ram_mb, g_width, g_height, g_width, g_height, app.c_str(), app.c_str());
-    } else {
-        snprintf(buf, sizeof buf,
-                 "Mozilla/5.0 (%ldMB; %dx%d; 160x160; %dx%d; Cordial; 33) "
-                 "AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App %s Tablet Hybrid()  "
-                 "GooglePlayStore RobloxApp/%s (GlobalDist; GooglePlayStore)",
-                 ram_mb, g_width, g_height, g_width, g_height, app.c_str(), app.c_str());
+    switch (device_identity()) {
+        case DeviceIdentity::PcWindows11:
+            snprintf(buf, sizeof buf,
+                     "Mozilla/5.0 (%ldMB; %dx%d; 160x160; %dx%d; Cordial) "
+                     "AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Windows App %s Desktop "
+                     "Hybrid()  Cordial RobloxApp/%s (GlobalDist; Cordial)",
+                     ram_mb, g_width, g_height, g_width, g_height, app.c_str(), app.c_str());
+            break;
+        case DeviceIdentity::AndroidTablet:
+            snprintf(buf, sizeof buf,
+                     "Mozilla/5.0 (%ldMB; %dx%d; 160x160; %dx%d; Cordial; 33) "
+                     "AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App %s Tablet "
+                     "Hybrid()  GooglePlayStore RobloxApp/%s (GlobalDist; GooglePlayStore)",
+                     ram_mb, g_width, g_height, g_width, g_height, app.c_str(), app.c_str());
+            break;
+        case DeviceIdentity::RobloxApp:
+            // No space before the parenthesis, matching the clause Sober's
+            // own `WebViewUserAgent` carries verbatim. The real Android
+            // client's capture in `docs/traces/` has a space there and the
+            // other two arms above keep it; this arm copies the shape that
+            // was read off a working client on this machine rather than
+            // normalising it to the other one, because which of the two
+            // roblox.com's parser prefers is not something anybody here has
+            // established, and the one with a live client behind it is the
+            // safer copy.
+            //
+            // `ram_mb`, `g_width` and `g_height` are deliberately unused
+            // here; see the doc above on why the device block is the part
+            // worth dropping.
+            (void)ram_mb;
+            snprintf(buf, sizeof buf, "RobloxApp/%s(GlobalDist; Cordial)", app.c_str());
+            break;
     }
     return std::string(buf);
 }
@@ -269,7 +379,7 @@ static std::string build_user_agent() {
 /// the failure mode `docs/analysis/platform-identity.md` and this file's own
 /// history warn about: two computations of "what device are we" drifting the
 /// moment one changes and the other does not — a stale window size in one, a
-/// device profile switch (`presenting_as_pc`) forgotten in the other. This
+/// device profile switch (`device_identity`) forgotten in the other. This
 /// is a getter, not a reimplementation: it calls the same function and
 /// copies the same bytes out.
 ///
@@ -1258,7 +1368,7 @@ public:
         // `android_get_device_api_level()` both left the log saying 15, and only
         // this field moved it.
         //
-        // Left at "33" even when `presenting_as_pc()` -- unlike the
+        // Left at "33" whatever `device_identity()` says -- unlike the
         // User-Agent and `InitParams.isTablet`, this field is a gate the
         // engine has been measured refusing Vulkan over, not just a
         // description, and there is no captured value for what a PC-presenting
@@ -1454,21 +1564,35 @@ public:
         // never appears in Cordial's own logs or the engine's FLog output --
         // it goes out on the wire, not into anything grep can reach here.
         std::string ua = build_user_agent();
-        fprintf(stderr, "[cordial] device identity: %s (User-Agent: %s)\n",
-                presenting_as_pc() ? "pc-windows-11, from CORDIAL_DEVICE_PROFILE" : "android-tablet, the default",
+        fprintf(stderr, "[cordial] device identity: %s (isTablet=%s, User-Agent: %s)\n",
+                device_identity_label(),
+                device_identity() == DeviceIdentity::AndroidTablet ? "true" : "false",
                 ua.c_str());
         p->userAgent = S(ua.c_str());
         p->deviceParams = DeviceParams::Create(env, width, height);
         p->platformParams = PlatformParams::Create(env, assets, width, height);
         // "Potato" is Roblox's own name for a device below the quality floor.
         p->isPotato = false;
-        // Tablet rather than phone: a desktop window is a large screen, and this
-        // agrees with the XLARGE reported through AConfiguration. False when
-        // `presenting_as_pc()`, because a User-Agent that says `Windows` and
-        // `Desktop` while this field still says tablet is a worse story than
-        // either half told alone -- the whole point of gating it on the same
-        // switch rather than leaving it always true.
-        p->isTablet = !presenting_as_pc();
+        // **True only under `android-tablet`, and that makes it the one field
+        // in this file that asserts a mobile form factor.**
+        //
+        // Tablet rather than phone, when it is claimed at all: a desktop window
+        // is a large screen and that agrees with the XLARGE reported through
+        // AConfiguration. It is false under `pc-windows-11` because a
+        // User-Agent saying `Windows` and `Desktop` beside a field saying
+        // tablet is a worse story than either half told alone, and false under
+        // the default `roblox-app` for the plainer reason that Cordial is a
+        // window on a desktop with a keyboard and a mouse, and the bare app
+        // token deliberately claims no form factor at all.
+        //
+        // Worth stating because it is the thing most likely to be assumed the
+        // other way: **`roblox-app` is not a request for mobile-tier
+        // graphics.** Nothing here has established that Roblox tiers graphics
+        // defaults off the User-Agent, and this field -- which the engine does
+        // read -- says the same under `roblox-app` as it did under
+        // `pc-windows-11`. Anyone chasing mobile-tier defaults wants
+        // `android-tablet`, and wants to measure it rather than assume it.
+        p->isTablet = device_identity() == DeviceIdentity::AndroidTablet;
         p->isVrDevice = false;
         p->vrContext = AndroidActivity::Create(env);
         to_jni(env, p);

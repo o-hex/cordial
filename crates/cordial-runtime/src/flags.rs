@@ -70,6 +70,17 @@ pub enum Source {
     Plugin(String),
     /// Cordial's own defaults, below every other layer.
     Builtin,
+    /// The engine worker-pool flags the chosen [`Performance`] mode asks for.
+    ///
+    /// A source of its own rather than folded into [`Source::Builtin`],
+    /// because the two answer different questions and the report is read to
+    /// find out why a flag has the value it has. `Builtin` means "Cordial
+    /// always sets this"; this means "you chose a mode in Settings and it set
+    /// this". Sitting immediately above `Builtin` and below every plugin, it
+    /// is a default a plugin or the user may still overrule -- which is right
+    /// for a mode whose tables nothing on this project's hardware has
+    /// measured.
+    Performance,
 }
 
 impl Source {
@@ -78,6 +89,7 @@ impl Source {
             Source::User => "user".into(),
             Source::Plugin(id) => format!("plugin:{id}"),
             Source::Builtin => "built-in".into(),
+            Source::Performance => "performance mode".into(),
         }
     }
 }
@@ -473,6 +485,83 @@ pub fn performance_flags(mode: Performance, physical_cores: usize) -> Vec<(Strin
     }
 }
 
+/// The environment variable the shell sets to choose a [`Performance`] mode.
+///
+/// Named and passed the same way [`DEVICE_PROFILE_ENV`] and `CORDIAL_GRAPHICS`
+/// are, and for the same reason all three are environment rather than a file:
+/// `FInt`/`FFlag` overrides are read once during engine startup, so the mode
+/// has to be settled before the process starts. `crates/cordial-shell`'s
+/// `launch.rs` sets it, and omits it entirely for the default -- an absent
+/// variable is what leaves a plugin room to have an opinion, which is the
+/// argument that block already makes about `CORDIAL_GRAPHICS`.
+pub const PERFORMANCE_ENV: &str = "CORDIAL_PERFORMANCE";
+
+impl Performance {
+    pub fn parse(text: &str) -> Option<Performance> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "" | "balanced" => Some(Performance::Balanced),
+            "throughput" => Some(Performance::Throughput),
+            "latency" => Some(Performance::Latency),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Performance::Balanced => "balanced",
+            Performance::Throughput => "throughput",
+            Performance::Latency => "latency",
+        }
+    }
+}
+
+/// Which mode is in force, from [`PERFORMANCE_ENV`].
+///
+/// An unparseable value is reported and treated as [`Performance::Balanced`]
+/// rather than silently ignored, matching `graphics::resolve` and
+/// [`device_profile`]: a switch that looks set and does nothing is the failure
+/// this project keeps writing rules against.
+pub fn performance() -> Performance {
+    let Ok(text) = std::env::var(PERFORMANCE_ENV) else {
+        return Performance::Balanced;
+    };
+    if text.trim().is_empty() {
+        return Performance::Balanced;
+    }
+    match Performance::parse(&text) {
+        Some(m) => m,
+        None => {
+            println!(
+                "  flags: {PERFORMANCE_ENV}={text:?} is not a performance mode; using balanced. \
+                 Known: balanced, throughput, latency"
+            );
+            Performance::Balanced
+        }
+    }
+}
+
+/// The layer [`performance`]'s mode contributes, empty on `Balanced`.
+///
+/// **Until this existed, [`performance_flags`] had no callers at all** — the
+/// table, its tests and its whole doc comment were in the tree and nothing
+/// ever asked for a flag from it, so choosing a mode was not possible by any
+/// route. That is the "control that reports success and does not act" shape
+/// this codebase keeps finding in its own settings pages, one layer down.
+fn performance_layer() -> Layer {
+    let mode = performance();
+    let values: BTreeMap<String, String> =
+        performance_flags(mode, physical_cores()).into_iter().collect();
+    if !values.is_empty() {
+        println!(
+            "  flags: performance mode {} sets {} flag(s) for {} physical core(s)",
+            mode.label(),
+            values.len(),
+            physical_cores()
+        );
+    }
+    Layer { source: Source::Performance, values }
+}
+
 /// Physical cores, counted from the kernel's own topology.
 ///
 /// `available_parallelism` reports threads, which is the wrong number here. Each
@@ -521,7 +610,7 @@ pub fn collect() -> Vec<Layer> {
         migrate_legacy_user_file(&crate::profile::active());
     });
 
-    let mut layers = vec![builtin_layer()];
+    let mut layers = vec![builtin_layer(), performance_layer()];
 
     // System first, so a first-party id is claimed before the user directory is
     // read and a same-id user directory cannot take it. Sorted within each root
@@ -621,25 +710,51 @@ pub const DEVICE_PROFILE_ENV: &str = "CORDIAL_DEVICE_PROFILE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceProfile {
-    /// The identity Cordial has always sent. Must stay the default: an
-    /// experiment that changes behaviour by default is not a control.
+    /// The bare Roblox app token and nothing else, the shape Sober sends —
+    /// `RobloxApp/<version>(GlobalDist; Cordial)`, with no `Mozilla`, no
+    /// WebKit clause, no platform words and no device block.
+    ///
+    /// **Not the default.** It is the only one of the three that does not claim
+    /// a form factor Cordial has not got, and that is an argument rather than a
+    /// measurement; the default stays `PcWindows11` until a frame rate says
+    /// otherwise. See
+    /// `native/init_params.cpp`'s `device_identity` for the measurement that
+    /// says what each identity makes roblox.com serve, and for the
+    /// `WebViewUserAgent` value it was copied from.
+    RobloxApp,
+    /// An Android tablet: `ROBLOX Android App … Tablet Hybrid()`, plus the
+    /// device block, plus `InitParams.isTablet = true`.
+    ///
+    /// **The only identity that asserts a mobile form factor to the engine**,
+    /// through `isTablet` — which is a field the engine reads, unlike the
+    /// User-Agent, whose effect on graphics tiering nothing here has
+    /// established. Reach for this one when mobile-tier defaults are what is
+    /// actually wanted, and measure it.
     AndroidTablet,
     /// mocktail's identity, spelled `pc-windows-11` to match its own log line
-    /// verbatim rather than a name invented here.
+    /// verbatim rather than a name invented here. **The default, since
+    /// 2026-08-20.**
+    ///
+    /// Worth knowing before choosing it: roblox.com reads this one as
+    /// `data-app-type="uwp"` — a Microsoft Store app, which Cordial is not.
     PcWindows11,
 }
 
 impl DeviceProfile {
     pub fn parse(text: &str) -> Option<DeviceProfile> {
         match text.trim().to_ascii_lowercase().as_str() {
-            "" | "android" | "android-tablet" | "tablet" => Some(DeviceProfile::AndroidTablet),
-            "pc" | "pc-windows-11" | "windows" | "windows-11" => Some(DeviceProfile::PcWindows11),
+            "" | "pc" | "pc-windows-11" | "windows" | "windows-11" => {
+                Some(DeviceProfile::PcWindows11)
+            }
+            "roblox-app" | "app" | "roblox" => Some(DeviceProfile::RobloxApp),
+            "android" | "android-tablet" | "tablet" => Some(DeviceProfile::AndroidTablet),
             _ => None,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            DeviceProfile::RobloxApp => "roblox-app",
             DeviceProfile::AndroidTablet => "android-tablet",
             DeviceProfile::PcWindows11 => "pc-windows-11",
         }
@@ -647,9 +762,14 @@ impl DeviceProfile {
 }
 
 impl Default for DeviceProfile {
-    /// **PC since 2026-08-20**, previously `AndroidTablet`.
+    /// **`PcWindows11` since 2026-08-20**, `AndroidTablet` before that.
     ///
-    /// This must stay in step with `presenting_as_pc()` in
+    /// `RobloxApp` was added on 2026-08-22 and deliberately did **not** take
+    /// the default with it: a user had already reported a tablet identity
+    /// breaking PC features, and nothing has measured what the bare token does
+    /// to a frame rate.
+    ///
+    /// This must stay in step with `device_identity()` in
     /// `native/init_params.cpp`, which is the one that actually reaches the
     /// engine -- see [`DEVICE_PROFILE_KEY`] for why the flag layer does not.
     /// Two defaults that disagree is the same drift `cordial_build_user_agent`
@@ -686,11 +806,19 @@ pub fn device_profile() -> DeviceProfile {
             match DeviceProfile::parse(trimmed) {
                 Some(p) => return p,
                 None => {
+                    // The wording and the fallback both match
+                    // `native/init_params.cpp`'s `device_identity` exactly.
+                    // They used to disagree -- this side fell back to
+                    // android-tablet while the C++ fell back to the PC
+                    // identity -- so a misspelt value produced a client whose
+                    // own log named one identity while the engine was sent
+                    // another. Both now name pc-windows-11 and both mean it.
                     println!(
                         "  flags: {DEVICE_PROFILE_ENV}={text:?} is not a device profile; \
-                         using android-tablet. Known: android-tablet, pc-windows-11"
+                         using pc-windows-11. Known: roblox-app, android-tablet, \
+                         pc-windows-11"
                     );
-                    return DeviceProfile::AndroidTablet;
+                    return DeviceProfile::PcWindows11;
                 }
             }
         }
@@ -808,18 +936,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn device_profile_parses_both_spellings_and_nothing_else() {
-        assert_eq!(DeviceProfile::parse(""), Some(DeviceProfile::AndroidTablet));
+    fn device_profile_parses_every_spelling_and_nothing_else() {
+        // The empty string means "the default", and the default is the PC
+        // identity -- this used to assert the tablet, which was the drift
+        // against `native/init_params.cpp` that the same change fixed.
+        assert_eq!(DeviceProfile::parse(""), Some(DeviceProfile::PcWindows11));
         assert_eq!(DeviceProfile::parse("android-tablet"), Some(DeviceProfile::AndroidTablet));
         assert_eq!(DeviceProfile::parse("PC-Windows-11"), Some(DeviceProfile::PcWindows11));
         assert_eq!(DeviceProfile::parse("windows"), Some(DeviceProfile::PcWindows11));
+        assert_eq!(DeviceProfile::parse("roblox-app"), Some(DeviceProfile::RobloxApp));
+        assert_eq!(DeviceProfile::parse(" Roblox "), Some(DeviceProfile::RobloxApp));
         assert_eq!(DeviceProfile::parse("ps5"), None);
     }
 
     #[test]
-    fn an_absent_device_profile_flag_defaults_to_the_tablet_identity() {
-        // The default has to be current behaviour: an experiment that changes
-        // what ships by default is not a control for anything.
+    fn the_default_profile_is_the_one_the_engine_gets_with_nothing_set() {
+        // `native/init_params.cpp`'s `device_identity` returns PcWindows11 for
+        // an absent `CORDIAL_DEVICE_PROFILE`, and this side must agree or the
+        // client's own log names one identity while the engine is sent
+        // another -- which is exactly what happened for unrecognised values
+        // until 2026-08-22.
+        assert_eq!(DeviceProfile::default(), DeviceProfile::PcWindows11);
+    }
+
+    #[test]
+    fn an_absent_device_profile_flag_resolves_to_nothing_at_all() {
+        // Nothing rather than a default, so the caller can tell "no layer
+        // asked for an identity" from "a layer asked for the default one" --
+        // `device_profile` is where the default is applied.
         let resolved = resolve(vec![layer(Source::User, &[("FFlagUnrelated", "true")])]);
         assert_eq!(device_profile_from_resolved(&resolved), None);
     }
@@ -856,11 +1000,15 @@ pub(crate) mod tests {
         std::env::set_var(DEVICE_PROFILE_ENV, "pc-windows-11");
         assert_eq!(device_profile(), DeviceProfile::PcWindows11);
 
-        // An unparseable value falls back to the default rather than being
-        // silently treated as either identity, so a typo cannot be mistaken
-        // for a deliberate choice of either side of the experiment.
+        std::env::set_var(DEVICE_PROFILE_ENV, "roblox-app");
+        assert_eq!(device_profile(), DeviceProfile::RobloxApp);
+
+        // An unparseable value falls back to the **default**, which is what
+        // the C++ does. It used to fall back to the tablet here while
+        // `device_identity` fell back to the PC identity, so `amiga-500`
+        // produced a client whose log and whose engine disagreed.
         std::env::set_var(DEVICE_PROFILE_ENV, "amiga-500");
-        assert_eq!(device_profile(), DeviceProfile::AndroidTablet);
+        assert_eq!(device_profile(), DeviceProfile::PcWindows11);
 
         std::env::remove_var(DEVICE_PROFILE_ENV);
     }

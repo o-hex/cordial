@@ -404,6 +404,26 @@ pub fn spawn(
         command.env("CORDIAL_GRAPHICS", &config.graphics);
     }
 
+    // The Graphics optimisation row, and **only for the parameters the chosen
+    // mode actually asks for** -- exactly the rule the Renderer row above
+    // follows, for exactly the same reason. `CordialDeviceProfile` is a
+    // flag-layer key a plugin may set (`cordial_runtime::flags`), and an
+    // absent `CORDIAL_DEVICE_PROFILE` is the only state in which that entry
+    // counts, because the environment wins when it is present. A mode that
+    // wants the client's own default therefore sends nothing rather than
+    // sending the default's name.
+    //
+    // Two variables from one row is not a leak of the abstraction: the row is
+    // one choice, and `GraphicsOptimization` owns the mapping from that choice
+    // to the two values, so this block cannot drift from what the row says it
+    // does without the enum changing first.
+    if let Some(profile) = config.graphics_optimization_mode.device_profile_env() {
+        command.env("CORDIAL_DEVICE_PROFILE", profile);
+    }
+    if let Some(mode) = config.graphics_optimization_mode.performance_env() {
+        command.env("CORDIAL_PERFORMANCE", mode);
+    }
+
     // The Audio row's chosen output sink, and **only when one was actually
     // chosen** -- an absent variable is what tells the client to follow the
     // session default and to keep following it when the default moves, which

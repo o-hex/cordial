@@ -404,6 +404,26 @@ pub fn spawn(
         command.env("CORDIAL_GRAPHICS", &config.graphics);
     }
 
+    // The Audio row's chosen output sink, and **only when one was actually
+    // chosen** -- an absent variable is what tells the client to follow the
+    // session default and to keep following it when the default moves, which
+    // is the same argument `CORDIAL_GRAPHICS` makes just above about not
+    // silently outvoting a plugin.
+    //
+    // Without this line the setting is the exact failure this codebase keeps
+    // writing rules against: a control that saves the user's choice, reports
+    // success, and never acts. Everything on the far side of it -- three
+    // output paths in `native/`, the fallback when the device has gone, the
+    // picker -- was built and tested while nothing carried the value across
+    // the process boundary.
+    //
+    // `env_value()` answers `None` for unset *and* for whitespace, and the
+    // native reader treats an empty `CORDIAL_AUDIO_SINK` as unset, so the two
+    // ends agree even if one of them is given something odd.
+    if let Some(sink) = config.audio_output.env_value() {
+        command.env("CORDIAL_AUDIO_SINK", sink);
+    }
+
     // MangoHUD is a Vulkan implicit layer, so `MANGOHUD=1` on the client's
     // environment is the entire mechanism — the loader finds the layer JSON on
     // its own and inserts it. The layer has to actually be installed, and the

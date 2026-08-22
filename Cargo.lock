@@ -344,6 +344,7 @@ dependencies = [
 name = "cordial-shell"
 version = "0.6.0"
 dependencies = [
+ "cordial-linker-sys",
  "cordial-plugins",
  "cordial-update",
  "gdk4-wayland",

@@ -538,7 +538,13 @@ static aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder* build
     s->error_callback = b->error_callback;
     s->error_user = b->error_user;
 
-    if (!s->pw.open(bits, is_float, "Cordial (Roblox via AAudio)", &fill_from_engine, s)) {
+    // The user's sink, or empty for the session default. Not something the
+    // engine can express: `AAudioStreamBuilder_setDeviceId` is absent from the
+    // 25 symbols this build dlsyms, so nothing on this path will ever be asked
+    // for a particular output and the choice has to arrive from outside the
+    // engine entirely. See `docs/analysis/aaudio-contract.md`.
+    if (!s->pw.open(bits, is_float, "Cordial (Roblox via AAudio)",
+                    cordial::audio::configured_output_device().c_str(), &fill_from_engine, s)) {
         delete s;
         return AAUDIO_ERROR_UNAVAILABLE;
     }

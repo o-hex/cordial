@@ -16,6 +16,7 @@
 //! keeps the area behind the engine's canvas the desktop's actual background
 //! colour instead of a flash of white while a resize catches up.
 
+mod audio_devices;
 mod chooser;
 mod crash;
 mod deep_link;

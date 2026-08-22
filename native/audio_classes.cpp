@@ -1043,8 +1043,16 @@ public:
 
         // S16 interleaved: what `write([BI)V` hands over as bytes, and what
         // every Android AudioTrack path FMOD has produces.
+        //
+        // The sink comes from `configured_output_device()` rather than from
+        // anything FMOD said, and it cannot come from anywhere else: Roblox's
+        // own picker is populated by FMOD's output backend, which presents a
+        // single device on every path Cordial provides, and the AAudio path
+        // has no `AAudioStreamBuilder_setDeviceId` for the engine to ask with
+        // (`docs/analysis/aaudio-contract.md`). Empty is the default and means
+        // the session's own default sink, followed live.
         if (!stream_.open(static_cast<uint32_t>(rate), static_cast<uint32_t>(channels),
-                          16, 16, false, depth)) {
+                          16, 16, false, depth, audio::configured_output_device())) {
             std::fprintf(stderr,
                 "E/Cordial-FMOD            AudioDevice.init: PipeWire refused a %d Hz, %d "
                 "channel S16 stream; reporting failure to FMOD.\n", rate, channels);

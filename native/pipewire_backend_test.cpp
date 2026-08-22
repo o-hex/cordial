@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 
+using cordial::audio::testing::choose_output_target;
 using cordial::audio::testing::fill_pcm;
 using cordial::audio::testing::PendingBuffer;
 
@@ -147,6 +148,111 @@ void a_capture_stream_holds_nothing_until_it_is_opened() {
     std::printf("ok: a_capture_stream_holds_nothing_until_it_is_opened\n");
 }
 
+// ------------------------------------------------------- output device choice
+//
+// The three answers a device picker has to get right, none of which needs a
+// session: the chosen sink is present, the chosen sink has gone, and nobody
+// chose anything. The third is the default and the one most likely to be
+// broken by accident, because "fall back to the default" and "follow the
+// default" produce the same empty target and only one of them should warn.
+
+void a_chosen_sink_that_is_present_is_the_target() {
+    const std::vector<std::string> sinks = {
+        "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink",
+        "bluez_output.AC_12_2F_9E_00_11.1",
+    };
+    bool fell_back = true; // deliberately wrong to start, so a no-op would fail
+    assert(choose_output_target("bluez_output.AC_12_2F_9E_00_11.1", sinks, &fell_back) ==
+           "bluez_output.AC_12_2F_9E_00_11.1");
+    assert(!fell_back);
+    std::printf("ok: a_chosen_sink_that_is_present_is_the_target\n");
+}
+
+void a_chosen_sink_that_has_gone_falls_back_to_the_default_and_says_so() {
+    // The headset was unplugged since the user chose it. Setting
+    // PW_KEY_TARGET_OBJECT to it anyway gives PipeWire nothing to link to and
+    // the game plays into nowhere, which is the outcome this whole path exists
+    // to prevent.
+    const std::vector<std::string> sinks = {"alsa_output.pci-0000_00_1f.3.analog-stereo"};
+    bool fell_back = false;
+    assert(choose_output_target("bluez_output.AC_12_2F_9E_00_11.1", sinks, &fell_back).empty());
+    assert(fell_back);
+    std::printf("ok: a_chosen_sink_that_has_gone_falls_back_to_the_default_and_says_so\n");
+}
+
+void no_choice_follows_the_default_and_is_not_a_fallback() {
+    const std::vector<std::string> sinks = {"alsa_output.pci-0000_00_1f.3.analog-stereo"};
+    bool fell_back = true;
+    assert(choose_output_target("", sinks, &fell_back).empty());
+    // Not a fallback: nothing was lost. If this reported one, every launch by
+    // every user who never opened the setting would carry a warning about a
+    // missing device, and the warning that means something would be lost in
+    // it.
+    assert(!fell_back);
+    std::printf("ok: no_choice_follows_the_default_and_is_not_a_fallback\n");
+}
+
+void an_empty_session_still_falls_back_rather_than_targeting_nothing() {
+    // No sinks at all — a daemon that has just started, or one with every
+    // device suspended out of the graph. The answer is the same as a missing
+    // device and must not be "target it anyway and hope".
+    bool fell_back = false;
+    assert(choose_output_target("alsa_output.anything", {}, &fell_back).empty());
+    assert(fell_back);
+    std::printf("ok: an_empty_session_still_falls_back_rather_than_targeting_nothing\n");
+}
+
+void matching_is_exact_rather_than_by_prefix_or_description() {
+    // Two sinks on one card differ only by a suffix, which is the ordinary
+    // case on the machine this was written on: HDMI1, HDMI2, HDMI3 and
+    // Speaker all share a long prefix. A prefix match would send audio to
+    // whichever happened to be listed first.
+    const std::vector<std::string> sinks = {
+        "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__HDMI1__sink",
+        "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__HDMI2__sink",
+    };
+    bool fell_back = false;
+    assert(choose_output_target(
+               "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__HDMI2__sink",
+               sinks, &fell_back) ==
+           "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__HDMI2__sink");
+    assert(!fell_back);
+
+    // And the description a user reads is not a routing target.
+    fell_back = false;
+    assert(choose_output_target("Built-in Audio Digital Stereo (HDMI 2)", sinks, &fell_back)
+               .empty());
+    assert(fell_back);
+    std::printf("ok: matching_is_exact_rather_than_by_prefix_or_description\n");
+}
+
+void a_null_fell_back_pointer_is_allowed() {
+    // `resolve_output_target` always passes one, but a caller that only wants
+    // the target should not have to invent somewhere to put the flag.
+    assert(choose_output_target("x", {"x"}, nullptr) == "x");
+    assert(choose_output_target("x", {"y"}, nullptr).empty());
+    std::printf("ok: a_null_fell_back_pointer_is_allowed\n");
+}
+
+/// The shell's C ABI, checked for the two things that can be checked here.
+///
+/// **Deliberately does not enumerate.** Every other check in this binary runs
+/// with no daemon, no session and nothing audible possible, and it runs as a
+/// build step — so a check that connected to whatever PipeWire the machine
+/// doing the build happens to have would make the build depend on the
+/// developer's audio session, and would be the first thing here whose result
+/// varied by machine. What it can pin is the contract at the boundary: a null
+/// out-pointer is answered rather than dereferenced, and freeing nothing is
+/// not a crash. The live behaviour is `enumerate_devices`', and the invariant
+/// that matters about it — that listing devices opens no capture stream — is
+/// what `a_capture_stream_holds_nothing_until_it_is_opened` above pins.
+void the_shells_device_list_survives_being_asked_for_nothing() {
+    assert(cordial_audio_sinks(nullptr) == 0);
+    cordial_audio_sinks_free(nullptr, 0);
+    assert(cordial::audio::active_capture_streams() == 0);
+    std::printf("ok: the_shells_device_list_survives_being_asked_for_nothing\n");
+}
+
 } // namespace
 
 int main() {
@@ -156,6 +262,13 @@ int main() {
     a_partially_consumed_buffer_is_not_dropped_early();
     multiple_buffers_are_drained_in_order_within_one_fill();
     a_capture_stream_holds_nothing_until_it_is_opened();
-    std::printf("all pipewire_backend fill_pcm checks passed\n");
+    a_chosen_sink_that_is_present_is_the_target();
+    a_chosen_sink_that_has_gone_falls_back_to_the_default_and_says_so();
+    no_choice_follows_the_default_and_is_not_a_fallback();
+    an_empty_session_still_falls_back_rather_than_targeting_nothing();
+    matching_is_exact_rather_than_by_prefix_or_description();
+    a_null_fell_back_pointer_is_allowed();
+    the_shells_device_list_survives_being_asked_for_nothing();
+    std::printf("all pipewire_backend checks passed\n");
     return 0;
 }

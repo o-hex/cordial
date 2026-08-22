@@ -621,8 +621,13 @@ void on_buffer_drained(void* /*buffer_context*/, void* user) {
 
 SLresult player_Realize(SLObjectItf self, SLboolean) {
     auto* p = strip_const<AudioPlayerObject>(self);
+    // The third output path, and it honours the user's sink for the same
+    // reason the other two do: FMOD reaches PipeWire through whichever of
+    // OpenSL ES, AAudio and the Java `AudioDevice` it settles on, and a device
+    // choice that only applied to two of the three would be a setting that
+    // works or does not depending on a decision the user never sees.
     if (!p->stream.open(p->rateHz, p->channels, p->bitsPerSample, p->containerBits, p->bigEndian,
-                         p->numBuffers)) {
+                         p->numBuffers, cordial::audio::configured_output_device())) {
         // pipewire_backend.cpp already printed the specific reason (unsupported
         // layout, or the stream failed to connect).
         return SL_RESULT_CONTENT_UNSUPPORTED;

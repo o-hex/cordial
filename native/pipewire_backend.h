@@ -78,6 +78,48 @@ struct DeviceInfo {
 /// as "no devices" rather than substituting a plausible-looking one.
 std::vector<DeviceInfo> enumerate_devices();
 
+/// The PipeWire sink Cordial has been asked to play into, as a stable
+/// `node.name` — `alsa_output.pci-0000_00_1f.3-...`, not an index and not a
+/// description.
+///
+/// Read once from `CORDIAL_AUDIO_SINK`, which the shell sets from the Audio
+/// row in its settings. Empty is the ordinary state and means "follow
+/// whatever the session calls the default sink", *and keeps following it* —
+/// PipeWire moves a stream with no `PW_KEY_TARGET_OBJECT` when the default
+/// changes, so the absence of a target is not a snapshot of today's default
+/// but a standing instruction. Writing today's default in here instead would
+/// pin the user to the speakers they happened to be using when they opened
+/// settings.
+///
+/// **Indices and descriptions were both rejected as the stored form.** A
+/// PipeWire global id renumbers when a device is unplugged and replugged, so
+/// a stored index eventually names a different device; `node.description` is
+/// localised and is what the user's own volume control renames when they
+/// rename a device. `node.name` is the routing target `PW_KEY_TARGET_OBJECT`
+/// takes and the only one of the three that is meant to be persisted.
+///
+/// One reader, here, on the same argument `aaudio.h` makes for `CORDIAL_AUDIO`:
+/// each file calling `getenv` for itself is how a switch comes to mean two
+/// different things in one process.
+const std::string& configured_output_device();
+
+/// The node name a playback stream should actually connect to, given what the
+/// user asked for.
+///
+/// Empty in, empty out — no session is walked in that case, because "follow
+/// the default" needs no lookup and paying two registry round trips per stream
+/// open for the overwhelmingly common case would be a tax on everybody.
+///
+/// Non-empty in, this enumerates and checks the sink is *there*. **A device
+/// that has gone away must not silently become silence**, which is what
+/// setting `PW_KEY_TARGET_OBJECT` to an absent node produces: PipeWire has
+/// nothing to link the stream to and the game plays into a node with no
+/// output. So an absent sink falls back to the default and says so on stderr,
+/// once per open, naming the sink that was asked for. AGENTS.md's rule against
+/// a stub that lies is the same rule: reporting the gap keeps it findable, and
+/// audio that quietly plays nowhere is the worst outcome available here.
+std::string resolve_output_target(const std::string& requested);
+
 /// How many `CaptureStream`s currently hold an open `pw_stream`.
 ///
 /// Exists so the privacy requirement can be *checked* rather than asserted:
@@ -116,8 +158,16 @@ public:
     /// `container_bits` and `big_endian` pick the exact `spa_audio_format`;
     /// combinations this backend does not know how to describe return false
     /// rather than guessing at a nearby one.
+    ///
+    /// `target_node_name` aims the stream at one sink by `node.name`, the same
+    /// parameter `CaptureStream::open` has always taken; empty connects to
+    /// whatever PipeWire calls the default and keeps following it. It is
+    /// passed through [`resolve_output_target`], so a sink that has been
+    /// unplugged since the user chose it degrades to the default with a line
+    /// in the log rather than to silence.
     bool open(uint32_t rate_hz, uint32_t channels, uint32_t bits_per_sample,
-              uint32_t container_bits, bool big_endian, uint32_t max_pending_buffers);
+              uint32_t container_bits, bool big_endian, uint32_t max_pending_buffers,
+              const std::string& target_node_name);
 
     void close();
 
@@ -207,8 +257,12 @@ public:
     /// and run one cycle, so that `rate_hz`, `channels` and `burst_frames`
     /// are measured values by the time this returns true rather than
     /// placeholders the caller would go on to report as fact.
+    ///
+    /// `target_node_name` is the sink's `node.name`, or empty/null to follow
+    /// the session default; see [`resolve_output_target`] for what happens
+    /// when the named sink is not there.
     bool open(uint32_t sample_bits, bool is_float, const char* node_description,
-              FillCallback cb, void* user);
+              const char* target_node_name, FillCallback cb, void* user);
 
     void close();
     bool is_open() const;
@@ -308,6 +362,21 @@ struct PendingBuffer {
     void* context;
 };
 
+/// The matching half of [`resolve_output_target`], with the registry walk
+/// taken out: given what the user asked for and the sink names a session
+/// actually has, which target should the stream connect to?
+///
+/// Separated purely so it can be checked without a PipeWire session, because
+/// the two answers that matter — "the chosen sink is still there" and "it has
+/// gone, fall back to the default and say so" — are exactly the ones that are
+/// awkward to produce on a live machine on demand. `*fell_back` is set true
+/// only in the second case; a request that was empty to begin with has not
+/// fallen back from anything and must not be reported as though a device had
+/// disappeared.
+std::string choose_output_target(const std::string& requested,
+                                 const std::vector<std::string>& available_sinks,
+                                 bool* fell_back);
+
 /// Copies from the front of `pending` into `dst[0, want)`, popping buffers
 /// as they empty (and recording their `context` in `drained_contexts`, in
 /// order) and zero-filling any shortfall. Returns the number of trailing
@@ -321,3 +390,48 @@ uint32_t fill_pcm(std::deque<PendingBuffer>& pending, uint8_t* dst, uint32_t wan
 } // namespace testing
 
 } // namespace cordial::audio
+
+// ------------------------------------------------------- the picker's window
+//
+// The shell's Audio row needs the same list the engine's device enumeration
+// gets, and the shell is a separate process that links none of this tree's
+// C++ — so the list has to cross a C ABI. Declared here rather than in a
+// header of its own because it is the same data `enumerate_devices` returns,
+// filtered to sinks, and a second header would invite a second answer.
+//
+// **Sinks only.** A device picker for *output* has no business listing
+// microphones, and the microphone rule at the top of `audio_classes.cpp`
+// makes the stronger point: nothing on this path may construct a
+// `CaptureStream`, and the cheapest way to be sure of that is for the sources
+// never to leave this function.
+
+extern "C" {
+
+/// One sink, as the shell shows it. Both pointers are NUL-terminated UTF-8
+/// owned by the array they came in, and are valid until it is freed.
+struct CordialAudioSink {
+    /// `node.name` — what gets stored in `shell.json` and handed back as
+    /// `CORDIAL_AUDIO_SINK`. Stable across replug; never shown to a user.
+    const char* node_name;
+    /// `node.description`, or `node.name` when the session gave no
+    /// description. What the row displays.
+    const char* description;
+    /// Non-zero if this is the session's current `default.audio.sink`. The
+    /// row marks it, so that "System default" and the device it currently
+    /// resolves to are both visible at once.
+    int is_default;
+};
+
+/// Fills `*out` with a freshly allocated array of every audio sink the session
+/// has, and returns how many. Returns 0 and leaves `*out` null when there is
+/// no session — which the caller must present as "no devices found", never as
+/// an invented default, for the reason the no-PipeWire build's
+/// `enumerate_devices` gives.
+///
+/// The caller owns the array and must hand it back to
+/// `cordial_audio_sinks_free`.
+size_t cordial_audio_sinks(CordialAudioSink** out);
+
+void cordial_audio_sinks_free(CordialAudioSink* sinks, size_t count);
+
+} // extern "C"

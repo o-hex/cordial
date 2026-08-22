@@ -39,6 +39,18 @@ required-features = ["webview"]
 [dependencies]
 libc = "0.2"
 cordial-plugins = { path = "../cordial-plugins" }
+# For one symbol pair, and it is worth saying which: `cordial_audio_sinks` /
+# `cordial_audio_sinks_free` in `native/pipewire_backend.cpp`, which the Audio
+# row in settings uses to list the machine's PipeWire outputs. This crate does
+# not call anything in `cordial-linker-sys`'s Rust API -- the edge exists so
+# that its build script's `libcordial_liblog.a` reaches this binary's link
+# line. See `src/audio_devices.rs`, which explains why the launcher asks the
+# client's own enumeration rather than growing a second one, and what the
+# coupling costs: building this crate alone now needs the
+# `third_party/mcpelauncher-linker` submodule and Clang. A static archive
+# contributes nothing for symbols nobody references, so the bionic linker and
+# libjnivm are on the link line and not in the launcher.
+cordial-linker-sys = { path = "../cordial-linker-sys" }
 # The engine cache's stamp (ADR-015). `install.rs` used to test presence alone,
 # so a new Roblox build left the old engine in place and Cordial ran it against
 # the new APK's assets; `cordial_update::cache` is where that test lives now,

@@ -302,6 +302,102 @@ impl PointerAcceleration {
     }
 }
 
+/// Which PipeWire sink Roblox's audio goes to, by stable `node.name`.
+///
+/// Empty — the default — means *follow the system default sink*, and it has to
+/// keep meaning that rather than being resolved to a name once. A stream with
+/// no `PW_KEY_TARGET_OBJECT` is moved by PipeWire when the default changes, so
+/// storing today's default here would quietly pin somebody to the speakers
+/// they happened to be using the day they opened settings, and they would find
+/// out by plugging in a headset that no longer worked.
+///
+/// **`node.name`, not an index and not a description.** A PipeWire global id
+/// renumbers across an unplug/replug, so a stored index eventually names a
+/// different device; `node.description` is localised and is what a user's
+/// volume control renames when they rename a device. `node.name` is the
+/// routing target PipeWire itself takes and is the only one of the three meant
+/// to be persisted.
+///
+/// **Global rather than per profile, deliberately, and it is worth saying
+/// which side of ADR-013's line this falls.** That ADR splits configuration
+/// from code by asking whether a thing belongs to an account or to the
+/// machine: grants and flags moved into the profile because an approval given
+/// on a throwaway account was silently in force on the one somebody plays. An
+/// audio device is neither an approval nor an identity — it is the hardware in
+/// front of the person sitting there, on the same footing as `graphics` and
+/// `roblox` above. Switching profiles must not move the sound to a different
+/// speaker.
+///
+/// **This is Cordial's choice of sink, not Roblox's device picker.** Roblox
+/// does have one — `FmodAudioDevice::setOutputDevice`, `GetOutputDevices` — but
+/// it is populated by FMOD's own output backend, which sees a single device on
+/// every path Cordial provides, and the AAudio path has no
+/// `AAudioStreamBuilder_setDeviceId` among the 25 symbols the engine looks up.
+/// So the in-game list cannot be filled from here; see
+/// `docs/analysis/aaudio-contract.md`. What this does instead is decide where
+/// the one stream Roblox opens actually lands, which is what somebody asking
+/// to "choose my audio device" wants either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct AudioOutput(pub String);
+
+impl AudioOutput {
+    /// Nothing chosen: follow whatever the session calls the default sink.
+    pub fn is_system_default(&self) -> bool {
+        self.0.trim().is_empty()
+    }
+
+    /// The value for `CORDIAL_AUDIO_SINK`, or `None` when the variable should
+    /// not be set at all.
+    ///
+    /// Absent and empty mean the same thing to the client — see
+    /// `configured_output_device()` in `native/pipewire_backend.cpp`, which
+    /// treats `CORDIAL_AUDIO_SINK=` as unset for exactly this reason — but
+    /// omitting it is the honest encoding of "the user expressed no opinion",
+    /// on the same argument `launch.rs` makes for leaving `CORDIAL_GRAPHICS`
+    /// out when the Renderer row says Automatic.
+    pub fn env_value(&self) -> Option<&str> {
+        if self.is_system_default() { None } else { Some(self.0.trim()) }
+    }
+
+    /// Which row of a picker listing `sinks` after a leading "System default"
+    /// entry this selects.
+    ///
+    /// Zero when nothing is chosen, and **zero when the chosen sink is not in
+    /// the list**, which is the case worth being careful about: a device that
+    /// has been unplugged since the choice was made must not silently read as
+    /// "System default" in a window the user is about to press a button in.
+    /// `settings.rs` handles it by adding the missing device to the list
+    /// before calling this, so that the row shows the choice and says it is
+    /// not connected; this function's job is only to be correct about a name
+    /// that genuinely is not there.
+    pub fn index_in(&self, sinks: &[String]) -> u32 {
+        if self.is_system_default() {
+            return 0;
+        }
+        sinks
+            .iter()
+            .position(|name| name == self.0.trim())
+            .map(|i| i as u32 + 1)
+            .unwrap_or(0)
+    }
+
+    /// The inverse: what row `index` of that same picker means.
+    pub fn from_index(index: u32, sinks: &[String]) -> Self {
+        if index == 0 {
+            return AudioOutput::default();
+        }
+        match sinks.get(index as usize - 1) {
+            Some(name) => AudioOutput(name.clone()),
+            // Out of range can only happen if the model changed under the
+            // row. Falling back to the system default loses the choice, which
+            // is the recoverable direction; storing an index-shaped guess
+            // would send audio to an arbitrary device.
+            None => AudioOutput::default(),
+        }
+    }
+}
+
 /// The profile a launch runs against when nobody has chosen otherwise.
 ///
 /// ADR-012's migration lands the pre-existing storage at `profiles/default`, so
@@ -377,6 +473,11 @@ pub struct ShellConfig {
     /// one. See `graphics::resolve`.
     pub graphics: String,
     pub mangohud: bool,
+    /// Which audio device Roblox plays through. See [`AudioOutput`], which
+    /// carries the whole of the reasoning, including why the stored form is a
+    /// `node.name` and why the default must stay "follow the system".
+    #[serde(default)]
+    pub audio_output: AudioOutput,
     /// The accelerator that toggles fullscreen, in GTK's own syntax.
     ///
     /// Configurable rather than hardcoded because F11 is not reachable on every
@@ -440,6 +541,7 @@ impl Default for ShellConfig {
             throttle: ThrottleWhen::default(),
             pointer_acceleration: PointerAcceleration::default(),
             graphics: "automatic".to_string(),
+            audio_output: AudioOutput::default(),
             mangohud: false,
             fullscreen_accel: default_fullscreen_accel(),
             marketplace_index_dir: None,
@@ -639,6 +741,104 @@ mod tests {
         for reported in [0, 1, 2] {
             assert_eq!(system_scheme(Some(reported)), libadwaita::ColorScheme::Default);
         }
+    }
+
+    fn sinks() -> Vec<String> {
+        // The names on the machine this was written on, abbreviated only where
+        // the abbreviation cannot change the answer. Two of them share a long
+        // prefix on purpose: that is the ordinary case for one sound card with
+        // several HDMI outputs, and a prefix match would send audio to the
+        // wrong one.
+        vec![
+            "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__HDMI1__sink".into(),
+            "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__HDMI2__sink".into(),
+            "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink".into(),
+        ]
+    }
+
+    #[test]
+    fn nothing_chosen_means_follow_the_system_and_sends_no_variable() {
+        // The default, and the one that must not drift: an unset
+        // `CORDIAL_AUDIO_SINK` is what leaves PipeWire free to move the stream
+        // when the user changes their default sink while playing.
+        let out = AudioOutput::default();
+        assert!(out.is_system_default());
+        assert_eq!(out.env_value(), None);
+        assert_eq!(out.index_in(&sinks()), 0);
+    }
+
+    #[test]
+    fn a_chosen_sink_round_trips_through_the_picker_and_the_environment() {
+        let list = sinks();
+        let out = AudioOutput(list[1].clone());
+        assert!(!out.is_system_default());
+        assert_eq!(out.env_value(), Some(list[1].as_str()));
+        assert_eq!(out.index_in(&list), 2);
+        assert_eq!(AudioOutput::from_index(2, &list), out);
+    }
+
+    #[test]
+    fn every_row_of_the_picker_maps_back_to_itself() {
+        // The `AdwComboRow` seam, on the same footing as `ThrottleWhen`'s: two
+        // encodings of one state, and nothing but a test would notice them
+        // drifting apart.
+        let list = sinks();
+        for index in 0..=list.len() as u32 {
+            let chosen = AudioOutput::from_index(index, &list);
+            assert_eq!(chosen.index_in(&list), index, "row {index} did not survive the trip");
+        }
+    }
+
+    #[test]
+    fn a_sink_that_is_no_longer_present_does_not_read_as_the_system_default() {
+        // The unplugged-headset case. `index_in` has to answer *something* for
+        // a name that is not in the list, and it answers 0 — but the value
+        // itself must still say a device was chosen, because that is what
+        // `settings.rs` keys the "not connected" row off and what stops the
+        // choice being thrown away by merely opening the window.
+        let gone = AudioOutput("bluez_output.AC_12_2F_9E_00_11.1".into());
+        assert!(!gone.is_system_default(), "the choice must survive the device going away");
+        assert_eq!(gone.env_value(), Some("bluez_output.AC_12_2F_9E_00_11.1"));
+        assert_eq!(gone.index_in(&sinks()), 0);
+    }
+
+    #[test]
+    fn an_out_of_range_row_falls_back_to_the_system_default() {
+        // Only reachable if the model changed under the row. Losing the choice
+        // is recoverable; guessing at a device is not.
+        assert_eq!(AudioOutput::from_index(99, &sinks()), AudioOutput::default());
+        assert_eq!(AudioOutput::from_index(1, &[]), AudioOutput::default());
+    }
+
+    #[test]
+    fn whitespace_is_not_a_device() {
+        // A hand-edited shell.json is the only way to produce this, and the
+        // failure it would otherwise cause is the expensive one: a
+        // `CORDIAL_AUDIO_SINK=" "` reaches PipeWire as a target node called
+        // " ", which matches nothing, so the client falls back and logs on
+        // every stream open for ever.
+        let blank = AudioOutput("   ".into());
+        assert!(blank.is_system_default());
+        assert_eq!(blank.env_value(), None);
+    }
+
+    #[test]
+    fn the_audio_output_round_trips_through_the_file() {
+        let p = scratch("audio-output.json");
+        let name = "alsa_output.usb-Generic_USB_Audio-00.analog-stereo";
+        save(&p, &ShellConfig { audio_output: AudioOutput(name.into()), ..Default::default() })
+            .unwrap();
+        assert_eq!(load(&p).audio_output, AudioOutput(name.into()));
+    }
+
+    #[test]
+    fn a_config_written_before_the_audio_row_existed_follows_the_system_default() {
+        // Everybody's shell.json predates this field, and landing on anything
+        // but "follow the system" would move somebody's game audio to another
+        // speaker because they upgraded Cordial.
+        let p = scratch("pre-audio.json");
+        std::fs::write(&p, r#"{"appearance":"dark","profile":"default"}"#).unwrap();
+        assert!(load(&p).audio_output.is_system_default());
     }
 
     #[test]

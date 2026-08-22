@@ -39,8 +39,9 @@ use cordial_plugins::sign;
 use cordial_plugins::source::LocalFileSource;
 use cordial_plugins::unpack;
 
+use crate::audio_devices;
 use crate::install;
-use crate::shell_config::{self, AppearanceScheme, ShellConfig, ThrottleWhen};
+use crate::shell_config::{self, AppearanceScheme, AudioOutput, ShellConfig, ThrottleWhen};
 
 /// What a plugin asks for, and what this profile has actually given it.
 ///
@@ -551,6 +552,112 @@ fn build_performance_group(
     group
 }
 
+/// The entries an output picker should show, and which one is selected.
+///
+/// Split out from the widget so the awkward case can be checked without a
+/// window: **a device that has gone away must keep its row**. Somebody who
+/// chose their USB headset and then unplugged it must not open settings, see
+/// "System default" selected, close it again, and have quietly lost the
+/// choice — which is what a naive "look the name up in the live list" would
+/// do. So a stored name the session no longer has is appended as its own
+/// entry, labelled as not connected, and selected.
+///
+/// Returns the labels in row order and the `node.name` behind each row after
+/// the leading "System default", which is what `AudioOutput::index_in` and
+/// `AudioOutput::from_index` are indexed against.
+fn output_picker_rows(
+    sinks: &[audio_devices::Sink],
+    chosen: &AudioOutput,
+) -> (Vec<String>, Vec<String>) {
+    let mut labels = vec!["System default".to_string()];
+    let mut names = Vec::with_capacity(sinks.len());
+    for sink in sinks {
+        labels.push(audio_devices::row_label(sink));
+        names.push(sink.node_name.clone());
+    }
+
+    if !chosen.is_system_default() && !names.iter().any(|n| n == chosen.0.trim()) {
+        // Named by its `node.name` rather than by a remembered description,
+        // because no description was ever stored -- see `AudioOutput`, which
+        // explains why storing one would have been the wrong thing to persist.
+        // A routing name is not pretty, and it is the true answer to "which
+        // device did I pick?" when the device is not there to say.
+        labels.push(format!("{} (not connected)", chosen.0.trim()));
+        names.push(chosen.0.trim().to_string());
+    }
+    (labels, names)
+}
+
+/// "Audio" — which output Roblox plays through.
+fn build_audio_group(
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Audio")
+        .description("Takes effect the next time you press Roblox.")
+        .build();
+
+    let sinks = audio_devices::sinks();
+    let chosen = config.borrow().audio_output.clone();
+    let (labels, names) = output_picker_rows(&sinks, &chosen);
+
+    // Nothing to choose between, and the reason is not the user's fault. An
+    // empty list means no PipeWire session was reachable, which is the same
+    // condition under which Roblox gets no audio at all -- so the row says
+    // that rather than offering a menu with one entry that would not work
+    // either.
+    if sinks.is_empty() {
+        let row = adw::ActionRow::builder()
+            .title("Output device")
+            .subtitle(
+                "No PipeWire audio devices found. Roblox has nowhere to send sound on this \
+                 machine either, so this is worth looking into before the setting is.",
+            )
+            .sensitive(false)
+            .build();
+        row.set_subtitle_lines(3);
+        group.add(&row);
+        return group;
+    }
+
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let model = gtk::StringList::new(&label_refs);
+    let row = adw::ComboRow::builder()
+        .title("Output device")
+        // The half that is misleading if omitted, twice over. First: this is
+        // Cordial's routing, not Roblox's own device list -- the in-game
+        // picker is FMOD's and cannot be filled from here (see `AudioOutput`).
+        // Second: "System default" is a standing instruction rather than a
+        // snapshot, so somebody who switches their desktop's default while
+        // playing will find the game follows, which is what they want and not
+        // what a picker usually implies.
+        .subtitle(
+            "System default follows your desktop's own choice, including when you change it \
+             later. Picking a device here sends only Roblox's sound to it.",
+        )
+        .model(&model)
+        .selected(chosen.index_in(&names))
+        .build();
+    row.set_subtitle_lines(3);
+
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        // Moved into the closure: the model outlives this function and the row
+        // is indexed against exactly the list it was built from, including the
+        // "not connected" entry. Re-reading the live sinks on selection would
+        // reindex against a different list.
+        let names = names.clone();
+        row.connect_selected_notify(move |row| {
+            config.borrow_mut().audio_output = AudioOutput::from_index(row.selected(), &names);
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&row);
+    group
+}
+
 /// "General" — ordinary client settings.
 ///
 /// Resolution and monitor placement are genuine `cordial-run` options and are
@@ -621,6 +728,7 @@ fn build_general_page(
 
     group.add(&row);
     page.add(&group);
+    page.add(&build_audio_group(config.clone(), config_path.clone()));
     page.add(&build_performance_group(config, config_path));
     page
 }
@@ -1533,6 +1641,80 @@ mod tests {
 
     fn granted(names: &[&str]) -> BTreeSet<Capability> {
         names.iter().map(|n| Capability::parse(n).expect("a real capability name")).collect()
+    }
+
+    fn sink(node_name: &str, description: &str, is_default: bool) -> audio_devices::Sink {
+        audio_devices::Sink {
+            node_name: node_name.into(),
+            description: description.into(),
+            is_default,
+        }
+    }
+
+    fn two_sinks() -> Vec<audio_devices::Sink> {
+        vec![
+            sink("alsa_output.pci-0000_00_1f.3.analog-stereo", "Built-in Audio", true),
+            sink("alsa_output.usb-Generic_USB_Audio-00.analog-stereo", "USB Headset", false),
+        ]
+    }
+
+    #[test]
+    fn the_picker_leads_with_system_default_and_marks_which_device_that_is() {
+        let (labels, names) = output_picker_rows(&two_sinks(), &AudioOutput::default());
+        assert_eq!(labels[0], "System default");
+        // Both readable at once: the standing instruction, and where it
+        // currently points. A picker that showed only the first makes somebody
+        // guess where their sound is going.
+        assert_eq!(labels[1], "Built-in Audio (current system default)");
+        assert_eq!(labels[2], "USB Headset");
+        assert_eq!(names.len(), 2, "the leading entry is not a device and has no name");
+        assert_eq!(AudioOutput::default().index_in(&names), 0);
+    }
+
+    #[test]
+    fn a_chosen_device_that_is_present_selects_its_own_row() {
+        let sinks = two_sinks();
+        let chosen = AudioOutput("alsa_output.usb-Generic_USB_Audio-00.analog-stereo".into());
+        let (labels, names) = output_picker_rows(&sinks, &chosen);
+        assert_eq!(labels.len(), 3, "nothing extra is added for a device that is here");
+        assert_eq!(chosen.index_in(&names), 2);
+    }
+
+    #[test]
+    fn a_chosen_device_that_has_been_unplugged_keeps_its_row_and_stays_selected() {
+        // The failure this exists to prevent, in one test: open settings with
+        // the headset unplugged, and a picker that only listed live devices
+        // would show "System default" selected. Close the window and the
+        // choice is gone -- silently, and only discovered the next time the
+        // headset is plugged in and the sound comes out of the speakers.
+        let gone = AudioOutput("bluez_output.AC_12_2F_9E_00_11.1".into());
+        let (labels, names) = output_picker_rows(&two_sinks(), &gone);
+        assert_eq!(labels.len(), 4);
+        assert_eq!(labels[3], "bluez_output.AC_12_2F_9E_00_11.1 (not connected)");
+        assert_eq!(gone.index_in(&names), 3);
+        // And selecting that row back gives the same value, so merely opening
+        // and closing the window is a no-op.
+        assert_eq!(AudioOutput::from_index(3, &names), gone);
+    }
+
+    #[test]
+    fn an_empty_session_offers_only_the_system_default_row() {
+        // `build_audio_group` shows an insensitive explanation instead of a
+        // menu in this case; what is checked here is that the row-building
+        // half does not invent a device to fill the gap.
+        let (labels, names) = output_picker_rows(&[], &AudioOutput::default());
+        assert_eq!(labels, vec!["System default".to_string()]);
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn every_row_the_picker_offers_can_be_selected_and_read_back() {
+        let gone = AudioOutput("alsa_output.somewhere-else".into());
+        let (labels, names) = output_picker_rows(&two_sinks(), &gone);
+        for index in 0..labels.len() as u32 {
+            let chosen = AudioOutput::from_index(index, &names);
+            assert_eq!(chosen.index_in(&names), index, "row {index} did not survive the trip");
+        }
     }
 
     #[test]

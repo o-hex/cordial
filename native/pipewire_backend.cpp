@@ -712,6 +712,76 @@ std::vector<DeviceInfo> enumerate_devices() {
     return scan.devices;
 }
 
+// ------------------------------------------------------- output device choice
+
+namespace testing {
+
+std::string choose_output_target(const std::string& requested,
+                                 const std::vector<std::string>& available_sinks,
+                                 bool* fell_back) {
+    if (fell_back) *fell_back = false;
+    // "Follow the default" is not a device that can be missing, so it is not a
+    // fallback either. Reporting it as one would put a line in the log on every
+    // stream open for the overwhelming majority of users, which is the fastest
+    // way to make the line that *does* matter unreadable.
+    if (requested.empty()) return {};
+    for (const std::string& name : available_sinks) {
+        if (name == requested) return requested;
+    }
+    if (fell_back) *fell_back = true;
+    return {};
+}
+
+} // namespace testing
+
+const std::string& configured_output_device() {
+    static const std::string name = [] {
+        const char* v = std::getenv("CORDIAL_AUDIO_SINK");
+        std::string s = v ? v : "";
+        // A variable set to the empty string is the same instruction as one
+        // that is not set: follow the default. `launch.rs` omits it rather
+        // than sending an empty value, but a hand-run client with
+        // `CORDIAL_AUDIO_SINK=` in its environment must not end up asking for
+        // a sink literally called "".
+        if (!s.empty()) {
+            std::fprintf(stderr,
+                "I/Cordial-OpenSLES         output device: playback will be aimed at PipeWire "
+                "sink '%s' (CORDIAL_AUDIO_SINK). Unset it to follow the system default.\n",
+                s.c_str());
+        }
+        return s;
+    }();
+    return name;
+}
+
+std::string resolve_output_target(const std::string& requested) {
+    if (requested.empty()) return {};
+
+    std::vector<std::string> sinks;
+    for (const DeviceInfo& d : enumerate_devices()) {
+        if (!d.is_source) sinks.push_back(d.node_name);
+    }
+
+    bool fell_back = false;
+    std::string target = testing::choose_output_target(requested, sinks, &fell_back);
+    if (fell_back) {
+        // Loud, and on every open rather than once, because this is the exact
+        // shape AGENTS.md forbids a stub from taking: setting
+        // PW_KEY_TARGET_OBJECT to a node that is not there leaves PipeWire
+        // nothing to link the stream to, and the game then plays perfectly
+        // into nowhere. Falling back to the default is the recoverable
+        // behaviour; saying nothing about it would make a user's unplugged
+        // headset indistinguishable from a Cordial bug.
+        std::fprintf(stderr,
+            "W/Cordial-OpenSLES         output device '%s' is not in this PipeWire session "
+            "(%zu sink(s) present); falling back to the system default so that audio still "
+            "plays somewhere. The choice is kept, so replugging the device and relaunching "
+            "will use it again.\n",
+            requested.c_str(), sinks.size());
+    }
+    return target;
+}
+
 // ---------------------------------------------------------- CallbackStream
 
 /// The AAudio bridge's stream: PipeWire pulls, we pull the engine, in the
@@ -858,7 +928,7 @@ CallbackStream::~CallbackStream() {
 }
 
 bool CallbackStream::open(uint32_t sample_bits, bool is_float, const char* node_description,
-                           FillCallback cb, void* user) {
+                           const char* target_node_name, FillCallback cb, void* user) {
     if (!cb) return false;
     Session* session = get_session();
     if (!session) return false;
@@ -899,16 +969,32 @@ bool CallbackStream::open(uint32_t sample_bits, bool is_float, const char* node_
     char name[64];
     std::snprintf(name, sizeof name, "cordial-aaudio-%u", next_id.fetch_add(1));
 
+    // Resolved before the loop is locked. `resolve_output_target` enumerates,
+    // and enumeration takes the same thread-loop lock; doing it here rather
+    // than three lines down is the difference between a device check and a
+    // self-deadlock.
+    const std::string target =
+        resolve_output_target(target_node_name ? std::string(target_node_name) : std::string());
+
     g_lib.thread_loop_lock(session->loop);
 
-    pw_properties* props = g_lib.properties_new(
-        PW_KEY_MEDIA_TYPE, "Audio",
-        PW_KEY_MEDIA_CATEGORY, "Playback",
-        PW_KEY_MEDIA_ROLE, "Game",
-        PW_KEY_APP_NAME, "Cordial",
-        PW_KEY_NODE_NAME, name,
-        PW_KEY_NODE_DESCRIPTION, node_description ? node_description : "Cordial (Roblox via AAudio)",
-        nullptr);
+    // Two calls rather than one with a conditional argument: `pw_properties_new`
+    // is variadic and terminated by a null, so a null *value* in the middle
+    // truncates the list silently. `CaptureStream::open` splits it for the same
+    // reason and this matches it deliberately.
+    pw_properties* props =
+        target.empty()
+            ? g_lib.properties_new(
+                  PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Playback",
+                  PW_KEY_MEDIA_ROLE, "Game", PW_KEY_APP_NAME, "Cordial", PW_KEY_NODE_NAME, name,
+                  PW_KEY_NODE_DESCRIPTION,
+                  node_description ? node_description : "Cordial (Roblox via AAudio)", nullptr)
+            : g_lib.properties_new(
+                  PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Playback",
+                  PW_KEY_MEDIA_ROLE, "Game", PW_KEY_APP_NAME, "Cordial", PW_KEY_NODE_NAME, name,
+                  PW_KEY_NODE_DESCRIPTION,
+                  node_description ? node_description : "Cordial (Roblox via AAudio)",
+                  PW_KEY_TARGET_OBJECT, target.c_str(), nullptr);
 
     impl_->stream = g_lib.stream_new_simple(g_lib.thread_loop_get_loop(session->loop), name, props,
                                              &Impl::events(), impl_);
@@ -1264,7 +1350,8 @@ PlaybackStream::~PlaybackStream() {
 }
 
 bool PlaybackStream::open(uint32_t rate_hz, uint32_t channels, uint32_t bits_per_sample,
-                           uint32_t container_bits, bool big_endian, uint32_t max_pending_buffers) {
+                           uint32_t container_bits, bool big_endian, uint32_t max_pending_buffers,
+                           const std::string& target_node_name) {
     Session* session = get_session();
     if (!session) return false; // slCreateEngine already refused if this is reachable; defensive only
 
@@ -1289,16 +1376,22 @@ bool PlaybackStream::open(uint32_t rate_hz, uint32_t channels, uint32_t bits_per
     char name[64];
     std::snprintf(name, sizeof name, "cordial-audioplayer-%u", next_id.fetch_add(1));
 
+    // Before the lock: see the same call in `CallbackStream::open`.
+    const std::string target = resolve_output_target(target_node_name);
+
     g_lib.thread_loop_lock(session->loop);
 
-    pw_properties* props = g_lib.properties_new(
-        PW_KEY_MEDIA_TYPE, "Audio",
-        PW_KEY_MEDIA_CATEGORY, "Playback",
-        PW_KEY_MEDIA_ROLE, "Game",
-        PW_KEY_APP_NAME, "Cordial",
-        PW_KEY_NODE_NAME, name,
-        PW_KEY_NODE_DESCRIPTION, "Cordial (Roblox via OpenSL ES)",
-        nullptr);
+    pw_properties* props =
+        target.empty()
+            ? g_lib.properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Playback",
+                                   PW_KEY_MEDIA_ROLE, "Game", PW_KEY_APP_NAME, "Cordial",
+                                   PW_KEY_NODE_NAME, name, PW_KEY_NODE_DESCRIPTION,
+                                   "Cordial (Roblox via OpenSL ES)", nullptr)
+            : g_lib.properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Playback",
+                                   PW_KEY_MEDIA_ROLE, "Game", PW_KEY_APP_NAME, "Cordial",
+                                   PW_KEY_NODE_NAME, name, PW_KEY_NODE_DESCRIPTION,
+                                   "Cordial (Roblox via OpenSL ES)", PW_KEY_TARGET_OBJECT,
+                                   target.c_str(), nullptr);
 
     impl_->stream = g_lib.stream_new_simple(g_lib.thread_loop_get_loop(session->loop), name, props,
                                              &Impl::events(), impl_);
@@ -1441,6 +1534,7 @@ PlaybackStream::QueueState PlaybackStream::state() const {
 // side these three cases are indistinguishable and deliberately so.
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace cordial::audio {
 
@@ -1464,6 +1558,39 @@ std::vector<DeviceInfo> enumerate_devices() { return {}; }
 
 uint32_t active_capture_streams() { return 0; }
 
+/// The user's choice is still read and still reported, even though nothing
+/// here can act on it. Returning empty instead would make a build without
+/// pipewire-devel report "following the system default" to anyone who asked,
+/// which is a different and untrue thing from "there is no audio at all".
+const std::string& configured_output_device() {
+    static const std::string name = [] {
+        const char* v = std::getenv("CORDIAL_AUDIO_SINK");
+        return std::string(v ? v : "");
+    }();
+    return name;
+}
+
+std::string resolve_output_target(const std::string&) { return {}; }
+
+namespace testing {
+
+/// Shares no code with the real one on purpose: it is four lines, and the
+/// alternative is hoisting it into the header where it would be the only
+/// logic in a file that is otherwise declarations.
+std::string choose_output_target(const std::string& requested,
+                                 const std::vector<std::string>& available_sinks,
+                                 bool* fell_back) {
+    if (fell_back) *fell_back = false;
+    if (requested.empty()) return {};
+    for (const std::string& name : available_sinks) {
+        if (name == requested) return requested;
+    }
+    if (fell_back) *fell_back = true;
+    return {};
+}
+
+} // namespace testing
+
 struct CaptureStream::Impl {};
 
 CaptureStream::CaptureStream() : impl_(nullptr) {}
@@ -1479,7 +1606,9 @@ struct CallbackStream::Impl {};
 CallbackStream::CallbackStream() : impl_(nullptr) {}
 CallbackStream::~CallbackStream() {}
 
-bool CallbackStream::open(uint32_t, bool, const char*, FillCallback, void*) { return false; }
+bool CallbackStream::open(uint32_t, bool, const char*, const char*, FillCallback, void*) {
+    return false;
+}
 void CallbackStream::close() {}
 bool CallbackStream::is_open() const { return false; }
 void CallbackStream::set_running(bool) {}
@@ -1496,7 +1625,10 @@ struct PlaybackStream::Impl {};
 PlaybackStream::PlaybackStream() : impl_(nullptr) {}
 PlaybackStream::~PlaybackStream() {}
 
-bool PlaybackStream::open(uint32_t, uint32_t, uint32_t, uint32_t, bool, uint32_t) { return false; }
+bool PlaybackStream::open(uint32_t, uint32_t, uint32_t, uint32_t, bool, uint32_t,
+                           const std::string&) {
+    return false;
+}
 void PlaybackStream::close() {}
 bool PlaybackStream::enqueue(const void*, uint32_t, void*) { return false; }
 void PlaybackStream::clear() {}
@@ -1509,3 +1641,66 @@ PlaybackStream::QueueState PlaybackStream::state() const { return {0, 0}; }
 } // namespace cordial::audio
 
 #endif // CORDIAL_HAVE_PIPEWIRE
+
+// The includes are repeated here rather than hoisted to the top of the file:
+// everything above this line is inside one arm of the `#ifdef` or the other,
+// and this block is in neither.
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+// ------------------------------------------------------- the picker's window
+//
+// Outside both branches of the `#ifdef`, because both define
+// `enumerate_devices` and this is only a projection of it. A build without
+// pipewire-devel therefore still exports these symbols and still answers
+// honestly — zero sinks — rather than failing to link the shell that calls
+// them.
+
+extern "C" {
+
+size_t cordial_audio_sinks(CordialAudioSink** out) {
+    if (!out) return 0;
+    *out = nullptr;
+
+    std::vector<cordial::audio::DeviceInfo> devices = cordial::audio::enumerate_devices();
+
+    size_t count = 0;
+    for (const cordial::audio::DeviceInfo& d : devices) {
+        if (!d.is_source && !d.node_name.empty()) ++count;
+    }
+    if (count == 0) return 0;
+
+    auto* list = static_cast<CordialAudioSink*>(std::calloc(count, sizeof(CordialAudioSink)));
+    if (!list) return 0;
+
+    size_t i = 0;
+    for (const cordial::audio::DeviceInfo& d : devices) {
+        if (d.is_source || d.node_name.empty()) continue;
+        // `strdup` rather than handing out pointers into the vector, which
+        // dies at the closing brace. Each string is freed individually below.
+        list[i].node_name = ::strdup(d.node_name.c_str());
+        // A sink with no `node.description` is unusual and not impossible —
+        // a hand-written null-sink in a config file has none. Showing the
+        // routing name is worse than showing a description and much better
+        // than showing an empty row the user cannot tell apart from the next
+        // empty row.
+        list[i].description =
+            ::strdup(d.description.empty() ? d.node_name.c_str() : d.description.c_str());
+        list[i].is_default = d.is_default ? 1 : 0;
+        ++i;
+    }
+    *out = list;
+    return count;
+}
+
+void cordial_audio_sinks_free(CordialAudioSink* sinks, size_t count) {
+    if (!sinks) return;
+    for (size_t i = 0; i < count; ++i) {
+        std::free(const_cast<char*>(sinks[i].node_name));
+        std::free(const_cast<char*>(sinks[i].description));
+    }
+    std::free(sinks);
+}
+
+} // extern "C"

@@ -340,11 +340,24 @@ headless compositor on its own `WAYLAND_DISPLAY` and inject inside that.
 separate IP. The risk is collateral rather than causal: enforcement is automated,
 runs in waves, and associates accounts sharing an address.
 
-**Give your runs their own data root.** A profile is held by one instance at a
-time, by `flock`, so a second launch against it is refused rather than allowed to
-corrupt Roblox's storage ([ADR-012](docs/adr/ADR-012-profiles-and-instances.md)).
+**Give your runs their own data root, and do not rely on the lock to save
+you.** ADR-012 says a profile is held by one instance at a time by `flock`, and
+that is true of clients the *shell* launches: `launch.rs` builds the claim and
+`Claim::hand_to` passes it to the child.
+
+**A hand-run `cordial-run --profile X` takes no lock at all.** There is no claim
+code in `cordial-run`; the only caller of `hand_to` is the shell. Measured on
+2026-08-22: four `--profile CordialTest` engines ran at once and not one was
+refused. So the invocation this file documents — the one an agent will actually
+type — has exactly the corruption exposure ADR-012 exists to prevent, and every
+agent has been told the opposite.
+
+Until that is fixed, **the separate data root is the only protection there is**,
+and two agents pointed at the same profile will write over each other's Roblox
+storage without either of them being told.
+
 Everything defaults to the `default` profile, so several agents testing at once
-collide on that lock and read it as a bug in the thing they were working on:
+collide on it and read the result as a bug in whatever they were working on:
 
 ```bash
 XDG_DATA_HOME=~/.cache/cordial-agent-<yours> just client --run 30

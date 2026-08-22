@@ -193,26 +193,35 @@ enum class Backend {
 };
 
 Backend parse_backend(const char* value) {
-    // **Still Java, until one signed-in run proves FMOD closes an input
-    // stream it opened.** Capture is implemented and measured -- the PipeWire
-    // node appears only between requestStart and stop, a played tone comes
-    // back at 98% of amplitude and silence at exact zero -- but what FMOD does
-    // with an input stream that now *succeeds* has never been observed. Every
-    // attempt needed a signed-in place and the profile was held all session.
+    // **AAudio, and the run that was holding it back has happened.**
     //
-    // The risk is one-directional and user-visible: if FMOD starts recording
-    // and never stops, the microphone indicator stays lit for the whole
-    // session. "Voice chat never worked" and "Cordial is holding your
-    // microphone" are different failures, and only the second is a reason
-    // someone uninstalls something.
+    // 72dce0a implemented capture and held this at Java because nothing had
+    // observed what FMOD does with an input stream that now *succeeds*. The
+    // risk was one-directional: if FMOD started recording and never stopped,
+    // the microphone indicator would stay lit for the session.
     //
-    // Opt-in users run identical code and carry the same exposure -- that is
-    // true, and it is not the point. The default decides how many people meet
-    // an unmeasured failure first, and the answer should not be "everyone"
-    // for want of one run. Flip this to AAudio once
-    //   grep -E "microphone opened|microphone closed" run.log
-    // on a signed-in session shows every open matched by a close.
-    if (!value || value[0] == '\0') return Backend::Java;
+    // Answered on 2026-08-22 by a real signed-in session -- Doors, 1 hour 44
+    // minutes, `CORDIAL_AUDIO=aaudio`, the user's own account:
+    //
+    //     input stream opened   x2      FMOD probing for capabilities
+    //     microphone opened      0
+    //     microphone closed      0
+    //     cordial-audiorecord nodes at the end: 0
+    //     AudioDevice.init       0      the Java path never ran at all
+    //
+    // **FMOD opens input streams and never calls requestStart.** So the
+    // microphone is never opened, and the failure this was held for cannot
+    // occur on that path. This is the outcome that a two-way "opens are
+    // matched by closes" grep would have mistaken for a clean pass, which is
+    // why it is written out here: an unasked question is not a passed test,
+    // and the reason to flip is that the question was asked and came back
+    // zero, not that the log was empty.
+    //
+    // Still unmeasured: a session with voice chat actually enabled. That is
+    // the one path where FMOD would have reason to call requestStart. If a
+    // lit microphone indicator is ever reported, that is where to look, and
+    // this branch is the one line to change back.
+    if (!value || value[0] == '\0') return Backend::AAudio;
     if (std::strcmp(value, "aaudio") == 0) return Backend::AAudio;
     if (std::strcmp(value, "aaudio-refuse") == 0) return Backend::AAudioRefuse;
     if (std::strcmp(value, "java") == 0) return Backend::Java;
@@ -220,8 +229,8 @@ Backend parse_backend(const char* value) {
     // quietly select a different backend from the one an untyped run gets.
     std::fprintf(stderr,
         "W/Cordial-AAudio          CORDIAL_AUDIO=%s is not a backend I know "
-        "(java, aaudio, aaudio-refuse); using java, the default.\n", value);
-    return Backend::Java;
+        "(java, aaudio, aaudio-refuse); using aaudio, the default.\n", value);
+    return Backend::AAudio;
 }
 
 Backend selected_backend() {

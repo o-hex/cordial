@@ -236,6 +236,43 @@ pub fn window_closed() -> bool {
 /// `Some(false)` from visibility overrides a definite `Some(true)` from focus.
 /// X11 answers `None` for both and keeps the behaviour it has always had.
 pub fn backend_focused() -> Option<bool> {
+    // `CORDIAL_REPORT_FOCUS=0` stops telling the engine about focus at all,
+    // which is a control rather than a preference.
+    //
+    // Reporting real focus transitions is recent and was added for a good
+    // reason: before it, `onWindowFocusChangedNative` reached the engine
+    // exactly twice a session, so Roblox believed it was focused the whole
+    // time and kept simulating at full rate behind whatever you had switched
+    // to. See `looper::pump`'s own comment.
+    //
+    // But a user reports that clicking Join and alt-tabbing away *before the
+    // game finishes loading* leaves WASD dead for the rest of the session,
+    // while the menu and Shift+F5 still work -- and that the same test on
+    // Sober does not reproduce. Sober is the interesting half: it is the same
+    // engine on the same machine, and the difference we know of is that it
+    // almost certainly never reports focus loss, because that is where Cordial
+    // was until recently too.
+    //
+    // Everything else plausible has been ruled out by measurement rather than
+    // argument: the engine imports no `AConfiguration_getKeyboard`, jnivm's
+    // gap register says "nothing went unanswered this run" for a full session,
+    // and `init_params.cpp` already reports the desktop profile Roblox would
+    // want -- `kTouchscreenNoTouch`, `kKeyboardQwerty`, `kHardKeyboardHiddenNo`.
+    // So the engine is not missing a capability and is not missing a method.
+    //
+    // Returning `None` here is exactly "not known", which the caller already
+    // treats as leave-the-last-state-alone, so this reproduces the old
+    // behaviour precisely rather than approximating it. That makes it a real
+    // A/B: same binary, same session, flip the variable.
+    //
+    // **This is a diagnostic, not the fix.** If it turns out to be the cause,
+    // the answer is to stop reporting focus loss *while the game is still
+    // loading* rather than to stop reporting it at all -- giving up the CPU
+    // saving to dodge a load-time race would be trading one real bug for
+    // another.
+    if !report_focus() {
+        return None;
+    }
     let focused = match backend() {
         Backend::Wayland => wayland::focused(),
         Backend::X11 => None,
@@ -244,6 +281,27 @@ pub fn backend_focused() -> Option<bool> {
         (Some(true), Some(false)) => Some(false),
         (f, _) => f,
     }
+}
+
+/// Whether to tell the engine about focus changes at all. On by default.
+///
+/// Read once and cached: the answer cannot change within a run, and this sits
+/// on the pump's per-tick path where a `getenv` would be paid millions of times
+/// for a value that never moves.
+fn report_focus() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let off = matches!(std::env::var("CORDIAL_REPORT_FOCUS").as_deref(), Ok("0") | Ok("off"));
+        if off {
+            println!(
+                "[android] CORDIAL_REPORT_FOCUS=0: the engine will never be told the window lost \
+                 focus. It will keep simulating at full rate while you are switched away, which \
+                 is what this costs. Set to compare against the default when movement keys stop \
+                 working after alt-tabbing during a load."
+            );
+        }
+        !off
+    })
 }
 
 /// Whether the engine's window is visible, for the active backend.

@@ -396,6 +396,49 @@ mod tests {
             .expect("the fabricated manifest should parse")
     }
 
+    /// Build the real widgets for the fabricated schema, on a real display.
+    ///
+    /// `#[ignore]` because it needs one, and a headless CI runner has none --
+    /// run it with `cargo test -p cordial-shell -- --ignored`. It is here
+    /// because everything else in this file tests the rules *around* the
+    /// rendering, and a page that panics on its first `AdwSpinRow` would pass
+    /// all of them. Every field shape is in `fabricated()` precisely so this
+    /// touches each arm of `build_row` once.
+    #[test]
+    #[ignore = "needs a display; run with --ignored"]
+    fn every_field_shape_actually_builds_a_widget() {
+        if adw::init().is_err() {
+            eprintln!("no display; nothing was verified");
+            return;
+        }
+        let window = adw::PreferencesWindow::new();
+        let plugin = plugin_with(serde_json::to_value(fabricated()).unwrap());
+        let dir = std::env::temp_dir().join("cordial-prefs-render-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Once with nothing saved, so every row takes its declared default.
+        let page = build_page(&window, &plugin, Some(&dir));
+        assert!(page.is::<adw::PreferencesPage>());
+
+        // And once with answers saved, which is the path that reads a value
+        // back out of the store and into a widget -- including the combo row
+        // mapping a stored value to a list index, the one place a drift
+        // between the two would write a plausible wrong answer.
+        let store = preferences::Store::new(&dir);
+        let fields = &plugin.manifest.preferences;
+        store.set("fabricated", fields, "mode", serde_json::json!("fast")).unwrap();
+        store.set("fabricated", fields, "level", serde_json::json!(9)).unwrap();
+        store.set("fabricated", fields, "note", serde_json::json!("typed")).unwrap();
+        let page = build_page(&window, &plugin, Some(&dir));
+        assert!(page.is::<adw::PreferencesPage>());
+
+        // And the no-profile arm, which must produce an explanation rather
+        // than controls that could not keep anything.
+        let page = build_page(&window, &plugin, None);
+        assert!(page.is::<adw::PreferencesPage>());
+    }
+
     #[test]
     fn a_plugin_declaring_nothing_gets_no_gear() {
         // The signal the whole affordance rests on. No declaration, no page,

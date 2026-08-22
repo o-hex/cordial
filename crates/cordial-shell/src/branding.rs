@@ -214,6 +214,65 @@ mod tests {
         }
     }
 
+    /// **Both icons must be square, or the Flatpak will not export.**
+    ///
+    /// `flatpak build-export` refuses a non-square icon outright -- "Expected a
+    /// square icon but got: 680x480" -- and it does so at the very last step,
+    /// after the whole Rust build has succeeded. That is an eight-minute CI
+    /// run to discover a wrong attribute in an SVG, which is exactly the kind
+    /// of thing a test costing microseconds should catch instead.
+    ///
+    /// It happened: the Frostbite icon was cut from the wide 680x480 artboard
+    /// while Cordial's uses a square 420x420 crop of the same drawing, and
+    /// nothing noticed until the export. The existing test above asserts both
+    /// files are *present*, which was true and insufficient.
+    #[test]
+    fn both_icons_are_square_or_the_flatpak_export_refuses_them() {
+        for brand in [Brand::Cordial, Brand::Frostbite] {
+            let path = format!(
+                "{}/../../packaging/icons/hicolor/scalable/apps/{}.svg",
+                env!("CARGO_MANIFEST_DIR"),
+                brand.icon()
+            );
+            let svg = std::fs::read_to_string(&path).expect("icon is readable");
+            let head = &svg[..svg.len().min(600)];
+            let attr = |name: &str| -> Option<f64> {
+                let at = head.find(&format!("{name}=\""))? + name.len() + 2;
+                head[at..].split('"').next()?.trim().parse().ok()
+            };
+            let w = attr("width");
+            let h = attr("height");
+            assert_eq!(
+                (w, h),
+                (w, w),
+                "{}: width and height must both be set and equal, got {w:?}x{h:?}",
+                brand.icon()
+            );
+
+            // The viewBox has to be square too: a square width/height over a
+            // 680x480 box still renders letterboxed, and it is the box
+            // `build-export` measures.
+            let vb: Vec<f64> = head
+                .split("viewBox=\"")
+                .nth(1)
+                .expect("a viewBox")
+                .split('"')
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .filter_map(|n| n.parse().ok())
+                .collect();
+            assert_eq!(vb.len(), 4, "{}: viewBox needs four numbers", brand.icon());
+            assert_eq!(
+                vb[2], vb[3],
+                "{}: viewBox must be square, got {}x{}",
+                brand.icon(),
+                vb[2],
+                vb[3]
+            );
+        }
+    }
+
     #[test]
     fn the_calendar_conversion_is_right_at_the_edges() {
         assert_eq!(civil_from_days(0), (1, 1)); // 1970-01-01

@@ -2669,7 +2669,76 @@ fn reconcile_keyboard_focus() {
 /// client knows to stop. Cordial simply was not listening.
 static KEYBOARD_FOCUSED: AtomicBool = AtomicBool::new(false);
 
+/// Keys the compositor has told us are down and has not yet told us are up.
+///
+/// Exists so [`keyboard_leave`] can release them. See that function for the bug.
+static HELD_KEYS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Whether to leave held keys pressed when the window loses focus.
+///
+/// **Off by default, because the default has to be the correct one**: a key the
+/// compositor will never send a release for is a key the engine believes is
+/// held for ever, and that is the WASD bug [`keyboard_leave`] describes.
+///
+/// It is a switch rather than a hard rule because the stranded-key behaviour is
+/// load-bearing for somebody: holding W, alt-tabbing away and leaving a
+/// character walking is how people AFK. Deleting that outright would fix a bug
+/// by removing a feature, which is a poor trade when the two are the same
+/// mechanism seen from different ends.
+///
+/// Read once and cached, in the same spirit as `branding::current` -- the
+/// answer cannot change within a run and a per-keystroke `getenv` on the input
+/// path would be a cost paid thousands of times for a value that never moves.
+fn hold_keys_unfocused() -> bool {
+    static HOLD: OnceLock<bool> = OnceLock::new();
+    *HOLD.get_or_init(|| {
+        let on = std::env::var_os("CORDIAL_HOLD_KEYS_UNFOCUSED").is_some();
+        if on {
+            println!(
+                "[android] wayland: CORDIAL_HOLD_KEYS_UNFOCUSED is set; keys held when the window \
+                 loses focus stay held, so a character keeps walking while you are away. Unset it \
+                 if movement keys stop responding after alt-tabbing."
+            );
+        }
+        on
+    })
+}
+
 unsafe extern "C" fn keyboard_leave(_data: *mut c_void, _kb: *mut c_void, _serial: u32, _surface: *mut c_void) {
+    // **Release everything still held, before anything else.**
+    //
+    // Wayland delivers `leave` and then simply stops sending key events -- the
+    // compositor never sends the `release` for a key that was down when focus
+    // moved away, because as far as it is concerned that key's story is no
+    // longer ours to hear. So alt-tabbing mid-stride left the engine believing
+    // W was still down for ever, and this is what a user reported as "alt-tab
+    // to another window and only the WASD movement keys break": every other key
+    // is pressed and released within one focus, so only the ones you hold while
+    // switching away can strand.
+    //
+    // Reported as happening on Roblox's official client too, which is a reason
+    // to fix it rather than to match it.
+    //
+    // The keys are collected and the lock dropped *before* dispatching, rather
+    // than dispatching inside the loop under the lock. That is the same
+    // discipline `AudioDevice::close` had to learn the hard way in c7215eb:
+    // never hold one subsystem's lock while calling into another, because the
+    // callee's threading is not yours to reason about.
+    // Drained either way. If the keys are being deliberately left held, this
+    // side must still forget them: the next `enter` starts a fresh focus, and
+    // carrying the old list across would release, on some later alt-tab, a key
+    // the user pressed in a different session entirely.
+    let stranded: Vec<u32> = {
+        let mut held = HELD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *held)
+    };
+    if !stranded.is_empty() && !hold_keys_unfocused() {
+        if let Some(w) = current() {
+            for key in stranded {
+                w.dispatch_key(key, false);
+            }
+        }
+    }
     KEYBOARD_FOCUSED.store(false, Ordering::Release);
     // **And forget the surface `enter` named, or the gate above undoes
     // itself.** `reconcile_keyboard_focus` re-asserts focus from
@@ -2708,7 +2777,24 @@ unsafe extern "C" fn keyboard_key(_data: *mut c_void, _kb: *mut c_void, _serial:
         return;
     }
     if let Some(w) = current() {
-        w.dispatch_key(key, state == 1);
+        let pressed = state == 1;
+        // Tracked so `keyboard_leave` can release whatever is still down. Kept
+        // here rather than inferred from the engine's own state because the
+        // engine has no interface to ask, and a key we never told it about is
+        // not one it can strand.
+        {
+            let mut held = HELD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+            match (pressed, held.iter().position(|&k| k == key)) {
+                // Key repeat re-sends press for a key already down; recording it
+                // twice would leave a duplicate to release.
+                (true, None) => held.push(key),
+                (false, Some(i)) => {
+                    held.swap_remove(i);
+                }
+                _ => {}
+            }
+        }
+        w.dispatch_key(key, pressed);
     }
 }
 

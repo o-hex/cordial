@@ -18,12 +18,12 @@
 //! without Cordial ever writing into the APK or into anything extracted from
 //! it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// One opened asset. The pointer handed back to Roblox is a `Box::into_raw` of
 /// this, which is what an `AAsset*` is as far as the engine is concerned.
@@ -88,6 +88,9 @@ impl Manager {
             if trace_assets_enabled() {
                 eprintln!("[asset] hit (cache): {name}");
             }
+            // Not re-recorded: the first request for this name already
+            // recorded which layer answered it, and overwriting that with
+            // "cache" would erase the one fact the recorder exists to keep.
             return Some(bytes);
         }
 
@@ -108,6 +111,7 @@ impl Manager {
                 if trace_assets_enabled() {
                     eprintln!("[asset] hit (overlay): {name} from {}", source.describe());
                 }
+                record(name, Served::Overlay(source));
                 let leaked: &'static [u8] = Vec::leak(bytes);
                 self.cache.lock().ok()?.insert(name.to_string(), leaked);
                 return Some(leaked);
@@ -125,12 +129,14 @@ impl Manager {
             if trace_assets_enabled() {
                 eprintln!("[asset] miss: {name}");
             }
+            record(name, Served::Missing);
             return None;
         };
 
         if trace_assets_enabled() {
             eprintln!("[asset] hit (apk): {name}");
         }
+        record(name, Served::Apk);
 
         // Deliberately leaked. Asset lifetimes in this API are the caller's to
         // manage and Roblox is not careful about them; an asset outliving its
@@ -144,32 +150,51 @@ impl Manager {
 
 // ---------------------------------------------------------------- the overlay
 //
-// ADR-010: a plugin, or the user directly, may provide a file that resolves in
-// place of the APK's own for the same name. The whole mechanism is a lookup
-// interposed ahead of the zip read above — nothing is ever copied into the
-// APK, nothing is ever copied into `extract_to`'s output, and removing a root
-// is exactly as simple as no longer consulting it. There is no cleanup step
-// because there was never a write to undo.
+// ADR-010 decided that a plugin, or the user directly, may provide a file that
+// resolves in place of the APK's own for the same name.
+// [ADR-021](../../../../docs/adr/ADR-021-everything-is-a-plugin.md) settles how,
+// and extends it to the second route the engine uses. The whole mechanism is a
+// lookup interposed ahead of the zip read above — nothing is ever copied into
+// the APK, nothing is ever copied into `extract_to`'s output, and removing a
+// root is exactly as simple as no longer consulting it. There is no cleanup
+// step because there was never a write to undo.
+//
+// **Why interception rather than a mount.** The assets are zip entries inside
+// `base.apk`, so overlayfs has nothing to overlay without extracting the whole
+// archive first, and Flatpak cannot mount overlayfs unprivileged in any case.
+// Interception also yields the request trace, the two orphan signals and the
+// shadow report below, none of which a mount can provide.
+//
+// **Why an open-intercept is not defeated by mmap.** The hazard in general is
+// a client that maps the archive once and reads each asset at an offset inside
+// that mapping, so no asset ever gets an fd. Sampled every 400 ms across two
+// complete cold launches — 136 samples, `libroblox.so` mapped in every one —
+// `/proc/<pid>/maps` and `/proc/<pid>/fd` held zero references to `base.apk`
+// and zero to the extracted asset tree. There was never a whole-archive
+// mapping to find. ADR-021 records the reading.
 //
 // One thing this does *not* attempt: if an asset is already cached (served
 // once, from either the overlay or the APK), it stays cached for the rest of
 // the process — the same "cached forever" contract `Manager::read` already
 // gives the APK path, because Roblox is handed a pointer that has to remain
-// valid. Changing the overlay stack after an asset has already been served
-// does not retroactively change what a held pointer points at. In practice
-// this does not bite: plugins register their roots at startup, before Roblox
-// asks for anything.
+// valid. Reloading the overlay after an asset has already been served does not
+// retroactively change what a held pointer points at, and `reload` reports how
+// many names it could not affect for exactly that reason.
 
 /// Where an overlaid file came from. Mirrors [`crate::flags::Source`] — naming
 /// the origin is what makes "why did this asset change" answerable after the
 /// fact, and what lets removing one root put back exactly what it replaced and
 /// nothing else.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OverlaySource {
+    /// A plugin's overlay root, named by the plugin's id.
+    ///
+    /// Ordered before `User` deliberately: the derived `Ord` is what sorts a
+    /// shadow report, and the user's layer belongs at the top of it because
+    /// the user's layer is the one that won.
+    Plugin(String),
     /// The user's own overlay root — see [`user_root`].
     User,
-    /// A plugin's overlay root, named by the plugin's id.
-    Plugin(String),
 }
 
 impl OverlaySource {
@@ -194,14 +219,81 @@ struct OverlayLayer {
 /// always whatever `user_root` resolves to — so this only ever holds plugins.
 static PLUGIN_OVERLAYS: Mutex<Vec<OverlayLayer>> = Mutex::new(Vec::new());
 
+/// What one name resolves to, and what it beat to get there.
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    pub source: OverlaySource,
+    pub path: PathBuf,
+    /// Every layer that also offered this name and lost, lowest priority
+    /// first. Empty in the ordinary case.
+    ///
+    /// Recorded at index-build time because it is free there and impossible
+    /// afterwards. "Why did this file not change" is otherwise
+    /// indistinguishable from "the overlay is broken", and it is the question
+    /// users ask most.
+    pub shadowed: Vec<OverlaySource>,
+}
+
+/// Every name any layer offers, merged in precedence order, built once.
+///
+/// **Why an index and not a walk per lookup.** Resolution used to canonicalise
+/// each root and stat the candidate on every single asset open, which is a
+/// stat storm on the hottest path in asset loading and gets worse with each
+/// overlay installed. Walking each root once instead turns a lookup into one
+/// hash probe, and a name absent from the map is absent from every overlay —
+/// so the negative answer costs the same probe and there is no separate
+/// negative cache to keep coherent with this one.
+#[derive(Debug, Default)]
+pub struct Index {
+    files: HashMap<String, Resolved>,
+    /// The roots this index was built from, so a report can say which layers
+    /// were consulted even when they contributed nothing.
+    layers: Vec<(OverlaySource, PathBuf)>,
+}
+
+impl Index {
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Resolved> {
+        self.files.get(name)
+    }
+
+    /// Every name the overlay stack provides, in sorted order.
+    pub fn names(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.files.keys().map(String::as_str).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Every name more than one layer offered, with the winner and the losers.
+    /// Sorted, so two runs over the same roots report the same thing.
+    pub fn shadowing(&self) -> Vec<(&str, &Resolved)> {
+        let mut v: Vec<(&str, &Resolved)> =
+            self.files.iter().filter(|(_, r)| !r.shadowed.is_empty()).map(|(n, r)| (n.as_str(), r)).collect();
+        v.sort_unstable_by_key(|(n, _)| *n);
+        v
+    }
+}
+
+/// The built index, or `None` when the stack has changed and it needs
+/// rebuilding. Held behind an `Arc` so a lookup clones a pointer and never
+/// holds the lock across a filesystem read.
+static INDEX: Mutex<Option<Arc<Index>>> = Mutex::new(None);
+
 /// The user's own overlay root: `$XDG_CONFIG_HOME/cordial/overlay`, falling
 /// back to `$HOME/.config/cordial/overlay`, overridable with `CORDIAL_OVERLAY`.
 /// Mirrors the APK's `assets/` layout exactly, the same shape Sober's
 /// `asset_overlay` uses.
 ///
-/// Not required to exist. A missing directory simply never matches anything —
-/// see `safe_join`, which fails closed rather than needing a separate
-/// existence check here.
+/// Not required to exist. A missing directory contributes no names — see
+/// `walk_root`, which fails closed rather than needing a separate existence
+/// check here.
 pub fn user_root() -> PathBuf {
     std::env::var_os("CORDIAL_OVERLAY")
         .map(PathBuf::from)
@@ -226,6 +318,7 @@ pub fn register_plugin_root(id: &str, root: PathBuf) {
         stack.retain(|l| l.source != source);
         stack.push(OverlayLayer { source, root });
     }
+    invalidate();
 }
 
 /// Remove a plugin's overlay root. Everything it was serving falls straight
@@ -236,66 +329,622 @@ pub fn unregister_plugin_root(id: &str) {
     if let Ok(mut stack) = PLUGIN_OVERLAYS.lock() {
         stack.retain(|l| l.source != source);
     }
+    invalidate();
 }
 
-/// Join `name` onto `root`, refusing anything that would resolve outside it.
-///
-/// `name` is not written by Cordial — for the overlay it is ultimately
-/// whatever path Roblox asked `AAssetManager` for — so it gets the same
-/// treatment as a zip entry in `extract_to`: a `..` or absolute component is
-/// rejected outright, and a symlink that resolves outside `root` is rejected
-/// even when the name itself looks clean, by canonicalising and checking the
-/// real path is still a descendant. A name that is rejected and a name that
-/// simply is not present both return `None`, because from the caller's point
-/// of view they are the same instruction: keep looking elsewhere.
-fn safe_join(root: &Path, name: &str) -> Option<PathBuf> {
-    let rel = Path::new(name);
-    if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
-        return None;
+/// Drop the built index so the next lookup rebuilds it.
+fn invalidate() {
+    if let Ok(mut held) = INDEX.lock() {
+        *held = None;
     }
-    let root = root.canonicalize().ok()?;
-    let candidate = root.join(rel).canonicalize().ok()?;
-    candidate.starts_with(&root).then_some(candidate)
 }
 
-/// Resolve `name` against a stack of overlay layers, in precedence order
-/// **lowest first** — a later layer in the slice overrides an earlier one for
-/// the same name, exactly like [`crate::flags::resolve`]. Callers build the
-/// slice so plugins come first (in registration order, so the last-registered
-/// plugin is last in the slice and therefore wins among plugins) and the user
-/// comes last (so the user beats every plugin).
+/// The layer stack in precedence order, **lowest first**: plugins in
+/// registration order, then the user, who therefore beats every plugin.
 ///
-/// Pure and side-effect-free: it only reads `root`'s filesystem entries to
-/// decide what exists, which is what makes it directly testable without
-/// touching the global stack or the process's real overlay directories.
-fn resolve_stack(layers: &[OverlayLayer], name: &str) -> Option<(OverlaySource, PathBuf)> {
-    let mut found = None;
-    for layer in layers {
-        if let Some(path) = safe_join(&layer.root, name) {
-            if path.is_file() {
-                found = Some((layer.source.clone(), path));
+/// This mirrors the rule [`crate::flags::resolve`] already uses, for the
+/// reason recorded there — an explicit choice the user made must not be
+/// silently overridden by something they installed to do something else.
+fn layers() -> Vec<OverlayLayer> {
+    let mut layers = PLUGIN_OVERLAYS.lock().map(|s| s.clone()).unwrap_or_default();
+    layers.push(OverlayLayer { source: OverlaySource::User, root: user_root() });
+    layers
+}
+
+/// Every file under `root`, as names relative to it with `/` separators.
+///
+/// A symlink is followed only when it stays inside the root — the containment
+/// check that used to run per lookup, moved here so it runs once per file at
+/// build time instead. An entry that escapes is dropped from the index
+/// entirely, so no later code has to remember to re-check it, which is what
+/// let the per-lookup version go. A root that does not exist, or cannot be
+/// canonicalised, contributes nothing — which is what makes the common case of
+/// "no user overlay directory" free rather than an error.
+fn walk_root(root: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(root) = root.canonicalize() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Canonicalising every entry is what keeps a symlink from
+            // smuggling a file in from outside the root. Doing it here rather
+            // than at lookup time means the cost is paid once per file at
+            // build, not once per asset open — and an entry that escapes is
+            // dropped from the index entirely, so no later code has to
+            // remember to re-check it.
+            let Ok(real) = path.canonicalize() else {
+                continue;
+            };
+            if !real.starts_with(&root) {
+                continue;
+            }
+            if real.is_dir() {
+                stack.push(real);
+                continue;
+            }
+            let Ok(rel) = real.strip_prefix(&root) else {
+                continue;
+            };
+            let name = rel.components().filter_map(|c| c.as_os_str().to_str()).collect::<Vec<_>>().join("/");
+            if !name.is_empty() {
+                out.push((name, real));
             }
         }
     }
-    found
+    out
 }
 
-/// The live resolution `Manager::read` actually uses: the registered plugin
-/// stack, with the user's root appended last so it always wins.
+/// Merge every layer into one map, later layers winning and earlier ones
+/// recorded as shadowed.
+fn build_index(layers: &[OverlayLayer]) -> Index {
+    let mut files: HashMap<String, Resolved> = HashMap::new();
+    for layer in layers {
+        for (name, path) in walk_root(&layer.root) {
+            match files.get_mut(&name) {
+                Some(existing) => {
+                    // The incumbent loses to a later layer, and is remembered
+                    // rather than dropped: the losers are the whole content of
+                    // the shadow report, and they are impossible to recover
+                    // once the map holds only winners.
+                    let beaten = std::mem::replace(&mut existing.source, layer.source.clone());
+                    existing.shadowed.push(beaten);
+                    existing.path = path;
+                }
+                None => {
+                    files.insert(name, Resolved { source: layer.source.clone(), path, shadowed: Vec::new() });
+                }
+            }
+        }
+    }
+    Index { files, layers: layers.iter().map(|l| (l.source.clone(), l.root.clone())).collect() }
+}
+
+/// The current index, building it if the stack has changed since the last one.
+pub fn index() -> Arc<Index> {
+    // Built outside the lock is tempting and wrong here: two threads would
+    // each walk every root. Roots are walked at startup, before Roblox asks
+    // for anything, so holding the lock across the walk costs nothing that
+    // anybody waits on.
+    let mut held = INDEX.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(index) = held.as_ref() {
+        return Arc::clone(index);
+    }
+    let built = Arc::new(build_index(&layers()));
+    *held = Some(Arc::clone(&built));
+    built
+}
+
+/// What a reload actually achieved, so the caller can report it honestly.
+///
+/// `already_cached` is the number of names the new index provides that this
+/// process has *already served* from somewhere. Those keep the bytes they were
+/// given, because the engine holds interior pointers into them that have to
+/// stay valid, so the reload applies to them at the next launch and not now.
+/// Reporting "reloaded" while the old texture is still on screen is exactly
+/// the stub-that-lies failure AGENTS.md forbids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reload {
+    pub files: usize,
+    pub layers: usize,
+    pub already_cached: usize,
+}
+
+/// Rebuild the overlay index from the roots as they are on disk now.
+///
+/// Cheap by construction — this is a directory walk and an `Arc` swap, with
+/// nothing remounted and nothing copied, which is the property that makes hot
+/// reload worth having at all under interception.
+pub fn reload() -> Reload {
+    invalidate();
+    let index = index();
+    let already_cached = MANAGER
+        .get()
+        .and_then(|m| m.cache.lock().ok().map(|c| index.files.keys().filter(|n| c.contains_key(*n)).count()))
+        .unwrap_or(0);
+    Reload { files: index.len(), layers: index.layers.len(), already_cached }
+}
+
+/// A cheap fingerprint of every registered root: how many files, and the
+/// newest modification time across them.
+///
+/// **Polled rather than inotify'd, and that is the honest trade.** An inotify
+/// watch has to be re-armed per directory as subdirectories appear, and
+/// getting that wrong presents as a reload that silently stops working. A
+/// signature that costs one `stat` per file, taken twice a second while an
+/// author is editing, is small enough not to matter and simple enough to be
+/// obviously right. It misses a change that leaves both the count and the
+/// newest mtime alone — editing a file and restoring its timestamp — and the
+/// answer to that is the explicit reload, which is the default anyway.
+fn roots_signature() -> (usize, std::time::SystemTime) {
+    let mut count = 0usize;
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    for layer in layers() {
+        for (_, path) in walk_root(&layer.root) {
+            count += 1;
+            if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+                if modified > newest {
+                    newest = modified;
+                }
+            }
+        }
+    }
+    (count, newest)
+}
+
+/// Start the overlay watcher, if `CORDIAL_OVERLAY_WATCH=1`. Returns whether
+/// one was started, so the caller can say so rather than assume.
+///
+/// The thread is deliberately not joined and not stopped: it holds no lock
+/// between polls, it does nothing at all when nothing changed, and a
+/// development instrument that needs a shutdown protocol is one more thing to
+/// get wrong in the path that matters.
+pub fn start_watcher() -> bool {
+    if !watch_enabled() {
+        return false;
+    }
+    std::thread::Builder::new()
+        .name("overlay-watch".into())
+        .spawn(|| {
+            let mut last = roots_signature();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if let Some(report) = watch_tick(&mut last) {
+                    // The caveat stated every time rather than once in the
+                    // docs, because it is the thing that will otherwise be
+                    // read as the reload having failed: the engine holds
+                    // pointers into bytes it has already been given, so a name
+                    // already served keeps what it was served until the next
+                    // launch.
+                    println!(
+                        "  overlay: reloaded, {} file(s) across {} layer(s); {} already loaded \
+                         and unchanged until the next launch",
+                        report.files, report.layers, report.already_cached
+                    );
+                }
+            }
+        })
+        .is_ok()
+}
+
+/// One poll: reload if the roots changed since `last`, and report what
+/// happened.
+///
+/// Split out of the thread so the decision is testable without spawning
+/// anything or sleeping — the loop around it is a sleep and a `println`, and
+/// this is the part that can be wrong.
+fn watch_tick(last: &mut (usize, std::time::SystemTime)) -> Option<Reload> {
+    let now = roots_signature();
+    if now == *last {
+        return None;
+    }
+    *last = now;
+    Some(reload())
+}
+
+/// Whether to watch the overlay roots for changes. **Off unless
+/// `CORDIAL_OVERLAY_WATCH=1`.**
+///
+/// Watching a directory tree costs wakeups, and a texture pack nobody is
+/// editing must not cost a single one — this codebase has a standing rule
+/// about paying for nothing. Reload is an explicit call by default; the
+/// watcher is what an author turns on while iterating, and if it ever misses
+/// an event the fix is to press reload rather than to make the watcher
+/// load-bearing.
+pub fn watch_enabled() -> bool {
+    std::env::var_os("CORDIAL_OVERLAY_WATCH").is_some_and(|v| v != "0")
+}
+
+/// The live resolution `Manager::read` uses: one probe into the built index.
 fn resolve_overlay(name: &str) -> Option<(OverlaySource, PathBuf)> {
-    let mut layers = PLUGIN_OVERLAYS.lock().ok()?.clone();
-    layers.push(OverlayLayer { source: OverlaySource::User, root: user_root() });
-    resolve_stack(&layers, name)
+    index().get(name).map(|r| (r.source.clone(), r.path.clone()))
 }
 
 /// Which layer currently serves `name` — `"user"`, `"plugin:<id>"`, or `None`
-/// meaning the APK itself. Diagnostic only; it recomputes the answer fresh each
-/// call rather than remembering what was actually served, so it can disagree
-/// with an asset that was cached before the stack last changed. That is the
-/// same page the running process has been serving since, which is the
-/// question worth answering here.
+/// meaning the APK itself. Diagnostic only; it reads the current index rather
+/// than remembering what was actually served, so it can disagree with an asset
+/// that was cached before the stack last changed. That is the same page the
+/// running process has been serving since, which is the question worth
+/// answering here.
 pub fn explain(name: &str) -> Option<String> {
     resolve_overlay(name).map(|(source, _)| source.describe())
+}
+
+// ------------------------------------------------------- the filesystem route
+//
+// The engine does not reach every asset through `AAssetManager`. It is also
+// handed `setAssetFolder <cache>/assets/content` and reads through libc, which
+// is the route ADR-010 explicitly left out of scope and ADR-021 brings in.
+//
+// The two routes share this one resolver and one index. They must, or an
+// overlay applies to a texture reached one way and not to the same texture
+// reached the other, which is a bug nobody would guess from the symptom.
+//
+// Ground truth on what has to be covered, from the engine's own dynamic symbol
+// table rather than from reasoning about it: `libroblox.so` imports `access`,
+// `fdopen`, `fopen`, `fstat`, `ftruncate`, `lstat`, `mmap`, `open`, `opendir`,
+// `readlink`, `realpath` and `stat`. **There is no `openat`**, no `fstatat`,
+// no `statx` and no `open64`, so the classic dirfd-relative bypass has nothing
+// to bypass through on this build — a fact to re-check whenever the build
+// moves, which `docs/analysis/undefined-symbols.tsv` makes a one-line diff.
+//
+// `fstat` needs no resolver and that is a result rather than an omission: it
+// takes an fd, which is the fd our `open` already returned, pointing at the
+// overlay file itself, so it reports the overlay's size because it is looking
+// at the overlay. The size-versus-bytes mismatch everyone warns about needs
+// the two to come from different files, and it can only arise through the
+// *path-taking* size and existence calls — `stat`, `lstat` and `access` —
+// every one of which is already in `native/system_paths.cpp`'s table beside
+// `open`. Hence the invariant that table enforces: every path-taking function
+// in it consults this resolver, or none of them do.
+
+/// The extracted asset root the engine was given, if it was given one.
+///
+/// Set by the loader when it hands the engine `assetFolderPath`. Until it is
+/// set, `resolve_asset_path` redirects nothing at all — failing closed to the
+/// original path, which for this route is not a stylistic preference: the
+/// first thing the engine resolves by real path is `ssl/cacert.pem`, and a
+/// resolver that guesses wrong there produces a TLS failure three layers from
+/// anything mentioning certificates. This project has already paid for that
+/// once.
+static ASSET_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Record the directory `assetFolderPath` points at — the extraction root,
+/// **not** its `content` subdirectory, because overlay names are relative to
+/// `assets/` and `content/…` is part of the name.
+pub fn set_asset_root(dir: &Path) {
+    if let Ok(mut held) = ASSET_ROOT.lock() {
+        *held = dir.canonicalize().ok().or_else(|| Some(dir.to_path_buf()));
+    }
+}
+
+/// Whether these `open` flags mean the caller intends to write.
+///
+/// `O_WRONLY` is 1 and `O_RDWR` is 2 on every Linux ABI Cordial runs on, and
+/// the creating and truncating flags are checked beside them so an
+/// `O_RDONLY|O_CREAT` cannot slip past as a read.
+pub fn is_write_intent(flags: i32) -> bool {
+    const O_WRONLY: i32 = 0o1;
+    const O_RDWR: i32 = 0o2;
+    const O_CREAT: i32 = 0o100;
+    const O_TRUNC: i32 = 0o1000;
+    const O_APPEND: i32 = 0o2000;
+    let access = flags & 0o3;
+    access == O_WRONLY || access == O_RDWR || flags & (O_CREAT | O_TRUNC | O_APPEND) != 0
+}
+
+/// Where a real filesystem path under the extracted asset tree should actually
+/// be read from, or `None` to use the path unchanged.
+///
+/// **Writes are never redirected**, and this is decided here rather than left
+/// to be discovered from a corrupted cache. ADR-010's entire claim is that
+/// nothing is written into the APK or into anything extracted from it, so
+/// handing a writable fd to a plugin's file would make an overlay a place the
+/// engine can scribble — neither non-destructive nor anything the plugin's
+/// author agreed to. Refusing the open outright would break an engine write to
+/// a path that merely collides with an overlay name, and copy-on-write needs
+/// the manifest of what was copied that ADR-010 declined to build. So reads
+/// resolve to the overlay and writes go to the original.
+///
+/// Anything outside the asset root is not an asset and is left alone. The
+/// overlay must never become a general filesystem redirect; that is the same
+/// line ADR-007 draws between an effect and a channel.
+pub fn resolve_asset_path(path: &str, write: bool) -> Option<PathBuf> {
+    if write {
+        return None;
+    }
+    let root = ASSET_ROOT.lock().ok()?.clone()?;
+    let candidate = Path::new(path);
+    // Not canonicalised first: the file being looked for frequently does not
+    // exist yet under the extraction root, and `canonicalize` on a missing
+    // path fails. Lexical containment is enough because the name is then put
+    // through the index, which only ever holds names walked from inside a
+    // root — an escaping name simply misses.
+    let rel = candidate.strip_prefix(&root).ok()?;
+    let name = rel.components().filter_map(|c| c.as_os_str().to_str()).collect::<Vec<_>>().join("/");
+    if name.is_empty() || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        return None;
+    }
+    index().get(&name).map(|r| r.path.clone())
+}
+
+/// The C ABI `native/system_paths.cpp` calls from each of its path-taking
+/// functions.
+///
+/// **Not yet called.** The table in `cordial_system_symbols` holds `stat`,
+/// `lstat`, `access`, `opendir`, `realpath`, `readlink`, `fopen`, `statvfs`
+/// and `open`, and every one of them must route through here together — the
+/// invariant is that they all consult one resolver or none of them do, because
+/// a size call answering about the original while `open` answers with the
+/// overlay is the mismatch that truncates a texture. Wiring it is a change to
+/// that file, which was held by another agent when this was written; the Rust
+/// half is complete and tested so the C++ half is one call per function.
+///
+/// Writes `out` as a NUL-terminated path and returns 1 when the caller should
+/// use it, 0 when it should use the path it was given. A buffer too small
+/// returns 0 rather than a truncated path, because a truncated path names a
+/// different file and would be worse than no redirect at all.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated C string; `out` points at `out_len` writable
+/// bytes.
+#[no_mangle]
+pub unsafe extern "C" fn cordial_overlay_resolve(
+    path: *const c_char,
+    for_write: c_int,
+    out: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if path.is_null() || out.is_null() || out_len == 0 {
+        return 0;
+    }
+    let Some(name) = cstr(path) else { return 0 };
+    let Some(resolved) = resolve_asset_path(&name, for_write != 0) else {
+        return 0;
+    };
+    let bytes = resolved.as_os_str().as_encoded_bytes();
+    if bytes.len() + 1 > out_len {
+        return 0;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
+    *out.add(bytes.len()) = 0;
+    1
+}
+
+// -------------------------------------------------------------- the recorder
+//
+// Every distinct name the engine asks for, with what answered it. One cold
+// launch plus one game join is the ground-truth list of what this build
+// actually reads, which is the missing half of the Windows-to-Android path
+// mapping and is the thing both orphan signals are computed against.
+//
+// Always on, and a set rather than a log, because that is what makes it free:
+// a name already seen costs one hash lookup and no allocation. The stderr
+// tracing under `CORDIAL_TRACE_ASSETS=1` is unchanged and separate — it is a
+// stream, this is a summary, and only the summary can answer "what was never
+// asked for".
+
+/// What answered a request. Kept apart because a miss is a different fact from
+/// a hit and reporting them as one is how a broken overlay looks healthy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Served {
+    Overlay(OverlaySource),
+    Apk,
+    Missing,
+}
+
+impl Served {
+    pub fn describe(&self) -> String {
+        match self {
+            Served::Overlay(source) => source.describe(),
+            Served::Apk => "apk".into(),
+            Served::Missing => "missing".into(),
+        }
+    }
+}
+
+static REQUESTED: Mutex<Option<BTreeMap<String, Served>>> = Mutex::new(None);
+
+fn record(name: &str, served: Served) {
+    if let Ok(mut held) = REQUESTED.lock() {
+        held.get_or_insert_with(BTreeMap::new).insert(name.to_string(), served);
+    }
+}
+
+/// Every distinct asset name requested so far, with what answered it.
+pub fn requested() -> BTreeMap<String, Served> {
+    REQUESTED.lock().ok().and_then(|h| h.clone()).unwrap_or_default()
+}
+
+/// Where the request trace is written: `$XDG_DATA_HOME/cordial/asset-trace.log`.
+///
+/// Under `XDG_DATA_HOME` rather than the cache, because it is a measurement
+/// somebody took and not something Cordial can regenerate — and because
+/// AGENTS.md's instruction to give a run its own data root then redirects it
+/// with everything else, which is what keeps two agents' traces apart.
+pub fn trace_path() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cordial/asset-trace.log")
+}
+
+/// Write the request trace, one `name<TAB>source` line per distinct name,
+/// sorted. Sorted on the way out so `sort -u` on it is idempotent and two
+/// runs can be diffed without preprocessing.
+pub fn write_trace(path: &Path) -> std::io::Result<usize> {
+    let requested = requested();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut text = String::new();
+    for (name, served) in &requested {
+        text.push_str(name);
+        text.push('\t');
+        text.push_str(&served.describe());
+        text.push('\n');
+    }
+    std::fs::write(path, text)?;
+    Ok(requested.len())
+}
+
+// ---------------------------------------------------------------- the orphans
+//
+// Two signals that mean different things and must never be reported as one.
+//
+// *Stale* is an overlay file with no counterpart anywhere in the APK: the name
+// is wrong, or the build removed it. It can never apply. This is the signal
+// that catches a Bloxstrap mod shipping `content/sounds/ouch.ogg` when this
+// build reads `content/sounds/oof.ogg` — checked against the real archive, the
+// most famous mod there is misses by one word and says nothing.
+//
+// *Unrequested* is an overlay file that does exist in the APK but that the
+// engine never asked for in this session. It did not apply *today*, possibly
+// because the feature it decorates was never opened, possibly because the run
+// was sixty seconds long.
+//
+// Stale is a defect. Unrequested is an observation. A report that gives a
+// single count of "orphans" has merged a certainty with a maybe.
+
+/// An overlay file that matches nothing in the APK's asset tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stale {
+    pub name: String,
+    pub source: OverlaySource,
+}
+
+/// Every name in the APK's `assets/` tree, relative to it — the set an overlay
+/// is diffed against.
+///
+/// Reads the zip's central directory only, so it costs a directory read rather
+/// than a decompression of ninety-odd megabytes.
+pub fn apk_asset_names() -> Result<BTreeSet<String>, String> {
+    let manager = MANAGER.get().ok_or("no APK is set")?;
+    let file = File::open(&manager.apk).map_err(|e| format!("{}: {e}", manager.apk.display()))?;
+    let zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    Ok(zip
+        .file_names()
+        .filter_map(|n| n.strip_prefix("assets/"))
+        .filter(|n| !n.is_empty() && !n.ends_with('/'))
+        .map(str::to_string)
+        .collect())
+}
+
+/// The Roblox client version this APK is, as `2.734.917`, or `None`.
+///
+/// **A scan, not a parser, and it says `None` rather than guessing.** Android's
+/// `AndroidManifest.xml` inside an APK is binary AXML, whose string pool is
+/// UTF-16; `versionName` is one of the strings in it. Writing an AXML parser to
+/// read one field would be a great deal of code to maintain against a format
+/// that has changed before, so this scans the pool for something shaped like a
+/// Roblox version and takes the first.
+///
+/// It exists because "7 files no longer match anything" is not a useful
+/// sentence without a version beside it — the same files were fine last month,
+/// and the user's next question is always "since when". A wrong version there
+/// would be worse than none, which is why an ambiguous scan returns `None` and
+/// the caller falls back to naming the file.
+pub fn client_version() -> Option<String> {
+    let manager = MANAGER.get()?;
+    let file = File::open(&manager.apk).ok()?;
+    let mut zip = zip::ZipArchive::new(file).ok()?;
+    let mut entry = zip.by_name("AndroidManifest.xml").ok()?;
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut bytes).ok()?;
+
+    // UTF-16LE with the high byte zero for ASCII, so the ASCII characters sit
+    // at even offsets with NULs between them. Pulling those out gives a
+    // readable ribbon of the whole pool without decoding it properly.
+    let ribbon: String = bytes
+        .chunks_exact(2)
+        .filter(|c| c[1] == 0)
+        .map(|c| if c[0].is_ascii_graphic() { c[0] as char } else { '\n' })
+        .collect();
+    ribbon.split('\n').find(|token| is_client_version(token)).map(str::to_string)
+}
+
+/// Whether a token looks like a Roblox client version: three dotted numeric
+/// parts with a three-digit middle, which is the shape every published Android
+/// build has had. Deliberately narrow — a looser pattern matches a library
+/// version out of the same string pool and reports it as the client's.
+fn is_client_version(token: &str) -> bool {
+    let parts: Vec<&str> = token.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && parts[1].len() == 3
+}
+
+/// Overlay files that match nothing in `apk`. Sorted, so a report is stable.
+pub fn stale(apk: &BTreeSet<String>) -> Vec<Stale> {
+    let index = index();
+    let mut out: Vec<Stale> = index
+        .files
+        .iter()
+        .filter(|(name, _)| !apk.contains(*name))
+        .map(|(name, r)| Stale { name: name.clone(), source: r.source.clone() })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Overlay files the engine never asked for in this session.
+///
+/// Weaker than [`stale`] on purpose, and its caveat has to travel with it
+/// wherever it is shown: a run that never joins an experience leaves almost
+/// everything unrequested. It is a strong signal after a real session and a
+/// misleading one after a smoke test.
+pub fn unrequested() -> Vec<Stale> {
+    let asked = requested();
+    let index = index();
+    let mut out: Vec<Stale> = index
+        .files
+        .iter()
+        .filter(|(name, _)| !asked.contains_key(*name))
+        .map(|(name, r)| Stale { name: name.clone(), source: r.source.clone() })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// A one-line summary per plugin of what its overlay is not doing, in the
+/// words a user can act on.
+///
+/// Names the client build, because "no longer matches anything" is only
+/// meaningful against a version — the same file was fine last month.
+pub fn stale_report(apk: &BTreeSet<String>, build: &str) -> Vec<String> {
+    let mut per_source: BTreeMap<String, usize> = BTreeMap::new();
+    for orphan in stale(apk) {
+        *per_source.entry(orphan.source.describe()).or_default() += 1;
+    }
+    per_source
+        .into_iter()
+        .map(|(source, count)| {
+            let (files, verb) = if count == 1 { ("file", "matches") } else { ("files", "match") };
+            format!("{source}: {count} {files} no longer {verb} anything in client {build}")
+        })
+        .collect()
+}
+
+/// Which layer beat which, for every name more than one layer offered.
+///
+/// `user:my-fonts wins over plugin:retro-ui   content/fonts/…`
+pub fn shadow_report() -> Vec<String> {
+    let index = index();
+    index
+        .shadowing()
+        .into_iter()
+        .map(|(name, resolved)| {
+            let losers: Vec<String> = resolved.shadowed.iter().map(OverlaySource::describe).collect();
+            format!("{} wins over {}   {name}", resolved.source.describe(), losers.join(", "))
+        })
+        .collect()
 }
 
 /// Extract `assets/` to a real directory and return its path.
@@ -512,6 +1161,12 @@ pub fn probe(name: &str) -> Result<usize, String> {
 mod overlay_tests {
     use super::*;
 
+    /// The global overlay stack, the built index and the request recorder are
+    /// all process-wide, and cargo runs this file's tests on several threads.
+    /// Every test that touches one of them takes this first; the ones that
+    /// only build an index from a local slice do not need it.
+    static GLOBAL: Mutex<()> = Mutex::new(());
+
     /// Write `contents` at `dir/rel`, creating whatever directories are needed
     /// to mirror the APK's own tree structure.
     fn write(dir: &Path, rel: &str, contents: &[u8]) {
@@ -520,8 +1175,31 @@ mod overlay_tests {
         std::fs::write(path, contents).unwrap();
     }
 
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cordial-overlay-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn layer(source: OverlaySource, root: &Path) -> OverlayLayer {
         OverlayLayer { source, root: root.to_path_buf() }
+    }
+
+    /// Point the user's root at an empty directory and clear the global state,
+    /// so a test of the live stack cannot be decided by whatever the developer
+    /// happens to have in `~/.config/cordial/overlay`.
+    fn isolate(tag: &str) -> PathBuf {
+        let empty = scratch(&format!("{tag}-user"));
+        std::env::set_var("CORDIAL_OVERLAY", &empty);
+        if let Ok(mut stack) = PLUGIN_OVERLAYS.lock() {
+            stack.clear();
+        }
+        if let Ok(mut held) = REQUESTED.lock() {
+            *held = None;
+        }
+        invalidate();
+        empty
     }
 
     #[test]
@@ -531,19 +1209,19 @@ mod overlay_tests {
         // for the same reason: a plugin quietly overriding a choice the user
         // made on purpose would make "the user's own overlay" a polite
         // fiction rather than a real one.
-        let dir = std::env::temp_dir().join("cordial-overlay-test-user-beats-plugin");
+        let dir = scratch("user-beats-plugin");
         let plugin_dir = dir.join("plugin");
         let user_dir = dir.join("user");
-        write(&plugin_dir, "textures/wood.png", b"plugin-version");
-        write(&user_dir, "textures/wood.png", b"user-version");
+        write(&plugin_dir, "content/textures/wood.png", b"plugin-version");
+        write(&user_dir, "content/textures/wood.png", b"user-version");
 
-        let layers = vec![
+        let index = build_index(&[
             layer(OverlaySource::Plugin("themer".into()), &plugin_dir),
             layer(OverlaySource::User, &user_dir),
-        ];
-        let (source, path) = resolve_stack(&layers, "textures/wood.png").unwrap();
-        assert_eq!(source, OverlaySource::User);
-        assert_eq!(std::fs::read(path).unwrap(), b"user-version");
+        ]);
+        let hit = index.get("content/textures/wood.png").unwrap();
+        assert_eq!(hit.source, OverlaySource::User);
+        assert_eq!(std::fs::read(&hit.path).unwrap(), b"user-version");
     }
 
     #[test]
@@ -552,21 +1230,87 @@ mod overlay_tests {
         // them, and resolving it by directory-iteration order would make the
         // outcome depend on something nobody chose. Registration order is at
         // least a fact — deterministic, and one a user can be told.
-        let dir = std::env::temp_dir().join("cordial-overlay-test-last-plugin-wins");
+        let dir = scratch("last-plugin-wins");
         let a = dir.join("a");
         let b = dir.join("b");
-        write(&a, "sounds/click.ogg", b"a");
-        write(&b, "sounds/click.ogg", b"b");
+        write(&a, "content/sounds/click.ogg", b"a");
+        write(&b, "content/sounds/click.ogg", b"b");
 
-        // Registration order is a-then-b, so b — the later registration — is
-        // later in the slice and wins, per resolve_stack's contract.
-        let layers = vec![
+        let index = build_index(&[
             layer(OverlaySource::Plugin("a".into()), &a),
             layer(OverlaySource::Plugin("b".into()), &b),
-        ];
-        let (source, path) = resolve_stack(&layers, "sounds/click.ogg").unwrap();
-        assert_eq!(source, OverlaySource::Plugin("b".into()));
-        assert_eq!(std::fs::read(path).unwrap(), b"b");
+        ]);
+        let hit = index.get("content/sounds/click.ogg").unwrap();
+        assert_eq!(hit.source, OverlaySource::Plugin("b".into()));
+        assert_eq!(std::fs::read(&hit.path).unwrap(), b"b");
+    }
+
+    #[test]
+    fn the_loser_of_a_collision_is_named_rather_than_dropped() {
+        // "Why did this file not change" is otherwise indistinguishable from
+        // "the overlay is broken", and it is the question users ask most. The
+        // losers only exist at merge time, so a map holding winners alone
+        // cannot answer it afterwards at any price.
+        let dir = scratch("shadow");
+        let a = dir.join("retro-ui");
+        let b = dir.join("my-fonts");
+        write(&a, "content/fonts/SourceSansPro-Regular.ttf", b"retro");
+        write(&b, "content/fonts/SourceSansPro-Regular.ttf", b"mine");
+
+        let index = build_index(&[
+            layer(OverlaySource::Plugin("retro-ui".into()), &a),
+            layer(OverlaySource::User, &b),
+        ]);
+        let shadowing = index.shadowing();
+        assert_eq!(shadowing.len(), 1);
+        let (name, resolved) = shadowing[0];
+        assert_eq!(name, "content/fonts/SourceSansPro-Regular.ttf");
+        assert_eq!(resolved.source.describe(), "user");
+        assert_eq!(
+            resolved.shadowed.iter().map(OverlaySource::describe).collect::<Vec<_>>(),
+            vec!["plugin:retro-ui".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_name_nothing_provides_is_absent_from_the_index() {
+        // Most assets are not overlaid. The common case has to behave as
+        // "nothing here, keep looking" rather than "nothing here, fail the
+        // lookup" — a miss in the map is exactly what lets Manager::read
+        // carry on to the zip, and it costs the same probe as a hit, which is
+        // why there is no separate negative cache.
+        let dir = scratch("miss");
+        write(&dir, "content/textures/other.png", b"unrelated");
+
+        let index = build_index(&[layer(OverlaySource::Plugin("x".into()), &dir)]);
+        assert!(index.get("content/textures/wood.png").is_none());
+        assert!(index.get("content/textures/other.png").is_some());
+    }
+
+    #[test]
+    fn a_symlink_leaving_the_root_never_enters_the_index() {
+        // A name with no ".." in it can still escape if a path component is a
+        // symlink. The containment check moved from per-lookup to per-file at
+        // build time, so this is the test that it did not get lost on the way:
+        // an escaping entry has to be absent from the map, not merely refused
+        // later by something that remembers to ask.
+        let dir = scratch("symlink");
+        let outside = std::env::temp_dir().join("cordial-overlay-test-symlink-target");
+        std::fs::write(&outside, b"outside").unwrap();
+        write(&dir, "content/legit.png", b"inside");
+        std::os::unix::fs::symlink(&outside, dir.join("content/escape.png")).unwrap();
+
+        let index = build_index(&[layer(OverlaySource::Plugin("x".into()), &dir)]);
+        assert!(index.get("content/escape.png").is_none(), "a symlink out of the root must not be indexed");
+        assert!(index.get("content/legit.png").is_some(), "the defence is about leaving the root, not refusing everything");
+    }
+
+    #[test]
+    fn a_root_that_does_not_exist_contributes_nothing_rather_than_failing() {
+        // The overwhelmingly common case is a user with no overlay directory
+        // at all. It has to be free and silent, not an error path.
+        let index = build_index(&[layer(OverlaySource::User, Path::new("/nonexistent/cordial-overlay"))]);
+        assert!(index.is_empty());
     }
 
     #[test]
@@ -575,65 +1319,302 @@ mod overlay_tests {
         // uninstalling a plugin is "stop consulting its directory", full
         // stop. There is nothing on disk to undo, because the asset the
         // overlay was standing in for was never touched.
-        let dir = std::env::temp_dir().join("cordial-overlay-test-removal");
-        write(&dir, "fonts/custom.ttf", b"overlay-font");
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        isolate("removal");
+        let dir = scratch("removal-plugin");
+        write(&dir, "content/fonts/custom.ttf", b"overlay-font");
 
         register_plugin_root("overlay-removal-test", dir.clone());
         assert_eq!(
-            resolve_overlay("fonts/custom.ttf").map(|(s, _)| s),
+            resolve_overlay("content/fonts/custom.ttf").map(|(s, _)| s),
             Some(OverlaySource::Plugin("overlay-removal-test".into()))
         );
 
         unregister_plugin_root("overlay-removal-test");
-        // Nothing else provides fonts/custom.ttf, so this is exactly what a
-        // real lookup would see: no overlay hit, fall through to the APK.
-        assert!(resolve_overlay("fonts/custom.ttf").is_none());
+        // Nothing else provides it, so this is exactly what a real lookup
+        // would see: no overlay hit, fall through to the APK.
+        assert!(resolve_overlay("content/fonts/custom.ttf").is_none());
     }
 
     #[test]
-    fn an_escape_attempt_is_rejected() {
-        // The name being resolved did not come from Cordial — for the overlay
-        // it is ultimately whatever path Roblox asked for. Trusting it would
-        // turn an overlay root into a way to read anything the process can
-        // read, which is a much bigger grant than "a directory of assets".
-        let dir = std::env::temp_dir().join("cordial-overlay-test-escape");
-        write(&dir, "marker", b"present");
+    fn registering_a_root_invalidates_an_index_already_built() {
+        // The index is the thing that makes a lookup one probe, and a stale
+        // one is a plugin that installed and did nothing. Registration has to
+        // drop it, or hot reload and plugin startup both silently fail in the
+        // same way.
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        isolate("invalidate");
+        assert!(index().is_empty(), "isolated: nothing registered yet");
 
-        assert!(safe_join(&dir, "../escape").is_none());
-        assert!(safe_join(&dir, "/etc/passwd").is_none());
-        assert!(safe_join(&dir, "a/../../escape").is_none());
-        // The defence is about leaving the root, not about refusing
-        // everything — an ordinary name still has to resolve normally.
-        assert!(safe_join(&dir, "marker").is_some());
+        let dir = scratch("invalidate-plugin");
+        write(&dir, "content/textures/new.png", b"new");
+        register_plugin_root("late", dir);
+        assert!(index().get("content/textures/new.png").is_some(), "the index must have been rebuilt");
+
+        unregister_plugin_root("late");
     }
 
     #[test]
-    fn a_symlink_leaving_the_root_is_rejected() {
-        // A name with no ".." in it can still escape if a path component is a
-        // symlink — the component check alone would miss this entirely, which
-        // is why safe_join also canonicalises and checks the real path stayed
-        // under the root, the same rigour extract_to's zip-slip defence uses.
-        let dir = std::env::temp_dir().join("cordial-overlay-test-symlink");
-        std::fs::create_dir_all(&dir).unwrap();
-        let outside = std::env::temp_dir().join("cordial-overlay-test-symlink-target");
-        std::fs::write(&outside, b"outside").unwrap();
-        let link = dir.join("escape.png");
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
+    fn a_reload_says_how_many_names_it_could_not_affect() {
+        // Reporting "reloaded" while the old texture is still on screen is the
+        // stub-that-lies failure AGENTS.md forbids. Nothing has been served
+        // here, so the honest answer is zero — and the field has to exist and
+        // be reported for the case where it is not.
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        isolate("reload");
+        let dir = scratch("reload-plugin");
+        write(&dir, "content/textures/a.png", b"a");
+        write(&dir, "content/textures/b.png", b"b");
+        register_plugin_root("reloadable", dir);
 
-        assert!(safe_join(&dir, "escape.png").is_none());
+        let report = reload();
+        assert_eq!(report.files, 2);
+        assert_eq!(report.layers, 2, "the plugin root and the user root");
+        assert_eq!(report.already_cached, 0);
+
+        unregister_plugin_root("reloadable");
     }
 
     #[test]
-    fn a_missing_overlay_file_falls_through_to_the_apk() {
-        // Most assets are not overlaid. The common case has to behave as
-        // "nothing here, keep looking" rather than "nothing here, fail the
-        // lookup" — resolve_stack returning None is exactly what lets
-        // Manager::read carry on to the zip.
-        let dir = std::env::temp_dir().join("cordial-overlay-test-miss");
-        write(&dir, "textures/other.png", b"unrelated");
+    fn watching_is_off_unless_asked_for() {
+        // Watching a directory tree costs wakeups, and a texture pack nobody
+        // is editing must not cost one. Reload is an explicit call by default.
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CORDIAL_OVERLAY_WATCH");
+        assert!(!watch_enabled());
+        std::env::set_var("CORDIAL_OVERLAY_WATCH", "1");
+        assert!(watch_enabled());
+        std::env::set_var("CORDIAL_OVERLAY_WATCH", "0");
+        assert!(!watch_enabled(), "an explicit 0 must mean off, not merely 'set'");
+        std::env::remove_var("CORDIAL_OVERLAY_WATCH");
+    }
 
-        let layers = vec![layer(OverlaySource::Plugin("x".into()), &dir)];
-        assert!(resolve_stack(&layers, "textures/wood.png").is_none());
+    #[test]
+    fn a_write_is_never_redirected_to_an_overlay() {
+        // Decided in ADR-021 rather than discovered from a corrupted cache.
+        // The overlay is read-only by definition: handing a writable fd to a
+        // plugin's file would make it somewhere the engine can scribble, which
+        // is neither non-destructive nor anything the plugin's author agreed
+        // to. Reads resolve to the overlay; writes go to the original.
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        isolate("write");
+        let root = scratch("write-assets");
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        let overlay = scratch("write-overlay");
+        write(&overlay, "content/cache.bin", b"overlay");
+        register_plugin_root("writer", overlay);
+        set_asset_root(&root);
+
+        let target = root.join("content/cache.bin").to_string_lossy().into_owned();
+        assert!(resolve_asset_path(&target, false).is_some(), "a read must find the overlay");
+        assert!(resolve_asset_path(&target, true).is_none(), "a write must fall through to the real file");
+
+        unregister_plugin_root("writer");
+    }
+
+    #[test]
+    fn write_intent_is_read_off_the_open_flags() {
+        // O_RDONLY is 0, so a naive `flags != 0` test would call every
+        // O_CLOEXEC read a write. The creating and truncating flags are
+        // checked beside the access mode so an O_RDONLY|O_CREAT cannot slip
+        // past as a read.
+        const O_RDONLY: i32 = 0;
+        const O_WRONLY: i32 = 0o1;
+        const O_RDWR: i32 = 0o2;
+        const O_CREAT: i32 = 0o100;
+        const O_CLOEXEC: i32 = 0o2000000;
+        assert!(!is_write_intent(O_RDONLY));
+        assert!(!is_write_intent(O_RDONLY | O_CLOEXEC));
+        assert!(is_write_intent(O_WRONLY));
+        assert!(is_write_intent(O_RDWR));
+        assert!(is_write_intent(O_RDONLY | O_CREAT));
+    }
+
+    #[test]
+    fn a_path_outside_the_asset_root_is_left_alone() {
+        // The overlay must never become a general filesystem redirect — the
+        // same line ADR-007 draws between an effect and a channel. And the
+        // failure has to be closed: the first thing the engine resolves by
+        // real path is ssl/cacert.pem, and getting that wrong produces a TLS
+        // failure three layers from anything mentioning certificates.
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        isolate("outside");
+        let root = scratch("outside-assets");
+        let overlay = scratch("outside-overlay");
+        write(&overlay, "content/textures/wood.png", b"overlay");
+        register_plugin_root("outsider", overlay);
+        set_asset_root(&root);
+
+        assert!(resolve_asset_path("/etc/passwd", false).is_none());
+        assert!(resolve_asset_path("content/textures/wood.png", false).is_none(), "a relative path is not under the root");
+        assert!(
+            resolve_asset_path(&root.join("content/textures/wood.png").to_string_lossy(), false).is_some(),
+            "a path genuinely under the asset root still resolves"
+        );
+
+        unregister_plugin_root("outsider");
+    }
+
+    #[test]
+    fn the_recorder_keeps_which_layer_answered_each_name() {
+        // One cold launch plus one game join is the ground-truth list of what
+        // this build actually reads, and it is what both orphan signals are
+        // computed against. A set rather than a log, so a name already seen
+        // costs a lookup and no allocation.
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        isolate("recorder");
+        record("content/textures/wood.png", Served::Overlay(OverlaySource::Plugin("retro-ui".into())));
+        record("content/sounds/oof.ogg", Served::Apk);
+        record("content/textures/absent.png", Served::Missing);
+
+        let asked = requested();
+        assert_eq!(asked.len(), 3);
+        assert_eq!(asked["content/textures/wood.png"].describe(), "plugin:retro-ui");
+        assert_eq!(asked["content/sounds/oof.ogg"].describe(), "apk");
+        assert_eq!(asked["content/textures/absent.png"].describe(), "missing");
+
+        let out = scratch("recorder-out").join("asset-trace.log");
+        assert_eq!(write_trace(&out).unwrap(), 3);
+        let text = std::fs::read_to_string(&out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        // Sorted on the way out, so `sort -u` on it is idempotent and two
+        // runs diff without preprocessing.
+        assert_eq!(lines[0], "content/sounds/oof.ogg\tapk");
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn a_stale_overlay_file_is_the_one_that_matches_nothing_in_the_build() {
+        // The signal that catches the most famous Bloxstrap mod there is:
+        // it ships content/sounds/ouch.ogg and this build reads
+        // content/sounds/oof.ogg, so the mod is installed, enabled, correct
+        // in every other respect, and silently does nothing. Checked against
+        // the real archive on this host — the miss is real, not illustrative.
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        isolate("stale");
+        let overlay = scratch("stale-overlay");
+        write(&overlay, "content/sounds/ouch.ogg", b"classic oof");
+        write(&overlay, "content/sounds/oof.ogg", b"the one that lands");
+        register_plugin_root("retro-ui", overlay);
+
+        let apk: BTreeSet<String> = ["content/sounds/oof.ogg".to_string()].into_iter().collect();
+        let orphans = stale(&apk);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].name, "content/sounds/ouch.ogg");
+        assert_eq!(orphans[0].source, OverlaySource::Plugin("retro-ui".into()));
+
+        let report = stale_report(&apk, "2.7xx");
+        assert_eq!(report, vec!["plugin:retro-ui: 1 file no longer matches anything in client 2.7xx".to_string()]);
+
+        unregister_plugin_root("retro-ui");
+    }
+
+    #[test]
+    fn unrequested_is_a_different_claim_from_stale() {
+        // Stale means the file can never apply. Unrequested means it did not
+        // apply today, possibly only because the run was short. Merging them
+        // into one count reports a certainty and a maybe as the same fact,
+        // which is the thing this pair exists to keep apart.
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        isolate("unrequested");
+        let overlay = scratch("unrequested-overlay");
+        write(&overlay, "content/textures/asked.png", b"a");
+        write(&overlay, "content/textures/never.png", b"b");
+        register_plugin_root("pack", overlay);
+
+        let apk: BTreeSet<String> =
+            ["content/textures/asked.png".to_string(), "content/textures/never.png".to_string()]
+                .into_iter()
+                .collect();
+        assert!(stale(&apk).is_empty(), "both names exist in the build, so neither is stale");
+
+        record("content/textures/asked.png", Served::Overlay(OverlaySource::Plugin("pack".into())));
+        let quiet = unrequested();
+        assert_eq!(quiet.len(), 1);
+        assert_eq!(quiet[0].name, "content/textures/never.png");
+
+        unregister_plugin_root("pack");
+    }
+
+    #[test]
+    fn the_signature_notices_a_file_appearing() {
+        // What the watcher polls. If this cannot tell one state from another,
+        // `CORDIAL_OVERLAY_WATCH=1` is a switch that silently does nothing --
+        // which is exactly the stub-that-lies shape AGENTS.md forbids, moved
+        // into a thread where it is harder to notice.
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        isolate("signature");
+        let dir = scratch("signature-plugin");
+        write(&dir, "content/textures/a.png", b"a");
+        register_plugin_root("watched", dir.clone());
+
+        let before = roots_signature();
+        write(&dir, "content/textures/b.png", b"b");
+        let after = roots_signature();
+        assert_ne!(before, after, "a new file must change the signature");
+        assert_eq!(after.0, before.0 + 1);
+
+        unregister_plugin_root("watched");
+    }
+
+    #[test]
+    fn a_tick_reloads_only_when_something_changed() {
+        // The whole watcher, minus the sleep. A tick that reloaded every time
+        // would rebuild the index twice a second for a directory nobody is
+        // editing, which is the cost this codebase has a rule about; one that
+        // never reloaded would make the switch do nothing.
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        isolate("tick");
+        let dir = scratch("tick-plugin");
+        write(&dir, "content/textures/a.png", b"a");
+        register_plugin_root("ticker", dir.clone());
+
+        let mut last = roots_signature();
+        assert!(watch_tick(&mut last).is_none(), "nothing changed, so nothing to do");
+
+        write(&dir, "content/textures/b.png", b"b");
+        let report = watch_tick(&mut last).expect("a new file must trigger a reload");
+        assert_eq!(report.files, 2);
+        assert!(watch_tick(&mut last).is_none(), "the signature must be carried forward");
+
+        unregister_plugin_root("ticker");
+    }
+
+    #[test]
+    fn no_watcher_is_started_unless_asked_for() {
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CORDIAL_OVERLAY_WATCH");
+        assert!(!start_watcher(), "a texture pack nobody is editing must not cost a wakeup");
+    }
+
+    #[test]
+    fn a_version_shaped_token_is_told_from_a_library_version() {
+        // The scan runs over a string pool that also holds every AndroidX
+        // library's version, so a loose pattern reports one of those as the
+        // client's. "7 files no longer match anything in client 7.1.1" would
+        // be confidently wrong, which is worse than saying nothing.
+        assert!(is_client_version("2.734.917"));
+        assert!(!is_client_version("7.1.1"), "a library version must not be mistaken for the client's");
+        assert!(!is_client_version("1.2"));
+        assert!(!is_client_version("2.734.917-beta"));
+        assert!(!is_client_version(""));
+    }
+
+    #[test]
+    fn the_shadow_report_names_the_winner_first() {
+        // The line a user reads. It has to say who won, because the whole
+        // point is answering "why is my file not the one being used".
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        let user = isolate("shadow-report");
+        write(&user, "content/fonts/x.ttf", b"mine");
+        let plugin = scratch("shadow-report-plugin");
+        write(&plugin, "content/fonts/x.ttf", b"theirs");
+        register_plugin_root("retro-ui", plugin);
+        invalidate();
+
+        let report = shadow_report();
+        assert_eq!(report, vec!["user wins over plugin:retro-ui   content/fonts/x.ttf".to_string()]);
+
+        unregister_plugin_root("retro-ui");
     }
 }

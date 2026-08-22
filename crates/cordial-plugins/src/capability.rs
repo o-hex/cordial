@@ -154,6 +154,89 @@ impl Capability {
         })
     }
 
+    /// What granting this actually lets the plugin do, in the second person,
+    /// with the honest edge of it included and its limit stated.
+    ///
+    /// **The wording is the whole job.** A prompt saying "this plugin wants to
+    /// run code, allow?" is worse than no prompt: it appears for everything,
+    /// it is answered yes by everybody, and it trains the user to dismiss the
+    /// one that mattered. ADR-007 already supplies the better vocabulary —
+    /// capabilities are named *effects*, and an effect is something a person
+    /// can judge. These sentences are that vocabulary spelled out.
+    ///
+    /// They live beside the enum rather than in the shell so a variant cannot
+    /// be added without one; the test below is what enforces it, the same way
+    /// `name`/`parse`/`all` are already held together by a test rather than by
+    /// remembering.
+    ///
+    /// The rule each sentence follows: say the effect, then the part a
+    /// reasonable person would be annoyed to discover later. `flags.write` is
+    /// the case that makes the rule necessary — see its arm.
+    pub fn consequence(self) -> &'static str {
+        match self {
+            Capability::FlagsRead => {
+                "See which Roblox and Cordial settings are in effect, and which layer set each one. \
+                 Reading only."
+            }
+            // ADR-020 records what this actually is, and the wording follows
+            // from the record rather than from the capability's name. It is
+            // not "contribute FastFlags": `graphics.rs::plugin_request` reads
+            // the plugin layers deliberately, so any `Cordial`-prefixed key is
+            // in reach — `CordialGraphicsBackend` and `CordialPresentMode`
+            // included, and every future one inherits it. "Change some Roblox
+            // settings" would be technically true and materially misleading,
+            // which is the standard `webview_policy.rs` already holds a URL to.
+            Capability::FlagsWrite => {
+                "Change how Cordial itself renders and behaves. Sets Roblox FastFlags, and also \
+                 Cordial's own settings including the graphics backend and present mode. Takes \
+                 effect at the next launch. Your own choices in Settings still win."
+            }
+            Capability::FlagsWriteDynamic => {
+                "Change a dynamic Roblox setting while you are playing, without a restart. Static \
+                 settings are read once at startup and cannot be changed this way."
+            }
+            Capability::Log => "Write lines into Cordial's own log output. Nothing leaves this machine.",
+            Capability::LifecycleRead => {
+                "Know when the client launches, becomes ready and shuts down. Not what you play."
+            }
+            // ADR-007 calls this out as privacy-relevant and says the UI
+            // should state what it publishes rather than merely that it is on.
+            Capability::PresenceSet => {
+                "Publish what you are playing to Discord, where your friends can see it. Cordial \
+                 owns the connection; the plugin decides what it says."
+            }
+            Capability::NotifySend => "Show you desktop notifications.",
+            Capability::UrlOpen => {
+                "Open a web page in your browser. Only http and https addresses, and only when the \
+                 plugin asks — it cannot browse on its own."
+            }
+            // ADR-010's "what is still refused" section earned this second
+            // sentence. Replacing a collision or hitbox mesh with a smaller or
+            // absent one is a substantive advantage rather than a cosmetic
+            // change, Cordial builds no detection for it, and the user is the
+            // one deciding. Saying only "replace textures and sounds" would
+            // describe the common case and hide the one that matters.
+            Capability::AssetsOverride => {
+                "Replace Roblox's own textures, sounds, fonts and models with files it supplies. \
+                 Nothing is written into Roblox's files and removing the plugin puts the originals \
+                 back. Replacing a model can change more than appearance, and Cordial does not \
+                 check which is which."
+            }
+            Capability::SettingsRead => "Read what it previously saved for itself. Its own data only.",
+            Capability::SettingsWrite => {
+                "Replace what it saved for itself, including discarding all of it. Its own data only."
+            }
+            Capability::EventsDeclare => "Announce the kinds of message it can send to other plugins.",
+            Capability::EventsPublish => {
+                "Send messages to other plugins, under its own name only — it cannot speak as \
+                 another plugin."
+            }
+            Capability::EventsSubscribe => {
+                "Receive messages other plugins send, including ones it did not declare."
+            }
+        }
+    }
+
     /// Every capability, so a UI can present the full set rather than a
     /// hand-maintained copy that drifts.
     pub fn all() -> &'static [Capability] {
@@ -198,6 +281,42 @@ mod tests {
         }
         let names: BTreeSet<&str> = Capability::all().iter().map(|c| c.name()).collect();
         assert_eq!(names.len(), Capability::all().len(), "two capabilities share a wire name");
+    }
+
+    #[test]
+    fn every_capability_says_what_it_actually_does() {
+        // `consequence` is the text a user reads before deciding, so a
+        // variant added without one would present as a blank line in the
+        // prompt — a permission the user was asked to approve with no
+        // description of it. The compiler catches a missing arm; this catches
+        // an arm someone filled in with nothing.
+        for c in Capability::all() {
+            let text = c.consequence();
+            assert!(!text.is_empty(), "{c} has no description");
+            assert!(text.ends_with('.'), "{c}: a description is a sentence, not a label: {text:?}");
+            // Only the dotted names are checked. `log`'s wire name is an
+            // ordinary English word and its description says "log output"
+            // legitimately; the jargon this guards against is `flags.write`
+            // and `presence.set` appearing where a sentence should be.
+            if c.name().contains('.') {
+                assert!(
+                    !text.contains(c.name()),
+                    "{c}: the description must say what it does, not repeat its wire name: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flags_write_says_it_changes_cordial_itself() {
+        // The one that would otherwise be described as "change some Roblox
+        // settings" — technically true and materially misleading. ADR-020
+        // records that it reaches every `Cordial`-prefixed key, the graphics
+        // backend and present mode included, so the description has to say so.
+        let text = Capability::FlagsWrite.consequence();
+        assert!(text.contains("Cordial"), "{text:?}");
+        assert!(text.contains("graphics backend"), "{text:?}");
+        assert!(text.contains("present mode"), "{text:?}");
     }
 
     #[test]

@@ -29,6 +29,7 @@ use libadwaita::prelude::*;
 use std::collections::BTreeSet;
 
 use cordial_plugins::capability::Capability;
+use cordial_plugins::consent;
 use cordial_plugins::enablement;
 use cordial_plugins::grants;
 use cordial_plugins::manifest::{self, Plugin};
@@ -757,40 +758,21 @@ fn build_general_page(
 /// instance in any case. A toggle that looked immediate and was not is exactly
 /// the small lie this project keeps writing ADRs about, so the wording is the
 /// weaker claim.
-/// A short, user-facing sentence for one capability — a checkbox needs prose,
-/// and `cordial_plugins::capability::Capability`'s own doc comments are the
-/// protocol's vocabulary, not this window's. Kept here rather than in that
-/// crate for the same reason `capability_summary` is: this is a shell
-/// concern, not a protocol one.
+/// A short, user-facing sentence for one capability, from
+/// [`Capability::consequence`].
+///
+/// **This used to be a second table, and it had already drifted.** It
+/// described `flags.write` as "Contribute FastFlag overrides that take effect
+/// at the next launch", which is what the capability was called and not what
+/// it does — ADR-020 records that the same capability sets
+/// `CordialGraphicsBackend` and `CordialPresentMode`, so a user reading that
+/// line had been told something technically true and materially misleading.
+/// The sentences now live beside the enum, where a variant cannot be added
+/// without one and where the install prompt and this page read the same words.
+/// The wrapper stays because two call sites want it and a rename in the
+/// protocol crate should not reach into widget-building code.
 fn capability_description(cap: Capability) -> &'static str {
-    match cap {
-        Capability::FlagsRead => "Read which FastFlag overrides are in effect, and where each came from.",
-        Capability::FlagsWrite => "Contribute FastFlag overrides that take effect at the next launch.",
-        Capability::FlagsWriteDynamic => {
-            "Change a DFFlag/DFInt/DFString while the client is running. Not available yet — \
-             nothing in Cordial writes into the running engine."
-        }
-        Capability::Log => "Write log lines into Cordial's own output.",
-        Capability::LifecycleRead => "Observe client lifecycle events — launch, ready, shutdown.",
-        Capability::PresenceSet => {
-            "Publish Discord Rich Presence. Cordial holds the connection to Discord; this only \
-             sends what to show."
-        }
-        Capability::NotifySend => "Post a desktop notification.",
-        Capability::UrlOpen => "Open an http(s) link in your browser.",
-        Capability::AssetsOverride => {
-            "Overlay files in place of Roblox's own assets — textures, sounds, fonts. Never \
-             modifies the APK; removing the plugin restores the original."
-        }
-        Capability::SettingsRead => {
-            "Read the settings document Cordial keeps for it, and the preferences you set on its \
-             own page."
-        }
-        Capability::SettingsWrite => "Replace the settings document Cordial keeps for it.",
-        Capability::EventsDeclare => "Register its own event types, for other plugins to hear.",
-        Capability::EventsPublish => "Broadcast on an event type it has declared.",
-        Capability::EventsSubscribe => "Receive events, including ones other plugins declared.",
-    }
+    cap.consequence()
 }
 
 /// Recompute and set `expander`'s subtitle from what is actually on disk,
@@ -1043,20 +1025,68 @@ fn build_install_group(
             };
             match unpack::install_local(&bytes, &root) {
                 Ok((plugin, _dir)) => {
-                    let name = if plugin.manifest.name.is_empty() {
-                        plugin.manifest.id.clone()
-                    } else {
-                        plugin.manifest.name.clone()
-                    };
-                    let requests = if plugin.requested.is_empty() {
-                        "no capabilities".to_string()
-                    } else {
-                        plugin.requested.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")
-                    };
-                    row.set_subtitle(&format!(
-                        "Installed {name}. It asks for {requests}; allow what you want to on \
-                         the Plugins page."
-                    ));
+                    // ADR-021's first consent rule, and the one the other two
+                    // depend on: a plugin with nothing to run and nothing it
+                    // could reach is installed without interrupting anybody.
+                    // If every import prompts, the prompt means nothing by the
+                    // third one — and then it is not protecting the install
+                    // that mattered.
+                    match consent::verdict(&plugin) {
+                        consent::Verdict::Silent => {
+                            row.set_subtitle(&format!(
+                                "Installed {}. It contains no code and asks for no permissions.",
+                                display_name(&plugin)
+                            ));
+                        }
+                        consent::Verdict::Ask(prompt) => {
+                            let dialog = adw::AlertDialog::builder()
+                                .heading(prompt.heading())
+                                .body(consent_body(&prompt))
+                                .build();
+                            dialog.add_response("skip", "Not now");
+                            dialog.add_response("allow", "Allow");
+                            dialog.set_response_appearance("allow", adw::ResponseAppearance::Suggested);
+                            // The safe answer is the default and the close
+                            // action, so dismissing the dialog grants nothing
+                            // — ADR-003's default deny has to survive somebody
+                            // pressing Escape.
+                            dialog.set_default_response(Some("skip"));
+                            dialog.set_close_response("skip");
+
+                            let profile_for_dialog = profile_dir.clone();
+                            let id = plugin.manifest.id.clone();
+                            let requested: Vec<_> = plugin.requested.iter().copied().collect();
+                            let row_for_dialog = row.clone();
+                            let name = display_name(&plugin);
+                            dialog.connect_response(None, move |dialog, response| {
+                                if response == "allow" {
+                                    if let Some(profile_dir) = profile_for_dialog.as_ref() {
+                                        let path = grants::path_in(profile_dir);
+                                        for cap in &requested {
+                                            if let Err(e) = grants::set(&path, &id, *cap, true) {
+                                                eprintln!(
+                                                    "shell: could not record {id}'s {} grant: {e}",
+                                                    cap.name()
+                                                );
+                                            }
+                                        }
+                                    }
+                                    row_for_dialog.set_subtitle(&format!(
+                                        "Installed {name} and allowed what it asked for. It is \
+                                         switched off until you turn it on."
+                                    ));
+                                } else {
+                                    row_for_dialog.set_subtitle(&format!(
+                                        "Installed {name}. It was allowed nothing; choose what \
+                                         it may do on the Plugins page."
+                                    ));
+                                }
+                                dialog.close();
+                            });
+                            dialog.present(Some(&window));
+                        }
+                    }
+                    park_new_plugin_disabled(profile_dir.as_ref(), &plugin);
                     let new_row = build_plugin_row(
                         &window,
                         &plugin,
@@ -1086,23 +1116,78 @@ fn build_install_group(
 /// below, which resolves a second time once the user has agreed, rather than
 /// carrying this borrow of the index across the time a modal dialog is open.
 fn plan_confirmation_text(plan: &resolve::Plan<'_>) -> String {
-    let lines: Vec<String> = plan
-        .steps
-        .iter()
-        .map(|step| {
-            let caps = if step.capabilities.is_empty() {
-                "no capabilities".to_string()
-            } else {
-                step.capabilities.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")
-            };
-            format!("{} {} — requests: {caps}", step.id, step.version)
-        })
-        .collect();
+    let mut out = String::new();
+    for step in &plan.steps {
+        out.push_str(&format!("{} {}\n", step.id, step.version));
+        if step.capabilities.is_empty() {
+            out.push_str("    Asks for no permissions.\n");
+        }
+        // The sentences, not the wire names. A dialog reading "requests:
+        // flags.write, presence.set" is accurate, unreadable, and answered
+        // yes by everybody — ADR-021 argues the wording is the whole job, and
+        // `Capability::consequence` is where it is kept so it cannot drift
+        // from the enum.
+        for cap in &step.capabilities {
+            out.push_str("    • ");
+            out.push_str(cap.consequence());
+            out.push('\n');
+        }
+        out.push('\n');
+    }
     format!(
-        "Installing this grants each plugin below exactly what it requests, in this profile \
-         only. Nothing is granted anywhere else, and nothing is granted at all if you cancel.\n\n{}",
-        lines.join("\n")
+        "Installing this grants each plugin below exactly what is listed, in this profile only. \
+         Nothing is granted anywhere else, and nothing is granted at all if you cancel. Anything \
+         with code in it starts switched off.\n\n{}",
+        out.trim_end()
     )
+}
+
+/// A plugin's display name, falling back to its id — the same fallback the
+/// consent prompt makes, kept in one place so a row and a dialog cannot
+/// disagree about what a plugin is called.
+fn display_name(plugin: &Plugin) -> String {
+    if plugin.manifest.name.is_empty() {
+        plugin.manifest.id.clone()
+    } else {
+        plugin.manifest.name.clone()
+    }
+}
+
+/// The body of the install prompt for one plugin: what it will be able to do,
+/// in sentences, and the line saying it starts switched off.
+///
+/// Pure, so it can be tested without a display connection — the dialog around
+/// it cannot be, and the part worth testing is the text.
+fn consent_body(prompt: &consent::Prompt) -> String {
+    let mut out = String::new();
+    for effect in &prompt.effects {
+        out.push_str("• ");
+        out.push_str(effect.description);
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(prompt.footer());
+    out
+}
+
+/// Record that a freshly installed plugin with code starts switched off.
+///
+/// **Consent and enablement are two acts, and this is the second one not
+/// happening.** Before this, an install dialog's OK button both granted the
+/// capabilities and — through `enablement`'s "absence means enabled" — started
+/// the process at the next launch, which is one act wearing the clothes of
+/// two. Data-only plugins are left absent, and therefore on: there is nothing
+/// to start, and a switch with no argument behind it is worse than no switch.
+fn park_new_plugin_disabled(profile_dir: Option<&PathBuf>, plugin: &Plugin) {
+    if !consent::starts_disabled(plugin) {
+        return;
+    }
+    let Some(profile_dir) = profile_dir else { return };
+    if let Err(e) = enablement::set_enabled(profile_dir, &plugin.manifest.id, false) {
+        eprintln!("shell: could not park {} as disabled: {e}", plugin.manifest.id);
+    }
 }
 
 /// One entry a marketplace index offers: what it is, what installing it (and
@@ -1246,6 +1331,10 @@ fn build_marketplace_entry_row(
                                         continue;
                                     };
                                     let Ok(plugin) = manifest::parse(&text, dir) else { continue };
+                                    // The plan above granted what it listed;
+                                    // starting the process is the separate
+                                    // act, and it is the user's.
+                                    park_new_plugin_disabled(Some(&profile_dir), &plugin);
                                     let new_row = build_plugin_row(
                                         &window,
                                         &plugin,
@@ -1851,8 +1940,72 @@ mod tests {
         let text = plan_confirmation_text(&plan);
         assert!(text.contains("app 1.0.0"), "{text}");
         assert!(text.contains("lib 1.0.0"), "{text}");
-        assert!(text.contains("assets.override"), "a dependency's own capability must be shown, \
-            not only the plugin the user clicked on: {text}");
-        assert!(text.contains("log"), "{text}");
+        // The sentences, not the wire names: the point of the dialog is that
+        // somebody can judge what they are agreeing to, and "requests:
+        // assets.override" is not something anybody judges.
+        assert!(
+            text.contains(Capability::AssetsOverride.consequence()),
+            "a dependency's own capability must be shown, not only the plugin the user clicked \
+             on: {text}"
+        );
+        assert!(text.contains(Capability::Log.consequence()), "{text}");
+        assert!(
+            !text.contains("assets.override"),
+            "the wire name is not what a user reads: {text}"
+        );
+        assert!(text.contains("starts switched off"), "{text}");
+    }
+
+    #[test]
+    fn a_data_only_plugin_is_installed_without_a_prompt_and_stays_enabled() {
+        // ADR-021's first consent rule, checked where it actually decides
+        // something. A texture pack has no entry module and no capabilities,
+        // so there is nothing to run, nothing it could reach, and nothing to
+        // ask — and nothing to switch off either, because a switch with no
+        // argument behind it is worse than no switch.
+        let pack = fixture(r#"{"id":"retro-ui","name":"Retro UI"}"#);
+        assert_eq!(consent::verdict(&pack), consent::Verdict::Silent);
+
+        let profile = std::env::temp_dir().join("cordial-settings-consent-data");
+        let _ = std::fs::remove_dir_all(&profile);
+        std::fs::create_dir_all(&profile).unwrap();
+        park_new_plugin_disabled(Some(&profile), &pack);
+        assert!(
+            enablement::is_enabled(&profile, "retro-ui"),
+            "data has nothing to start, so it must not be parked off"
+        );
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    #[test]
+    fn a_plugin_with_code_is_parked_switched_off_however_the_prompt_was_answered() {
+        // Consent and enablement are two acts. Before this, an install
+        // dialog's OK both granted the capabilities and — through
+        // `enablement`'s "absence means enabled" — started the process at the
+        // next launch, which is one act wearing the clothes of two.
+        let plugin = fixture(r#"{"id":"tweaks","name":"Tweaks","entry":"main.ts","capabilities":["flags.write"]}"#);
+        let profile = std::env::temp_dir().join("cordial-settings-consent-code");
+        let _ = std::fs::remove_dir_all(&profile);
+        std::fs::create_dir_all(&profile).unwrap();
+        park_new_plugin_disabled(Some(&profile), &plugin);
+        assert!(!enablement::is_enabled(&profile, "tweaks"));
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    #[test]
+    fn the_consent_body_says_what_it_does_and_that_it_starts_off() {
+        // The whole argument of ADR-021's consent section, in one assertion:
+        // a prompt that says "wants to run code" is answered yes by
+        // everybody, and one that names the effect is not.
+        let plugin = fixture(r#"{"id":"t","name":"T","entry":"m.ts","capabilities":["flags.write"]}"#);
+        let consent::Verdict::Ask(prompt) = consent::verdict(&plugin) else {
+            panic!("code must be asked about")
+        };
+        let body = consent_body(&prompt);
+        assert!(body.contains("graphics backend"), "{body}");
+        assert!(body.contains("present mode"), "{body}");
+        assert!(body.contains("starts switched off"), "{body}");
+        assert!(!body.contains("run code"), "{body}");
+        assert!(prompt.heading().contains("will be able to"), "{}", prompt.heading());
     }
 }

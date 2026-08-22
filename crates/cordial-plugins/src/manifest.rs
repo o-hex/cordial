@@ -42,6 +42,23 @@ pub struct Manifest {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    /// The module to run, if this plugin runs anything.
+    ///
+    /// **Optional, and its absence is the whole signal that this plugin is
+    /// data** — a texture pack, a flag preset, a set of preferences — rather
+    /// than something with code in it
+    /// ([ADR-021](../../../docs/adr/ADR-021-everything-is-a-plugin.md)). There
+    /// is deliberately no `type` key saying which sort of thing this is: two
+    /// facts that can disagree eventually do, and the disagreement here would
+    /// be a plugin declaring itself data while shipping an entry module, or an
+    /// entry module that never runs because a key says it should not.
+    ///
+    /// It is also what the install prompt is gated on. A plugin with nothing
+    /// to run and nothing to reach gets no prompt at all, because a prompt
+    /// that appears for every import is answered yes by everybody by the third
+    /// one, and then it is not protecting anything. See
+    /// [`crate::consent`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub entry: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -168,7 +185,24 @@ impl Plugin {
     /// Rejects anything that escapes it. A manifest is attacker-controlled input
     /// as far as this is concerned — it arrives with the plugin — and `"entry":
     /// "../../../etc/shadow"` must not resolve.
+    /// Whether this plugin contains anything to run.
+    ///
+    /// A property read off the manifest, never a category the manifest
+    /// declares. Everything is a plugin; some plugins happen to contain code,
+    /// and that is the only distinction that exists — which is what lets a
+    /// texture pack grow an entry module in version 2 without changing what it
+    /// is, keeping its id, its directory and the user's settings for it.
+    pub fn has_code(&self) -> bool {
+        !self.manifest.entry.is_empty()
+    }
+
     pub fn entry_path(&self) -> Result<PathBuf, String> {
+        if self.manifest.entry.is_empty() {
+            return Err(format!(
+                "{:?} declares no entry module, so there is nothing to run",
+                self.manifest.id
+            ));
+        }
         let entry = Path::new(&self.manifest.entry);
         if entry.is_absolute() || entry.components().any(|c| c.as_os_str() == "..") {
             return Err(format!("entry {:?} must be a path inside the plugin directory", self.manifest.entry));

@@ -13,6 +13,7 @@
 
 pub mod broker;
 pub mod capability;
+pub mod consent;
 pub mod enablement;
 pub mod events;
 pub mod grants;

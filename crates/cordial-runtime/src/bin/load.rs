@@ -27,6 +27,7 @@ struct Options {
     /// from the path afterwards is one more place for the two to disagree.
     profile: Option<String>,
     read_asset: Option<String>,
+    check_overlays: bool,
     client_settings: Option<String>,
     flag_overrides: Option<String>,
     gl_probe: bool,
@@ -47,6 +48,7 @@ usage: cordial-load --lib-dir <dir> [options]
   --library <name>  object to load (default: libroblox.so)
   --apk <path>      APK to serve assets from; without it AAssetManager_open fails
   --read-asset <p>  read one asset through the AAsset API and report its size
+  --check-overlays  report which overlay files match nothing in this build, then exit
   --client-settings <f>  newline-free list of flag names to pre-cache.
                     NOT the ClientSettings document — the engine loads values itself
   --flag-overrides <f>  JSON passed to nativePreloadFlagOverrides. DIAGNOSTIC
@@ -162,6 +164,7 @@ fn parse() -> Result<Options, String> {
         apk: None,
         profile: None,
         read_asset: None,
+        check_overlays: false,
         client_settings: None,
         flag_overrides: None,
         gl_probe: false,
@@ -208,6 +211,7 @@ fn parse() -> Result<Options, String> {
             "--read-asset" => {
                 opt.read_asset = Some(args.next().ok_or("--read-asset needs a name")?)
             }
+            "--check-overlays" => opt.check_overlays = true,
             "--flag-overrides" => {
                 let p = args.next().ok_or("--flag-overrides needs a path")?;
                 opt.flag_overrides = Some(
@@ -297,7 +301,17 @@ fn asset_folder(apk: &Option<String>) -> String {
         .unwrap_or_else(std::env::temp_dir)
         .join("cordial/assets");
     match cordial_runtime::android::asset::extract_to(&base) {
-        Ok(dir) => dir.join("content").to_string_lossy().into_owned(),
+        Ok(dir) => {
+            // The overlay resolver needs the *extraction root*, not the
+            // `content` subdirectory handed to the engine: overlay names are
+            // relative to `assets/`, so `content/…` is part of the name.
+            // Both routes then share one index, which they must — an overlay
+            // that applied to a texture reached through `AAssetManager` and
+            // not to the same texture reached by path would be a bug nobody
+            // would guess from the symptom (ADR-021).
+            cordial_runtime::android::asset::set_asset_root(&dir);
+            dir.join("content").to_string_lossy().into_owned()
+        }
         Err(e) => {
             println!("  asset extraction failed ({e}); using the APK path");
             apk.clone()
@@ -1271,8 +1285,62 @@ fn main() -> ExitCode {
     // anything asks the engine to resolve a path.
     if opt.apk.is_some() {
         let _ = asset_folder(&opt.apk);
+        // Before the engine reads a single asset, and therefore long before
+        // `plugin_host::start_all` further down: an overlay registered after
+        // the engine has already loaded a texture cannot change it, because
+        // the bytes are cached and the engine holds a pointer into them
+        // (ADR-010's caching note). A data-only plugin has no process to
+        // register anything of its own, so this is the only point at which a
+        // texture pack can take effect at all.
+        let n = cordial_runtime::plugin_host::register_static_overlays();
+        if n > 0 {
+            println!("  {n} plugin asset overlay(s) registered");
+        }
+        if cordial_runtime::android::asset::start_watcher() {
+            println!("  overlay: watching for changes (CORDIAL_OVERLAY_WATCH)");
+        }
     }
     enter_run_dir(&mut opt);
+
+    // Answers "which of my mod's files can never apply" without starting the
+    // engine, which is the point: the check is against the APK's own entry
+    // list, so it needs an archive and an overlay stack and nothing else. The
+    // weaker signal -- a file that exists in the build but was never asked for
+    // -- deliberately is not offered here, because it can only be honest after
+    // a session that actually played something (ADR-021).
+    if opt.check_overlays {
+        // Already registered above, with the APK, so this only reads.
+        let index = cordial_runtime::android::asset::index();
+        println!("overlay: {} file(s) across every registered layer", index.len());
+        // Named rather than guessed: if the scan cannot find a version, the
+        // report says which archive it checked against instead of inventing
+        // one. "no longer matches anything in client <something wrong>" is a
+        // worse answer than naming the file.
+        let label = cordial_runtime::android::asset::client_version()
+            .unwrap_or_else(|| opt.apk.clone().unwrap_or_else(|| "this build".into()));
+        match cordial_runtime::android::asset::apk_asset_names() {
+            Ok(apk) => {
+                let lines = cordial_runtime::android::asset::stale_report(&apk, &label);
+                if lines.is_empty() {
+                    println!("overlay: every overlay file matches something in this build");
+                }
+                for line in lines {
+                    println!("overlay: {line}");
+                }
+                for orphan in cordial_runtime::android::asset::stale(&apk) {
+                    println!("    stale  {} ({})", orphan.name, orphan.source.describe());
+                }
+            }
+            Err(e) => {
+                eprintln!("overlay: cannot read the APK's asset list ({e})");
+                return ExitCode::FAILURE;
+            }
+        }
+        for line in cordial_runtime::android::asset::shadow_report() {
+            println!("overlay: {line}");
+        }
+        return ExitCode::SUCCESS;
+    }
 
     if let Some(name) = &opt.read_asset {
         match cordial_runtime::android::asset::probe(name) {
@@ -3867,6 +3935,41 @@ fn main() -> ExitCode {
                                                         cordial_runtime::android::glcount::report()
                                                     {
                                                         println!("    {name:<24} {n}");
+                                                    }
+
+                                                    // The instrument ADR-021
+                                                    // is built around: one
+                                                    // cold launch plus one
+                                                    // game join is the
+                                                    // ground-truth list of
+                                                    // every asset this build
+                                                    // actually reads, which
+                                                    // is what both orphan
+                                                    // signals are diffed
+                                                    // against. Written at the
+                                                    // end because the set is
+                                                    // only complete then, and
+                                                    // never fatal -- a run
+                                                    // that produced a client
+                                                    // is not a failed run
+                                                    // because a log could not
+                                                    // be saved.
+                                                    let trace =
+                                                        cordial_runtime::android::asset::trace_path();
+                                                    match cordial_runtime::android::asset::write_trace(&trace) {
+                                                        Ok(n) => println!(
+                                                            "\n  {n} distinct assets requested -> {}",
+                                                            trace.display()
+                                                        ),
+                                                        Err(e) => println!(
+                                                            "  asset trace not written ({}): {e}",
+                                                            trace.display()
+                                                        ),
+                                                    }
+                                                    for line in
+                                                        cordial_runtime::android::asset::shadow_report()
+                                                    {
+                                                        println!("    overlay: {line}");
                                                     }
                                                 }
                                             }

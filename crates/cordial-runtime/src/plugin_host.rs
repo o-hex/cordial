@@ -93,6 +93,17 @@ pub fn start_all() -> usize {
             continue;
         }
 
+        // A plugin with no entry module is data — a texture pack, a flag
+        // preset, a set of preferences — and there is nothing to spawn. Said
+        // plainly rather than falling through to "no capabilities granted",
+        // which would report a working asset pack as a failed plugin and send
+        // its author looking for a permission that was never involved.
+        // ADR-021: code is a property read off the manifest, not a category.
+        if !plugin.has_code() {
+            println!("  plugin {id}: data only, nothing to start");
+            continue;
+        }
+
         let granted = approved.get(&id).cloned().unwrap_or_default();
 
         // Say what was withheld. A plugin silently doing less than it asked for
@@ -152,6 +163,55 @@ pub fn start_all() -> usize {
         }
     }
     started
+}
+
+/// Register every enabled plugin's own `overlay/` directory with the asset
+/// resolver, before the engine asks for anything.
+///
+/// **A shipped overlay directory needs no capability, and that is the existing
+/// precedent rather than a new hole.** `flags::collect` already reads every
+/// enabled plugin's `flags.json` with no capability check at all, because a
+/// static file a plugin ships is not a request a process is making — it is
+/// what the plugin *is*, and installing and enabling it is the consent. The
+/// `assets.override` capability gates something different: a **running**
+/// plugin asking Cordial to register a directory of its choosing at runtime,
+/// which is a request from a process and is brokered like every other one
+/// (ADR-007). Getting these two confused would mean a texture pack that
+/// cannot work without a permission prompt for a process it does not have.
+///
+/// Without this, a data-only plugin could not overlay anything at all: the
+/// only way to register a root was the `assets.override` call, and a plugin
+/// with no entry module has nothing to make it from. That is the whole
+/// mechanism ADR-021 needs for "a texture pack is a plugin" to be true rather
+/// than aspirational.
+///
+/// **System first, then the user root, sorted within each**, matching
+/// `flags::collect` exactly — including its rule that a user plugin may not
+/// shadow a first-party id. Registration order is precedence order among
+/// plugins (last wins), so this is the fact a shadow report can quote, and it
+/// does not depend on directory iteration order.
+pub fn register_static_overlays() -> usize {
+    let profile = crate::profile::active();
+    let mut claimed: std::collections::BTreeSet<String> = Default::default();
+    let mut registered = 0usize;
+    for root in crate::flags::plugin_dirs() {
+        for plugin in manifest::discover(&root) {
+            let id = plugin.manifest.id.clone();
+            if !claimed.insert(id.clone()) {
+                continue;
+            }
+            if !enabled_in_profile(&profile, &id) {
+                continue;
+            }
+            let overlay = plugin.dir.join("overlay");
+            if !overlay.is_dir() {
+                continue;
+            }
+            crate::android::asset::register_plugin_root(&id, overlay);
+            registered += 1;
+        }
+    }
+    registered
 }
 
 /// Whether `id` is allowed to run in `profile_dir`, per Settings' plugin

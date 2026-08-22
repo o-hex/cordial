@@ -3,8 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cordial — Roblox on Linux</title>
-<meta name="description" content="Play Roblox on Linux. No Wine, no emulator, no Android container.">
+<title>Cordial — Open-Source Roblox for Linux | Sober Alternative</title>
+<meta name="description" content="Cordial is an open-source Roblox client for Linux, GPL-3.0 and fully auditable. Runs Roblox natively with no Wine, no emulator and no Android container. A free and open-source alternative to Sober.">
+<link rel="canonical" href="https://luohoa97.github.io/cordial/">
+<meta property="og:title" content="Cordial — Open-Source Roblox for Linux">
+<meta property="og:description" content="An open-source, GPL-3.0 Roblox client for Linux. Native, no Wine, no emulator, no Android container.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://luohoa97.github.io/cordial/">
+<meta name="twitter:card" content="summary">
 <link rel="icon" href="favicon.svg">
 <style>
   :root {
@@ -70,16 +76,27 @@
 
   <header>
     <img src="cordial.svg" alt="">
-    <h1>Cordial</h1>
-    <p class="tag">Play Roblox on Linux.</p>
+    <h1>Open-source Roblox for Linux</h1>
+    <p class="tag">Cordial runs Roblox natively. No Wine, no emulator, no Android container.</p>
     <a class="cta" href="#install">Install</a>
     <span class="under">Flatpak · x86-64 · needs a Vulkan GPU</span>
   </header>
 
   <p>
     Cordial runs Roblox’s official Android build natively on your machine —
-    no Wine, no emulator, no Android container. It fetches the build from
-    Roblox itself the first time you launch it.
+    no Wine, no emulator, no Android container. It is
+    <strong>GPL-3.0 and fully auditable</strong>: every line of what runs on
+    your machine is published, which is the part most Linux Roblox clients
+    cannot say.
+  </p>
+
+  <p class="n">
+    <strong>You supply the Roblox build.</strong> Cordial ships none and
+    cannot download one: Roblox publishes no Android binary to fetch — its own
+    update endpoint answers <code>supportsAndroidBinaries: false</code> — and
+    the APK is distributed through Google Play. In practice Cordial reads the
+    copy Sober has already downloaded, or an APK you point it at yourself.
+    Removing that step is open work, not a solved problem.
   </p>
 
   <h2>What you get</h2>
@@ -99,6 +116,45 @@
     <p>Every Roblox flag you set, and every conflict between them, printed at
        startup. No config file with a “don’t edit this by hand” warning at the top.</p>
   </div>
+
+  <h2 id="compare">Cordial vs Sober vs Waydroid</h2>
+
+  <p class="n">
+    Written to be useful rather than flattering. Sober is a good client and is
+    what most people on Linux use today; if you want the smoothest path and do
+    not care about source availability, use Sober.
+  </p>
+
+  <table>
+    <tr>
+      <td colspan="2"><strong>Cordial</strong></td>
+    </tr>
+    <tr><td class="n">Source</td><td><strong>Open, GPL-3.0.</strong> Every line auditable.</td></tr>
+    <tr><td class="n">How</td><td>Native. AOSP bionic linker, a bionic/glibc shim, a JNI VM in place of Android’s.</td></tr>
+    <tr><td class="n">Extensible</td><td>Yes — a plugin API with brokered capabilities. No plugin gets a socket or a file descriptor.</td></tr>
+    <tr><td class="n">Gets the build</td><td>You supply it, or it reads Sober’s copy.</td></tr>
+    <tr><td class="n">Maturity</td><td>Younger, and rougher. See the status page before installing.</td></tr>
+
+    <tr><td colspan="2" style="padding-top:1.2rem"><strong>Sober</strong></td></tr>
+    <tr><td class="n">Source</td><td><strong>Not available.</strong> <code>vinegarhq/sober</code> is an issue tracker; the client itself is not published.</td></tr>
+    <tr><td class="n">How</td><td>Native, by its own account. Architecture not described in detail.</td></tr>
+    <tr><td class="n">Extensible</td><td>FastFlags, no plugin API.</td></tr>
+    <tr><td class="n">Gets the build</td><td>Downloads it for you. This is the thing it does that Cordial does not.</td></tr>
+    <tr><td class="n">Maturity</td><td>Mature and widely used.</td></tr>
+
+    <tr><td colspan="2" style="padding-top:1.2rem"><strong>Waydroid</strong></td></tr>
+    <tr><td class="n">Source</td><td>Open, GPL-3.0.</td></tr>
+    <tr><td class="n">How</td><td>A full Android container. Roblox runs inside Android, which runs on your kernel.</td></tr>
+    <tr><td class="n">Extensible</td><td>Not for Roblox specifically.</td></tr>
+    <tr><td class="n">Gets the build</td><td>You install the APK inside Android.</td></tr>
+    <tr><td class="n">Maturity</td><td>Mature, but it is general Android infrastructure and not a Roblox client.</td></tr>
+  </table>
+
+  <p class="n">
+    The short version: <strong>Waydroid</strong> runs Android and Roblox happens
+    to be in it. <strong>Sober</strong> runs Roblox and does not show you how.
+    <strong>Cordial</strong> runs Roblox and shows you all of it.
+  </p>
 
   <h2 id="install">Install</h2>
 

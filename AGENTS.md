@@ -252,9 +252,33 @@ lldb -p $(pgrep -f 'cordial-run.*--profile <yours>') -b \
 lldb rather than gdb because Cordial is a Clang project by necessity -- AOSP's
 bionic does not build with GCC -- so it is the toolchain already required.
 **Not for speed:** attach-and-backtrace measured 1.63 s and 1.56 s against gdb's
-1.64 s and 1.65 s here, which is a tie, and both resolved Cordial frames to file
-and line. gdb still works and the equivalent is
+1.64 s and 1.65 s here, which is a tie. gdb still works and the equivalent is
 `gdb -p PID -batch -ex 'thread apply all bt 12'`.
+
+**Keep gdb to hand, because lldb cannot unwind every stack.** This paragraph
+used to say both resolved Cordial frames to file and line, which is true of an
+ordinary address and false of the one that mattered. On 2026-08-22 a genuinely
+deadlocked client gave lldb nothing but
+
+    frame #0: libc.so.6`__syscall_cancel_arch_end
+
+for every thread, twice, including with disassembly display off. gdb walked the
+same process and named both halves of the deadlock. Without it the bug would
+not have been found.
+
+The cause is specific and worth knowing rather than generalising from: the
+return address landed on `__syscall_cancel_arch_end+0`, a bare zero-size label
+marking the end of glibc's cancellable-syscall region. At offset zero of a
+symbol with no size there are no function bounds and so no unwind plan, and the
+walk stops; gdb gets past it on its own heuristics. **lldb is not the weaker
+unwinder in general** -- on a `sleep(300)` stopped mid-function it produced five
+correct frames to gdb's four. Nor is it a missing-symbol problem: gdb reported
+debuginfod off, this host has no glibc debuginfo, and it still unwound from
+`.eh_frame` alone.
+
+`cordial_backtrace` now notices a stack that did not unwind and retries with
+gdb, saying so. **A one-frame backtrace is not an answer**, and reporting one as
+though it were is the broken instrument this file's opening rule is about.
 
 Easier still, and preferred, is to let the development MCP do it:
 `tools/cordial-mcp.py` exposes `cordial_backtrace` (which quotes the process's

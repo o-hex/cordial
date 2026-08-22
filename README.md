@@ -67,7 +67,6 @@ working alongside it. That is not a footnote. It is why the commit messages are
 long, why `docs/` records what was disproved as carefully as what worked, and why
 nobody should assume a human reviewed every line. The engineering is real and
 every finding was verified by running the thing rather than reasoning about it.
-It has still only existed for two days.
 
 > ### ⚠️ Read this before using an account you care about
 >

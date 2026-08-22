@@ -2971,6 +2971,38 @@ impl WaylandWindow {
         if let Some(keycode) = super::input::keysym_to_android(keysym) {
             if handle != 0 {
                 super::input::deliver_key(handle, down, keycode, evdev_key as i32, meta, 0, unicode, now, now);
+            } else {
+                // **A mapped key with no handle went nowhere and said nothing.**
+                //
+                // The `else` below reports an unmapped keysym on every press,
+                // but this arm -- mapped fine, no activity handle to deliver
+                // to -- was silent, so a key that reached xkb, mapped
+                // correctly, and was then dropped looked identical in every
+                // log to a key that was never pressed. That is the shape this
+                // codebase keeps paying for: not a wrong answer, an absent
+                // one.
+                //
+                // Rate-limited to the first occurrence per key, because a held
+                // movement key repeats and one stuck line per frame would bury
+                // the thing it is trying to show.
+                static COMPLAINED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+                let first = {
+                    let mut seen = COMPLAINED.lock().unwrap_or_else(|e| e.into_inner());
+                    if seen.contains(&evdev_key) {
+                        false
+                    } else {
+                        seen.push(evdev_key);
+                        true
+                    }
+                };
+                if first {
+                    eprintln!(
+                        "[android] wayland: key {evdev_key} (Android {keycode}) mapped but the \
+                         activity handle is 0, so it was dropped before reaching the engine. \
+                         Every later press of this key is dropped the same way and will not be \
+                         reported again."
+                    );
+                }
             }
         } else {
             super::trace(format_args!("wayland: unmapped keysym {keysym:#x}"));

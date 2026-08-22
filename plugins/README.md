@@ -198,6 +198,77 @@ They are two capabilities, not one, for the reason `events.declare` and
 `events.publish` are two: a plugin that only reads its configuration should not
 have to be trusted to rewrite it.
 
+## Preferences: you declare them, Cordial draws them
+
+The section above is your plugin's own scratch document. This is a different
+thing: **settings a person sets**, in a page Cordial builds and Cordial owns.
+
+Declare them in `plugin.json` and a gear appears on your row in Settings. There
+is no capability and no other manifest key to set — declaring a field *is* how
+you get a page, so the button can never appear with nothing behind it.
+
+```json
+{
+  "id": "example",
+  "entry": "main.ts",
+  "capabilities": ["settings.read"],
+  "preferences": [
+    { "key": "loud", "type": "bool", "title": "Be loud",
+      "description": "Shown under the title.", "default": false },
+    { "key": "level", "type": "int", "title": "Level", "default": 3,
+      "minimum": 1, "maximum": 10, "step": 1, "group": "Tuning" },
+    { "key": "mode", "type": "choice", "title": "Mode", "default": "slow",
+      "group": "Tuning",
+      "options": [ { "value": "slow", "label": "Slow" },
+                   { "value": "fast", "label": "Fast" } ] },
+    { "key": "note", "type": "text", "title": "Note", "default": "" }
+  ]
+}
+```
+
+| `type` | the row you get | its own keys |
+|---|---|---|
+| `bool` | a switch | `default` |
+| `int` | a spin box | `default`, `minimum`, `maximum`, `step` |
+| `choice` | a drop-down | `default`, `options` of `{value,label}` |
+| `text` | an entry | `default` |
+
+Every field takes `key`, `title`, and optionally `description` and `group`.
+Fields sharing a `group` become one group on the page, in the order the groups
+first appear; ungrouped fields come first.
+
+Reading them is the same shape as settings, and needs the same `settings.read`:
+
+```ts
+if (msg.id === undefined && msg.event === "cordial/init") {
+  const prefs = msg.payload.preferences;   // every declared key, always
+}
+const prefs = (await call("preferences.get")).result;
+```
+
+**The document you get is always complete and always valid.** Every key you
+declared is present, and every value fits the declaration you wrote — so no
+`?? default` and no range checks in your code. A value saved against an older
+version of your manifest that no longer fits falls back to the current default,
+and Cordial says so in its log rather than silently.
+
+**There is no `preferences.set`, and there is not going to be one.** These
+answers are the user's. A plugin that could rewrite them could set them to
+whatever it liked and have the page show the result back as though the user had
+chosen it. Your own state goes in `settings.json`, which is yours to replace.
+
+**Your words are drawn as text, never as markup.** Titles, descriptions, group
+names and option labels are shown literally; a control character anywhere in
+them refuses the whole plugin at install rather than being stripped quietly.
+
+**Why you cannot draw the page yourself.** GNOME Shell extensions can, because
+they run inside the shell's own process. Your plugin does not: it is a separate
+sandboxed process with no display and no toolkit, and a plugin able to draw in
+Cordial's window could draw something indistinguishable from Cordial's own
+sign-in dialog. See
+[ADR-020](../docs/adr/ADR-020-declarative-plugin-preferences.md), which also
+lists what the declarative form gives up and what is planned to be added to it.
+
 ## Plugins may declare their own events
 
 `events.declare` registers an event type under your plugin's own namespace —

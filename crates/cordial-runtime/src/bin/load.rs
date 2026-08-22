@@ -136,10 +136,14 @@ env:
                                      off (forward the engine's own choice, which
                                      is FIFO — this is the control for a frame
                                      rate measurement), or one of mailbox,
-                                     immediate, fifo, fifo-relaxed. FIFO is the
+                                     immediate, uncapped, fifo, fifo-relaxed.
+                                     'uncapped' means MAILBOX if the driver has
+                                     it and IMMEDIATE otherwise. FIFO is the
                                      only mode the spec guarantees, so anything
                                      the driver does not advertise falls back to
-                                     what the engine asked for
+                                     what the engine asked for. A plugin can ask
+                                     for one through the CordialPresentMode flag
+                                     key; this variable overrules it
   CORDIAL_GAMEMODE=0                 do not ask Feral GameMode to raise the CPU
                                      governor and priority for this process.
                                      On by default; a machine without gamemoded

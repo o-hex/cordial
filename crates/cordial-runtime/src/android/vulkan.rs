@@ -787,8 +787,8 @@ extern "C" fn vk_create_device(
     f(physical_device, create_info, allocator, device_out)
 }
 
-/// What `CORDIAL_PRESENT_MODE` asked for.
-#[derive(Clone, Copy)]
+/// What the present-mode setting asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PresentModeChoice {
     /// Forward whatever the engine put in `VkSwapchainCreateInfoKHR`. This is
     /// the control for a measurement: `CORDIAL_PRESENT_MODE=off` reproduces the
@@ -800,35 +800,137 @@ enum PresentModeChoice {
     Prefer(&'static [i32]),
 }
 
-/// `CORDIAL_PRESENT_MODE=off|auto|mailbox|immediate|fifo|fifo-relaxed`,
-/// unset meaning `auto`.
+/// The flag-layer key that asks for a present mode, and the environment
+/// variable that overrides it.
+///
+/// A `Cordial`-prefixed key rides `flags.rs`'s layering for its precedence and
+/// provenance, and `client_settings.rs`'s `is_roblox_flag` filters it back out
+/// before anything reaches Roblox's settings document — the engine has no idea
+/// this key exists. Exactly the arrangement `graphics.rs`'s
+/// `CordialGraphicsBackend` already uses, deliberately, rather than a second
+/// way of doing the same thing.
+///
+/// **This is what makes "unlock the frame rate" available to a plugin without
+/// giving a plugin the swapchain.** A plugin writes a value into its own flags
+/// layer with `flags.set`; Cordial reads it here and decides what to hand
+/// `vkCreateSwapchainKHR`. The plugin never learns that a swapchain exists,
+/// cannot name a mode the driver does not advertise, and cannot reach any other
+/// Vulkan call — the effect, never the channel (ADR-007). It also inherits the
+/// layering's own answer to "who wins": the user's `flags.json` beats every
+/// plugin's, so a plugin cannot quietly overrule a mode somebody chose.
+pub const PRESENT_MODE_KEY: &str = "CordialPresentMode";
+
+/// `CORDIAL_PRESENT_MODE=off|auto|mailbox|immediate|fifo|fifo-relaxed`.
+pub const PRESENT_MODE_ENV: &str = "CORDIAL_PRESENT_MODE";
+
+/// One spelling of a present mode, or `None` if it is not one.
+///
+/// `None` rather than a fallback, so [`resolve_present_mode`] can say which
+/// setting was unreadable. `graphics.rs` makes the same split for the same
+/// reason: a switch that looks set and silently does nothing is the failure
+/// this project keeps finding.
+fn parse_present_mode(text: &str) -> Option<PresentModeChoice> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Some(PresentModeChoice::Prefer(&[VK_PRESENT_MODE_MAILBOX_KHR])),
+        "off" | "engine" => Some(PresentModeChoice::Untouched),
+        "mailbox" => Some(PresentModeChoice::Prefer(&[VK_PRESENT_MODE_MAILBOX_KHR])),
+        "immediate" => Some(PresentModeChoice::Prefer(&[VK_PRESENT_MODE_IMMEDIATE_KHR])),
+        // "As fast as the driver will let me, tearing if that is what it
+        // takes." MAILBOX first because it uncaps without tearing where the
+        // driver has it; IMMEDIATE is the fallback that always exists. One
+        // name for the intent, so a plugin asking for an uncapped frame rate
+        // does not have to know which modes this surface advertises.
+        "uncapped" => Some(PresentModeChoice::Prefer(&[
+            VK_PRESENT_MODE_MAILBOX_KHR,
+            VK_PRESENT_MODE_IMMEDIATE_KHR,
+        ])),
+        "fifo" => Some(PresentModeChoice::Prefer(&[VK_PRESENT_MODE_FIFO_KHR])),
+        "fifo-relaxed" | "fifo_relaxed" => {
+            Some(PresentModeChoice::Prefer(&[VK_PRESENT_MODE_FIFO_RELAXED_KHR]))
+        }
+        _ => None,
+    }
+}
+
+/// The spellings a setting may use, for an error message that lists them.
+const PRESENT_MODE_NAMES: &str = "off, auto, mailbox, immediate, uncapped, fifo, fifo-relaxed";
+
+/// Which present mode is in force, and who asked for it.
+///
+/// Environment first, then the flag layers, then `auto` — the order
+/// `graphics.rs::resolve` uses, and for its reason: the environment variable is
+/// what a measurement run and the shell both set, so it has to be able to
+/// overrule a plugin that was installed to do something else.
+///
+/// Pure, so the precedence can be tested without a machine that has a Vulkan
+/// driver on it.
+fn resolve_present_mode(
+    from_env: Option<String>,
+    from_flags: Option<(String, String)>,
+) -> (PresentModeChoice, String) {
+    let auto = PresentModeChoice::Prefer(&[VK_PRESENT_MODE_MAILBOX_KHR]);
+
+    if let Some(text) = from_env.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        match parse_present_mode(text) {
+            // An explicit `auto` from the environment still lets a plugin have
+            // its say, the same way `graphics.rs` treats `automatic`: the user
+            // said "you decide", not "ignore everything".
+            Some(choice) if choice == auto && text.eq_ignore_ascii_case("auto") => {}
+            Some(choice) => return (choice, format!("{PRESENT_MODE_ENV}={text}")),
+            None => {
+                println!(
+                    "[android] vulkan: {PRESENT_MODE_ENV}={text:?} is not a present mode; \
+                     using auto. Known: {PRESENT_MODE_NAMES}"
+                );
+                return (auto, format!("auto, after an unusable {PRESENT_MODE_ENV}"));
+            }
+        }
+    }
+
+    if let Some((source, text)) = from_flags {
+        match parse_present_mode(&text) {
+            Some(choice) => return (choice, format!("{PRESENT_MODE_KEY}={text} from {source}")),
+            None => {
+                println!(
+                    "[android] vulkan: {PRESENT_MODE_KEY}={text:?} from {source} is not a \
+                     present mode; using auto. Known: {PRESENT_MODE_NAMES}"
+                );
+                return (auto, format!("auto, after an unusable {PRESENT_MODE_KEY}"));
+            }
+        }
+    }
+
+    (auto, "auto".to_string())
+}
+
+/// What the flag layers say about [`PRESENT_MODE_KEY`], if anything.
+fn present_mode_from_flags() -> Option<(String, String)> {
+    let resolved = crate::flags::resolve(crate::flags::collect());
+    let entry = resolved.get(PRESENT_MODE_KEY)?;
+    Some((entry.source.describe(), entry.value.clone()))
+}
+
+/// The present mode this process will ask for, decided once.
 ///
 /// `auto` prefers MAILBOX alone and not IMMEDIATE. Both uncap the frame rate;
 /// only MAILBOX does it without tearing, because it replaces the queued image
 /// rather than scanning out mid-refresh. Somebody who wants the tearing one can
-/// name it, and then it is their choice rather than a default that quietly made
-/// the picture worse to make a number better.
+/// name it — or say `uncapped` and take whichever the driver has — and then it
+/// is their choice rather than a default that quietly made the picture worse to
+/// make a number better.
+///
+/// Decided once and not re-read: the mode is a field of
+/// `VkSwapchainCreateInfoKHR`, so changing it means a new swapchain, and the
+/// engine owns when that happens. A setting that appeared to change live and
+/// only took effect at the next resize would be worse than one that plainly
+/// takes effect at the next launch.
 fn present_mode_choice() -> PresentModeChoice {
     static CHOICE: OnceLock<PresentModeChoice> = OnceLock::new();
     *CHOICE.get_or_init(|| {
-        let raw = std::env::var("CORDIAL_PRESENT_MODE").unwrap_or_default();
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "auto" => PresentModeChoice::Prefer(&[VK_PRESENT_MODE_MAILBOX_KHR]),
-            "off" | "engine" => PresentModeChoice::Untouched,
-            "mailbox" => PresentModeChoice::Prefer(&[VK_PRESENT_MODE_MAILBOX_KHR]),
-            "immediate" => PresentModeChoice::Prefer(&[VK_PRESENT_MODE_IMMEDIATE_KHR]),
-            "fifo" => PresentModeChoice::Prefer(&[VK_PRESENT_MODE_FIFO_KHR]),
-            "fifo-relaxed" | "fifo_relaxed" => {
-                PresentModeChoice::Prefer(&[VK_PRESENT_MODE_FIFO_RELAXED_KHR])
-            }
-            other => {
-                println!(
-                    "[android] vulkan: CORDIAL_PRESENT_MODE={other:?} is not one of \
-                     off/auto/mailbox/immediate/fifo/fifo-relaxed; using auto"
-                );
-                PresentModeChoice::Prefer(&[VK_PRESENT_MODE_MAILBOX_KHR])
-            }
-        }
+        let (choice, source) =
+            resolve_present_mode(std::env::var(PRESENT_MODE_ENV).ok(), present_mode_from_flags());
+        println!("[android] vulkan: present mode setting is {source}");
+        choice
     })
 }
 
@@ -1480,5 +1582,89 @@ extern "C" fn vk_create_android_surface_khr(
             // unchanged.
             unsafe { f(instance, &xlib_info, allocator, surface_out) }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAILBOX: PresentModeChoice = PresentModeChoice::Prefer(&[VK_PRESENT_MODE_MAILBOX_KHR]);
+
+    fn resolved(env: Option<&str>, flag: Option<(&str, &str)>) -> PresentModeChoice {
+        resolve_present_mode(
+            env.map(str::to_string),
+            flag.map(|(s, v)| (s.to_string(), v.to_string())),
+        )
+        .0
+    }
+
+    #[test]
+    fn nothing_set_is_the_behaviour_cordial_has_always_had() {
+        assert_eq!(resolved(None, None), MAILBOX);
+        assert_eq!(resolved(Some(""), None), MAILBOX);
+    }
+
+    #[test]
+    fn uncapped_takes_the_untearing_one_first_and_falls_back_to_the_tearing_one() {
+        // A plugin asking for an uncapped frame rate should not have to know
+        // which modes this particular surface advertises. MAILBOX uncaps
+        // without tearing; IMMEDIATE always exists.
+        assert_eq!(
+            resolved(Some("uncapped"), None),
+            PresentModeChoice::Prefer(&[
+                VK_PRESENT_MODE_MAILBOX_KHR,
+                VK_PRESENT_MODE_IMMEDIATE_KHR
+            ])
+        );
+    }
+
+    #[test]
+    fn a_plugin_can_ask_for_a_present_mode_without_being_given_the_swapchain() {
+        // ADR-007 and ADR-020: the plugin contributes a value to a flag layer
+        // and Cordial performs the effect. This is the whole of the mechanism
+        // on the runtime's side.
+        assert_eq!(
+            resolved(None, Some(("plugin:fps-flex", "immediate"))),
+            PresentModeChoice::Prefer(&[VK_PRESENT_MODE_IMMEDIATE_KHR])
+        );
+    }
+
+    #[test]
+    fn an_explicit_setting_beats_a_plugin_and_auto_does_not() {
+        // The precedence `graphics.rs` established. Somebody who set the
+        // variable — a measurement run, or the shell — must be able to
+        // overrule a plugin they installed to do something else; somebody who
+        // said "auto" said "you decide", not "ignore everything".
+        assert_eq!(resolved(Some("fifo"), Some(("plugin:p", "immediate"))), 
+                   PresentModeChoice::Prefer(&[VK_PRESENT_MODE_FIFO_KHR]));
+        assert_eq!(
+            resolved(Some("auto"), Some(("plugin:p", "immediate"))),
+            PresentModeChoice::Prefer(&[VK_PRESENT_MODE_IMMEDIATE_KHR])
+        );
+    }
+
+    #[test]
+    fn the_control_for_a_measurement_is_still_reachable() {
+        // `off` forwards whatever the engine asked for, which is the arm every
+        // present-mode timing claim here needs beside it.
+        assert_eq!(resolved(Some("off"), None), PresentModeChoice::Untouched);
+        assert_eq!(resolved(Some("engine"), None), PresentModeChoice::Untouched);
+    }
+
+    #[test]
+    fn a_value_nobody_understands_falls_back_rather_than_guessing() {
+        // From either source. A misspelled mode must not silently become the
+        // one whose name it is closest to.
+        assert_eq!(resolved(Some("imediate"), None), MAILBOX);
+        assert_eq!(resolved(None, Some(("plugin:p", "as-fast-as-possible"))), MAILBOX);
+    }
+
+    #[test]
+    fn the_present_mode_key_is_cordials_own_and_never_reaches_roblox() {
+        // `client_settings::is_roblox_flag` filters on the `Cordial` prefix,
+        // so this name must keep it. A key that lost the prefix would be sent
+        // to the engine as though it were a FastFlag.
+        assert!(PRESENT_MODE_KEY.starts_with("Cordial"));
     }
 }

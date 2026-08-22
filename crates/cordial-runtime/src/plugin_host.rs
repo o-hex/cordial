@@ -26,6 +26,7 @@ use cordial_plugins::events::EventRegistry;
 use cordial_plugins::host::{authorise, Plugin as PluginProc, Writer};
 use cordial_plugins::presence::{DiscordPresence, PresencePayload};
 use cordial_plugins::protocol::{Push, Request, Response};
+use cordial_plugins::preferences;
 use cordial_plugins::settings::{self, Store};
 use cordial_plugins::{enablement, grants, manifest, notify, urlopen};
 use std::collections::BTreeMap;
@@ -120,7 +121,12 @@ pub fn start_all() -> usize {
                 // that reading its own configuration — the first thing most
                 // plugins do — costs no round trip. Best effort: a plugin that
                 // died on startup is reported by its stdout closing, not here.
-                let _ = proc.push(&settings::init_push(Some(&store), &id, &granted));
+                let _ = proc.push(&settings::init_push(
+                    Some(&store),
+                    &plugin.manifest.preferences,
+                    &id,
+                    &granted,
+                ));
 
                 // Registered before the process is handed to its own thread:
                 // another plugin's `events.publish` has to be able to find
@@ -134,9 +140,10 @@ pub fn start_all() -> usize {
                 let store = store.clone();
                 let shared = shared.clone();
                 let plugin_dir = plugin.dir.clone();
+                let declared = plugin.manifest.preferences.clone();
                 std::thread::Builder::new()
                     .name(format!("plugin:{id}"))
-                    .spawn(move || serve(proc, broker, store, shared, plugin_dir))
+                    .spawn(move || serve(proc, broker, store, shared, plugin_dir, declared))
                     .ok();
                 started += 1;
                 println!("  plugin {id}: started");
@@ -158,7 +165,14 @@ fn enabled_in_profile(profile_dir: &std::path::Path, id: &str) -> bool {
     enablement::is_enabled(profile_dir, id)
 }
 
-fn serve(mut proc: PluginProc, mut broker: Broker, store: Store, shared: Shared, plugin_dir: PathBuf) {
+fn serve(
+    mut proc: PluginProc,
+    mut broker: Broker,
+    store: Store,
+    shared: Shared,
+    plugin_dir: PathBuf,
+    declared: Vec<preferences::Declaration>,
+) {
     let id = proc.id.clone();
     // One Discord connection per plugin thread, held for the plugin's whole
     // run rather than opened fresh on every call — Session does the same for
@@ -175,7 +189,7 @@ fn serve(mut proc: PluginProc, mut broker: Broker, store: Store, shared: Shared,
         };
         let response = match authorise(&mut broker, &id, &req) {
             Err(refusal) => refusal,
-            Ok(()) => dispatch(&id, &req, &store, &mut presence, &shared, &plugin_dir),
+            Ok(()) => dispatch(&id, &req, &store, &mut presence, &shared, &plugin_dir, &declared),
         };
         if proc.reply(&response).is_err() {
             break;
@@ -202,6 +216,7 @@ fn dispatch(
     presence: &mut DiscordPresence,
     shared: &Shared,
     plugin_dir: &Path,
+    declared: &[preferences::Declaration],
 ) -> Response {
     match req.method.as_str() {
         // `id` is this thread's own plugin — the process on the other end of
@@ -209,6 +224,16 @@ fn dispatch(
         // plugin naming another one in its params reads and writes its own
         // document; see cordial_plugins::settings.
         "settings.get" | "settings.set" => settings::serve(Some(store), id, req),
+        // ADR-020. Read-only on purpose: the answers belong to the user, so
+        // the launcher writes them and the plugin is only told. The
+        // declarations come from this plugin's own manifest, held by the
+        // serving thread rather than taken from the request, for the reason
+        // `id` is -- a plugin that could name its own schema could claim a
+        // range it does not have.
+        "preferences.get" => {
+            let prefs = preferences::Store::new(store.profile_dir());
+            preferences::serve(Some(&prefs), declared, id, req)
+        }
         // ADR-007's worked example, finally reachable from the host the
         // client actually runs: cordial-plugins already speaks Discord's IPC
         // framing (presence.rs) and cordial_plugins::host::Session already
@@ -469,7 +494,7 @@ mod tests {
             "presence.set",
             serde_json::json!({"client_id": "1234567890123456", "details": "Playing Baseplate"}),
         );
-        let res = dispatch("discord-presence", &req, &store, &mut presence, &shared, &plugin_dir);
+        let res = dispatch("discord-presence", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
         match res {
             Response::Error { message, .. } => assert!(message.contains("not running"), "{message}"),
             other => panic!("expected an honest failure with no Discord listening, got {other:?}"),
@@ -491,7 +516,7 @@ mod tests {
         let shared = Shared::new();
         let plugin_dir = scratch_plugin_dir("presence-clear");
         let req = call("presence.clear", serde_json::Value::Null);
-        let res = dispatch("discord-presence", &req, &store, &mut presence, &shared, &plugin_dir);
+        let res = dispatch("discord-presence", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
         assert!(matches!(res, Response::Ok { .. }), "{res:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -504,7 +529,7 @@ mod tests {
         let shared = Shared::new();
         let plugin_dir = scratch_plugin_dir("presence-bad-payload");
         let req = call("presence.set", serde_json::json!({"client_id": "not-a-snowflake"}));
-        let res = dispatch("discord-presence", &req, &store, &mut presence, &shared, &plugin_dir);
+        let res = dispatch("discord-presence", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
         match res {
             Response::Error { message, .. } => assert!(message.contains("snowflake"), "{message}"),
             other => panic!("expected a parse error, got {other:?}"),
@@ -518,7 +543,7 @@ mod tests {
         let shared = Shared::new();
         let plugin_dir = scratch_plugin_dir("lifecycle-subscribe");
         let req = call("lifecycle.subscribe", serde_json::Value::Null);
-        let res = dispatch("some-plugin", &req, &store, &mut presence, &shared, &plugin_dir);
+        let res = dispatch("some-plugin", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
         assert!(matches!(res, Response::Ok { .. }), "{res:?}");
     }
 
@@ -539,7 +564,7 @@ mod tests {
         // wired for real below and is no longer a stand-in for "not written
         // yet".
         let req = call("flags.setDynamic", serde_json::json!({"key": "DFFlagX", "value": "true"}));
-        let res = dispatch("some-plugin", &req, &store, &mut presence, &shared, &plugin_dir);
+        let res = dispatch("some-plugin", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
         match res {
             Response::Error { message, .. } => assert!(message.contains("not implemented yet"), "{message}"),
             other => panic!("expected the not-implemented-yet stub, got {other:?}"),
@@ -557,7 +582,7 @@ mod tests {
         let shared = Shared::new();
         let plugin_dir = scratch_plugin_dir("notify-no-summary");
         let req = call("notify.send", serde_json::json!({"body": "no summary here"}));
-        let res = dispatch("some-plugin", &req, &store, &mut presence, &shared, &plugin_dir);
+        let res = dispatch("some-plugin", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
         match res {
             Response::Error { message, .. } => assert!(message.contains("summary"), "{message}"),
             other => panic!("expected a shape refusal, got {other:?}"),
@@ -575,7 +600,7 @@ mod tests {
         let shared = Shared::new();
         let plugin_dir = scratch_plugin_dir("url-open-bad-scheme");
         let req = call("url.open", serde_json::json!({"url": "file:///etc/passwd"}));
-        let res = dispatch("some-plugin", &req, &store, &mut presence, &shared, &plugin_dir);
+        let res = dispatch("some-plugin", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
         match res {
             Response::Error { message, .. } => assert!(message.contains("refused"), "{message}"),
             other => panic!("expected a refusal, got {other:?}"),
@@ -592,7 +617,7 @@ mod tests {
         std::fs::write(plugin_dir.join("overlay/textures/wood.png"), b"fake texture bytes").unwrap();
 
         let req = call("assets.override", serde_json::json!({}));
-        let res = dispatch("themer", &req, &store, &mut presence, &shared, &plugin_dir);
+        let res = dispatch("themer", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
         assert!(matches!(res, Response::Ok { .. }), "{res:?}");
 
         assert_eq!(
@@ -604,7 +629,7 @@ mod tests {
         // And clearing it falls straight back to nothing being overlaid —
         // there was never a write to undo (ADR-010).
         let clear = call("assets.override", serde_json::json!({"clear": true}));
-        let res = dispatch("themer", &clear, &store, &mut presence, &shared, &plugin_dir);
+        let res = dispatch("themer", &clear, &store, &mut presence, &shared, &plugin_dir, &[]);
         assert!(matches!(res, Response::Ok { .. }), "{res:?}");
         assert_eq!(crate::android::asset::explain("textures/wood.png"), None);
     }
@@ -618,7 +643,7 @@ mod tests {
 
         for bad in ["../../etc", "/etc"] {
             let req = call("assets.override", serde_json::json!({"dir": bad}));
-            let res = dispatch("themer", &req, &store, &mut presence, &shared, &plugin_dir);
+            let res = dispatch("themer", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
             match res {
                 Response::Error { message, .. } => assert!(message.contains("inside"), "{bad}: {message}"),
                 other => panic!("{bad:?} should have been refused, got {other:?}"),
@@ -640,7 +665,7 @@ mod tests {
         std::fs::write(plugin_dir.join("overlay/sound.ogg"), b"fake sound bytes").unwrap();
 
         let req = call("assets.override", serde_json::json!({}));
-        dispatch("sound-pack", &req, &store, &mut presence, &shared, &plugin_dir);
+        dispatch("sound-pack", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
         assert!(crate::android::asset::explain("sound.ogg").is_some());
 
         crate::android::asset::unregister_plugin_root("sound-pack");
@@ -663,7 +688,7 @@ mod tests {
         std::env::set_var("CORDIAL_PLUGIN_DIR", &root);
 
         let req = call("flags.set", serde_json::json!({"values": {"FFlagFoo": "true", "FIntBar": 3}}));
-        let res = dispatch("tuner", &req, &store, &mut presence, &shared, &plugin_dir);
+        let res = dispatch("tuner", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
         assert!(matches!(res, Response::Ok { .. }), "{res:?}");
 
         let layer = crate::flags::read_layer(
@@ -688,7 +713,7 @@ mod tests {
             "events.publish",
             serde_json::json!({"type": "flag-manager/profile-changed", "payload": {}}),
         );
-        let res = dispatch("evil", &req, &store, &mut presence, &shared, &plugin_dir);
+        let res = dispatch("evil", &req, &store, &mut presence, &shared, &plugin_dir, &[]);
         match res {
             Response::Error { message, .. } => assert!(message.contains("may not publish"), "{message}"),
             other => panic!("expected a refusal, got {other:?}"),
@@ -709,6 +734,7 @@ mod tests {
             &mut presence,
             &shared,
             &plugin_dir,
+            &[],
         );
         let event_type = match declared {
             Response::Ok { result, .. } => result["type"].as_str().unwrap().to_string(),
@@ -723,6 +749,7 @@ mod tests {
             &mut presence,
             &shared,
             &plugin_dir,
+            &[],
         );
         // No subscriber is registered in `shared.writers` at all here, and
         // that must not be an error: publishing to nobody is exactly what a
@@ -763,6 +790,7 @@ mod tests {
             &mut publisher_presence,
             &shared,
             &plugin_dir,
+            &[],
         );
         let event_type = match declared {
             Response::Ok { result, .. } => result["type"].as_str().unwrap().to_string(),
@@ -794,7 +822,7 @@ mod tests {
                 continue;
             }
 
-            let res = dispatch("launcher", &req, &store, &mut launcher_presence, &shared, &plugin_dir);
+            let res = dispatch("launcher", &req, &store, &mut launcher_presence, &shared, &plugin_dir, &[]);
             let subscribed_ok = req.method == "events.subscribe" && matches!(res, Response::Ok { .. });
             launcher.reply(&res).unwrap();
 
@@ -814,6 +842,7 @@ mod tests {
                     &mut publisher_presence,
                     &shared,
                     &plugin_dir,
+                    &[],
                 );
                 assert!(matches!(pub_res, Response::Ok { .. }), "publish should succeed: {pub_res:?}");
             }

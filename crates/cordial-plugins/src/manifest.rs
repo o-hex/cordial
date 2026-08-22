@@ -60,6 +60,15 @@ pub struct Manifest {
     /// requirement. Never npm packages; see the module note.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: BTreeMap<String, String>,
+    /// The settings this plugin wants asked, which Cordial renders as a
+    /// preferences page (ADR-020).
+    ///
+    /// **Its presence is the entire signal that the plugin has a page**, which
+    /// is why there is no companion `has-preferences` key and no capability
+    /// meaning the same thing. Two facts that can disagree eventually do, and
+    /// the disagreement here would be a gear button that opens nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preferences: Vec<crate::preferences::Declaration>,
 }
 
 /// A version requirement on another plugin, with the operator spelled out.
@@ -235,6 +244,11 @@ pub fn parse(text: &str, dir: &Path) -> Result<Plugin, String> {
             None => return Err(format!("unknown capability {name:?}")),
         }
     }
+    // Refused with the plugin rather than pruned, the same as an unknown
+    // capability above. A plugin whose page is quietly missing the one row it
+    // needed installs looking correct and then behaves strangely, and the
+    // author debugs their own code for it.
+    crate::preferences::check_all(&manifest.preferences)?;
     let version = match &manifest.version {
         Some(v) => Some(
             Version::parse(v).map_err(|e| format!("version {v:?} is not a semantic version ({e})"))?,

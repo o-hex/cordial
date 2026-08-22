@@ -26,6 +26,7 @@
 pub mod branding;
 pub mod host_window;
 pub mod network;
+pub mod plugin_preferences;
 pub mod profile;
 pub mod pvpn;
 // Not pulled in by `host_window` or `network` -- registered here on its own

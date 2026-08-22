@@ -65,6 +65,14 @@ impl Writer {
 
 pub struct Plugin {
     pub id: String,
+    /// What this plugin's manifest declares it wants asked (ADR-020), so the
+    /// handshake can carry the user's answers.
+    ///
+    /// Set by [`Plugin::declaring`] rather than by [`Plugin::spawn`], which is
+    /// handed an id and an entry module and has no manifest to read it from.
+    /// Empty is the honest default: a plugin that declares nothing has no
+    /// preferences page and no answers to be given.
+    pub preferences: Vec<crate::preferences::Declaration>,
     child: Child,
     writer: Writer,
     stdout: BufReader<ChildStdout>,
@@ -97,7 +105,26 @@ impl Plugin {
             .spawn()?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = BufReader::new(child.stdout.take().expect("stdout was piped"));
-        Ok(Plugin { id: id.to_string(), child, writer: Writer(Arc::new(Mutex::new(stdin))), stdout })
+        Ok(Plugin {
+            id: id.to_string(),
+            preferences: Vec::new(),
+            child,
+            writer: Writer(Arc::new(Mutex::new(stdin))),
+            stdout,
+        })
+    }
+
+    /// Record what this plugin's manifest declares it wants asked, so the
+    /// handshake carries the user's answers (ADR-020).
+    ///
+    /// Separate from [`Plugin::spawn`] because spawning needs an entry module
+    /// and nothing else, and a caller that has no manifest -- a test, or a
+    /// bare process someone is driving by hand -- should not have to invent
+    /// one. Not calling it means "declares nothing", which is true of every
+    /// plugin written before this existed.
+    pub fn declaring(mut self, fields: Vec<crate::preferences::Declaration>) -> Self {
+        self.preferences = fields;
+        self
     }
 
     /// Read one request from the plugin. `None` at end of stream.
@@ -212,7 +239,8 @@ impl Session {
     /// plugin a handshake saying it holds nothing.
     pub fn add_plugin(&mut self, mut plugin: Plugin) {
         let granted = self.broker.granted(&plugin.id);
-        let push = settings::init_push(self.settings.as_ref(), &plugin.id, &granted);
+        let push =
+            settings::init_push(self.settings.as_ref(), &plugin.preferences, &plugin.id, &granted);
         // Best effort, like every other push: a plugin that has already died
         // is not a reason to fail adopting it, and the write error would only
         // repeat what the next read of its stdout is about to say.
@@ -295,6 +323,21 @@ impl Session {
             // writes its own document. See settings.rs.
             "settings.get" | "settings.set" => {
                 settings::serve(self.settings.as_ref(), plugin_id, req)
+            }
+            // ADR-020. The declarations come from the adopted plugin's own
+            // manifest, so a plugin that was never adopted -- or was adopted
+            // without one -- reads an empty page rather than somebody else's.
+            "preferences.get" => {
+                let declared = self
+                    .plugins
+                    .get(plugin_id)
+                    .map(|p| p.preferences.clone())
+                    .unwrap_or_default();
+                let store = self
+                    .settings
+                    .as_ref()
+                    .map(|s| crate::preferences::Store::new(s.profile_dir()));
+                crate::preferences::serve(store.as_ref(), &declared, plugin_id, req)
             }
             "events.publish" => self.publish(plugin_id, req),
             "events.subscribe" => match req.params.get("type").and_then(|v| v.as_str()) {

@@ -782,7 +782,10 @@ fn capability_description(cap: Capability) -> &'static str {
             "Overlay files in place of Roblox's own assets — textures, sounds, fonts. Never \
              modifies the APK; removing the plugin restores the original."
         }
-        Capability::SettingsRead => "Read the settings document Cordial keeps for it.",
+        Capability::SettingsRead => {
+            "Read the settings document Cordial keeps for it, and the preferences you set on its \
+             own page."
+        }
         Capability::SettingsWrite => "Replace the settings document Cordial keeps for it.",
         Capability::EventsDeclare => "Register its own event types, for other plugins to hear.",
         Capability::EventsPublish => "Broadcast on an event type it has declared.",
@@ -844,6 +847,28 @@ fn build_plugin_row(
         tag.set_valign(gtk::Align::Center);
         expander.add_suffix(&tag);
     }
+    // The gear, and only when the plugin declares something to configure —
+    // GNOME's Extensions app does the same, and an extension with nothing to
+    // set simply has no gear there. A permanently insensitive button would
+    // read as broken rather than as "nothing here". ADR-020.
+    //
+    // Placed before Remove so the order down the row is configure-then-destroy,
+    // and so the destructive control stays furthest from the one people press
+    // often.
+    // The real type behind `parent` rather than its static one: every caller
+    // passes the preferences window, but they pass it as a `gtk::Window`.
+    if let Ok(window) = parent.as_ref().clone().downcast::<adw::PreferencesWindow>() {
+        // `false`: Cordial has no plugin update detection, so nothing can
+        // truthfully ask for the accent-coloured gear yet. Passing the literal
+        // rather than omitting the argument keeps the state visible at the one
+        // call site that will have to change when updates land.
+        if let Some(gear) =
+            cordial_shell::plugin_preferences::gear_for(&window, plugin, profile_dir, false)
+        {
+            expander.add_suffix(&gear);
+        }
+    }
+
     let remove = gtk::Button::from_icon_name("user-trash-symbolic");
     remove.set_valign(gtk::Align::Center);
     remove.add_css_class("flat");

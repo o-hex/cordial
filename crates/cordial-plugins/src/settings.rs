@@ -199,6 +199,7 @@ pub fn serve(store: Option<&Store>, plugin_id: &str, req: &Request) -> Response 
 /// request to check.
 pub fn init_push(
     store: Option<&Store>,
+    fields: &[crate::preferences::Declaration],
     plugin_id: &str,
     granted: &BTreeSet<Capability>,
 ) -> Push {
@@ -216,9 +217,32 @@ pub fn init_push(
         },
         _ => None,
     };
+    // The user's answers to the questions this plugin's own manifest asked,
+    // complete and already validated (ADR-020). Rooted at the same profile
+    // directory, so it is derived from the settings store rather than passed
+    // separately -- two parameters that must name the same profile is a pair
+    // that can be handed different ones.
+    //
+    // `null` and `{}` are told apart here exactly as they are for `settings`
+    // above, and there is a third case: a plugin that declares no preferences
+    // has no page and gets `{}`, which is the truthful answer -- it has no
+    // answers because it asked nothing, not because it was refused.
+    let preferences = match (granted.contains(&Capability::SettingsRead), store) {
+        (true, Some(store)) => {
+            let prefs = crate::preferences::Store::new(store.profile_dir());
+            match prefs.effective_for(plugin_id, fields) {
+                Ok(values) => Some(serde_json::to_value(values).unwrap_or_default()),
+                Err(e) => {
+                    println!("  plugin {plugin_id}: preferences not delivered ({e})");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     Push {
         event: INIT_EVENT.to_string(),
-        payload: serde_json::json!({ "settings": settings }),
+        payload: serde_json::json!({ "settings": settings, "preferences": preferences }),
     }
 }
 
@@ -398,12 +422,12 @@ mod tests {
         store.write("themer", &serde_json::json!({"accent": "teal"})).unwrap();
 
         let granted: BTreeSet<Capability> = [Capability::SettingsRead].into_iter().collect();
-        let push = init_push(Some(&store), "themer", &granted);
+        let push = init_push(Some(&store), &[], "themer", &granted);
         assert_eq!(push.event, INIT_EVENT);
         assert_eq!(push.payload["settings"]["accent"], "teal");
 
         let ungranted: BTreeSet<Capability> = [Capability::Log].into_iter().collect();
-        let push = init_push(Some(&store), "themer", &ungranted);
+        let push = init_push(Some(&store), &[], "themer", &ungranted);
         assert!(push.payload["settings"].is_null(), "{}", push.payload);
     }
 
@@ -414,7 +438,7 @@ mod tests {
         // first launch from a missing capability.
         let store = scratch("handshake-empty");
         let granted: BTreeSet<Capability> = [Capability::SettingsRead].into_iter().collect();
-        let push = init_push(Some(&store), "brand-new", &granted);
+        let push = init_push(Some(&store), &[], "brand-new", &granted);
         assert_eq!(push.payload["settings"], serde_json::json!({}));
     }
 }

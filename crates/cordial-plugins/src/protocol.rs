@@ -76,6 +76,14 @@ pub fn required_capability(method: &str) -> Option<Capability> {
         "url.open" => Capability::UrlOpen,
         "assets.override" => Capability::AssetsOverride,
         "settings.get" => Capability::SettingsRead,
+        // The user's answers to the questions this plugin's own manifest
+        // asked. Under `SettingsRead` rather than a capability of its own:
+        // both are "read what Cordial keeps for you", the data is the
+        // plugin's own by construction, and a separate permission a user
+        // could deny would leave a plugin declaring questions it cannot hear
+        // the answers to. There is deliberately no `preferences.set` -- see
+        // ADR-020; Cordial is the only writer.
+        "preferences.get" => Capability::SettingsRead,
         "settings.set" => Capability::SettingsWrite,
         "events.declare" => Capability::EventsDeclare,
         "events.publish" => Capability::EventsPublish,

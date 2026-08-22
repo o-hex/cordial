@@ -235,8 +235,9 @@ Backend selected_backend() {
             std::getenv("CORDIAL_AUDIO") ? std::getenv("CORDIAL_AUDIO") : "unset",
             b == Backend::Java
                 ? "libaaudio.so is not registered and org.fmod.FMOD.supportsAAudio() reports "
-                  "false, so FMOD takes its Java AudioDevice path. This is no longer the "
-                  "default; CORDIAL_AUDIO=java asked for it."
+                  "false, so FMOD takes its Java AudioDevice path. This is the default, and "
+                  "it is held here until one signed-in run shows FMOD closing an input "
+                  "stream it opened; CORDIAL_AUDIO=aaudio opts in."
                 : b == Backend::AAudio
                       ? "libaaudio.so is registered and supportsAAudio() reports true; streams "
                         "open against PipeWire. Playback is callback-driven, capture is a "

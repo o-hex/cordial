@@ -370,25 +370,35 @@ A `microphone opened` with no `microphone closed` behind it, in a run where
 nobody spoke, is the failure this paragraph exists to look for, and it would
 mean the default has to go back.
 
-**Why the default was flipped anyway, rather than waiting for that run.** The
-exposure is created by implementing capture, not by making it the default:
-anyone following `CORDIAL_AUDIO=aaudio` — which is what the documentation has
-told people to do since AAudio landed — has exactly the same behaviour from
-exactly the same code. Leaving the switch off by default would not protect
-them; it would only make the gap harder to find. Whereas an unset variable now
-takes the path that gets the most use, which is the path this question gets
-answered on soonest.
+**The default was NOT flipped, and this section used to say it was.** The
+argument for flipping is recorded here because it is a good one and it may yet
+win: the exposure is created by implementing capture, not by defaulting to it,
+since anyone following `CORDIAL_AUDIO=aaudio` runs identical code; and an unset
+variable taking the common path is what gets the question answered soonest.
+
+It lost on one point. The two failures are not symmetric. "Voice chat never
+worked" is a feature gap someone reports; "Cordial is holding your microphone"
+is a reason someone uninstalls it, and it is the one a user *sees*, as a lit
+indicator, for a whole session. The default decides how many people meet an
+unmeasured failure first, and "everyone" is the wrong answer to that for want
+of a single run. So `parse_backend` returns `Backend::Java` for an unset
+variable, and the comment beside it names the grep that flips it.
 
 ## How it landed
 
 The plan was: behind `CORDIAL_AUDIO=aaudio`, off by default, measured against
 the Java path in one session, and only then made default in its own commit
-quoting the numbers. That is what happened, with one substitution — the
-measurement is `pw-top`'s `ERR` column and a peak meter, not `getXRunCount`,
-for the reason two sections above.
+quoting the numbers. That is what happened up to the last step, with one
+substitution — the measurement is `pw-top`'s `ERR` column and a peak meter, not
+`getXRunCount`, for the reason two sections above. The last step has not
+happened: the commit that would flip the default is waiting on the microphone
+lifetime run, and until it lands every claim about "the default" in this file
+means Java.
 
-**AAudio is now the default**, and the honest summary of why is not that it is
-better. On this machine it is not measurably better: zero `ERR` on both paths,
+**AAudio is not the default; Java still is** — see the section above, which
+this paragraph contradicted until it was corrected. What follows is the case
+for AAudio on its merits, which is unaffected by which one is default, and the
+honest summary of it is not that AAudio is better. On this machine it is not measurably better: zero `ERR` on both paths,
 same rate, same clean teardown. What it is, is structurally different — no JNI
 hop, no `jbyteArray` copy, no `std::deque`, no mutex between the engine and
 PipeWire's callback, F32 end to end — and, since capture was implemented, the

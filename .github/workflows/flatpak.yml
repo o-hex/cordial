@@ -146,41 +146,48 @@ jobs:
           echo "runtime version: $v; sdk extension version: $e"
           flatpak remote-add --user --if-not-exists flathub \
               https://dl.flathub.org/repo/flathub.flatpakrepo
-          # `--no-static-deltas`, and a retry, because this step failed three
-          # consecutive runs on 2026-08-22 with
+          # rust-stable is pinned to a commit, and llvm20 is not, because
+          # Flathub's current rust-stable is broken on their side.
           #
-          #   Failed to install org.freedesktop.Sdk.Extension.rust-stable:
-          #   While pulling .../rust-stable/x86_64/25.08 from remote flathub:
+          # Published 2026-08-21 02:28 UTC, commit 4d0c0a79, and it 404s on one
+          # of its own objects:
+          #
+          #   While fetching https://dl.flathub.org/repo/objects/06/
+          #   0fdf65e0a1042c0db51bf9d009048f9f07e047b422e0e736c5d8ad35ac3a9c.filez
           #   Server returned HTTP 404
           #
-          # The ref is not missing. `flatpak remote-info --system flathub
-          # org.freedesktop.Sdk.Extension.rust-stable//25.08` answers from a
-          # developer machine, as do 24.08 and 23.08 and the llvm20 extension
-          # that installed successfully on the line above. So the manifest is
-          # right and flatpak is 404ing on an object rather than on the ref --
-          # which is what a static delta that was never generated looks like
-          # from the client side. Plain object pulls are slower and cannot 404
-          # on something that does not exist.
+          # Reproduced off CI on a developer machine, so it is not the runner,
+          # not the region and not this workflow. Two theories were tried and
+          # both were wrong: the ref is present (`remote-info` answers, but
+          # that reads summary metadata and never touches the objects, so it
+          # was the wrong check), and `--no-static-deltas` made no difference
+          # across three attempts.
           #
-          # The retry is separate and covers the other reading, that Flathub's
-          # CDN was simply unwell for a few hours. If this recurs with
-          # `--no-static-deltas` already in place, that is the answer and this
-          # comment is wrong -- say so here rather than adding a third retry.
-          for attempt in 1 2 3; do
-              if flatpak install --user --noninteractive --no-static-deltas flathub \
-                  "org.gnome.Platform//$v" \
-                  "org.gnome.Sdk//$v" \
-                  "org.freedesktop.Sdk.Extension.rust-stable//$e" \
-                  "org.freedesktop.Sdk.Extension.llvm20//$e"; then
-                  break
-              fi
-              if [ "$attempt" = 3 ]; then
-                  echo "::error::runtime install failed three times; see the comment above this step"
-                  exit 1
-              fi
-              echo "install attempt $attempt failed; retrying in $((attempt * 15))s"
-              sleep $((attempt * 15))
-          done
+          # 385427f6 is the commit before it, from 2026-08-12, and it pulls
+          # cleanly -- 325 MB, verified by hand. `flatpak install --commit` does
+          # not exist and `flatpak update --commit` needs the ref installed
+          # already, which is the thing that fails, so the pin goes through
+          # ostree into flatpak's own repo and the install then runs offline.
+          #
+          # **Remove this the moment Flathub republishes.** Pinning a toolchain
+          # to a three-week-old commit is a thing that quietly rots; the check
+          # is whether the plain install below the pin succeeds on its own.
+          flatpak install --user --noninteractive flathub \
+              "org.gnome.Platform//$v" \
+              "org.gnome.Sdk//$v" \
+              "org.freedesktop.Sdk.Extension.llvm20//$e"
+
+          rust_ref="runtime/org.freedesktop.Sdk.Extension.rust-stable/x86_64/$e"
+          rust_pin="385427f6dabe6d297cced114496cfa6e38bb93fe4c6fbee7fdabb97dd141d29a"
+          if flatpak install --user --noninteractive flathub \
+                 "org.freedesktop.Sdk.Extension.rust-stable//$e"; then
+              echo "rust-stable installed normally; the pin below is no longer needed"
+          else
+              echo "::warning::rust-stable//$e will not pull from Flathub; falling back to pinned commit $rust_pin"
+              ostree --repo="$HOME/.local/share/flatpak/repo" pull flathub "${rust_ref}@${rust_pin}"
+              flatpak install --user --noninteractive --no-pull flathub \
+                  "org.freedesktop.Sdk.Extension.rust-stable//$e"
+          fi
 
       # The build step has no network (issue #3), so every crate arrives through
       # packaging/cargo-sources.json and is fetched in flatpak-builder's download

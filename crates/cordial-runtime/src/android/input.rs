@@ -504,6 +504,19 @@ pub fn pass_key_event(down: bool, evdev_code: i32, modifiers: i32) {
     super::trace(format_args!(
         "nativePassKeyEvent(down={down}, keyCode={key_code}, modifiers={modifiers:#x}) -> {r:?}"
     ));
+    // Focus is printed here rather than only in `dispatch_key` because the
+    // control socket calls this function directly, so a synthetic keystroke
+    // produced no focus line at all and "is a text box eating the movement
+    // keys?" could not be answered from a driven run. `super::trace` is no use
+    // for it: that is `CORDIAL_TRACE=1`, which aborts the engine.
+    if trace_text() {
+        eprintln!(
+            "[cordial] pass_key_event down={down} code={key_code} mods={modifiers:#x} \
+             focus={:?} gen={}",
+            cordial_linker_sys::game_activity::focused_textbox(),
+            cordial_linker_sys::game_activity::textbox_generation(),
+        );
+    }
 }
 
 /// Which evdev codes are currently held, tracked here rather than in

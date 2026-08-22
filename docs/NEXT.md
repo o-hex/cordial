@@ -196,6 +196,71 @@ is still running prints the geometry, the pid and the backtrace command, once,
 ungated. Verified negative (an idle run produces none across 35 s); the positive
 branch is `INFERRED` -- no wedge occurred while it was compiled in.
 
+### WASD is dead after joining through the Play button, and fine via deep link
+
+**The variable is the join path, not the focus change.** Measured 2026-08-22
+with Cordial's own `devctl` socket driving `pass_key_event`, scored by RMSE
+between swapchain screenshots before and after a key hold. Calibrated first: in
+a healthy session a 2 s hold scores ~0.34 against an idle control of ~0.06, and
+the character is visibly in a different room.
+
+| join path | runs | W hold RMSE (idle) | movement |
+|---|---|---|---|
+| `--join-url roblox://experiences/start?placeId=…` | 6 | 0.353 (0.056), 0.305 (0.072), 0.337 (0.100), 0.340 (0.072) | works |
+| the game tile, then **Play**, in the app shell | 4 | 0.193 (0.167), 0.047 (0.033), 0.112 (0.111) | dead |
+
+Both places tried on both paths. The decisive pair ran back to back with a
+verified single engine: deep link `0.340 / idle 0.072`, character walked into a
+different corridor; Play button `0.112 / idle 0.111`, camera pixel-for-pixel
+unmoved after a 4 s hold.
+
+**No focus change is required.** Play-button runs with no alt-tab at all are
+just as dead. In the dead state a right-button camera drag scores 0.361 — mouse
+and camera are entirely healthy — and Space and the arrow keys are dead
+alongside WASD. Delivering a large mouse drag and re-testing does not revive
+movement, so "the engine re-picks a scheme from the last input type" does not
+survive contact.
+
+Everything below was closed with a control, same binary:
+
+* **Focus reporting.** `CORDIAL_SCRIPT=12:focus-off,50:focus-on` spanning the
+  whole load drives real `onWindowFocusChangedNative` both ways. Movement fine
+  (0.305), presents held 60/s so the throttle was not involved either. Agrees
+  with `CORDIAL_REPORT_FOCUS=0` from the opposite direction.
+* **A genuine focus change**, a GTK window mapped for 35 s mid-load producing a
+  real `wl_keyboard.leave`. Movement fine (0.337).
+* **No mouse event during the load.** `CORDIAL_TRACE_MOUSE=1` counted exactly
+  one `nativePassMouseMove` per deep-link run — the `pointer_enter` hover — and
+  movement worked. The `POINTER_ON_CANVAS` hypothesis is dead.
+* **Clicks during the load.** Six, spread across a deep-link join. Fine (0.178).
+
+Two things that were believed and are not true. **The orientation lock is a
+constant, not a lead**: `orientation 2 (locked: no→yes)` fires at t≈2 s in every
+run including the healthy ones, and is not at spawn. **Pointer tracing already
+existed** — `CORDIAL_TRACE_MOUSE=1`, `input::trace_mouse` — and was written up
+here as missing.
+
+Where to go next, in order: read `focused_textbox()` in the dead state (already
+printed in the `CORDIAL_TRACE_TEXT` key line, but note `devctl key` calls
+`pass_key_event` directly and bypasses `dispatch_key`, so it needs a real
+keypress or the field added to that trace); instrument the divergence between
+`deeplink.rs`'s `Linking.detectURL` publish and the app shell's own join; and
+redo the Sober comparison **through Sober's Play button**, because the control
+run against Sober was a deep-link join, which is the half that works here too.
+
+Unexplained: the reporter experiences this as an alt-tab trigger, while the
+measurements say the Play button alone is sufficient. Their "no alt-tab is fine"
+observation may predate this or the failure may be intermittent.
+
+### A fullscreen window over the client wedged the renderer once
+
+Presents went 60/s to 0.0/s at t=37 s and never recovered, 80 s after focus and
+visibility both returned, with `looper::pump` still spinning at 8.7 M polls/s
+and 92–133% CPU. Occluding *after* spawn did not do it. **One occurrence, and
+that run had a second engine alive on the same profile**, so it is a lead and
+not a result. Distinct from the audio deadlock above: the pump is spinning here,
+not blocked.
+
 ### Roblox exposes no accessibility tree
 
 Settled four ways, see §4 and `native/accessibility.cpp`. Any development or

@@ -252,6 +252,57 @@ Unexplained: the reporter experiences this as an alt-tab trigger, while the
 measurements say the Play button alone is sufficient. Their "no alt-tab is fine"
 observation may predate this or the failure may be intermittent.
 
+#### Sharpened 2026-08-22, and two claims above are wrong
+
+**A respawn fixes it, and that is the control.** Twice in one session, same
+binary: six W probes over 34 s scoring 0.026–0.037 against idle 0.029–0.055,
+then Escape → Respawn, then 0.263 / 0.303 / 0.242 / 0.171. Corroborated outside
+RMSE entirely — the game prints a plot coordinate bottom-left, which read
+`(0, 0)` through the dead window and `(0, -1)` after.
+
+`INFERRED`: the movement controls never bind to the character the Play-button
+join spawns with, and a fresh `CharacterAdded` binds them. Nothing here can see
+inside the engine's Lua and ADR-001 keeps it that way.
+
+**The dead state is much narrower than "input is dead".** In it: Escape opens
+and closes the menu (0.341 / 0.335), clicks on the game's own Lua buttons work
+(Shop 0.258, Podiums 0.254), the camera answers a right-drag (0.244). Only
+WASD, Space and the arrow keys do nothing. So keys reach the engine, reach
+CoreGui, and reach the game's own GUI.
+
+**No text box is involved — that lead is closed.** The focus reading was added
+to `pass_key_event`'s own trace (`input.rs`, and note `devctl key` bypasses
+`dispatch_key`, which is why the existing line never fired for synthetic keys).
+Every event in every run, dead and healthy alike, reads `focus=None gen=0`;
+`showKeyboard` is never called inside an experience.
+
+**Correction: "dead" is not always permanent.** One Play-button run came alive
+on its own between 46 s and 55 s after the button — `W=0.021` then `0.151`,
+then 0.07–0.21 for the next 90 s. Another was still dead past 95 s. **Any run
+measured only in the first ~45 s will read as uniformly dead**, which is a trap
+for anyone repeating this.
+
+**Correction: "the camera is entirely healthy" needs a qualifier.** In Podiums
+VC the camera was dead too — a 40×40 px right-drag scored 0.019 — while the
+game's own GUI clicks still worked at 0.254. Probably game-specific, but the
+unqualified claim above is wrong.
+
+The engine-log divergence between the two joins, so far: `startLuaApp_` /
+`continueAfterLuaAppStarted_` and `pauseLuaAppAndDestroyIfNeeded …
+destroySurfaceView:true` appear on the Play path only, with
+`SurfaceController[_:2]` reused rather than a second one created. Nothing is
+logged at the moment a run heals itself.
+
+Still not done: the Sober comparison **through Sober's own Play button**. Every
+Sober control so far has been a deep-link join, which is the half that works in
+Cordial too, so none of them has tested this.
+
+**Practical caution for whoever measures this next.** 3440×1359 uncompressed
+PNGs are 14 MB each and the scratchpad is tmpfs; a few hundred filled 6 GB of
+RAM and took the shell down mid-measurement. Write captures to `~/.cache` and
+delete them as they are scored. Roughly one capture in a few dozen comes back
+with a truncated IDAT and must be retried, or it loses the whole curve.
+
 ### A fullscreen window over the client wedged the renderer once
 
 Presents went 60/s to 0.0/s at t=37 s and never recovered, 80 s after focus and

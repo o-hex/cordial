@@ -21,7 +21,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -34,8 +35,99 @@ struct Asset {
     bytes: &'static [u8],
 }
 
+/// A reader over the APK that can be cloned cheaply and used from any thread
+/// at the same time as its clones.
+///
+/// **This exists to stop the zip's central directory being parsed once per
+/// asset**, which is what `Manager::read` used to do — `File::open` plus
+/// `ZipArchive::new` on every uncached name, and `ZipArchive::new` walks all
+/// 1,835 central-directory entries before it can answer anything. A menu that
+/// opens a thousand small UI textures paid for a thousand full re-indexes of
+/// the archive, plus a thousand `open(2)`s.
+///
+/// The shape of the fix comes from the crate's own type:
+/// `ZipArchive<R> { reader: R, shared: Arc<Shared> }`, deriving `Clone`. The
+/// parsed directory is *already* behind an `Arc`, so cloning an archive costs
+/// a refcount bump and copies nothing — provided `R` is `Clone`, which
+/// `std::fs::File` is not. This is the `R` that is.
+///
+/// **Positioned reads, not a shared seek offset.** Every read goes through
+/// `pread(2)` via [`FileExt::read_at`] with this handle's own `pos`, so two
+/// clones reading different entries at the same time cannot move each other's
+/// cursor. Sharing one `File` and calling `Seek` on it would be a data race
+/// that shows up as an asset served the bytes of a different asset — the worst
+/// possible failure mode here, because the engine would render it rather than
+/// report it.
+///
+/// One file descriptor for the process, rather than one per read. The
+/// alternative considered was a pool of `ZipArchive<File>`: it also parses the
+/// directory once per pooled archive, but it needs a lock to hand one out, a
+/// cap to bound memory, and a policy for what happens when the pool is empty.
+/// This needs none of the three, because there is nothing to hand out.
+#[derive(Clone)]
+struct ApkReader {
+    file: Arc<File>,
+    pos: u64,
+    len: u64,
+}
+
+impl ApkReader {
+    fn open(path: &Path) -> std::io::Result<ApkReader> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(ApkReader { file: Arc::new(file), pos: 0, len })
+    }
+}
+
+impl Read for ApkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read_at(buf, self.pos)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for ApkReader {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        // Saturating rather than wrapping, and an explicit error for a
+        // negative result: the zip reader seeks backwards from the end to find
+        // the end-of-central-directory record, so `End(-22)` and friends are
+        // the ordinary case here, not an edge one.
+        let next = match from {
+            SeekFrom::Start(n) => n as i64,
+            SeekFrom::End(n) => self.len as i64 + n,
+            SeekFrom::Current(n) => self.pos as i64 + n,
+        };
+        if next < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before the start of the APK",
+            ));
+        }
+        self.pos = next as u64;
+        Ok(self.pos)
+    }
+}
+
 struct Manager {
     apk: PathBuf,
+    /// The archive with its central directory already parsed, cloned per read.
+    ///
+    /// Built once, lazily, so that a `set_apk` on a file that later becomes
+    /// unreadable still fails at the read rather than at startup — the
+    /// behaviour before this existed. `None` means the archive could not be
+    /// opened or parsed at all, which is reported by the caller as a miss, as
+    /// it always was.
+    ///
+    /// **Deliberately not a `Mutex<ZipArchive<_>>`.** `by_name` needs `&mut`,
+    /// so one shared archive would mean holding a lock across the read and the
+    /// inflate — serialising every asset the engine asks for, on the twenty-odd
+    /// threads it asks from. The previous code was slow but at least concurrent
+    /// (the cache lock is released before the zip work, which is why it never
+    /// showed up as contention), and a fix that made the fast path serial would
+    /// have traded one bug for a worse one. A `OnceLock` of a *template* that
+    /// each read clones keeps the concurrency and removes the re-parse.
+    archive: OnceLock<Option<zip::ZipArchive<ApkReader>>>,
     /// Decompressed contents, keyed by path inside `assets/`.
     ///
     /// Roblox reopens the same assets repeatedly during startup, and zip
@@ -43,6 +135,27 @@ struct Manager {
     /// out a pointer that stays valid after the asset is closed, which the API
     /// does not promise but callers routinely assume.
     cache: Mutex<HashMap<String, &'static [u8]>>,
+}
+
+impl Manager {
+    /// A private archive handle sharing the one parsed central directory, or
+    /// `None` if the APK could not be read.
+    fn archive(&self) -> Option<zip::ZipArchive<ApkReader>> {
+        self.archive
+            .get_or_init(|| {
+                let reader = ApkReader::open(&self.apk).ok()?;
+                let zip = zip::ZipArchive::new(reader).ok()?;
+                if trace_assets_enabled() {
+                    eprintln!(
+                        "[asset] indexed {} entries in {}",
+                        zip.len(),
+                        self.apk.display()
+                    );
+                }
+                Some(zip)
+            })
+            .clone()
+    }
 }
 
 static MANAGER: OnceLock<Manager> = OnceLock::new();
@@ -55,6 +168,7 @@ pub fn set_apk(path: &Path) -> Result<(), String> {
     MANAGER
         .set(Manager {
             apk: path.to_path_buf(),
+            archive: OnceLock::new(),
             cache: Mutex::new(HashMap::new()),
         })
         .map_err(|_| "an APK is already set".to_string())
@@ -119,8 +233,10 @@ impl Manager {
         }
 
         let Some(bytes) = (|| -> Option<Vec<u8>> {
-            let file = File::open(&self.apk).ok()?;
-            let mut zip = zip::ZipArchive::new(file).ok()?;
+            // `archive()` parses the central directory once for the process
+            // and hands back a clone that shares it; this used to open the
+            // APK and re-index all 1,835 entries here, per asset.
+            let mut zip = self.archive()?;
             let mut entry = zip.by_name(&format!("assets/{name}")).ok()?;
             let mut bytes = Vec::with_capacity(entry.size() as usize);
             entry.read_to_end(&mut bytes).ok()?;
@@ -827,8 +943,7 @@ pub struct Stale {
 /// than a decompression of ninety-odd megabytes.
 pub fn apk_asset_names() -> Result<BTreeSet<String>, String> {
     let manager = MANAGER.get().ok_or("no APK is set")?;
-    let file = File::open(&manager.apk).map_err(|e| format!("{}: {e}", manager.apk.display()))?;
-    let zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let zip = manager.archive().ok_or_else(|| format!("cannot read {}", manager.apk.display()))?;
     Ok(zip
         .file_names()
         .filter_map(|n| n.strip_prefix("assets/"))
@@ -853,8 +968,7 @@ pub fn apk_asset_names() -> Result<BTreeSet<String>, String> {
 /// the caller falls back to naming the file.
 pub fn client_version() -> Option<String> {
     let manager = MANAGER.get()?;
-    let file = File::open(&manager.apk).ok()?;
-    let mut zip = zip::ZipArchive::new(file).ok()?;
+    let mut zip = manager.archive()?;
     let mut entry = zip.by_name("AndroidManifest.xml").ok()?;
     let mut bytes = Vec::with_capacity(entry.size() as usize);
     entry.read_to_end(&mut bytes).ok()?;
@@ -961,14 +1075,76 @@ pub fn shadow_report() -> Vec<String> {
 /// which fails the client-settings fetch, which fails the flag set — three
 /// layers away from anything that mentions certificates.
 ///
-/// Extraction is skipped when the destination is already populated, so repeat
-/// launches pay for it once.
+/// Extraction is skipped when the destination is **stamped with this exact
+/// APK**, so repeat launches pay for it once and a new Roblox build pays for
+/// it again.
+///
+/// **Two defects fixed here on 2026-08-22, both of the kind this project calls
+/// its most expensive.**
+///
+/// *It had no staleness check at all.* The test was `out.exists()`, per file,
+/// so a new APK left every previously-extracted asset exactly as it was and
+/// the engine ran the new build against the old build's content. That is the
+/// same silent version mismatch `cordial_update::cache`'s own module doc was
+/// written for, one directory across — the shell had it fixed for
+/// `libroblox.so` and this had not. The fix is that module, not a second
+/// notion of "is this current": two independent answers to that question is
+/// how one of them quietly stops being true, and `install.rs` already has the
+/// tests pinning both directions.
+///
+/// *It had no completion marker.* An extraction interrupted half way left a
+/// partial tree that the per-file existence check then read as finished, and
+/// nothing anywhere would ever have said so. The stamp is now the completion
+/// marker: it is written after the last file and nowhere else, so a partial
+/// tree is unstamped, and unstamped is not current.
+///
+/// Each file is also written through a temporary and renamed into place, so no
+/// individual asset can be observed half-written — the engine `mmap`s some of
+/// these and a truncated read is a texture rendered as garbage rather than an
+/// error anybody sees.
+///
+/// **The tree is overwritten in place rather than swapped in.** Same choice
+/// `install.rs` makes and for the same reason it records: deleting first would
+/// leave a user with nothing at all if the extraction then failed, and an
+/// unstamped tree simply re-extracts next launch, which is slow rather than
+/// wrong.
+///
+/// **A gap that remains, named rather than left to be discovered.** A file
+/// present in the old APK and absent from the new one is not removed, because
+/// nothing here walks the destination to diff it. The filesystem route would
+/// still serve that orphan. It has not been seen and removing a cache
+/// directory's contents is a change that wants its own test rather than a
+/// clause in this one, but it is the honest remaining hole in "the extracted
+/// tree matches this APK".
 pub fn extract_to(dir: &Path) -> Result<PathBuf, String> {
     let manager = MANAGER.get().ok_or("no APK is set")?;
-    let file = File::open(&manager.apk).map_err(|e| format!("{}: {e}", manager.apk.display()))?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    if cordial_update::cache::is_current(dir, &manager.apk) {
+        return Ok(dir.to_path_buf());
+    }
+    let zip =
+        manager.archive().ok_or_else(|| format!("cannot read {}", manager.apk.display()))?;
+    extract_archive_to(dir, &manager.apk, zip)
+}
+
+/// The half of [`extract_to`] that does not need the process-wide `MANAGER`.
+///
+/// Split out for the reason `merge` is split from `apply_overrides` and
+/// `build_index` from `index`: `MANAGER` is a `OnceLock` set at most once per
+/// process, so a test that went through the public entry point could exercise
+/// exactly one APK per test binary. Generic over the reader so a test can hand
+/// it an archive built in memory.
+fn extract_archive_to<R: Read + Seek>(
+    dir: &Path,
+    apk: &Path,
+    mut zip: zip::ZipArchive<R>,
+) -> Result<PathBuf, String> {
+    // Said out loud, because until now this was silent either way and a user
+    // whose first launch after an update took an extra second had nothing to
+    // attribute it to.
+    println!("  assets: {} is not extracted from {}; extracting", dir.display(), apk.display());
 
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut written = 0usize;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         let Some(name) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
@@ -984,17 +1160,45 @@ pub fn extract_to(dir: &Path) -> Result<PathBuf, String> {
             continue;
         }
         let out = dir.join(rel);
-        if out.exists() {
-            continue;
-        }
+        // No `out.exists()` skip any more. That skip was the staleness bug:
+        // once the APK has changed, an existing file with the right name is
+        // the *wrong* file, and keeping it is the whole failure.
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
         let mut bytes = Vec::with_capacity(entry.size() as usize);
         entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        std::fs::write(&out, &bytes).map_err(|e| format!("{}: {e}", out.display()))?;
+        write_atomically(&out, &bytes)?;
+        written += 1;
     }
+
+    // Last, and only on success. Everything above can fail and leave a tree
+    // that is merely unstamped, which the check at the top of this function
+    // treats as "extract again" -- the recoverable direction.
+    cordial_update::cache::write_stamp(dir, apk)
+        .map_err(|e| format!("extracted {written} assets but could not stamp {}: {e}", dir.display()))?;
+    println!("  assets: extracted {written} files into {}", dir.display());
     Ok(dir.to_path_buf())
+}
+
+/// Write `bytes` to `out` through a temporary in the same directory.
+///
+/// Same-directory so the rename is within one filesystem and therefore atomic;
+/// a temporary in `/tmp` would be a copy across a mount on this host, which is
+/// not. The temporary carries the pid so two processes extracting into one
+/// cache cannot truncate each other's half-written file -- profiles are locked
+/// one instance at a time (ADR-012) but the *cache* is machine-wide and shared
+/// between them.
+fn write_atomically(out: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = out.with_extension(format!("cordial-{}", std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    match std::fs::rename(&tmp, out) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("{}: {e}", out.display()))
+        }
+    }
 }
 
 /// SAFETY: `p` is null or a NUL-terminated C string, per the API contract.
@@ -1180,6 +1384,188 @@ mod overlay_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ------------------------------------------------- extraction and the zip
+
+    /// A zip with `assets/<name>` entries, in memory.
+    ///
+    /// `Stored` rather than `Deflated` so the test does not depend on which
+    /// compression features the crate is built with -- the thing under test is
+    /// the extraction, not the codec.
+    fn apk_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut out = std::io::Cursor::new(Vec::new());
+        let mut w = zip::ZipWriter::new(&mut out);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(bytes).unwrap();
+        }
+        w.finish().unwrap();
+        out.into_inner()
+    }
+
+    fn archive_of(bytes: &[u8]) -> zip::ZipArchive<std::io::Cursor<Vec<u8>>> {
+        zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap()
+    }
+
+    /// Stand-in for a real APK on disk, so `cordial_update::cache` has
+    /// something to stat. Its size and mtime are what the stamp is made of.
+    fn fake_apk(dir: &Path, name: &str, contents: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_clone_of_the_apk_reader_has_its_own_position() {
+        // The whole safety argument for sharing one parsed central directory
+        // is that clones do positioned reads and cannot move each other's
+        // cursor. If they could, two threads inflating different entries would
+        // serve each other's bytes -- an asset rendered as the wrong asset,
+        // with nothing reporting an error anywhere.
+        let dir = scratch("apk-reader");
+        let path = fake_apk(&dir, "base.apk", b"0123456789");
+        let mut a = ApkReader::open(&path).unwrap();
+        let mut b = a.clone();
+
+        let mut first = [0u8; 4];
+        a.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"0123");
+
+        // `b` has not moved, even though `a` has.
+        let mut second = [0u8; 4];
+        b.read_exact(&mut second).unwrap();
+        assert_eq!(&second, b"0123");
+
+        // And seeking from the end works, which is how the zip reader finds
+        // the end-of-central-directory record in the first place.
+        assert_eq!(b.seek(SeekFrom::End(-2)).unwrap(), 8);
+        let mut tail = [0u8; 2];
+        b.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"89");
+    }
+
+    #[test]
+    fn an_apk_reader_refuses_to_seek_before_the_start() {
+        let dir = scratch("apk-reader-underflow");
+        let path = fake_apk(&dir, "base.apk", b"abc");
+        let mut r = ApkReader::open(&path).unwrap();
+        assert!(r.seek(SeekFrom::End(-99)).is_err());
+        // The failed seek must not have moved it -- a position quietly
+        // clamped to zero would read the wrong entry rather than fail.
+        assert_eq!(r.seek(SeekFrom::Current(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn extraction_writes_the_assets_and_stamps_only_at_the_end() {
+        let dir = scratch("extract-basic");
+        let apk = fake_apk(&dir, "base.apk", b"apk-v1");
+        let zip = apk_with(&[
+            ("assets/content/a.txt", b"one"),
+            ("assets/ssl/cacert.pem", b"pem"),
+            // Not under `assets/`, so not ours to extract.
+            ("lib/x86_64/libroblox.so", b"elf"),
+        ]);
+        let out = dir.join("assets");
+
+        extract_archive_to(&out, &apk, archive_of(&zip)).unwrap();
+
+        assert_eq!(std::fs::read(out.join("content/a.txt")).unwrap(), b"one");
+        assert_eq!(std::fs::read(out.join("ssl/cacert.pem")).unwrap(), b"pem");
+        assert!(!out.join("lib/x86_64/libroblox.so").exists());
+        // The stamp is the completion marker, so it has to be there now.
+        assert!(cordial_update::cache::is_current(&out, &apk));
+        // And no temporary is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(out.join("content"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("cordial-"))
+            .collect();
+        assert!(leftovers.is_empty(), "left a temporary behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn a_new_roblox_build_re_extracts_rather_than_serving_the_old_builds_assets() {
+        // The defect this replaces: the test was `out.exists()` per file, so a
+        // new APK left every asset from the old build exactly where it was and
+        // the engine ran the new build against the old build's content.
+        let dir = scratch("extract-stale");
+        let out = dir.join("assets");
+
+        let old_apk = fake_apk(&dir, "old.apk", b"apk-v1");
+        extract_archive_to(&out, &old_apk, archive_of(&apk_with(&[("assets/x.txt", b"old")])))
+            .unwrap();
+        assert_eq!(std::fs::read(out.join("x.txt")).unwrap(), b"old");
+
+        let new_apk = fake_apk(&dir, "new.apk", b"apk-v2-longer");
+        assert!(!cordial_update::cache::is_current(&out, &new_apk));
+        extract_archive_to(&out, &new_apk, archive_of(&apk_with(&[("assets/x.txt", b"new")])))
+            .unwrap();
+        assert_eq!(std::fs::read(out.join("x.txt")).unwrap(), b"new");
+        assert!(cordial_update::cache::is_current(&out, &new_apk));
+    }
+
+    #[test]
+    fn an_unchanged_apk_is_current_and_needs_no_second_extraction() {
+        let dir = scratch("extract-unchanged");
+        let out = dir.join("assets");
+        let apk = fake_apk(&dir, "base.apk", b"apk-v1");
+        extract_archive_to(&out, &apk, archive_of(&apk_with(&[("assets/x.txt", b"one")])))
+            .unwrap();
+        // `extract_to`'s early return keys on exactly this, and it is the one
+        // thing standing between a launch and re-unpacking ninety megabytes.
+        assert!(cordial_update::cache::is_current(&out, &apk));
+    }
+
+    #[test]
+    fn an_interrupted_extraction_is_not_mistaken_for_a_finished_one() {
+        // A partial tree with the right filenames in it -- what an extraction
+        // killed part way leaves behind. Under the old per-file `exists()`
+        // check every one of these counted as done and the missing remainder
+        // was never noticed. The stamp is written last and only on success, so
+        // a tree without one is not current whatever is in it.
+        let dir = scratch("extract-partial");
+        let out = dir.join("assets");
+        let apk = fake_apk(&dir, "base.apk", b"apk-v1");
+        write(&out, "content/a.txt", b"half");
+        assert!(out.join("content/a.txt").exists());
+        assert!(!cordial_update::cache::is_current(&out, &apk));
+
+        extract_archive_to(
+            &out,
+            &apk,
+            archive_of(&apk_with(&[("assets/content/a.txt", b"whole"), ("assets/b.txt", b"b")])),
+        )
+        .unwrap();
+        // The half-written file is replaced rather than skipped.
+        assert_eq!(std::fs::read(out.join("content/a.txt")).unwrap(), b"whole");
+        assert_eq!(std::fs::read(out.join("b.txt")).unwrap(), b"b");
+        assert!(cordial_update::cache::is_current(&out, &apk));
+    }
+
+    #[test]
+    fn an_entry_that_escapes_the_destination_is_not_written() {
+        // `enclosed_name` is the whole zip-slip defence and it is easy to
+        // delete by accident while editing the loop around it.
+        let dir = scratch("extract-slip");
+        let out = dir.join("assets");
+        let apk = fake_apk(&dir, "base.apk", b"apk-v1");
+        extract_archive_to(
+            &out,
+            &apk,
+            archive_of(&apk_with(&[
+                ("assets/../../escaped.txt", b"no"),
+                ("assets/kept.txt", b"yes"),
+            ])),
+        )
+        .unwrap();
+        assert!(out.join("kept.txt").exists());
+        assert!(!dir.parent().unwrap().join("escaped.txt").exists());
+        assert!(!dir.join("escaped.txt").exists());
     }
 
     fn layer(source: OverlaySource, root: &Path) -> OverlayLayer {

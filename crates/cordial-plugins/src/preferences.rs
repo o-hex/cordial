@@ -808,6 +808,23 @@ mod tests {
     }
 
     #[test]
+    fn markup_in_a_title_is_accepted_and_must_therefore_be_drawn_literally() {
+        // The other half of the test above, and the one that says what the
+        // renderer owes. `<b>` is ordinary text a plugin author might
+        // reasonably write, so refusing it here would be wrong -- which means
+        // `plugin_preferences.rs` is what has to stop libadwaita parsing it as
+        // Pango markup in Cordial's own chrome. If this test is ever "fixed"
+        // by refusing markup here, that renderer guard is what to check first.
+        let fields: Vec<Declaration> = serde_json::from_value(serde_json::json!([
+            {"key": "k", "type": "bool",
+             "title": "<b>Bold</b> & <span size='xx-large'>huge</span>",
+             "description": "<i>also not italic</i>"}
+        ]))
+        .unwrap();
+        assert!(check_all(&fields).is_ok());
+    }
+
+    #[test]
     fn a_key_that_is_not_boring_is_refused() {
         for key in ["", "has space", "a/b", "..", "e\u{301}"] {
             assert!(!is_valid_key(key), "{key:?} should not be a usable preference key");

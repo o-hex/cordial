@@ -489,6 +489,139 @@ pub fn opensles_overrides() -> Vec<(&'static str, *mut c_void)> {
         .collect()
 }
 
+// -------------------------------------------------------------------- AAudio
+
+/// Whether `CORDIAL_AUDIO` selected an AAudio mode.
+///
+/// Read from `native/aaudio.cpp` rather than from `std::env` here so that
+/// there is exactly one parser of the variable in the process. The failure
+/// this forecloses is specific: `symtab` deciding to register
+/// `libaaudio.so` while `org.fmod.FMOD.supportsAAudio()` in
+/// `native/audio_classes.cpp` says false, which would leave FMOD on the Java
+/// path with a virtual library nobody opens — an experiment that looks like
+/// it ran and did not.
+pub fn aaudio_selected() -> bool {
+    extern "C" {
+        fn cordial_audio_backend_is_aaudio() -> c_int;
+    }
+    // SAFETY: reads a process-wide `static` decided once in aaudio.cpp.
+    unsafe { cordial_audio_backend_is_aaudio() != 0 }
+}
+
+/// Prints which audio backend is in force, during startup.
+///
+/// `CORDIAL_AUDIO` was described in conversation as the intended design and
+/// then tried on a live run before it existed, where it was silently ignored.
+/// That is indistinguishable from a feature that did nothing, so the switch
+/// announces itself rather than leaving the reader to infer it from whether
+/// sound comes out.
+pub fn announce_audio_backend() {
+    extern "C" {
+        fn cordial_audio_backend_announce();
+    }
+    // SAFETY: no arguments, no return; writes one line to stderr.
+    unsafe { cordial_audio_backend_announce() }
+}
+
+/// AAudio, implemented in `native/aaudio.cpp` over
+/// `native/pipewire_backend.cpp`'s `CallbackStream`.
+///
+/// Unlike OpenSL ES above, none of these are linked: `libroblox.so` has no
+/// undefined `AAudio*` symbols at all. It reaches them by `dlopen`ing
+/// `libaaudio.so` and `dlsym`ing the 25 names in
+/// `docs/analysis/aaudio-contract.md` — but only after
+/// `org.fmod.FMOD.supportsAAudio()` has said yes, which is the actual gate
+/// and which was measured, not assumed; see the comment on that method.
+///
+/// So this is registered the way `android::vulkan` and `mimalloc_lib` are, as
+/// a virtual library of its own, and only when `CORDIAL_AUDIO` asked for it.
+pub fn aaudio_overrides() -> Vec<(&'static str, *mut c_void)> {
+    #[repr(C)]
+    struct Symbol {
+        name: *const c_char,
+        addr: *mut c_void,
+    }
+    extern "C" {
+        fn cordial_aaudio_symbols(count: *mut usize) -> *const Symbol;
+    }
+
+    let mut count = 0usize;
+    // SAFETY: the table is a static in aaudio.cpp and outlives the process.
+    let table = unsafe { cordial_aaudio_symbols(&mut count) };
+    if table.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: `table` points at `count` initialised entries with static names.
+    let entries = unsafe { std::slice::from_raw_parts(table, count) };
+    entries
+        .iter()
+        .map(|e| {
+            // SAFETY: each `name` is a string literal in aaudio.cpp.
+            let name = unsafe { CStr::from_ptr(e.name) }.to_str().unwrap_or("");
+            (name, e.addr)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod aaudio_tests {
+    /// The 25 names `libroblox.so` 2.734.0.917 looks up, from
+    /// `docs/analysis/aaudio-contract.md`.
+    ///
+    /// Duplicated here on purpose rather than generated from the C++ table:
+    /// this is the assertion that the table and the measurement still agree.
+    /// A typo in one entry of `aaudio.cpp`'s `kSymbols` is otherwise silent —
+    /// the guest's `dlsym` returns null for that one name, FMOD carries on
+    /// with a null function pointer, and what surfaces is a crash or a mute
+    /// stream a long way from the cause.
+    const MEASURED: &[&str] = &[
+        "AAudio_createStreamBuilder",
+        "AAudioStreamBuilder_delete",
+        "AAudioStreamBuilder_openStream",
+        "AAudioStreamBuilder_setBufferCapacityInFrames",
+        "AAudioStreamBuilder_setDataCallback",
+        "AAudioStreamBuilder_setDirection",
+        "AAudioStreamBuilder_setErrorCallback",
+        "AAudioStreamBuilder_setFormat",
+        "AAudioStreamBuilder_setInputPreset",
+        "AAudioStreamBuilder_setPerformanceMode",
+        "AAudioStreamBuilder_setUsage",
+        "AAudioStream_close",
+        "AAudioStream_getBufferCapacityInFrames",
+        "AAudioStream_getBufferSizeInFrames",
+        "AAudioStream_getChannelCount",
+        "AAudioStream_getFormat",
+        "AAudioStream_getFramesPerBurst",
+        "AAudioStream_getSampleRate",
+        "AAudioStream_getState",
+        "AAudioStream_getXRunCount",
+        "AAudioStream_read",
+        "AAudioStream_requestPause",
+        "AAudioStream_requestStart",
+        "AAudioStream_requestStop",
+        "AAudioStream_setBufferSizeInFrames",
+    ];
+
+    #[test]
+    fn exports_exactly_the_symbols_the_engine_looks_up() {
+        let mut got: Vec<&str> = super::aaudio_overrides().into_iter().map(|(n, _)| n).collect();
+        got.sort_unstable();
+        let mut want: Vec<&str> = MEASURED.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn every_export_has_a_real_address() {
+        // A null here would register the name and resolve it to nothing,
+        // which is worse than not registering it at all: the guest's `dlsym`
+        // succeeds and the call goes to address zero.
+        for (name, addr) in super::aaudio_overrides() {
+            assert!(!addr.is_null(), "{name} resolved to a null address");
+        }
+    }
+}
+
 // ------------------------------------------------------------------ /system
 
 /// The path-taking libc calls, redirected for `/system` — `native/system_paths.cpp`.

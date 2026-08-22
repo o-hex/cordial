@@ -1249,6 +1249,11 @@ fn main() -> ExitCode {
     // bound by a CPU that has not been asked to hurry yet.
     gamemode::register();
 
+    // Before the table is built, because `symtab::build` consults the same
+    // selection to decide whether `libaaudio.so` exists at all, and a reader
+    // of this log should see the choice before its consequence.
+    cordial_runtime::bionic::announce_audio_backend();
+
     let table = symtab::build(opt.host_libc);
     let totals = table.totals();
 

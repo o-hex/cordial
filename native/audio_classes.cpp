@@ -83,6 +83,7 @@
 #include <string>
 #include <vector>
 
+#include "aaudio.h"
 #include "pipewire_backend.h"
 
 namespace cordial {
@@ -919,23 +920,62 @@ public:
     /// latency produces underruns rather than an error anybody can trace.
     static jboolean supportsLowLatency(jnivm::ENV*, jnivm::Class*) { return JNI_FALSE; }
 
-    /// **AAudio: answered false, and this is a decision rather than a gap.**
+    /// **AAudio: true only when `CORDIAL_AUDIO` asked for it, false otherwise.**
     ///
-    /// AAudio is Android's low-latency C API — `AAudioStreamBuilder_*`,
-    /// `AAudioStream_*`, roughly thirty entry points in `libaaudio.so`, none of
-    /// which Cordial has and none of which the linker offers as a virtual
-    /// library. Answering true here sends FMOD down a path that immediately
-    /// looks for that library. It is the better path when it exists — lower
-    /// latency is exactly why FMOD prefers it — and it is a real piece of work,
-    /// not a line change.
+    /// This used to be an unconditional false, with a comment saying to flip
+    /// it "the day `libaaudio.so` is real, not before". That day has come
+    /// halfway: `native/aaudio.cpp` implements the 25 entry points this build
+    /// looks up, over PipeWire, and `symtab.rs` registers them as a virtual
+    /// `libaaudio.so` — but only under `CORDIAL_AUDIO=aaudio`, because an
+    /// audio backend nobody has measured must not become the default on an
+    /// update. So the honest answer is now conditional, and it is conditional
+    /// on exactly the same reading of `CORDIAL_AUDIO` that decides whether
+    /// the library exists at all. The two cannot disagree: both call
+    /// `cordial_audio_backend_is_aaudio`, and there is one definition of it.
     ///
-    /// Until that library exists, false is the honest answer and it routes FMOD
-    /// to the `AudioDevice` path below, which is implemented and which PipeWire
-    /// already serves. Flip this the day `libaaudio.so` is real, not before:
-    /// the failure mode of claiming it early is FMOD initialising against an
-    /// output that is not there, which is precisely the `FMOD_ERR_OUTPUT_INIT`
-    /// this whole file exists to fix.
-    static jboolean supportsAAudio(jnivm::ENV*, jnivm::Class*) { return JNI_FALSE; }
+    /// **This predicate, not `dlopen`, is the real gate**, and that was worth
+    /// measuring rather than assuming. `docs/analysis/aaudio-contract.md` had
+    /// it that Roblox's `dlopen("libaaudio.so")` fails because Cordial
+    /// registers no such library. It does not fail — it never happens. A
+    /// signed-in run into place 1818 with `CORDIAL_TRACE_DLSYM=1` records six
+    /// guest `dlopen` calls (`libc`, `libcamera2ndk`, `libmediandk`,
+    /// `libvulkan`, `libandroid` twice) and no audio library among them:
+    /// FMOD asks this Java method first and never looks for the library when
+    /// the answer is false. Answer it true and `dlopen("libaaudio.so", 1)`
+    /// appears in the very next few trace lines, followed by a `dlsym` for
+    /// each of the 25 names.
+    ///
+    /// **Saying yes here is a commitment, not a preference, and that is the
+    /// most consequential thing measured on 2026-08-22.** A control run
+    /// (`CORDIAL_AUDIO=aaudio-refuse`) answered this true and then reported
+    /// `AAUDIO_ERROR_UNAVAILABLE` from every `openStream`. FMOD tried twice —
+    /// a probe with no callbacks, then the real stream — and on the second
+    /// refusal **gave up on audio entirely**. It did not fall back to
+    /// `AudioDevice` below, and it did not fall back to OpenSL ES: there is
+    /// no `AudioDevice.init` anywhere in the rest of that log, and the place
+    /// loaded and played in silence. The "AAudio, then OpenSL ES, then Java"
+    /// chain this work was planned around does not exist on this build once
+    /// the first link has been claimed.
+    ///
+    /// That is why `pipewire_available()` is part of the condition. It is the
+    /// same call `slCreateEngine` gates on, it is cached after the first
+    /// round trip, and without it a machine with no PipeWire daemon would
+    /// have this method promise an output that `AAudioStreamBuilder_openStream`
+    /// must then refuse — costing the Java fallback that would have reported
+    /// the same failure in the one place people already know to look.
+    static jboolean supportsAAudio(jnivm::ENV*, jnivm::Class*) {
+        if (!cordial_audio_backend_is_aaudio()) return JNI_FALSE;
+        if (!audio::pipewire_available()) {
+            std::fprintf(stderr,
+                "W/Cordial-FMOD            CORDIAL_AUDIO asked for AAudio but no PipeWire "
+                "session is reachable; answering supportsAAudio() false so FMOD keeps its "
+                "AudioDevice fallback. Claiming AAudio here would cost all audio, not just "
+                "the low-latency path -- FMOD does not fall back once a stream it opened "
+                "through AAudio refuses.\n");
+            return JNI_FALSE;
+        }
+        return JNI_TRUE;
+    }
 
     static void Register(jnivm::ENV* env) {
         env->GetClass<FMOD>("org/fmod/FMOD");

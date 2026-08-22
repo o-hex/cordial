@@ -355,6 +355,45 @@ bool map_format(uint32_t bits_per_sample, uint32_t container_bits, bool big_endi
 
 } // namespace
 
+/// The same job for AAudio's much smaller format set. `bits`/`is_float`
+/// describe one `aaudio_format_t`; `aaudio.cpp` does the enum-to-pair
+/// translation so that Android's vocabulary stays in the file that speaks
+/// Android, exactly as `DeviceInfo` above keeps it out of this one.
+///
+/// Little-endian only, and that is not a gap: this backend exists to run
+/// Android x86-64 code on a desktop x86-64, and both ends of that are
+/// little-endian. A big-endian host would need the whole tree ported first.
+bool map_aaudio_format(uint32_t sample_bits, bool is_float, spa_audio_format& out) {
+    if (is_float) {
+        if (sample_bits == 32) {
+            out = SPA_AUDIO_FORMAT_F32_LE;
+            return true;
+        }
+        return false;
+    }
+    switch (sample_bits) {
+    case 16: out = SPA_AUDIO_FORMAT_S16_LE; return true;
+    case 24: out = SPA_AUDIO_FORMAT_S24_LE; return true; // three packed bytes, as AAudio's I24_PACKED
+    case 32: out = SPA_AUDIO_FORMAT_S32_LE; return true;
+    default: return false;
+    }
+}
+
+/// The inverse, for reporting back what PipeWire actually negotiated.
+/// Returns false for a format this bridge cannot describe to the engine,
+/// which the caller must treat as a failed open rather than rounding to
+/// something nearby — the engine reads these numbers and lays its mixer out
+/// against them.
+bool describe_format(uint32_t spa_format, uint32_t& sample_bits, bool& is_float) {
+    switch (spa_format) {
+    case SPA_AUDIO_FORMAT_S16_LE: sample_bits = 16; is_float = false; return true;
+    case SPA_AUDIO_FORMAT_S24_LE: sample_bits = 24; is_float = false; return true;
+    case SPA_AUDIO_FORMAT_S32_LE: sample_bits = 32; is_float = false; return true;
+    case SPA_AUDIO_FORMAT_F32_LE: sample_bits = 32; is_float = true; return true;
+    default: return false;
+    }
+}
+
 // ------------------------------------------------------------------- Impl
 
 using PendingBuffer = testing::PendingBuffer;
@@ -671,6 +710,321 @@ std::vector<DeviceInfo> enumerate_devices() {
                                     : (!scan.default_sink.empty() && d.node_name == scan.default_sink);
     }
     return scan.devices;
+}
+
+// ---------------------------------------------------------- CallbackStream
+
+/// The AAudio bridge's stream: PipeWire pulls, we pull the engine, in the
+/// same call on the same thread. See the class comment in the header for why
+/// this has no queue and no mutex where `PlaybackStream` has both.
+struct CallbackStream::Impl {
+    pw_stream* stream = nullptr;
+    Session* session = nullptr;
+
+    CallbackStream::FillCallback fill = nullptr;
+    void* user = nullptr;
+
+    /// Written on the loop thread by `on_param_changed`, read by the opening
+    /// thread only after `negotiated` has been observed true, and by
+    /// `process` on the loop thread thereafter. Not atomic individually
+    /// because `negotiated`'s release/acquire pair orders the lot.
+    uint32_t rate = 0;
+    uint32_t channels = 0;
+    uint32_t sample_bytes = 0;
+    uint32_t sample_bits = 0;
+    bool is_float = false;
+    std::atomic<bool> negotiated{false};
+
+    std::atomic<bool> running{false};
+    std::atomic<uint32_t> burst{0};
+    std::atomic<uint64_t> silence{0};
+
+    static void on_process(void* data) { static_cast<Impl*>(data)->process(); }
+
+    /// **Realtime.** Nothing here locks, allocates, frees, logs or calls into
+    /// the kernel; `memset` and the engine's own callback are the whole of
+    /// it. That is the property the whole class exists to have — see
+    /// `c7215eb` for the deadlock that a mutex on this path produced.
+    void process() {
+        pw_buffer* b = g_lib.stream_dequeue_buffer(stream);
+        if (!b) return; // no buffer this cycle; PipeWire will ask again
+        spa_buffer* buf = b->buffer;
+        auto* dst = static_cast<uint8_t*>(buf->datas[0].data);
+        const uint32_t bpf = channels * sample_bytes;
+        if (!dst || bpf == 0) {
+            g_lib.stream_queue_buffer(stream, b);
+            return;
+        }
+
+        uint32_t frames = buf->datas[0].maxsize / bpf;
+        if (b->requested != 0 && b->requested < frames) {
+            frames = static_cast<uint32_t>(b->requested);
+        }
+        // One signal per stream, on the first cycle only, so that `open` can
+        // stop waiting the moment there is a measured burst size to report.
+        // `param_changed` signals for the format; nothing else would signal
+        // for this, and without it `open` sits out a full second of
+        // `thread_loop_timed_wait` on every stream it brings up. The
+        // realtime rule this bends is bent exactly once and never on a cycle
+        // that is producing audio.
+        if (burst.exchange(frames, std::memory_order_relaxed) == 0 && session) {
+            g_lib.thread_loop_signal(session->loop, false);
+        }
+
+        bool filled = false;
+        if (running.load(std::memory_order_relaxed) && fill != nullptr) {
+            filled = fill(dst, frames, user);
+            // The callback asking to stop is the AAudio contract's
+            // AAUDIO_CALLBACK_RESULT_STOP, not a fault: stop pulling, keep
+            // the node connected, and let the owner close it when it likes.
+            if (!filled) running.store(false, std::memory_order_relaxed);
+        } else if (running.load(std::memory_order_relaxed)) {
+            // Running with nothing to pull from. Cannot happen while `fill`
+            // is set before connect and never cleared, and counted rather
+            // than asserted so that a future change which breaks that shows
+            // up as a number instead of as silence nobody can explain.
+            silence.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!filled) std::memset(dst, 0, static_cast<size_t>(frames) * bpf);
+
+        buf->datas[0].chunk->offset = 0;
+        buf->datas[0].chunk->stride = static_cast<int32_t>(bpf);
+        buf->datas[0].chunk->size = frames * bpf;
+
+        g_lib.stream_queue_buffer(stream, b);
+    }
+
+    /// PipeWire's answer to the deliberately underspecified format `open`
+    /// offered. This is the only place rate and channel count are ever set,
+    /// and they are read back out of the pod rather than assumed, because
+    /// "we asked for nothing in particular and then reported 48000" is
+    /// exactly the shape of claim this project keeps having to retract.
+    static void on_param_changed(void* data, uint32_t id, const spa_pod* param) {
+        auto* self = static_cast<Impl*>(data);
+        if (!param || id != SPA_PARAM_Format) return;
+
+        uint32_t media_type = 0, media_subtype = 0;
+        if (spa_format_parse(param, &media_type, &media_subtype) < 0) return;
+        if (media_type != SPA_MEDIA_TYPE_audio || media_subtype != SPA_MEDIA_SUBTYPE_raw) return;
+
+        spa_audio_info_raw raw{};
+        if (spa_format_audio_raw_parse(param, &raw) < 0) return;
+
+        uint32_t bits = 0;
+        bool is_float = false;
+        if (!describe_format(raw.format, bits, is_float)) return;
+        // A Format with no rate or no channel count is not a negotiated
+        // format, and treating it as one would have `open` report a rate of
+        // zero to an engine that lays its mixer out against the answer.
+        if (raw.rate == 0 || raw.channels == 0) return;
+
+        self->rate = raw.rate;
+        self->channels = raw.channels;
+        self->sample_bits = bits;
+        self->sample_bytes = bits / 8;
+        self->is_float = is_float;
+        self->negotiated.store(true, std::memory_order_release);
+        if (self->session) g_lib.thread_loop_signal(self->session->loop, false);
+    }
+
+    static void on_state_changed(void* data, pw_stream_state, pw_stream_state state,
+                                  const char* error) {
+        (void)data;
+        if (state == PW_STREAM_STATE_ERROR) {
+            std::fprintf(stderr,
+                "E/Cordial-AAudio          PipeWire stream entered the error state (%s).\n",
+                error ? error : "no reason given");
+        }
+    }
+
+    static const pw_stream_events& events() {
+        static const pw_stream_events e = [] {
+            pw_stream_events ev{};
+            ev.version = PW_VERSION_STREAM_EVENTS;
+            ev.state_changed = &Impl::on_state_changed;
+            ev.param_changed = &Impl::on_param_changed;
+            ev.process = &Impl::on_process;
+            return ev;
+        }();
+        return e;
+    }
+};
+
+CallbackStream::CallbackStream() : impl_(new Impl()) {}
+
+CallbackStream::~CallbackStream() {
+    close();
+    delete impl_;
+}
+
+bool CallbackStream::open(uint32_t sample_bits, bool is_float, const char* node_description,
+                           FillCallback cb, void* user) {
+    if (!cb) return false;
+    Session* session = get_session();
+    if (!session) return false;
+
+    // `sample_bits == 0` is "no preference", and it must still name a format.
+    //
+    // The first revision left `wanted` at `SPA_AUDIO_FORMAT_UNKNOWN` in that
+    // case, on the theory that an unconstrained EnumFormat lets PipeWire pick
+    // everything. It does not: `spa_format_audio_raw_build` omits every zero
+    // field, so the pod went out carrying nothing but mediaType and
+    // mediaSubtype, and PipeWire never answered with a Format at all. Measured
+    // — FMOD asks for `AAUDIO_FORMAT_UNSPECIFIED`, so this was the path every
+    // real stream took, and every one of them failed with
+    //
+    //     PipeWire did not negotiate a format and turn a cycle within 3s
+    //     (format no, first cycle no)
+    //
+    // F32 is the right default and not merely a working one: it is PipeWire's
+    // own internal sample format, so choosing it means no conversion anywhere
+    // between the engine's mixer and the sink. Rate and channel count are
+    // still left at zero, and those two really are filled in by the graph.
+    spa_audio_format wanted = SPA_AUDIO_FORMAT_F32_LE;
+    if (sample_bits != 0 && !map_aaudio_format(sample_bits, is_float, wanted)) {
+        std::fprintf(stderr,
+            "E/Cordial-AAudio          no PipeWire format for %u-bit %s samples; refusing to "
+            "open a stream rather than substituting a nearby one.\n",
+            sample_bits, is_float ? "float" : "integer");
+        return false;
+    }
+
+    impl_->session = session;
+    impl_->fill = cb;
+    impl_->user = user;
+    impl_->negotiated.store(false, std::memory_order_relaxed);
+    impl_->burst.store(0, std::memory_order_relaxed);
+
+    static std::atomic<uint32_t> next_id{0};
+    char name[64];
+    std::snprintf(name, sizeof name, "cordial-aaudio-%u", next_id.fetch_add(1));
+
+    g_lib.thread_loop_lock(session->loop);
+
+    pw_properties* props = g_lib.properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CATEGORY, "Playback",
+        PW_KEY_MEDIA_ROLE, "Game",
+        PW_KEY_APP_NAME, "Cordial",
+        PW_KEY_NODE_NAME, name,
+        PW_KEY_NODE_DESCRIPTION, node_description ? node_description : "Cordial (Roblox via AAudio)",
+        nullptr);
+
+    impl_->stream = g_lib.stream_new_simple(g_lib.thread_loop_get_loop(session->loop), name, props,
+                                             &Impl::events(), impl_);
+    if (!impl_->stream) {
+        std::fprintf(stderr,
+            "E/Cordial-AAudio          pw_stream_new_simple failed; no audio.\n");
+        g_lib.thread_loop_unlock(session->loop);
+        return false;
+    }
+
+    // Rate and channel count are left out of the pod on purpose:
+    // `spa_format_audio_raw_build` omits any field that is zero, and an
+    // omitted field is one PipeWire is free to fill from whatever the sink is
+    // already running at. That is the whole of "no resampling on either
+    // side", and it is only available because this engine build looks up no
+    // AAudioStreamBuilder_setSampleRate to disagree with it.
+    uint8_t pod_buffer[1024];
+    spa_pod_builder builder = SPA_POD_BUILDER_INIT(pod_buffer, sizeof pod_buffer);
+    spa_audio_info_raw info{};
+    info.format = wanted;
+    info.rate = 0;
+    info.channels = 0;
+    const spa_pod* params[1];
+    params[0] = spa_format_audio_raw_build(&builder, SPA_PARAM_EnumFormat, &info);
+
+    // Connected *active*, unlike `PlaybackStream`. Nothing is audible until
+    // `set_running(true)`, because `process` writes silence until then; what
+    // this buys is that negotiation and the first cycle happen straight away,
+    // so `open` can return measured values for rate, channels and burst
+    // instead of placeholders its caller would go on to report to the engine
+    // as fact.
+    int rc = g_lib.stream_connect(
+        impl_->stream, SPA_DIRECTION_OUTPUT, PW_ID_ANY,
+        static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS),
+        params, 1);
+
+    if (rc < 0) {
+        std::fprintf(stderr,
+            "E/Cordial-AAudio          pw_stream_connect failed (%s); no audio.\n",
+            spa_strerror(rc));
+        g_lib.stream_destroy(impl_->stream);
+        impl_->stream = nullptr;
+        g_lib.thread_loop_unlock(session->loop);
+        return false;
+    }
+
+    // Three seconds, matching `round_trip` above and for the same reason: a
+    // session that cannot negotiate a format and turn one cycle in that long
+    // is not one worth making the engine wait on.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while ((!impl_->negotiated.load(std::memory_order_acquire) ||
+            impl_->burst.load(std::memory_order_relaxed) == 0) &&
+           std::chrono::steady_clock::now() < deadline) {
+        if (g_lib.thread_loop_timed_wait(session->loop, 1) != 0 &&
+            impl_->negotiated.load(std::memory_order_acquire) &&
+            impl_->burst.load(std::memory_order_relaxed) != 0) {
+            break;
+        }
+    }
+
+    const bool ready = impl_->negotiated.load(std::memory_order_acquire) &&
+                       impl_->burst.load(std::memory_order_relaxed) != 0;
+    if (!ready) {
+        std::fprintf(stderr,
+            "E/Cordial-AAudio          PipeWire did not negotiate a format and turn a cycle "
+            "within 3s (format %s, first cycle %s); refusing the stream rather than "
+            "reporting a rate nobody agreed to.\n",
+            impl_->negotiated.load(std::memory_order_acquire) ? "yes" : "no",
+            impl_->burst.load(std::memory_order_relaxed) != 0 ? "yes" : "no");
+        g_lib.stream_destroy(impl_->stream);
+        impl_->stream = nullptr;
+        g_lib.thread_loop_unlock(session->loop);
+        return false;
+    }
+
+    g_lib.thread_loop_unlock(session->loop);
+    return true;
+}
+
+void CallbackStream::close() {
+    if (!impl_ || !impl_->stream) return;
+    impl_->running.store(false, std::memory_order_relaxed);
+    Session* session = impl_->session;
+    if (session) {
+        // The loop lock is the only lock this class ever takes, and it is
+        // never held while anything else is. `process` runs on this same loop
+        // thread (no PW_STREAM_FLAG_RT_PROCESS), so holding it here excludes
+        // the callback outright — which is what makes tearing a stream down
+        // underneath a running engine safe without a mutex of our own.
+        g_lib.thread_loop_lock(session->loop);
+        g_lib.stream_destroy(impl_->stream);
+        g_lib.thread_loop_unlock(session->loop);
+    }
+    impl_->stream = nullptr;
+}
+
+bool CallbackStream::is_open() const { return impl_ && impl_->stream != nullptr; }
+
+void CallbackStream::set_running(bool running) {
+    if (!impl_) return;
+    impl_->running.store(running, std::memory_order_relaxed);
+}
+
+bool CallbackStream::is_running() const {
+    return impl_ && impl_->running.load(std::memory_order_relaxed);
+}
+
+uint32_t CallbackStream::rate_hz() const { return impl_ ? impl_->rate : 0; }
+uint32_t CallbackStream::channels() const { return impl_ ? impl_->channels : 0; }
+uint32_t CallbackStream::sample_bits() const { return impl_ ? impl_->sample_bits : 0; }
+bool CallbackStream::sample_is_float() const { return impl_ && impl_->is_float; }
+uint32_t CallbackStream::burst_frames() const {
+    return impl_ ? impl_->burst.load(std::memory_order_relaxed) : 0;
+}
+uint64_t CallbackStream::silence_cycles() const {
+    return impl_ ? impl_->silence.load(std::memory_order_relaxed) : 0;
 }
 
 // ---------------------------------------------------------- CaptureStream
@@ -1119,6 +1473,23 @@ bool CaptureStream::open(uint32_t, uint32_t, const std::string&) { return false;
 void CaptureStream::close() {}
 bool CaptureStream::is_open() const { return false; }
 uint32_t CaptureStream::read(void*, uint32_t) { return 0; }
+
+struct CallbackStream::Impl {};
+
+CallbackStream::CallbackStream() : impl_(nullptr) {}
+CallbackStream::~CallbackStream() {}
+
+bool CallbackStream::open(uint32_t, bool, const char*, FillCallback, void*) { return false; }
+void CallbackStream::close() {}
+bool CallbackStream::is_open() const { return false; }
+void CallbackStream::set_running(bool) {}
+bool CallbackStream::is_running() const { return false; }
+uint32_t CallbackStream::rate_hz() const { return 0; }
+uint32_t CallbackStream::channels() const { return 0; }
+uint32_t CallbackStream::sample_bits() const { return 0; }
+bool CallbackStream::sample_is_float() const { return false; }
+uint32_t CallbackStream::burst_frames() const { return 0; }
+uint64_t CallbackStream::silence_cycles() const { return 0; }
 
 struct PlaybackStream::Impl {};
 

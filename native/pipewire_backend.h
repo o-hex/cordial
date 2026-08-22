@@ -156,6 +156,90 @@ private:
     Impl* impl_;
 };
 
+/// One playback stream that is *pulled* rather than pushed: PipeWire asks for
+/// frames and this class asks its owner for them, in the same call, on the
+/// same thread.
+///
+/// `PlaybackStream` above exists because `SLAndroidSimpleBufferQueueItf` is a
+/// push interface — the engine hands over buffers and expects a drain
+/// notification later, so something has to hold them in between, and that
+/// something is a `std::deque` under a `std::mutex`. AAudio is not that shape.
+/// `AAudioStreamBuilder_setDataCallback` installs a function AAudio calls on
+/// its own realtime thread with "here is a buffer, fill it", which is
+/// precisely PipeWire's `process()`. Bridging one to the other needs no
+/// queue, no mutex, and no buffer of our own: `process()` calls the engine's
+/// callback with PipeWire's own buffer and queues it.
+///
+/// **Nothing on this path may lock, allocate, free, log, or make a syscall**,
+/// and the shape above is what makes that easy to hold to rather than a rule
+/// to remember. The failure it forecloses is on record: `c7215eb` fixed an
+/// AB-BA deadlock between `AudioDevice::close` holding its own mutex while
+/// waiting for PipeWire's thread-loop lock and PipeWire's own thread holding
+/// that lock while waiting for the mutex inside `AudioDevice::drained`. This
+/// class has no mutex for the second half of that cycle to form against.
+///
+/// **The format is PipeWire's to choose, not ours to request.** The engine
+/// build this was written for looks up no `AAudioStreamBuilder_setSampleRate`
+/// and no `_setChannelCount` (see `docs/analysis/aaudio-contract.md`), so it
+/// opens a stream and then reads back what it got. `open` therefore offers a
+/// sample *format* and leaves rate and channel count unconstrained, waits for
+/// PipeWire to negotiate them against whatever sink the session is already
+/// running, and reports those. Nothing resamples on either side.
+class CallbackStream {
+public:
+    CallbackStream();
+    ~CallbackStream();
+
+    CallbackStream(const CallbackStream&) = delete;
+    CallbackStream& operator=(const CallbackStream&) = delete;
+
+    /// Fill `frames` frames of interleaved PCM at `dst`, in the negotiated
+    /// format. Returns false to ask that the stream stop being pulled — the
+    /// AAudio callback's `AAUDIO_CALLBACK_RESULT_STOP`.
+    ///
+    /// **Called on PipeWire's callback thread.** Realtime rules apply to
+    /// everything it reaches.
+    using FillCallback = bool (*)(void* dst, uint32_t frames, void* user);
+
+    /// `sample_bits`/`is_float` describe the sample format to ask for; 0 bits
+    /// means "no preference", which offers PipeWire's own float and so
+    /// converts nothing. Blocks until PipeWire has both negotiated a format
+    /// and run one cycle, so that `rate_hz`, `channels` and `burst_frames`
+    /// are measured values by the time this returns true rather than
+    /// placeholders the caller would go on to report as fact.
+    bool open(uint32_t sample_bits, bool is_float, const char* node_description,
+              FillCallback cb, void* user);
+
+    void close();
+    bool is_open() const;
+
+    /// Whether PipeWire is being asked for frames. False writes silence into
+    /// every cycle rather than disconnecting, so this is safe to call from
+    /// inside the fill callback — which `AAudioStream_requestStop` is
+    /// documented to be reached from, and which taking PipeWire's loop lock
+    /// here would deadlock against.
+    void set_running(bool running);
+    bool is_running() const;
+
+    uint32_t rate_hz() const;
+    uint32_t channels() const;
+    /// Bits per sample of the negotiated format, and whether it is float.
+    uint32_t sample_bits() const;
+    bool sample_is_float() const;
+    /// Frames PipeWire asked for on the most recent cycle — the graph
+    /// quantum, and the only truthful answer to `getFramesPerBurst`.
+    uint32_t burst_frames() const;
+
+    /// Cycles that had to be filled with silence while the stream was
+    /// running. See the note in `aaudio.cpp` on why this is not, and cannot
+    /// be, Android's `getXRunCount` number.
+    uint64_t silence_cycles() const;
+
+private:
+    struct Impl;
+    Impl* impl_;
+};
+
 /// One capture stream, backed by one `pw_stream` in the input direction.
 ///
 /// The lifetime rule is the point of this class and is not negotiable: an

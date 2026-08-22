@@ -136,8 +136,15 @@ endif()
 # Thin extern "C" surface over the linker's C++ API, so Rust can drive it.
 # Android liblog. Roblox narrates its own startup through it, so this is the
 # runtime layer's most valuable diagnostic — and the source of onLogLine/onJoin.
+#
+# `aaudio.cpp` is here rather than beside the JNI shim because it belongs with
+# `pipewire_backend.cpp`, and it needs no PipeWire headers of its own — it
+# speaks only `pipewire_backend.h`, which deliberately carries no PipeWire
+# types. So the AAudio bridge compiles identically on a tree with no
+# pipewire-devel, and honestly refuses every stream there, exactly as
+# `slCreateEngine` does.
 add_library(cordial_liblog STATIC
-  liblog.cpp system_paths.cpp netdb_compat.cpp opensles.cpp pipewire_backend.cpp thread_trace.cpp)
+  liblog.cpp system_paths.cpp netdb_compat.cpp opensles.cpp pipewire_backend.cpp aaudio.cpp thread_trace.cpp)
 if(PIPEWIRE_FOUND)
   target_include_directories(cordial_liblog PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
   target_compile_definitions(cordial_liblog PRIVATE CORDIAL_HAVE_PIPEWIRE=1)

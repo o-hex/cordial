@@ -60,6 +60,14 @@ const ANDROID_PREFIXES: &[(&str, &str)] = &[
     ("slCreateEngine", "libOpenSLES.so"),
 ];
 
+/// The soname FMOD's Android output looks for once
+/// `org.fmod.FMOD.supportsAAudio()` has said yes. Measured, not inferred: a
+/// run with `CORDIAL_TRACE_DLSYM=1` and `supportsAAudio()` answering true is
+/// what shows the `dlopen` happening at all — with it answering false, as it
+/// did before `native/aaudio.cpp` existed, the guest never asks for any audio
+/// library by any name.
+pub const AAUDIO_LIBRARY_NAME: &str = "libaaudio.so";
+
 /// In `libroblox.so`'s `DT_NEEDED` but contributing no undefined symbols — they
 /// are consulted via `dlsym` at runtime, if at all. They still have to exist for
 /// the `DT_NEEDED` walk to succeed.
@@ -288,6 +296,34 @@ pub fn build(host_libc: bool) -> SymbolTable {
             table
                 .stats
                 .entry(crate::mimalloc_lib::LIBRARY_NAME)
+                .or_default()
+                .record(Source::Cordial);
+        }
+    }
+
+    // AAudio, and the same shape again: `libroblox.so` has no undefined
+    // `AAudio*` symbols, so nothing here is reached by the per-symbol loop
+    // above and the library has to be registered whole.
+    //
+    // **Registered only when `CORDIAL_AUDIO` asked for it**, which is what
+    // keeps this off by default. An audio backend nobody has measured must
+    // not arrive with an update and take everyone's sound with it if it is
+    // wrong; `flags::Performance::Balanced` is the precedent, setting nothing
+    // and staying the default until a number exists. The condition is read
+    // out of `native/aaudio.cpp` rather than from the environment here so
+    // that this and `org.fmod.FMOD.supportsAAudio()` cannot disagree — see
+    // `bionic::aaudio_selected`.
+    if crate::bionic::aaudio_selected() {
+        let aaudio = table.libraries.entry(AAUDIO_LIBRARY_NAME).or_default();
+        for (symbol, address) in crate::bionic::aaudio_overrides() {
+            aaudio.push(Entry {
+                symbol,
+                address,
+                source: Source::Cordial,
+            });
+            table
+                .stats
+                .entry(AAUDIO_LIBRARY_NAME)
                 .or_default()
                 .record(Source::Cordial);
         }

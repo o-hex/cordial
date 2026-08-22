@@ -1633,7 +1633,31 @@ impl WaylandWindow {
             *placed = (x, y);
             moved
         };
-        if moved {
+        // **The first placement has to happen even when nothing moved**, and
+        // leaving that out rendered a white window for a whole session.
+        //
+        // `moved` compares against `placed_at`, which is this side's
+        // bookkeeping of where the subsurface sits. The compositor has been
+        // told nothing at that point: a `wl_subsurface` that has never been
+        // `set_position`ed and never committed does not display, whatever this
+        // struct believes about it. So a run whose geometry happens to match
+        // the initial bookkeeping value on the very first sync skips the only
+        // call that would have put the canvas on screen, and skips it for ever
+        // -- every later sync also sees no movement.
+        //
+        // Observed 2026-08-22 on a hand-run `cordial-run`: the engine drew
+        // 20,868 frames, the swapchain was created twice, and the stall
+        // detector reported `rect=Some((25, 71, 1280, 721)) placed=(25, 71)
+        // setpos=0 qcommit=0` -- our bookkeeping agreeing with itself while
+        // Wayland had never heard of it.
+        //
+        // The shell path only ever worked by accident. It fits the window to a
+        // monitor during bring-up, so the geometry changes, `moved` goes true
+        // and the placement lands as a side effect of the resize. That is why
+        // this survived: the launcher everybody uses papers over it, and only a
+        // direct run whose geometry never changes shows it.
+        let first = !EVER_PLACED.swap(true, Ordering::Relaxed);
+        if moved || first {
             INSTR_SET_POSITIONS.fetch_add(1, Ordering::Relaxed);
             INSTR_QUEUE_COMMITS.fetch_add(1, Ordering::Relaxed);
             if instr_on() {
@@ -3331,6 +3355,15 @@ extern "C" {
 /// Whether the last `sync_canvas_geometry` had no content rectangle to work
 /// with — see the message it prints for why that state has its own line.
 static NO_CONTENT_RECT: AtomicBool = AtomicBool::new(false);
+
+/// Whether the canvas subsurface has ever actually been placed and committed.
+///
+/// A static rather than a field for the same reason `NO_CONTENT_RECT` above is
+/// one: `WINDOW` is a `OnceLock`, so there is exactly one of these per process
+/// and a second copy on the struct would be a second thing to keep in step.
+/// See `sync_canvas_geometry`'s use of it for the white window this exists to
+/// prevent.
+static EVER_PLACED: AtomicBool = AtomicBool::new(false);
 
 // TEMPORARY INSTRUMENTATION -- not for commit. See the session notes.
 static INSTR_SET_POSITIONS: AtomicI64 = AtomicI64::new(0);

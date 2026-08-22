@@ -17,6 +17,33 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// for work shows up here; one that never started does not.
 pub static POLLS: AtomicU64 = AtomicU64::new(0);
 
+/// How long an "infinite" `ALooper_pollOnce` is actually allowed to sleep.
+///
+/// Android's contract for a negative timeout is to block until something
+/// arrives, and Cordial honoured that literally until 2026-08-23, when two
+/// clients were caught frozen at the same time. Both sat at 0.01 cores with
+/// their engine looper thread in `epoll_wait(-1)` and their present counts
+/// nailed down -- 2198 and 2198 eight seconds apart on one, 1 and 1 on the
+/// other. One had rendered for half a minute and one had never finished a
+/// frame, which is what a lost wakeup looks like: the race does not care how
+/// far in you are. Nothing else in either process was holding a lock, and the
+/// main pump was healthily awake at 20 Hz the whole time.
+///
+/// A ceiling does not fix the race. What it does is convert its consequence
+/// from a permanently dead window into one late frame, and make the rate
+/// countable via `BLOCK_EXPIRED` instead of leaving it to be noticed by a
+/// user. 50 ms matches the cadence `pump` already runs at, so a thread parked
+/// here costs 20 wakeups a second and nothing measurable.
+const BLOCK_CEILING_MS: c_int = 50;
+
+/// Infinite waits that hit `BLOCK_CEILING_MS` with no event to report.
+///
+/// **This is not the same as a lost wakeup and must not be read as one.** An
+/// idle looper with genuinely nothing to do expires here every 50 ms and is
+/// perfectly healthy, so the count climbs steadily on a working client. It is
+/// the number to difference against a control, not a fault counter.
+pub static BLOCK_EXPIRED: AtomicU64 = AtomicU64::new(0);
+
 /// Who is polling, with what timeout, and what `epoll_wait` hands back.
 ///
 /// A single global count said ten million polls a second and could not say
@@ -1125,6 +1152,28 @@ extern "C" fn looper_wake(looper: *mut c_void) {
     unsafe { write(l.wake, &one as *const u64 as *const c_void, 8) };
 }
 
+/// Restore the literal Android contract: a negative timeout blocks forever.
+///
+/// This exists to be the control. A clamp that is never compared against the
+/// unclamped behaviour is a change nobody can attribute, and this repository
+/// has four "fixes" that measured nothing because no control was run in the
+/// same session. Set `CORDIAL_LOOPER_BLOCK=1` to reproduce the freeze on
+/// demand and confirm the ceiling is what stopped it.
+fn block_forever() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(std::env::var("CORDIAL_LOOPER_BLOCK").as_deref(), Ok("1") | Ok("on"));
+        if on {
+            println!(
+                "[looper] CORDIAL_LOOPER_BLOCK=1: an infinite ALooper_pollOnce will sleep with no \
+                 ceiling, as it did before 2026-08-23. If a wakeup is lost the window freezes for \
+                 good rather than for one frame. This is the control, not a setting to run with."
+            );
+        }
+        on
+    })
+}
+
 extern "C" fn looper_poll_once(
     timeout_millis: c_int,
     out_fd: *mut c_int,
@@ -1149,6 +1198,16 @@ extern "C" fn looper_poll_once(
         census::bump(&census::OVERFLOW);
     }
 
+    // Clamped rather than passed through; see BLOCK_CEILING_MS. The census above
+    // deliberately classifies on the *requested* timeout, so `t_block` still
+    // counts what the engine asked for rather than what it got.
+    let requested_block = timeout_millis < 0;
+    let effective_timeout = if requested_block && !block_forever() {
+        BLOCK_CEILING_MS
+    } else {
+        timeout_millis
+    };
+
     let mut events = [EpollEvent { events: 0, data: 0 }; 16];
     // Time the syscall on one call in 1024. Timing every call would cost two
     // clock reads against a syscall that turns out to take about as long as
@@ -1156,7 +1215,7 @@ extern "C" fn looper_poll_once(
     let timed = seat.is_some_and(|s| s.calls.load(Ordering::Relaxed) % 1024 == 0);
     let t0 = timed.then(std::time::Instant::now);
     // SAFETY: `events` is a live array of the length passed.
-    let n = unsafe { epoll_wait(l.epoll, events.as_mut_ptr(), events.len() as c_int, timeout_millis) };
+    let n = unsafe { epoll_wait(l.epoll, events.as_mut_ptr(), events.len() as c_int, effective_timeout) };
     if let (Some(s), Some(t0)) = (seat, t0) {
         s.ns.store(
             s.ns.load(Ordering::Relaxed) + t0.elapsed().as_nanos() as u64,
@@ -1171,6 +1230,16 @@ extern "C" fn looper_poll_once(
         if let Some(s) = seat {
             census::bump(&s.r_empty);
         }
+        if requested_block {
+            BLOCK_EXPIRED.fetch_add(1, Ordering::Relaxed);
+        }
+        // POLL_TIMEOUT even though the caller asked for no timeout, and the
+        // alternative was worse: returning POLL_WAKE would claim a wake that
+        // nobody performed, which is the shape of stub this project refuses to
+        // write. A caller that asked for -1 is not expecting POLL_TIMEOUT, but
+        // it is a value the same code path already handles for every finite
+        // timeout, whereas a fabricated wake sends it looking for work that is
+        // not there.
         return POLL_TIMEOUT;
     }
 
@@ -1263,6 +1332,61 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_infinite_poll_returns_instead_of_blocking_forever() {
+        // The regression this guards is a frozen window, so the assertion has to
+        // be that the call *comes back at all*. Two clients were caught on
+        // 2026-08-23 parked in `epoll_wait(-1)` with their present counts
+        // stopped dead -- one after 2198 frames, one after 1 -- and the thing
+        // that made that unrecoverable rather than a hiccup was the absence of
+        // any ceiling here.
+        //
+        // Nothing is registered on this looper and nobody calls `looper_wake`,
+        // so a request to block forever has, genuinely, nothing to wait for.
+        // Before BLOCK_CEILING_MS this test would hang the suite rather than
+        // fail it.
+        let looper = looper_prepare(0);
+        assert!(!looper.is_null());
+
+        let before = BLOCK_EXPIRED.load(Ordering::Relaxed);
+        let start = std::time::Instant::now();
+        let r = looper_poll_once(-1, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+        let waited = start.elapsed();
+
+        assert_eq!(r, POLL_TIMEOUT, "an expired infinite wait reports a timeout, not a fabricated wake");
+        // Generous upper bound: the point is "bounded", not "precisely 50 ms",
+        // and a loaded CI box should not turn a real fix into a flaky test.
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "an infinite poll blocked for {waited:?}, so the ceiling is not being applied"
+        );
+        assert_eq!(
+            BLOCK_EXPIRED.load(Ordering::Relaxed),
+            before + 1,
+            "an expired infinite wait must be countable, or the lost-wakeup rate cannot be measured"
+        );
+    }
+
+    #[test]
+    fn a_woken_infinite_poll_still_reports_a_wake_rather_than_the_ceiling() {
+        // The other half, and the one that would catch a clamp applied too
+        // eagerly: a genuine wake must still come back as POLL_WAKE well inside
+        // the ceiling. Without this, "returns POLL_TIMEOUT promptly" could be
+        // satisfied by a poll that had stopped listening altogether.
+        let looper = looper_prepare(0);
+        assert!(!looper.is_null());
+
+        looper_wake(looper);
+        let start = std::time::Instant::now();
+        let r = looper_poll_once(-1, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+
+        assert_eq!(r, POLL_WAKE, "a wake written before the poll must not be swallowed");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(BLOCK_CEILING_MS as u64),
+            "the wake was already pending, so this must not have waited out the ceiling"
+        );
+    }
 
     #[test]
     fn teardown_lifecycle_sequence_matches_androids_shutdown_order() {

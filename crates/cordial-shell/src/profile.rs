@@ -40,9 +40,10 @@ extern "C" {
     fn kill(pid: c_int, sig: c_int) -> c_int;
 }
 
-/// `SIGTERM`, and `ESRCH` for the process having already gone. Both are stable
-/// across every Linux ABI Cordial runs on.
+/// `SIGTERM`, `SIGKILL`, and `ESRCH` for the process having already gone. All
+/// three are stable across every Linux ABI Cordial runs on.
 const SIGTERM: c_int = 15;
+const SIGKILL: c_int = 9;
 const ESRCH: c_int = 3;
 
 /// `LOCK_EX | LOCK_NB` from `sys/file.h`. Non-blocking on purpose: a second
@@ -255,6 +256,89 @@ impl Holder {
             return Err(format!("could not close process {}: {e}", self.pid));
         }
         Ok(())
+    }
+
+    /// Stop asking and end this holder outright, releasing the profile
+    /// whatever state its teardown was in.
+    ///
+    /// Reached only once `ask_to_stop`'s `SIGTERM` has been given a real
+    /// chance and missed it — see `window.rs`'s escalation thresholds for how
+    /// long that chance is and why. `SIGKILL` cannot be caught, so unlike
+    /// `ask_to_stop` this does not give the engine any opportunity to finish
+    /// writing `rbx-storage.db` or a cookie to the secret service; it is the
+    /// trade this function's callers accept once a shutdown has run far
+    /// longer than any observed here, in exchange for the thing the user
+    /// actually asked for: the profile back. `_exit` drops every file
+    /// descriptor including the `flock`, whatever the process was doing.
+    ///
+    /// Guarded by `is_cordial` for the same reason `ask_to_stop` is, and the
+    /// reason is worth restating here specifically: this is the sharper of
+    /// the two signals, so a caller that skipped the check upstream would do
+    /// more damage here, not less.
+    pub fn force_stop(&self) -> Result<(), String> {
+        if !self.is_cordial() {
+            return Err(format!(
+                "process {} is not a Cordial client, so Cordial will not close it: {}",
+                self.pid, self.command
+            ));
+        }
+        // SAFETY: as in `ask_to_stop`.
+        if unsafe { kill(self.pid as c_int, SIGKILL) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(ESRCH) {
+                return Ok(());
+            }
+            return Err(format!("could not force-close process {}: {e}", self.pid));
+        }
+        Ok(())
+    }
+
+    /// Total CPU time this process has been scheduled for, in kernel jiffies
+    /// — `/proc/<pid>/stat`'s `utime` plus `stime` fields.
+    ///
+    /// Two samples of this taken a few seconds apart are the cheap, no-debugger
+    /// way to tell a process still doing something from one that is truly
+    /// blocked, which is the exact distinction AGENTS.md's note on reading a
+    /// backtrace warns is otherwise invisible: "a spinning pump and a blocked
+    /// one produce identical backtraces... always quote the process's CPU
+    /// beside the stack." A backtrace needs a debugger Cordial cannot assume
+    /// is installed on a user's machine; `/proc` needs nothing.
+    ///
+    /// `comm` (`/proc/<pid>/stat`'s second field) is parenthesised and may
+    /// itself contain spaces, digits or parentheses — a process can name
+    /// itself anything via `PR_SET_NAME` — so the split point is the *last*
+    /// `)` on the line rather than a fixed field index, which is what
+    /// `proc(5)` itself recommends.
+    pub fn cpu_ticks(&self) -> Option<u64> {
+        let raw = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)).ok()?;
+        let after_comm = raw.rsplit_once(')')?.1;
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        // `state` is the first field after the closing paren, so counting
+        // from there rather than from the start of the line: utime is
+        // proc(5)'s field 14 and stime is field 15, which land at indices 11
+        // and 12 once the two already-consumed fields (pid, comm) are out of
+        // the slice.
+        let utime: u64 = fields.get(11)?.parse().ok()?;
+        let stime: u64 = fields.get(12)?.parse().ok()?;
+        Some(utime + stime)
+    }
+
+    /// The kernel function this process's main thread is blocked in, if the
+    /// kernel is willing to say — `/proc/<pid>/wchan`.
+    ///
+    /// A thread that is actually runnable reads back empty or `"0"`, both of
+    /// which are treated as "nothing to report" rather than as a wait channel
+    /// literally named that. Best-effort in the same spirit as `holder_of`:
+    /// some kernels gate this behind `kernel.kptr_restrict` or refuse it
+    /// outright, and a missing answer here means "could not tell", never
+    /// "not blocked".
+    pub fn wchan(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(format!("/proc/{}/wchan", self.pid)).ok()?;
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "0" {
+            return None;
+        }
+        Some(raw.to_string())
     }
 }
 
@@ -576,5 +660,56 @@ mod tests {
         let _ = child.wait();
 
         assert!(acquire("default").is_ok(), "the profile must be reusable once the instance is gone");
+    }
+
+    #[test]
+    fn force_stop_refuses_a_process_it_did_not_start() {
+        // Same guard as `ask_to_stop`, and worth its own test here rather than
+        // trusting that the check was only copied correctly: `force_stop` is
+        // the sharper signal, so a slip in this one does more damage.
+        let holder = Holder { pid: 649889, command: "/usr/bin/grep -r something".into(), running_for: None };
+        let err = holder.force_stop().expect_err("a stranger's process must be refused");
+        assert!(err.contains("not a Cordial client"), "{err}");
+    }
+
+    #[test]
+    fn cpu_ticks_reads_a_real_processs_scheduled_time() {
+        // `sleep` barely runs, but it does get scheduled at least once to be
+        // exec'd at all, so this only has to show the parse succeeds against a
+        // real `/proc/<pid>/stat` line rather than assert a particular value.
+        let mut child = std::process::Command::new("sleep").arg("2").spawn().expect("sleep is on PATH");
+        let holder = Holder { pid: child.id(), command: "sleep".into(), running_for: None };
+        assert!(holder.cpu_ticks().is_some(), "a running process must have readable /proc/<pid>/stat");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn cpu_ticks_is_none_for_a_pid_that_does_not_exist() {
+        // The escalation logic in `window.rs` samples this across a wait and
+        // has to treat "the process is gone" and "the process used no CPU" as
+        // different things, so the missing case has to actually be `None`
+        // rather than, say, `Some(0)`.
+        let holder = Holder { pid: 0, command: String::new(), running_for: None };
+        // pid 0 is never a real process from userspace's point of view, and
+        // /proc/0 does not exist.
+        assert!(holder.cpu_ticks().is_none());
+    }
+
+    #[test]
+    fn wchan_names_where_a_sleeping_process_is_blocked() {
+        // Best-effort, per the doc comment: some kernels refuse this. When it
+        // answers at all the two placeholder values ("0", empty) must read as
+        // `None` rather than as a wait channel literally named that, because a
+        // caller reporting "blocked in 0" would be inventing a diagnosis, not
+        // reading one.
+        let mut child = std::process::Command::new("sleep").arg("2").spawn().expect("sleep is on PATH");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let holder = Holder { pid: child.id(), command: "sleep".into(), running_for: None };
+        if let Some(w) = holder.wchan() {
+            assert!(!w.is_empty() && w != "0", "{w}");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

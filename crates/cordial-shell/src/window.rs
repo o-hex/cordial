@@ -1074,9 +1074,15 @@ fn busy_body(holder: Option<&profile::Holder>) -> String {
 /// storage and there is no interval that is both short enough to feel like a
 /// button and long enough to be true.
 ///
-/// Gives up out loud. A recovery path that silently does nothing is worse than
-/// the refusal it was reached from, since the user has now been told the
-/// problem was handled.
+/// **Escalates instead of giving up.** The previous version sent one
+/// `SIGTERM`, waited ten seconds, and if that was not enough it told the user
+/// to press Roblox again — which is the bug this replaces: a real shutdown
+/// here has been observed to take longer than that ten seconds, so the first
+/// press signalled the client and gave up, and the second press only worked
+/// because the shutdown the first press started had, by then, finished. See
+/// [`escalation_for`] for the thresholds this now waits through and why each
+/// one is what it is, and [`profile::Holder::force_stop`] for what happens if
+/// even those run out.
 fn close_then_launch(
     window: gtk::Window,
     toasts: adw::ToastOverlay,
@@ -1088,35 +1094,196 @@ fn close_then_launch(
         alert(&window, "Could not close the other client", &message);
         return;
     }
+
+    // Sampled now, before any waiting, so the warning at `STOP_WARN` has a
+    // baseline to compare against rather than only the instant of the
+    // warning itself — see `stuck_diagnosis` for why one sample alone cannot
+    // tell a slow shutdown from a stopped one.
+    let started_cpu = holder.cpu_ticks();
     let waited = Cell::new(Duration::ZERO);
+    let stage = Cell::new(Escalation::KeepWaiting);
+
     glib::timeout_add_local(STOP_POLL, move || {
         if holder.has_exited() {
             activate_roblox(&window, &toasts, &config, &join);
             return glib::ControlFlow::Break;
         }
         waited.set(waited.get() + STOP_POLL);
-        if waited.get() < STOP_GIVE_UP {
-            return glib::ControlFlow::Continue;
+        let now = escalation_for(waited.get());
+
+        // Each tier's action fires once, on the tick where the stage first
+        // advances into it — `stage` is what makes that idempotent against a
+        // timer that keeps calling this closure every `STOP_POLL` for as long
+        // as the tier lasts.
+        if now != stage.get() {
+            stage.set(now);
+            match now {
+                Escalation::KeepWaiting => {}
+                Escalation::Warn => {
+                    let diagnosis = stuck_diagnosis(started_cpu, holder.cpu_ticks(), holder.wchan().as_deref());
+                    println!(
+                        "  shell: process {} still stopping after {}s: {diagnosis}",
+                        holder.pid,
+                        waited.get().as_secs()
+                    );
+                    toasts.add_toast(adw::Toast::new(&format!(
+                        "Still closing the other Roblox client (process {}). {diagnosis}",
+                        holder.pid
+                    )));
+                }
+                Escalation::Kill => {
+                    println!(
+                        "  shell: process {} has not stopped after {}s; forcing it closed",
+                        holder.pid,
+                        waited.get().as_secs()
+                    );
+                    if let Err(message) = holder.force_stop() {
+                        alert(&window, "Could not close the other client", &message);
+                        return glib::ControlFlow::Break;
+                    }
+                    toasts.add_toast(adw::Toast::new(&format!(
+                        "Process {} did not respond; closing it and continuing.",
+                        holder.pid
+                    )));
+                }
+                Escalation::GiveUp => {
+                    // `SIGKILL` cannot be caught, deferred or blocked, so a
+                    // process that is still here despite it is not merely
+                    // slow — it is stuck in the kernel (uninterruptible I/O,
+                    // state `D`) in a way nothing in user space can end. That
+                    // is rare enough, and different enough from every other
+                    // branch here, that it is worth its own honest sentence
+                    // rather than folding it into the wording above.
+                    alert(
+                        &window,
+                        "The other client will not close",
+                        &format!(
+                            "Process {} did not stop even after being forced to close. This is \
+                             unusual — it is likely stuck waiting on the kernel rather than on \
+                             Roblox. Wait a moment and press Roblox again, or investigate the \
+                             process yourself (its pid is {}).",
+                            holder.pid, holder.pid
+                        ),
+                    );
+                    return glib::ControlFlow::Break;
+                }
+            }
         }
-        alert(
-            &window,
-            "The other client is still running",
-            &format!(
-                "Process {} was asked to close and has not stopped after {} seconds. It may be \
-                 busy saving. Wait a moment and press Roblox again, or close it yourself.",
-                holder.pid,
-                STOP_GIVE_UP.as_secs()
-            ),
-        );
-        glib::ControlFlow::Break
+        glib::ControlFlow::Continue
     });
 }
 
-/// How often to look for the old client having gone, and how long to keep
-/// looking. Ten seconds is past any shutdown observed here and short enough
-/// that a wedged client still produces an answer rather than a spinner.
+/// What to do about a client that has been asked to stop and has not yet,
+/// given how long ago that was asked.
+///
+/// Pure and separate from the timer that drives it, the same shape
+/// `busy_body` and `initial_size` take for the same reason: a threshold that
+/// can only be checked by starting a real client and waiting is a threshold
+/// nobody re-verifies, and this one has already been wrong once — the value
+/// this replaces, `STOP_GIVE_UP: Duration::from_secs(10)`, was reached by a
+/// real shutdown on this developer's own machine, which is the bug report
+/// this function exists to fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escalation {
+    /// Nothing worth doing or saying yet.
+    KeepWaiting,
+    /// Worth telling the user something, and worth naming what the wait looks
+    /// like — see [`stuck_diagnosis`] — but not yet worth acting on: this is
+    /// still within reach of an ordinary graceful shutdown.
+    Warn,
+    /// Long enough that it is no longer being treated as ordinary. `SIGKILL`,
+    /// once, and keep waiting for the kernel to actually reap it.
+    Kill,
+    /// `SIGKILL` was sent and the process is still here. Nothing left to
+    /// escalate to; say so.
+    GiveUp,
+}
+
+/// Past which point, since `SIGTERM` was sent, a client that has not stopped
+/// is worth mentioning to the user rather than waiting on in silence.
+///
+/// The exact value of the constant this replaced: `STOP_GIVE_UP` used to be
+/// ten seconds and be the *whole* budget, and this bug report is a real
+/// shutdown that outlasted it. Kept as the point past which staying silent
+/// stops being honest, rather than discarded — ten seconds genuinely is past
+/// what a quick shutdown here takes, so it is still the right moment to say
+/// something. It is simply no longer the moment to give up.
+const STOP_WARN: Duration = Duration::from_secs(10);
+
+/// Past which point a client that has not stopped is treated as unresponsive
+/// rather than slow, and is sent `SIGKILL`.
+///
+/// Three times [`STOP_WARN`], and grounded in the one number this project
+/// actually knows about a graceful shutdown's slowest scheduled step:
+/// `secrets::CALL_TIMEOUT` gives a keyring write up to five seconds before it
+/// gives up, because that call runs on the looper thread during a save. Even
+/// a shutdown that hits a wedged keyring, waits out that timeout, and then
+/// has to flush Roblox's own storage on top of it is not this slow twice
+/// over. Past this point the client is not doing that; it is not doing
+/// anything.
+const STOP_KILL: Duration = Duration::from_secs(30);
+
+/// Past which point, since `SIGKILL` was sent, a client that is somehow still
+/// here is given up on rather than waited on further.
+///
+/// A runnable or ordinarily-sleeping process cannot survive `SIGKILL` for
+/// more than a scheduling tick, so five seconds of grace after
+/// [`STOP_KILL`] is not a race against the kernel — it exists only for the one
+/// state that *can* survive a kill signal, uninterruptible I/O (`D` in
+/// `ps`), which is rare and which nothing in user space can shorten. Waiting
+/// longer would not change the answer; it would only make the dialog that
+/// finally appears feel more like a hang than the honest report it is meant
+/// to be.
+const STOP_GIVE_UP: Duration = Duration::from_secs(35);
+
+fn escalation_for(elapsed: Duration) -> Escalation {
+    if elapsed >= STOP_GIVE_UP {
+        Escalation::GiveUp
+    } else if elapsed >= STOP_KILL {
+        Escalation::Kill
+    } else if elapsed >= STOP_WARN {
+        Escalation::Warn
+    } else {
+        Escalation::KeepWaiting
+    }
+}
+
+/// What to say about a client that is still running past [`STOP_WARN`],
+/// given two samples of [`profile::Holder::cpu_ticks`] taken across the wait
+/// and the kernel function its main thread is blocked in when that can be
+/// read at all.
+///
+/// This is the highest-value part of the whole change and the part worth
+/// being honest about the limits of. It cannot name a source line the way a
+/// debugger attached to the process could — AGENTS.md's own account of the
+/// AB-BA deadlock in `AudioDevice::close` found that with `lldb`, not with
+/// this. What it *can* do without asking a user to install a debugger is the
+/// distinction AGENTS.md says a backtrace alone cannot make either: "a
+/// spinning pump and a blocked one produce identical backtraces... always
+/// quote the process's CPU beside the stack." Two free reads of `/proc` are
+/// enough for that half of the diagnosis, which is real information a user
+/// can act on — "it's still doing something, wait" against "it's not doing
+/// anything, this is probably stuck" — even without the other half.
+fn stuck_diagnosis(before: Option<u64>, after: Option<u64>, wchan: Option<&str>) -> String {
+    let activity = match (before, after) {
+        (Some(b), Some(a)) if a > b => {
+            "It has used CPU time since being asked to close, so it is doing something rather \
+             than stuck."
+                .to_string()
+        }
+        (Some(_), Some(_)) => {
+            "It has used no CPU time since being asked to close.".to_string()
+        }
+        _ => "Its CPU use could not be read.".to_string(),
+    };
+    match wchan {
+        Some(w) => format!("{activity} The kernel reports it waiting in {w}."),
+        None => activity,
+    }
+}
+
+/// How often to look for the old client having gone.
 const STOP_POLL: Duration = Duration::from_millis(250);
-const STOP_GIVE_UP: Duration = Duration::from_secs(10);
 
 /// Say something went wrong, in a dialog the user has to acknowledge.
 ///
@@ -1234,5 +1401,88 @@ mod tests {
         let body = busy_body(None);
         assert!(body.contains("cannot tell what"), "{body}");
         assert!(!body.contains("process 649889"), "{body}");
+    }
+
+    #[test]
+    fn a_quick_shutdown_is_never_warned_about() {
+        // The ordinary case, and the one that must stay silent: most closes
+        // finish in well under STOP_WARN, and a dialog or toast popping up for
+        // every routine "close it and launch" would train users to ignore it.
+        assert_eq!(escalation_for(Duration::ZERO), Escalation::KeepWaiting);
+        assert_eq!(escalation_for(Duration::from_secs(9)), Escalation::KeepWaiting);
+    }
+
+    #[test]
+    fn the_bug_reports_own_ten_seconds_now_only_warns() {
+        // This is the regression test for the actual report: ten seconds was
+        // the whole budget before, and a real shutdown reached it. Now it must
+        // be a status update, not a give-up.
+        assert_eq!(escalation_for(Duration::from_secs(10)), Escalation::Warn);
+        assert_eq!(escalation_for(Duration::from_secs(29)), Escalation::Warn);
+    }
+
+    #[test]
+    fn only_a_long_silence_is_forced_closed() {
+        assert_eq!(escalation_for(Duration::from_secs(30)), Escalation::Kill);
+        assert_eq!(escalation_for(Duration::from_secs(34)), Escalation::Kill);
+    }
+
+    #[test]
+    fn giving_up_is_reserved_for_surviving_sigkill() {
+        assert_eq!(escalation_for(Duration::from_secs(35)), Escalation::GiveUp);
+        assert_eq!(escalation_for(Duration::from_secs(600)), Escalation::GiveUp);
+    }
+
+    #[test]
+    fn the_thresholds_are_in_the_order_the_state_machine_assumes() {
+        // `close_then_launch` relies on `escalation_for` being monotonic in
+        // `elapsed` -- warn, then kill, then give up, never out of order --
+        // and that is a property of the three constants, not of the function
+        // reading them. Pinned directly so a future edit to one constant
+        // cannot silently invert the sequence.
+        assert!(STOP_WARN < STOP_KILL, "warning must come before forcing a close");
+        assert!(STOP_KILL < STOP_GIVE_UP, "forcing a close must come before giving up on it");
+    }
+
+    #[test]
+    fn cpu_used_since_asking_reads_as_still_working() {
+        let message = stuck_diagnosis(Some(1000), Some(1050), None);
+        assert!(message.contains("doing something"), "{message}");
+        assert!(!message.contains("no CPU"), "{message}");
+    }
+
+    #[test]
+    fn no_cpu_used_since_asking_reads_as_likely_stuck() {
+        let message = stuck_diagnosis(Some(1000), Some(1000), None);
+        assert!(message.contains("no CPU"), "{message}");
+    }
+
+    #[test]
+    fn an_unreadable_cpu_sample_says_so_rather_than_guessing() {
+        // `/proc/<pid>/stat` can vanish out from under a read on a process
+        // that exits mid-poll, or be unreadable across a mount namespace, and
+        // this must not be read as either "using CPU" or "not using CPU" --
+        // both are claims about a number the caller does not actually have.
+        let message = stuck_diagnosis(None, None, None);
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(!message.contains("doing something") && !message.contains("no CPU"), "{message}");
+    }
+
+    #[test]
+    fn a_known_wait_channel_is_named_alongside_the_cpu_reading() {
+        // The two readings are independent -- a process can be burning CPU in
+        // one thread while its main thread waits in a syscall -- so both are
+        // worth saying when both are known, not one in place of the other.
+        let message = stuck_diagnosis(Some(1000), Some(1000), Some("futex_wait_queue_me"));
+        assert!(message.contains("no CPU"), "{message}");
+        assert!(message.contains("futex_wait_queue_me"), "{message}");
+    }
+
+    #[test]
+    fn no_wait_channel_known_leaves_the_sentence_about_cpu_alone() {
+        // A missing wchan must not read as "waiting in nothing" -- that would
+        // be inventing a location the kernel did not actually give.
+        let message = stuck_diagnosis(Some(1000), Some(1050), None);
+        assert!(!message.contains("waiting in"), "{message}");
     }
 }

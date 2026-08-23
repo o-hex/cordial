@@ -40,7 +40,119 @@ had looked in `appData/`.
 
 # What is blocking
 
-## 0. What 2026-08-21 settled, and what it retracted
+## 0. What 2026-08-23 settled, and what it retracted
+
+A day with one lesson, and it is the same one as 2026-08-21: **n=1 against a
+probabilistic bug is not a result, and acting on one costs more than waiting.**
+
+### The freeze is characterised. Its cause is still open
+
+Two clients were caught frozen at once, which is the first time there has been a
+live specimen. What that settled, all read from the running processes:
+
+    presents, read twice 8 s apart through devctl
+      profile CordialTest   2198 -> 2198
+      profile evr_l            1 -> 1
+
+So it strikes after half a minute of healthy rendering and also on the very
+first frame. Both processes sat at **0.01 cores** with 63 threads each and
+identical thread rosters.
+
+**It is not a deadlock.** The main thread was in `looper::pump` ->
+`looper_poll_once(timeout_millis=50)` -> `epoll_wait` in both, waking twenty
+times a second throughout. Nothing held a contended lock. Quoting the CPU beside
+the stack is what separates that from a blocked pump, and it is why AGENTS.md
+insists on it.
+
+**It is not Wayland.** `CORDIAL_X11=1` reproduces it identically, watchdog line
+and all, which exonerates the compositor and the subsurface path.
+
+**No wake was sitting unconsumed.** Every `eventfd-count` in
+`/proc/<pid>/fdinfo/*` read zero in both processes. That rules out a wake
+written but not noticed; it cannot distinguish "never sent" from "drained just
+before the sleep", which is what `looper::BLOCK_EXPIRED` now exists to count.
+
+### Retracted the same day: the present mode is not the cause
+
+One run with `CORDIAL_PRESENT_MODE=off` printed no freeze warning and one run
+with the MAILBOX default froze, on both backends. **That was written up as a
+lead, acted on, and was wrong.** The default was flipped to forward the engine's
+own FIFO and then reverted within the hour, because the control said the
+opposite:
+
+    new default (FIFO)      froze YES, YES, no   (and one segfault)
+    CORDIAL_PRESENT_MODE=mailbox   froze  no, no
+
+MAILBOX is not implicated and `1d(ii)`'s frame-rate measurement stands
+untouched. Worse, every one of those trials ran with a benchmark agent working
+and other clients rendering, at load average 6 -- exactly the contamination
+AGENTS.md warns makes two clients' numbers meaningless. **The user pointed out
+the load before the arithmetic did.** Anyone re-opening the freeze should start
+by reproducing it on a quiet machine, because it is not yet known whether
+contention is a cause or a coincidence.
+
+### Capping the infinite looper wait does not fix it
+
+`187f7fa` bounds an infinite `ALooper_pollOnce` at 50 ms so a lost wakeup costs
+one frame rather than the window. **It was verified not to fix this freeze** --
+a client built with it still printed `presented nothing for 5s after 1 frames`.
+It is worth having anyway and `CORDIAL_LOOPER_BLOCK=1` is the control, but do
+not credit it if the freeze goes quiet for some other reason.
+
+### A client can sit in `teardown` indefinitely
+
+A leftover client ignored SIGTERM and stayed in `looper::teardown` ->
+`cordial_game_activity_lifecycle` for twenty minutes before needing SIGKILL.
+`teardown_returns_within_its_grace_period_with_no_native_handle` covers only the
+case where the natives never resolve; with a real handle the loop is evidently
+not bounded. Untriaged, separate from the freeze.
+
+### mocktail does not draw text boxes. Its display code is dead
+
+CLAUDE.md sends you to mocktail before guessing a platform contract, and that
+remains right in general -- but **not for text entry**. Its
+`src/runtime/roblox_text_display_state.cc` computes caret positions and password
+masking into a shadow buffer that **nothing renders**: grep finds no caller
+anywhere in `src/` outside the file itself, and no draw, blit, glyph or font
+call inside it. The user confirmed independently that mocktail does not show
+text as you type.
+
+An agent read that file and reported that mocktail "draws the box's text and
+caret itself"; that was relayed here without checking whether the code had a
+caller, and it was wrong. Its `roblox_text_editor.cc` call sequence is still
+readable as *design* -- `sync` then `pass_text(finished=false)` per keystroke,
+`return_pressed` then `pass_text(finished=true)` at Enter -- but it is the
+design of a client that demonstrably does not get text on screen. The one thing
+worth keeping is the **name** of `nativePassText`'s boolean, `finished`, which
+`input.rs` records as "not declared anywhere Cordial can read".
+
+§1's conclusion is untouched, because it never depended on mocktail: the engine
+does not paint a focused box's own text, established from the dex superclass
+chain and confirmed by the `abc` experiment.
+
+### Sober cannot be introspected the easy ways
+
+For anyone planning to watch Sober rather than guess:
+
+    /proc/<pid>/fd        DENIED   (same uid)
+    /proc/<pid>/environ   DENIED
+    /proc/<pid>/io        DENIED
+
+The flatpak sandbox refuses these to the owning user, and they go through the
+same `ptrace_may_access` check `PTRACE_ATTACH` uses, so **plain `gdb -p` on
+Sober is expected to be refused** -- INFERRED, not yet tested, because a
+successful attach stops the process and the machine's owner was playing.
+`flatpak run --devel` is the documented way to get debugging permissions, and it
+needs Sober restarted.
+
+Its logs are at `~/.var/app/org.vinegarhq.Sober/data/sober/sober_logs/`, **not**
+`appData/logs`, which is empty. They carry Roblox's own FLog stream and are
+useful -- and they contain **zero** hits for `TextBox`, `Keyboard`,
+`InputConnection`, `passText` or `syncTextbox`, so they cannot answer anything
+about text entry. (A first grep of them appeared to hit, because the pattern
+included `IME` and matched "runt*ime*". Beware.)
+
+## 0a. What 2026-08-21 settled, and what it retracted
 
 A long session with one theme: **every number trusted without a control turned
 out to be wrong, and every control caught it.** Four mechanisms and two of this
@@ -2066,7 +2178,7 @@ It is left in place because removing it changes what runs at every
 
 ## 5. System time equals user time — and it is almost all the engine's
 
-> **2026-08-21:** still true, and §0 now says what the engine is doing with it —
+> **2026-08-21:** still true, and §0a now says what the engine is doing with it —
 > one thread on `ALooper_pollOnce(0, ...)`, which Sober also has. The attribution
 > below stands; the conclusion once drawn from it, that Cordial is unusually
 > expensive, does not.

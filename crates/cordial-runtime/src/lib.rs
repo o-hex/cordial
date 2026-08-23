@@ -25,6 +25,7 @@ pub mod deeplink;
 pub mod devctl;
 pub mod flags;
 pub mod graphics;
+pub mod headless;
 pub mod identity;
 pub mod plugin_host;
 pub mod profile;

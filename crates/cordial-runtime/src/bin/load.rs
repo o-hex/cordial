@@ -63,6 +63,12 @@ usage: cordial-load --lib-dir <dir> [options]
                     One client at a time per profile, held by a lock for the
                     life of the process (ADR-012); a second is refused rather
                     than allowed to write over the first one's Roblox storage
+  --headless        run inside a nested `cage` compositor, so no window appears
+                    on this session and nothing takes focus. For agents and CI.
+                    Re-execs, because the compositor has to be the parent. Fails
+                    rather than falling back to a visible window if cage is
+                    missing. Pair with CORDIAL_DEV_CONTROL=1 or nothing can see
+                    the client at all
   --host-libc       also resolve libc from the host (ABI-unsafe; diagnostic only)
   --jni-onload      stand up a JavaVM and call JNI_OnLoad
   --game-activity   implies --jni-onload; bring Roblox up and hand it a surface
@@ -226,6 +232,15 @@ fn parse() -> Result<Options, String> {
             "--window" => {
                 let v = args.next().ok_or("--window needs a duration in seconds")?;
                 opt.window_seconds = Some(v.parse().map_err(|_| "--window wants a number")?);
+            }
+            // Consumed by the re-exec in `main` long before this. Reaching
+            // here means the handover did not happen, and silently ignoring it
+            // would put a window on the screen of somebody who asked for none.
+            "--headless" => {
+                return Err(
+                    "--headless should have been consumed before argument parsing;                      this is a bug in the re-exec, not in your command line"
+                        .into(),
+                )
             }
             "--host-libc" => opt.host_libc = true,
             "--jni-onload" => opt.jni_onload = true,
@@ -1207,6 +1222,26 @@ fn claim_profile(opt: &Options) -> Result<cordial_shell::profile::Claim, String>
 }
 
 fn main() -> ExitCode {
+    // **Before `parse()`, and that is not stylistic.** `--profile` latches the
+    // active profile directory as a side effect of being parsed, and the whole
+    // point of `--headless` is that the compositor must already be this
+    // process's parent before anything touches a display or a profile. Handing
+    // over here means the child does all of it once, properly, inside the
+    // nested compositor.
+    if !cordial_runtime::headless::is_child() {
+        if cordial_runtime::headless::nested_argv(&std::env::args_os().collect::<Vec<_>>())
+            .is_some()
+        {
+            match cordial_runtime::headless::exec_nested() {
+                Ok(never) => match never {},
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    }
+
     let mut opt = match parse() {
         Ok(o) => o,
         Err(msg) => {

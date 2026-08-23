@@ -198,10 +198,11 @@
 //! for Cordial before doing it.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use libadwaita as adw;
+use gtk4::prelude::GtkWindowExt;
 
 // ------------------------------------------------------------- wire layout
 //
@@ -994,6 +995,10 @@ pub struct WaylandWindow {
     seat: *mut c_void,
     #[allow(dead_code)]
     pointer: *mut c_void,
+    /// GDK's `wl_pointer`, borrowed for pointer constraints and relative
+    /// motion. GDK owns and destroys it; Cordial must never attach its core
+    /// pointer listener to this object or release it.
+    capture_pointer: *mut c_void,
     #[allow(dead_code)]
     keyboard: *mut c_void,
     text_input: *mut c_void,
@@ -1001,8 +1006,8 @@ pub struct WaylandWindow {
     /// Null is not an error: everything except pointer capture works without
     /// it, exactly as text entry works without `zwp_text_input_manager_v3`.
     pointer_constraints: *mut c_void,
-    /// The `zwp_relative_pointer_v1` for this seat's pointer, created once and
-    /// kept for the process's life. It delivers `relative_motion` whenever the
+    /// The `zwp_relative_pointer_v1` for GDK's pointer, created once and kept
+    /// for the process's life. It delivers `relative_motion` whenever the
     /// pointer has focus, lock or no lock; `dispatch_relative_motion` is what
     /// decides to act on it, so there is nothing to create and destroy per
     /// lock.
@@ -1026,7 +1031,10 @@ pub struct WaylandWindow {
     egl_window: Mutex<*mut c_void>,
 
     xkb: Mutex<Option<XkbState>>,
-    pointer_pos: Mutex<(f32, f32)>,
+    /// Canvas-local pointer position. This is read on every motion and on
+    /// each relative report while locked, so keep the two coordinates in one
+    /// atomic word rather than taking a mutex on the hottest input path.
+    pointer_pos: AtomicU64,
     pointer_buttons: AtomicI32,
     down_time_ms: AtomicI64,
     clock: std::time::Instant,
@@ -1048,6 +1056,9 @@ pub struct WaylandWindow {
     /// closing one of two leaves the engine correctly hidden until the last
     /// one goes.
     open_web_view_dialogs: AtomicI32,
+    text_overlay_visible: AtomicBool,
+    text_overlay_cache:
+        Mutex<Option<(u32, u64, String, i32, cordial_linker_sys::game_activity::RawTextBoxInfo)>>,
 }
 // SAFETY: every raw pointer field is either a `libwayland-client` proxy (only
 // ever touched from the single input-pump thread, matching the file-level
@@ -1165,6 +1176,17 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     })?;
     let parent_surface =
         host.wl_surface().ok_or_else(|| "GTK's window has no wl_surface".to_string())?;
+    // This must be GDK's pointer, not another `wl_seat.get_pointer` object.
+    // GDK owns the desktop cursor visible over this GTK window; a constraint
+    // on Cordial's separate event pointer can be acknowledged as locked while
+    // leaving that real cursor free, which is the observed escape bug.
+    let capture_pointer = host.wl_pointer().unwrap_or(std::ptr::null_mut());
+    if !capture_pointer.is_null() {
+        eprintln!(
+            "[android] wayland: pointer capture uses GDK's wl_pointer on the GTK toplevel \
+             (KWin subsurface workaround)"
+        );
+    }
     let (cx, cy, cw, ch) =
         host.content_rect().ok_or_else(|| "GTK's window has no content allocation".to_string())?;
 
@@ -1406,11 +1428,12 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     // manager is there too, and the pair is treated as one capability.
     let relative_pointer = globals.relative_pointer_manager.and_then(|(name, ver)| {
         let mgr = bind(name, 1, ver, &RELATIVE_POINTER_MANAGER_INTERFACE, "zwp_relative_pointer_manager_v1");
-        if mgr.is_null() || pointer.is_null() {
+        if mgr.is_null() || capture_pointer.is_null() {
             return None;
         }
-        // SAFETY: `mgr` and `pointer` are live proxies; the argument list
-        // matches `get_relative_pointer`'s "no" signature.
+        // SAFETY: `mgr` is a live proxy and `capture_pointer` is GDK's live,
+        // borrowed pointer on this same connection. The argument list matches
+        // `get_relative_pointer`'s "no" signature.
         let rp = unsafe {
             (wl.marshal_flags)(
                 mgr,
@@ -1419,7 +1442,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
                 1,
                 0,
                 std::ptr::null_mut::<c_void>(),
-                pointer,
+                capture_pointer,
             )
         };
         (!rp.is_null()).then_some(rp)
@@ -1429,12 +1452,20 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
             bind(name, 1, ver, &POINTER_CONSTRAINTS_INTERFACE, "zwp_pointer_constraints_v1")
         }
         _ => {
-            eprintln!(
-                "[android] wayland: this compositor advertises no \
-                 zwp_pointer_constraints_v1/zwp_relative_pointer_manager_v1 pair; \
-                 the pointer cannot be captured, so first person and camera drags \
-                 will let the cursor leave the window"
-            );
+            if capture_pointer.is_null() {
+                eprintln!(
+                    "[android] wayland: GDK exposed no wl_pointer for its default seat; \
+                     pointer capture is disabled rather than attaching a false lock to \
+                     Cordial's secondary pointer"
+                );
+            } else {
+                eprintln!(
+                    "[android] wayland: this compositor advertises no \
+                     zwp_pointer_constraints_v1/zwp_relative_pointer_manager_v1 pair; \
+                     the pointer cannot be captured, so first person and camera drags \
+                     will let the cursor leave the window"
+                );
+            }
             std::ptr::null_mut()
         }
     };
@@ -1489,6 +1520,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         parent_surface,
         seat,
         pointer,
+        capture_pointer,
         keyboard,
         text_input: text_input.unwrap_or(std::ptr::null_mut()),
         pointer_constraints,
@@ -1500,7 +1532,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         placed_at: Mutex::new((cx, cy)),
         egl_window: Mutex::new(std::ptr::null_mut()),
         xkb: Mutex::new(None),
-        pointer_pos: Mutex::new((0.0, 0.0)),
+        pointer_pos: AtomicU64::new(pack_pointer_position(0.0, 0.0)),
         pointer_buttons: AtomicI32::new(0),
         down_time_ms: AtomicI64::new(0),
         clock: std::time::Instant::now(),
@@ -1513,6 +1545,8 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         }),
         active_handle: AtomicI64::new(0),
         open_web_view_dialogs: AtomicI32::new(0),
+        text_overlay_visible: AtomicBool::new(false),
+        text_overlay_cache: Mutex::new(None),
     };
     let host = WINDOW.get_or_init(|| host);
 
@@ -1812,7 +1846,9 @@ impl WaylandWindow {
     /// site that will eventually be trusted to mean "just lowered it", which
     /// would be false the second time.
     pub fn webview_dialog_opened(&self) {
-        if self.open_web_view_dialogs.fetch_add(1, Ordering::SeqCst) == 0 {
+        if self.open_web_view_dialogs.fetch_add(1, Ordering::SeqCst) == 0
+            && !self.text_overlay_visible.load(Ordering::SeqCst)
+        {
             self.set_engine_stacking(false);
         }
     }
@@ -1822,9 +1858,88 @@ impl WaylandWindow {
     /// with two dialogs open, closing one must leave the engine hidden behind
     /// whichever is still up.
     pub fn webview_dialog_closed(&self) {
-        if self.open_web_view_dialogs.fetch_sub(1, Ordering::SeqCst) == 1 {
+        if self.open_web_view_dialogs.fetch_sub(1, Ordering::SeqCst) == 1
+            && !self.text_overlay_visible.load(Ordering::SeqCst)
+        {
             self.set_engine_stacking(true);
         }
+    }
+
+    fn update_text_overlay(
+        &self,
+        generation: u32,
+        revision: u64,
+        text: &str,
+        caret: i32,
+        info: cordial_linker_sys::game_activity::RawTextBoxInfo,
+    ) {
+        let mut cache = self.text_overlay_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let unchanged = cache.as_ref().is_some_and(|(g, r, old, old_caret, old_info)| {
+            *g == generation
+                && *r == revision
+                && old == text
+                && *old_caret == caret
+                && *old_info == info
+        });
+        if unchanged {
+            return;
+        }
+        *cache = Some((generation, revision, text.to_owned(), caret, info));
+        drop(cache);
+
+        self.host.0.set_text_overlay(Some(cordial_shell::host_window::TextOverlay {
+            text,
+            caret_chars: caret,
+            x: info.x,
+            y: info.y,
+            width: info.width,
+            height: info.height,
+            font_size: info.font_size,
+            text_color: info.text_color as u32,
+            password: matches!(info.i10, 5 | 9 | 10),
+        }));
+        if !self.text_overlay_visible.swap(true, Ordering::SeqCst)
+            && self.open_web_view_dialogs.load(Ordering::SeqCst) == 0
+        {
+            self.set_engine_stacking(false);
+        }
+    }
+
+    fn sync_text_overlay(&self) {
+        let Some(_which) = cordial_linker_sys::game_activity::focused_textbox() else {
+            if self.text_overlay_visible.swap(false, Ordering::SeqCst) {
+                *self.text_overlay_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                self.host.0.set_text_overlay(None);
+                if self.open_web_view_dialogs.load(Ordering::SeqCst) == 0 {
+                    self.set_engine_stacking(true);
+                }
+            }
+            return;
+        };
+        let generation = cordial_linker_sys::game_activity::textbox_generation();
+        let revision = super::input::text_buffer_revision();
+        let Some(info) = cordial_linker_sys::game_activity::focused_textbox_info() else {
+            return;
+        };
+        if self
+            .text_overlay_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(g, r, _, _, old_info)| {
+                *g == generation && *r == revision && *old_info == info
+            })
+        {
+            return;
+        }
+        let (text, caret) = super::input::text_buffer_snapshot();
+        self.update_text_overlay(
+            generation,
+            super::input::text_buffer_revision(),
+            &text,
+            caret,
+            info,
+        );
     }
 
     /// Reorder the engine's subsurface relative to `parent_surface` — the
@@ -1949,6 +2064,14 @@ fn fixed_to_f32(v: i32) -> f32 {
     v as f32 / 256.0
 }
 
+fn pack_pointer_position(x: f32, y: f32) -> u64 {
+    ((x.to_bits() as u64) << 32) | y.to_bits() as u64
+}
+
+fn unpack_pointer_position(position: u64) -> (f32, f32) {
+    (f32::from_bits((position >> 32) as u32), f32::from_bits(position as u32))
+}
+
 /// Linux `input-event-codes.h` `BTN_*` values, which is what
 /// `wl_pointer.button` reports — X11 numbers buttons 1/2/3 in click order,
 /// Wayland reports the evdev code directly. `window.rs`'s equivalent table
@@ -1958,10 +2081,14 @@ fn linux_button_to_android(button: u32) -> Option<i32> {
     const BTN_LEFT: u32 = 0x110;
     const BTN_RIGHT: u32 = 0x111;
     const BTN_MIDDLE: u32 = 0x112;
+    const BTN_SIDE: u32 = 0x113;
+    const BTN_EXTRA: u32 = 0x114;
     match button {
         BTN_LEFT => Some(super::input::BUTTON_PRIMARY),
         BTN_RIGHT => Some(super::input::BUTTON_SECONDARY),
         BTN_MIDDLE => Some(super::input::BUTTON_TERTIARY),
+        BTN_SIDE => Some(super::input::BUTTON_BACK),
+        BTN_EXTRA => Some(super::input::BUTTON_FORWARD),
         _ => None,
     }
 }
@@ -1971,8 +2098,16 @@ impl WaylandWindow {
         self.clock.elapsed().as_millis() as i64
     }
 
+    fn set_pointer_position(&self, x: f32, y: f32) {
+        self.pointer_pos.store(pack_pointer_position(x, y), Ordering::Release);
+    }
+
+    fn pointer_position(&self) -> (f32, f32) {
+        unpack_pointer_position(self.pointer_pos.load(Ordering::Acquire))
+    }
+
     fn dispatch_pointer_motion(&self, x: f32, y: f32) {
-        *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y);
+        self.set_pointer_position(x, y);
         let handle = self.active_handle.load(Ordering::Relaxed);
         let buttons = self.pointer_buttons.load(Ordering::Relaxed);
         let down_time = self.down_time_ms.load(Ordering::Relaxed);
@@ -1986,7 +2121,7 @@ impl WaylandWindow {
     }
 
     fn dispatch_pointer_button(&self, android_button: i32, press: bool) {
-        let (x, y) = *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, y) = self.pointer_position();
         let handle = self.active_handle.load(Ordering::Relaxed);
         let now = self.now_ms();
 
@@ -2019,6 +2154,21 @@ impl WaylandWindow {
         // here dropped right and middle before they reached Roblox's own input
         // path, and a right-button drag is how a mouse turns the camera.
         super::input::pass_mouse_button(x, y, press, android_button);
+
+        // Do not wait for the next pump to capture a camera drag. Pointer
+        // events are dispatched near the end of `pump`, while the periodic
+        // lock synchronisation runs near its beginning; that left up to 50ms
+        // in which a fast pointer could cross the canvas edge. The resulting
+        // `leave` cleared `POINTER_ON_CANVAS`, so the following pump concluded
+        // no drag wanted a lock and the real desktop cursor escaped while the
+        // engine's drawn cursor remained centred. At this point the button
+        // event still proves pointer focus on the canvas, which is exactly
+        // when the compositor can honour `lock_pointer`.
+        if android_button == super::input::BUTTON_SECONDARY
+            || android_button == super::input::BUTTON_TERTIARY
+        {
+            self.sync_pointer_lock();
+        }
     }
 
     /// One `wl_pointer.axis` event, converted to detents and handed to the
@@ -2027,7 +2177,7 @@ impl WaylandWindow {
         let Some((hscroll, vscroll)) = axis_to_notches(axis, value) else {
             return;
         };
-        let (x, y) = *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, y) = self.pointer_position();
         let handle = self.active_handle.load(Ordering::Relaxed);
         super::input::wheel(handle, x, y, hscroll, vscroll, self.now_ms());
     }
@@ -2385,7 +2535,7 @@ impl WaylandWindow {
     /// held still. If a captured camera turns out not to turn, this is the
     /// first thing to doubt and `CORDIAL_TRACE_MOUSE=1` prints every argument.
     fn dispatch_relative_motion(&self, dx: f32, dy: f32) {
-        let (x, y) = *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, y) = self.pointer_position();
         // Deliberately not also `deliver_touch`. AGDK's touch path carries an
         // absolute position and nothing else; while the pointer is locked that
         // position does not change, so every event would say the finger had not
@@ -2468,10 +2618,18 @@ impl WaylandWindow {
         if !slot.is_null() {
             return;
         }
-        // SAFETY: `pointer_constraints`, `surface` and `pointer` are live
-        // proxies for the process's lifetime; the argument list matches
-        // `lock_pointer`'s "noo?ou" signature, with a null region meaning the
-        // whole surface.
+        // Constrain the GTK toplevel, not the engine's rendering subsurface.
+        // KWin acknowledges constraints made against a subsurface but, on
+        // affected versions, still lets the physical cursor leave it (KDE bug
+        // 463088). Native game windows such as Sober's SDL3 window constrain
+        // their xdg_toplevel surface and do not hit that compositor path. The
+        // parent covers this whole window, including the engine subsurface, so
+        // it is also the correct user-visible boundary for a camera capture.
+        //
+        // SAFETY: `pointer_constraints` and `parent_surface` are live proxies,
+        // and `capture_pointer` is GDK's live borrowed pointer on this
+        // connection. The argument list matches `lock_pointer`'s "noo?ou"
+        // signature, with a null region meaning the whole surface.
         let lp = unsafe {
             (self.wl.marshal_flags)(
                 self.pointer_constraints,
@@ -2480,8 +2638,8 @@ impl WaylandWindow {
                 1,
                 0,
                 std::ptr::null_mut::<c_void>(),
-                self.surface,
-                self.pointer,
+                self.parent_surface,
+                self.capture_pointer,
                 std::ptr::null_mut::<c_void>(),
                 POINTER_CONSTRAINT_LIFETIME_PERSISTENT,
             )
@@ -2503,7 +2661,7 @@ impl WaylandWindow {
         *self.lock_requested_at.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(std::time::Instant::now());
         if super::input::trace_mouse() {
-            let (x, y) = *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner());
+            let (x, y) = self.pointer_position();
             eprintln!("[cordial] pointer lock: requested at ({x}, {y})");
         }
     }
@@ -2521,7 +2679,7 @@ impl WaylandWindow {
         if slot.is_null() {
             return;
         }
-        let (x, y) = *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, y) = self.pointer_position();
         // SAFETY: `*slot` is the live locked-pointer proxy; the two calls match
         // `set_cursor_position_hint`'s "ff" and `destroy`'s empty signature,
         // the latter sent with the destroy flag its `type="destructor"`
@@ -2921,6 +3079,7 @@ impl WaylandWindow {
     const KEY_LEFTALT: u32 = 56;
     const KEY_RIGHTCTRL: u32 = 97;
     const KEY_RIGHTALT: u32 = 100;
+    const KEY_F11: u32 = 87;
 
     fn dispatch_key(&self, evdev_key: u32, down: bool) {
         // `xkb_keycode_t` is evdev's own code offset by 8 — XKB reserves the
@@ -3007,6 +3166,18 @@ impl WaylandWindow {
         const KEY_ESC: u32 = 1;
         if down && evdev_key == KEY_ESC && self.escape_pointer_lock() {
             eprintln!("[android] wayland: Escape released the pointer lock");
+        }
+
+        // This window has no GtkApplication accelerator group: the launcher's
+        // `win.fullscreen` action can never receive a key pressed while the
+        // game toplevel owns focus. Consume both halves so Roblox does not see
+        // an unmatched function-key event, and let GTK's state notification
+        // persist the choice in game-window.json.
+        if evdev_key == Self::KEY_F11 {
+            if down {
+                self.host.0.set_fullscreen(!self.host.0.window().is_fullscreen());
+            }
+            return;
         }
 
         let handle = self.active_handle.load(Ordering::Relaxed);
@@ -3146,6 +3317,9 @@ impl WaylandWindow {
                 let _ = cordial_linker_sys::game_activity::text_input(handle, &contents, caret, caret);
             }
             self.send_current_text(which);
+            if handle != 0 {
+                super::input::deliver_surface_redraw(handle);
+            }
         }
     }
 }
@@ -3196,6 +3370,15 @@ impl WaylandWindow {
         let preedit = self.ime.lock().unwrap_or_else(|e| e.into_inner()).preedit.clone();
         let (text, caret) = splice_preedit(&committed, caret, preedit.as_ref());
         super::input::pass_text(which, &text, caret);
+        if let Some(info) = cordial_linker_sys::game_activity::focused_textbox_info() {
+            self.update_text_overlay(
+                cordial_linker_sys::game_activity::textbox_generation(),
+                super::input::text_buffer_revision(),
+                &text,
+                caret,
+                info,
+            );
+        }
     }
 
     /// Drive `enable()`/`disable()` off the same focus signal `input.rs`
@@ -3302,7 +3485,7 @@ impl WaylandWindow {
     /// canvas-local. Sending it unadjusted would put the candidate window a
     /// header bar and a drop shadow away from where the user is typing.
     fn send_cursor_rectangle(&self) {
-        let (x, y) = *self.pointer_pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, y) = self.pointer_position();
         let (ox, oy) = *self.placed_at.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             (self.wl.marshal_flags)(
@@ -3388,6 +3571,9 @@ impl WaylandWindow {
             let _ = cordial_linker_sys::game_activity::text_input(handle, &committed, caret, caret);
         }
         self.send_current_text(which);
+        if handle != 0 {
+            super::input::deliver_surface_redraw(handle);
+        }
     }
 }
 
@@ -3601,8 +3787,10 @@ pub fn instr_set_fullscreen(on: bool) {
 impl WaylandWindow {
     fn pump(&self, handle: i64) {
         self.active_handle.store(handle, Ordering::Relaxed);
-        let (gw, gh, _) = self.geometry();
-        super::input::report_keyboard_state((gw, gh));
+        if super::input::keyboard_report_enabled() {
+            let (gw, gh, _) = self.geometry();
+            super::input::report_keyboard_state((gw, gh));
+        }
 
         // GTK's main loop does not get a thread of its own. It is iterated
         // here, on the thread that ran `gtk_init`, from inside the engine's
@@ -3618,6 +3806,7 @@ impl WaylandWindow {
         self.host.0.pump();
         self.sync_canvas_geometry();
         self.sync_ime_focus();
+        self.sync_text_overlay();
         // Polled rather than driven by an event, because the engine's own
         // request for a locked centre is a *getter* — `nativeGetMainWindow
         // IsMouseLockedCenter` — with nothing that calls out when it changes.
@@ -4037,6 +4226,18 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_positions_and_side_buttons_keep_their_meaning() {
+        let position = pack_pointer_position(123.5, -45.25);
+        assert_eq!(unpack_pointer_position(position), (123.5, -45.25));
+
+        assert_eq!(linux_button_to_android(0x110), Some(super::super::input::BUTTON_PRIMARY));
+        assert_eq!(linux_button_to_android(0x111), Some(super::super::input::BUTTON_SECONDARY));
+        assert_eq!(linux_button_to_android(0x112), Some(super::super::input::BUTTON_TERTIARY));
+        assert_eq!(linux_button_to_android(0x113), Some(super::super::input::BUTTON_BACK));
+        assert_eq!(linux_button_to_android(0x114), Some(super::super::input::BUTTON_FORWARD));
+    }
 
     // The `app_id_matches_the_desktop_entry` test that lived here moved to
     // `cordial_shell::host_window`, which is what sets the app_id now that GTK

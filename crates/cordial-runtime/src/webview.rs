@@ -909,10 +909,10 @@ pub fn report_window_closed() {
 /// `signalJavascriptCallback(Ljava/lang/String;)V` is read out of the dex's
 /// own method table (`tools/dex_method.py --class WebViewProtocol`), so the
 /// single `String` is a fact rather than a naming-convention guess. What is
-/// `INFERRED` is that the string the engine wants is the JSON rendering of
-/// the script message the page posted: that is what WebKitGTK hands over and
-/// the only thing this side has, but nothing observed confirms the engine
-/// parses exactly that. **A successful call here is not evidence that Join
+/// The shell mirrors Mocktail's two measured contracts before calling this:
+/// `executeRoblox` supplies the posted object's JSON, while `RobloxWKHybrid`
+/// supplies the envelope's string `command` property. **A successful call
+/// here is not evidence that Join
 /// worked** — it means the native returned without throwing. The observable
 /// test is a game actually launching, and until someone has seen that, this
 /// having "succeeded" says only that a string reached the engine.

@@ -189,7 +189,11 @@ pub fn is_configured() -> bool {
 /// observed. See docs/analysis/flag-init.md §34, "What is left after
 /// twenty-four".
 fn trace_assets_enabled() -> bool {
-    std::env::var_os("CORDIAL_TRACE_ASSETS").is_some() || std::env::var_os("CORDIAL_TRACE").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CORDIAL_TRACE_ASSETS").is_some()
+            || std::env::var_os("CORDIAL_TRACE").is_some()
+    })
 }
 
 impl Manager {

@@ -21,6 +21,7 @@ pub mod host;
 pub mod manifest;
 pub mod marketplace;
 pub mod notify;
+pub mod plugin_data;
 pub mod preferences;
 pub mod presence;
 pub mod protocol;

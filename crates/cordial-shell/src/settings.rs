@@ -32,6 +32,7 @@ use cordial_plugins::capability::Capability;
 use cordial_plugins::consent;
 use cordial_plugins::enablement;
 use cordial_plugins::grants;
+use cordial_plugins::plugin_data;
 use cordial_plugins::manifest::{self, Plugin};
 use cordial_plugins::marketplace;
 use cordial_plugins::registry::Entry;
@@ -919,15 +920,59 @@ fn build_plugin_row(
         let group = group.clone();
         let expander = expander.clone();
         let window = window.clone();
+        let profile_dir_for_remove = profile_dir.cloned();
         remove.connect_clicked(move |_| {
+            // What the *profile* remembers, which uninstalling does not touch:
+            // the settings chosen, the capabilities allowed, whether it was
+            // switched off. The plugin's own files -- manifest, entry module,
+            // assets, the flag layer it wrote -- all live in its installed
+            // directory and go with it either way, so none of them are counted
+            // here and none of them are what this checkbox is about.
+            let footprint = profile_dir_for_remove
+                .as_ref()
+                .map(|dir| plugin_data::footprint(dir, &id))
+                .unwrap_or_default();
+
             let dialog = adw::AlertDialog::builder()
                 .heading(format!("Remove {title}?"))
-                .body(
+                .body(if footprint.is_empty() {
+                    "Its files are deleted. This profile has nothing saved for it.".to_string()
+                } else {
                     "Its files are deleted. What you allowed it to do, and anything it saved, \
                      are kept for this profile — install it again later and it picks up where \
-                     it left off.",
-                )
+                     it left off."
+                        .to_string()
+                })
                 .build();
+
+            // Only when there is something to delete. A permanently unticked
+            // checkbox over nothing reads as a control that does not work,
+            // which is the same reason the gear above appears only for a
+            // plugin that declares preferences.
+            let also_delete = (!footprint.is_empty()).then(|| {
+                let label = if footprint.bytes > 0 {
+                    format!(
+                        "Also delete its settings and permissions ({})",
+                        plugin_data::human_bytes(footprint.bytes)
+                    )
+                } else {
+                    // Grants and the off switch are single entries in documents
+                    // shared by every plugin, so they weigh nothing worth
+                    // quoting -- and a "0 bytes" on the label would read as
+                    // "this does nothing".
+                    "Also delete its settings and permissions".to_string()
+                };
+                let check = gtk::CheckButton::with_label(&label);
+                // Off by default. The destructive half of a destructive dialog
+                // does not get to be pre-ticked.
+                check.set_active(false);
+                check.set_tooltip_text(Some(
+                    "Installing it again will ask for permission from scratch.",
+                ));
+                check.set_margin_top(6);
+                dialog.set_extra_child(Some(&check));
+                check
+            });
             dialog.add_response("cancel", "Cancel");
             dialog.add_response("remove", "Remove");
             dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
@@ -938,11 +983,23 @@ fn build_plugin_row(
             let id = id.clone();
             let group = group.clone();
             let expander = expander.clone();
+            let profile_for_forget = profile_dir_for_remove.clone();
             dialog.connect_response(None, move |dialog, response| {
                 if response == "remove" {
                     match unpack::uninstall(&root, &id) {
                         Ok(()) => group.remove(&expander),
                         Err(e) => eprintln!("shell: could not remove plugin {id}: {e}"),
+                    }
+                    // After the files, and only if asked. Ordered this way so a
+                    // failure to delete the plugin does not silently take the
+                    // user's settings with it -- uninstall is the thing they
+                    // pressed the button for, and this is the extra.
+                    if also_delete.as_ref().is_some_and(|c| c.is_active()) {
+                        if let Some(dir) = profile_for_forget.as_ref() {
+                            if let Err(e) = plugin_data::forget(dir, &id) {
+                                eprintln!("shell: could not delete {id}'s saved data: {e}");
+                            }
+                        }
                     }
                 }
                 dialog.close();

@@ -1818,6 +1818,8 @@ pub mod game_activity {
         fn cordial_textbox_generation() -> c_int;
         fn cordial_textbox_text(buf: *mut c_char, n: c_int) -> c_int;
         fn cordial_textbox_info(out: *mut RawTextBoxInfo) -> c_int;
+        fn cordial_games_loaded() -> u32;
+        fn cordial_last_place() -> i64;
         fn cordial_game_activity_window_focus(
             handle: i64,
             focused: c_int,
@@ -1984,6 +1986,23 @@ pub mod game_activity {
     /// `None` is not a zeroed box. A caller must not fall back to drawing an
     /// editor at the origin: an editor in the wrong place reads as a layout bug
     /// and hides the fact that the value never arrived.
+    /// How many times the engine has reported a place finished loading.
+    ///
+    /// Both `gameLoadedCallback` and `onGameLoaded` bump it, because either
+    /// means the join completed and different builds have been seen to call
+    /// different ones. The join watchdog waits for this to move; it is a count
+    /// rather than a flag so a second join in the same session is visible.
+    pub fn games_loaded() -> u32 {
+        // SAFETY: a plain atomic load on the C++ side.
+        unsafe { cordial_games_loaded() }
+    }
+
+    /// The place id of the most recent load, or 0 if none has been reported.
+    pub fn last_place() -> i64 {
+        // SAFETY: a plain atomic load on the C++ side.
+        unsafe { cordial_last_place() }
+    }
+
     pub fn focused_textbox_info() -> Option<RawTextBoxInfo> {
         let mut info = RawTextBoxInfo::default();
         // SAFETY: `info` is a live, fully initialised mirror of the C++ struct

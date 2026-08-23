@@ -37,6 +37,10 @@
 #include <mutex>
 #include <string>
 
+// Defined in android_classes.cpp. Both game-loaded callbacks feed one counter
+// so the join watchdog does not have to know which of them a given build calls.
+extern "C" void cordial_note_game_loaded(long long place_id);
+
 namespace cordial {
 class Surface;
 
@@ -1082,6 +1086,10 @@ public:
     static void onGameLoaded(ENV*, Object*, jlong place_id) {
         fprintf(stderr, "[roblox] game loaded: place %lld\n",
                 static_cast<long long>(place_id));
+        // The same counter `gameLoadedCallback` bumps, for the join watchdog.
+        // Both callbacks mean the join completed and different builds have been
+        // seen to call different ones, so the watchdog waits on either.
+        cordial_note_game_loaded(static_cast<long long>(place_id));
     }
     /// The argument is a session identifier, not a credential — but this
     /// boundary is next to the one that carries `.ROBLOSECURITY`, so it is

@@ -259,6 +259,12 @@ fn parse() -> Result<Options, String> {
             "--join-url" => {
                 let raw = args.next().ok_or("--join-url needs a URL")?;
                 opt.join_url = Some(cordial_runtime::deeplink::validate(&raw)?);
+                // Arms the join watchdog in `looper::pump`. Only a join Cordial
+                // itself asked for is watched; one the user starts from inside
+                // the app shell never reaches this parser, and a watchdog that
+                // claimed to cover it would be reporting on something it cannot
+                // see.
+                cordial_runtime::android::looper::note_join_requested();
             }
             "--dump-classes" => {
                 opt.jni_onload = true;

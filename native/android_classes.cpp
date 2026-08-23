@@ -224,6 +224,28 @@ extern "C" unsigned cordial_textbox_generation() {
     return g_textbox_generation.load(std::memory_order_acquire);
 }
 
+/// How many times the engine has said a place finished loading, and which one.
+///
+/// Two callbacks report it -- `NativeGLJavaInterface::gameLoadedCallback` and
+/// `NativeHelper::onGameLoaded` -- and either is enough to mean "the join
+/// completed", so both bump the same counter rather than the watchdog having to
+/// know which build calls which.
+static std::atomic<unsigned> g_games_loaded{0};
+static std::atomic<long long> g_last_place{0};
+
+extern "C" void cordial_note_game_loaded(long long place_id) {
+    g_games_loaded.fetch_add(1, std::memory_order_release);
+    g_last_place.store(place_id, std::memory_order_release);
+}
+
+extern "C" unsigned cordial_games_loaded(void) {
+    return g_games_loaded.load(std::memory_order_acquire);
+}
+
+extern "C" long long cordial_last_place(void) {
+    return g_last_place.load(std::memory_order_acquire);
+}
+
 /// Copy the focused box's spec into `*out`. Returns 1 when one is known, 0
 /// otherwise — and 0 has to mean "do not style anything from this", because
 /// `*out` is left untouched rather than zeroed. A box at (0, 0) sized 0x0 is
@@ -604,6 +626,12 @@ public:
     static void gameLoadedCallback(ENV*, Class*, jlong place_id) {
         fprintf(stderr, "[roblox] gameLoadedCallback: place %lld\n",
                 static_cast<long long>(place_id));
+        // Recorded, not only printed, so the join watchdog in `looper::pump`
+        // has something to wait for. A join Cordial started and the engine
+        // never completed is otherwise invisible: the pump keeps running, the
+        // window keeps presenting the place it was already on, and the user is
+        // left looking at a screen that simply never changes.
+        cordial_note_game_loaded(static_cast<long long>(place_id));
     }
 
     static std::shared_ptr<DeviceStaticParams> getDeviceStaticParams(ENV*, Class*) {

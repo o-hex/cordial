@@ -11,11 +11,44 @@
 
 use std::cell::RefCell;
 use std::ffi::{c_int, c_void};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// How many times the engine has polled. A game thread that is alive and waiting
 /// for work shows up here; one that never started does not.
 pub static POLLS: AtomicU64 = AtomicU64::new(0);
+
+/// Set when Cordial itself asked the engine to join a place, so the join
+/// watchdog below knows there is something to wait for.
+///
+/// Only Cordial-initiated joins are watched -- `--join-url`, and the shell's
+/// Play button, which passes one. A join the user starts from inside the app
+/// shell is invisible here, and claiming to watch it would be worse than not
+/// watching it.
+pub static JOIN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Record that a join was asked for. Called once, before the pump starts.
+pub fn note_join_requested() {
+    JOIN_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// How long a Cordial-initiated join may take before it is reported as not
+/// having completed.
+///
+/// Sixty seconds because a join is not one operation: a server has to be
+/// allocated, the place has to download, and on a slow connection that is
+/// legitimately long. A watchdog that cries at fifteen seconds trains people to
+/// ignore it, which is worse than not having one. `CORDIAL_JOIN_TIMEOUT`
+/// overrides it in seconds for anyone testing the message itself.
+fn join_timeout() -> std::time::Duration {
+    static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_secs(*SECS.get_or_init(|| {
+        std::env::var("CORDIAL_JOIN_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(60)
+    }))
+}
 
 /// How long an "infinite" `ALooper_pollOnce` is actually allowed to sleep.
 ///
@@ -491,6 +524,9 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
     let mut stall_presents: u64 = 0;
     let mut stall_since = std::time::Instant::now();
     let mut stall_reported = false;
+    let join_watch = JOIN_REQUESTED.load(Ordering::Relaxed);
+    let join_started = std::time::Instant::now();
+    let mut join_reported = false;
     let mut focus_reported: Option<bool> = Some(true);
     // `focus-off`/`focus-on` -- see the override's own comment at the call site.
     let mut focus_override: Option<bool> = None;
@@ -788,6 +824,32 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                     std::process::id(),
                 );
             }
+        }
+        // The join watchdog. A join Cordial started and the engine never
+        // completed is otherwise invisible: the pump keeps running, the window
+        // keeps presenting whatever it was already showing, and the user is
+        // left watching a screen that never changes. The present watchdog above
+        // says nothing about it, because presents are healthy throughout.
+        //
+        // **It reports that the join has not completed, not that it failed**,
+        // and the difference is not pedantry. Sixty seconds on a slow
+        // connection is a join still in progress, and a line saying "failed"
+        // would be a claim this code cannot support -- the same shape of lie as
+        // a stub returning success. Whoever reads it can tell the difference;
+        // this can only report what it waited for.
+        if join_watch
+            && !join_reported
+            && cordial_linker_sys::game_activity::games_loaded() == 0
+            && join_started.elapsed() >= join_timeout()
+        {
+            join_reported = true;
+            println!(
+                "[android] a join was requested {:.0}s ago and the engine has not reported a \
+                 loaded place. It may still be connecting -- this is a timeout, not a failure. \
+                 If the window is showing the app shell rather than a place, the join did not \
+                 take. Set CORDIAL_JOIN_TIMEOUT to change how long this waits.",
+                join_started.elapsed().as_secs_f64(),
+            );
         }
         if instr && tick.elapsed() >= std::time::Duration::from_secs(1) {
             let dt = tick.elapsed().as_secs_f64();

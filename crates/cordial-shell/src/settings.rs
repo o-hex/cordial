@@ -102,7 +102,13 @@ pub fn capability_summary(
         return "On. It asks for no permissions.".to_string();
     }
     if allowed.is_empty() {
-        return "On, but you have not allowed it to do anything yet.".to_string();
+        // Says where to go, because the switches are inside the expander and
+        // the row gives no sign of it. Reported as "the plugin doesnt work" by
+        // somebody looking at a plugin that was installed, enabled, and had
+        // simply never been granted anything -- which is ADR-003's default
+        // deny working exactly as intended and reading as a broken plugin.
+        return "On, but you have not allowed it to do anything yet. Open this row to choose."
+            .to_string();
     }
     if withheld.is_empty() {
         format!("On. Allowed: {}.", names(&allowed))

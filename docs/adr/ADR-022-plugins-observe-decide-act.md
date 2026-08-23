@@ -128,19 +128,42 @@ below the parent, and the parent is transparent and input-transparent over the
 canvas region.** Then every GTK widget composites above the engine for free, and
 a plugin panel is an ordinary widget rather than a special case.
 
-**This is not yet established and must not be built on until it is.** The three
-open questions, each with a way to answer it:
+**Measured on 2026-08-23, and it works.** All three questions were open when
+this ADR was written; all three now have answers, taken under `cage` in a nested
+compositor with `grim` for the composited screenshots and `WAYLAND_DEBUG=1` for
+the protocol.
 
-1. Can the GTK toplevel be transparent over the canvas area?
-2. Does `wl_surface.set_opaque_region` — GTK's, not ours — let a compositor skip
-   painting the subsurface underneath?
-3. Do pointer events fall through to the engine, and does an input region we set
-   survive GTK's next commit?
+1. **Transparency: yes, and it needs less than expected.** A
+   `window.background { background-color: transparent; }` CSS provider on the
+   toplevel is sufficient.
+2. **The engine shows through, and GTK's opaque region was the whole obstacle.**
+   With an opaque background GTK sends `set_opaque_region` covering the entire
+   surface, and a compositor is then entitled to skip painting anything beneath
+   it — which is the real reason behind the module doc's warning. With the CSS
+   change GTK stops sending `set_opaque_region` at all, having worked out for
+   itself that the surface is no longer opaque, and no manual override is needed.
+   Three-way control: `place_above` shows Roblox; `place_below` without the CSS
+   shows a flat libadwaita background with the engine presenting frames nobody
+   can see; `place_below` with the CSS shows the Roblox landing page with GTK's
+   header bar composited over it.
+3. **Input falls through, and only because the region is punched.** GTK does
+   *not* shrink its input region when its content becomes transparent — it sends
+   `set_input_region` once for the whole surface plus the CSD shadow and never
+   revisits it. An explicit `set_input_region` excluding the canvas rectangle
+   works and is not clobbered. With it, two synthetic clicks inside the canvas
+   produced four `nativePassMouseButton` calls into the engine; with the punch
+   removed and nothing else changed, the same clicks produced **zero**.
 
-Question 3 decides the design. If GTK will not yield the input region, the
-fallback is a dedicated overlay subsurface placed *above* the engine and painted
-by Cordial rather than by GTK — which serves toasts and plugin panels but not a
-WebKit view, and that is a materially worse outcome worth knowing early.
+So the fallback — a dedicated overlay subsurface Cordial paints itself — is not
+needed, and the WebKit view is reachable after all.
+
+**Two things remain untested and must be before this becomes the default.**
+Whether the input region survives a window resize or a header-bar re-layout,
+since GTK owns the surface and recomputes geometry on both; and what happens on
+a compositor that ignores an empty opaque region. A resize that silently
+restored the full input region would swallow every click into the canvas with no
+visible cause, which is a worse failure than the one this replaces. Land it
+behind a flag, test the resize, then flip the default.
 
 ### What a plugin declares, and the escape hatch that is not a channel
 

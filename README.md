@@ -113,6 +113,32 @@ will be declined.
 
 ## Status: early, but playable. Sign in, load a game, move around.
 
+### Recent desktop/runtime improvements in this fork
+
+- **Reliable mouse capture on Wayland and X11.** Right-drag and first-person
+  camera control now constrain the desktop cursor to the gameplay window. On
+  Wayland the constraint is attached to GTK/GDK's real pointer and to the
+  toplevel surface, which fixes the cursor escaping on KWin while Roblox's
+  internal pointer remained centred. Relative, unaccelerated motion and side
+  mouse buttons are carried through the Android input bridge as well.
+- **Visible text entry.** A native GTK overlay mirrors the focused Android text
+  field, including caret movement, editing operations and Wayland IME preedit,
+  so typed characters no longer remain invisible until focus is lost.
+- **Web-view bridge.** Marketplace, Profile and Communities continue to use a
+  signed-in WebKitGTK view, and both Roblox bridge formats (`executeRoblox` and
+  `RobloxWKHybrid.command`) are forwarded to the engine. The Vulkan canvas is
+  lowered while a dialog or text overlay is visible and restored on close.
+- **Fullscreen on the gameplay window.** F11 now targets the window containing
+  the engine, hides the compact header bar and persists the choice per profile.
+  The header uses the desktop's libadwaita/KDE theme colours instead of a
+  transparent custom background.
+- **Lower Android-runtime overhead.** Pointer positions use atomic pairs;
+  ordinary Vulkan presents no longer contend on the screenshot mutex; looper
+  accounting runs only when instrumentation is enabled; unchanged text avoids
+  repeated cloning and GTK updates; and environment/configuration probes used
+  by hot paths are cached for the process lifetime. These are runtime changes,
+  not Roblox graphics options or FastFlags.
+
 | | |
 |---|---|
 | Loads `libroblox.so` natively | ✅ |
@@ -127,7 +153,7 @@ will be declined.
 | Scroll wheel | ✅ |
 | Frame rate | ✅ a flat 60 on MAILBOX, where FIFO gave a variable 35–50 |
 | Feral GameMode | ✅ registered while the client runs |
-| Typing into text fields | ❌ characters reach the engine and are not drawn until the field loses focus |
+| Typing into text fields | ✅ a GTK overlay draws focused Android fields live, including caret movement and Wayland IME preedit |
 | Pointer capture in first person | ✅ the cursor stays in the window, reported from real play |
 | Staying signed in across a restart | ✅ cookies and identity kept in the **desktop keyring**, not a file |
 | Loading into an experience | ✅ world, avatar and UI render, signed in |
@@ -136,9 +162,9 @@ will be declined.
 | Launching from the shell | ✅ finds a build, or explains how to get one |
 | Choosing a profile | ✅ a chooser above the Launch button; creates one, and shows a profile another window holds as unavailable |
 | Audio | ✅ sound in an experience, reported from real play; the OpenSL ES bridge into PipeWire was measured with a control before that |
-| Web views (Marketplace, Profile, Communities…) | 🟡 they render — a real WebKitGTK window, signed in, with the engine's canvas correctly lowered behind it and raised again on close. Pressing **Join** inside one does not yet reach the engine |
+| Web views (Marketplace, Profile, Communities…) | 🟡 they render in a real signed-in WebKitGTK window, with correct canvas stacking; both observed JavaScript bridge formats now reach the runtime, but more pages still need interactive coverage |
 | **Asset overlays** (custom textures, sounds, fonts) | ✅ drop a file mirroring the APK's `assets/` tree into `~/.config/cordial/overlay` and it is served instead; nothing is modified, remove the file and the original returns |
-| Fullscreen | 🟡 F11 with the header bar hidden, and the choice persists per profile — but on the launcher window, not the one you play in |
+| Fullscreen | ✅ F11 acts on the gameplay window, hides the compact themed header bar and persists per profile |
 | **The engine's content store** | ✅ `RbxStorage` initialises and is read back — a real SQLite database, the engine's own `files` table, eight engine-created partitions, and cache hits rising across launches. Assets are no longer refetched every session |
 | Clean shutdown | ✅ full pause/stop/destroy sequence, observed in the engine's own log |
 | Plugins | 🟡 host, broker and per-profile grants now enforce every capability, not only `flags.*`/`presence.*` as before — notify, url.open, asset overlays, `flags.write` and cross-plugin events all reach a real effect; Settings can grant or revoke a capability, and install or remove a plugin from a local `.tar.zst` archive; still no in-app fetch from a remote index, so the marketplace half of the registry is unbuilt |
@@ -148,12 +174,11 @@ presents drop to exactly 1/s when nothing is happening and every earlier figure
 in this repository was that idle throttle integrated: a flat 60.0 on MAILBOX
 against a variable 35–50 on FIFO, four runs of 120 s.
 
-**What is left is polish and two real gaps.** Text fields take the characters
-and do not draw them until focus leaves, because on Android a transparent
-`EditText` draws a focused box and there is none here — mocktail does not manage
-this either. And pressing **Join** inside a web view does not yet reach the
-engine: the page finds Cordial's bridge and stops falling back to a link, but
-the command does not complete a launch.
+**What is left is polish and broader live coverage.** Focused text fields now
+have a desktop overlay, and web views forward both bridge formats observed in
+Roblox pages. Those paths still need testing across more field types, input
+methods and web pages; a page-specific bridge command can still expose engine
+vocabulary Cordial has not observed yet.
 
 Pointer capture and the content store were both on this list and are not any
 more.
@@ -196,9 +221,10 @@ of memory apiece.
 ## Install
 
 > Cordial is early. You can sign in, load an experience and play it with a
-> keyboard and mouse; text fields still do not draw what you type, and the
-> pointer is not captured in first person. The status table above says which
-> claims were measured and how — read it before you install.
+> keyboard and mouse; pointer capture, live text entry and gameplay-window
+> fullscreen are implemented, but web views and different input methods still
+> need broader testing. The status table above says what works — read it before
+> you install.
 
 ### 1. What you need
 

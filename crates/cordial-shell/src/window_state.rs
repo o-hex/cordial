@@ -59,38 +59,23 @@
 //! something it cannot is the "stub that returns success" AGENTS.md rules out,
 //! wearing a config file instead of a function. So this remembers size only.
 //!
-//! ## The escape hatch, and why this file restores fullscreen unconditionally
+//! ## The escape hatch
 //!
 //! The risk named in this feature's task is real and specific: a launch that
 //! comes up fullscreen with a broken renderer, or a display that no longer
 //! exists, traps the user behind chrome they cannot get to. That risk is about
 //! the *engine's* window -- black canvas, no frame, nothing to click -- and
-//! this file does not restore fullscreen there. It cannot: `window.rs` builds
-//! the shell's own launcher window, which is a `GtkDrawingArea` that paints
-//! nothing behind libadwaita's own background (see `HostWindow::with_canvas`),
-//! never an engine surface. There is no renderer in this window to break.
+//! the game window now has its own physical F11 handler before engine key
+//! delivery. It does not depend on the launcher's accelerator group, so it is
+//! available even when the engine canvas has focus or has failed to draw.
 //!
-//! So `window.rs` restores this state unconditionally, before the window is
-//! shown, and that is safe specifically because F11 (`win.fullscreen`, wired
-//! in the same function, before `present()`) and the compositor's own
-//! fullscreen keybinding are both live from the first frame this window ever
-//! draws -- there is no gap in which a fullscreen chooser window exists with
-//! no way out.
+//! So both windows restore this state before they are shown. The launcher's
+//! `win.fullscreen` action and the game's direct F11 handler are installed
+//! before their first frame, leaving no gap in which a restored fullscreen
+//! window has no keyboard way out.
 //!
-//! **That reasoning does not carry over to the engine's own window, and
-//! whoever wires a saved preference there next must re-derive it rather than
-//! copy this comment.** `android/wayland.rs` builds that window directly
-//! against `HostWindow::with_canvas` (confirmed by reading it, not touched by
-//! this change -- it is out of this task's scope) with no `GtkApplication` and
-//! therefore no accelerator group at all: `set_accels_for_action` in
-//! `window.rs` only works because this window's `set_application` call gives
-//! it one. `docs/NEXT.md` §1e already documents that window's fullscreen path
-//! as fragile even when driven deliberately, by test instrumentation, with a
-//! developer watching. Restoring a saved fullscreen state into a window with
-//! no confirmed keyboard escape and a documented history of fullscreen bugs,
-//! right as the engine itself might be the thing that is broken, is precisely
-//! the trap this task's brief warns against. It needs its own escape hatch
-//! before it earns this file's default.
+//! The game and launcher remain separate records. Restoring either is now safe:
+//! the launcher owns `win.fullscreen`, and the game owns the direct F11 path.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -238,14 +223,6 @@ pub fn save(profile_dir: &Path, which: Which, state: &WindowState) -> std::io::R
 /// the window is open. A window that belongs to one running client cannot, so
 /// this takes the directory once.
 ///
-/// **`fullscreen` is written and deliberately not applied.** This module's
-/// header says why at length and says it about this exact caller: the window
-/// Roblox draws into has no accelerator group, no `win.fullscreen`, and a
-/// documented history of fullscreen bugs, so a saved fullscreen restored into a
-/// launch where the renderer is the thing that is broken leaves a black
-/// full-screen surface with no keyboard way out. The state is recorded so that
-/// whoever wires an escape can turn this on in one line; until then, restoring
-/// it would be a trap.
 pub fn remember(window: &libadwaita::Window, profile_dir: PathBuf, which: Which) {
     use libadwaita::glib;
     use libadwaita::prelude::*;
@@ -258,6 +235,9 @@ pub fn remember(window: &libadwaita::Window, profile_dir: PathBuf, which: Which)
     // seen at its floating size for a frame and then snapping.
     if state.maximised {
         window.maximize();
+    }
+    if state.fullscreen {
+        window.fullscreen();
     }
 
     let write = {

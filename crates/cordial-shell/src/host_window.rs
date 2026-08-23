@@ -237,6 +237,38 @@ pub struct HostWindow {
     /// what the engine's subsurface is sized and positioned from, so that the
     /// header bar's height never has to be assumed anywhere.
     content: gtk::Widget,
+    text_layer: gtk::Fixed,
+    text_label: gtk::Label,
+}
+
+/// The Android editor rectangle Roblox asks the platform to paint over its
+/// surface while a TextBox has focus.
+pub struct TextOverlay<'a> {
+    pub text: &'a str,
+    pub caret_chars: i32,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub font_size: f32,
+    pub text_color: u32,
+    pub password: bool,
+}
+
+fn displayed_editor_text(text: &str, caret_chars: i32, password: bool) -> String {
+    let mut display = if password {
+        "•".repeat(text.chars().count())
+    } else {
+        text.to_owned()
+    };
+    let caret = caret_chars.max(0) as usize;
+    let byte = display
+        .char_indices()
+        .nth(caret)
+        .map(|(at, _)| at)
+        .unwrap_or(display.len());
+    display.insert(byte, '│');
+    display
 }
 
 impl HostWindow {
@@ -254,14 +286,53 @@ impl HostWindow {
         let canvas = gtk::DrawingArea::new();
         canvas.set_hexpand(true);
         canvas.set_vexpand(true);
-        Self::new(title, width, height, &canvas)
+        let host = Self::new(title, width, height, &canvas);
+        host.window.add_css_class("cordial-engine-host");
+        let css = gtk::CssProvider::new();
+        css.load_from_string(
+            ".cordial-engine-host, .cordial-engine-host drawingarea { \
+                 background-color: transparent; \
+             } \
+             .cordial-engine-host headerbar { \
+                 background-color: @headerbar_bg_color; \
+                 color: @headerbar_fg_color; \
+                 background-image: none; \
+                 min-height: 30px; \
+                 padding: 0 6px; \
+             } \
+             .cordial-engine-host headerbar windowcontrols button { \
+                 min-width: 24px; \
+                 min-height: 24px; \
+                 padding: 0; \
+                 margin: 2px; \
+             }",
+        );
+        gtk::style_context_add_provider_for_display(
+            &WidgetExt::display(&host.window),
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        host
     }
 
     pub fn new(title: &str, width: i32, height: i32, content: &impl IsA<gtk::Widget>) -> Self {
         let header = adw::HeaderBar::new();
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
-        toolbar.set_content(Some(content));
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(content));
+        let text_layer = gtk::Fixed::new();
+        text_layer.set_can_target(false);
+        text_layer.set_hexpand(true);
+        text_layer.set_vexpand(true);
+        let text_label = gtk::Label::new(None);
+        text_label.set_can_target(false);
+        text_label.set_visible(false);
+        text_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        text_label.set_overflow(gtk::Overflow::Hidden);
+        text_layer.put(&text_label, 0.0, 0.0);
+        overlay.add_overlay(&text_layer);
+        toolbar.set_content(Some(&overlay));
 
         // Clamped before the window exists, because a default size larger than
         // the screen is not something the compositor will correct for you: it
@@ -301,7 +372,14 @@ impl HostWindow {
             });
         }
 
-        HostWindow { window, header, toolbar, content: content.as_ref().clone() }
+        HostWindow {
+            window,
+            header,
+            toolbar,
+            content: content.as_ref().clone(),
+            text_layer,
+            text_label,
+        }
     }
 
     pub fn window(&self) -> &adw::Window {
@@ -320,6 +398,46 @@ impl HostWindow {
         self.window.present();
     }
 
+    /// Paint (or hide) the desktop equivalent of Android's transparent
+    /// `EditText` over the engine canvas. The caller controls subsurface
+    /// stacking; this method only updates GTK's parent surface.
+    pub fn set_text_overlay(&self, overlay: Option<TextOverlay<'_>>) {
+        let Some(overlay) = overlay else {
+            self.text_label.set_text("");
+            self.text_label.set_visible(false);
+            self.window.queue_draw();
+            return;
+        };
+
+        let display = displayed_editor_text(overlay.text, overlay.caret_chars, overlay.password);
+        self.text_label.set_text(&display);
+        self.text_label.set_size_request(
+            overlay.width.max(1.0).round() as i32,
+            overlay.height.max(1.0).round() as i32,
+        );
+        self.text_label.set_xalign(0.0);
+        self.text_label.set_yalign(0.5);
+
+        let attrs = gtk::pango::AttrList::new();
+        attrs.insert(gtk::pango::AttrSize::new(
+            (overlay.font_size.max(1.0) * gtk::pango::SCALE as f32).round() as i32,
+        ));
+        let color = overlay.text_color;
+        attrs.insert(gtk::pango::AttrColor::new_foreground(
+            (((color >> 16) & 0xff) * 257) as u16,
+            (((color >> 8) & 0xff) * 257) as u16,
+            ((color & 0xff) * 257) as u16,
+        ));
+        self.text_label.set_attributes(Some(&attrs));
+        self.text_layer.move_(
+            &self.text_label,
+            overlay.x.round() as f64,
+            overlay.y.round() as f64,
+        );
+        self.text_label.set_visible(true);
+        self.window.queue_draw();
+    }
+
     /// The `wl_display` GTK opened, as a raw pointer.
     ///
     /// Everything Cordial does natively — the engine's own `wl_surface`, the
@@ -331,6 +449,22 @@ impl HostWindow {
     pub fn wl_display(&self) -> Option<*mut c_void> {
         let display = WidgetExt::display(&self.window).downcast::<gdk4_wayland::WaylandDisplay>().ok()?;
         display.wl_display_raw().map(std::ptr::NonNull::as_ptr)
+    }
+
+    /// GDK's own `wl_pointer` for the default seat, borrowed as a raw pointer.
+    ///
+    /// A Wayland client may create more than one `wl_pointer` from one seat,
+    /// but GDK's is the object that owns the desktop cursor for this GTK
+    /// window. Pointer constraints attached to a second object can receive a
+    /// `locked` event without constraining GDK's cursor, which leaves the host
+    /// pointer free to cross the window edge while the engine's cursor stays
+    /// centred. The runtime borrows this object for its relative-pointer and
+    /// constraint requests; ownership and destruction remain with GDK.
+    pub fn wl_pointer(&self) -> Option<*mut c_void> {
+        let display = WidgetExt::display(&self.window);
+        let pointer = display.default_seat()?.pointer()?;
+        let pointer = pointer.downcast::<gdk4_wayland::WaylandDevice>().ok()?;
+        pointer.wl_pointer_raw().map(std::ptr::NonNull::as_ptr)
     }
 
     /// The toplevel's own `wl_surface` — the parent the engine's surface is
@@ -510,6 +644,12 @@ fn header_height_hint() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_editor_caret_counts_characters_and_passwords_never_reach_the_label() {
+        assert_eq!(displayed_editor_text("aé中", 2, false), "aé│中");
+        assert_eq!(displayed_editor_text("secret", 3, true), "•••│•••");
+    }
 
     #[test]
     fn app_id_matches_the_desktop_entry() {

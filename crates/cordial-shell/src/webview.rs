@@ -130,6 +130,55 @@ const BRIDGE_ROBLOX_WK_HYBRID: &str = "RobloxWKHybrid";
 type BridgeSink = dyn Fn(&str) + Send + Sync;
 static BRIDGE_SINK: std::sync::OnceLock<std::sync::Arc<BridgeSink>> = std::sync::OnceLock::new();
 
+#[derive(Clone, Copy)]
+enum BridgeHandler {
+    ExecuteRoblox,
+    RobloxWkHybrid,
+}
+
+fn forward_script_message(
+    view: &webkit6::WebView,
+    value: &webkit6::javascriptcore::Value,
+    handler: BridgeHandler,
+) {
+    // Match mocktail's two distinct handler contracts. executeRoblox posts an
+    // object whose complete JSON representation is the command; RobloxWKHybrid
+    // posts an envelope and the native receives only its string `command`.
+    // Treating both signals as the former was subtle: both handlers existed,
+    // the callback ran, and the engine still received the wrong bytes for Join.
+    let command = match handler {
+        BridgeHandler::ExecuteRoblox if value.is_object() => {
+            value.to_json(0).map(|s| s.to_string())
+        }
+        BridgeHandler::RobloxWkHybrid if value.is_object() => value
+            .object_get_property("command")
+            .filter(|property| property.is_string())
+            .and_then(|property| property.to_string_as_bytes())
+            .and_then(|bytes| std::str::from_utf8(bytes.as_ref()).ok().map(str::to_owned)),
+        _ => None,
+    };
+    let Some(command) = command.filter(|command| !command.is_empty()) else {
+        eprintln!("[webview] rejected a malformed bridge command");
+        return;
+    };
+
+    let current_uri = view.uri().map(|u| u.to_string()).unwrap_or_default();
+    let verdict = webview_policy::evaluate(&current_uri);
+    if let Err(reason) = webview_policy::bridge_message_acceptable(&verdict, command.len()) {
+        eprintln!("[webview] rejected a bridge message (host {}): {reason}", verdict.host);
+        return;
+    }
+    match BRIDGE_SINK.get() {
+        Some(sink) => sink(&command),
+        None => eprintln!(
+            "[webview] a bridge message passed policy (host {}, {} bytes), but no sink is \
+             installed to forward it -- see set_bridge_sink's doc",
+            verdict.host,
+            command.len()
+        ),
+    }
+}
+
 /// Install the sink [`open`]'s bridge handler forwards an approved message
 /// to. Only the first call takes effect — see `cordial_runtime::webview::
 /// set_presenter`'s doc for why two installations racing is a bug worth
@@ -359,31 +408,14 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
     // the lie that rule exists to rule out.
     {
         let bridge_view = view.clone();
-        user_content.connect_script_message_received(None, move |_manager, value| {
-            // The live address, not the one this window was opened with --
-            // see the comment above `user_content`'s construction.
-            let current_uri = bridge_view.uri().map(|u| u.to_string()).unwrap_or_default();
-            let verdict = webview_policy::evaluate(&current_uri);
-            let rendered = value.to_json(0).map(|s| s.to_string()).unwrap_or_default();
-            if let Err(reason) = webview_policy::bridge_message_acceptable(&verdict, rendered.len()) {
-                eprintln!("[webview] rejected a bridge message (host {}): {reason}", verdict.host);
-                return;
-            }
-            // Never the payload itself, here or in anything this is handed
-            // to -- a bridge message can carry whatever the page and the
-            // engine are mid-conversation about, which is exactly the kind
-            // of session-scoped value `extract_roblosecurity` already
-            // refuses to print. Length and the fact that it passed policy
-            // are the whole of what is worth a log line.
-            match BRIDGE_SINK.get() {
-                Some(sink) => sink(&rendered),
-                None => eprintln!(
-                    "[webview] a bridge message passed policy (host {}, {} bytes), but no sink is \
-                     installed to forward it -- see set_bridge_sink's doc",
-                    verdict.host,
-                    rendered.len()
-                ),
-            }
+        user_content.connect_script_message_received(Some(BRIDGE_EXECUTE_ROBLOX), move |_manager, value| {
+            forward_script_message(&bridge_view, value, BridgeHandler::ExecuteRoblox);
+        });
+    }
+    {
+        let bridge_view = view.clone();
+        user_content.connect_script_message_received(Some(BRIDGE_ROBLOX_WK_HYBRID), move |_manager, value| {
+            forward_script_message(&bridge_view, value, BridgeHandler::RobloxWkHybrid);
         });
     }
 

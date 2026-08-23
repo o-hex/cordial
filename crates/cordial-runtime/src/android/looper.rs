@@ -1184,8 +1184,11 @@ extern "C" fn looper_poll_once(
         super::trace(format_args!("ALooper_pollOnce on a thread with no looper"));
         return POLL_ERROR;
     };
-    POLLS.fetch_add(1, Ordering::Relaxed);
-    let seat = census::on().then(census::slot).flatten();
+    let instrumentation = census::on();
+    if instrumentation {
+        POLLS.fetch_add(1, Ordering::Relaxed);
+    }
+    let seat = instrumentation.then(census::slot).flatten();
     if let Some(s) = seat {
         census::bump(&s.calls);
         census::bump(match timeout_millis {
@@ -1194,7 +1197,7 @@ extern "C" fn looper_poll_once(
             1..=9 => &s.t_short,
             _ => &s.t_long,
         });
-    } else if census::on() {
+    } else if instrumentation {
         census::bump(&census::OVERFLOW);
     }
 

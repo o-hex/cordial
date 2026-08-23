@@ -407,6 +407,7 @@ pub fn paste_into_engine(handle: i64) -> Result<usize, String> {
     };
     let _ = linker::game_activity::text_input(handle, &contents, caret, caret);
     super::input::pass_text(which, &contents, caret);
+    super::input::deliver_surface_redraw(handle);
     let n = flattened.chars().count();
     if trace() {
         eprintln!("[clipboard] host -> engine: {n} characters into the focused box");

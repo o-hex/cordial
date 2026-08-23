@@ -17,6 +17,7 @@
 //! them into the keysym/button/text vocabulary this module speaks.
 
 use std::ffi::{c_ulong, c_void};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // --------------------------------------------------------- Android vocabulary
@@ -27,6 +28,8 @@ use std::sync::{Mutex, OnceLock};
 pub const BUTTON_PRIMARY: i32 = 1;
 pub const BUTTON_SECONDARY: i32 = 2;
 pub const BUTTON_TERTIARY: i32 = 4;
+pub const BUTTON_BACK: i32 = 8;
+pub const BUTTON_FORWARD: i32 = 16;
 
 /// `nativePassMouseButton`'s own button index, which is not Android's bitmask.
 ///
@@ -38,13 +41,22 @@ pub const BUTTON_TERTIARY: i32 = 4;
 /// the parameter as a bare `I` and strips parameter names, so nothing readable
 /// settles it; a human with a mouse does, in one click.
 ///
-/// Getting this wrong is not silent: the right button would act as some other
-/// button rather than doing nothing.
-pub fn roblox_mouse_button(android_button: i32) -> i32 {
+/// `None` means Android has a button the GameActivity path can represent but
+/// this native interface has no established ordinal for. Getting that wrong is
+/// not silent: a side button would act as a primary click rather than doing
+/// nothing.
+pub fn roblox_mouse_button(android_button: i32) -> Option<i32> {
     match android_button {
-        BUTTON_SECONDARY => 1,
-        BUTTON_TERTIARY => 2,
-        _ => 0,
+        BUTTON_PRIMARY => Some(0),
+        BUTTON_SECONDARY => Some(1),
+        BUTTON_TERTIARY => Some(2),
+        // Android has well-defined back and forward button bits, and the
+        // GameActivity path below carries those bits directly. The native
+        // interface instead takes a small ordinal whose meaning past middle
+        // is not established, so treating either as left would be a false
+        // click. Leave that path out until a run establishes its mapping.
+        BUTTON_BACK | BUTTON_FORWARD => None,
+        _ => None,
     }
 }
 pub const ACTION_DOWN: i32 = 0;
@@ -641,7 +653,7 @@ pub fn idle_keepalive() {
     if !any_held {
         return;
     }
-    if let Some((x, y)) = *MOUSE_LAST.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some((x, y)) = mouse_last_position() {
         pass_mouse_move_delta(x, y, 0.0, 0.0);
     }
 }
@@ -683,7 +695,10 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
     //
     // `CORDIAL_PASS_TEXT_ON_KEY=1` restores the old behaviour for anyone
     // testing this claim rather than taking it on trust.
-    let f = if std::env::var_os("CORDIAL_PASS_TEXT_ON_KEY").is_some() {
+    static PASS_TEXT_ON_KEY: OnceLock<bool> = OnceLock::new();
+    let f = if *PASS_TEXT_ON_KEY
+        .get_or_init(|| std::env::var_os("CORDIAL_PASS_TEXT_ON_KEY").is_some())
+    {
         PASS_TEXT.load(std::sync::atomic::Ordering::Relaxed)
     } else {
         std::ptr::null_mut()
@@ -692,7 +707,9 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
         // `nativePassText(long, String, boolean, int)`. The boolean's meaning is
         // not declared anywhere Cordial can read, so it stays a knob until a run
         // settles it: `CORDIAL_PASSTEXT_FLAG=1` sends true.
-        let flag = std::env::var_os("CORDIAL_PASSTEXT_FLAG").is_some();
+        static PASS_TEXT_FLAG: OnceLock<bool> = OnceLock::new();
+        let flag = *PASS_TEXT_FLAG
+            .get_or_init(|| std::env::var_os("CORDIAL_PASSTEXT_FLAG").is_some());
         if let Err(e) = cordial_linker_sys::game_activity::pass_text(f, which, text, flag, cursor) {
             if trace_text() {
                 eprintln!("[cordial] passText failed: {e}");
@@ -714,7 +731,25 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
 /// Where the pointer was the last time one was reported, so the next report
 /// can carry how far it moved. `None` means "no previous position to subtract"
 /// — see [`reset_mouse_delta`].
-static MOUSE_LAST: Mutex<Option<(f32, f32)>> = Mutex::new(None);
+// Motion can arrive at a mouse's full report rate. Keeping the last absolute
+// position behind a mutex made every report contend with the control socket's
+// keepalive read, despite the two floats fitting in one atomic word. All
+// producers still observe a complete pair: `swap` publishes x and y together.
+const NO_MOUSE_POSITION: u64 = u64::MAX;
+static MOUSE_LAST: AtomicU64 = AtomicU64::new(NO_MOUSE_POSITION);
+
+fn pack_mouse_position(x: f32, y: f32) -> u64 {
+    ((x.to_bits() as u64) << 32) | y.to_bits() as u64
+}
+
+fn unpack_mouse_position(position: u64) -> (f32, f32) {
+    (f32::from_bits((position >> 32) as u32), f32::from_bits(position as u32))
+}
+
+fn mouse_last_position() -> Option<(f32, f32)> {
+    let position = MOUSE_LAST.load(Ordering::Acquire);
+    (position != NO_MOUSE_POSITION).then(|| unpack_mouse_position(position))
+}
 
 /// Forget the last reported pointer position, so the next move reports a zero
 /// delta rather than the distance from wherever the pointer was before.
@@ -724,20 +759,20 @@ static MOUSE_LAST: Mutex<Option<(f32, f32)>> = Mutex::new(None);
 /// width of the window as a single movement — and a delta is what turns the
 /// camera, so that is not a cosmetic error but a view that snaps round.
 pub fn reset_mouse_delta() {
-    *MOUSE_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    MOUSE_LAST.store(NO_MOUSE_POSITION, Ordering::Release);
 }
 
 /// Split a new absolute position into itself and the movement since the last
 /// one. Separate from [`pass_mouse_move`] so the arithmetic — specifically the
 /// first-event case — is testable without a loaded engine.
 fn mouse_delta(x: f32, y: f32) -> (f32, f32) {
-    let mut last = MOUSE_LAST.lock().unwrap_or_else(|e| e.into_inner());
-    let d = match *last {
-        Some((px, py)) => (x - px, y - py),
-        None => (0.0, 0.0),
-    };
-    *last = Some((x, y));
-    d
+    let previous = MOUSE_LAST.swap(pack_mouse_position(x, y), Ordering::AcqRel);
+    if previous == NO_MOUSE_POSITION {
+        (0.0, 0.0)
+    } else {
+        let (px, py) = unpack_mouse_position(previous);
+        (x - px, y - py)
+    }
 }
 
 /// `nativePassMouseMove(F x, F y, F dx, F dy)`.
@@ -789,12 +824,14 @@ pub fn pass_mouse_move_delta(x: f32, y: f32, dx: f32, dy: f32) {
 /// never reports a right button cannot turn its camera with the mouse however
 /// well the rest of the path works.
 pub fn pass_mouse_button(x: f32, y: f32, down: bool, android_button: i32) {
+    let Some(button) = roblox_mouse_button(android_button) else {
+        return;
+    };
     let f = PASS_MOUSE_BUTTON.load(std::sync::atomic::Ordering::Relaxed);
     if f.is_null() {
         report_unregistered("nativePassMouseButton");
         return;
     }
-    let button = roblox_mouse_button(android_button);
     let r = cordial_linker_sys::game_activity::pass_mouse_button(f, x, y, down, button);
     if trace_mouse() {
         eprintln!(
@@ -1011,7 +1048,7 @@ fn no_pass_key() -> bool {
 /// So it stays off for want of a reason to turn it on rather than for fear of
 /// what it did, and turning it on is not a fix for text entry. Do not spend
 /// another session on that hypothesis; §1 has the screenshots.
-fn keyboard_report_enabled() -> bool {
+pub fn keyboard_report_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CORDIAL_KEYBOARD_REPORT").is_some())
 }
@@ -1240,6 +1277,10 @@ pub enum Caret {
 /// the username into it, and the first keystroke in a pre-filled field appends
 /// rather than continues.
 static TEXT_GENERATION: Mutex<Option<u32>> = Mutex::new(None);
+/// Changes whenever the committed text buffer changes or is reseeded. The
+/// Wayland overlay uses this as a cheap invalidation key, avoiding a clone of
+/// the entire field and JNI metadata locks on every idle pump tick.
+static TEXT_REVISION: AtomicU64 = AtomicU64::new(0);
 
 /// What a key press means to the focused field.
 pub enum Edit<'a> {
@@ -1293,6 +1334,7 @@ fn reseed_if_needed(buf: &mut TextField) {
             buf.seed(cordial_linker_sys::game_activity::textbox_text());
         }
         *seen = Some(generation);
+        TEXT_REVISION.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1324,7 +1366,16 @@ pub fn edit_text_buffer(edit: Edit<'_>) -> Option<(String, i32)> {
         }
     };
 
-    changed.then(|| (buf.text.clone(), buf.caret as i32))
+    changed.then(|| {
+        TEXT_REVISION.fetch_add(1, Ordering::Relaxed);
+        (buf.text.clone(), buf.caret as i32)
+    })
+}
+
+/// Cheap invalidation key for consumers which only need a fresh snapshot
+/// after the text buffer actually changes.
+pub fn text_buffer_revision() -> u64 {
+    TEXT_REVISION.load(Ordering::Relaxed)
 }
 
 /// The focused field's contents and caret, reseeding first exactly as
@@ -1620,9 +1671,11 @@ mod tests {
         // only the primary button was ever delivered, and always as 0. A test
         // that the three are distinct is what stops a future edit collapsing
         // them back into one.
-        assert_eq!(roblox_mouse_button(BUTTON_PRIMARY), 0);
-        assert_eq!(roblox_mouse_button(BUTTON_SECONDARY), 1);
-        assert_eq!(roblox_mouse_button(BUTTON_TERTIARY), 2);
+        assert_eq!(roblox_mouse_button(BUTTON_PRIMARY), Some(0));
+        assert_eq!(roblox_mouse_button(BUTTON_SECONDARY), Some(1));
+        assert_eq!(roblox_mouse_button(BUTTON_TERTIARY), Some(2));
+        assert_eq!(roblox_mouse_button(BUTTON_BACK), None);
+        assert_eq!(roblox_mouse_button(BUTTON_FORWARD), None);
     }
 
     #[test]

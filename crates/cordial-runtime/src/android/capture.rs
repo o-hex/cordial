@@ -29,7 +29,7 @@
 //! into a run that never takes a screenshot.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 // ---------------------------------------------------------------- constants
@@ -230,12 +230,18 @@ pub fn extent() -> (u32, u32) {
 /// while one is pending replaces it, because a harness that asks twice wants
 /// the newer frame.
 static PENDING: Mutex<Option<String>> = Mutex::new(None);
+/// Lock-free hint for the per-frame present path. The request itself remains
+/// behind `PENDING`; this only prevents taking that mutex on every ordinary
+/// frame when no capture was requested.
+static PENDING_FAST: AtomicBool = AtomicBool::new(false);
 /// Set once the pending capture finishes, so the requester can be told.
 static RESULT: Mutex<Option<Result<String, String>>> = Mutex::new(None);
 
 pub fn request(path: &str) {
-    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_string());
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     *RESULT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *pending = Some(path.to_string());
+    PENDING_FAST.store(true, Ordering::Release);
 }
 
 pub fn take_result() -> Option<Result<String, String>> {
@@ -247,7 +253,11 @@ pub fn take_result() -> Option<Result<String, String>> {
 /// to a wedged engine, which is the one thing this surface exists to tell
 /// apart.
 pub fn abandon(why: &str) {
-    if PENDING.lock().unwrap_or_else(|e| e.into_inner()).take().is_some() {
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let had_request = pending.take().is_some();
+    PENDING_FAST.store(false, Ordering::Release);
+    drop(pending);
+    if had_request {
         finish(Err(why.to_string()));
     }
 }
@@ -258,11 +268,10 @@ fn finish(r: Result<String, String>) {
 
 /// Whether a capture is waiting, checked once per present.
 ///
-/// A plain `try_lock` so that a present is never delayed by the requester
-/// still holding the lock: a missed frame costs the harness one more attempt,
-/// where a stalled present would cost the run its frame rate.
+/// The full request is mutex-protected, but the normal (no capture) case is a
+/// single atomic load so presenting frames never contends with the harness.
 pub fn pending() -> bool {
-    PENDING.try_lock().map(|g| g.is_some()).unwrap_or(false)
+    PENDING_FAST.load(Ordering::Acquire)
 }
 
 /// Device-level entry points, resolved through the host's
@@ -327,7 +336,11 @@ pub fn capture(
     ),
     physical_device: *mut c_void,
 ) {
-    let Some(path) = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let path = pending.take();
+    PENDING_FAST.store(false, Ordering::Release);
+    drop(pending);
+    let Some(path) = path else { return };
     let r = do_capture(
         queue,
         swapchain,

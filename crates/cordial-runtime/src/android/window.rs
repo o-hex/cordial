@@ -16,6 +16,7 @@
 //! and a surface role — more moving parts for the same first frame.
 
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CString};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Android pixel formats, from `android/native_window.h`.
@@ -79,6 +80,11 @@ struct Xlib {
     ) -> c_ulong,
     define_cursor: unsafe extern "C" fn(Display, Window, c_ulong) -> c_int,
     free_pixmap: unsafe extern "C" fn(Display, c_ulong) -> c_int,
+    // ---- pointer capture for camera drags ----
+    grab_pointer: unsafe extern "C" fn(
+        Display, Window, c_int, c_uint, c_int, c_int, Window, c_ulong, c_ulong,
+    ) -> c_int,
+    ungrab_pointer: unsafe extern "C" fn(Display, c_ulong) -> c_int,
 }
 
 /// `XColor`. Only the pixel/RGB prefix is read by `XCreatePixmapCursor`, but the
@@ -142,6 +148,8 @@ impl Xlib {
             create_pixmap_cursor: sym!("XCreatePixmapCursor"),
             define_cursor: sym!("XDefineCursor"),
             free_pixmap: sym!("XFreePixmap"),
+            grab_pointer: sym!("XGrabPointer"),
+            ungrab_pointer: sym!("XUngrabPointer"),
         })
     }
 }
@@ -162,6 +170,8 @@ pub struct HostWindow {
     /// framebuffers from the answer.
     buffers: Mutex<Geometry>,
     input: Mutex<InputState>,
+    pointer_grabbed: AtomicBool,
+    fullscreen: AtomicBool,
 }
 
 /// Buttons and timing carried across calls to `pump_input_events`, the way a
@@ -466,11 +476,11 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         //
         // `XDefineCursor` is scoped to this window: the pointer is invisible
         // while it is over Cordial and completely untouched everywhere else on
-        // the desktop. That matters more than it sounds. The global alternatives
-        // (`XFixesHideCursor`, grabbing the pointer) change the cursor for the
-        // whole session, and this project has already hijacked the developer's
-        // real pointer once with `XTestFakeMotionEvent` — window-scoped is the
-        // rule here, not a preference.
+        // the desktop. A camera drag deliberately takes a short-lived pointer
+        // grab below, but hiding the cursor itself must not affect the session
+        // while no drag is active. This project has already hijacked the
+        // developer's real pointer once with `XTestFakeMotionEvent`; every grab
+        // therefore has independent button-up and Escape release paths.
         //
         // `CORDIAL_SHOW_CURSOR=1` puts it back, for debugging input where seeing
         // where the host thinks the pointer is matters.
@@ -578,6 +588,8 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             down_time_ms: 0,
             clock: std::time::Instant::now(),
         }),
+        pointer_grabbed: AtomicBool::new(false),
+        fullscreen: AtomicBool::new(place.fullscreen),
     };
     Ok(WINDOW.get_or_init(|| host))
 }
@@ -656,9 +668,11 @@ impl HostWindow {
             );
             (xlib.flush)(self.display);
         }
+        self.fullscreen.store(on, Ordering::Relaxed);
     }
 
     pub fn close(&self) {
+        self.set_pointer_capture(false);
         // SAFETY: both handles came from this struct's own creation calls.
         unsafe {
             (self.xlib.destroy_window)(self.display, self.window);
@@ -801,11 +815,12 @@ use super::input::{
     deliver_key, deliver_surface_redraw, deliver_touch, edit_text_buffer, keysym_to_android,
     pass_key_event, pass_mouse_button, pass_mouse_move, pass_text, report_keyboard_state, Caret,
     Edit, ACTION_BUTTON_PRESS, ACTION_BUTTON_RELEASE, ACTION_DOWN, ACTION_HOVER_MOVE, ACTION_MOVE,
-    ACTION_UP, BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_TERTIARY,
+    ACTION_UP, BUTTON_BACK, BUTTON_FORWARD, BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_TERTIARY,
 };
 
 /// X11 numbers buttons 1/2/3 as left/middle/right; Android's bit assignment
-/// puts secondary (right) before tertiary (middle). Buttons 4-7 are the wheel
+/// puts secondary (right) before tertiary (middle). X11's conventional 8/9
+/// side buttons become Android's back/forward bits. Buttons 4-7 are the wheel
 /// and are handled by [`x11_button_to_wheel`] instead — they must not fall
 /// through to here, because delivering a scroll as some button press is worse
 /// than dropping it.
@@ -814,6 +829,8 @@ fn x11_button_to_android(button: c_uint) -> Option<i32> {
         1 => Some(BUTTON_PRIMARY),
         2 => Some(BUTTON_TERTIARY),
         3 => Some(BUTTON_SECONDARY),
+        8 => Some(BUTTON_BACK),
+        9 => Some(BUTTON_FORWARD),
         _ => None,
     }
 }
@@ -867,6 +884,63 @@ impl HostWindow {
         state.clock.elapsed().as_millis() as i64
     }
 
+    /// Confine the real X pointer to the client while a camera button is held.
+    ///
+    /// Roblox's Android cursor is drawn by the engine and can remain centred
+    /// while the host pointer continues moving outside the window. X11 has no
+    /// implicit Android-style capture, so without this explicit grab a right
+    /// drag controls the camera and the next click lands on another program.
+    fn set_pointer_capture(&self, capture: bool) {
+        if capture {
+            if self.pointer_grabbed.load(Ordering::Acquire) {
+                return;
+            }
+            const OWNER_EVENTS: c_int = 1;
+            const BUTTON_PRESS_MASK: c_uint = 1 << 2;
+            const BUTTON_RELEASE_MASK: c_uint = 1 << 3;
+            const POINTER_MOTION_MASK: c_uint = 1 << 6;
+            const GRAB_MODE_ASYNC: c_int = 1;
+            const CURRENT_TIME: c_ulong = 0;
+            // SAFETY: the display and window are live. `confine_to` is the
+            // same window receiving the events, no cursor override is made,
+            // and asynchronous modes ensure Xlib never blocks this pump.
+            let result = unsafe {
+                (self.xlib.grab_pointer)(
+                    self.display,
+                    self.window,
+                    OWNER_EVENTS,
+                    BUTTON_PRESS_MASK | BUTTON_RELEASE_MASK | POINTER_MOTION_MASK,
+                    GRAB_MODE_ASYNC,
+                    GRAB_MODE_ASYNC,
+                    self.window,
+                    0,
+                    CURRENT_TIME,
+                )
+            };
+            // `GrabSuccess` is zero. A compositor or another client may own a
+            // grab already; report that rather than claiming capture occurred.
+            if result == 0 {
+                self.pointer_grabbed.store(true, Ordering::Release);
+                if super::input::trace_mouse() {
+                    eprintln!("[cordial] X11 pointer captured for camera drag");
+                }
+            } else {
+                eprintln!("[cordial] X11 pointer capture was refused (XGrabPointer={result})");
+            }
+        } else if self.pointer_grabbed.swap(false, Ordering::AcqRel) {
+            const CURRENT_TIME: c_ulong = 0;
+            // SAFETY: this client owns the grab recorded by `pointer_grabbed`.
+            unsafe {
+                (self.xlib.ungrab_pointer)(self.display, CURRENT_TIME);
+                (self.xlib.flush)(self.display);
+            }
+            super::input::reset_mouse_delta();
+            if super::input::trace_mouse() {
+                eprintln!("[cordial] X11 pointer capture released");
+            }
+        }
+    }
+
     fn dispatch_button(&self, handle: i64, ev: &XInputEvent, press: bool) {
         // The wheel first. X11 sends a press *and* a release for every detent,
         // and a wheel has no "released" state to report — sending both would
@@ -887,6 +961,7 @@ impl HostWindow {
         let mut state = self.input.lock().unwrap_or_else(|e| e.into_inner());
         let now = state.clock.elapsed().as_millis() as i64;
 
+        let camera_button = android_button == BUTTON_SECONDARY || android_button == BUTTON_TERTIARY;
         if press {
             if state.buttons == 0 {
                 state.down_time_ms = now;
@@ -899,12 +974,19 @@ impl HostWindow {
             // ACTION_BUTTON_PRESS names which button did it.
             deliver_touch(handle, ACTION_DOWN, x, y, buttons, 0, now, down_time);
             deliver_touch(handle, ACTION_BUTTON_PRESS, x, y, buttons, android_button, now, down_time);
+            if camera_button {
+                self.set_pointer_capture(true);
+            }
         } else {
             state.buttons &= !android_button;
             let (buttons, down_time) = (state.buttons, state.down_time_ms);
             drop(state);
             deliver_touch(handle, ACTION_BUTTON_RELEASE, x, y, buttons, android_button, now, down_time);
             deliver_touch(handle, ACTION_UP, x, y, buttons, 0, now, down_time);
+            const CAMERA_BUTTONS: i32 = BUTTON_SECONDARY | BUTTON_TERTIARY;
+            if buttons & CAMERA_BUTTONS == 0 {
+                self.set_pointer_capture(false);
+            }
         }
 
         // The interface's own input path, alongside AGDK's — and every button,
@@ -953,6 +1035,22 @@ impl HostWindow {
         let unicode = if n > 0 { text[0] as i32 } else { 0 };
         let meta = android_meta_state(ev.state);
         let now = self.now_ms();
+
+        // Independent escape hatch for an X11 grab. Button-up remains the
+        // ordinary release, but a game must never be able to leave the user's
+        // desktop pointer confined if its own input state gets stuck.
+        if down && keysym == 0xff1b {
+            self.set_pointer_capture(false);
+        }
+
+        // XK_F11. Like the Wayland game window, this backend is not the GTK
+        // launcher and therefore cannot inherit its `win.fullscreen` action.
+        if keysym == 0xffc8 {
+            if down {
+                self.set_fullscreen(!self.fullscreen.load(Ordering::Relaxed));
+            }
+            return;
+        }
 
         if super::input::trace_text() {
             // `text=` is a length unless `CORDIAL_TRACE_TEXT_SHOW_PASSWORDS=1`:
@@ -1040,6 +1138,7 @@ impl HostWindow {
                 let _ =
                     cordial_linker_sys::game_activity::text_input(handle, &contents, caret, caret);
                 pass_text(which, &contents, caret);
+                deliver_surface_redraw(handle);
             }
         }
     }
@@ -1050,8 +1149,10 @@ impl HostWindow {
         // Before draining input: if the engine has opened or closed an editor
         // since last time, acknowledge it. Cheap — an atomic load and a
         // comparison unless something actually changed.
-        let (gw, gh, _) = self.geometry();
-        report_keyboard_state((gw, gh));
+        if super::input::keyboard_report_enabled() {
+            let (gw, gh, _) = self.geometry();
+            report_keyboard_state((gw, gh));
+        }
 
         let mut pfd = PollFd { fd: self.conn_fd, events: POLLIN, revents: 0 };
         // SAFETY: `pfd` is a live array of length 1; a 0ms timeout makes this a
@@ -1417,6 +1518,8 @@ mod tests {
         for b in 1..=3 {
             assert!(x11_button_to_wheel(b).is_none(), "button {b} is a click, not the wheel");
         }
+        assert_eq!(x11_button_to_android(8), Some(BUTTON_BACK));
+        assert_eq!(x11_button_to_android(9), Some(BUTTON_FORWARD));
         // Up is positive, matching MotionEvent.AXIS_VSCROLL, and one X11
         // pseudo-button is exactly one detent — no conversion to get wrong.
         assert_eq!(x11_button_to_wheel(4), Some((0.0, 1.0)));

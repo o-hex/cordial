@@ -184,6 +184,24 @@ cargo test --workspace
 
 Both must pass. Run them; do not assume.
 
+**Two builds must never share one `target/`, and this is not a tidiness rule.**
+On 2026-08-24 an agent working in a `git worktree` pointed `CARGO_TARGET_DIR` at
+the main checkout's `target/` to save disk while the main session was building
+the same crates. What came out was two `cordial-linker-sys` rlibs with different
+hashes, **neither containing a symbol that was plainly in the source**, and a
+link that failed on an undefined reference to it. From the other side of the
+same collision the main session saw `android_classes.cpp.o` timestamped six
+minutes older than `android_classes.cpp` and concluded that `build.rs` had
+stopped watching `native/`, which it had not.
+
+That failure mode is the worst one available here, because it looks exactly like
+code that compiled and had no effect -- the same sentence `build.rs` uses to
+explain why it watches the whole native tree. Give a worktree its own
+`CARGO_TARGET_DIR` on disk and delete it afterwards. If a symbol you can see in
+the source is undefined at link time, check the `.o` timestamp under
+`target/*/build/cordial-linker-sys-*/out/build` and check whether anything else
+was building, before believing anything about the build script.
+
 Running the client needs an APK the user supplies — Cordial ships none. On this
 machine it is at
 `~/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk`,

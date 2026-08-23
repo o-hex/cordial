@@ -198,7 +198,7 @@
 //! for Cordial before doing it.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use libadwaita as adw;
@@ -525,6 +525,32 @@ const WL_COMPOSITOR_CREATE_SURFACE: u32 = 0;
 const WL_SURFACE_COMMIT: u32 = 6;
 const WL_SEAT_GET_POINTER: u32 = 0;
 const WL_SEAT_GET_KEYBOARD: u32 = 1;
+
+/// `wl_seat.capabilities` bits.
+const WL_SEAT_CAPABILITY_POINTER: u32 = 1;
+const WL_SEAT_CAPABILITY_KEYBOARD: u32 = 2;
+
+/// What the seat said it has, filled in by [`seat_capabilities`] before either
+/// device is asked for.
+static SEAT_CAPS: AtomicU32 = AtomicU32::new(0);
+
+/// `wl_seat`'s events. Two slots, not one: `name` arrives at version 2 and the
+/// seat is bound at 1, so it should never fire -- but the module doc records a
+/// freeze caused by a listener with fewer slots than the compositor had events
+/// for, and an unused slot costs nothing while a missing one is a wild jump.
+#[repr(C)]
+struct SeatListener {
+    capabilities: unsafe extern "C" fn(*mut c_void, *mut c_void, u32),
+    name: unsafe extern "C" fn(*mut c_void, *mut c_void, *const std::ffi::c_char),
+}
+
+unsafe extern "C" fn seat_capabilities(_data: *mut c_void, _seat: *mut c_void, caps: u32) {
+    SEAT_CAPS.store(caps, Ordering::SeqCst);
+}
+
+unsafe extern "C" fn seat_name(_data: *mut c_void, _seat: *mut c_void, _name: *const std::ffi::c_char) {}
+
+static SEAT_LISTENER: SeatListener = SeatListener { capabilities: seat_capabilities, name: seat_name };
 const WL_POINTER_SET_CURSOR: u32 = 0;
 
 // --------------------------------------------------------------- dlopen'd API
@@ -1255,6 +1281,32 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     if seat.is_null() {
         return Err("binding wl_seat failed".into());
     }
+    // **Ask the seat what it has before asking it for anything.**
+    //
+    // `wl_seat.get_pointer` on a seat with no pointer capability is a protocol
+    // error -- `missing_capability` -- and the compositor answers it by
+    // disconnecting the client, not by returning null. Every desktop
+    // compositor's seat has both a pointer and a keyboard, so this went
+    // unnoticed until Cordial was run under a compositor whose seat has
+    // neither: wlroots' headless backend has no libinput behind it and
+    // advertises zero capabilities. The client died on startup with
+    //
+    //     wl_seat#56: error 0: wl_seat.get_pointer called when no pointer
+    //     capability has existed
+    //     Gdk-Message: Error flushing display: Protocol error
+    //
+    // which is the whole reason headless runs were impossible. The roundtrip is
+    // what makes the answer usable here rather than three frames later.
+    unsafe {
+        (wl.add_listener)(
+            seat,
+            &SEAT_LISTENER as *const SeatListener as *const c_void,
+            std::ptr::null_mut(),
+        );
+        if (wl.roundtrip)(display) < 0 {
+            return Err("wl_display_roundtrip failed while asking wl_seat for its capabilities".into());
+        }
+    }
 
     // The version asked for comes from the table, not from a literal repeated
     // here. Those two numbers being allowed to disagree is the whole of the
@@ -1322,11 +1374,29 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     // and keyboard on this seat; both clients see every event, and
     // `pointer_enter` below is what keeps this one from acting on the ones
     // aimed at the header bar.
-    let pointer = unsafe {
-        (wl.marshal_flags)(seat, WL_SEAT_GET_POINTER, wl.pointer_interface, 1, 0, std::ptr::null_mut::<c_void>())
+    //
+    // Both are null when the seat does not advertise them, which the rest of
+    // this file already copes with -- every use downstream is behind an
+    // `is_null` guard, because a compositor can withdraw a capability at
+    // runtime and both were already optional in practice. A headless seat
+    // therefore loses input and keeps rendering, which is exactly what an
+    // agent's run wants and is a great deal better than dying at startup.
+    let caps = SEAT_CAPS.load(Ordering::SeqCst);
+    let pointer = if caps & WL_SEAT_CAPABILITY_POINTER != 0 {
+        unsafe {
+            (wl.marshal_flags)(seat, WL_SEAT_GET_POINTER, wl.pointer_interface, 1, 0, std::ptr::null_mut::<c_void>())
+        }
+    } else {
+        eprintln!("[android] wayland: the seat advertises no pointer; running without one");
+        std::ptr::null_mut()
     };
-    let keyboard = unsafe {
-        (wl.marshal_flags)(seat, WL_SEAT_GET_KEYBOARD, wl.keyboard_interface, 1, 0, std::ptr::null_mut::<c_void>())
+    let keyboard = if caps & WL_SEAT_CAPABILITY_KEYBOARD != 0 {
+        unsafe {
+            (wl.marshal_flags)(seat, WL_SEAT_GET_KEYBOARD, wl.keyboard_interface, 1, 0, std::ptr::null_mut::<c_void>())
+        }
+    } else {
+        eprintln!("[android] wayland: the seat advertises no keyboard; running without one");
+        std::ptr::null_mut()
     };
 
     // ---- pointer capture. Both halves are optional and independent of each

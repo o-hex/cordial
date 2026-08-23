@@ -142,6 +142,49 @@ fallback is a dedicated overlay subsurface placed *above* the engine and painted
 by Cordial rather than by GTK — which serves toasts and plugin panels but not a
 WebKit view, and that is a materially worse outcome worth knowing early.
 
+### What a plugin declares, and the escape hatch that is not a channel
+
+A plugin never receives a `wl_surface`, a GL context, or a handle to anything
+Cordial composites. It declares content and Cordial draws it, which is ADR-007
+applied to pixels rather than to sockets. The vocabulary is three things:
+
+1. **A toast** — text, a position, a duration. The server-location indicator is
+   this and nothing more.
+2. **A panel** — the declarative widget set ADR-020 already defines for
+   preferences, rendered somewhere other than the settings window.
+3. **An image** — the plugin renders offscreen and hands over a buffer.
+
+The third exists because refusing it makes the other two a cage. A plugin
+wanting a chart, a minimap or a custom readout has no way to express it
+declaratively, and a design that answers "you cannot" invites somebody to
+propose a surface capability again in six months. **Pixels are content; a
+surface is a channel**, and handing over a finished image keeps every property
+that matters:
+
+- it cannot wedge the compositor, because the plugin never commits and never
+  blocks — a slow plugin yields a stale frame, not a hung client;
+- it is droppable, because Cordial owns the frame budget and can skip a
+  plugin's buffer while the engine is busy, which is impossible if the plugin
+  holds the surface;
+- it is bounded, because a size and a refresh cap are enforceable on a handover
+  and unenforceable on somebody else's surface.
+
+**Two constraints ride with all three, and they are not negotiable.**
+
+**Plugin content is always visually attributed.** A plugin's pixels are visibly
+a plugin's — Cordial draws the frame around them, and a plugin cannot suppress
+it. **Plugin content can never cover Cordial's own chrome and can never go
+fullscreen.**
+
+These are the constraints browsers put on extension UI, for the reason that
+applies here with more force: anything composited over Roblox can be drawn to
+look like Roblox. A plugin able to paint arbitrary unattributed pixels over the
+canvas can paint a convincing sign-in prompt, and this project keeps the user's
+`.ROBLOSECURITY` in the desktop secret service. Attribution and the chrome
+exclusion are what make an overlay a feature rather than a phishing surface, and
+they must be enforced by the compositing code rather than requested of the
+plugin.
+
 A compositor-level screenshot can now answer all three, which was impossible
 until `a4abe15`: `--headless` runs the client under a wlroots compositor we
 control, and `wlr-screencopy` will photograph the composited result. The

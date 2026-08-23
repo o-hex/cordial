@@ -1687,7 +1687,17 @@ fn build_plugins_page(
     let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
 
     // ---- the master switch ------------------------------------------------
-    let master_group = adw::PreferencesGroup::new();
+    // Named on the page, because permissions are per profile and the page gave
+    // no sign of which one it meant. Somebody who allowed FPS Flex everything
+    // it asked for under one profile, then opened this window under another,
+    // was told "you have not allowed it to do anything yet" -- true, and
+    // indistinguishable from the grant having failed. Grants stopped being
+    // global on purpose; saying so costs one line.
+    let master_group = adw::PreferencesGroup::builder()
+        .description(format!(
+            "What you allow here applies to the {profile_name} profile. Other profiles decide separately."
+        ))
+        .build();
     let master = adw::SwitchRow::builder()
         .title("Use Plugins")
         // GNOME's register, and the same honesty: a consequence the user can

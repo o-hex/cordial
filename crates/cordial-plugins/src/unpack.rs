@@ -399,15 +399,18 @@ fn check_manifest(dir: &Path, entry: &Entry) -> Result<(), Refusal> {
 ///
 /// Separate from [`install`] so the refusals can be tested against a directory
 /// and a handmade archive, with no index entry and no hash to satisfy.
-pub fn extract_into(archive: &[u8], dest: &Path, limits: Limits) -> Result<(), Refusal> {
+pub fn extract_into(archive_bytes: &[u8], dest: &Path, limits: Limits) -> Result<(), Refusal> {
     let decoder =
-        zstd::stream::read::Decoder::new(io::Cursor::new(archive)).map_err(io_err)?;
+        zstd::stream::read::Decoder::new(io::Cursor::new(archive_bytes)).map_err(io_err)?;
     // A second, independent cap on the decompressed stream. The per-entry
     // budget below is computed from what each header declares, and this one is
     // computed from what actually came out of the decompressor, so an archive
     // whose headers disagree with its contents runs into one or the other.
     let mut capped = Capped::new(decoder, limits.max_total_bytes.saturating_add(SLACK));
     let mut archive = tar::Archive::new(&mut capped);
+
+    // Decided before a byte is written, from its own pass over the archive.
+    let prefix = wrapper_dir(archive_bytes, limits);
 
     let mut count = 0usize;
     let mut written = 0u64;
@@ -447,6 +450,13 @@ pub fn extract_into(archive: &[u8], dest: &Path, limits: Limits) -> Result<(), R
         }
 
         let relative = safe_relative(&declared)?;
+        // Applied after sanitising, never before: the traversal, absolute-path
+        // and escape checks all run against what the archive actually declared,
+        // and stripping only removes a component that survived them.
+        let Some(relative) = strip_prefix(&relative, prefix.as_deref()) else {
+            // The prefix directory's own entry. Nothing left to write.
+            continue;
+        };
         let out = dest.join(&relative);
         // Redundant given `safe_relative`, which only ever emits ordinary
         // components — and kept anyway. It is the check that still holds if
@@ -498,6 +508,76 @@ pub fn extract_into(archive: &[u8], dest: &Path, limits: Limits) -> Result<(), R
 /// end. Generous rather than exact — this cap is a backstop, and the per-entry
 /// budget is the one that gives the precise answer.
 const SLACK: u64 = 8 * 1024 * 1024;
+
+/// The single directory every entry sits inside, when stripping it is the only
+/// thing standing between this archive and a valid plugin.
+///
+/// `tar -czf x.tar.zst fps-flex/` produces `fps-flex/plugin.json`, and so does
+/// every tarball GitHub generates for a tag. Refusing those with "the archive
+/// has no plugin.json at its root" is technically accurate and useless: the
+/// manifest is right there, one level down, and the person who packed it did
+/// the obvious thing. So one wrapper directory is stripped, the way
+/// `tar --strip-components=1` and every package manager that consumes a GitHub
+/// tarball does.
+///
+/// **The rule is deliberately narrow, so that no archive which installs today
+/// can change behaviour.** All three must hold:
+///
+/// - there is no `plugin.json` at the archive's own root, so this archive is
+///   currently refused outright;
+/// - every entry shares one first component, so nothing is being merged and no
+///   file can collide with another that was previously distinct;
+/// - after stripping it, a `plugin.json` appears at the root, so the strip
+///   actually produces a plugin rather than burrowing hopefully.
+///
+/// Anything else returns `None` and the caller refuses exactly as before.
+/// Reading the archive twice is affordable because it is already wholly in
+/// memory and capped; the alternative is deciding the layout while half of it
+/// is on disk.
+fn wrapper_dir(archive_bytes: &[u8], limits: Limits) -> Option<PathBuf> {
+    let decoder = zstd::stream::read::Decoder::new(io::Cursor::new(archive_bytes)).ok()?;
+    let mut capped = Capped::new(decoder, limits.max_total_bytes.saturating_add(SLACK));
+    let mut archive = tar::Archive::new(&mut capped);
+
+    let mut first: Option<PathBuf> = None;
+    let mut inner_manifest = false;
+    let mut count = 0usize;
+
+    for entry in archive.entries().ok()? {
+        let entry = entry.ok()?;
+        count += 1;
+        if count > limits.max_entries {
+            return None;
+        }
+        // Sanitised here too. A path this rejects is one the extraction is
+        // about to refuse anyway, and it must not influence the prefix.
+        let relative = safe_relative(&entry.path().ok()?).ok()?;
+
+        if relative == Path::new("plugin.json") {
+            return None; // Already a valid root. Nothing to strip.
+        }
+
+        let mut components = relative.components();
+        let head = PathBuf::from(components.next()?.as_os_str());
+        match &first {
+            None => first = Some(head),
+            Some(seen) if *seen == head => {}
+            Some(_) => return None, // More than one top-level name.
+        }
+        if components.as_path() == Path::new("plugin.json") {
+            inner_manifest = true;
+        }
+    }
+
+    inner_manifest.then_some(first?)
+}
+
+/// `relative` with `prefix` removed, or `None` if nothing would be left.
+fn strip_prefix(relative: &Path, prefix: Option<&Path>) -> Option<PathBuf> {
+    let Some(prefix) = prefix else { return Some(relative.to_path_buf()) };
+    let stripped = relative.strip_prefix(prefix).unwrap_or(relative);
+    (!stripped.as_os_str().is_empty()).then(|| stripped.to_path_buf())
+}
 
 /// The relative path an entry may be written to, or why it may not.
 fn safe_relative(path: &Path) -> Result<PathBuf, Refusal> {
@@ -616,6 +696,15 @@ mod tests {
         append_file(&mut b, "plugin.json", manifest.as_bytes(), 0o644);
         append_file(&mut b, "main.ts", b"console.log('hello');\n", 0o644);
         compress(b.into_inner().unwrap())
+    }
+
+    fn append_dir(b: &mut tar::Builder<Vec<u8>>, path: &str) {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(0);
+        h.set_mode(0o755);
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_cksum();
+        b.append_data(&mut h, path, io::empty()).unwrap();
     }
 
     fn append_file(b: &mut tar::Builder<Vec<u8>>, path: &str, data: &[u8], mode: u32) {
@@ -927,6 +1016,83 @@ mod tests {
             "an upgrade must not leave the previous version's files behind"
         );
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "and no staging left over");
+    }
+
+    #[test]
+    fn a_single_wrapper_directory_is_stripped() {
+        // `tar -czf x.tar.zst fps-flex/` and every GitHub tag tarball look like
+        // this. Refusing them was accurate and useless -- reported as "plugin
+        // installation is broken, it says plugin root not found, but it has a
+        // root file".
+        let mut b = tar::Builder::new(Vec::new());
+        append_dir(&mut b, "fps-flex/");
+        append_file(&mut b, "fps-flex/plugin.json", MANIFEST.as_bytes(), 0o644);
+        append_file(&mut b, "fps-flex/main.ts", b"export default {}", 0o644);
+        let archive = compress(b.into_inner().unwrap());
+
+        let root = scratch("wrapper-stripped");
+        let (_manifest, dir) = install_local(&archive, &root).expect("one wrapper is stripped");
+        assert!(dir.join("plugin.json").is_file(), "the manifest lands at the root");
+        assert!(dir.join("main.ts").is_file(), "and so does everything beside it");
+        assert!(!dir.join("fps-flex").exists(), "the wrapper itself is gone");
+    }
+
+    #[test]
+    fn a_root_manifest_is_never_second_guessed() {
+        // The guard that keeps this change from touching any archive that
+        // already worked: a root plugin.json means no stripping is considered
+        // at all, even where a sibling directory shares the only other name.
+        let mut b = tar::Builder::new(Vec::new());
+        append_file(&mut b, "plugin.json", MANIFEST.as_bytes(), 0o644);
+        append_file(&mut b, "vendor/thing.ts", b"export default {}", 0o644);
+        let archive = compress(b.into_inner().unwrap());
+
+        let root = scratch("root-manifest-untouched");
+        let (_m, dir) = install_local(&archive, &root).expect("installs as before");
+        assert!(dir.join("plugin.json").is_file());
+        assert!(dir.join("vendor/thing.ts").is_file(), "the subdirectory survives intact");
+    }
+
+    #[test]
+    fn two_top_level_names_are_not_merged() {
+        // Stripping here would silently fuse two trees, and a file from one
+        // could take the path of a file from the other. Refuse instead.
+        let mut b = tar::Builder::new(Vec::new());
+        append_file(&mut b, "one/plugin.json", MANIFEST.as_bytes(), 0o644);
+        append_file(&mut b, "two/main.ts", b"export default {}", 0o644);
+        let archive = compress(b.into_inner().unwrap());
+
+        let root = scratch("two-tops");
+        assert!(matches!(install_local(&archive, &root), Err(Refusal::NoManifest)));
+    }
+
+    #[test]
+    fn burrowing_further_than_one_level_is_refused() {
+        // One wrapper, not "keep going until a manifest turns up".
+        let mut b = tar::Builder::new(Vec::new());
+        append_file(&mut b, "a/b/plugin.json", MANIFEST.as_bytes(), 0o644);
+        let archive = compress(b.into_inner().unwrap());
+
+        let root = scratch("too-deep");
+        assert!(matches!(install_local(&archive, &root), Err(Refusal::NoManifest)));
+    }
+
+    #[test]
+    fn a_wrapper_does_not_smuggle_a_hostile_entry_past_the_checks() {
+        // The refusals run on the declared path, before any stripping, so a
+        // wrapper cannot be used to launder one.
+        let mut b = tar::Builder::new(Vec::new());
+        append_file(&mut b, "fps-flex/plugin.json", MANIFEST.as_bytes(), 0o644);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(0);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_link_name("/etc/passwd").unwrap();
+        b.append_data(&mut h, "fps-flex/sneaky.ts", std::io::empty()).unwrap();
+        let archive = compress(b.into_inner().unwrap());
+
+        let root = scratch("wrapper-symlink");
+        assert!(matches!(install_local(&archive, &root), Err(Refusal::Symlink(_))));
     }
 
     #[test]

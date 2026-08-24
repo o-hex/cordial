@@ -40,6 +40,43 @@ had looked in `appData/`.
 
 # What is blocking
 
+## 0. Why typed text is invisible: the engine sends no geometry, 2026-08-24
+
+**Traced, not inferred.** `showKeyboard`'s fourth argument is the
+`NativeTextBoxInfo` saying where the box is and how its text is drawn -- Android
+places a real `EditText` from it, because the engine does not paint a focused
+box's contents itself. For every box reachable from the app shell the engine
+passes **null**:
+
+    [cordial] showKeyboard: info=NULL spec_known=n/a
+    [cordial] textbox spec unavailable
+
+`nativeGetTextBoxInfo` is the same fact from the other side: exported, callable,
+returns null, three runs. So there is no geometry to be had from any engine call
+known here, and `android_classes.cpp`'s claim that Cordial "dropped" the spec
+was wrong. Nothing is dropped; nothing arrives.
+
+That settles the shape of the answer. **The overlay is not a workaround, it is
+the platform obligation** -- and Sober's tracker says the same from outside: on
+#99 a maintainer confirms the same custom TextBox *"works on the Android client
+... but not on Sober"*. Same engine, same build. It works there because Android
+puts a real widget up; it fails on both desktop runtimes because neither did.
+
+Placement stays open and is bounded by the same finding: with a null spec there
+is nothing to place against, so the editor goes where an on-screen keyboard's
+own text would sit. **Whether an in-game `TextBox` supplies a real spec where an
+app-shell React input does not is untested**, and it decides whether placement
+is fixable in general or only for some boxes. That is the next thing to measure.
+
+Two smaller things found on the way. The `<init>` hook for `NativeTextBoxInfo`
+had the wrong signature -- `--dump-classes` shows libjnivm expects a
+`shared_ptr<java::lang::Class>` before the five floats and ours lacked it, so it
+could never have matched; corrected, and marked `INFERRED` because with a null
+`info` it cannot be observed firing. And **`CORDIAL_SCRIPT` does nothing without
+`CORDIAL_INSTR=1`**: four runs were read as "the click missed the button" before
+that was noticed, and only a control with the change reverted -- which behaved
+identically -- kept it from being blamed on the change under test.
+
 ## 0. The freeze has a reliable reproduction, 2026-08-24
 
 **It stalls at `StartupController stage = 2`, immediately after `sync cookies

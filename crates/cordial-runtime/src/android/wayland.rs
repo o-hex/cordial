@@ -2613,18 +2613,61 @@ impl WaylandWindow {
         }
     }
 
+/// Whether to constrain the GTK toplevel rather than the engine's subsurface.
+///
+/// KWin only, and only because of KDE bug 463088 -- see `lock_pointer`. On
+/// every other compositor the subsurface is the surface that actually holds
+/// pointer focus over the canvas, and constraining anything else is a lock that
+/// is granted and never activates.
+fn constrain_toplevel() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        match std::env::var("CORDIAL_POINTER_LOCK_SURFACE").as_deref() {
+            Ok("toplevel") => return true,
+            Ok("canvas") => return false,
+            _ => {}
+        }
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_ascii_lowercase();
+        let session = std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_ascii_lowercase();
+        desktop.contains("kde") || desktop.contains("plasma")
+            || session.contains("kde") || session.contains("plasma")
+    })
+}
+
     fn lock_pointer(&self) {
         let mut slot = self.locked_pointer.lock().unwrap_or_else(|e| e.into_inner());
         if !slot.is_null() {
             return;
         }
-        // Constrain the GTK toplevel, not the engine's rendering subsurface.
-        // KWin acknowledges constraints made against a subsurface but, on
-        // affected versions, still lets the physical cursor leave it (KDE bug
-        // 463088). Native game windows such as Sober's SDL3 window constrain
-        // their xdg_toplevel surface and do not hit that compositor path. The
-        // parent covers this whole window, including the engine subsurface, so
-        // it is also the correct user-visible boundary for a camera capture.
+        // **Which surface to constrain is compositor-dependent, and getting it
+        // wrong silently does nothing.**
+        //
+        // `zwp_pointer_constraints` says a lock becomes *active* when the
+        // constrained surface has pointer focus. Over the canvas that is the
+        // engine's subsurface, not the toplevel -- so constraining the parent
+        // leaves mutter with nothing to activate, and the lock never takes.
+        // Reported as "his contribution to cursor lock broke my cursor lock" on
+        // GNOME, where the KWin path below was being taken unconditionally.
+        //
+        // The KWin workaround it came from is real and stays: KWin acknowledges
+        // a constraint made against a subsurface and, on affected versions,
+        // still lets the physical cursor leave it (KDE bug 463088). Native game
+        // windows such as Sober's SDL3 window constrain their xdg_toplevel and
+        // do not hit that path.
+        //
+        // So the two halves of 3d67e59 are separated, because only one of them
+        // was ever about the surface. Using **GDK's** pointer rather than
+        // Cordial's own is the half that fixed the escape -- Cordial's separate
+        // event pointer can be acknowledged as locked while the real cursor,
+        // which GDK owns, stays free -- and it applies everywhere. Constraining
+        // the **toplevel** is the half that is a KWin bug workaround, and it is
+        // now gated to KWin instead of imposed on every compositor.
+        //
+        // `CORDIAL_POINTER_LOCK_SURFACE=toplevel|canvas` overrules the guess,
+        // because a compositor list in a binary goes stale and the person
+        // hitting it should not need a rebuild.
+        let on_toplevel = Self::constrain_toplevel();
+        let target = if on_toplevel { self.parent_surface } else { self.surface };
         //
         // SAFETY: `pointer_constraints` and `parent_surface` are live proxies,
         // and `capture_pointer` is GDK's live borrowed pointer on this
@@ -2638,7 +2681,7 @@ impl WaylandWindow {
                 1,
                 0,
                 std::ptr::null_mut::<c_void>(),
-                self.parent_surface,
+                target,
                 self.capture_pointer,
                 std::ptr::null_mut::<c_void>(),
                 POINTER_CONSTRAINT_LIFETIME_PERSISTENT,

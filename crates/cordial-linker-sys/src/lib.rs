@@ -1818,6 +1818,9 @@ pub mod game_activity {
         fn cordial_textbox_generation() -> c_int;
         fn cordial_textbox_text(buf: *mut c_char, n: c_int) -> c_int;
         fn cordial_textbox_info(out: *mut RawTextBoxInfo) -> c_int;
+        fn cordial_textbox_info_now(
+            f: *mut c_void, out: *mut RawTextBoxInfo, err: *mut c_char, n: usize,
+        ) -> c_int;
         fn cordial_games_loaded() -> u32;
         fn cordial_last_place() -> i64;
         fn cordial_game_activity_window_focus(
@@ -2006,6 +2009,39 @@ pub mod game_activity {
     pub fn last_place() -> i64 {
         // SAFETY: a plain atomic load on the C++ side.
         unsafe { cordial_last_place() }
+    }
+
+    /// `NativeGLInterface.nativeGetTextBoxInfo()` — the focused box's geometry
+    /// asked for now, rather than remembered from `showKeyboard`.
+    ///
+    /// **Not a replacement for [`focused_textbox_info`], a second opinion when
+    /// that one is unusable.** The engine volunteers a spec at focus time and
+    /// sometimes volunteers it too early: Roblox's search modal is focused with
+    /// `w=0 h=0` and this call returns real geometry for the same box about a
+    /// second later. It is also null for the whole of the sign-in page, so
+    /// `Ok(None)` is an ordinary answer and not a failure.
+    ///
+    /// `native` is `Java_com_roblox_engine_jni_NativeGLInterface_nativeGetTextBoxInfo`,
+    /// resolved by the loader. Calling this costs a JNI call and a Java object,
+    /// so the caller owns the decision about how often — see `sync_text_overlay`.
+    pub fn textbox_info_now(native: *mut c_void) -> Result<Option<RawTextBoxInfo>, String> {
+        let mut info = RawTextBoxInfo::default();
+        let mut err = vec![0u8; 512];
+        // SAFETY: `info` is a live, fully initialised mirror of the C++ struct
+        // and `err` outlives the call; both are only written into.
+        let rc = unsafe {
+            cordial_textbox_info_now(
+                native,
+                &mut info as *mut RawTextBoxInfo,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        match rc {
+            1 => Ok(Some(info)),
+            0 => Ok(None),
+            _ => Err(take_err(err)),
+        }
     }
 
     pub fn focused_textbox_info() -> Option<RawTextBoxInfo> {

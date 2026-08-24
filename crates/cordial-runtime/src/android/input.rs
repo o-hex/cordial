@@ -320,6 +320,23 @@ static GET_MOUSE_LOCKED_CENTER: std::sync::atomic::AtomicPtr<c_void> =
 /// Focus generation the keyboard state was last reported for.
 static KEYBOARD_REPORTED: Mutex<Option<u32>> = Mutex::new(None);
 
+/// `NativeGLInterface.nativeGetTextBoxInfo()`, the engine's own answer to where
+/// the focused box is. Read rather than written, like
+/// [`GET_MOUSE_LOCKED_CENTER`] and unlike everything above it, and resolved
+/// separately for the same reason.
+static GET_TEXTBOX_INFO: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+pub fn set_textbox_info_native(native: *mut c_void) {
+    GET_TEXTBOX_INFO.store(native, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Null when this build does not export it, in which case a caller has only
+/// the spec `showKeyboard` volunteered and its own fallback.
+pub fn textbox_info_native() -> *mut c_void {
+    GET_TEXTBOX_INFO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn set_input_natives(
     mouse_move: *mut c_void,

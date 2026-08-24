@@ -10,6 +10,73 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## Text entry: where the editor goes, 2026-08-25
+
+**Solved and verified.** A focused Roblox TextBox gets an editor drawn on the
+box itself, with the box's own font size and colour, and a caret in the right
+place. Four boxes checked by composited screenshot on 2026-08-25: the home
+search bar, the search modal it opens, and the sign-in username and password
+fields. The password field masks, and nothing typed appears in the log.
+
+Three sources of geometry, in this order, in `sync_text_overlay`:
+
+1. **`showKeyboard`'s NativeTextBoxInfo.** Exact and free. Answers for the home
+   search bar and both sign-in fields.
+2. **`nativeGetTextBoxInfo`, polled at 10 Hz** while the first is unusable.
+   Answers for the search modal, which is focused with `x=0 y=0 w=0 h=0`
+   because the engine builds the spec before the modal has laid out, then keeps
+   a correct one internally and never re-offers it. The getter returns
+   `x=332 y=10 w=592 h=36` about a second later -- twice out of two probe runs
+   with identical numbers, then twice more out of two full check runs.
+   **A zero height is the trap:** on the pump tick right after focus it answers
+   `x=596 y=10 w=42 h=0`, a sliver of the header bar caught mid-animation, with
+   non-zero x, y and width to make it look like an answer.
+3. **A placed bar Cordial positions itself.** Now a safety net nothing lands
+   in, and untested as of this date. Kept deliberately; see the comment.
+
+### Two claims this falsified, both of which had been written down
+
+- *"On the sign-in page neither fires."* False since the `<init>` hook was
+  corrected to the dex's fifteen-argument signature. The spec was always being
+  constructed; Cordial was not capturing it, so `spec_known` was false and the
+  page looked as though it volunteered nothing. The sentence outlived the fix.
+- *"`nativeGetTextBoxInfo` ... returns null there, measured over three runs"*,
+  read as a general claim about the call. It was measured on the sign-in page
+  only, before that hook fix, and has not been re-run since -- `showKeyboard`
+  now answers first there, so the getter is never reached. History, not a
+  current reading.
+
+Both are corrected in `crates/cordial-runtime/src/android/wayland.rs`.
+
+### Building this
+
+Needs the host toolchain, not the container:
+`PATH=/home/linuxbrew/.linuxbrew/bin:$PATH cargo build --release`. `target/`'s
+CMake cache is configured against that clang, and touching `native/` inside
+`distrobox enter cordial` forces a reconfigure that then fails to find its
+archiver. `tools/text-entry-check.sh` still launches the client inside the
+container, because `cage` is only there.
+
+### The decision that supersedes the current editor
+
+**The text editor should be a real GTK text field, not a `GtkLabel` mirroring
+our own buffer.** The user's words on 2026-08-25: *"The text field is so weird,
+i want to use gtk field because our own handling is ultra awkward."* That
+outranks the analysis recorded in commit `4c43e4e`, which argued for keeping
+the Label because `zwp_text_input_v3` already gives us IME at the protocol
+level and a `GtkText` would take keyboard focus away from the runtime's own
+`wl_keyboard`. That argument is about implementation cost; it is not a reason
+to keep an editor that is awkward to use, and the awkwardness is the point.
+
+Whoever picks this up: the hard part is not the widget. It is that
+`crates/cordial-runtime/src/android/wayland.rs` binds its own `wl_keyboard` and
+implements `zwp_text_input_v3` itself, and `input.rs` owns the text buffer that
+`syncTextboxTextAndCursorPosition2` is driven from. A `GtkText` owns a buffer
+and wants focus, so the two have to be reconciled rather than stacked. Note
+that Android's own `EditText` *is* the authoritative buffer and syncs to the
+engine, so handing authority to the widget is closer to the platform contract
+than what exists today, not further from it.
+
 ## The one rule
 
 **Grep the capture before disassembling anything.**

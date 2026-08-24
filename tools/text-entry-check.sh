@@ -23,7 +23,9 @@
 #
 #   1. the app shell reaches a screen that has a search box
 #   2. clicking it focuses a TextBox
-#   3. `showKeyboard` delivers a NativeTextBoxInfo -- not null, and not zeroed
+#   3. `showKeyboard` delivers a NativeTextBoxInfo, and the editor ends up
+#      somewhere with a real size -- on the box where the engine says where it
+#      is, in the fallback bar where it does not
 #   4. the characters reach the engine
 #   5. a composited screenshot exists to look at
 #
@@ -117,16 +119,31 @@ note "step 2 ok: a TextBox took focus"
 
 # 3. the geometry. Null was the year-long bug; all-zero is a real answer the
 #    engine gives for some boxes and is not a pass.
+#
+#    Two readings, because they are two different facts and conflating them
+#    cost a run. `textbox spec from showKeyboard` is what the engine
+#    volunteered at focus time, and for the search modal it is legitimately
+#    zeroed -- the modal has not laid out yet. `text editor placed from` is
+#    where the editor actually went, after `sync_text_overlay` has consulted
+#    `nativeGetTextBoxInfo` and, failing that, its own fallback bar. The second
+#    is the one that decides whether typing is usable, so it is the one the
+#    warning hangs on.
 spec=$(grep -oE 'textbox spec from showKeyboard x=[-0-9.]+ y=[-0-9.]+ w=[-0-9.]+ h=[-0-9.]+' "$LOG" | tail -1)
 [ -n "$spec" ] || { reap; fail "no NativeTextBoxInfo arrived -- showKeyboard got null (step 3)"; }
-w=$(sed -E 's/.* w=([-0-9.]+) .*/\1/' <<<"$spec")
-h=$(sed -E 's/.* h=([-0-9.]+)$/\1/' <<<"$spec")
 note "step 3 ok: $spec"
-if awk "BEGIN{exit !($w > 0 && $h > 0)}"; then
-  note "        geometry is non-zero, so the editor can be placed on the box"
-else
-  note "        WARNING: geometry is zeroed; the editor falls back to a placed bar"
-fi
+placed=$(grep -oE 'text editor placed from [a-z ]+ x=[-0-9.]+ y=[-0-9.]+ w=[-0-9.]+ h=[-0-9.]+' "$LOG" | tail -1)
+[ -n "$placed" ] || { reap; fail "the editor was never placed at all (step 3)"; }
+w=$(sed -E 's/.* w=([-0-9.]+) .*/\1/' <<<"$placed")
+h=$(sed -E 's/.* h=([-0-9.]+)$/\1/' <<<"$placed")
+note "        $placed"
+case "$placed" in
+  *"from engine geometry"*)
+    note "        placed on the box from the engine's own geometry" ;;
+  *)
+    note "        WARNING: no geometry for this box; the editor is a placed bar" ;;
+esac
+awk "BEGIN{exit !($w > 0 && $h > 0)}" ||
+  { reap; fail "the editor was placed 0-sized and is invisible (step 3)"; }
 
 # 4. type, per character, through the same path a keystroke takes
 mcp "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"cordial_text\",\"arguments\":{\"text\":\"$TYPED\"}}}" >/dev/null

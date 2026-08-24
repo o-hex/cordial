@@ -3303,6 +3303,26 @@ fn main() -> ExitCode {
                                                 "Java_com_roblox_engine_jni_NativeInputInterface_nativeGetMainWindowIsMouseLockedCenter",
                                             ).unwrap_or(std::ptr::null_mut());
                                             cordial_runtime::android::input::set_mouse_lock_native(ml);
+                                            // The other native on this
+                                            // interface Cordial reads rather
+                                            // than writes: where the focused
+                                            // text box is. `showKeyboard`
+                                            // volunteers the same thing and is
+                                            // preferred, but it volunteers it
+                                            // before a modal has laid out --
+                                            // see `sync_text_overlay`.
+                                            let gt = lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeGLInterface_nativeGetTextBoxInfo",
+                                            ).unwrap_or(std::ptr::null_mut());
+                                            cordial_runtime::android::input::set_textbox_info_native(gt);
+                                            println!(
+                                                "  input: nativeGetTextBoxInfo {}",
+                                                if gt.is_null() {
+                                                    "NOT exported; a box focused with no geometry falls back to a placed bar"
+                                                } else {
+                                                    "resolved"
+                                                }
+                                            );
                                             println!(
                                                 "  input: nativeGetMainWindowIsMouseLockedCenter {}",
                                                 if ml.is_null() {

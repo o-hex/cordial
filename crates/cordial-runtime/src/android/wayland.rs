@@ -1059,6 +1059,26 @@ pub struct WaylandWindow {
     text_overlay_visible: AtomicBool,
     text_overlay_cache:
         Mutex<Option<(u32, u64, String, i32, cordial_linker_sys::game_activity::RawTextBoxInfo)>>,
+    /// What `nativeGetTextBoxInfo` last said, for the focus generation it said
+    /// it about. See [`WaylandWindow::polled_textbox_info`] — this exists so
+    /// the ticks between polls keep drawing the editor where the last poll put
+    /// it, rather than dropping back to the fallback bar and flickering
+    /// between the two at half the pump rate.
+    polled_textbox_info: Mutex<Option<PolledTextBoxInfo>>,
+}
+
+/// One focus generation's worth of polling state for
+/// [`WaylandWindow::polled_textbox_info`].
+struct PolledTextBoxInfo {
+    /// Which focused box this is about. A new generation resets everything;
+    /// handles are reused, generations are not.
+    generation: u32,
+    /// When the engine was last asked, so the rate limit has something to
+    /// measure against.
+    asked: std::time::Instant,
+    /// The last answer good enough to place an editor from, if there has been
+    /// one. `None` while the engine is still saying null or still mid-layout.
+    usable: Option<cordial_linker_sys::game_activity::RawTextBoxInfo>,
 }
 // SAFETY: every raw pointer field is either a `libwayland-client` proxy (only
 // ever touched from the single input-pump thread, matching the file-level
@@ -1547,6 +1567,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         open_web_view_dialogs: AtomicI32::new(0),
         text_overlay_visible: AtomicBool::new(false),
         text_overlay_cache: Mutex::new(None),
+        polled_textbox_info: Mutex::new(None),
     };
     let host = WINDOW.get_or_init(|| host);
 
@@ -1894,6 +1915,18 @@ impl WaylandWindow {
         }
         *cache = Some((generation, revision, text.to_owned(), caret, info));
         drop(cache);
+        if super::input::trace_text() {
+            // Which of the three sources won, and the numbers it won with.
+            // Placement is the question this whole path exists to answer, and
+            // it was previously only answerable by photographing the window --
+            // `showKeyboard`'s spec is in the log but is not what gets used
+            // when the getter or the fallback supplies the geometry instead.
+            eprintln!(
+                "[cordial] text editor placed from {} x={} y={} w={} h={}",
+                if fallback { "fallback bar" } else { "engine geometry" },
+                info.x, info.y, info.width, info.height
+            );
+        }
 
         self.host.0.set_text_overlay(Some(cordial_shell::host_window::TextOverlay {
             text,
@@ -1945,6 +1978,79 @@ impl WaylandWindow {
         }
     }
 
+    /// Ask `nativeGetTextBoxInfo` where the focused box is, at most ten times a
+    /// second, and remember the last answer worth using.
+    ///
+    /// Only called when the spec `showKeyboard` volunteered is unusable, so on
+    /// the common path this costs nothing at all.
+    ///
+    /// **Ten a second, and the number is a compromise between two measured
+    /// things.** `sync_text_overlay` runs off `looper::pump`, which comes round
+    /// roughly twenty times a second, and a JNI call that constructs a Java
+    /// object on every tick is a cost on the one thread this project defends.
+    /// Against that, the search modal's geometry went from unusable to correct
+    /// somewhere between 0 and 1 second after focus, so a poll interval near a
+    /// second would be a visible lag before the editor jumped onto the field.
+    /// 100 ms is half the pump rate -- at most every other tick -- and latches
+    /// on within a tenth of a second of the engine having an answer.
+    ///
+    /// Polling continues after a usable answer arrives, because the answer
+    /// moves: the modal's field measured `w=592` and then `w=564` once there
+    /// was text in it. Following that costs one overlay rebuild, not one per
+    /// tick, because `sync_text_overlay`'s cache compares the geometry it drew
+    /// with the geometry it is about to draw and returns early when they match.
+    fn polled_textbox_info(
+        &self,
+        generation: u32,
+    ) -> Option<cordial_linker_sys::game_activity::RawTextBoxInfo> {
+        /// Half the pump rate. See the doc comment.
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let native = super::input::textbox_info_native();
+        if native.is_null() {
+            return None;
+        }
+        let mut state = self.polled_textbox_info.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        match state.as_ref() {
+            // Same box, asked recently enough: reuse whatever the last poll
+            // established rather than asking again.
+            Some(p) if p.generation == generation => {
+                if now.duration_since(p.asked) < POLL_INTERVAL {
+                    return p.usable;
+                }
+            }
+            // A different box, or the first one. Nothing carries over --
+            // reusing another box's numbers is the thing `android_classes.cpp`
+            // refuses by design.
+            _ => {
+                *state = Some(PolledTextBoxInfo { generation, asked: now, usable: None });
+            }
+        }
+        let carried = state.as_ref().and_then(|p| p.usable);
+        let answer = match cordial_linker_sys::game_activity::textbox_info_now(native) {
+            // **A zero height is the trap this call brings with it.** Asked on
+            // the same pump tick as `showKeyboard`, the search modal answered
+            // `x=596 y=10 w=42 h=0` -- caught mid-animation, expanding out of
+            // the header search bar it replaces. Non-zero x, y and width make
+            // it look like an answer; the zero height makes it invisible. Same
+            // test as the remembered spec gets, for the same reason.
+            Ok(Some(i)) if i.width > 0.0 && i.height > 0.0 => Some(i),
+            // Null is ordinary, not a failure: it is what the whole sign-in
+            // page answers. Keep whatever the last poll found rather than
+            // dropping an editor that is currently placed correctly.
+            Ok(_) => carried,
+            Err(e) => {
+                if super::input::trace_text() {
+                    eprintln!("[cordial] nativeGetTextBoxInfo failed: {e}");
+                }
+                carried
+            }
+        };
+        *state = Some(PolledTextBoxInfo { generation, asked: now, usable: answer });
+        answer
+    }
+
     fn sync_text_overlay(&self) {
         let Some(_which) = cordial_linker_sys::game_activity::focused_textbox() else {
             if self.text_overlay_visible.swap(false, Ordering::SeqCst) {
@@ -1968,9 +2074,49 @@ impl WaylandWindow {
         //
         // The spec is the geometry Android would style a real EditText with, and
         // it arrives either as `showKeyboard`'s NativeTextBoxInfo or from a
-        // remembered `<init>`. On the sign-in page neither fires, and asking the
-        // engine directly does not help: `nativeGetTextBoxInfo` is exported and
-        // callable and returns null there, measured over three runs.
+        // remembered `<init>`.
+        //
+        // **This used to say "on the sign-in page neither fires", and that is
+        // no longer true.** It was true when it was written, and it stopped
+        // being true when the `<init>` hook was corrected to the dex's real
+        // fifteen-argument signature: the spec was always being constructed,
+        // Cordial was simply not capturing it, so `spec_known` was false and
+        // the page looked as though it volunteered nothing. Measured on
+        // 2026-08-25 on a fresh signed-out profile, the username field arrives
+        // here as `x=470 y=264 w=340 h=22` and the password field as
+        // `x=470 y=330 w=304 h=22`, both from `showKeyboard`, both correct on
+        // a composited screenshot. The old sentence survived the fix that
+        // falsified it, which is the ordinary way a comment starts lying.
+        //
+        // **Asking the engine directly helps on some pages and not others, and
+        // this used to say only the half of that which was measured first.**
+        // `nativeGetTextBoxInfo` returned null for the whole of the sign-in
+        // page over three runs -- taken before that hook fix, and not re-run
+        // since, because `showKeyboard` now answers first there and the getter
+        // is never reached. Treat it as history rather than as a current
+        // reading. For the search modal,
+        // the box that arrives here with `w=0 h=0`, the same call returns real
+        // geometry about a second later: `x=596 y=10 w=42 h=0` on the pump tick
+        // after focus, then `x=332 y=10 w=592 h=36` at one second and for the
+        // rest of the box's life, twice out of two runs on 2026-08-25 with
+        // identical numbers. So the engine has the geometry; what it does not
+        // have is the geometry at the moment it volunteers a spec.
+        //
+        // Hence the order below: `showKeyboard` first because it is exact and
+        // free, the getter second and only when the first is unusable, the
+        // fallback bar third and only when neither answered. See
+        // [`Self::polled_textbox_info`] for the rate limit and why it is 10 Hz.
+        //
+        // **The fallback below is now a safety net nothing currently lands
+        // in, and it stays.** Every box tried on 2026-08-25 -- the home search
+        // bar, the search modal it opens, the sign-in username and password
+        // fields -- is placed from real geometry by one of the two sources
+        // above. No box is known that supplies neither. That is a reason to
+        // keep the net rather than to remove it: it has been reached before,
+        // the set of boxes here is not the set of boxes Roblox ships, and the
+        // failure it catches is invisible typing, which is the bug this whole
+        // path exists for. It is untested as of that date and should be
+        // treated as such.
         //
         // So when there is no spec, place the editor ourselves rather than
         // abandoning it. It will not sit exactly over the box, and that is the
@@ -1990,7 +2136,10 @@ impl WaylandWindow {
         // which is the whole reason that script exists.
         let (info, fallback) = match cordial_linker_sys::game_activity::focused_textbox_info() {
             Some(info) if info.width > 0.0 && info.height > 0.0 => (info, false),
-            _ => (self.fallback_textbox_info(), true),
+            _ => match self.polled_textbox_info(generation) {
+                Some(info) => (info, false),
+                None => (self.fallback_textbox_info(), true),
+            },
         };
         if self
             .text_overlay_cache

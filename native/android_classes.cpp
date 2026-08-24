@@ -1730,3 +1730,88 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
         fprintf(stderr, "[classes] Cordial's Java side registered\n");
     }
 }
+
+// ------------------------------------------------- asking the engine directly
+//
+// Down here rather than beside `cordial_textbox_info` because it needs
+// `cordial::NativeTextBoxInfo`, which is defined above and cannot be
+// forward-declared usefully.
+
+namespace cordial {
+/// Defined in `game_activity.cpp`; declared rather than duplicated for the
+/// same reason `make_display_metrics` is declared there.
+jnivm::ENV* process_env();
+} // namespace cordial
+
+/// `NativeGLInterface.nativeGetTextBoxInfo()` — the engine's own answer to
+/// "where is the focused box", as opposed to the one it volunteered at
+/// `showKeyboard`.
+///
+/// **The two disagree, and the getter is the one that catches up.** Roblox's
+/// search modal is focused with a spec of `x=0 y=0 w=0 h=0`, because the engine
+/// builds it before the modal has laid out; a second later this call returns
+/// `x=332 y=10 w=592 h=36` for the same box. Measured twice, identically, on
+/// 2026-08-25. See the comment in `sync_text_overlay` for the whole shape of it
+/// and for why `showKeyboard` still comes first.
+///
+/// The dex descriptor is `()Lcom/roblox/engine/jni/model/NativeTextBoxInfo;` —
+/// read with `tools/dex_method.py`, not guessed, because a wrong arity here
+/// would be the same silent nothing the `<init>` hook was for a year. The
+/// object it returns is built through that same hook, so every slot arrives
+/// named the way `CordialTextBoxInfo` names them.
+///
+/// Returns 1 with `*out` filled, 0 when the engine answered null — which it
+/// does for the whole of the sign-in page — and -1 on error. **A 0 is not a
+/// zeroed box:** `*out` is left untouched, for the reason
+/// `cordial_textbox_info` gives at more length.
+extern "C" int cordial_textbox_info_now(void* fn, CordialTextBoxInfo* out,
+                                        char* err, size_t err_len) {
+    using Call = jobject (*)(JNIEnv*, jobject);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or nativeGetTextBoxInfo is not exported");
+        return -1;
+    }
+    // **The pop has to happen on every path out, including the throwing one.**
+    // This is polled ten times a second while a box is focused with no usable
+    // geometry, so a frame leaked per failure is not a one-off -- it is a leak
+    // that grows for as long as the box has focus, on the pump thread. Written
+    // as a guard rather than a pop before each `return` because the next person
+    // to add an early return will not remember.
+    struct LocalFrame {
+        JNIEnv* jni;
+        ~LocalFrame() {
+            if (jni) jni->PopLocalFrame(nullptr);
+        }
+    };
+    try {
+        auto* jni = env->GetJNIEnv();
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeGLInterface");
+        // `to_jni` parks every object it touches in the current local frame --
+        // the same unbounded growth `cordial_game_activity_touch` documents.
+        jni->PushLocalFrame(16);
+        LocalFrame frame{jni};
+        jobject r = reinterpret_cast<Call>(fn)(
+            jni,
+            (jobject)jnivm::JNITypes<std::shared_ptr<jnivm::Class>>::ToJNIType(env, cls));
+        int rc = 0;
+        if (r) {
+            auto obj =
+                jnivm::JNITypes<std::shared_ptr<cordial::NativeTextBoxInfo>>::JNICast(env, r);
+            // `spec_known` is false for an object that never went through the
+            // `<init>` hook. Reporting that as success would hand the caller a
+            // default-constructed struct dressed up as geometry.
+            if (obj && obj->spec_known) {
+                if (out) *out = obj->spec;
+                rc = 1;
+            }
+        }
+        return rc;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}

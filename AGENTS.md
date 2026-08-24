@@ -69,6 +69,43 @@ stripped binary were wrong**, and every conclusion drawn from running something
 held up. This is the single most expensive mistake available here, and agents are
 unusually prone to it because reasoning from a binary feels like progress.
 
+## Search Sober's issues before investigating a user-facing bug
+
+`tools/sober-corpus/data/raw.jsonl` is a local copy of Sober's issue tracker,
+2,000+ issues with their comments, fetched incrementally ([ADR-017](docs/adr/ADR-017-sober-issue-corpus.md)).
+Sober runs the same engine on the same kind of desktop, so **almost every
+user-facing symptom here has already been reported there, often years earlier
+and often with the environment that distinguishes it.** It is offline, it is one
+`grep`, and it costs nothing.
+
+```bash
+python3 - <<'EOF'
+import json, re
+pat = re.compile(r'textbox|cannot see.*typ', re.I)
+for line in open('tools/sober-corpus/data/raw.jsonl'):
+    d = json.loads(line)
+    if pat.search(str(d.get('title',''))):
+        print(d['number'], d.get('state'), d['title'])
+EOF
+```
+
+**Read the comments, not just the title, and check whether it was actually
+fixed.** Sober's tracker closes issues by inactivity, so `CLOSED` frequently
+means "nobody replied", not "solved" -- and an issue closed unfixed is still
+evidence about the symptom.
+
+Worked example, 2026-08-24. "Characters are invisible until the box loses
+focus" was being investigated here from first principles. Sober #987 reports it
+verbatim -- *"when typing in chat or any other textboxes i cant see text i
+typed"* -- and was closed by inactivity with a comment saying it went away after
+switching to KDE Plasma. Sober #1026, still open, narrows it much further: the
+textbox stops working *only in fullscreen*, only on Wayland and not X11, on
+Sway/DWL/Hyprland but not KDE, and one reporter pins it to the surface being as
+large as the output -- "stops when either is even a pixel below that". None of
+that was going to come out of reading our own code, and it is the difference
+between "the engine never draws focused text" and "the engine's drawing of
+focused text is sensitive to compositor and surface size".
+
 ## Verify by running. Do not report what you have not observed
 
 A claim about this engine is worth what it was measured with.

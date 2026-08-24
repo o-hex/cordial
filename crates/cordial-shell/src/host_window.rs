@@ -238,12 +238,34 @@ pub struct HostWindow {
     /// header bar's height never has to be assumed anywhere.
     content: gtk::Widget,
     text_layer: gtk::Fixed,
-    text_label: gtk::Label,
-    /// The caret, as a rectangle of its own rather than a character in the
-    /// string. See [`HostWindow::set_text_overlay`] for why that distinction is
-    /// the whole difference between a caret and a glyph that looks like one.
-    caret: gtk::DrawingArea,
-    caret_color: std::rc::Rc<std::cell::Cell<u32>>,
+    /// The editor itself: a real editable GTK widget, not a picture of one.
+    ///
+    /// It was a `GtkLabel` mirroring a buffer Cordial owned, with a caret
+    /// Cordial drew. That worked and was miserable to use -- no selection, no
+    /// click-to-position, no double-click-to-word, a caret that did not blink,
+    /// and every one of those would have had to be written by hand. Reported as
+    /// "the text field is so weird ... our own handling is ultra awkward".
+    ///
+    /// A `gtk::Text` is the bare editable widget behind `GtkEntry`, without the
+    /// frame and background an entry draws, which is what suits sitting
+    /// invisibly on top of a box Roblox has already drawn.
+    editor: gtk::Text,
+    /// Font size and colours for the current box. Reloaded when a box takes
+    /// focus rather than styled per keystroke -- see [`HostWindow::set_text_overlay`].
+    editor_css: gtk::CssProvider,
+    /// Where the editor is in surface coordinates, so the input-region punch
+    /// can hand that one rectangle back to GTK. `None` when nothing is focused.
+    editor_rect: std::cell::Cell<Option<(i32, i32, i32, i32)>>,
+    /// Set while Cordial is seeding the widget from the engine's text, so the
+    /// change signal does not echo Cordial's own write straight back at it.
+    editor_seeding: std::rc::Rc<std::cell::Cell<bool>>,
+    /// What to tell when the user edits. Installed by the runtime, which owns
+    /// the push to `syncTextboxTextAndCursorPosition2`.
+    editor_changed: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(&str, i32)>>>>,
+    /// Whether the canvas is currently lowered. Remembered because the input
+    /// region depends on it *and* on where the editor is, and those two change
+    /// at different moments.
+    canvas_see_through: std::cell::Cell<bool>,
 }
 
 /// The Android editor rectangle Roblox asks the platform to paint over its
@@ -262,38 +284,6 @@ pub struct TextOverlay<'a> {
     /// itself. Such an editor is not sitting on the box, so it has to carry its
     /// own chrome to be legible -- see the CSS class below.
     pub fallback: bool,
-}
-
-/// What the label shows: the text, or one bullet per character of it.
-///
-/// **The caret is not in here, and used to be.** It was inserted as a '│'
-/// at the caret index, which put a whole character cell into the middle of the
-/// string -- so every character after the caret sat one cell to the right of
-/// where the engine draws the same string, and the caret itself was as wide as
-/// a letter. Reported as "the caret looks off like it's in the wrong place",
-/// which it was, and so was everything following it. The caret is now a
-/// rectangle positioned from Pango's measurement of this string, and this
-/// function returns exactly what the box contains.
-fn displayed_editor_text(text: &str, password: bool) -> String {
-    if password {
-        "•".repeat(text.chars().count())
-    } else {
-        text.to_owned()
-    }
-}
-
-/// Byte offset into `display` of the caret, counted in characters.
-///
-/// Characters rather than bytes because that is the unit the engine reports
-/// and the unit `syncTextboxTextAndCursorPosition2` answers in. Anything past
-/// the end clamps to the end, which is where the caret belongs after the last
-/// keystroke.
-fn caret_byte(display: &str, caret_chars: i32) -> usize {
-    display
-        .char_indices()
-        .nth(caret_chars.max(0) as usize)
-        .map(|(at, _)| at)
-        .unwrap_or(display.len())
 }
 
 impl HostWindow {
@@ -350,6 +340,20 @@ impl HostWindow {
                  background-image: none; \
              } \
              .cordial-engine-host.cordial-canvas-below { background-color: transparent; } \
+             .cordial-editor { \
+                 background: none; \
+                 background-image: none; \
+                 border: none; \
+                 box-shadow: none; \
+                 outline: none; \
+                 padding: 0; \
+                 margin: 0; \
+                 min-height: 0; \
+                 min-width: 0; \
+             } \
+             .cordial-editor selection { \
+                 background-color: alpha(currentColor, 0.25); \
+             } \
              .cordial-text-fallback { \
                  background-color: rgba(28, 28, 30, 0.94); \
                  color: #ffffff; \
@@ -373,6 +377,16 @@ impl HostWindow {
             &css,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        // The editor's own sheet, empty until a box takes focus and reloaded
+        // with that box's font size and colours each time one does. Separate
+        // from the sheet above because that one is written once and this one is
+        // rewritten, and reparsing the whole stylesheet to restyle one widget
+        // would restyle the header bar too.
+        gtk::style_context_add_provider_for_display(
+            &WidgetExt::display(&host.window),
+            &host.editor_css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
         host
     }
 
@@ -383,37 +397,56 @@ impl HostWindow {
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(content));
         let text_layer = gtk::Fixed::new();
+        // **Off unless an editor is up, and this is not a tidiness setting.**
+        // A `GtkFixed` is picked over its whole allocation, so a targetable one
+        // spanning the content would swallow every pointer event GTK receives.
+        // It is switched on for exactly as long as there is something in it to
+        // click, which is also exactly as long as the input region has a hole
+        // punched for that something.
         text_layer.set_can_target(false);
         text_layer.set_hexpand(true);
         text_layer.set_vexpand(true);
-        let text_label = gtk::Label::new(None);
-        text_label.set_can_target(false);
-        text_label.set_visible(false);
-        text_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        text_label.set_overflow(gtk::Overflow::Hidden);
-        text_layer.put(&text_label, 0.0, 0.0);
 
-        // Drawn rather than styled, because the colour arrives with the
-        // engine's own `NativeTextBoxInfo` on every focus, and a CSS provider
-        // would mean reparsing a stylesheet to move two pixels.
-        let caret = gtk::DrawingArea::new();
-        caret.set_can_target(false);
-        caret.set_visible(false);
-        let caret_color = std::rc::Rc::new(std::cell::Cell::new(0x00ff_ffffu32));
+        let editor = gtk::Text::new();
+        editor.set_visible(false);
+        editor.add_css_class("cordial-editor");
+        // The engine has already drawn the box; the editor supplies the text
+        // and the caret and nothing else. `gtk::Text` is the bare widget from
+        // inside a `GtkEntry` and draws no frame of its own -- there is
+        // deliberately no `set_has_frame` here, and reaching for one resolves
+        // to `ButtonExt`'s and fails to compile, which is a confusing way to
+        // be told the widget was already the right choice. The background and
+        // padding an entry would draw are turned off in CSS instead.
+        editor.set_overflow(gtk::Overflow::Hidden);
+
+        let editor_css = gtk::CssProvider::new();
+        let editor_seeding = std::rc::Rc::new(std::cell::Cell::new(false));
+        let editor_changed: std::rc::Rc<
+            std::cell::RefCell<Option<Box<dyn Fn(&str, i32)>>>,
+        > = std::rc::Rc::new(std::cell::RefCell::new(None));
         {
-            let colour = caret_color.clone();
-            caret.set_draw_func(move |area, cr, _, _| {
-                let rgb = colour.get();
-                cr.set_source_rgb(
-                    ((rgb >> 16) & 0xff) as f64 / 255.0,
-                    ((rgb >> 8) & 0xff) as f64 / 255.0,
-                    (rgb & 0xff) as f64 / 255.0,
-                );
-                cr.rectangle(0.0, 0.0, area.width() as f64, area.height() as f64);
-                let _ = cr.fill();
+            // One closure behind an `Rc`, shared by both signals: the text and
+            // the caret are one fact as far as the engine is concerned --
+            // `syncTextboxTextAndCursorPosition2` takes them together -- and
+            // reporting them from two independent handlers would send the
+            // engine a caret for text it had not been told about yet.
+            let seeding = editor_seeding.clone();
+            let sink = editor_changed.clone();
+            let widget = editor.clone();
+            let notify: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+                if seeding.get() {
+                    return;
+                }
+                if let Some(cb) = sink.borrow().as_ref() {
+                    cb(widget.text().as_str(), widget.position());
+                }
             });
+            let on_text = notify.clone();
+            editor.connect_changed(move |_| on_text());
+            editor.connect_notify_local(Some("cursor-position"), move |_, _| notify());
         }
-        text_layer.put(&caret, 0.0, 0.0);
+        text_layer.put(&editor, 0.0, 0.0);
+
         overlay.add_overlay(&text_layer);
         toolbar.set_content(Some(&overlay));
 
@@ -461,9 +494,12 @@ impl HostWindow {
             toolbar,
             content: content.as_ref().clone(),
             text_layer,
-            text_label,
-            caret,
-            caret_color,
+            editor,
+            editor_css,
+            editor_rect: std::cell::Cell::new(None),
+            canvas_see_through: std::cell::Cell::new(false),
+            editor_seeding,
+            editor_changed,
         }
     }
 
@@ -483,89 +519,108 @@ impl HostWindow {
         self.window.present();
     }
 
-    /// Paint (or hide) the desktop equivalent of Android's transparent
+    /// Install a callback for edits the user makes in the editor.
+    ///
+    /// The runtime owns the push to the engine, because it owns the JNI handle
+    /// and the decision about `pass_text` versus
+    /// `syncTextboxTextAndCursorPosition2`. This window owns the widget and
+    /// knows nothing about either.
+    ///
+    /// Text and caret arrive together and never separately, because the engine
+    /// is told them together and a caret reported for text the engine has not
+    /// seen yet is a caret past the end of the string it holds.
+    pub fn connect_editor_changed<F: Fn(&str, i32) + 'static>(&self, f: F) {
+        *self.editor_changed.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Place (or hide) the desktop equivalent of Android's transparent
     /// `EditText` over the engine canvas. The caller controls subsurface
     /// stacking; this method only updates GTK's parent surface.
+    ///
+    /// **The widget owns the text; this seeds it.** Android's own `EditText` is
+    /// the authoritative buffer and syncs to the engine, and that is the shape
+    /// being imitated. So the text passed in is written only when it differs
+    /// from what the widget already holds -- a blind `set_text` on every pump
+    /// tick would reset the selection, fight the user's caret, and echo back
+    /// through [`Self::connect_editor_changed`] as though they had typed it.
     pub fn set_text_overlay(&self, overlay: Option<TextOverlay<'_>>) {
         let Some(overlay) = overlay else {
-            self.text_label.set_text("");
-            self.text_label.set_visible(false);
-            self.caret.set_visible(false);
+            self.editor.set_visible(false);
+            self.text_layer.set_can_target(false);
+            self.editor_rect.set(None);
+            // Seeded, not typed: clearing on blur must not reach the engine as
+            // an edit that empties the box the user just finished filling in.
+            self.editor_seeding.set(true);
+            self.editor.set_text("");
+            self.editor_seeding.set(false);
+            self.refresh_input_region();
             self.window.queue_draw();
             return;
         };
 
-        let display = displayed_editor_text(overlay.text, overlay.password);
-        self.text_label.set_text(&display);
-        self.text_label.set_size_request(
+        let (x, y) = (overlay.x.round() as i32, overlay.y.round() as i32);
+        let (w, h) = (
             overlay.width.max(1.0).round() as i32,
             overlay.height.max(1.0).round() as i32,
         );
-        self.text_label.set_xalign(0.0);
-        self.text_label.set_yalign(0.5);
 
-        let attrs = gtk::pango::AttrList::new();
-        attrs.insert(gtk::pango::AttrSize::new(
-            (overlay.font_size.max(1.0) * gtk::pango::SCALE as f32).round() as i32,
-        ));
-        let color = overlay.text_color;
-        attrs.insert(gtk::pango::AttrColor::new_foreground(
-            (((color >> 16) & 0xff) * 257) as u16,
-            (((color >> 8) & 0xff) * 257) as u16,
-            ((color & 0xff) * 257) as u16,
-        ));
-        self.text_label.set_attributes(Some(&attrs));
-        self.text_layer.move_(
-            &self.text_label,
-            overlay.x.round() as f64,
-            overlay.y.round() as f64,
+        // Colours and size, as CSS rather than Pango attributes, because the
+        // caret is the reason. GTK paints it from the CSS `caret-color`, which
+        // defaults to the themed text colour and takes no notice of a Pango
+        // foreground override -- so an attribute-styled editor on Roblox's
+        // light search field drew dark text with the theme's white caret,
+        // invisible on exactly the field it was in.
+        let rgb = format!(
+            "#{:02x}{:02x}{:02x}",
+            (overlay.text_color >> 16) & 0xff,
+            (overlay.text_color >> 8) & 0xff,
+            overlay.text_color & 0xff
         );
+        self.editor_css.load_from_string(&format!(
+            ".cordial-editor {{ color: {rgb}; caret-color: {rgb}; font-size: {}px; }}",
+            overlay.font_size.max(1.0).round() as i32
+        ));
 
-        // Where the caret goes, asked of Pango rather than estimated. A caret
-        // placed at `x + characters * average_width` is right for one font at
-        // one size and wrong everywhere else, and this string is whatever the
-        // user typed -- proportional, possibly CJK, possibly bullets. The
-        // measuring layout wears the same attribute list as the label, or its
-        // size would be the theme's rather than the engine's and the caret
-        // would drift further along the line the more was typed.
-        let layout = self.text_label.create_pango_layout(Some(&display));
-        layout.set_attributes(Some(&attrs));
-        let pos = layout.index_to_pos(caret_byte(&display, overlay.caret_chars) as i32);
-        let scale = gtk::pango::SCALE as f64;
-        let caret_x = pos.x() as f64 / scale;
-        // The line's own height, not the box's: the box is padded, and a caret
-        // spanning the padding reads as a divider between fields rather than a
-        // cursor in one.
-        let line_h = (pos.height() as f64 / scale).max(1.0);
-        let box_h = overlay.height.max(1.0) as f64;
-        self.caret_color.set(overlay.text_color);
-        // Two logical pixels. One disappears under fractional scaling on this
-        // host; three reads as a block cursor, which Roblox's is not.
-        self.caret.set_size_request(2, line_h.round() as i32);
-        self.text_layer.move_(
-            &self.caret,
-            (overlay.x as f64 + caret_x).round(),
-            (overlay.y as f64 + ((box_h - line_h) / 2.0).max(0.0)).round(),
-        );
-        self.caret.set_visible(true);
-        self.caret.queue_draw();
-        // **A bare label is invisible half the time.** With the engine's own
-        // spec the editor sits on the box and takes the box's colour, which is
-        // right. With a synthesised placement it floats over whatever happens
-        // to be there -- and Roblox's own search dropdown is white, so white
-        // text on it renders nothing at all. Reported as "I don't think it's
-        // even drawing"; it was drawing, in white, on white.
-        //
-        // So the placed editor carries chrome: a panel behind it, the way a
-        // real text field does. That is also the honest signal that it is not
-        // the box -- an unstyled string floating mid-screen reads as a glitch,
-        // a field reads as a field.
-        if overlay.fallback {
-            self.text_label.add_css_class("cordial-text-fallback");
-        } else {
-            self.text_label.remove_css_class("cordial-text-fallback");
+        // GTK's own masking rather than a string of bullets: the widget then
+        // holds the real text, so the caret lands between real characters and
+        // a paste or a selection means what it says. Substituting the bullets
+        // ourselves would have made the buffer a lie the moment anything
+        // measured it.
+        self.editor.set_visibility(!overlay.password);
+
+        if self.editor.text() != overlay.text {
+            self.editor_seeding.set(true);
+            self.editor.set_text(overlay.text);
+            self.editor.set_position(overlay.caret_chars);
+            self.editor_seeding.set(false);
         }
-        self.text_label.set_visible(true);
+
+        self.editor.set_size_request(w, h);
+        self.text_layer.move_(&self.editor, x as f64, y as f64);
+
+        // **A bare editor is invisible half the time.** With the engine's own
+        // spec it sits on the box and takes the box's colour, which is right.
+        // With a synthesised placement it floats over whatever happens to be
+        // there -- and Roblox's own search dropdown is white, so white text on
+        // it renders nothing at all. Reported as "I don't think it's even
+        // drawing"; it was drawing, in white, on white.
+        if overlay.fallback {
+            self.editor.add_css_class("cordial-text-fallback");
+        } else {
+            self.editor.remove_css_class("cordial-text-fallback");
+        }
+
+        self.editor.set_visible(true);
+        self.text_layer.set_can_target(true);
+        self.editor_rect.set(Some((x, y, w, h)));
+        self.refresh_input_region();
+        if !self.editor.has_focus() {
+            // Focus is what makes GTK blink the caret and accept a click into
+            // the text, and it is taken once per focus session rather than on
+            // every tick -- `grab_focus` on a widget that already has it still
+            // resets the selection.
+            self.editor.grab_focus();
+        }
         self.window.queue_draw();
     }
 
@@ -628,7 +683,19 @@ impl HostWindow {
         } else {
             self.window.remove_css_class("cordial-canvas-below");
         }
-        self.set_canvas_input_passthrough(on);
+        self.canvas_see_through.set(on);
+        self.refresh_input_region();
+    }
+
+    /// Recompute the input region from the two things it depends on: whether
+    /// the canvas is lowered, and where the editor is.
+    ///
+    /// Called from both, because they change at different moments and the
+    /// wrong combination is silent. A lowered canvas with no hole punched
+    /// swallows every click; a punched hole with no editor in it swallows
+    /// clicks on the editor that is not there.
+    fn refresh_input_region(&self) {
+        self.set_canvas_input_passthrough(self.canvas_see_through.get());
     }
 
     /// Let pointer events over the canvas reach the engine's subsurface instead
@@ -668,6 +735,15 @@ impl HostWindow {
         // the only thing outside the canvas, and enumerating the rest by hand
         // would go stale the first time the layout changes.
         let _ = region.subtract_rectangle(&gtk::cairo::RectangleInt::new(cx, cy, cw, ch));
+        // **And hand the editor's own rectangle straight back.** It sits inside
+        // the canvas by construction -- it is placed on a box the engine drew --
+        // so the subtraction above takes it out along with everything else, and
+        // a text field GTK is never told about is a text field that cannot be
+        // clicked into, selected in, or positioned by mouse. Which is most of
+        // the reason for having a real widget at all.
+        if let Some((ex, ey, ew, eh)) = self.editor_rect.get() {
+            region.union_rectangle(&gtk::cairo::RectangleInt::new(ex, ey, ew, eh)).ok();
+        }
         surface.set_input_region(Some(&region));
     }
 
@@ -880,30 +956,6 @@ fn header_height_hint() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_password_never_reaches_the_label() {
-        assert_eq!(displayed_editor_text("aé中", false), "aé中");
-        assert_eq!(displayed_editor_text("secret", true), "••••••");
-    }
-
-    #[test]
-    fn the_caret_offset_counts_characters_and_never_splits_one() {
-        // The bug this replaces put a character *into* the string. This
-        // returns an offset into it and leaves it alone -- and the offset has
-        // to land on a character boundary, or Pango's measurement of it is
-        // meaningless and `index_to_pos` is being asked about half a letter.
-        let s = "aé中";
-        assert_eq!(caret_byte(s, 0), 0);
-        assert_eq!(caret_byte(s, 1), 1);
-        assert_eq!(caret_byte(s, 2), 3, "past the two-byte é");
-        assert_eq!(caret_byte(s, 3), 6, "the end, and 中 is three bytes");
-        assert_eq!(caret_byte(s, 99), 6, "clamped rather than panicking");
-        assert_eq!(caret_byte(s, -1), 0);
-        for n in -1..6 {
-            assert!(s.is_char_boundary(caret_byte(s, n)), "n={n}");
-        }
-    }
 
     #[test]
     fn app_id_matches_the_desktop_entry() {

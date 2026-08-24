@@ -196,6 +196,16 @@
 //! objects on one seat from one client would be a new and much harder bug, and
 //! whoever adds an editor widget here has to resolve which of the two speaks
 //! for Cordial before doing it.
+//!
+//! **That happened on 2026-08-25, and the answer is GTK's.** The overlay is now
+//! a real `gtk::Text` placed on the focused box, so GDK does create a second
+//! `zwp_text_input_v3`, and this file's is no longer enabled while a box has
+//! focus -- see `sync_ime_focus`. The widget is the one holding the text, the
+//! caret rectangle and the surrounding context, which is everything an input
+//! method is given in order to do its job, so it is the one that should have
+//! them. This file's object still exists and still receives `enter`; it is
+//! simply dormant, and is kept rather than destroyed so that whether two of
+//! them on one seat is tolerated stays a question this can answer by running.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -1571,6 +1581,40 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     };
     let host = WINDOW.get_or_init(|| host);
 
+    // **The other direction: what the user typed, back to the engine.**
+    //
+    // The editor widget owns the text now, so this is the only path by which a
+    // keystroke reaches Roblox -- `dispatch_key` deliberately stops short of
+    // the buffer while a box has focus, because GDK has already delivered the
+    // same key to the widget through its own `wl_keyboard`.
+    //
+    // Installed here rather than where the window is built because it needs
+    // `WINDOW`, and `WINDOW` is what `get_or_init` above has just produced.
+    // The closure captures nothing and reads the static, so it cannot outlive
+    // what it points at.
+    host.host.0.connect_editor_changed(|text, caret| {
+        let Some(w) = WINDOW.get() else { return };
+        // No focused box means no editor, and a change arriving anyway is the
+        // widget being cleared on blur. Nothing to tell the engine about.
+        let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else { return };
+        // The buffer becomes a mirror of the widget before anything reads it:
+        // `send_current_text` takes its text from `text_buffer_snapshot`, so
+        // this has to happen first or the engine is told the previous value.
+        super::input::adopt_editor_text(text, caret);
+        let handle = w.active_handle.load(Ordering::Relaxed);
+        if handle != 0 {
+            // AGDK's own text-input state, kept in step for the same reason
+            // `dispatch_key` keeps it in step -- this is the path that used to
+            // do it, and dropping it here would be a silent behaviour change
+            // rather than a decision.
+            let _ = cordial_linker_sys::game_activity::text_input(handle, text, caret, caret);
+        }
+        w.send_current_text(which);
+        if handle != 0 {
+            super::input::deliver_surface_redraw(handle);
+        }
+    });
+
     // Listeners that dereference `current()` can only be installed now.
     unsafe {
         if !pointer.is_null() {
@@ -2051,6 +2095,28 @@ impl WaylandWindow {
         answer
     }
 
+    /// Where the focused box is, from the best source that will answer.
+    ///
+    /// One function because there are two painters -- `sync_text_overlay` on
+    /// the pump and `send_current_text` on every keystroke -- and they used to
+    /// resolve this separately. When the `nativeGetTextBoxInfo` source was
+    /// added only the first learned about it, so the editor sat correctly on
+    /// the search modal until the user typed, at which point the other one
+    /// re-placed it in the fallback bar from the same zeroed spec. Two callers
+    /// deciding the same thing differently is the bug; one function is the fix.
+    fn resolve_textbox_geometry(
+        &self,
+        generation: u32,
+    ) -> (cordial_linker_sys::game_activity::RawTextBoxInfo, bool) {
+        match cordial_linker_sys::game_activity::focused_textbox_info() {
+            Some(info) if info.width > 0.0 && info.height > 0.0 => (info, false),
+            _ => match self.polled_textbox_info(generation) {
+                Some(info) => (info, false),
+                None => (self.fallback_textbox_info(), true),
+            },
+        }
+    }
+
     fn sync_text_overlay(&self) {
         let Some(_which) = cordial_linker_sys::game_activity::focused_textbox() else {
             if self.text_overlay_visible.swap(false, Ordering::SeqCst) {
@@ -2134,13 +2200,7 @@ impl WaylandWindow {
         // invisible -- and, worse, it looks like a real spec so the fallback
         // never runs. Found by `tools/text-entry-check.sh` on its first pass,
         // which is the whole reason that script exists.
-        let (info, fallback) = match cordial_linker_sys::game_activity::focused_textbox_info() {
-            Some(info) if info.width > 0.0 && info.height > 0.0 => (info, false),
-            _ => match self.polled_textbox_info(generation) {
-                Some(info) => (info, false),
-                None => (self.fallback_textbox_info(), true),
-            },
-        };
+        let (info, fallback) = self.resolve_textbox_geometry(generation);
         if self
             .text_overlay_cache
             .lock()
@@ -3559,6 +3619,25 @@ impl WaylandWindow {
             return;
         }
 
+        // **The editor widget owns the text, so this path must not also edit
+        // it.** A `gtk::Text` is placed on the focused box and given keyboard
+        // focus, and GDK delivers these same keystrokes to it through its own
+        // `wl_keyboard`. Cordial's is a *second* keyboard object on the same
+        // seat -- see the module doc -- so both clients see every key, and
+        // inserting here as well would put every character in twice: once by
+        // the widget, once by this buffer, and the engine would be told the
+        // second.
+        //
+        // Returning here rather than earlier is deliberate. `pass_key_event`
+        // above has already run, which is what suppresses text keys from
+        // reaching the game while a box is focused; that behaviour is
+        // unchanged. What stops is only this side's editing of a buffer that
+        // is no longer the authority -- which is what the comment above wanted
+        // and could not have until something else was willing to own it.
+        if self.editor_owns_text() {
+            return;
+        }
+
         // If an input method is producing text for this session, it owns the
         // text and the keyboard must not also insert it — otherwise every
         // character an engine commits arrives twice. Editing keys still go
@@ -3641,22 +3720,31 @@ impl WaylandWindow {
         let preedit = self.ime.lock().unwrap_or_else(|e| e.into_inner()).preedit.clone();
         let (text, caret) = splice_preedit(&committed, caret, preedit.as_ref());
         super::input::pass_text(which, &text, caret);
-        // Same fallback as `sync_text_overlay`: a box with no spec still has to
-        // show what is being composed, or IME preedit is invisible for exactly
-        // the boxes the engine gives no geometry for -- which is all of them so
-        // far.
-        let (info, fallback) = match cordial_linker_sys::game_activity::focused_textbox_info() {
-            Some(info) if info.width > 0.0 && info.height > 0.0 => (info, false),
-            _ => (self.fallback_textbox_info(), true),
-        };
+        // The same resolution `sync_text_overlay` uses, and through the same
+        // function so the two cannot drift apart again.
+        let generation = cordial_linker_sys::game_activity::textbox_generation();
+        let (info, fallback) = self.resolve_textbox_geometry(generation);
         self.update_text_overlay(
-            cordial_linker_sys::game_activity::textbox_generation(),
+            generation,
             super::input::text_buffer_revision(),
             &text,
             caret,
             info,
             fallback,
         );
+    }
+
+    /// Whether the `gtk::Text` placed on the focused box is the authority for
+    /// the text, rather than this file's buffer.
+    ///
+    /// It is, whenever a Roblox TextBox has focus, because that is exactly when
+    /// the widget is visible and holding GTK's keyboard focus --
+    /// `set_text_overlay` shows it and grabs focus on the same signal this
+    /// reads. Deliberately the same condition rather than a second flag: two
+    /// notions of "is the editor up" that can disagree is how the overlay and
+    /// the input region got out of step before.
+    fn editor_owns_text(&self) -> bool {
+        cordial_linker_sys::game_activity::focused_textbox().is_some()
     }
 
     /// Drive `enable()`/`disable()` off the same focus signal `input.rs`
@@ -3685,8 +3773,29 @@ impl WaylandWindow {
             (was_enabled, now_focused && !was_enabled, !now_focused && was_enabled)
         };
         let _ = was_enabled;
+        // **GTK's input method speaks for Cordial now, and this one stays
+        // quiet.** The module doc above says whoever adds a focusable editable
+        // widget to this window has to resolve which of the two
+        // `zwp_text_input_v3` objects speaks, because GDK creates its own as
+        // soon as such a widget takes focus. The widget is here, it owns the
+        // text, and it is the one with the caret rectangle and the surrounding
+        // context an input method actually needs -- so it wins, and Cordial's
+        // object is never enabled while a box is focused.
+        //
+        // `disable()` on blur is still sent, and must be: an object left
+        // enabled from before this change, or from a path that enabled it, is
+        // an object still receiving preedit for a box that no longer exists.
+        // Sending `disable` to an already-disabled text input is a no-op.
+        //
+        // Cordial's object is deliberately not destroyed. Whether two of them
+        // on one seat is tolerated by every compositor is the open question
+        // this change tests, and keeping the object makes the answer visible
+        // rather than pre-empting it. If the widget's IME turns out not to
+        // work, re-enabling this is one line.
         if just_focused {
-            self.ime_enable();
+            if !self.editor_owns_text() {
+                self.ime_enable();
+            }
         } else if just_blurred {
             self.ime_disable();
         }

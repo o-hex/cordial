@@ -1481,6 +1481,38 @@ pub fn text_buffer_snapshot() -> (String, i32) {
     (buf.text.clone(), buf.caret as i32)
 }
 
+/// Take the editor widget's text as the truth, wholesale.
+///
+/// **This is the buffer stopping being an editor and becoming a mirror.** The
+/// comment on `CORDIAL_NO_TEXT_BUFFER` in `wayland.rs` calls Cordial keeping a
+/// shadow copy of a field Roblox owns "a design error, not a feature", and
+/// lists what it cost: an empty group clearing the box, characters landing at
+/// the end regardless of the caret, and the caret being this side's guess
+/// rather than anybody's fact. A real `gtk::Text` now owns the text and does
+/// its own editing, so none of those are this buffer's to get wrong any more.
+///
+/// It is kept rather than deleted because three things still read it --
+/// `text_buffer_snapshot` for the overlay, `splice_preedit` for IME display,
+/// and `reseed_if_needed` for the engine's own value at a focus boundary -- and
+/// because the X11 backend has no editor widget and still edits it the old way.
+///
+/// The generation is stamped as current so [`reseed_if_needed`] does not
+/// immediately overwrite what the user just typed with what the engine last
+/// said the box contained.
+pub fn adopt_editor_text(text: &str, caret: i32) {
+    let mut buf = TEXT_BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+    let caret = caret.max(0) as usize;
+    let caret = caret.min(text.chars().count());
+    if buf.text == text && buf.caret == caret {
+        return;
+    }
+    buf.text = text.to_owned();
+    buf.caret = caret;
+    *TEXT_GENERATION.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(cordial_linker_sys::game_activity::textbox_generation());
+    TEXT_REVISION.fetch_add(1, Ordering::Relaxed);
+}
+
 // ------------------------------------------------------------ scripted input
 //
 // A click and a keystroke Cordial delivers to itself, for the experiments the

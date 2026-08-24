@@ -40,7 +40,64 @@ had looked in `appData/`.
 
 # What is blocking
 
-## 0. RETRACTED: the freeze is not the focus report, 2026-08-24
+## 0. The freeze is the app shell never reaching Landing, 2026-08-24
+
+**The best characterisation so far, and the instrument that found it is a diff
+of two startup logs.** Take a frozen run and a healthy one, normalise the
+numbers out of the `[roblox]`/`[android]` lines, and `comm` them. The entire
+difference is two lines:
+
+    [roblox] datamodel notification: APP_READY Landing
+    [roblox] app ready: Landing
+
+Everything else about the two startups is identical. Looking at the sequence
+rather than the set makes it sharper still:
+
+    frozen   APP_READY PlatformAccountRouter, APP_READY Startup
+    healthy  APP_READY PlatformAccountRouter, APP_READY Startup,
+             APP_READY PlatformAccountRouter, APP_READY Startup, APP_READY Landing
+
+A healthy client runs the router-then-startup pair **twice** and then lands. A
+frozen one runs it once and stops. Both reach `app upgrade status 0/3` and
+neither goes past it. So the stall is in the engine's own app shell, after that
+point, and it is a second pass that fails to happen rather than a first pass
+that dies.
+
+### What it is not, all read off a live specimen with lldb
+
+- **Not blocked in Vulkan.** 128 threads, and the only `libvulkan_intel.so`
+  frames are Mesa's own queue workers in `cnd_wait` -- idle driver threads.
+  Nothing is in `vkAcquireNextImageKHR`, a fence, or a present.
+- **Not executing at all.** **Zero `libroblox` frames in the whole capture.**
+  Every engine thread is parked in libc. The engine is not spinning on anything,
+  it is waiting.
+- **Not blocked on the network.** `ss -tnp` shows two ESTAB HTTPS connections
+  with `Recv-Q 0` and `Send-Q 0`, and nothing in `syn-sent`. No request is
+  hanging at the socket layer, which is worth knowing because "the internet was
+  slow" is the natural first guess and it does not survive.
+- **Not a deadlock.** 0.007 cores. The engine's game thread sits in
+  `looper_poll_once(timeout_millis=50)` with `out_events` non-null -- the
+  native-activity drain-then-draw loop, polling twenty times a second and
+  finding nothing to do. A client that has not been told it may draw looks
+  exactly like this.
+
+lldb unwound this one properly (109 frames past `#0`), unlike the
+`__syscall_cancel_arch_end` case this file records elsewhere.
+
+### What to do next
+
+Find out what the second `PlatformAccountRouter` pass is waiting on. It is a
+platform answer the shell needs and sometimes does not get, and Cordial is what
+answers those. The `--dump-classes` surface and jnivm's unresolved-call register
+are the places to look for a call that goes unanswered on a frozen run and is
+answered on a healthy one -- **diff those two the same way the logs were
+diffed**, because that comparison is what turned this from "presents=1" into a
+named stall in four commands.
+
+**And measure the base rate before testing any fix.** Every attempt on this bug
+so far has been read off three to six runs and three of them were wrong.
+
+## 0-prev. RETRACTED: the freeze is not the focus report, 2026-08-24
 
 **Everything in the section below is wrong and is kept because the way it went
 wrong is the point.** Two further runs, made while building the fix it

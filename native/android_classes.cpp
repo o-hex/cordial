@@ -440,8 +440,36 @@ public:
     // half of it: these are the numbers that say where the box is on screen and
     // what its text should look like, and without them Cordial has nothing to
     // position or style an editor from.
+    /// **The third parameter is not decoration and its absence cost a year.**
+    ///
+    /// `--dump-classes` prints the shape libjnivm actually expects, and for this
+    /// constructor it is
+    ///
+    ///     NativeTextBoxInfo(ENV*, Class*, shared_ptr<java::lang::Class>,
+    ///                       jfloat x5, jboolean, jint x6, jboolean, jboolean)
+    ///
+    /// -- a `java.lang.Class` between the environment and the floats. Without it
+    /// the hook does not match, `init` never runs, `spec_known` stays false, and
+    /// `showKeyboard` is handed an object carrying no geometry. That is the
+    /// whole of "textbox spec unavailable", and therefore the whole of
+    /// characters being invisible until the box blurs: Android places a real
+    /// `EditText` from these numbers, and Cordial had nothing to place one
+    /// from.
+    ///
+    /// Note that the same dump lists `showKeyboard` in *both* shapes, with and
+    /// without that parameter, which is why that hook matched all along and
+    /// this one never did. One overload listed means one shape accepted.
+    ///
+    /// **`INFERRED`: corrected from the dump, and never yet observed firing.**
+    /// It cannot be observed on the boxes reachable so far, because the engine
+    /// hands `showKeyboard` a **null** `NativeTextBoxInfo` for them -- traced
+    /// directly, `info=NULL spec_known=n/a` -- so nothing constructs one and
+    /// this hook is never reached whatever its shape. The signature is still
+    /// worth correcting on the dump's evidence; it is simply not what was
+    /// making text invisible.
     static std::shared_ptr<NativeTextBoxInfo> init(
-        ENV*, Class*, jfloat f0, jfloat f1, jfloat f2, jfloat f3, jfloat f4,
+        ENV*, Class*, std::shared_ptr<jnivm::java::lang::Class>,
+        jfloat f0, jfloat f1, jfloat f2, jfloat f3, jfloat f4,
         jboolean z5, jint i6, jint i7, jint i8, jint i9, jint i10, jint i11,
         jboolean z12, jboolean z13) {
         auto o = std::make_shared<NativeTextBoxInfo>();
@@ -685,6 +713,16 @@ public:
         // exactly like a box with no spec.
         const CordialTextBoxInfo* spec =
             (info && info->spec_known) ? &info->spec : nullptr;
+        // Separates the two ways this arrives empty, which look identical from
+        // "textbox spec unavailable" and lead somewhere completely different: a
+        // null object means the engine had nothing to give, while an object
+        // whose spec is unknown means our `<init>` hook never matched and the
+        // fourteen values went past us.
+        if (getenv("CORDIAL_TRACE_TEXT") != nullptr) {
+            fprintf(stderr, "[cordial] showKeyboard: info=%s spec_known=%s\n",
+                    info ? "object" : "NULL",
+                    info ? (info->spec_known ? "true" : "false") : "n/a");
+        }
         cordial_textbox_focused(handle, text.c_str(), spec);
     }
     static void hideKeyboard(ENV*, Class*) { cordial_textbox_blurred(); }

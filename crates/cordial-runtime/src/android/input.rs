@@ -501,8 +501,65 @@ pub fn report_keyboard_state(current_geometry: (i32, i32)) {
 /// takes one code and no scan code is taking the platform's own.
 ///
 /// `CORDIAL_KEY_ANDROID_CODES=1` restores the old behaviour as a control.
+/// Whether this evdev code is a key a focused text field would consume.
+///
+/// Letters, digits, space and the punctuation between them -- the keys that
+/// produce a character. Deliberately *not* Escape, Tab, Enter, the function
+/// keys, the arrows or the modifiers: a game legitimately hears those while a
+/// box is open, and Escape in particular is how somebody gets out of one.
+///
+/// Ranges rather than a table because evdev's layout is contiguous here:
+/// 2-13 is the number row, 16-27 and 30-41 and 44-53 are the three letter rows
+/// with their neighbouring punctuation, and 57 is space.
+fn evdev_is_text_key(code: i32) -> bool {
+    matches!(code, 2..=13 | 16..=27 | 30..=41 | 44..=53 | 57)
+}
+
+/// Send the game keystrokes that a focused text box has already eaten.
+///
+/// Off by default, because doing it is a bug -- see `pass_key_event`. Kept as
+/// the control, so the old behaviour can be measured against the new one in the
+/// same session rather than argued about.
+fn keys_to_game_while_typing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_KEYS_TO_GAME_WHILE_TYPING").is_some())
+}
+
 pub fn pass_key_event(down: bool, evdev_code: i32, modifiers: i32) {
     if no_pass_key() {
+        return;
+    }
+    // **A focused text box eats its own keys, and the game must not hear them
+    // too.**
+    //
+    // Every path funnels through here, so this is the one place it can be said.
+    // Without it, typing "w" into a chat box also walks the character and "/"
+    // reopens chat over what you were writing -- reported against Sober, which
+    // has the same shape: its #987 describes pressing "/" and the previous
+    // message sending again.
+    //
+    // Android does this for us and that is why the engine never asked: an
+    // `EditText` with focus consumes the key, the IME commits it, and the
+    // activity's own key handler never sees it. Cordial is the platform here,
+    // so the suppression is Cordial's job.
+    //
+    // Only character keys. Escape, Tab, Enter, the arrows, the function keys
+    // and the modifiers still go through -- a game hears those while a box is
+    // open, and Escape is how somebody leaves one.
+    //
+    // `KEYS_HELD` is still updated below, before this returns, or a key held
+    // when a box took focus would never be recorded as released.
+    if !keys_to_game_while_typing()
+        && evdev_is_text_key(evdev_code)
+        && cordial_linker_sys::game_activity::focused_textbox().is_some()
+    {
+        track_key_held(down, evdev_code);
+        if trace_text() {
+            eprintln!(
+                "[cordial] pass_key_event suppressed: code={evdev_code} down={down} \
+                 (a text box has focus and would eat this)"
+            );
+        }
         return;
     }
     track_key_held(down, evdev_code);

@@ -72,6 +72,7 @@ reap
 nohup distrobox enter cordial -- bash -lc "
   cd '$ROOT'
   export CORDIAL_DEV_CONTROL=1 CORDIAL_TRACE_TEXT=1 CORDIAL_INSTR=1
+  ${CORDIAL_KEYS_TO_GAME_WHILE_TYPING:+export CORDIAL_KEYS_TO_GAME_WHILE_TYPING='$CORDIAL_KEYS_TO_GAME_WHILE_TYPING'}
   '$BIN' --headless --lib-dir '$LIB' --apk '$APK' \
     --host-libc --game-activity --run 0 --profile '$PROFILE'
 " > "$LOG" 2>&1 &
@@ -140,4 +141,12 @@ shoot "$SHOT"
 note "step 5 ok: $SHOT ($(stat -c%s "$SHOT") bytes)"
 
 reap
+sup=$(grep -c 'pass_key_event suppressed' "$LOG")
+# Not `nativePassKeyEvent`: that line comes from `super::trace`, which is
+# CORDIAL_TRACE=1, and that aborts the engine -- so it never appears and counting
+# it measures nothing. The trace_text line below is the one that actually fires.
+game=$(grep -cE 'pass_key_event down=' "$LOG")
+note "keys: $sup suppressed, $game reached the game's key handler"
+[ "${CORDIAL_KEYS_TO_GAME_WHILE_TYPING:-}" = "" ] && [ "$game" -gt 0 ] &&
+  note "        WARNING: characters reached the game while a box had focus"
 echo "PASS -- look at $SHOT to judge placement; the steps above prove the path."

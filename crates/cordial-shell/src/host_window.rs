@@ -288,45 +288,47 @@ impl HostWindow {
         canvas.set_vexpand(true);
         let host = Self::new(title, width, height, &canvas);
         host.window.add_css_class("cordial-engine-host");
-        let css = gtk::CssProvider::new();
-        css.load_from_string(
-            // **The window itself is not transparent, and must not be.**
-            //
-            // It was, briefly, and the result was a window nobody could see at
-            // all -- not the canvas, not the header bar, not the background.
-            // Reported as "its just an invisible window, i cant see it, alt tab
-            // its just invisible, but its there".
-            //
-            // A transparent toplevel is only safe while the engine's subsurface
-            // is both painting and stacked above it. Neither holds reliably
-            // today: the canvas is lowered whenever a web-view dialog or the
-            // text overlay is up, and there is an open bug where the engine
-            // presents one frame and then stops. In either state a transparent
-            // window shows the desktop behind it and there is nothing left to
-            // click, read, or even find.
-            //
-            // The drawing area alone stays transparent, which is all the engine
-            // needs: its subsurface covers that region when it is above, and
-            // when it is below the window's own background is what should show
-            // -- an occluded game, which is recoverable, rather than an absent
-            // window, which is not.
-            ".cordial-engine-host drawingarea { \
-                 background-color: transparent; \
-             } \
+        // **The window itself is not transparent, and must not be.**
+        //
+        // It was, briefly, and the result was a window nobody could see at all
+        // -- not the canvas, not the header bar, not the background. Reported
+        // as "its just an invisible window, i cant see it, alt tab its just
+        // invisible, but its there".
+        //
+        // A transparent toplevel is only safe while the engine's subsurface is
+        // both painting and stacked above it, and neither holds reliably today:
+        // the canvas is lowered whenever a web-view dialog or the text overlay
+        // is up, and there is an open bug where the engine presents one frame
+        // and stops. In either state the desktop shows through and there is
+        // nothing left to click, read, or even find. The drawing area alone
+        // stays transparent, which is all the engine needs.
+        //
+        // The header bar takes the desktop's own colours -- that part of
+        // 3d67e59 is worth keeping, and is what stopped the bar being drawn on
+        // a transparent custom background. Its *sizing* is not: the same commit
+        // shrank it to a 30px min-height with 24px controls against a
+        // libadwaita default nearer 47px, which read as "the x in the title bar
+        // looks off and the titlebar looks short". That is now opt-in through
+        // the Appearance page rather than the only option.
+        let compact = matches!(std::env::var("CORDIAL_TITLE_BAR").as_deref(), Ok("compact"));
+        let mut sheet = String::from(
+            ".cordial-engine-host drawingarea { background-color: transparent; } \
              .cordial-engine-host headerbar { \
                  background-color: @headerbar_bg_color; \
                  color: @headerbar_fg_color; \
                  background-image: none; \
-                 min-height: 30px; \
-                 padding: 0 6px; \
-             } \
-             .cordial-engine-host headerbar windowcontrols button { \
-                 min-width: 24px; \
-                 min-height: 24px; \
-                 padding: 0; \
-                 margin: 2px; \
              }",
         );
+        if compact {
+            sheet.push_str(
+                " .cordial-engine-host headerbar { min-height: 30px; padding: 0 6px; } \
+                 .cordial-engine-host headerbar windowcontrols button { \
+                     min-width: 24px; min-height: 24px; padding: 0; margin: 2px; \
+                 }",
+            );
+        }
+        let css = gtk::CssProvider::new();
+        css.load_from_string(&sheet);
         gtk::style_context_add_provider_for_display(
             &WidgetExt::display(&host.window),
             &css,

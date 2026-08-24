@@ -382,6 +382,11 @@ pub fn spawn(
     if !config.gamemode {
         command.env("CORDIAL_GAMEMODE", "0");
     }
+    if let Some(v) = config.title_bar.env_value() {
+        // Absent means the platform default, so a client that predates this
+        // variable behaves exactly as it always has.
+        command.env("CORDIAL_TITLE_BAR", v);
+    }
 
     // When Cordial stops holding the engine awake in the background. Passed
     // unconditionally, unlike `CORDIAL_GRAPHICS` above: there is no plugin

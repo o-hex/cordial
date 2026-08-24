@@ -163,6 +163,10 @@ enum Tier {
 /// else on the desktop. `AppearanceScheme::apply` is what makes this take
 /// effect immediately; this function only wires the row to it and to disk.
 fn build_appearance_page(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> adw::PreferencesPage {
+    // Cloned up front: the theme row's closure below takes ownership of both,
+    // and the title bar row further down needs them too.
+    let config_for_bar = config.clone();
+    let config_path_for_bar = config_path.clone();
     let page = adw::PreferencesPage::builder()
         .title("Appearance")
         .name("appearance")
@@ -200,6 +204,44 @@ fn build_appearance_page(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathB
 
     group.add(&row);
     page.add(&group);
+
+    // ---- the game window's chrome ------------------------------------------
+    //
+    // Two named sizes, not a pixel value. A free number gives chrome that
+    // matches nothing else on the desktop and, under about 30px, clips the
+    // window controls -- which is the "the x in the title bar looks off" that
+    // put this row here in the first place. Somebody who wants the pixels back
+    // properly wants fullscreen, which F11 gives and which persists per profile.
+    let window_group = adw::PreferencesGroup::builder().title("Game window").build();
+    // Order has to match TitleBar::index/from_index.
+    let bar_model = gtk::StringList::new(&["Default", "Compact"]);
+    let bar_row = adw::ComboRow::builder()
+        .title("Title bar")
+        .subtitle("Default matches every other window on your desktop.")
+        .model(&bar_model)
+        .selected(config_for_bar.borrow().title_bar.index())
+        .build();
+    {
+        let config = config_for_bar.clone();
+        let config_path = config_path_for_bar.clone();
+        bar_row.connect_selected_notify(move |row| {
+            let choice = crate::shell_config::TitleBar::from_index(row.selected());
+            config.borrow_mut().title_bar = choice;
+            // Reported rather than swallowed, and the row is not put back:
+            // unlike a switch, a combo that snapped back would hide which value
+            // is actually stored. Saying so is the honest half.
+            if let Err(e) = crate::shell_config::save(&config_path, &config.borrow()) {
+                eprintln!("shell: could not save the title bar choice: {e}");
+            }
+        });
+    }
+    // Says when it applies, because it does not apply to a window already open
+    // and a setting that appears to do nothing is worse than one that explains
+    // itself.
+    bar_row.set_subtitle("Default matches every other window on your desktop. Applies to the next launch.");
+    window_group.add(&bar_row);
+    page.add(&window_group);
+
     page
 }
 

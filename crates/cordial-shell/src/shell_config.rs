@@ -17,6 +17,57 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// How tall the game window's header bar should be.
+///
+/// Exists because 3d67e59 shrank it to a 30px min-height with 24px window
+/// controls, against a libadwaita default nearer 47px, and the result was
+/// reported as "the x in the title bar looks off and the titlebar looks short
+/// now compared to earlier builds". The sizing went back to the platform's, and
+/// this is the way to ask for the compact one on purpose.
+///
+/// **Two named sizes rather than a pixel value, deliberately.** A free number
+/// produces chrome that matches nothing else on the desktop and, below about
+/// 30px, clips the window controls -- which is exactly the "looks off" that
+/// started this. Somebody who wants the game to fill the screen wants
+/// fullscreen, which F11 already gives and which persists per profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TitleBar {
+    /// Whatever the desktop's theme says. The default, and what every other
+    /// window on the machine looks like.
+    #[default]
+    Default,
+    /// A shorter bar with smaller window controls, for people who want the
+    /// pixels back and accept chrome that does not match.
+    Compact,
+}
+
+impl TitleBar {
+    /// Order matches the `AdwComboRow` model in `settings.rs`.
+    pub fn index(self) -> u32 {
+        match self {
+            TitleBar::Default => 0,
+            TitleBar::Compact => 1,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            1 => TitleBar::Compact,
+            _ => TitleBar::Default,
+        }
+    }
+
+    /// What the client is told. Absent means the platform default, so an older
+    /// client that does not know this variable behaves as it always has.
+    pub fn env_value(self) -> Option<&'static str> {
+        match self {
+            TitleBar::Default => None,
+            TitleBar::Compact => Some("compact"),
+        }
+    }
+}
+
 /// What appearance Cordial itself should use.
 ///
 /// Not a desktop-wide setting — `AdwStyleManager::set_color_scheme` applies
@@ -531,6 +582,8 @@ pub const DEFAULT_PROFILE: &str = "default";
 #[serde(default)]
 pub struct ShellConfig {
     pub appearance: AppearanceScheme,
+    /// How tall the game window's header bar is. See [`TitleBar`].
+    pub title_bar: TitleBar,
     /// Where the Roblox build is, when the user has pinned it. Empty is the
     /// normal state and means "look every time" — see `install::locate`, which
     /// explains why a remembered answer is the wrong thing to store here.
@@ -665,6 +718,7 @@ impl Default for ShellConfig {
     fn default() -> Self {
         Self {
             appearance: AppearanceScheme::default(),
+            title_bar: TitleBar::default(),
             roblox: crate::install::RobloxInstall::default(),
             profile: DEFAULT_PROFILE.to_string(),
             automatic_updates: cordial_update::settings::Automatic::default(),

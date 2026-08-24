@@ -1879,6 +1879,7 @@ impl WaylandWindow {
         text: &str,
         caret: i32,
         info: cordial_linker_sys::game_activity::RawTextBoxInfo,
+        fallback: bool,
     ) {
         let mut cache = self.text_overlay_cache.lock().unwrap_or_else(|e| e.into_inner());
         let unchanged = cache.as_ref().is_some_and(|(g, r, old, old_caret, old_info)| {
@@ -1904,6 +1905,7 @@ impl WaylandWindow {
             font_size: info.font_size,
             text_color: info.text_color as u32,
             password: matches!(info.i10, 5 | 9 | 10),
+            fallback,
         }));
         if !self.text_overlay_visible.swap(true, Ordering::SeqCst)
             && self.open_web_view_dialogs.load(Ordering::SeqCst) == 0
@@ -1977,9 +1979,9 @@ impl WaylandWindow {
         // is the one `android_classes.cpp` already refuses, because an editor
         // styled from a stale spec looks like a layout bug rather than a missing
         // value.
-        let info = match cordial_linker_sys::game_activity::focused_textbox_info() {
-            Some(info) => info,
-            None => self.fallback_textbox_info(),
+        let (info, fallback) = match cordial_linker_sys::game_activity::focused_textbox_info() {
+            Some(info) => (info, false),
+            None => (self.fallback_textbox_info(), true),
         };
         if self
             .text_overlay_cache
@@ -1999,6 +2001,7 @@ impl WaylandWindow {
             &text,
             caret,
             info,
+            fallback,
         );
     }
 
@@ -3480,15 +3483,22 @@ impl WaylandWindow {
         let preedit = self.ime.lock().unwrap_or_else(|e| e.into_inner()).preedit.clone();
         let (text, caret) = splice_preedit(&committed, caret, preedit.as_ref());
         super::input::pass_text(which, &text, caret);
-        if let Some(info) = cordial_linker_sys::game_activity::focused_textbox_info() {
-            self.update_text_overlay(
-                cordial_linker_sys::game_activity::textbox_generation(),
-                super::input::text_buffer_revision(),
-                &text,
-                caret,
-                info,
-            );
-        }
+        // Same fallback as `sync_text_overlay`: a box with no spec still has to
+        // show what is being composed, or IME preedit is invisible for exactly
+        // the boxes the engine gives no geometry for -- which is all of them so
+        // far.
+        let (info, fallback) = match cordial_linker_sys::game_activity::focused_textbox_info() {
+            Some(info) => (info, false),
+            None => (self.fallback_textbox_info(), true),
+        };
+        self.update_text_overlay(
+            cordial_linker_sys::game_activity::textbox_generation(),
+            super::input::text_buffer_revision(),
+            &text,
+            caret,
+            info,
+            fallback,
+        );
     }
 
     /// Drive `enable()`/`disable()` off the same focus signal `input.rs`

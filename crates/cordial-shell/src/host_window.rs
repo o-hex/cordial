@@ -253,6 +253,10 @@ pub struct TextOverlay<'a> {
     pub font_size: f32,
     pub text_color: u32,
     pub password: bool,
+    /// True when the engine gave no geometry and Cordial placed the editor
+    /// itself. Such an editor is not sitting on the box, so it has to carry its
+    /// own chrome to be legible -- see the CSS class below.
+    pub fallback: bool,
 }
 
 fn displayed_editor_text(text: &str, caret_chars: i32, password: bool) -> String {
@@ -324,7 +328,14 @@ impl HostWindow {
                  color: @headerbar_fg_color; \
                  background-image: none; \
              } \
-             .cordial-engine-host.cordial-canvas-below { background-color: transparent; }",
+             .cordial-engine-host.cordial-canvas-below { background-color: transparent; } \
+             .cordial-text-fallback { \
+                 background-color: rgba(28, 28, 30, 0.94); \
+                 color: #ffffff; \
+                 border: 1px solid rgba(255, 255, 255, 0.25); \
+                 border-radius: 8px; \
+                 padding: 6px 10px; \
+             }",
         );
         if compact {
             sheet.push_str(
@@ -463,6 +474,22 @@ impl HostWindow {
             overlay.x.round() as f64,
             overlay.y.round() as f64,
         );
+        // **A bare label is invisible half the time.** With the engine's own
+        // spec the editor sits on the box and takes the box's colour, which is
+        // right. With a synthesised placement it floats over whatever happens
+        // to be there -- and Roblox's own search dropdown is white, so white
+        // text on it renders nothing at all. Reported as "I don't think it's
+        // even drawing"; it was drawing, in white, on white.
+        //
+        // So the placed editor carries chrome: a panel behind it, the way a
+        // real text field does. That is also the honest signal that it is not
+        // the box -- an unstyled string floating mid-screen reads as a glitch,
+        // a field reads as a field.
+        if overlay.fallback {
+            self.text_label.add_css_class("cordial-text-fallback");
+        } else {
+            self.text_label.remove_css_class("cordial-text-fallback");
+        }
         self.text_label.set_visible(true);
         self.window.queue_draw();
     }

@@ -57,25 +57,46 @@ CMake cache is configured against that clang, and touching `native/` inside
 archiver. `tools/text-entry-check.sh` still launches the client inside the
 container, because `cage` is only there.
 
-### The decision that supersedes the current editor
+### The editor is a real GTK field, as of `fd0f0c6`
 
-**The text editor should be a real GTK text field, not a `GtkLabel` mirroring
-our own buffer.** The user's words on 2026-08-25: *"The text field is so weird,
-i want to use gtk field because our own handling is ultra awkward."* That
-outranks the analysis recorded in commit `4c43e4e`, which argued for keeping
-the Label because `zwp_text_input_v3` already gives us IME at the protocol
-level and a `GtkText` would take keyboard focus away from the runtime's own
-`wl_keyboard`. That argument is about implementation cost; it is not a reason
-to keep an editor that is awkward to use, and the awkwardness is the point.
+`gtk::Text` -- the bare editable widget from inside a `GtkEntry` -- placed on
+the focused box and owning the text. Cordial's buffer is now a mirror of it,
+which is what the `CORDIAL_NO_TEXT_BUFFER` comment in `wayland.rs` has been
+asking for since it was written.
 
-Whoever picks this up: the hard part is not the widget. It is that
-`crates/cordial-runtime/src/android/wayland.rs` binds its own `wl_keyboard` and
-implements `zwp_text_input_v3` itself, and `input.rs` owns the text buffer that
-`syncTextboxTextAndCursorPosition2` is driven from. A `GtkText` owns a buffer
-and wants focus, so the two have to be reconciled rather than stacked. Note
-that Android's own `EditText` *is* the authoritative buffer and syncs to the
-engine, so handing authority to the widget is closer to the platform contract
-than what exists today, not further from it.
+Three things were reconciled to get there, and the module doc in `wayland.rs`
+predicted all three:
+
+- **Two `wl_keyboard` objects.** Cordial binds its own alongside GDK's, so both
+  see every key. `dispatch_key` now returns before touching the buffer while a
+  box has focus -- after `pass_key_event`, so text keys are still kept out of
+  the game exactly as before.
+- **Two `zwp_text_input_v3` objects.** GTK's wins: the widget holds the text,
+  the caret rectangle and the surrounding context, which is all an input method
+  is given. Cordial's is no longer enabled, and deliberately not destroyed, so
+  whether two on one seat is tolerated stays answerable by running.
+- **The input region.** The punch that lets clicks reach the engine subtracts
+  the canvas, and the editor is inside the canvas, so it was subtracting the
+  editor too. Its rectangle is unioned back in.
+
+**What is measured:** real keys through a nested compositor's virtual keyboard
+land in the widget and nowhere else -- four `wlrctl` calls produced
+`hellohixrivals`, in order, each character once. Use `wlrctl`, not
+`cordial_text`: the MCP drives Cordial's own entry points and exercises only
+the path that *seeds* the widget, so it will report success whatever GTK does.
+
+**What is not, and the two things to check on a real desktop:**
+
+1. **The double-insert guard is `INFERRED`.** Cage's headless seat advertises no
+   keyboard and Cordial reads `SEAT_CAPS` once at `open()`, so its key path
+   never runs in this harness. Driving a virtual keyboard in a loop before
+   `open()` does make it bind -- the "advertises no keyboard" line disappears --
+   but the compositor then sends it no keymap and no keys. A real seat has a
+   keyboard from boot and the path does run. **If the guard is wrong the
+   symptom is unmistakable: every character appears twice.**
+2. **Resize with the editor up.** `editor_rect` is in surface coordinates and
+   the region is recomputed on stacking and placement changes only, never on
+   configure. ADR-022 already flagged this and it is still open.
 
 ## The one rule
 

@@ -277,10 +277,44 @@ pub fn backend_focused() -> Option<bool> {
         Backend::Wayland => wayland::focused(),
         Backend::X11 => None,
     };
-    match (focused, backend_visible()) {
-        (Some(true), Some(false)) => Some(false),
-        (f, _) => f,
-    }
+    // **Visibility does not answer the focus question, and conflating them
+    // killed clients.**
+    //
+    // This used to read `(Some(true), Some(false)) => Some(false)`: a window the
+    // compositor said was focused but not visible was reported to the engine as
+    // unfocused. `visible()` is `xdg_toplevel`'s SUSPENDED or MINIMIZED, and the
+    // intent was to stop simulating behind something -- reasonable, and wrong in
+    // one specific way that matters more than the saving.
+    //
+    // Focus is only ever reported on a *transition*. So a `false` manufactured
+    // from a SUSPENDED that the compositor never clears can never be taken back:
+    // the engine gets APP_CMD_LOST_FOCUS, stops drawing, and no later
+    // APP_CMD_GAINED_FOCUS is ever sent because, as far as this function is
+    // concerned, nothing changed. The window stays on screen, plainly focused,
+    // and dead.
+    //
+    // That is what the engine's own log shows on a client frozen for eleven
+    // minutes -- found by reading `appData/logs/*_Player_*.log`, which Cordial
+    // writes every run and which nothing here had ever looked at:
+    //
+    //     t=13.08  nativeActivity_onSurfaceChanged: state:7
+    //     t=13.09  APP_CMD_WINDOW_REDRAW_NEEDED
+    //     t=17.33  APP_CMD_LOST_FOCUS
+    //     (then six hundred seconds of nothing but flag-cache timers)
+    //
+    // The 17 s matters: presents drop to the 1.0/s idle throttle at about
+    // thirteen seconds, so the loss lands on an already-quiet engine and takes
+    // it to zero. An earlier scripted test that dropped focus at 3.9 s appeared
+    // to disprove all of this, because at 3.9 s the engine is still in its 60/s
+    // startup phase and carries on drawing regardless. The artificial test was
+    // measuring a different moment than the bug.
+    //
+    // So focus now means focus. An occluded window may keep simulating, which
+    // costs CPU that was worth reclaiming; a window that can never be told it
+    // has focus again costs the whole session. `backend_visible` is unchanged
+    // and still available to the pump's own throttle, which is where a
+    // visibility policy belongs.
+    focused
 }
 
 /// Whether to tell the engine about focus changes at all. On by default.

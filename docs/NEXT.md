@@ -40,7 +40,66 @@ had looked in `appData/`.
 
 # What is blocking
 
-## 0. Why typed text is invisible: the engine sends no geometry, 2026-08-24
+## 0. SOLVED: typed text renders, in the box, 2026-08-25
+
+**The engine sends geometry every time. Cordial could not receive it, because
+the `<init>` hook was one argument short.**
+
+`CORDIAL_JNI_TRACE=1 cargo build` prints the descriptor the engine looks up:
+
+    Found symbol, Class=`...NativeTextBoxInfo`, StaticMethod=`<init>`,
+      Signature=`(FFFFFZIIIIIIZZZ)L...NativeTextBoxInfo;`
+    Call Unknown Static Function ... Method=`<init>`
+
+Five floats, a boolean, six ints, **three** booleans. The hook had two. A
+signature that never matches means `<init>` resolves to nothing, `new
+NativeTextBoxInfo(...)` yields null, and the engine hands that null to
+`showKeyboard` -- which is the `info=NULL` this section previously concluded
+meant "the engine sends nothing". It sends everything.
+
+With the fifteenth slot in place, clicking the home search bar:
+
+    textbox spec from showKeyboard x=516 y=10 w=358 h=36 fontSize=20
+      textColor=0xff202227
+
+and a screenshot taken in the same second shows the caret sitting at the left
+edge of that search field, in the field's own colour, with no fallback chrome.
+Placement is correct when a spec arrives.
+
+### What the platform contract actually is
+
+The engine calls `glViewTextBoxFocused`, **stops painting the box's contents**,
+and calls `showKeyboard` with a `NativeTextBoxInfo`. Android answers with a real
+`EditText` styled from those numbers, and *that widget* draws the characters --
+Gboard does not, no IME does. Cordial is the platform, so the editor is
+Cordial's obligation rather than a workaround. Sober #99 has a maintainer
+confirming the same TextBox working on the Android client and not on Sober;
+Sober #987 is the same symptom, open since 2025-06-14.
+
+### Two answers the engine gives, and only one is geometry
+
+The home search bar reports `x=516 y=10 w=358 h=36`. The search *modal* it opens
+then reports `x=0 y=0 w=0 h=0`. A zeroed spec arrives as `Some(info)`, so taking
+it at face value placed a 0x0 editor -- invisible, and it defeated the fallback.
+Both call sites now treat non-positive width or height as no usable geometry.
+
+### The rest of the platform obligation
+
+A focused box eats its own keys. `pass_key_event` was forwarding every character
+to the engine's general key handler as well, so "w" in a chat box walked the
+character. Measured: 12 suppressed / 0 forwarded by default, 0 / 12 with
+`CORDIAL_KEYS_TO_GAME_WHILE_TYPING=1`. Escape, Tab, Enter, arrows, function keys
+and modifiers still reach the game.
+
+### How to check it without a person
+
+`tools/text-entry-check.sh [profile] [text]`. It polls for readiness rather than
+sleeping, retries the click, captures with `grim` -- `cordial_screenshot` reads
+the engine's swapchain and cannot see a GTK editor at all -- and asserts each
+step separately so a failure names the step. It warns rather than passes when
+the geometry is zeroed, which is how the 0x0 bug was found on its first run.
+
+## 0-prev. Why typed text is invisible: the engine sends no geometry, 2026-08-24
 
 **Traced, not inferred.** `showKeyboard`'s fourth argument is the
 `NativeTextBoxInfo` saying where the box is and how its text is drawn -- Android

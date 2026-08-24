@@ -290,7 +290,27 @@ impl HostWindow {
         host.window.add_css_class("cordial-engine-host");
         let css = gtk::CssProvider::new();
         css.load_from_string(
-            ".cordial-engine-host, .cordial-engine-host drawingarea { \
+            // **The window itself is not transparent, and must not be.**
+            //
+            // It was, briefly, and the result was a window nobody could see at
+            // all -- not the canvas, not the header bar, not the background.
+            // Reported as "its just an invisible window, i cant see it, alt tab
+            // its just invisible, but its there".
+            //
+            // A transparent toplevel is only safe while the engine's subsurface
+            // is both painting and stacked above it. Neither holds reliably
+            // today: the canvas is lowered whenever a web-view dialog or the
+            // text overlay is up, and there is an open bug where the engine
+            // presents one frame and then stops. In either state a transparent
+            // window shows the desktop behind it and there is nothing left to
+            // click, read, or even find.
+            //
+            // The drawing area alone stays transparent, which is all the engine
+            // needs: its subsurface covers that region when it is above, and
+            // when it is below the window's own background is what should show
+            // -- an occluded game, which is recoverable, rather than an absent
+            // window, which is not.
+            ".cordial-engine-host drawingarea { \
                  background-color: transparent; \
              } \
              .cordial-engine-host headerbar { \

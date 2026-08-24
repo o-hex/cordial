@@ -1726,6 +1726,13 @@ impl WaylandWindow {
             }
             return;
         };
+        // Punch the canvas out of the parent's opaque and input regions, every
+        // time the geometry moves. GTK recomputes both on a resize, so setting
+        // them once at startup would be quietly undone by the first one -- and
+        // the symptom of that is a canvas that stops taking clicks with nothing
+        // on screen to say why.
+        self.host.0.set_canvas_cutout(x, y, w, h);
+
         // The other half of the same signal: a rectangle that came back after
         // there was none, and the size it came back with.
         if NO_CONTENT_RECT.swap(false, Ordering::Relaxed) {
@@ -2013,6 +2020,13 @@ impl WaylandWindow {
     /// `parent_surface` directly as well, the same belt-and-braces the
     /// geometry sync already needed.
     fn set_engine_stacking(&self, above: bool) {
+        // The window has to stop painting its own background over the canvas
+        // for a lowered engine to be visible at all -- punching the opaque
+        // region is not enough, because GTK's pixels are still there. Measured:
+        // region punched, background opaque, engine lowered, canvas completely
+        // black. Paired here so the two can never disagree, and so the window
+        // is only ever see-through while something is painting underneath it.
+        self.host.0.set_canvas_see_through(!above);
         let opcode = if above { WL_SUBSURFACE_PLACE_ABOVE } else { WL_SUBSURFACE_PLACE_BELOW };
         // SAFETY: `self.subsurface` is a live proxy for the process's
         // lifetime; `self.parent_surface` is the only valid sibling reference

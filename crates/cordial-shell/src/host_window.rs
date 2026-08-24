@@ -311,13 +311,20 @@ impl HostWindow {
         // looks off and the titlebar looks short". That is now opt-in through
         // the Appearance page rather than the only option.
         let compact = matches!(std::env::var("CORDIAL_TITLE_BAR").as_deref(), Ok("compact"));
+        // The see-through state is a class rather than the default, and that
+        // distinction is the whole lesson of 5a295e3. A permanently transparent
+        // toplevel shows the desktop whenever the engine is not painting, which
+        // is a window nobody can find. Transparent *only while the engine is
+        // deliberately lowered* is safe, because in that state the engine is by
+        // definition the thing painting the canvas.
         let mut sheet = String::from(
             ".cordial-engine-host drawingarea { background-color: transparent; } \
              .cordial-engine-host headerbar { \
                  background-color: @headerbar_bg_color; \
                  color: @headerbar_fg_color; \
                  background-image: none; \
-             }",
+             } \
+             .cordial-engine-host.cordial-canvas-below { background-color: transparent; }",
         );
         if compact {
             sheet.push_str(
@@ -497,6 +504,70 @@ impl HostWindow {
         let surface = self.window.surface()?;
         let surface = surface.downcast::<gdk4_wayland::WaylandSurface>().ok()?;
         surface.wl_surface_raw().map(std::ptr::NonNull::as_ptr)
+    }
+
+    /// Make the window see-through so a lowered engine subsurface is visible,
+    /// or opaque again when it is raised back.
+    ///
+    /// Paired with `set_engine_stacking`, and only meaningful together: GTK
+    /// paints the window's own background across the canvas area, so declaring
+    /// the region non-opaque is not enough on its own -- the pixels are still
+    /// there. Measured: with the region punched but the background opaque, a
+    /// lowered engine stays completely hidden.
+    ///
+    /// Deliberately not the default state. A toplevel that is always
+    /// transparent shows the desktop through itself the moment the engine stops
+    /// painting, which is the invisible window 5a295e3 had to fix. Tying it to
+    /// the lowered state means it is only ever transparent while something is
+    /// known to be painting underneath.
+    pub fn set_canvas_see_through(&self, on: bool) {
+        if on {
+            self.window.add_css_class("cordial-canvas-below");
+        } else {
+            self.window.remove_css_class("cordial-canvas-below");
+        }
+    }
+
+    /// Tell the compositor that the canvas rectangle is neither opaque nor
+    /// ours to click, so a lowered engine subsurface shows through it.
+    ///
+    /// **This is what stops the game going black while a text overlay or a web
+    /// view is up.** Those lower the engine beneath the parent so GTK can draw
+    /// on top; with an opaque parent the compositor is then entitled to skip
+    /// painting the engine entirely, and the whole canvas goes flat. Punching
+    /// the rectangle out of the opaque region is the compositor's cue that
+    /// there is something underneath worth compositing.
+    ///
+    /// The input region is punched to match, for the same reason and in the
+    /// same call: whatever is visible there should also be clickable there.
+    /// Without it the parent swallows clicks aimed at a lowered canvas --
+    /// measured, with an explicit region two synthetic clicks produced four
+    /// `nativePassMouseButton` calls into the engine and without it zero.
+    ///
+    /// Called from `sync_canvas_geometry`, which already runs on every
+    /// allocation change. That is deliberate: GTK recomputes its own regions
+    /// when the window resizes, so a region set once at startup would be
+    /// silently reverted by the first resize, and the canvas would stop taking
+    /// clicks with nothing to show why.
+    pub fn set_canvas_cutout(&self, x: i32, y: i32, w: i32, h: i32) {
+        let Some(surface) = self.window.surface() else { return };
+        let (sw, sh) = (surface.width(), surface.height());
+        if sw <= 0 || sh <= 0 || w <= 0 || h <= 0 {
+            return;
+        }
+        let whole = gtk::cairo::RectangleInt::new(0, 0, sw, sh);
+        let region = gtk::cairo::Region::create_rectangle(&whole);
+        if region.subtract_rectangle(&gtk::cairo::RectangleInt::new(x, y, w, h)).is_err() {
+            return;
+        }
+        surface.set_input_region(Some(&region));
+        // Deprecated since GDK 4.16, which computes its own from the render
+        // tree -- and its own answer is "the whole surface", because the
+        // drawing area being transparent is not something it can see through
+        // to a subsurface with. Calling it anyway is the only way to say what
+        // is actually true here.
+        #[allow(deprecated)]
+        surface.set_opaque_region(Some(&region));
     }
 
     /// Whether the compositor currently considers this window focused.

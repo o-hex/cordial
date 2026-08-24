@@ -553,6 +553,47 @@ impl HostWindow {
         } else {
             self.window.remove_css_class("cordial-canvas-below");
         }
+        self.set_canvas_input_passthrough(on);
+    }
+
+    /// Let pointer events over the canvas reach the engine's subsurface instead
+    /// of being swallowed by GTK's.
+    ///
+    /// **Paired with lowering, and useless apart from it.** While the engine's
+    /// subsurface sits *above* the parent it holds pointer focus over the
+    /// canvas and this is unnecessary. The moment it is lowered -- which is
+    /// what makes a web view or the text editor visible -- GTK's surface is on
+    /// top and receives every click, so nothing reaches the game. Reported as
+    /// "you can't click out a box?": with the editor up, the click that should
+    /// dismiss it never arrives anywhere.
+    ///
+    /// GTK does not do this for us. Measured with `WAYLAND_DEBUG=1`: it sends
+    /// `set_input_region` once for the whole surface plus the CSD shadow and
+    /// never revisits it, whatever its content's transparency. With the punch,
+    /// two synthetic clicks over the canvas produced four
+    /// `nativePassMouseButton` calls into the engine; without it, zero.
+    ///
+    /// Restoring passes `None`, which is the protocol's own "infinite region":
+    /// `wl_surface.set_input_region(NULL)` means the whole surface takes input,
+    /// which is exactly the default being returned to. Building a
+    /// whole-surface rectangle instead would be the same thing spelled less
+    /// clearly, and wrong the moment the surface is resized between the punch
+    /// and the restore.
+    fn set_canvas_input_passthrough(&self, on: bool) {
+        let Some(surface) = self.window.surface() else { return };
+        if !on {
+            surface.set_input_region(None);
+            return;
+        }
+        let Some((cx, cy, cw, ch)) = self.content_rect() else { return };
+        let w = surface.width().max(cx + cw);
+        let h = surface.height().max(cy + ch);
+        let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, w, h));
+        // Subtract rather than build up from the chrome: the header bar is not
+        // the only thing outside the canvas, and enumerating the rest by hand
+        // would go stale the first time the layout changes.
+        let _ = region.subtract_rectangle(&gtk::cairo::RectangleInt::new(cx, cy, cw, ch));
+        surface.set_input_region(Some(&region));
     }
 
     /// Tell the compositor that the canvas rectangle is neither opaque nor

@@ -1978,6 +1978,11 @@ pub mod game_activity {
         /// that genuinely differs, such as an in-experience chat entry.
         pub z12: i32,
         pub z13: i32,
+        /// The fifteenth constructor slot. The dex signature is
+        /// `(FFFFFZIIIIIIZZZ)` -- three trailing booleans, not two -- and
+        /// omitting this one made the whole hook fail to match. Unnamed
+        /// because nothing has established what it means, only that it exists.
+        pub z14: i32,
     }
 
     /// The focused box's spec, or `None` when nothing is focused or the engine
@@ -2243,11 +2248,11 @@ pub mod game_activity {
                 handle: i64, text: *const c_char,
                 f0: f32, f1: f32, f2: f32, f3: f32, f4: f32, z5: c_int,
                 i6: c_int, i7: c_int, i8: c_int, i9: c_int, i10: c_int, i11: c_int,
-                z12: c_int, z13: c_int,
+                z12: c_int, z13: c_int, z14: c_int,
             );
         }
 
-        /// The fourteen values arriving in the slots they were sent to, with
+        /// The fifteen values arriving in the slots they were sent to, with
         /// C++ naming the members on its side and Rust naming them again on
         /// this one. That is what makes the two layouts have to agree: a test
         /// that handed a Rust-built struct to `cordial_textbox_focused` and
@@ -2273,7 +2278,7 @@ pub mod game_activity {
                     42, text.as_ptr(),
                     1.5, 2.5, 3.5, 4.5, 5.5, 1,
                     6, 7, 8, 9, 10, 11,
-                    0, 1,
+                    0, 1, 1,
                 )
             };
 
@@ -2284,7 +2289,7 @@ pub mod game_activity {
                     x: 1.5, y: 2.5, width: 3.5, height: 4.5, font_size: 5.5,
                     z5: 1,
                     i6: 6, i7: 7, text_color: 8, i9: 9, i10: 10, i11: 11,
-                    z12: 0, z13: 1,
+                    z12: 0, z13: 1, z14: 1,
                 })
             );
 

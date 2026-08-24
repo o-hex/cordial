@@ -294,8 +294,25 @@ pub fn apply_queued(handle: i64) {
                 crate::android::input::pass_key_event(down, evdev, modifiers)
             }
             Cmd::Text(s) => {
-                let cursor = s.chars().count() as i32;
-                crate::android::input::pass_text(0, &s, cursor)
+                // **Per character, through the same path a keystroke takes.**
+                //
+                // This used to call `pass_text` once with the whole string,
+                // which reaches the engine but never touches Cordial's own text
+                // buffer -- and the editor draws from that buffer. So the MCP
+                // could type into a box, the engine would act on it (search
+                // suggestions updated), and the editor showed an empty field
+                // with a caret. That is not a bug in the editor; it is this
+                // command bypassing the thing the editor reads.
+                //
+                // It also meant `cordial_text` could not exercise the
+                // per-keystroke path at all, so an agent testing text entry
+                // through the MCP was testing a paste and reporting on typing.
+                // `handle` here is the **GameActivity** handle, which is what
+                // `script_type` wants -- the same thing `looper.rs` passes it
+                // from `game_activity_handle`. Handing it the *focused textbox*
+                // handle instead segfaulted the client on the first keystroke,
+                // silently, with no panic and the log ending mid-`pass_key_event`.
+                crate::android::input::script_type(handle, &s, now_ms());
             }
             Cmd::Scroll { x, y, detents } => {
                 crate::android::input::wheel(handle, x, y, 0.0, detents, now_ms())

@@ -117,7 +117,7 @@ struct CordialTextBoxInfo {
     int i6, i7;
     int text_color;
     int i9, i10, i11;
-    int z12, z13;
+    int z12, z13, z14;
 };
 
 namespace {
@@ -271,7 +271,8 @@ extern "C" int cordial_textbox_info(CordialTextBoxInfo* out) {
 extern "C" void cordial_textbox_test_focus(long long handle, const char* text,
                                            float s0, float s1, float s2, float s3,
                                            float s4, int s5, int s6, int s7, int s8,
-                                           int s9, int s10, int s11, int s12, int s13) {
+                                           int s9, int s10, int s11, int s12, int s13,
+                                           int s14) {
     CordialTextBoxInfo info{};
     info.x = s0;
     info.y = s1;
@@ -287,6 +288,7 @@ extern "C" void cordial_textbox_test_focus(long long handle, const char* text,
     info.i11 = s11;
     info.z12 = s12;
     info.z13 = s13;
+    info.z14 = s14;
     cordial_textbox_focused(handle, text, &info);
 }
 
@@ -440,38 +442,35 @@ public:
     // half of it: these are the numbers that say where the box is on screen and
     // what its text should look like, and without them Cordial has nothing to
     // position or style an editor from.
-    /// **The third parameter is not decoration and its absence cost a year.**
+    /// **Fifteen arguments, not fourteen, and the fifteenth is why text was
+    /// invisible for a year.**
     ///
-    /// `--dump-classes` prints the shape libjnivm actually expects, and for this
-    /// constructor it is
+    /// libjnivm's trace prints the signature the engine actually asks for:
     ///
-    ///     NativeTextBoxInfo(ENV*, Class*, shared_ptr<java::lang::Class>,
-    ///                       jfloat x5, jboolean, jint x6, jboolean, jboolean)
+    ///     Found symbol, Class=`...NativeTextBoxInfo`, StaticMethod=`<init>`,
+    ///       Signature=`(FFFFFZIIIIIIZZZ)L...NativeTextBoxInfo;`
+    ///     Call Unknown Static Function ... Method=`<init>`
     ///
-    /// -- a `java.lang.Class` between the environment and the floats. Without it
-    /// the hook does not match, `init` never runs, `spec_known` stays false, and
-    /// `showKeyboard` is handed an object carrying no geometry. That is the
-    /// whole of "textbox spec unavailable", and therefore the whole of
-    /// characters being invisible until the box blurs: Android places a real
-    /// `EditText` from these numbers, and Cordial had nothing to place one
-    /// from.
+    /// Five floats, a boolean, six ints, then **three** booleans. This hook had
+    /// two. One argument short is a signature that never matches, so `<init>`
+    /// resolved to nothing, `new NativeTextBoxInfo(...)` produced null, and the
+    /// engine passed that null straight into `showKeyboard` -- which is the
+    /// `info=NULL` every trace here showed, and therefore the whole of
+    /// "characters are invisible until the box loses focus". Android places a
+    /// real `EditText` from these numbers; Cordial received none of them.
     ///
-    /// Note that the same dump lists `showKeyboard` in *both* shapes, with and
-    /// without that parameter, which is why that hook matched all along and
-    /// this one never did. One overload listed means one shape accepted.
+    /// An earlier attempt added a `shared_ptr<java::lang::Class>` third
+    /// parameter, read off `--dump-classes`. That was wrong: the dump prints
+    /// libjnivm's own receiver convention for the generated class, not a
+    /// parameter of the Java constructor. The trace is the authority here
+    /// because it prints the descriptor the engine looked up.
     ///
-    /// **`INFERRED`: corrected from the dump, and never yet observed firing.**
-    /// It cannot be observed on the boxes reachable so far, because the engine
-    /// hands `showKeyboard` a **null** `NativeTextBoxInfo` for them -- traced
-    /// directly, `info=NULL spec_known=n/a` -- so nothing constructs one and
-    /// this hook is never reached whatever its shape. The signature is still
-    /// worth correcting on the dump's evidence; it is simply not what was
-    /// making text invisible.
+    /// `CORDIAL_JNI_TRACE=1 cargo build` is what makes that visible, and it is
+    /// the tool to reach for whenever a hook silently does nothing.
     static std::shared_ptr<NativeTextBoxInfo> init(
-        ENV*, Class*, std::shared_ptr<jnivm::java::lang::Class>,
-        jfloat f0, jfloat f1, jfloat f2, jfloat f3, jfloat f4,
+        ENV*, Class*, jfloat f0, jfloat f1, jfloat f2, jfloat f3, jfloat f4,
         jboolean z5, jint i6, jint i7, jint i8, jint i9, jint i10, jint i11,
-        jboolean z12, jboolean z13) {
+        jboolean z12, jboolean z13, jboolean z14) {
         auto o = std::make_shared<NativeTextBoxInfo>();
         // Positional on purpose: these are the constructor's slots, and only
         // some of them have earned a name. See `CordialTextBoxInfo`.
@@ -479,7 +478,7 @@ public:
             f0, f1, f2, f3, f4,
             z5 ? 1 : 0,
             i6, i7, i8, i9, i10, i11,
-            z12 ? 1 : 0, z13 ? 1 : 0,
+            z12 ? 1 : 0, z13 ? 1 : 0, z14 ? 1 : 0,
         };
         o->spec_known = true;
         cordial_textbox_last_built(&o->spec);

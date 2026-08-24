@@ -381,6 +381,20 @@ spins faster. Full working in `docs/analysis/startup-and-idle-cost.md`.
 which answers without listening can never deliver an input event, a wake or a
 surface change.
 
+**CPU affinity is not a lever, and this is measured rather than argued.** The
+idea was to keep the engine's hot thread on a P-core and push background threads
+off it. The engine has already done it: every thread in the process carries an
+affinity mask of `fff` -- CPUs 0-11, which on this machine is exactly the six
+hyperthreaded P-cores, with the four E-cores excluded. The busiest thread sits on
+cpu 7, one of the four 4900 MHz top-bin cores. **Cordial sets no affinity
+anywhere** (`sched_setaffinity` appears nowhere in the tree) and an ordinary
+shell on the same machine gets `ffff`, so the mask is Roblox's own choice --
+which is what a client written for Android big.LITTLE would do.
+
+There is also nothing to relieve: one hot thread against twelve logical P-cores
+is not contention. Overriding the engine's own placement would be arguing with a
+decision it made deliberately, on hardware where it happens to be right.
+
 Two levers remain and both are trades rather than fixes. The focus report
 (128% focused against 27.5% unfocused, at the same frame rate and the same
 `ident` count) means telling the engine a focused window is unfocused. Making

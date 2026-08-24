@@ -614,6 +614,85 @@ impl std::fmt::Display for Error {
 /// signed in at the time. There is nothing to ask, so the only available check
 /// is whether such a process exists at all; deferring costs one launch against
 /// an empty profile, and getting it wrong costs a session.
+/// Everything the Roblox engine keeps in `<profile>/data`, and what removing it
+/// costs.
+///
+/// **Not "the cache", though that is most of it by size.** `data/` holds the
+/// engine's downloaded assets and flag caches, and also its `LocalStorage`,
+/// `rbx-storage.db` and `ClientSettings` -- state the engine wrote and expects
+/// to find. Calling the control "clear cached data" and quietly deleting local
+/// storage would be the kind of label this project treats as a lie, so the
+/// caller says what it is.
+///
+/// What it does **not** touch: the sign-in, which lives in the desktop secret
+/// service rather than here, and Cordial's own per-profile files -- window
+/// geometry, plugin grants, enablement -- which sit beside `data/` rather than
+/// inside it. Somebody who clears this stays signed in and keeps what they
+/// allowed their plugins to do.
+///
+/// This exists because it is the only thing known to clear the freeze reported
+/// on 2026-08-24, where a signed-in client reached Home and then presented
+/// nothing. Moving `data/` aside fixed it twice running; **why** is still
+/// unknown, and an attempt to narrow it to the 2.0 GB cache alone was invalid.
+/// So the control removes the whole directory, which is the thing that was
+/// actually measured to work, rather than a subset that was not.
+pub fn engine_data_dir(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("data")
+}
+
+/// Bytes under `<profile>/data`, or 0 if it is absent or unreadable.
+///
+/// Best effort: this exists to put a number on a button, and a dialog that
+/// refused to open because a directory walk hit a permission error would be
+/// worse than one that under-reports.
+pub fn engine_data_bytes(profile_dir: &Path) -> u64 {
+    fn walk(dir: &Path, total: &mut u64) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.is_dir() {
+                walk(&e.path(), total);
+            } else {
+                *total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    let mut total = 0;
+    walk(&engine_data_dir(profile_dir), &mut total);
+    total
+}
+
+/// Delete `<profile>/data`, returning what it freed.
+///
+/// **Renamed aside first, then deleted.** A half-removed `data/` is worse than
+/// either state -- the engine would find some of its files and not others, and
+/// this project has spent a day on a bug that presents as exactly that kind of
+/// inconsistency. The rename is atomic within the profile, so an interrupted
+/// call leaves either the old directory or none, never half of one.
+pub fn clear_engine_data(profile_dir: &Path) -> Result<u64, String> {
+    let data = engine_data_dir(profile_dir);
+    if !data.exists() {
+        return Ok(0);
+    }
+    let freed = engine_data_bytes(profile_dir);
+    let aside = profile_dir.join("data.clearing");
+    let _ = std::fs::remove_dir_all(&aside);
+    std::fs::rename(&data, &aside).map_err(|e| format!("{}: {e}", data.display()))?;
+    std::fs::remove_dir_all(&aside).map_err(|e| format!("{}: {e}", aside.display()))?;
+    Ok(freed)
+}
+
+/// A size for a sentence.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [("GB", 1_000_000_000), ("MB", 1_000_000), ("kB", 1_000)];
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1} {unit}", bytes as f64 / scale as f64);
+        }
+    }
+    format!("{bytes} bytes")
+}
+
 pub fn migrate_legacy_layout() -> Option<PathBuf> {
     let legacy = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)

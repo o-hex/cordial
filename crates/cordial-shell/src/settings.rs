@@ -422,6 +422,111 @@ fn build_roblox_page(
     // way to launching rather than a setting to go and find, and because two
     // controls writing `ShellConfig.profile` would be two things to keep
     // agreeing with each other.
+
+    // ---- stored data --------------------------------------------------------
+    //
+    // Here rather than in General because it is Roblox's data, not Cordial's,
+    // and because this page is where somebody already goes to think about the
+    // build.
+    let data_group = adw::PreferencesGroup::builder()
+        .title("Stored data")
+        .description(
+            "Roblox keeps its downloaded assets, caches and local storage in this profile.              Clearing it does not sign you out and does not touch your plugins.",
+        )
+        .build();
+
+    let profile_name = config.borrow().profile.clone();
+    let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
+    let bytes = profile_dir.as_ref().map(|d| cordial_shell::profile::engine_data_bytes(d)).unwrap_or(0);
+
+    let clear_row = adw::ActionRow::builder()
+        .title("Clear Roblox's stored data")
+        .subtitle(if bytes == 0 {
+            format!("Nothing stored for the {profile_name} profile yet.")
+        } else {
+            format!(
+                "{} for the {profile_name} profile. It is downloaded again as you use Roblox.",
+                cordial_shell::profile::human_bytes(bytes)
+            )
+        })
+        .build();
+    clear_row.set_subtitle_lines(2);
+
+    let clear = gtk::Button::with_label("Clear");
+    clear.set_valign(gtk::Align::Center);
+    clear.add_css_class("destructive-action");
+    // Nothing to clear is not a reason to draw a button that cannot work, the
+    // same rule the plugin gear and the remove-dialog checkbox already follow.
+    clear.set_sensitive(bytes > 0 && profile_dir.is_some());
+    clear_row.add_suffix(&clear);
+    {
+        let window = parent.as_ref().clone();
+        let dir = profile_dir.clone();
+        let name = profile_name.clone();
+        let row = clear_row.clone();
+        let clear_btn = clear.clone();
+        clear.connect_clicked(move |_| {
+            let Some(dir) = dir.clone() else { return };
+            // A client holding the profile has these files open, and deleting
+            // them under it is how a profile gets half-removed while something
+            // is still writing to it. ADR-012's lock is what answers "is
+            // anything using this", so ask it rather than guessing from a
+            // process list.
+            if let Err(e) = cordial_shell::profile::acquire(&name) {
+                let busy = adw::AlertDialog::builder()
+                    .heading("Roblox is open")
+                    .body(format!(
+                        "Close the client using the {name} profile first, then clear its data.
+
+{e}"
+                    ))
+                    .build();
+                busy.add_response("ok", "OK");
+                busy.present(Some(&window));
+                return;
+            }
+
+            let dialog = adw::AlertDialog::builder()
+                .heading("Clear Roblox's stored data?")
+                .body(
+                    "Its downloaded assets, caches and local storage for this profile are                      deleted, and downloaded again as you use Roblox.
+
+You stay signed in,                      and your plugins and what you allowed them to do are untouched.",
+                )
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("clear", "Clear");
+            dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+
+            let row = row.clone();
+            let clear_btn = clear_btn.clone();
+            let name = name.clone();
+            dialog.connect_response(None, move |dialog, response| {
+                if response == "clear" {
+                    match cordial_shell::profile::clear_engine_data(&dir) {
+                        Ok(freed) => {
+                            row.set_subtitle(&format!(
+                                "Cleared {}. Nothing stored for the {name} profile now.",
+                                cordial_shell::profile::human_bytes(freed)
+                            ));
+                            clear_btn.set_sensitive(false);
+                        }
+                        // Said on the row rather than only to stderr: this is a
+                        // destructive control and "did it work" is the only
+                        // question the person pressing it has.
+                        Err(e) => row.set_subtitle(&format!("Could not clear it: {e}")),
+                    }
+                }
+                dialog.close();
+            });
+            dialog.present(Some(&window));
+        });
+    }
+    data_group.add(&clear_row);
+    page.add(&data_group);
+
     page
 }
 

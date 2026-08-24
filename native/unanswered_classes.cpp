@@ -52,6 +52,22 @@ using jnivm::ENV;
 using jnivm::Object;
 using jnivm::String;
 
+/// Device profile from `init_params.cpp` — one source of truth for brand /
+/// model / build fields. Declared rather than shared through a header because
+/// the framework layer's cross-file surface is declarations like `S_pub`.
+struct DeviceProfile {
+    const char* brand;
+    const char* manufacturer;
+    const char* model;
+    const char* device;
+    const char* product;
+    const char* build_id;
+    const char* build_type;
+    const char* build_release;
+    const char* sdk_version;
+};
+const DeviceProfile& device_profile();
+
 namespace {
 
 std::shared_ptr<String> S(const char* v) {
@@ -204,29 +220,49 @@ public:
 
 /// `org.webrtc.voiceengine.BuildInfo`
 ///
-/// Registered, with **no getter hooked**, and that is a considered choice
-/// rather than an unfinished one.
+/// Nine static device-identity getters. Names and static-ness match the dex
+/// (`getBrand()Ljava/lang/String;` etc.); libjnivm binds by name and
+/// static-vs-instance, and a mismatch fails silently — the same failure that
+/// hit `NetworkUtils.getPublicIPv4Addresseses` above.
 ///
-/// The class is nine device-identity getters -- brand, model, manufacturer,
-/// device, product, build id, build release, build type, SDK version. Cordial
-/// already has truthful answers for every one of them, but they live in
-/// `native/init_params.cpp` behind `presenting_as_pc()` and the device-profile
-/// switch, both file-static. Answering them here would mean a second copy of
-/// "what device are we", and this codebase has already been bitten by exactly
-/// that: `cordial_build_user_agent` exists specifically so the web view and
-/// the engine cannot drift into two answers to that question.
-///
-/// So the follow-up is to expose the device profile from `init_params.cpp` the
-/// way `S_pub` is exposed and hook these against it -- one source of truth,
-/// nine getters. Not done here because that file is held by other work in
-/// flight, and because nothing has been observed calling any of these: the
-/// engine resolves the class and stops. A duplicated device identity shipped
-/// today to satisfy calls that never come is a worse trade than a registered
-/// class and a named follow-up.
+/// Answers come from `device_profile()` in `init_params.cpp` (declared just
+/// outside this anonymous namespace), so `CORDIAL_DEVICE_PROFILE=pc-windows-11`
+/// changes BuildInfo in the same run as InitParams and the User-Agent. Nothing
+/// has been observed calling these yet (the engine resolves the class and
+/// stops); they are hooked so a future call cannot invent a second device
+/// identity.
 class WebRtcBuildInfo : public Object {
 public:
+#define BUILDINFO_GETTER(name, field)                                          \
+    static std::shared_ptr<String> name(ENV*, Class*) {                        \
+        return S(device_profile().field);                                      \
+    }
+    BUILDINFO_GETTER(getBrand, brand)
+    BUILDINFO_GETTER(getDeviceManufacturer, manufacturer)
+    BUILDINFO_GETTER(getDeviceModel, model)
+    BUILDINFO_GETTER(getDevice, device)
+    BUILDINFO_GETTER(getDeviceProduct, product)
+    BUILDINFO_GETTER(getAndroidBuildId, build_id)
+    BUILDINFO_GETTER(getBuildType, build_type)
+    BUILDINFO_GETTER(getBuildRelease, build_release)
+    BUILDINFO_GETTER(getSdkVersion, sdk_version)
+#undef BUILDINFO_GETTER
+
     static void Register(ENV* env) {
         env->GetClass<WebRtcBuildInfo>("org/webrtc/voiceengine/BuildInfo");
+        auto c = env->GetClass("org/webrtc/voiceengine/BuildInfo");
+        // Static hooks: the dex declares static methods. Instance hooks would
+        // bind nothing and look fine until a CORDIAL_JNI_TRACE run printed
+        // `Constructed Unresolved symbol` for each.
+        c->Hook(env, "getBrand", &WebRtcBuildInfo::getBrand);
+        c->Hook(env, "getDeviceManufacturer", &WebRtcBuildInfo::getDeviceManufacturer);
+        c->Hook(env, "getDeviceModel", &WebRtcBuildInfo::getDeviceModel);
+        c->Hook(env, "getDevice", &WebRtcBuildInfo::getDevice);
+        c->Hook(env, "getDeviceProduct", &WebRtcBuildInfo::getDeviceProduct);
+        c->Hook(env, "getAndroidBuildId", &WebRtcBuildInfo::getAndroidBuildId);
+        c->Hook(env, "getBuildType", &WebRtcBuildInfo::getBuildType);
+        c->Hook(env, "getBuildRelease", &WebRtcBuildInfo::getBuildRelease);
+        c->Hook(env, "getSdkVersion", &WebRtcBuildInfo::getSdkVersion);
     }
 };
 

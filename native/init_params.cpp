@@ -237,6 +237,58 @@ static const char* device_identity_label() {
     return "roblox-app";
 }
 
+/// Device-identity strings for surfaces that need brand/model/build fields
+/// without inventing a second `device_identity()` switch.
+///
+/// Exposed (non-static) the same way `S_pub` is: other translation units link
+/// against one accessor rather than copy the profile table. `BuildInfo` in
+/// `unanswered_classes.cpp` is the first consumer — hooking those getters
+/// against a local table would make `CORDIAL_DEVICE_PROFILE` change InitParams
+/// and the User-Agent while leaving WebRTC's BuildInfo on a stale answer.
+///
+/// Values stay inside Cordial's own honest vocabulary (manufacturer/device
+/// name already report `"Cordial"`). Only the fields that legitimately differ
+/// by profile — model/device/product form factor, and the Android release
+/// string — change with the switch. `sdk_version` stays `"33"` for every
+/// profile: `DeviceParams.osVersion` is load-bearing for Vulkan and is not
+/// varied by profile either.
+struct DeviceProfile {
+    const char* brand;
+    const char* manufacturer;
+    const char* model;
+    const char* device;
+    const char* product;
+    const char* build_id;
+    const char* build_type;
+    const char* build_release;
+    const char* sdk_version;
+};
+
+const DeviceProfile& device_profile() {
+    static const DeviceProfile v = []() -> DeviceProfile {
+        switch (device_identity()) {
+            case DeviceIdentity::PcWindows11:
+                // model matches mocktail's `class=pc model="Windows 11 PC"`
+                // line; device/product keep the PC form factor distinct from
+                // the tablet identity so a BuildInfo read can see the switch.
+                return DeviceProfile{"Cordial", "Cordial", "Windows 11 PC",
+                                     "cordial_pc", "cordial_pc", "cordial", "user",
+                                     "11", "33"};
+            case DeviceIdentity::AndroidTablet:
+                return DeviceProfile{"Cordial", "Cordial", "Cordial", "cordial",
+                                     "cordial", "cordial", "user", "13", "33"};
+            case DeviceIdentity::RobloxApp:
+                // Bare app token: no form-factor claim beyond Cordial's own
+                // name, matching the User-Agent arm that drops the device block.
+                return DeviceProfile{"Cordial", "Cordial", "Cordial", "cordial",
+                                     "cordial", "cordial", "user", "13", "33"};
+        }
+        return DeviceProfile{"Cordial", "Cordial", "Cordial", "cordial", "cordial",
+                             "cordial", "user", "13", "33"};
+    }();
+    return v;
+}
+
 /// The `User-Agent` the engine puts on every HTTP request it makes.
 ///
 /// **This was `"Roblox/Android"`, and the comment above it was wrong in the most

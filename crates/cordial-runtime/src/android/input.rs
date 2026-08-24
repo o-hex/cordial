@@ -679,9 +679,24 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
     // issued and is the *finish* call: on Android it is the soft keyboard
     // delivering its final text and dismissing itself.
     //
-    // Driving both on every character meant typing one letter and then hanging
-    // up, which is precisely what the trace showed — the character landed and
-    // the box immediately lost focus:
+    // **RETRACTED, 2026-08-24: driving both no longer blurs the box.** Nine
+    // runs across two sessions -- six by an agent on the sign-in field, three
+    // here with `CORDIAL_PASS_TEXT_ON_KEY=1` -- typed six and eight characters
+    // with every keystroke driving `nativePassText` as well, and produced zero
+    // early blurs. `textbox blurred` fired only at teardown. Whatever the
+    // original trace caught, it does not reproduce on this build.
+    //
+    // The default stays off anyway, because the run that disproved the blur
+    // also showed it buys nothing: with `nativePassText` on all eight
+    // keystrokes the focused field still rendered **empty**, and only Cordial's
+    // own editor overlay showed the text. Feeding the engine exactly what an
+    // Android IME feeds does not make it draw a focused TextBox, which is
+    // `docs/NEXT.md` §1 confirmed rather than escaped. A default flipped for a
+    // reason that turned out to be wrong, with no measured benefit, is a change
+    // nobody could attribute later.
+    //
+    // The original account, kept because the shape of it is what the flag is
+    // for -- the character landed and the box immediately lost focus:
     //
     //     textbox focused ... current=0 bytes
     //     key down "g" focus=Some(140515299098752)

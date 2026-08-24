@@ -818,7 +818,7 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
             {
                 stall_reported = true;
                 println!(
-                    "[android] the engine has presented nothing for {:.0}s after {now} frames;                      {}. The pump is still running, so this is not the idle throttle.                      Take a backtrace -- `just mcp` then cordial_backtrace, or                      `lldb -p {} -b -o 'thread backtrace all -c 16'`.",
+                    "[android] the engine has presented nothing for {:.0}s after {now} frames; {}. The pump is still running, so this is not the idle throttle. Take a backtrace -- `just mcp` then cordial_backtrace, or `lldb -p {} -b -o 'thread backtrace all -c 16'`.",
                     stall_since.elapsed().as_secs_f64(),
                     super::backend_instr_geometry(),
                     std::process::id(),

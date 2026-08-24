@@ -431,7 +431,8 @@ fn build_roblox_page(
     let data_group = adw::PreferencesGroup::builder()
         .title("Stored data")
         .description(
-            "Roblox keeps its downloaded assets, caches and local storage in this profile.              Clearing it does not sign you out and does not touch your plugins.",
+            "Roblox keeps its downloaded assets, caches and local storage in this profile. \
+             Clearing it does not sign you out and does not touch your plugins.",
         )
         .build();
 
@@ -489,9 +490,9 @@ fn build_roblox_page(
             let dialog = adw::AlertDialog::builder()
                 .heading("Clear Roblox's stored data?")
                 .body(
-                    "Its downloaded assets, caches and local storage for this profile are                      deleted, and downloaded again as you use Roblox.
+                    "Its downloaded assets, caches and local storage for this profile are deleted, and downloaded again as you use Roblox.
 
-You stay signed in,                      and your plugins and what you allowed them to do are untouched.",
+You stay signed in, and your plugins and what you allowed them to do are untouched.",
                 )
                 .build();
             dialog.add_response("cancel", "Cancel");

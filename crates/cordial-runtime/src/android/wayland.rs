@@ -1979,9 +1979,18 @@ impl WaylandWindow {
         // is the one `android_classes.cpp` already refuses, because an editor
         // styled from a stale spec looks like a layout bug rather than a missing
         // value.
+        // **A zero-sized spec is not geometry, and it is worse than none.**
+        //
+        // Roblox hands out both. Clicking the home search bar gives
+        // `x=516 y=10 w=358 h=36`, which is exactly where that bar is; the
+        // search modal it opens then reports `x=0 y=0 w=0 h=0`. Taking the
+        // second at face value places a 0x0 editor -- present, correct, and
+        // invisible -- and, worse, it looks like a real spec so the fallback
+        // never runs. Found by `tools/text-entry-check.sh` on its first pass,
+        // which is the whole reason that script exists.
         let (info, fallback) = match cordial_linker_sys::game_activity::focused_textbox_info() {
-            Some(info) => (info, false),
-            None => (self.fallback_textbox_info(), true),
+            Some(info) if info.width > 0.0 && info.height > 0.0 => (info, false),
+            _ => (self.fallback_textbox_info(), true),
         };
         if self
             .text_overlay_cache
@@ -3488,8 +3497,8 @@ impl WaylandWindow {
         // the boxes the engine gives no geometry for -- which is all of them so
         // far.
         let (info, fallback) = match cordial_linker_sys::game_activity::focused_textbox_info() {
-            Some(info) => (info, false),
-            None => (self.fallback_textbox_info(), true),
+            Some(info) if info.width > 0.0 && info.height > 0.0 => (info, false),
+            _ => (self.fallback_textbox_info(), true),
         };
         self.update_text_overlay(
             cordial_linker_sys::game_activity::textbox_generation(),

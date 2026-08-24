@@ -40,7 +40,49 @@ had looked in `appData/`.
 
 # What is blocking
 
-## 0. What 2026-08-23 settled, and what it retracted
+## 0. The freeze is the focus report, 2026-08-24
+
+**An engine told it lost focus stops presenting entirely, and resumes only when
+told focus came back.** Reproduced on demand, headless, with a control, twice:
+
+    CORDIAL_SCRIPT=3:focus-off              presents/s 0.0  freeze warning   (2/2)
+    CORDIAL_SCRIPT=3:focus-off,8:focus-on   presents/s 1.0  none             (2/2)
+    no script                               presents/s 1.0  none
+
+1.0/s is the documented idle throttle and is healthy; 0.0 is the freeze. So a
+focus-loss that is reported and never followed by a focus-gain wedges the client
+permanently, and that is exactly what a user sees: a window that is plainly
+focused, with an engine that believes otherwise.
+
+This matches the live specimen captured the same day. `presents=1`, 0.01 cores,
+and -- the reading that redirected the whole investigation -- the engine's own
+game thread **awake and polling at 20 Hz** in `looper_poll_once(timeout_millis=50)`,
+not blocked. No thread was inside a Vulkan call at all, so nothing was stalled in
+`vkAcquireNextImageKHR` or the driver. The engine was running its idle loop and
+declining to draw, which is what an unfocused Android client is supposed to do.
+
+It also explains why **every headless run in this repository has been clean while
+desktop runs freeze intermittently**: a headless seat delivers no focus events, so
+the report never fires. That asymmetry was visible for two days and read as luck.
+
+`android/mod.rs` already predicted the shape of this, and its own note stands:
+
+> **This is a diagnostic, not the fix.** If it turns out to be the cause, the
+> answer is to stop reporting focus loss *while the game is still loading*
+> rather than to stop reporting it at all.
+
+What is **not** yet established is why Cordial reports the loss without the
+matching gain on a real desktop. `backend_focused` returns `None` for "not
+known" and leaves the last reported state alone, so a `false` published early --
+before the compositor's first `wl_keyboard.enter`, or across a transition where
+`wayland::focused()` goes unknown -- would never be corrected. That is the next
+thing to measure, not to assume: run with `CORDIAL_INSTR=1` and read the
+`focus -> ` transitions against the freeze.
+
+Quick confirmation available to anyone holding a frozen window: alt-tab away and
+back. If a real focus transition unwedges it, this is the cause.
+
+## 0a. What 2026-08-23 settled, and what it retracted
 
 A day with one lesson, and it is the same one as 2026-08-21: **n=1 against a
 probabilistic bug is not a result, and acting on one costs more than waiting.**
@@ -152,7 +194,7 @@ useful -- and they contain **zero** hits for `TextBox`, `Keyboard`,
 about text entry. (A first grep of them appeared to hit, because the pattern
 included `IME` and matched "runt*ime*". Beware.)
 
-## 0a. What 2026-08-21 settled, and what it retracted
+## 0b. What 2026-08-21 settled, and what it retracted
 
 A long session with one theme: **every number trusted without a control turned
 out to be wrong, and every control caught it.** Four mechanisms and two of this
@@ -2178,7 +2220,7 @@ It is left in place because removing it changes what runs at every
 
 ## 5. System time equals user time — and it is almost all the engine's
 
-> **2026-08-21:** still true, and §0a now says what the engine is doing with it —
+> **2026-08-21:** still true, and §0b now says what the engine is doing with it —
 > one thread on `ALooper_pollOnce(0, ...)`, which Sober also has. The attribution
 > below stands; the conclusion once drawn from it, that Cordial is unusually
 > expensive, does not.

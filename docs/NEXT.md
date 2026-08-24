@@ -40,7 +40,49 @@ had looked in `appData/`.
 
 # What is blocking
 
-## 0. The freeze is the focus report, 2026-08-24
+## 0. RETRACTED: the freeze is not the focus report, 2026-08-24
+
+**Everything in the section below is wrong and is kept because the way it went
+wrong is the point.** Two further runs, made while building the fix it
+recommended, killed it:
+
+    CORDIAL_SCRIPT=1:focus-off    focus -> false at t=3.9s,
+                                  then presents/s 59.2, 60.0, 57.0, 60.0 ... to the end
+    CORDIAL_SCRIPT=25:focus-off   no focus report at all -- the script never reached 25s
+                                  presents/s 0.0 from t=1.0s, "presented nothing after 1 frames"
+
+So reporting focus loss does **not** stop the engine rendering: a client told it
+was unfocused at 3.9 s went straight to a full 60/s and stayed there. And a
+client that froze did so from its first frame, before any focus report existed
+to blame.
+
+The six runs below split perfectly along the scripted focus states, and that
+split was a coincidence -- the `focus-off` runs happened to be the ones that
+froze at startup on their own. Two arms of three runs looked like a mechanism
+and were sampling noise, which is the *same* error this file already records
+twice: for the present mode on 2026-08-23, and for the CPU comparison on
+2026-08-21. Three times now. **On this bug, six runs is not enough to separate
+an arm from the base rate, and nothing under about twenty should be believed.**
+
+### What the runs do establish
+
+The freeze is a **startup** failure, not a stall: the client presents exactly one
+frame and never gets going. A healthy run ramps to ~60/s by t=4s and then drops
+to the 1.0/s idle throttle; a frozen one reads 0.0 from t=1s with a single stray
+present. `after 1 frames` in the watchdog line, and `presents=1` on the live
+specimen, are the same state.
+
+And the live-specimen reading still stands, because it did not depend on the
+focus theory: the engine's own game thread was **awake and polling at 20 Hz** in
+`looper_poll_once(timeout_millis=50)`, at 0.01 cores, with **no thread anywhere
+inside a Vulkan call**. Nothing is blocked in `vkAcquireNextImageKHR` or in the
+driver. The engine is running its idle loop and never starting to draw.
+
+The headless-versus-desktop asymmetry is also **not** established. Headless runs
+froze too, once enough of them were run -- `late-1` above was headless. Earlier
+clean headless runs were a small sample of an intermittent bug.
+
+## 0-old. The freeze is the focus report, 2026-08-24 -- WRONG, see above
 
 **An engine told it lost focus stops presenting entirely, and resumes only when
 told focus came back.** Reproduced on demand, headless, with a control, twice:

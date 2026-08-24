@@ -1905,6 +1905,37 @@ impl WaylandWindow {
         }
     }
 
+    /// Where to draw the editor when the engine never told us where the box is.
+    ///
+    /// A bar across the lower third of the canvas, which is where an on-screen
+    /// keyboard's own text would sit on the device this engine was built for.
+    /// Deliberately not the exact box: we do not know where that is, and
+    /// pretending to would put a correctly-styled editor in the wrong place,
+    /// which reads as a rendering bug. A bar that is obviously a bar reads as
+    /// what it is.
+    fn fallback_textbox_info(&self) -> cordial_linker_sys::game_activity::RawTextBoxInfo {
+        let (w, h) = match self.host.0.content_rect() {
+            Some((_, _, w, h)) => (w as f32, h as f32),
+            // No allocation yet is not a reason to draw nothing either; a
+            // plausible default is still legible and still beats invisible.
+            None => (1280.0, 720.0),
+        };
+        let width = (w * 0.6).max(240.0);
+        let height = 44.0;
+        cordial_linker_sys::game_activity::RawTextBoxInfo {
+            x: (w - width) / 2.0,
+            y: (h * 0.72).min(h - height - 8.0).max(0.0),
+            width,
+            height,
+            font_size: 18.0,
+            // White, which is legible against the engine's own dark chrome and
+            // against most places a text box appears. The real spec carries the
+            // box's colour and is preferred whenever it exists.
+            text_color: 0x00FF_FFFFu32 as i32,
+            ..Default::default()
+        }
+    }
+
     fn sync_text_overlay(&self) {
         let Some(_which) = cordial_linker_sys::game_activity::focused_textbox() else {
             if self.text_overlay_visible.swap(false, Ordering::SeqCst) {
@@ -1918,8 +1949,30 @@ impl WaylandWindow {
         };
         let generation = cordial_linker_sys::game_activity::textbox_generation();
         let revision = super::input::text_buffer_revision();
-        let Some(info) = cordial_linker_sys::game_activity::focused_textbox_info() else {
-            return;
+        // **A missing spec is not a reason to draw nothing.**
+        //
+        // The engine does not paint a focused TextBox's own text -- established
+        // in docs/NEXT.md §1 from the dex and confirmed by experiment -- so if
+        // this returns early the characters are invisible until the box blurs
+        // and the engine finally draws them. Reported exactly that way:
+        // "characters are still invisible till unfocus".
+        //
+        // The spec is the geometry Android would style a real EditText with, and
+        // it arrives either as `showKeyboard`'s NativeTextBoxInfo or from a
+        // remembered `<init>`. On the sign-in page neither fires, and asking the
+        // engine directly does not help: `nativeGetTextBoxInfo` is exported and
+        // callable and returns null there, measured over three runs.
+        //
+        // So when there is no spec, place the editor ourselves rather than
+        // abandoning it. It will not sit exactly over the box, and that is the
+        // honest trade: a legible bar in a fixed place beats invisible typing,
+        // and the alternative on offer -- reusing the previous box's numbers --
+        // is the one `android_classes.cpp` already refuses, because an editor
+        // styled from a stale spec looks like a layout bug rather than a missing
+        // value.
+        let info = match cordial_linker_sys::game_activity::focused_textbox_info() {
+            Some(info) => info,
+            None => self.fallback_textbox_info(),
         };
         if self
             .text_overlay_cache

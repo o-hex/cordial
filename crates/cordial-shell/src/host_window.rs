@@ -239,6 +239,11 @@ pub struct HostWindow {
     content: gtk::Widget,
     text_layer: gtk::Fixed,
     text_label: gtk::Label,
+    /// The caret, as a rectangle of its own rather than a character in the
+    /// string. See [`HostWindow::set_text_overlay`] for why that distinction is
+    /// the whole difference between a caret and a glyph that looks like one.
+    caret: gtk::DrawingArea,
+    caret_color: std::rc::Rc<std::cell::Cell<u32>>,
 }
 
 /// The Android editor rectangle Roblox asks the platform to paint over its
@@ -259,20 +264,36 @@ pub struct TextOverlay<'a> {
     pub fallback: bool,
 }
 
-fn displayed_editor_text(text: &str, caret_chars: i32, password: bool) -> String {
-    let mut display = if password {
+/// What the label shows: the text, or one bullet per character of it.
+///
+/// **The caret is not in here, and used to be.** It was inserted as a '│'
+/// at the caret index, which put a whole character cell into the middle of the
+/// string -- so every character after the caret sat one cell to the right of
+/// where the engine draws the same string, and the caret itself was as wide as
+/// a letter. Reported as "the caret looks off like it's in the wrong place",
+/// which it was, and so was everything following it. The caret is now a
+/// rectangle positioned from Pango's measurement of this string, and this
+/// function returns exactly what the box contains.
+fn displayed_editor_text(text: &str, password: bool) -> String {
+    if password {
         "•".repeat(text.chars().count())
     } else {
         text.to_owned()
-    };
-    let caret = caret_chars.max(0) as usize;
-    let byte = display
-        .char_indices()
-        .nth(caret)
-        .map(|(at, _)| at)
-        .unwrap_or(display.len());
-    display.insert(byte, '│');
+    }
+}
+
+/// Byte offset into `display` of the caret, counted in characters.
+///
+/// Characters rather than bytes because that is the unit the engine reports
+/// and the unit `syncTextboxTextAndCursorPosition2` answers in. Anything past
+/// the end clamps to the end, which is where the caret belongs after the last
+/// keystroke.
+fn caret_byte(display: &str, caret_chars: i32) -> usize {
     display
+        .char_indices()
+        .nth(caret_chars.max(0) as usize)
+        .map(|(at, _)| at)
+        .unwrap_or(display.len())
 }
 
 impl HostWindow {
@@ -371,6 +392,28 @@ impl HostWindow {
         text_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         text_label.set_overflow(gtk::Overflow::Hidden);
         text_layer.put(&text_label, 0.0, 0.0);
+
+        // Drawn rather than styled, because the colour arrives with the
+        // engine's own `NativeTextBoxInfo` on every focus, and a CSS provider
+        // would mean reparsing a stylesheet to move two pixels.
+        let caret = gtk::DrawingArea::new();
+        caret.set_can_target(false);
+        caret.set_visible(false);
+        let caret_color = std::rc::Rc::new(std::cell::Cell::new(0x00ff_ffffu32));
+        {
+            let colour = caret_color.clone();
+            caret.set_draw_func(move |area, cr, _, _| {
+                let rgb = colour.get();
+                cr.set_source_rgb(
+                    ((rgb >> 16) & 0xff) as f64 / 255.0,
+                    ((rgb >> 8) & 0xff) as f64 / 255.0,
+                    (rgb & 0xff) as f64 / 255.0,
+                );
+                cr.rectangle(0.0, 0.0, area.width() as f64, area.height() as f64);
+                let _ = cr.fill();
+            });
+        }
+        text_layer.put(&caret, 0.0, 0.0);
         overlay.add_overlay(&text_layer);
         toolbar.set_content(Some(&overlay));
 
@@ -419,6 +462,8 @@ impl HostWindow {
             content: content.as_ref().clone(),
             text_layer,
             text_label,
+            caret,
+            caret_color,
         }
     }
 
@@ -445,11 +490,12 @@ impl HostWindow {
         let Some(overlay) = overlay else {
             self.text_label.set_text("");
             self.text_label.set_visible(false);
+            self.caret.set_visible(false);
             self.window.queue_draw();
             return;
         };
 
-        let display = displayed_editor_text(overlay.text, overlay.caret_chars, overlay.password);
+        let display = displayed_editor_text(overlay.text, overlay.password);
         self.text_label.set_text(&display);
         self.text_label.set_size_request(
             overlay.width.max(1.0).round() as i32,
@@ -474,6 +520,35 @@ impl HostWindow {
             overlay.x.round() as f64,
             overlay.y.round() as f64,
         );
+
+        // Where the caret goes, asked of Pango rather than estimated. A caret
+        // placed at `x + characters * average_width` is right for one font at
+        // one size and wrong everywhere else, and this string is whatever the
+        // user typed -- proportional, possibly CJK, possibly bullets. The
+        // measuring layout wears the same attribute list as the label, or its
+        // size would be the theme's rather than the engine's and the caret
+        // would drift further along the line the more was typed.
+        let layout = self.text_label.create_pango_layout(Some(&display));
+        layout.set_attributes(Some(&attrs));
+        let pos = layout.index_to_pos(caret_byte(&display, overlay.caret_chars) as i32);
+        let scale = gtk::pango::SCALE as f64;
+        let caret_x = pos.x() as f64 / scale;
+        // The line's own height, not the box's: the box is padded, and a caret
+        // spanning the padding reads as a divider between fields rather than a
+        // cursor in one.
+        let line_h = (pos.height() as f64 / scale).max(1.0);
+        let box_h = overlay.height.max(1.0) as f64;
+        self.caret_color.set(overlay.text_color);
+        // Two logical pixels. One disappears under fractional scaling on this
+        // host; three reads as a block cursor, which Roblox's is not.
+        self.caret.set_size_request(2, line_h.round() as i32);
+        self.text_layer.move_(
+            &self.caret,
+            (overlay.x as f64 + caret_x).round(),
+            (overlay.y as f64 + ((box_h - line_h) / 2.0).max(0.0)).round(),
+        );
+        self.caret.set_visible(true);
+        self.caret.queue_draw();
         // **A bare label is invisible half the time.** With the engine's own
         // spec the editor sits on the box and takes the box's colour, which is
         // right. With a synthesised placement it floats over whatever happens
@@ -807,9 +882,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_editor_caret_counts_characters_and_passwords_never_reach_the_label() {
-        assert_eq!(displayed_editor_text("aé中", 2, false), "aé│中");
-        assert_eq!(displayed_editor_text("secret", 3, true), "•••│•••");
+    fn a_password_never_reaches_the_label() {
+        assert_eq!(displayed_editor_text("aé中", false), "aé中");
+        assert_eq!(displayed_editor_text("secret", true), "••••••");
+    }
+
+    #[test]
+    fn the_caret_offset_counts_characters_and_never_splits_one() {
+        // The bug this replaces put a character *into* the string. This
+        // returns an offset into it and leaves it alone -- and the offset has
+        // to land on a character boundary, or Pango's measurement of it is
+        // meaningless and `index_to_pos` is being asked about half a letter.
+        let s = "aé中";
+        assert_eq!(caret_byte(s, 0), 0);
+        assert_eq!(caret_byte(s, 1), 1);
+        assert_eq!(caret_byte(s, 2), 3, "past the two-byte é");
+        assert_eq!(caret_byte(s, 3), 6, "the end, and 中 is three bytes");
+        assert_eq!(caret_byte(s, 99), 6, "clamped rather than panicking");
+        assert_eq!(caret_byte(s, -1), 0);
+        for n in -1..6 {
+            assert!(s.is_char_boundary(caret_byte(s, n)), "n={n}");
+        }
     }
 
     #[test]

@@ -40,7 +40,55 @@ had looked in `appData/`.
 
 # What is blocking
 
-## 0. The freeze is the app shell never reaching Landing, 2026-08-24
+## 0. The freeze has a reliable reproduction, 2026-08-24
+
+**It stalls at `StartupController stage = 2`, immediately after `sync cookies
+from engine`, and on a signed-in profile it does this every time.** Three
+consecutive launches on `CordialTest`, three freezes, `presents=1` in all of
+them. That is the first reliable reproduction this bug has had, and it is worth
+more than any of the theories below it.
+
+    t=2.87  [FLog::RobloxTelemetry] Lua app running status has been updated to true
+    t=3.00  [FLog::NativeDM] (callback) initEngine_: ... StartupController started: stage = 2
+    t=3.00  [FLog::NativeDM] (callback) initEngine_: ... sync cookies from engine.
+    (nothing further, ever)
+
+A healthy run continues from there into `CorePackages...ReactFiberCommitWork`,
+registers its navigation routes, and reaches `APP_READY Landing`.
+
+**Read `appData/logs/*_Player_*.log`. It is the engine's own narration, Cordial
+writes one per run, and nothing in this repository had ever looked at it** --
+two days of theories argued from Cordial's stdout while this sat on disk beside
+it. Sober's equivalent carries 9722 `FLog::` lines. It is the same class of
+evidence as `docs/traces/`, and unlike a trace it is per-run and already there.
+
+### What the reproduction has already killed
+
+Each of these looked right on three to six runs and died on the next test:
+
+- **Present mode.** MAILBOX vs FIFO, both directions, retracted twice.
+- **Focus.** A scripted loss at 3.9 s does not stop a client that is still in its
+  60/s startup phase. The `visible()`-derived focus loss was a genuine bug and is
+  fixed in 4f818cc, but the frozen run above shows `APP_CMD_GAINED_FOCUS` and no
+  loss at all, so it is not this freeze.
+- **Cookies.** Same profile three times: the run that restored **0** domains
+  froze, both runs that restored 4 were healthy.
+- **The OTA cache.** 147 MB of `ota_rbxm_decompressed_cache` and
+  `UniversalApp_cache` moved aside; froze identically on the next launch.
+
+### The correlation still standing
+
+Signed-in profiles reach `Home` and freeze. Logged-out profiles reach `Landing`
+and mostly do not. Every clean headless run in this repository has been logged
+out. That is the axis to test next, and testing it needs a signed-in profile
+rather than another mechanism guess.
+
+`http://10.110.101.222:5052` -- a LAN websocket that times out after 60 s --
+appears in every `CordialTest` log and no healthy one. It survives clearing the
+OTA caches, so it comes from the account's IXP settings or the flag cache, not
+from the bundle. Unexplained, and suspicious for being a private address.
+
+## 0-old. The freeze is the app shell never reaching Landing, 2026-08-24
 
 **The best characterisation so far, and the instrument that found it is a diff
 of two startup logs.** Take a frozen run and a healthy one, normalise the

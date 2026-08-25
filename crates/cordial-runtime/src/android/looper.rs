@@ -253,6 +253,66 @@ pub const POLL_CALLBACK: c_int = -2;
 pub const POLL_TIMEOUT: c_int = -3;
 pub const POLL_ERROR: c_int = -4;
 
+/// How long a zero-timeout poll that found nothing is allowed to answer from
+/// memory before going back to the kernel. Microseconds.
+///
+/// **This exists because the engine busy-polls and it was costing a whole
+/// core.** Roblox calls `ALooper_pollOnce(0)` in a tight loop, and answering
+/// each one with a real `epoll_wait` meant a syscall per iteration at whatever
+/// rate the kernel would sustain. Measured on a live client in Brookhaven --
+/// a deliberately light game -- one thread pegged at 99.5% of a core with
+/// every stack sample inside `epoll_wait` under `looper_poll_once`, while the
+/// GPU sat at 45% and would not even clock up past 967 MHz of its 1.50 GHz
+/// boost. The engine was starving the GPU by burning the core that feeds it.
+///
+/// mocktail sidesteps the same loop by not implementing a looper at all: its
+/// `ALooper_pollOnce` returns `POLL_TIMEOUT` immediately, no syscall, no fds
+/// (`stubs/libandroid_stub.cc`). Cordial cannot do that -- this looper carries
+/// the Wayland connection and the input descriptors, and answering "nothing
+/// happened" without looking would drop real events on the floor. So the idea
+/// is taken and bounded instead: still look, just not a million times a second.
+///
+/// 250 microseconds is a thirtieth of a frame at 120 fps, so the worst case an
+/// event can sit unnoticed is far below anything a player can perceive, while
+/// the syscall ceiling drops to 4000 a second. Any poll that actually finds
+/// something clears the damper immediately, so a burst of input is never
+/// throttled -- only an idle spin is.
+///
+/// `CORDIAL_POLL_COALESCE_US=0` turns it off, which is the control this was
+/// measured against.
+const ZERO_TIMEOUT_COALESCE_US_DEFAULT: u64 = 250;
+
+/// Empty zero-timeout polls in a row before the loop is treated as idle.
+///
+/// High enough that a normal burst of polling during a frame is never slowed,
+/// low enough that an idle spin is caught within a fraction of a millisecond.
+const IDLE_SPIN_THRESHOLD: u64 = 64;
+
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+extern "C" {
+    fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> c_int;
+}
+
+fn zero_timeout_coalesce_ns() -> u64 {
+    static NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NS.get_or_init(|| {
+        std::env::var("CORDIAL_POLL_COALESCE_US")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(ZERO_TIMEOUT_COALESCE_US_DEFAULT)
+            * 1_000
+    })
+}
+
+/// Zero-timeout polls answered from memory rather than from the kernel.
+pub static POLLS_COALESCED: AtomicU64 = AtomicU64::new(0);
+
+
 // Event bits.
 const EVENT_INPUT: c_int = 1 << 0;
 const EVENT_OUTPUT: c_int = 1 << 1;
@@ -299,6 +359,13 @@ pub struct Looper {
     wake: c_int,
     registrations: RefCell<Vec<Registration>>,
     refs: AtomicUsize,
+    /// How many zero-timeout polls in a row have come back with nothing.
+    ///
+    /// Drives the idle backoff; see [`ZERO_TIMEOUT_COALESCE_US_DEFAULT`].
+    /// Atomic rather than a `Cell` because `ALooper_wake` is explicitly a
+    /// cross-thread call -- waking a looper from another thread is the entire
+    /// point of it -- and that path resets this.
+    empty_zero_streak: AtomicU64,
 }
 
 thread_local! {
@@ -321,6 +388,7 @@ impl Looper {
             wake,
             registrations: RefCell::new(Vec::new()),
             refs: AtomicUsize::new(1),
+            empty_zero_streak: AtomicU64::new(0),
         }));
 
         let mut ev = EpollEvent {
@@ -1161,6 +1229,9 @@ extern "C" fn looper_add_fd(
     let Some(l) = as_looper(looper) else {
         return -1;
     };
+    // A descriptor that was not being watched a moment ago is new state; the
+    // backoff's belief that nothing is happening predates it.
+    l.empty_zero_streak.store(0, Ordering::Relaxed);
 
     let mut epoll_events = 0;
     if events & EVENT_INPUT != 0 {
@@ -1209,6 +1280,17 @@ extern "C" fn looper_wake(looper: *mut c_void) {
     let Some(l) = as_looper(looper) else {
         return;
     };
+    // **Flush the busy-poll damper before the write, not after.**
+    //
+    // The damper lets a zero-timeout poll answer "nothing happened" from
+    // memory for a few hundred microseconds. A wake is precisely the event
+    // that makes that answer wrong, so the remembered emptiness has to go --
+    // otherwise waking a looper could be ignored for the rest of the window,
+    // which would turn a latency optimisation into dropped wakeups.
+    //
+    // Cleared first so there is no instant where the eventfd is readable and
+    // this side still believes nothing has happened.
+    l.empty_zero_streak.store(0, Ordering::Relaxed);
     let one: u64 = 1;
     // SAFETY: writing the eight bytes an eventfd requires to our own descriptor.
     unsafe { write(l.wake, &one as *const u64 as *const c_void, 8) };
@@ -1273,6 +1355,34 @@ extern "C" fn looper_poll_once(
         timeout_millis
     };
 
+    // **The idle backoff.** Only the zero-timeout case, which is the one the
+    // engine spins on; a blocking or finite-timeout poll is untouched.
+    //
+    // The first attempt at this made each call cheaper -- answering from a
+    // remembered timestamp instead of the kernel -- and that fixed nothing,
+    // which is the measurement worth keeping. The thread stayed pegged at
+    // 99.8% and simply moved from `epoll_wait` to the `clock_gettime` the
+    // damper itself was doing. **The cost per call was never the problem: the
+    // problem is that the loop has no blocking point and free-runs.** Making
+    // the body cheaper only lets it spin faster.
+    //
+    // So once the poll has come back empty enough times in a row to be
+    // obviously idle, sleep briefly before looking again. That caps the loop
+    // at a few thousand iterations a second instead of millions, which is what
+    // actually gives the core back. Any poll that finds something, and any
+    // wake, resets the streak to zero, so a burst of real events is never
+    // slowed -- only an idle spin is.
+    let backoff_ns = zero_timeout_coalesce_ns();
+    if timeout_millis == 0 && backoff_ns > 0
+        && l.empty_zero_streak.load(Ordering::Relaxed) >= IDLE_SPIN_THRESHOLD
+    {
+        POLLS_COALESCED.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: a plain relative sleep on this thread; the struct is
+        // fully initialised and the call cannot fail in a way that matters.
+        let ts = Timespec { tv_sec: 0, tv_nsec: backoff_ns as i64 };
+        unsafe { nanosleep(&ts, std::ptr::null_mut()) };
+    }
+
     let mut events = [EpollEvent { events: 0, data: 0 }; 16];
     // Time the syscall on one call in 1024. Timing every call would cost two
     // clock reads against a syscall that turns out to take about as long as
@@ -1290,6 +1400,16 @@ extern "C" fn looper_poll_once(
     }
     if n < 0 {
         return POLL_ERROR;
+    }
+    // Remember an empty zero-timeout poll so the next few can be answered
+    // without the kernel; forget it the moment anything is actually ready, so
+    // input in flight is never delayed by the damper.
+    if timeout_millis == 0 {
+        if n == 0 {
+            l.empty_zero_streak.fetch_add(1, Ordering::Relaxed);
+        } else {
+            l.empty_zero_streak.store(0, Ordering::Relaxed);
+        }
     }
     if n == 0 {
         if let Some(s) = seat {

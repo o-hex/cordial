@@ -5,6 +5,18 @@
 # Open-source Roblox for Linux — run it natively, extend it yourself
 
 <p align="center">
+  <a href="https://discord.gg/qJzU3Xfr9b">
+    <img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?style=for-the-badge&logo=discord&logoColor=white"
+         alt="Join the Cordial Discord">
+  </a>
+</p>
+
+<p align="center">
+  <strong><a href="https://discord.gg/qJzU3Xfr9b">Come and talk to us on Discord</a></strong> — bug reports,
+  help getting it running, and what is being worked on.
+</p>
+
+<p align="center">
   <img src="https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-doors.gif"
        alt="Roblox DOORS running under Cordial on Linux: first-person corridor, candle in hand"
        width="560">
@@ -43,6 +55,7 @@ disabled. Plugins extend *Cordial*.
 
 ## Get started
 
+- [Join the Discord 💬](https://discord.gg/qJzU3Xfr9b)
 - [Read the documentation 📖](docs)
 - [Start here — what works and what is blocking 🧭](docs/NEXT.md)
 - [Install it 🔽](#install)
@@ -50,7 +63,6 @@ disabled. Plugins extend *Cordial*.
 - [Why there is no script execution, ever 🔒](docs/adr/ADR-001-in-process-hooking.md)
 - [Report a bug 🐛](https://github.com/luohoa97/cordial/issues)
 - [Contribute 🛠️](CONTRIBUTING.md)
-- [Official Discord](https://discord.gg/qJzU3Xfr9b)
 
 **New here?** Read the warning below first, then
 [`docs/NEXT.md`](docs/NEXT.md) — it is written for someone picking the project

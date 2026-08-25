@@ -505,13 +505,28 @@ Identical. And the offset between the two clocks is the same in both groups
 (+0.214s against +0.210s), so it is not a clock artefact either -- the two
 groups simply run at the same speed.
 
-The first survey's frozen runs clustered in a contiguous block of launches, and
-the machine's speed drifts across a survey; the frozen group inherited the
-timing of the window it happened to fall in. **That is the same confound this
-file already warns about for A/B arms, applied to a comparison that is not an
-A/B and so did not look like it needed the warning.** Any frozen-versus-healthy
-comparison here has to be checked against a second survey before it is believed,
-because the freezes come in runs.
+**The cause is more specific than "drift", and worth naming exactly, because it
+is a trap this comparison will set again.** The thirty launches it came from
+were the `LOAD=8`-against-`LOAD=0` arms, and **`LOAD=8` slows startup by roughly
+250 ms**. Five of the six frozen runs landed in the fast idle arm and fourteen
+of the twenty-four healthy runs in the slow busy arm, so pooling them put the
+healthy median in the empty space between two modes. Split by arm, it vanishes:
+
+    idle arm   frozen med 0.488   healthy med 0.479
+    busy arm   frozen med 0.906   healthy med 0.745
+
+Within each arm a frozen run is, if anything, marginally *slower*. It is
+Simpson's paradox, from pooling across an intervention that moves the very
+quantity being compared. **A frozen-versus-healthy split is not an A/B and does
+not look like it needs the interleaving warning, and it needs it more**: it has
+no randomisation at all, so any variable that moves startup timing will sort
+itself into the groups.
+
+The replication above also ran an AUC test on every one of 313 stdout lines
+present in both groups, and on the phase durations between them, which remove
+any run-level offset. **Nothing separates them.** No line reaches |AUC-0.5| >
+0.35; the best is 0.78 on the second swapchain recreate, whose ranges overlap
+completely.
 
 `CORDIAL_BRIDGE_DELAY_MS` remains, off, as the knob that would have tested the
 retracted theory. It is harmless and it is the cheapest way to hold the bridge
@@ -542,6 +557,13 @@ resize being reported and the swapchain being rebuilt**, and no amount of
 further staring at Cordial's own log will find it. The next instrument has to
 see into that gap: the engine's own log is the only thing that does, and it
 stops one line after `sync cookies from engine`.
+
+Two corrections to how that has been put here before. Cordial's stdout is
+**identical up to the divergence**, not identical outright -- a healthy run goes
+on to log `DID_LOG_IN`, the home page loading, both `DataModelPatchConfigurer`
+downloads and a second swapchain, and a frozen run logs the stall warning
+instead. Those are consequences of the second Lua app start, not causes, but
+"the logs are identical" is the wrong sentence and invites the wrong search.
 
 ### The correlation still standing
 

@@ -172,15 +172,29 @@ install(TARGETS cordial_linker_shim cordial_liblog linker ARCHIVE DESTINATION li
 
 # Vendored x86-64 CPU feature emulator (see third_party/libbadcpu/README.md).
 # Independent of the bionic subtree; built here so there is one native build.
-add_library(badcpu STATIC
-  ../third_party/libbadcpu/src/badcpu.cpp
-  ../third_party/libbadcpu/src/cpuid.cpp
-  ../third_party/libbadcpu/src/decoder.cpp
-  ../third_party/libbadcpu/src/emulator.cpp
-  ../third_party/libbadcpu/src/signal_handler.cpp
-)
-target_include_directories(badcpu PUBLIC ../third_party/libbadcpu/include)
-install(TARGETS badcpu ARCHIVE DESTINATION lib)
+#
+# **Only on x86-64, and this is a build break rather than a nicety.**
+# `cpuid.cpp` includes `<cpuid.h>` and calls `__get_cpuid`, neither of which
+# exists on aarch64, so an ARM build fails at compile time here -- the first
+# thing that breaks, before anything interesting has been attempted.
+# `docs/multiarch.md` already says an ARM64 host "needs no feature emulator",
+# and it also claims this is gated in the build; it was not, and the claim was
+# written against a Meson build this project does not use.
+#
+# Nothing links it today: `crates/cordial-linker-sys/build.rs` names six
+# archives and `badcpu` is not among them. So gating it costs exactly nothing
+# and removes the first obstacle on a port nobody has started.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  add_library(badcpu STATIC
+    ../third_party/libbadcpu/src/badcpu.cpp
+    ../third_party/libbadcpu/src/cpuid.cpp
+    ../third_party/libbadcpu/src/decoder.cpp
+    ../third_party/libbadcpu/src/emulator.cpp
+    ../third_party/libbadcpu/src/signal_handler.cpp
+  )
+  target_include_directories(badcpu PUBLIC ../third_party/libbadcpu/include)
+  install(TARGETS badcpu ARCHIVE DESTINATION lib)
+endif()
 
 # JNI virtual machine. Roblox's native code calls into Java through 518 statically
 # registered natives and expects a JavaVM to call back into; libjnivm supplies both

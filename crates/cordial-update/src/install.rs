@@ -72,7 +72,15 @@ pub const BASE_APK: &str = "base.apk";
 
 /// The archive the engine comes out of on a split build, which is every build
 /// this has been run against.
+///
+/// **Underscore, not hyphen.** Play names the split for an ABI with the ABI's
+/// characters normalised -- `split_config.arm64_v8a.apk` -- while the directory
+/// inside the archive keeps the hyphen, `lib/arm64-v8a/`. The two spellings of
+/// one ABI sit four lines apart in this crate for that reason.
+#[cfg(target_arch = "x86_64")]
 pub const SPLIT_APK: &str = "split_config.x86_64.apk";
+#[cfg(target_arch = "aarch64")]
+pub const SPLIT_APK: &str = "split_config.arm64_v8a.apk";
 
 /// Where the staged download lives while it is being checked. Inside
 /// [`build_dir`] so the move into place is a rename rather than a copy, and
@@ -88,19 +96,24 @@ pub fn cache_root() -> PathBuf {
         .join("cordial")
 }
 
-/// The build Cordial manages: `~/.cache/cordial/build/x86_64`.
+/// The build Cordial manages: `~/.cache/cordial/build/<abi>`.
+///
+/// Named by ABI rather than fixed, so a machine that has run both an x86-64 and
+/// an aarch64 build against the same home directory does not have them collide
+/// in one cache. That costs nothing today and is the kind of thing nobody
+/// notices is missing until two builds have already overwritten each other.
 pub fn build_dir() -> PathBuf {
-    cache_root().join("build/x86_64")
+    cache_root().join("build").join(crate::apk::HOST_ABI)
 }
 
-/// The extracted engine: `~/.cache/cordial/lib/x86_64`.
+/// The extracted engine: `~/.cache/cordial/lib/<abi>`.
 ///
 /// `cordial-shell`'s `install::engine_cache` computes the same path and
 /// `justfile` writes the same string into it. Three copies of one path is two
 /// too many; this is the one the crate that owns the stamp offers, so the others
 /// can delegate.
 pub fn engine_dir() -> PathBuf {
-    cache_root().join("lib/x86_64")
+    cache_root().join("lib").join(crate::apk::HOST_ABI)
 }
 
 /// The managed `base.apk`, if Cordial has one.

@@ -45,7 +45,12 @@ pub const LIBRARY: &str = "libroblox.so";
 pub const APK_OVERRIDE: &str = "CORDIAL_APK";
 
 /// Its path inside whichever APK carries it.
-const LIBRARY_IN_APK: &str = "lib/x86_64/libroblox.so";
+///
+/// Taken from `cordial-update` rather than declared again here. It was declared
+/// twice, privately, and two copies of one ABI string is how a port ends up
+/// half done: the crate that extracts the engine and the crate that looks for
+/// it would disagree, and nothing would say so.
+use cordial_update::apk::LIBRARY_IN_APK;
 
 /// What the user has pinned by hand, if anything.
 ///
@@ -175,7 +180,11 @@ pub fn engine_cache() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir)
-        .join("cordial/lib/x86_64")
+        // Must stay in step with `cordial_update::install::engine_dir`, which
+        // is ABI-named for the same reason: two builds for two architectures
+        // sharing one home directory must not share one engine cache.
+        .join("cordial/lib")
+        .join(cordial_update::apk::HOST_ABI)
 }
 
 /// The APK Cordial would use, and whether the user picked it or Cordial found
@@ -254,7 +263,7 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
     }
 
     // Beside the APK, which is where it lands if you unzip in place.
-    if let Some(beside) = apk.parent().map(|d| d.join("lib/x86_64")) {
+    if let Some(beside) = apk.parent().map(|d| d.join("lib").join(cordial_update::apk::HOST_ABI)) {
         if beside.join(LIBRARY).is_file() {
             return Ok(Build { apk, lib_dir: beside });
         }
@@ -352,10 +361,11 @@ fn extract_engine(apk: &Path, into: &Path) -> Result<PathBuf, String> {
 
     Err(format!(
         "No {LIBRARY_IN_APK} in {} or its split_config siblings ({} tried). \
-         On a split build the engine is in split_config.x86_64.apk, not base.apk — \
+         On a split build the engine is in {}, not base.apk — \
          if it is somewhere else, set the engine directory in Settings.",
         apk.display(),
-        tried.len()
+        tried.len(),
+        cordial_update::install::SPLIT_APK
     ))
 }
 

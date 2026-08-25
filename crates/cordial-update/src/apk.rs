@@ -41,8 +41,42 @@ use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
+/// The Android ABI this build of Cordial can execute, spelled the way an APK
+/// spells it.
+///
+/// **Cordial never translates machine code** -- `docs/multiarch.md` decided
+/// that -- so the only library it can load is the one built for the host's own
+/// architecture. Which means the ABI is a property of *this binary*, fixed at
+/// compile time, and not something to detect at run time or ask the user for.
+///
+/// Two spellings, and confusing them is the trap worth naming: the directory
+/// inside the APK is `lib/arm64-v8a/` with a hyphen, and Play's split archive
+/// for the same ABI is `split_config.arm64_v8a.apk` with an underscore. Both
+/// appear below.
+#[cfg(target_arch = "x86_64")]
+pub const HOST_ABI: &str = "x86_64";
+#[cfg(target_arch = "aarch64")]
+pub const HOST_ABI: &str = "arm64-v8a";
+
 /// The engine, and where it lives inside whichever APK carries it.
+///
+/// Per-architecture rather than built from [`HOST_ABI`] at run time, so it
+/// stays a `&'static str` and every caller keeps working unchanged.
+#[cfg(target_arch = "x86_64")]
 pub const LIBRARY_IN_APK: &str = "lib/x86_64/libroblox.so";
+#[cfg(target_arch = "aarch64")]
+pub const LIBRARY_IN_APK: &str = "lib/arm64-v8a/libroblox.so";
+
+// A host Roblox does not ship a build for cannot be served by this runtime at
+// all, and failing at compile time says so once rather than leaving somebody to
+// discover it from a linker error inside `dlopen`. `docs/multiarch.md` has the
+// table.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!(
+    "Cordial executes Roblox's own Android build natively and never translates \
+     machine code, so it can only be built for an architecture Roblox ships: \
+     x86-64 or aarch64. See docs/multiarch.md."
+);
 
 /// How much an archive may be, whatever it says about itself.
 #[derive(Debug, Clone, Copy)]

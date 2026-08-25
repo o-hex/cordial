@@ -44,7 +44,7 @@ struct Options {
 const USAGE: &str = "\
 usage: cordial-load --lib-dir <dir> [options]
 
-  --lib-dir <dir>   directory holding the APK's lib/x86_64/ objects
+  --lib-dir <dir>   directory holding the APK's lib/<abi>/ objects
   --library <name>  object to load (default: libroblox.so)
   --apk <path>      APK to serve assets from; without it AAssetManager_open fails
   --read-asset <p>  read one asset through the AAsset API and report its size

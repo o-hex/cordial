@@ -994,9 +994,11 @@ fn version_line(recorded: Option<String>) -> String {
 /// sit in, and this is the only place the re-extraction is visible at all.
 pub(crate) fn cache_line(engine: bool, stamp: Option<String>, current: bool) -> String {
     if !engine {
-        return "None yet. Cordial takes lib/x86_64/libroblox.so out of the APK the first time \
-                you launch, into its own cache."
-            .to_string();
+        return format!(
+            "None yet. Cordial takes {} out of the APK the first time you launch, \
+             into its own cache.",
+            cordial_update::apk::LIBRARY_IN_APK
+        );
     }
     match stamp {
         Some(stamp) if current => format!("Extracted from the APK above.\n{stamp}"),

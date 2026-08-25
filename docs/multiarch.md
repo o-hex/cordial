@@ -25,11 +25,45 @@ the runtime actually launches Roblox on the primary target.
 
 **ARM64 hosts are cheap in principle and expensive in practice.** The ABI is present in
 the APK, so the loader, bionic shim, syscall translation and framework layer are all
-architecture-agnostic in design — but each of them contains architecture-specific code
-(TLS layout, relocation types, syscall numbers, signal frame layout), and the graphics
-path differs. Treat ARM64 as a real port, not a compile flag, and do not attempt it until
-x86-64 works. `libbadcpu` is not built on ARM64: it is an x86-64 instruction emulator and
-has no meaning there.
+architecture-agnostic in design. Treat ARM64 as a real port, not a compile flag, and do
+not attempt it until x86-64 works. `libbadcpu` is not built on ARM64: it is an x86-64
+instruction emulator and has no meaning there.
+
+**The reason has changed, though, and the sentence above used to give the wrong one.** It
+said each layer "contains architecture-specific code (TLS layout, relocation types,
+syscall numbers, signal frame layout)". Inventoried on 2026-08-26: **ours contains none of
+it.** `git grep -E '__x86_64__|__aarch64__|asm volatile|target_arch' -- crates native`
+matches nothing across all 159 tracked files — no TLS handling, no relocation switch, no
+syscall wrapper, no signal trampoline, no assembly. All of that is upstream bionic's, and
+upstream already has it per-architecture: `third_party/mcpelauncher-linker/CMakeLists.txt`
+carries an arm64 branch, the arch trees are checked out, and `GetTargetElfMachine()`
+already returns `EM_AARCH64` on an aarch64 build, so a wrong-architecture library is
+refused with a readable message for free.
+
+**What is expensive is a thing this document did not anticipate: the page size.**
+`third_party/mcpelauncher-linker/include/compat.h` defines `PAGE_SIZE` as a literal 4096
+and force-includes it into every linker translation unit. Roughly half the hardware people
+ask about is not 4K — Asahi on Apple silicon is 16K by hardware mandate, and recent
+Raspberry Pi OS defaults the Pi 5 to a 16K kernel, while most postmarketOS phone SoCs and
+Graviton are 4K. Upstream *does* detect this at run time and switch strategy, and the
+strategy it switches to is the problem: it maps the whole reservation `PROT_READ |
+PROT_WRITE | PROT_EXEC` and copies the ELF in by hand, never re-protecting it.
+
+**That silently voids ADR-001's guarantee.** `patches/0001-map-engine-text-read-only.patch`
+edits an `mmap64` the 16K path never reaches, so the patch is not broken by this — it is
+bypassed, and 106 MB of engine text stays `rwxp` for the life of the process. ADR-001's
+verification is also scoped to "Roblox's own x86-64 build"; the arm64-v8a build's
+`DT_TEXTREL` status has never been looked at.
+
+So the honest split is: **a 4K aarch64 host is plausibly a mechanical job, and a 16K one is
+not** — and two of the three platforms people ask for are 16K. Android 15 also requires
+16 KB-aligned native libraries, so an arm64-v8a `libroblox.so` will likely carry
+`p_align = 16384` and take a different loader path from the x86-64 one *even on a 4K host*.
+The port cannot assume 4K aarch64 behaves like x86-64.
+
+**The cheapest next step needs no ARM hardware at all:** `readelf` an `arm64-v8a`
+`libroblox.so` and read off its `DT_TEXTREL`, `p_align`, relocation counts and CPU feature
+floor. That closes a real slice of the unknown for the price of one APK.
 
 **No translation layer will be designed.** If a future host has no matching ABI, the
 answer is "unsupported", not "write a JIT". Reopening this requires reopening Task A.
@@ -39,12 +73,26 @@ exactly the translation path this decision exists to avoid. Linux desktop only.
 
 ## Implementation notes
 
-- Host ABI is resolved once, at instance launch, and selects the `lib/<abi>/` directory to
-  load from. If the APK ships no matching ABI, fail early with a clear message rather than
-  falling back to anything.
+- Host ABI is fixed at **compile time**, not resolved at launch. `cordial_update::apk::
+  HOST_ABI` is a `#[cfg(target_arch)]` constant, and `LIBRARY_IN_APK` and `SPLIT_APK` are
+  spelled per-architecture beside it; an unsupported target fails with a `compile_error!`
+  naming this document. Cordial never translates machine code, so the only library it can
+  load is the one for its own architecture — which makes the ABI a property of the binary
+  rather than something to detect. This paragraph previously described a run-time
+  resolution that did not exist; the constants were two hardcoded literals in two crates.
+- Watch the two spellings. The directory inside the APK is `lib/arm64-v8a/` with a hyphen;
+  Play's split archive for the same ABI is `split_config.arm64_v8a.apk` with an underscore.
 - Prefer the APK variant that carries the host ABI. If only a universal APK is available,
-  load from the matching subdirectory and ignore the others.
-- `libbadcpu` is gated on `host_machine.cpu_family() == 'x86_64'` in the build, and its
-  `SIGILL` handler is installed only in the Roblox child process.
+  load from the matching subdirectory and ignore the others. `apk::holds_with(apk, wanted)`
+  already takes the path as a parameter and `engine_candidates` already loops over
+  siblings, so this part needed no change.
+- The engine cache is ABI-named — `~/.cache/cordial/lib/<abi>` — so two builds for two
+  architectures against one home directory cannot overwrite each other.
+- `libbadcpu` is gated on `CMAKE_SYSTEM_PROCESSOR` in `native/CMakeLists.txt`, and its
+  `SIGILL` handler is installed only in the Roblox child process. It was **not** gated
+  until 2026-08-26, and this line claimed a Meson `host_machine.cpu_family()` check in a
+  project that uses CMake. `cpuid.cpp` includes `<cpuid.h>`, which does not exist on
+  aarch64, so it was the first thing an ARM build would have hit. Nothing links the
+  archive today, so gating it cost nothing.
 - x86-64-v2 is the effective CPU floor. Below SSE4.1 the emulator cannot help enough and
   the correct behaviour is a clear hardware-too-old message, not a crash.

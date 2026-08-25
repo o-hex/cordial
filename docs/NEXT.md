@@ -145,6 +145,34 @@ surface coordinates and the region is recomputed on stacking and placement
 changes only, never on configure. ADR-022 already flagged this and it is still
 open.
 
+## Frame pacing, measured properly, 2026-08-26
+
+A user reported *"can't play fps games and low fps randomly"*. **On the app
+shell, with input flowing, there is no such thing** -- and the way that number
+was got is the point.
+
+`tools/frame-pacing-check.py` drives the pointer for the whole measurement and
+then reads the percentiles out of `frame_pacing.rs`'s ring, which holds the last
+1024 inter-present intervals. Two runs, same session, same build:
+
+    input at 59/s   p50 4.7ms   p95  15.7ms   p99   16.7ms   max   19.4ms
+    idle (control)  p50 4.4ms   p95 999.9ms   p99 1001.0ms   max 1004.6ms
+
+Nothing above 20ms in 1024 consecutive frames with input flowing. The idle run's
+tail is the throttle -- 1.0 a second, exactly, which is what this file's own
+warning about present counts has said since 2026-08-02 -- and note that **the
+medians are identical**. An average would have shown almost no difference
+between a healthy client and a client presenting one frame a second, which is
+why `cordial_fps` dividing presents by wall time cannot answer this question and
+the percentiles can.
+
+**Every `p99` near 1000ms recorded during the startup-freeze surveys is that
+throttle**, not a stall. Those surveys drove no input by design.
+
+What this does not cover is the report itself, which is about being in a game.
+The app shell is not a game, and reproducing "can't play fps games" means
+joining one.
+
 ## Open: the canvas goes black when a TextBox focuses IN AN EXPERIENCE
 
 **Reproduced, characterised, not fixed.** This is the top open bug and the

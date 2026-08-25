@@ -149,11 +149,28 @@ done
 # `CORDIAL_POLL_COALESCE_US=0: command not found` -- which this script then
 # scores as a freeze, because a client that never started never presents. That
 # turned a whole control arm into noise before anyone read the log.
+# Cordial's own stdout has no timestamps, and the difference between a frozen
+# startup and a healthy one opens *before* the engine's first shared log line --
+# so the engine's log cannot localise it and this can. Stamped through a fifo
+# rather than a pipeline, so `$!` is still the client and not the last stage of
+# a pipe; and stamped by the harness rather than built into the binary, because
+# a harness that can add this without touching the binary cannot invalidate the
+# binary under test by adding it.
+STDOUT_FIFO=$OUT/stdout-${TAG:-run}$RUN.fifo
+rm -f "$STDOUT_FIFO"; mkfifo "$STDOUT_FIFO"
+python3 -u -c '
+import sys, time
+t0 = time.monotonic()
+for line in sys.stdin:
+    sys.stdout.write("[%8.3f] %s" % (time.monotonic() - t0, line))
+' < "$STDOUT_FIFO" > "$LOG" &
+STAMPER=$!
+
 env WAYLAND_DISPLAY=$DISP GDK_BACKEND=wayland CORDIAL_DEV_CONTROL=1 \
   ${CORDIAL_POLL_COALESCE_US:+CORDIAL_POLL_COALESCE_US=$CORDIAL_POLL_COALESCE_US} \
   ${CORDIAL_BRIDGE_DELAY_MS:+CORDIAL_BRIDGE_DELAY_MS=$CORDIAL_BRIDGE_DELAY_MS} \
   "$ROOT/target/release/cordial-run" --lib-dir "$LIB" --apk "$APK" --host-libc \
-  --game-activity --run 0 --profile "$PROFILE" > "$LOG" 2>&1 &
+  --game-activity --run 0 --profile "$PROFILE" > "$STDOUT_FIFO" 2>&1 &
 CLIENT=$!
 
 if [ -n "$NUDGING" ]; then
@@ -219,5 +236,7 @@ VERDICT=HEALTHY
 [ "$P10" = "$P25" ] && [ "$P25" -lt 10 ] && VERDICT=FROZEN
 
 kill -9 $CLIENT 2>/dev/null
+kill "${STAMPER:-0}" 2>/dev/null
+rm -f "$STDOUT_FIFO"
 distrobox enter cordial -- bash -lc 'for p in $(pidof sway); do kill -9 $p 2>/dev/null; done' >/dev/null 2>&1
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$RUN" "$READY" "$P10" "$P25" "$COOKIES" "$VERDICT" "$STAGE"

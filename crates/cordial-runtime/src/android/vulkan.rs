@@ -532,6 +532,9 @@ static HOST_QUEUE_PRESENT: std::sync::atomic::AtomicUsize =
 extern "C" fn vk_queue_present_khr(queue: *mut c_void, info: *const c_void) -> i32 {
     crate::android::glcount::QUEUE_PRESENT
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // How evenly, not just how often. A count is a mean and a mean hides
+    // judder -- see `frame_pacing`.
+    crate::android::frame_pacing::record_present();
     let f = HOST_QUEUE_PRESENT.load(std::sync::atomic::Ordering::Relaxed);
     if f == 0 {
         return 0;

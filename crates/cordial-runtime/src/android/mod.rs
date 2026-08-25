@@ -18,6 +18,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod config;
 pub mod editor_font;
+pub mod frame_pacing;
 pub mod gl;
 pub mod glcount;
 pub mod input;

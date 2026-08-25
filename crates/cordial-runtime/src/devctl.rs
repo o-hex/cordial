@@ -264,7 +264,8 @@ fn info_line() -> String {
         crate::android::glcount::QUEUE_PRESENT.load(Ordering::Relaxed);
     let (w, h) = crate::android::vulkan::last_extent();
     format!(
-        "ok presents={presents} accepted={} extent={w}x{h} pid={}",
+        "ok presents={presents}{} accepted={} extent={w}x{h} pid={}",
+        crate::android::frame_pacing::summary().map(|s| format!(" {s}")).unwrap_or_default(),
         ACCEPTED.load(Ordering::Relaxed),
         std::process::id(),
     )

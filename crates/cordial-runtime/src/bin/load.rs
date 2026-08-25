@@ -3934,6 +3934,17 @@ fn main() -> ExitCode {
                                                 // clipboard's but after the
                                                 // same precondition holds.
                                                 cordial_runtime::webview::arm(|name| lib.symbol(name));
+                                                // Same precondition, same
+                                                // moment: the bus exists, so
+                                                // the outbound half of
+                                                // linking can bind its
+                                                // request handler. Without
+                                                // this, clicking Terms,
+                                                // Privacy or any external
+                                                // link does nothing at all --
+                                                // the engine issues the
+                                                // request and no one answers.
+                                                cordial_runtime::linking::arm(|name| lib.symbol(name));
                                                 install_webview_presenter();
 
                                                 // A dev-only trigger, in the same family as

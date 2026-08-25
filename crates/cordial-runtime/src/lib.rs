@@ -27,6 +27,7 @@ pub mod flags;
 pub mod graphics;
 pub mod headless;
 pub mod identity;
+pub mod linking;
 pub mod plugin_host;
 pub mod profile;
 pub mod refresh;

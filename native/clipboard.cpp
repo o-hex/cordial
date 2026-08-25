@@ -73,6 +73,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <unordered_map>
 
 namespace cordial {
@@ -220,6 +221,75 @@ public:
     }
 };
 
+/// `com.roblox.universalapp.messagebus.RequestHandlerRaw`
+///
+/// The other half of the bus. `RawCallback` is fire-and-forget -- the engine
+/// publishes and nobody answers; this one is a *request*, and the engine waits
+/// for the string this returns. `Linking.openURL` is the first user: the
+/// engine hands over `{"url": "..."}` and expects `{"success": <bool>}` back.
+///
+/// The answer has to be honest. AGENTS.md's rule about never making a stub lie
+/// applies with unusual force here, because the engine's Lua shows the user
+/// something based on that boolean -- returning success for a URL that was
+/// refused would put a "link opened" in front of somebody whose browser never
+/// moved.
+///
+/// The payload is measured and forwarded, never parsed and never printed. A
+/// link can carry credentials in its query string, and this path has printed
+/// one before -- see docs/analysis/deep-links.md section 6.3.
+class MessageBusRequestHandlerRaw : public Object {
+public:
+    /// Fills `out` with the JSON response. Returns non-zero if it wrote one.
+    int (*sink)(const char* request, char* out, size_t out_len) = nullptr;
+    std::string method_id;
+
+    /// `run(Ljava/lang/String;)Ljava/lang/String;`
+    ///
+    /// **The descriptor is INFERRED and worth re-checking.** The interface
+    /// carries no method in the dex `method_ids` table; three things agree on
+    /// the shape -- R8's own implementor `MessageBus$b.run(Ljava/lang/String;)Ljava/lang/String;`,
+    /// the factory `MessageBus.j(...)Lcom/roblox/universalapp/messagebus/RequestHandlerRaw;`,
+    /// and mocktail's dispatcher, which handles `run` on this class with one
+    /// jstring in and a jobject out. A wrong arity here is the failure that
+    /// kept NativeTextBoxInfo null for a year, so if requests never arrive,
+    /// suspect this line first.
+    static std::shared_ptr<String> run(ENV*, Object* self, std::shared_ptr<String> payload) {
+        auto* h = dynamic_cast<MessageBusRequestHandlerRaw*>(self);
+        const std::string json =
+            payload ? static_cast<const std::string&>(*payload) : std::string();
+        char out[256] = {0};
+        bool answered = false;
+        if (h && h->sink) {
+            answered = h->sink(json.c_str(), out, sizeof out) != 0;
+        }
+        if (trace()) {
+            fprintf(stderr, "[messagebus] request %s: %zu bytes in, %s\n",
+                    (h && !h->method_id.empty()) ? h->method_id.c_str() : "(unknown)",
+                    json.size(), answered ? "answered" : "no handler");
+        }
+        return std::make_shared<String>(answered ? std::string(out)
+                                                 : std::string("{\"success\":false}"));
+    }
+
+    static void Register(ENV* env) {
+        const char* name = "com/roblox/universalapp/messagebus/RequestHandlerRaw";
+        env->GetClass<MessageBusRequestHandlerRaw>(name);
+        auto c = env->GetClass(name);
+        c->HookInstanceFunction(env, "run", &MessageBusRequestHandlerRaw::run);
+    }
+};
+
+/// Handlers stay alive for the life of the process.
+///
+/// The bus holds the engine's own reference, but nothing here would keep the
+/// object from being collected between registration and the first request --
+/// the same reasoning `subscription_for` records for the subscribe side, and
+/// the same fix.
+static std::vector<std::shared_ptr<MessageBusRequestHandlerRaw>>& request_handlers() {
+    static std::vector<std::shared_ptr<MessageBusRequestHandlerRaw>> held;
+    return held;
+}
+
 /// Registers `RawCallback` and `Connection` once for the whole process.
 ///
 /// Called from `android_classes.cpp`'s `JNI_OnLoad` path. Must not be called a
@@ -231,6 +301,7 @@ public:
 void register_clipboard_classes(jnivm::ENV* env) {
     MessageBusRawCallback::Register(env);
     MessageBusConnection::Register(env);
+    MessageBusRequestHandlerRaw::Register(env);
 }
 
 } // namespace cordial
@@ -308,6 +379,50 @@ int cordial_messagebus_subscribe(void* fn, const char* message_id, void (*sink)(
         return -1;
     } catch (...) {
         sub.callback.reset();
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// Bind a request handler for one protocol method, e.g. `Linking` / `openURL`.
+///
+/// `fn` is `Java_com_roblox_universalapp_messagebus_MessageBus_setRequestHandlerRaw`.
+/// Note the arity: five, not four. The second parameter is the receiver, and
+/// the class goes there -- the same trick `cordial_messagebus_subscribe` and
+/// `deeplink.cpp`'s `publishRaw` caller already rely on against this engine.
+///
+/// Unlike a subscription this returns nothing, so there is no `Connection` to
+/// confirm it with. "Did not throw" is the whole of the available evidence,
+/// and the only real confirmation is a request arriving.
+extern "C" int cordial_messagebus_set_request_handler(
+    void* fn, const char* protocol, const char* method,
+    int (*sink)(const char*, char*, size_t), char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jstring, jstring, jobject);
+    auto* env = cordial::process_env();
+    if (!fn || !env || !protocol || !method) {
+        snprintf(err, err_len, "no JavaVM, or setRequestHandlerRaw is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/universalapp/messagebus/MessageBus");
+        auto handler = std::make_shared<cordial::MessageBusRequestHandlerRaw>();
+        handler->sink = sink;
+        handler->method_id = std::string(protocol) + "." + method;
+        auto jproto = std::make_shared<cordial::String>(std::string(protocol));
+        auto jmethod = std::make_shared<cordial::String>(std::string(method));
+        // Held before the call: the bus may deliver a request synchronously
+        // from inside it, exactly as the subscribe path may deliver a message.
+        cordial::request_handlers().push_back(handler);
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(),
+                                   (jobject)cordial::to_jni(env, cls),
+                                   (jstring)cordial::to_jni(env, jproto),
+                                   (jstring)cordial::to_jni(env, jmethod),
+                                   (jobject)cordial::to_jni(env, handler));
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
         snprintf(err, err_len, "non-standard C++ exception");
         return -1;
     }

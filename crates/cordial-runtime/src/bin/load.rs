@@ -1098,13 +1098,39 @@ fn install_webview_presenter() {
     }
 }
 
+/// Without an embedded web view, send the engine's `openWindow` to the user's
+/// browser instead of dropping it.
+///
+/// **This used to install nothing at all.** It printed a line saying an
+/// `openWindow` would be "parsed and logged but nothing will be shown", and
+/// that is exactly what happened: the engine asked for a window, the request
+/// was parsed, and it went in the bin. From the outside that is a link that
+/// does nothing, which is how it was reported -- "clicking a link on sober
+/// takes you to a website via xdg open, on cordial it doesnt".
+///
+/// Handing it to the browser is strictly better than dropping it and is what
+/// the user is asking for by clicking. It is deliberately *only* the
+/// no-web-view build: where a real web view exists the engine gets the
+/// in-application window it asked for, because some of these are sign-in and
+/// checkout flows that expect to come back.
+///
+/// Same gate as `Linking.openURL` and for the same reason -- the URL comes
+/// from the engine, which got it from Lua. `urlopen` refuses anything that is
+/// not http or https, and the address is never logged because it can carry
+/// credentials in its query string.
 #[cfg(not(feature = "webview"))]
 fn install_webview_presenter() {
     println!(
-        "  webview: built without the `webview` feature (needs webkitgtk6.0-devel); an \
-         openWindow request will be parsed and logged but nothing will be shown -- see \
-         `just build toolbox`"
+        "  webview: built without the `webview` feature (needs webkitgtk6.0-devel); \
+         openWindow will open in your browser instead of an in-app window -- see \
+         `just build toolbox` for the embedded one"
     );
+    cordial_runtime::webview::set_presenter(|request| {
+        match cordial_plugins::urlopen::open(&request.url) {
+            Ok(()) => println!("  webview: openWindow handed to the browser"),
+            Err(e) => println!("  webview: openWindow could not be opened: {e}"),
+        }
+    });
 }
 
 /// The engine's own version, read out of `libroblox.so` rather than hardcoded.

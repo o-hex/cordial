@@ -2260,7 +2260,24 @@ impl WaylandWindow {
         // region punched, background opaque, engine lowered, canvas completely
         // black. Paired here so the two can never disagree, and so the window
         // is only ever see-through while something is painting underneath it.
-        self.host.0.set_canvas_see_through(!above);
+        // **Order matters, and getting it wrong costs a visible frame.**
+        //
+        // Going *down*, the background must already be transparent when the
+        // restack lands: a CSS class change is honoured on GTK's next frame
+        // while the restack and the parent commit below go out immediately, so
+        // doing them in the written order hands the compositor "the canvas is
+        // underneath now" together with a parent buffer that is still opaque.
+        // The engine vanishes for exactly one frame and comes back when GTK
+        // next paints -- reported as "once you press it, roblox disappears for
+        // a frame then reappears".
+        //
+        // Going *up* the same reasoning runs backwards: restack first, and the
+        // canvas is opaque and covering before the background stops being
+        // transparent, so there is no frame where the desktop shows through.
+        if !above {
+            self.host.0.set_canvas_see_through(true);
+            self.host.0.repaint_now();
+        }
         let opcode = if above { WL_SUBSURFACE_PLACE_ABOVE } else { WL_SUBSURFACE_PLACE_BELOW };
         // SAFETY: `self.subsurface` is a live proxy for the process's
         // lifetime; `self.parent_surface` is the only valid sibling reference
@@ -2283,6 +2300,12 @@ impl WaylandWindow {
         // for the process's lifetime, and `commit` takes no arguments.
         unsafe {
             (self.wl.marshal_flags)(self.parent_surface, WL_SURFACE_COMMIT, std::ptr::null(), 1, 0);
+        }
+        // The other half of the ordering above: the canvas is back on top and
+        // covering, so the background can stop being see-through without a
+        // frame of desktop showing through behind it.
+        if above {
+            self.host.0.set_canvas_see_through(false);
         }
         println!(
             "[android] wayland: engine subsurface placed {} the host window (web-view dialogs open: {})",

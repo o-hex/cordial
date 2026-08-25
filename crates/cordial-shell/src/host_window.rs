@@ -970,6 +970,27 @@ impl HostWindow {
     /// commits when it has drawn. Moving the engine's surface without this
     /// leaves it at its old position until something unrelated happens to
     /// repaint the window, which reads as a stuck or torn canvas.
+    /// Repaint the toplevel now, rather than on GTK's next frame.
+    ///
+    /// Exists for one caller: restacking the engine's subsurface. Lowering it
+    /// and turning the background transparent have to reach the compositor in
+    /// the same breath, and they do not by default -- a CSS class change is
+    /// honoured on GTK's next frame while the restack goes out immediately, so
+    /// the compositor gets "the canvas is underneath now" together with a
+    /// parent buffer that is still opaque. That is one frame of the engine
+    /// hidden behind GTK's background, reported as "once you press it, roblox
+    /// disappears for a frame then reappears".
+    ///
+    /// Best effort, and it does not pretend otherwise: GTK renders on its
+    /// frame clock and nothing here can force a frame the compositor has not
+    /// asked for. Queuing the draw and then running the main context gives it
+    /// the opportunity, which is enough in practice and is strictly better
+    /// than not trying.
+    pub fn repaint_now(&self) {
+        self.window.queue_draw();
+        self.pump();
+    }
+
     pub fn queue_commit(&self) {
         self.window.queue_draw();
     }

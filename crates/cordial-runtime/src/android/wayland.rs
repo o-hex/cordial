@@ -1030,6 +1030,10 @@ pub struct WaylandWindow {
     /// declines can be reported once instead of leaving the camera dead with no
     /// explanation. `None` while no request is outstanding.
     lock_requested_at: Mutex<Option<std::time::Instant>>,
+    /// When the compositor last deactivated a lock Cordial still wants, or
+    /// `None` while the lock is active. See [`WaylandWindow::sync_pointer_lock`]
+    /// -- a deactivation that is never reversed is otherwise permanent.
+    lock_inactive_since: Mutex<Option<std::time::Instant>>,
     conn_fd: c_int,
 
     buffers: Mutex<Geometry>,
@@ -1557,6 +1561,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         relative_pointer: relative_pointer.unwrap_or(std::ptr::null_mut()),
         locked_pointer: Mutex::new(std::ptr::null_mut()),
         lock_requested_at: Mutex::new(None),
+        lock_inactive_since: Mutex::new(None),
         conn_fd,
         buffers: Mutex::new(Geometry { width: cw, height: ch, format: super::window::WINDOW_FORMAT_RGBA_8888 }),
         placed_at: Mutex::new((cx, cy)),
@@ -2769,6 +2774,7 @@ unsafe extern "C" fn locked_pointer_locked(_data: *mut c_void, _lp: *mut c_void)
     POINTER_LOCK_ACTIVE.store(true, Ordering::Release);
     if let Some(w) = current() {
         *w.lock_requested_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *w.lock_inactive_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     // Arriving at a lock is not a movement. Without this the first relative
     // motion after the cursor stops would be added to whatever absolute delta
@@ -2788,6 +2794,12 @@ unsafe extern "C" fn locked_pointer_locked(_data: *mut c_void, _lp: *mut c_void)
 /// relative motion stops being treated as camera movement.
 unsafe extern "C" fn locked_pointer_unlocked(_data: *mut c_void, _lp: *mut c_void) {
     POINTER_LOCK_ACTIVE.store(false, Ordering::Release);
+    if let Some(w) = current() {
+        let mut since = w.lock_inactive_since.lock().unwrap_or_else(|e| e.into_inner());
+        if since.is_none() {
+            *since = Some(std::time::Instant::now());
+        }
+    }
     super::input::reset_mouse_delta();
     if super::input::trace_mouse() {
         eprintln!("[cordial] pointer lock: compositor sent unlocked");
@@ -2893,6 +2905,33 @@ impl WaylandWindow {
         super::input::pass_mouse_move_delta(x, y, dx, dy);
     }
 
+    /// Whether a lock Cordial holds has been deactivated long enough to treat
+    /// as gone rather than paused.
+    ///
+    /// One second, matching the refusal timeout beside it, and only while the
+    /// pointer is over the canvas: a deactivation with the pointer elsewhere is
+    /// the compositor doing its job, and re-requesting into that would be a
+    /// destroy and a create per second for as long as the user is in another
+    /// window.
+    ///
+    /// `INFERRED`. The mechanism is read off the protocol -- a `persistent`
+    /// lock may be deactivated and reactivated at the compositor's discretion,
+    /// and nothing obliges it to reactivate -- and off this file's own state
+    /// machine, which has no path out of that combination. It is not measured:
+    /// exercising it needs a compositor that deactivates a lock without
+    /// restoring it, and the headless harness cannot even give Cordial a
+    /// pointer (`SEAT_CAPS` is read once at `open`).
+    fn lock_went_dead(&self) -> bool {
+        if POINTER_LOCK_ACTIVE.load(Ordering::Acquire) || !POINTER_ON_CANVAS.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.lock_inactive_since
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|at| at.elapsed() > std::time::Duration::from_secs(1))
+    }
+
     /// Take or release the pointer to match what the engine and the mouse are
     /// currently asking for. Called once per pump.
     fn sync_pointer_lock(&self) {
@@ -2939,6 +2978,32 @@ impl WaylandWindow {
             self.lock_pointer();
         } else if !want && held {
             self.release_pointer();
+        } else if want && held && self.lock_went_dead() {
+            // **A lock the compositor switched off and never switched back
+            // on.** `locked_pointer_unlocked` deliberately keeps the object
+            // alive, because a `persistent` lock may be reactivated and
+            // destroying it on every deactivation would turn a pause into a
+            // permanent loss. The gap that left is this branch: if it is never
+            // reactivated, `held` stays true, `want` stays true, and neither
+            // arm above fires -- so Cordial believes it holds a lock, the
+            // compositor has it switched off, relative motion is discarded,
+            // and nothing ever asks again. The camera is dead with no way out.
+            //
+            // Reported on Discord as shift lock that "sometimes won't undo ...
+            // then it works", and separately as behaving "like shift lock if
+            // it would do nothing" -- by someone on a tiling WM, which is the
+            // kind of compositor that activates and deactivates constraints
+            // far more readily than GNOME does.
+            //
+            // Dropping the object makes the next tick request a fresh one.
+            // Gated on the pointer being over the canvas so that being
+            // alt-tabbed away -- where deactivation is correct and expected --
+            // does not churn a destroy and a create every second.
+            println!(
+                "[cordial] pointer lock: deactivated and not restored; asking again"
+            );
+            self.release_pointer();
+            *self.lock_inactive_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
 
         // A compositor may decline, and the protocol gives it no way to say so

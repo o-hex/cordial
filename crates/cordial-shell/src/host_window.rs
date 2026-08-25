@@ -262,10 +262,14 @@ pub struct HostWindow {
     /// What to tell when the user edits. Installed by the runtime, which owns
     /// the push to `syncTextboxTextAndCursorPosition2`.
     editor_changed: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(&str, i32)>>>>,
-    /// Whether the canvas is currently lowered. Remembered because the input
-    /// region depends on it *and* on where the editor is, and those two change
-    /// at different moments.
+    /// Whether the canvas is currently lowered. Remembered for the CSS class;
+    /// the input region no longer depends on it, see [`HostWindow::set_canvas_cutout`].
     canvas_see_through: std::cell::Cell<bool>,
+    /// The canvas rectangle in surface coordinates, as last given to
+    /// [`HostWindow::set_canvas_cutout`]. Remembered so the input region can be
+    /// rebuilt when the *editor* moves, without waiting for the next geometry
+    /// sync to supply the canvas again.
+    canvas_rect: std::cell::Cell<Option<(i32, i32, i32, i32)>>,
 }
 
 /// The Android editor rectangle Roblox asks the platform to paint over its
@@ -350,9 +354,6 @@ impl HostWindow {
                  margin: 0; \
                  min-height: 0; \
                  min-width: 0; \
-             } \
-             .cordial-editor selection { \
-                 background-color: alpha(currentColor, 0.25); \
              } \
              .cordial-text-fallback { \
                  background-color: rgba(28, 28, 30, 0.94); \
@@ -498,6 +499,7 @@ impl HostWindow {
             editor_css,
             editor_rect: std::cell::Cell::new(None),
             canvas_see_through: std::cell::Cell::new(false),
+            canvas_rect: std::cell::Cell::new(None),
             editor_seeding,
             editor_changed,
         }
@@ -610,8 +612,7 @@ impl HostWindow {
         // measured it.
         self.editor.set_visibility(!overlay.password);
 
-        let seeded = self.editor.text() != overlay.text;
-        if seeded {
+        if self.editor.text() != overlay.text {
             self.editor_seeding.set(true);
             self.editor.set_text(overlay.text);
             self.editor.set_position(overlay.caret_chars);
@@ -654,15 +655,15 @@ impl HostWindow {
             // reported the box as one byte long.
             self.editor.grab_focus_without_selecting();
         }
-        // Collapse any selection and put the caret where the engine says it is,
-        // every time -- not only on the focus transition. `set_text` above
-        // leaves the caret at the end and a stray select-all can also arrive
-        // from a double click that GTK handled before this ran; either way the
-        // engine's caret is the one that should win, and setting it is what
-        // makes the selection empty again.
-        if self.editor.selection_bounds().is_some() && !seeded {
-            self.editor.set_position(self.editor.position());
-        }
+        // **Nothing here touches the selection, and that is deliberate.**
+        // There used to be a "collapse any stray selection" line, added to
+        // belt-and-brace the select-on-focus fix above. It destroyed every
+        // selection the user made: selecting text moves the cursor, moving the
+        // cursor notifies, notifying pushes to the engine, pushing repaints the
+        // overlay, and the repaint ran the collapse. Ctrl+A appeared to do
+        // nothing and dragging across text would not highlight it.
+        // `grab_focus_without_selecting` already handles the only case that
+        // needed handling. The widget owns its selection.
         self.window.queue_draw();
     }
 
@@ -729,50 +730,19 @@ impl HostWindow {
         self.refresh_input_region();
     }
 
-    /// Recompute the input region from the two things it depends on: whether
-    /// the canvas is lowered, and where the editor is.
+    /// Rebuild and apply the input region.
     ///
-    /// Called from both, because they change at different moments and the
-    /// wrong combination is silent. A lowered canvas with no hole punched
-    /// swallows every click; a punched hole with no editor in it swallows
-    /// clicks on the editor that is not there.
+    /// Called from both the things it depends on -- the canvas moving and the
+    /// editor moving -- because they change at different moments and the wrong
+    /// combination is silent in both directions. A canvas with no hole punched
+    /// for the editor swallows every click on the text field; a hole with no
+    /// editor in it drops clicks meant for the game.
     fn refresh_input_region(&self) {
-        self.set_canvas_input_passthrough(self.canvas_see_through.get());
-    }
-
-    /// Let pointer events over the canvas reach the engine's subsurface instead
-    /// of being swallowed by GTK's.
-    ///
-    /// **Paired with lowering, and useless apart from it.** While the engine's
-    /// subsurface sits *above* the parent it holds pointer focus over the
-    /// canvas and this is unnecessary. The moment it is lowered -- which is
-    /// what makes a web view or the text editor visible -- GTK's surface is on
-    /// top and receives every click, so nothing reaches the game. Reported as
-    /// "you can't click out a box?": with the editor up, the click that should
-    /// dismiss it never arrives anywhere.
-    ///
-    /// GTK does not do this for us. Measured with `WAYLAND_DEBUG=1`: it sends
-    /// `set_input_region` once for the whole surface plus the CSD shadow and
-    /// never revisits it, whatever its content's transparency. With the punch,
-    /// two synthetic clicks over the canvas produced four
-    /// `nativePassMouseButton` calls into the engine; without it, zero.
-    ///
-    /// Restoring passes `None`, which is the protocol's own "infinite region":
-    /// `wl_surface.set_input_region(NULL)` means the whole surface takes input,
-    /// which is exactly the default being returned to. Building a
-    /// whole-surface rectangle instead would be the same thing spelled less
-    /// clearly, and wrong the moment the surface is resized between the punch
-    /// and the restore.
-    fn set_canvas_input_passthrough(&self, on: bool) {
         let Some(surface) = self.window.surface() else { return };
-        if !on {
-            surface.set_input_region(None);
-            return;
-        }
-        let Some((cx, cy, cw, ch)) = self.content_rect() else { return };
+        let Some(canvas) = self.canvas_rect.get().or_else(|| self.content_rect()) else { return };
         let region = input_region(
             (surface.width(), surface.height()),
-            (cx, cy, cw, ch),
+            canvas,
             self.editor_rect.get(),
         );
         surface.set_input_region(Some(&region));
@@ -799,25 +769,44 @@ impl HostWindow {
     /// when the window resizes, so a region set once at startup would be
     /// silently reverted by the first resize, and the canvas would stop taking
     /// clicks with nothing to show why.
+    /// Tell the compositor which part of the parent surface is the engine's.
+    ///
+    /// **This is the only place the input region is written, and that is the
+    /// point.** There used to be a second writer -- the editor's hole was
+    /// punched by `set_text_overlay` and this function, called from
+    /// `sync_canvas_geometry` on every pump tick, immediately overwrote it with
+    /// a region that knew nothing about the editor. The hole existed for a few
+    /// milliseconds at a time, roughly twenty times a second, so a click into
+    /// the text field essentially never landed. Reported as "you cant click to
+    /// move the caret ... you cant drag to select text", and it survived a
+    /// first fix that corrected the hole's coordinates while leaving the
+    /// overwrite in place.
+    ///
+    /// The opaque region is *not* the same shape and must not be: it says what
+    /// GTK paints solidly, and the editor is drawn over the canvas with a
+    /// transparent background, so it stays part of the cut-out.
     pub fn set_canvas_cutout(&self, x: i32, y: i32, w: i32, h: i32) {
         let Some(surface) = self.window.surface() else { return };
         let (sw, sh) = (surface.width(), surface.height());
         if sw <= 0 || sh <= 0 || w <= 0 || h <= 0 {
             return;
         }
+        self.canvas_rect.set(Some((x, y, w, h)));
+
         let whole = gtk::cairo::RectangleInt::new(0, 0, sw, sh);
-        let region = gtk::cairo::Region::create_rectangle(&whole);
-        if region.subtract_rectangle(&gtk::cairo::RectangleInt::new(x, y, w, h)).is_err() {
+        let opaque = gtk::cairo::Region::create_rectangle(&whole);
+        if opaque.subtract_rectangle(&gtk::cairo::RectangleInt::new(x, y, w, h)).is_err() {
             return;
         }
-        surface.set_input_region(Some(&region));
         // Deprecated since GDK 4.16, which computes its own from the render
         // tree -- and its own answer is "the whole surface", because the
         // drawing area being transparent is not something it can see through
         // to a subsurface with. Calling it anyway is the only way to say what
         // is actually true here.
         #[allow(deprecated)]
-        surface.set_opaque_region(Some(&region));
+        surface.set_opaque_region(Some(&opaque));
+
+        self.refresh_input_region();
     }
 
     /// Whether the compositor currently considers this window focused.

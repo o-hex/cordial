@@ -487,34 +487,61 @@ arms above, including the one that made the looper backoff look guilty, are
 confounded and must not be quoted as evidence about code.** Both ran one arm
 after the other. Interleave.
 
-### Frozen runs are the fast ones, and that is probably backwards
+### RETRACTED: frozen runs are not the fast ones
 
-With the engine's own timestamps across thirty launches, **a run that freezes
-reaches every startup milestone earlier than one that does not**:
+This section said, on the strength of thirty launches, that a run which freezes
+reaches every startup milestone earlier than one that does not --
+`nativeAppBridgeStartLuaAppDM` at a median 0.490s against 0.665s and so on down
+the list. **It does not replicate, and it was almost certainly the burst
+structure two paragraphs up wearing a disguise.**
 
-    milestone                         frozen    healthy
-    nativeAppBridgeStartLuaAppDM       0.490      0.665
-    Lua app running status = true      0.625      0.896
-    Forcing finalize coordinator       1.061      1.366
-    sync cookies from engine           1.237      1.558
+Twenty-four more launches, eleven frozen and thirteen healthy, with the same
+measurement:
 
-Medians, consistent in direction at every mark, and the gap is already 0.175s at
-the first line common to all thirty logs. It also explains the load arm: making
-the machine busy slows that window down and froze one in fifteen instead of five.
+    nativeAppBridgeStartLuaAppDM, engine clock   frozen 0.483   healthy 0.482
+    the same event, Cordial's own clock          frozen 0.692   healthy 0.692
 
-**The obvious reading is a race lost by arriving too early, and the obvious test
-falsifies it.** `CORDIAL_BRIDGE_DELAY_MS=250` holds Cordial's `StartLuaAppDM`
-back; it moved the whole timeline into the healthy band -- `StartLuaAppDM` at
-0.734s, `sync cookies` at 1.555s -- **and the run froze anyway.** One run, so not
-a result on its own, but it is a direct counterexample and it points at the
-likelier reading: **a frozen run is faster because it skipped something**, not
-frozen because it was fast. Something in the first half-second does not happen,
-and its absence is both why the run arrives early and why it wedges.
+Identical. And the offset between the two clocks is the same in both groups
+(+0.214s against +0.210s), so it is not a clock artefact either -- the two
+groups simply run at the same speed.
 
-That is where to look next: not at the freeze, at the 175 milliseconds of work a
-healthy run does before `StartLuaAppDM` and a frozen one does not. Cordial's own
-stdout is identical between the two, line for line, across fifty runs -- so
-whatever is skipped, Cordial is not logging it.
+The first survey's frozen runs clustered in a contiguous block of launches, and
+the machine's speed drifts across a survey; the frozen group inherited the
+timing of the window it happened to fall in. **That is the same confound this
+file already warns about for A/B arms, applied to a comparison that is not an
+A/B and so did not look like it needed the warning.** Any frozen-versus-healthy
+comparison here has to be checked against a second survey before it is believed,
+because the freezes come in runs.
+
+`CORDIAL_BRIDGE_DELAY_MS` remains, off, as the knob that would have tested the
+retracted theory. It is harmless and it is the cheapest way to hold the bridge
+back if a future timing idea needs testing.
+
+### Where the two actually part company, in one clock
+
+Cordial's stdout is timestamped by `tools/startup-freeze-survey.sh`, which puts
+every line of a launch on one clock. Across twenty-four runs, **frozen and
+healthy are identical to within three milliseconds** all the way through:
+
+    0.692  Lua app DataModel started              frozen 0.692  healthy 0.692
+    0.798  surface handed to the engine           frozen 0.798  healthy 0.798
+    1.006  app ready: Home                        frozen 1.010  healthy 1.006
+    1.051  mainWorkCallback                       frozen 1.051  healthy 1.051
+    1.07   reporting surface extent to the engine frozen 1.098  healthy 1.072
+
+and then, **in healthy runs only**:
+
+    1.366  vkCreateSwapchainKHR (the second one)
+    1.871  DID_LOG_IN
+    2.895  LUA_HOME_PAGE_LOADED
+
+A frozen run reports the new surface extent like every other run and the engine
+never acts on it. Nothing Cordial does differs, at any point, by more than three
+milliseconds -- so **whatever decides this is inside the engine, between the
+resize being reported and the swapchain being rebuilt**, and no amount of
+further staring at Cordial's own log will find it. The next instrument has to
+see into that gap: the engine's own log is the only thing that does, and it
+stops one line after `sync cookies from engine`.
 
 ### The correlation still standing
 

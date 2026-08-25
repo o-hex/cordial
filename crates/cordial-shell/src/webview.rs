@@ -504,6 +504,51 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
                     Err(e) => eprintln!("[webview] could not ask the page about WebAuthn: {e}"),
                 }
             });
+
+            // **`CORDIAL_WEBVIEW_BRIDGE_TEST=1`: make the page call the bridge,
+            // so the JS-to-engine direction can be seen working.**
+            //
+            // Everything else about this window is observable from outside --
+            // the dialog opens or it does not, the page renders or it does not.
+            // The bridge is the one part that is invisible until a real Roblox
+            // page decides to use it, which needs signed-in UI and a click
+            // AGENTS.md's rule against synthesising input rules out. So there
+            // was no way to tell a working bridge from a broken one except by
+            // waiting for somebody to press Join and report back.
+            //
+            // This skips the page's own decision to call the bridge and skips
+            // nothing else: the message goes through the same handler, the same
+            // origin and size policy, the same sink and the same
+            // `signalJavascriptCallback`. A run with this set prints
+            // `forwarded a bridge message` from `cordial_runtime::webview` if
+            // and only if the whole chain works.
+            //
+            // The page's own world, deliberately, unlike the probe above: the
+            // bridge global is injected there and a named world would not see
+            // it -- which would make this report "absent" on a perfectly
+            // healthy build.
+            if std::env::var_os("CORDIAL_WEBVIEW_BRIDGE_TEST").is_some() {
+                const SELF_TEST: &str = r#"(() => {
+  const bridge = window.__globalRobloxAndroidBridge__;
+  if (!bridge || typeof bridge.executeRoblox !== "function") { return "no bridge on this page"; }
+  bridge.executeRoblox(JSON.stringify({ cordial: "bridge-self-test" }));
+  return "called";
+})()"#;
+                v.evaluate_javascript(
+                    SELF_TEST,
+                    None,
+                    None,
+                    gtk4::gio::Cancellable::NONE,
+                    |r| match r {
+                        Ok(value) => eprintln!(
+                            "[webview] bridge self-test: {} (a `forwarded a bridge message` line \
+                             below is the round trip; its absence is the finding)",
+                            value.to_str()
+                        ),
+                        Err(e) => eprintln!("[webview] bridge self-test could not run: {e}"),
+                    },
+                );
+            }
         });
     });
 

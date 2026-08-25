@@ -534,6 +534,9 @@ const WL_DISPLAY_GET_REGISTRY: u32 = 1;
 const WL_REGISTRY_BIND: u32 = 0;
 const WL_COMPOSITOR_CREATE_SURFACE: u32 = 0;
 const WL_SURFACE_COMMIT: u32 = 6;
+/// `wl_surface.set_opaque_region`. Sent by Cordial directly, not through GDK --
+/// see `set_engine_stacking`.
+const WL_SURFACE_SET_OPAQUE_REGION: u32 = 4;
 const WL_SEAT_GET_POINTER: u32 = 0;
 const WL_SEAT_GET_KEYBOARD: u32 = 1;
 
@@ -2296,6 +2299,40 @@ impl WaylandWindow {
             );
         }
         self.host.0.queue_commit();
+        if !above {
+            // **Say "nothing here is opaque" ourselves, in the same commit as
+            // the restack.**
+            //
+            // Cordial already asks GDK for this through
+            // `set_opaque_region(None)`, and the game still went black in an
+            // experience with every other explanation eliminated -- GTK
+            // painting (every descendant forced transparent), the CSS class
+            // (instrumented identical), a stale region (fixed), frame
+            // starvation (200ms of pumping). What none of those could rule out
+            // is GDK recomputing its own region and committing it after ours,
+            // because that happens inside GTK where this code cannot see.
+            //
+            // Sending it on the wire here removes the question. The request is
+            // double-buffered like everything else, so landing it immediately
+            // before the commit below means the compositor applies an empty
+            // opaque region and the `place_below` together, with no window in
+            // which the parent claims to be opaque over a lowered canvas.
+            //
+            // SAFETY: `parent_surface` is GTK's toplevel `wl_surface`, live for
+            // the process's lifetime. `set_opaque_region`'s signature is "?o" --
+            // one nullable object -- and a null region is the protocol's own
+            // spelling of "empty".
+            unsafe {
+                (self.wl.marshal_flags)(
+                    self.parent_surface,
+                    WL_SURFACE_SET_OPAQUE_REGION,
+                    std::ptr::null(),
+                    1,
+                    0,
+                    std::ptr::null_mut::<c_void>(),
+                );
+            }
+        }
         // SAFETY: `self.parent_surface` is GTK's toplevel `wl_surface`, live
         // for the process's lifetime, and `commit` takes no arguments.
         unsafe {

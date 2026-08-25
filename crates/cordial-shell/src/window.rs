@@ -999,7 +999,12 @@ fn profile_busy(
         .heading(format!("Profile {name} is already in use"))
         .body(body)
         .build();
-    dialog.add_response("close", "Close");
+    // **"Cancel", not "Close".** This dialog can carry a "Close It and Launch"
+    // response beside it, and two buttons both beginning with "Close" left the
+    // dismissing one ambiguous about what it closed -- the dialog, or the other
+    // client. Reported as the dialog having three buttons, two of which appear
+    // to do the same thing. They never did: this one only dismisses.
+    dialog.add_response("cancel", "Cancel");
     dialog.add_response("profile", "Choose a Profile");
     if ours.is_some() {
         dialog.add_response("stop", "Close It and Launch");

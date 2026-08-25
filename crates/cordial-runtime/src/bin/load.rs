@@ -3672,6 +3672,30 @@ fn main() -> ExitCode {
                                                 Ok(()) => println!("  Lua app DataModel started"),
                                                 Err(e) => println!("  StartLuaAppDM failed: {e}"),
                                             }
+                                            // The same call, kept for the pump's
+                                            // startup watchdog. A third of
+                                            // launches leave the engine parked
+                                            // having started the Lua app once
+                                            // where a healthy run starts it
+                                            // twice; the watchdog asks again.
+                                            // See `looper::RECOVERY_MAX_PRESENTS`
+                                            // for why that cannot fire on a
+                                            // client which ever drew properly.
+                                            //
+                                            // The address is carried as a
+                                            // `usize` because a raw pointer is
+                                            // not `Send`, and this closure is
+                                            // read from the pump thread. It
+                                            // points into `libroblox.so`, which
+                                            // this process never unloads.
+                                            let addr = f as usize;
+                                            println!("  startup recovery armed");
+                                            let _ = cordial_runtime::android::looper::STARTUP_RECOVERY
+                                                .set(Box::new(move || {
+                                                    linker::game_activity::appbridge_call_bare(
+                                                        addr as *mut std::ffi::c_void,
+                                                    )
+                                                }));
                                         }
                                         }
 

@@ -381,6 +381,18 @@ Each of these looked right on three to six runs and died on the next test:
   that a client which never presents 120 frames never sleeps at all -- **the
   freeze still happened on six of eleven launches.** Recorded because the
   suspicion was reasonable and the next person will have it too.
+- **A lost looper wakeup -- and the experiment that replaced it with something
+  better, 2026-08-25.** A healthy run starts the Lua app twice and a frozen one
+  once, so `CORDIAL_STARTUP_RETRY=1` was written to ask the platform's own entry
+  point, `nativeAppBridgeStartLuaAppDM`, for the second start when the engine
+  stops during startup. **The call never returns.** The announcement flushes and
+  no completion line ever follows it, and the pump thread joins the engine in
+  being stuck, so the window stops responding at all -- strictly worse than the
+  freeze. It is left in the tree, off, in the way `CORDIAL_LOOPER_BLOCK` is.
+  **That failure is worth more than the fix would have been: a call that blocks
+  means the wedged thread is still holding something the app bridge needs, so
+  this is a lock and not a lost message.** Look for what the engine's app thread
+  holds while it sits in `ALooper_pollOnce`, not for a notification nobody sent.
 - **A lost looper wakeup.** The shape fits and the mechanism does not: a lost
   wake strands a thread in a *blocking* `ALooper_pollOnce`, and both threads in
   a frozen client are polling with a timeout -- the pump at 50 ms, the engine's
@@ -452,6 +464,27 @@ account or flag cache carries a non-empty `DebugUTPLauncherWebSocketUri` would
 produce exactly the reported symptom -- a LAN websocket nobody configured,
 attempted once, timing out. Not a mystery, and not a cause: the runs that freeze
 here have it empty.
+
+### Suspect the machine, not only the code
+
+**Eight consecutive launches came back healthy on an idle machine**, against
+nine in twenty-five frozen measured earlier the same evening while builds,
+greps and a second agent were running alongside. At a 36% rate, eight healthy in
+a row is a one-in-thirty-five event.
+
+That is not yet a result -- eight is eight -- but it has a consequence that is
+immediate: **the two arms already recorded above compared code while the machine
+load differed**, treatment while the session was busy and control while it was
+idle, and the 9/25-against-3/25 gap they showed is at least as easily explained
+by load as by the change under test. Neither arm should be quoted as evidence
+about code.
+
+It also fits everything else. The bug is a race; the person who reported it runs
+a slow laptop and says so; and "give it input while it loads" -- their own
+workaround -- is a way of adding wakeups and work to exactly the window in which
+the race is decided. `tools/startup-freeze-survey.sh` takes `LOAD=<n>` for this
+reason. **Interleave the arms.** Both surveys above ran one arm after the other,
+which is how the confound got in.
 
 ### The correlation still standing
 

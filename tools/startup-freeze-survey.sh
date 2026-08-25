@@ -31,6 +31,13 @@
 # Set `CORDIAL_POLL_COALESCE_US=0` to run the looper's idle backoff off as a
 # control, and `TAG=<word>` to keep one arm's logs from overwriting another's.
 #
+# `LOAD=<n>` runs n busy loops for the duration of the launch. **Suspect the
+# machine before the code here:** eight consecutive launches on an otherwise
+# idle machine came back healthy, against a third frozen measured earlier the
+# same evening while builds and greps were running alongside. That is not proof
+# of anything yet, but it means the first two arms of this survey compared code
+# while the load differed, and neither of them is safe to quote.
+#
 # `NUDGE=1` drives real pointer motion through the nested compositor from the
 # moment the client starts until the shell is ready. That is the one arm that
 # is *not* a clean measurement of the bug -- it is a measurement of the user's
@@ -96,25 +103,56 @@ PY
 # `CORDIAL_POLL_COALESCE_US=0: command not found` -- which this script then
 # scores as a freeze, because a client that never started never presents. That
 # turned a whole control arm into noise before anyone read the log.
+# **The virtual pointer has to exist before the client connects.** Cordial reads
+# the seat's capabilities once, when it binds the seat, and a headless seat with
+# no input device reports `capabilities: 0` -- so a pointer created afterwards is
+# one Cordial will never look at, and the whole nudge arm becomes a silent no-op
+# that reads exactly like a null result. It was written the other way round
+# first and produced one.
+NUDGING=
+if [ "${NUDGE:-0}" = "1" ]; then
+  HOLDER="${CORDIAL_HOLDER_BIN:-/tmp/cordial-wl-holders}/wl-pointer-holder"
+  [ -x "$HOLDER" ] || { echo "no $HOLDER -- run tools/build-wl-holders.sh in the container" >&2; exit 1; }
+  NUDGE_FIFO=$OUT/nudge.fifo
+  rm -f "$NUDGE_FIFO"; mkfifo "$NUDGE_FIFO"
+  distrobox enter cordial -- bash -lc "export WAYLAND_DISPLAY=$DISP; exec $HOLDER 1280 800" \
+    < "$NUDGE_FIFO" > /dev/null 2>&1 &
+  NUDGE_HOLDER=$!
+  exec 8> "$NUDGE_FIFO"
+  sleep 1
+  NUDGING=1
+fi
+
+# `LOAD=<n>` keeps n busy loops running for the launch. The freeze is a race and
+# the machine it was reported on is a slow laptop, so whether contention changes
+# the rate is a real question -- and it has to be part of the harness rather
+# than "whatever else the developer happened to be running", which is what
+# confounded the first two arms of this survey.
+LOAD_PIDS=
+for _ in $(seq 1 "${LOAD:-0}"); do
+  ( while :; do :; done ) &
+  LOAD_PIDS="$LOAD_PIDS $!"
+done
+
+# GDK_BACKEND=wayland explicitly: the container exports x11, and a GTK window
+# that lands on the host's X server is one nobody in this harness can see.
+#
+# **`env`, not a bare assignment prefix.** `${VAR:+VAR=value}` looks like one and
+# is not: bash decides what is an assignment before it expands, so the expanded
+# word becomes the command name and the run dies with
+# `CORDIAL_POLL_COALESCE_US=0: command not found` -- which this script then
+# scores as a freeze, because a client that never started never presents. That
+# turned a whole control arm into noise before anyone read the log.
 env WAYLAND_DISPLAY=$DISP GDK_BACKEND=wayland CORDIAL_DEV_CONTROL=1 \
   ${CORDIAL_POLL_COALESCE_US:+CORDIAL_POLL_COALESCE_US=$CORDIAL_POLL_COALESCE_US} \
   "$ROOT/target/release/cordial-run" --lib-dir "$LIB" --apk "$APK" --host-libc \
   --game-activity --run 0 --profile "$PROFILE" > "$LOG" 2>&1 &
 CLIENT=$!
 
-# The nudge arm. A persistent virtual pointer, moving continuously, inside this
-# harness's own headless compositor and nowhere near the developer's session.
-NUDGE_PID=
-if [ "${NUDGE:-0}" = "1" ]; then
-  NUDGE_FIFO=$OUT/nudge.fifo
-  rm -f "$NUDGE_FIFO"; mkfifo "$NUDGE_FIFO"
-  distrobox enter cordial -- bash -lc     "export WAYLAND_DISPLAY=$DISP; exec ${CORDIAL_HOLDER_BIN:-/tmp/cordial-wl-holders}/wl-pointer-holder 1280 800"     < "$NUDGE_FIFO" > /dev/null 2>&1 &
-  NUDGE_PID=$!
-  exec 8> "$NUDGE_FIFO"
+if [ -n "$NUDGING" ]; then
   ( i=0
-    while kill -0 $CLIENT 2>/dev/null && [ $i -lt 900 ]; do
-      printf 'move %d %d
-' $((300 + i % 400)) $((300 + i % 200)) >&8
+    while kill -0 $CLIENT 2>/dev/null && [ $i -lt 1200 ]; do
+      printf 'move %d %d\n' $((300 + i % 400)) $((300 + i % 200)) >&8
       i=$((i + 1)); sleep 0.05
     done ) &
   NUDGER=$!
@@ -125,11 +163,13 @@ for _ in $(seq 1 100); do
   kill -0 $CLIENT 2>/dev/null || break
   sleep 1
 done
-if [ -n "$NUDGE_PID" ]; then
+if [ -n "$NUDGING" ]; then
   kill "${NUDGER:-0}" 2>/dev/null
   exec 8>&-
-  kill "$NUDGE_PID" 2>/dev/null
+  kill "${NUDGE_HOLDER:-0}" 2>/dev/null
 fi
+for lp in $LOAD_PIDS; do kill "$lp" 2>/dev/null; done
+
 READY=$(grep -oE "app ready: [A-Za-z]+" "$LOG" | tail -1 | cut -d' ' -f3)
 [ -n "$READY" ] || READY=NEVER
 

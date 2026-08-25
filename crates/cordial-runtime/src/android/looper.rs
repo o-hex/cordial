@@ -310,8 +310,10 @@ const IDLE_SPIN_THRESHOLD: u64 = 64;
 /// What the backoff does once it is allowed to engage, measured in one session
 /// against `CORDIAL_POLL_COALESCE_US=0` as the control:
 ///
-///     gated (default)   3,261 polls/s   1.2% on that thread    9.0% process
-///     backoff off   9,670,516 polls/s  99.7% on that thread  108.7% process
+/// ```text
+/// gated (default)   3,261 polls/s   1.2% on that thread    9.0% process
+/// backoff off   9,670,516 polls/s  99.7% on that thread  108.7% process
+/// ```
 ///
 /// with median frame rates of 240 and 237. A whole core, and the frames are the
 /// same. `cordial_loopers` is where those poll rates come from.
@@ -381,6 +383,59 @@ struct Registration {
     callback: Option<extern "C" fn(c_int, c_int, *mut c_void) -> c_int>,
     data: *mut c_void,
 }
+
+/// Push whatever the watchdog just printed out of the buffer.
+///
+/// Rust's stdout is line-buffered only when it is a terminal. Every harness in
+/// this repository redirects it to a file or a pipe, which makes it block-
+/// buffered, and every harness then ends the run with `kill -9` -- which throws
+/// the buffer away. A watchdog whose whole purpose is to report the state of a
+/// client that is about to be killed has to flush, and this one silently did
+/// not: two runs were read as "the recovery never fired" when it may well have.
+fn flush_stdout() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+/// What to try when the engine stops presenting during startup, installed by
+/// whoever holds the library handle. See [`RECOVERY_MAX_PRESENTS`].
+pub static STARTUP_RECOVERY: OnceLock<Box<dyn Fn() -> Result<(), String> + Send + Sync>> =
+    OnceLock::new();
+
+/// `CORDIAL_STARTUP_RETRY=1`: re-drive the app bridge when the engine stops
+/// during startup. **Off, and it must stay off.**
+///
+/// This is a recorded experiment, not a setting, in the same sense as
+/// `CORDIAL_LOOPER_BLOCK`. The reasoning was sound: a healthy run starts the
+/// Lua app twice and a frozen one once, so ask the platform's own entry point
+/// for the second start. What happens is that `nativeAppBridgeStartLuaAppDM`
+/// **never returns** -- observed on the first frozen client it was tried
+/// against, with the announcement flushed and no completion line after it -- so
+/// the pump thread joins the engine in being stuck and the window stops
+/// responding at all, which is strictly worse than the freeze.
+///
+/// That failure is worth more than the fix would have been. **A call that
+/// blocks means the wedged thread is holding something the app bridge needs**,
+/// so the freeze is a lock and not a lost message, and the next person should
+/// be looking for what the engine's app thread still holds while it sits in
+/// `ALooper_pollOnce`. Left in, off, so that reasoning is reproducible in one
+/// environment variable rather than rediscovered.
+fn startup_retry_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("CORDIAL_STARTUP_RETRY").as_deref(), Ok("1") | Ok("on")))
+}
+
+/// The most frames a client may have drawn and still be treated as stuck in
+/// startup rather than merely idle.
+///
+/// A frozen client presents between zero and five frames and then nothing, ever
+/// -- measured over fifty launches. A client that got past startup is at three
+/// hundred within seconds. Sixty is far above the first and far below the
+/// second, and the gap matters: **a window the user minimised also stops
+/// presenting**, and re-driving the app bridge underneath a client that has
+/// been running happily for an hour would be a much worse bug than the one this
+/// recovers from. Below sixty frames, no such client exists.
+const RECOVERY_MAX_PRESENTS: u64 = 60;
 
 /// Per-looper counters, kept separate from the looper itself so they can be
 /// read from another thread.
@@ -685,6 +740,7 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
     let mut stall_presents: u64 = 0;
     let mut stall_since = std::time::Instant::now();
     let mut stall_reported = false;
+    let mut recovery_tried = false;
     let join_watch = JOIN_REQUESTED.load(Ordering::Relaxed);
     let join_started = std::time::Instant::now();
     let mut join_reported = false;
@@ -973,7 +1029,70 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
             if now != stall_presents {
                 stall_presents = now;
                 stall_since = std::time::Instant::now();
-            } else if now > 0
+            }
+            // **Ask the app bridge to start the Lua app again.**
+            //
+            // The startup freeze (docs/NEXT.md §0) leaves the engine's own
+            // thread parked in `ALooper_pollOnce` with nothing to do, having
+            // logged `Lua app running status has been updated to true` and
+            // stopped. A healthy run starts the Lua app *twice* -- the second
+            // time after the experience coordinator is destructed -- and a
+            // frozen one only once; that is 25 for 25 across two surveys, and
+            // it is visible from outside as `app ready: PlatformAccountRouter`
+            // appearing once instead of twice. So the missing step is the
+            // second `initializeLuaAppWithLoggedInUser`, and the platform's own
+            // way of asking for it is `nativeAppBridgeStartLuaAppDM`, which
+            // Cordial already calls once during bring-up.
+            //
+            // **This is a recovery, not a cause.** Nothing here knows why the
+            // engine did not do it itself; Cordial's own behaviour is
+            // byte-identical between a frozen run and a healthy one, checked
+            // line by line across fifty logs. It is written as a retry of a
+            // call this process already makes, gated so tightly that no client
+            // which ever drew a frame properly can reach it, and it says so in
+            // the log when it fires -- so a run that needed it is never
+            // mistaken for one that did not.
+            if std::env::var_os("CORDIAL_RECOVERY_DEBUG").is_some()
+                && stall_since.elapsed().as_millis() % 5000 < 40
+            {
+                println!(
+                    "[recovery-debug] presents={now} tried={recovery_tried} armed={} stalled={:.1}s",
+                    STARTUP_RECOVERY.get().is_some(),
+                    stall_since.elapsed().as_secs_f64()
+                );
+                flush_stdout();
+            }
+            if startup_retry_enabled()
+                && !recovery_tried
+                && now <= RECOVERY_MAX_PRESENTS
+                && stall_since.elapsed() >= std::time::Duration::from_secs(6)
+            {
+                recovery_tried = true;
+                if let Some(retry) = STARTUP_RECOVERY.get() {
+                    println!(
+                        "[android] the engine has drawn {now} frames and stopped; \
+                         CORDIAL_STARTUP_RETRY is on, so asking the app bridge to start the Lua \
+                         app again. Expect this to be the last line: the call does not return."
+                    );
+                    // **Before the call, not after.** If the retry itself never
+                    // returns -- it goes into an engine that has already stopped
+                    // making progress -- then the announcement is the only
+                    // evidence there will be, and a buffered one dies with the
+                    // process.
+                    flush_stdout();
+                    match retry() {
+                        Ok(()) => println!("[android] app bridge retried"),
+                        Err(e) => println!("[android] app bridge retry failed: {e}"),
+                    }
+                } else {
+                    println!(
+                        "[android] the engine stopped during startup and no recovery is armed; \
+                         nothing to retry."
+                    );
+                }
+                flush_stdout();
+            }
+            if now > 0
                 && !stall_reported
                 && stall_since.elapsed() >= std::time::Duration::from_secs(5)
             {
@@ -984,6 +1103,7 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                     super::backend_instr_geometry(),
                     std::process::id(),
                 );
+                flush_stdout();
             }
         }
         // The join watchdog. A join Cordial started and the engine never

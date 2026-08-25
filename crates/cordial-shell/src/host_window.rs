@@ -347,7 +347,12 @@ impl HostWindow {
                  color: @headerbar_fg_color; \
                  background-image: none; \
              } \
-             .cordial-engine-host.cordial-canvas-below { background-color: transparent; } \
+             .cordial-engine-host.cordial-canvas-below, \
+             .cordial-engine-host.cordial-canvas-below toolbarview, \
+             .cordial-engine-host.cordial-canvas-below overlay { \
+                 background-color: transparent; \
+                 background-image: none; \
+             } \
              .cordial-editor { \
                  background: none; \
                  background-image: none; \
@@ -755,11 +760,27 @@ impl HostWindow {
     /// known to be painting underneath.
     pub fn set_canvas_see_through(&self, on: bool) {
         if on {
+            // **Every layer, not just the window.** Making the toplevel
+            // transparent is not enough: `AdwToolbarView` sits between the
+            // window and the canvas and paints `@window_bg_color` of its own,
+            // so a lowered canvas stayed hidden behind a flat sheet of
+            // #222226 while the engine went on presenting at sixty frames a
+            // second. Measured in an experience with the chat box focused --
+            // the whole window that colour, `presents` climbing 39138 to
+            // 39321, and the game reappearing the instant the canvas was
+            // raised again.
+            //
+            // fb67d71 measured the single-selector version working, and it
+            // does on the pages where something else in the tree happens to be
+            // transparent already. In an experience it is not.
             self.window.add_css_class("cordial-canvas-below");
         } else {
             self.window.remove_css_class("cordial-canvas-below");
         }
         self.canvas_see_through.set(on);
+        // Both regions, now, rather than waiting for a geometry sync that may
+        // never come -- see `refresh_opaque_region`.
+        self.refresh_opaque_region();
         self.refresh_input_region();
     }
 
@@ -818,89 +839,80 @@ impl HostWindow {
     /// The opaque region is *not* the same shape and must not be: it says what
     /// GTK paints solidly, and the editor is drawn over the canvas with a
     /// transparent background, so it stays part of the cut-out.
+    /// Record where the engine's canvas is, then rewrite both regions.
     pub fn set_canvas_cutout(&self, x: i32, y: i32, w: i32, h: i32) {
-        let Some(surface) = self.window.surface() else { return };
-        let (sw, sh) = (surface.width(), surface.height());
-        if sw <= 0 || sh <= 0 || w <= 0 || h <= 0 {
+        if w <= 0 || h <= 0 {
             return;
         }
         self.canvas_rect.set(Some((x, y, w, h)));
+        self.refresh_opaque_region();
+        self.refresh_input_region();
+    }
 
-        // **This override is load-bearing, and removing it turned the game
-        // black.** ADR-022 measured that GTK "stops sending
-        // `set_opaque_region` at all" once the toplevel's background goes
-        // transparent, and on the strength of that the whole call was deleted
-        // in 31760d3. It does not hold in every configuration: with a client
-        // in an experience and the chat box focused, GTK went on advertising
-        // the surface as opaque, the compositor therefore never composited the
-        // lowered subsurface, and the window was a flat sheet of Adwaita grey
-        // while the engine went on presenting at sixty frames a second. That
-        // is exactly the failure fb67d71 was written to fix, reintroduced by
-        // trusting a measurement taken under different conditions. Reverted.
-        //
-        // The see-through branch below is the part that matters for that:
-        // saying "nothing here is opaque" is what lets the subsurface show
-        // through, and GTK will not say it for us.
-        //
-        // **The opaque region is the window, not the surface.** `surface`
-        // includes the client-side decoration shadow: a translucent margin
-        // GTK paints around a floating window. Declaring that opaque tells the
-        // compositor it need not repaint what is behind it, and a compositor
-        // that believes it leaves whatever was there last -- so the window
-        // drags a stale halo of the desktop around with it. Reported as
-        // "a window just trails behind ... it breaks everything around it".
-        //
-        // It never showed up here because the headless compositor the tests
-        // run under tiles the window full-screen, where the shadow is zero and
-        // the surface and the window are the same rectangle. It needs a
-        // floating window on a compositor that draws shadows, which is any
-        // ordinary desktop.
-        //
-        // `surface_transform` is exactly the offset of the window inside the
-        // surface -- the same call `content_rect` already uses to put the
-        // canvas in surface coordinates -- so the window's own rectangle is
-        // that offset plus its allocation.
-        //
-        // Measured on a floating window under sway, which draws the shadow the
-        // headless default does not: surface 1636x911, transform (20,20),
-        // window 1596x871, canvas (20,66,1596,825). Forty pixels of translucent
-        // margin in each axis, every one of which the old region claimed was
-        // opaque. What is left after this change is the header bar strip
-        // (20,20,1596,46), which is the only part that actually is.
-        let (dx, dy) = self.window.surface_transform();
-        let (wx, wy) = (dx.round() as i32, dy.round() as i32);
-        let (ww, wh) = (self.window.width(), self.window.height());
-        let (ox, oy, ow, oh) =
-            if ww > 0 && wh > 0 { (wx, wy, ww, wh) } else { (0, 0, sw, sh) };
-
-        // **And nothing is opaque while the canvas is lowered.** In that state
-        // the CSS has made the toplevel transparent so the engine's subsurface
-        // shows through from underneath; claiming any of it is opaque is the
-        // same lie in a second place. GTK stops advertising an opaque region
-        // itself when its content goes transparent, and the right thing here
-        // is to stop as well rather than to override it with a shape that was
-        // computed for the opaque case.
-        if self.canvas_see_through.get() {
-            surface.set_opaque_region(None);
-            self.refresh_input_region();
+    /// Tell the compositor which part of the parent surface it may skip.
+    ///
+    /// **Called from the two things it depends on, and that is the whole bug
+    /// this function exists to fix.** It used to live inside
+    /// `set_canvas_cutout`, which runs off `sync_canvas_geometry` -- so it was
+    /// rewritten only when the *geometry* changed. Lowering the canvas does not
+    /// change the geometry. In an experience, where the window has been the
+    /// same size for minutes, the region therefore kept the value it was given
+    /// while the canvas was still on top: fully opaque. The compositor was told
+    /// the parent is opaque and skipped compositing the subsurface underneath,
+    /// so the window was a flat sheet of #222226 no matter what GTK painted.
+    ///
+    /// That is why every attempt to fix this with CSS failed. Measured: with
+    /// the toplevel *and every descendant* forced transparent, the window was
+    /// still that exact colour, while the engine presented at sixty frames a
+    /// second and the game reappeared the instant the canvas was raised. It
+    /// was never a painting problem.
+    ///
+    /// On the landing page it happened to work, because moving between pages
+    /// resizes things often enough that a geometry sync lands soon after the
+    /// lower. That is luck, and it is why this looked state-dependent.
+    fn refresh_opaque_region(&self) {
+        let Some(surface) = self.window.surface() else { return };
+        let (sw, sh) = (surface.width(), surface.height());
+        if sw <= 0 || sh <= 0 {
             return;
         }
 
-        let opaque = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(
-            ox, oy, ow, oh,
-        ));
+        // Nothing is opaque while the canvas is lowered: the toplevel is
+        // transparent over it so the subsurface can show through, and claiming
+        // otherwise is what hid it.
+        if self.canvas_see_through.get() {
+            #[allow(deprecated)]
+            surface.set_opaque_region(None);
+            return;
+        }
+
+        let Some((x, y, w, h)) = self.canvas_rect.get() else { return };
+
+        // The window, not the surface. A GTK surface carries the client-side
+        // decoration shadow -- a translucent margin around a floating window --
+        // and declaring that opaque means the compositor does not repaint what
+        // is behind it, so the window drags a stale halo around with it.
+        // Measured under sway with the window floated: surface 1636x911
+        // against window 1596x871, forty pixels in each axis.
+        let (dx, dy) = self.window.surface_transform();
+        let (ww, wh) = (self.window.width(), self.window.height());
+        let (ox, oy, ow, oh) = if ww > 0 && wh > 0 {
+            (dx.round() as i32, dy.round() as i32, ww, wh)
+        } else {
+            (0, 0, sw, sh)
+        };
+
+        let opaque =
+            gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(ox, oy, ow, oh));
         if opaque.subtract_rectangle(&gtk::cairo::RectangleInt::new(x, y, w, h)).is_err() {
             return;
         }
         // Deprecated since GDK 4.16, which computes its own from the render
         // tree -- and its own answer is "the whole surface", because the
         // drawing area being transparent is not something it can see through
-        // to a subsurface with. Calling it anyway is the only way to say what
-        // is actually true here.
+        // to a subsurface with.
         #[allow(deprecated)]
         surface.set_opaque_region(Some(&opaque));
-
-        self.refresh_input_region();
     }
 
     /// Whether the compositor currently considers this window focused.

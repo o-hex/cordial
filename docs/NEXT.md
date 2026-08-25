@@ -105,6 +105,51 @@ rather than `cage`.
    the region is recomputed on stacking and placement changes only, never on
    configure. ADR-022 already flagged this and it is still open.
 
+## Open: the canvas goes black when a TextBox focuses IN AN EXPERIENCE
+
+**Reproduced, characterised, not fixed.** This is the top open bug and the
+elimination list below is the valuable part -- do not repeat it.
+
+Press `/` in an experience. The chat box focuses, `sync_text_overlay` lowers
+the engine's subsurface so the editor can be drawn over it, and the whole
+window becomes a flat sheet of `#222226` (libadwaita's dark `@window_bg_color`).
+Pressing Escape raises the canvas and the game returns instantly.
+
+What is established:
+
+- **The engine never stops rendering.** `presents` climbed 39138 to 39321 while
+  the window was blank.
+- **It is state-dependent, not build-dependent.** With the same binary in the
+  same session, focusing a TextBox on the sign-in page lowers the canvas and
+  the page stays visible -- 498 distinct sampled colours against 1 in-game.
+- **The stacking itself works.** `place_below` takes effect; that is *why* the
+  game disappears.
+
+What has been ruled out, each by measurement:
+
+1. **GTK painting an opaque background.** Forcing the toplevel *and every
+   descendant* transparent (`.cordial-canvas-below *`) changed nothing.
+2. **The CSS class not being applied.** Instrumented: `engine-host=true
+   canvas-below=true mapped=true surface=true`, identical on the page that
+   works and the one that does not.
+3. **A stale opaque region.** It was genuinely stale -- only `set_canvas_cutout`
+   rewrote it, and that runs off geometry changes which do not happen when a
+   box focuses. Fixed anyway (`refresh_opaque_region`), and the black remained.
+4. **GTK being starved of frames by the engine.** Pumping the main context for
+   200 ms before the restack changed nothing.
+5. **The window's decoration shadow being declared opaque.** Real, fixed, and
+   not this.
+
+The one instrument not yet brought to bear is a Wayland protocol trace of the
+in-game transition. `WAYLAND_DEBUG=1` will not survive the client long enough
+to reach an experience -- four consecutive launches sat at `presents` 0 or 1,
+which is the timing distortion AGENTS.md warns about. Getting that trace needs
+either a way to enable the trace mid-run or a lighter filter at the source.
+
+The suspicious correlate, unproven: the Vulkan swapchain is recreated on
+entering an experience (`vkCreateSwapchainKHR ... old swapchain none` followed
+by `recreated`), between the lower that works and the lower that does not.
+
 ## The one rule
 
 **Grep the capture before disassembling anything.**

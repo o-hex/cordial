@@ -576,10 +576,32 @@ impl HostWindow {
             (overlay.text_color >> 8) & 0xff,
             overlay.text_color & 0xff
         );
-        self.editor_css.load_from_string(&format!(
-            ".cordial-editor {{ color: {rgb}; caret-color: {rgb}; font-size: {}px; }}",
-            overlay.font_size.max(1.0).round() as i32
+        // **Colour here, size deliberately not.** A CSS `font-size` is scaled
+        // by the desktop's text-scaling factor before it reaches Pango, so on
+        // any setup with font scaling turned up -- which is most laptops -- the
+        // editor drew visibly larger than the text Roblox draws in the same box
+        // when it is not focused. Reported as "text gets too big when
+        // selected", and "selected" is "focused", because the editor only
+        // exists while the box has focus.
+        //
+        // The size is set below as an absolute Pango attribute instead, which
+        // is in the same units as the rest of this spec.
+        self.editor_css
+            .load_from_string(&format!(".cordial-editor {{ color: {rgb}; caret-color: {rgb}; }}"));
+
+        // `new_size_absolute`, not `new`. `AttrSize::new` takes points and Pango
+        // converts them through the context's resolution; the absolute form takes
+        // device units and skips that conversion entirely. The engine's
+        // `fontSize` is in the same space as the `x`, `y`, `width` and `height`
+        // beside it in the same struct, and those are placed straight into the
+        // widget tree without a conversion -- so the size must not get one
+        // either, or the text is the only part of the spec drawn in different
+        // units from the box it goes in.
+        let attrs = gtk::pango::AttrList::new();
+        attrs.insert(gtk::pango::AttrSize::new_size_absolute(
+            (overlay.font_size.max(1.0) * gtk::pango::SCALE as f32).round() as i32,
         ));
+        self.editor.set_attributes(Some(&attrs));
 
         // GTK's own masking rather than a string of bullets: the widget then
         // holds the real text, so the caret lands between real characters and
@@ -588,7 +610,8 @@ impl HostWindow {
         // measured it.
         self.editor.set_visibility(!overlay.password);
 
-        if self.editor.text() != overlay.text {
+        let seeded = self.editor.text() != overlay.text;
+        if seeded {
             self.editor_seeding.set(true);
             self.editor.set_text(overlay.text);
             self.editor.set_position(overlay.caret_chars);
@@ -615,11 +638,30 @@ impl HostWindow {
         self.editor_rect.set(Some((x, y, w, h)));
         self.refresh_input_region();
         if !self.editor.has_focus() {
-            // Focus is what makes GTK blink the caret and accept a click into
-            // the text, and it is taken once per focus session rather than on
-            // every tick -- `grab_focus` on a widget that already has it still
-            // resets the selection.
-            self.editor.grab_focus();
+            // **`grab_focus_without_selecting`, and the difference is not
+            // cosmetic.** GTK's `gtk-entry-select-on-focus` is on by default,
+            // so a plain `grab_focus` on a text widget selects its entire
+            // contents. The editor then comes up with everything selected and
+            // the very next keystroke *replaces* the lot -- so focusing a box
+            // that already had text in it and typing one character threw the
+            // rest away. Reported as two separate symptoms that turned out to
+            // be one bug: "text gets too big when selected" (that is the
+            // selection highlight, on all of it) and "when you deselect and
+            // select it again, it clears everything once you type".
+            //
+            // Measured: a sign-in username field holding `abcdefZ`, one real
+            // keystroke through the compositor, and the engine afterwards
+            // reported the box as one byte long.
+            self.editor.grab_focus_without_selecting();
+        }
+        // Collapse any selection and put the caret where the engine says it is,
+        // every time -- not only on the focus transition. `set_text` above
+        // leaves the caret at the end and a stray select-all can also arrive
+        // from a double click that GTK handled before this ran; either way the
+        // engine's caret is the one that should win, and setting it is what
+        // makes the selection empty again.
+        if self.editor.selection_bounds().is_some() && !seeded {
+            self.editor.set_position(self.editor.position());
         }
         self.window.queue_draw();
     }
@@ -728,22 +770,11 @@ impl HostWindow {
             return;
         }
         let Some((cx, cy, cw, ch)) = self.content_rect() else { return };
-        let w = surface.width().max(cx + cw);
-        let h = surface.height().max(cy + ch);
-        let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, w, h));
-        // Subtract rather than build up from the chrome: the header bar is not
-        // the only thing outside the canvas, and enumerating the rest by hand
-        // would go stale the first time the layout changes.
-        let _ = region.subtract_rectangle(&gtk::cairo::RectangleInt::new(cx, cy, cw, ch));
-        // **And hand the editor's own rectangle straight back.** It sits inside
-        // the canvas by construction -- it is placed on a box the engine drew --
-        // so the subtraction above takes it out along with everything else, and
-        // a text field GTK is never told about is a text field that cannot be
-        // clicked into, selected in, or positioned by mouse. Which is most of
-        // the reason for having a real widget at all.
-        if let Some((ex, ey, ew, eh)) = self.editor_rect.get() {
-            region.union_rectangle(&gtk::cairo::RectangleInt::new(ex, ey, ew, eh)).ok();
-        }
+        let region = input_region(
+            (surface.width(), surface.height()),
+            (cx, cy, cw, ch),
+            self.editor_rect.get(),
+        );
         surface.set_input_region(Some(&region));
     }
 
@@ -944,6 +975,45 @@ impl HostWindow {
     }
 }
 
+/// The parent surface's input region: everything except the canvas, plus the
+/// editor's rectangle handed back.
+///
+/// Pure, and separated out so it can be tested, because the bug it had was
+/// invisible from every direction. `content` and `editor` arrive in two
+/// different coordinate spaces -- `content` is already in surface coordinates,
+/// `editor` is in the content area's, which is what `gtk::Fixed::move_` and the
+/// engine's own `NativeTextBoxInfo` both use. Unioning the editor in without
+/// offsetting it drew the editor in exactly the right place and punched the
+/// hole for it a header bar's height too high, so the text was visible and
+/// unclickable, and nothing about either the code or the screen said why.
+///
+/// `surface` is the whole surface including any CSD shadow, and is widened to
+/// cover the content if a configure has left it briefly smaller -- a region
+/// that does not reach the canvas would clip the hole rather than the chrome.
+fn input_region(
+    surface: (i32, i32),
+    content: (i32, i32, i32, i32),
+    editor: Option<(i32, i32, i32, i32)>,
+) -> gtk::cairo::Region {
+    let (cx, cy, cw, ch) = content;
+    let w = surface.0.max(cx + cw);
+    let h = surface.1.max(cy + ch);
+    let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, w, h));
+    // Subtract rather than build up from the chrome: the header bar is not the
+    // only thing outside the canvas, and enumerating the rest by hand would go
+    // stale the first time the layout changes.
+    let _ = region.subtract_rectangle(&gtk::cairo::RectangleInt::new(cx, cy, cw, ch));
+    if let Some((ex, ey, ew, eh)) = editor {
+        // Into surface coordinates. See the doc comment: this `+ cx, + cy` is
+        // the entire fix for "you cant click on a specific part of it to move
+        // the caret".
+        region
+            .union_rectangle(&gtk::cairo::RectangleInt::new(cx + ex, cy + ey, ew, eh))
+            .ok();
+    }
+    region
+}
+
 /// A first guess at the header bar's height, used only to pick the window's
 /// initial size so the *content* comes out at the requested resolution. The
 /// real height is read back from the widget tree once there is a layout — see
@@ -956,6 +1026,65 @@ fn header_height_hint() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The header bar is what makes the two coordinate spaces differ, so the
+    /// numbers here are a real layout: a 1280x720 surface whose content starts
+    /// 47px down, and an editor the engine placed 10px into that content.
+    fn layout() -> ((i32, i32), (i32, i32, i32, i32), (i32, i32, i32, i32)) {
+        ((1280, 720), (0, 47, 1280, 673), (332, 10, 592, 36))
+    }
+
+    #[test]
+    fn the_canvas_is_not_ours_to_click() {
+        let (surface, content, _) = layout();
+        let r = input_region(surface, content, None);
+        assert!(r.contains_point(10, 10), "the header bar still takes input");
+        assert!(!r.contains_point(640, 400), "the canvas does not");
+    }
+
+    #[test]
+    fn the_editor_is_clickable_where_it_is_drawn() {
+        // The regression test for the coordinate-space bug. The editor draws at
+        // content-relative (332, 10), which on screen is (332, 57). Before the
+        // fix the hole was punched at (332, 10) -- inside the header bar -- and
+        // every click on the visible field went past it to the engine.
+        let (surface, content, editor) = layout();
+        let (cx, cy, _, _) = content;
+        let (ex, ey, ew, eh) = editor;
+        let r = input_region(surface, content, Some(editor));
+
+        for (dx, dy, what) in [(1, 1, "top left"), (ew / 2, eh / 2, "middle"), (ew - 2, eh - 2, "bottom right")] {
+            assert!(
+                r.contains_point(cx + ex + dx, cy + ey + dy),
+                "the {what} of the editor must be clickable, at surface ({}, {})",
+                cx + ex + dx,
+                cy + ey + dy
+            );
+        }
+        // **Why the bug was silent, in one assertion.** The unoffset position
+        // is `(332, 10)`, which is inside the header bar -- and the header bar
+        // is *supposed* to take input, so unioning the editor there changed
+        // nothing observable, while the field itself stayed subtracted. There
+        // was no wrong-looking region to notice: just a rectangle added where
+        // one already was, and a field that quietly did not respond.
+        assert!(
+            r.contains_point(ex + 2, ey + 2),
+            "the unoffset position is header bar, which is why adding it there was a no-op"
+        );
+        assert!(!r.contains_point(cx + ex - 4, cy + ey + eh / 2), "just left of the editor is canvas");
+        assert!(!r.contains_point(cx + ex + ew + 4, cy + ey + eh / 2), "just right of it is canvas");
+    }
+
+    #[test]
+    fn a_surface_smaller_than_its_content_still_covers_the_canvas() {
+        // A configure can leave the surface briefly behind the allocation. A
+        // region that stopped at the stale width would clip the subtraction and
+        // leave part of the canvas taking input.
+        let (_, content, _) = layout();
+        let r = input_region((320, 200), content, None);
+        assert!(!r.contains_point(1200, 700), "still excluded, not merely off the end");
+        assert!(r.contains_point(10, 10));
+    }
 
     #[test]
     fn app_id_matches_the_desktop_entry() {

@@ -1411,6 +1411,24 @@ fn reseed_if_needed(buf: &mut TextField) {
     let generation = cordial_linker_sys::game_activity::textbox_generation();
     let mut seen = TEXT_GENERATION.lock().unwrap_or_else(|e| e.into_inner());
     if *seen != Some(generation) {
+        if trace_text() {
+            // **Lengths only, never the text.** This runs on every focus and
+            // one of the boxes it runs for is a password field.
+            //
+            // Worth keeping rather than deleting after the investigation it was
+            // added for: `ime_gen` has been 0 on every run measured so far,
+            // meaning `InputConnection.setState` never fires and the
+            // `ime_state_*` branch below has never once been taken. If that
+            // ever changes, this line is how anyone finds out. `showkb_len` is
+            // the branch that does the work, and it is correct -- a box
+            // refocused with content in it reports that content's length.
+            eprintln!(
+                "[cordial] textbox reseed gen={generation} ime_gen={} ime_len={} showkb_len={}",
+                cordial_linker_sys::game_activity::ime_state_generation(),
+                cordial_linker_sys::game_activity::ime_state_text().chars().count(),
+                cordial_linker_sys::game_activity::textbox_text().chars().count(),
+            );
+        }
         if cordial_linker_sys::game_activity::ime_state_generation() > 0 {
             let text = cordial_linker_sys::game_activity::ime_state_text();
             let (_, selection_end) = cordial_linker_sys::game_activity::ime_state_selection();

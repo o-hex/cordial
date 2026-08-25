@@ -85,6 +85,13 @@ land in the widget and nowhere else -- four `wlrctl` calls produced
 `cordial_text`: the MCP drives Cordial's own entry points and exercises only
 the path that *seeds* the widget, so it will report success whatever GTK does.
 
+Sober, for comparison, does none of this: it has no widget toolkit but does
+bind `zwp_text_input_v3` directly, so it has the IME plumbing and nothing to
+paint with. That is why its equivalent bug is still open. See
+[`analysis/sober-input-stack.md`](analysis/sober-input-stack.md), which also
+records why a nested-compositor protocol trace must be taken under `sway`
+rather than `cage`.
+
 **What is not, and the two things to check on a real desktop:**
 
 1. **The double-insert guard is `INFERRED`.** Cage's headless seat advertises no

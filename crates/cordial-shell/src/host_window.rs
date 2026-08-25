@@ -818,72 +818,36 @@ impl HostWindow {
     /// The opaque region is *not* the same shape and must not be: it says what
     /// GTK paints solidly, and the editor is drawn over the canvas with a
     /// transparent background, so it stays part of the cut-out.
+    /// Record where the engine's canvas is, and punch it out of the input
+    /// region.
+    ///
+    /// **It used to set the opaque region too, and that was both unnecessary
+    /// and wrong.** Unnecessary because GTK already computes one and knows
+    /// things this code did not: ADR-022 measured that once the toplevel's
+    /// background goes transparent, "GTK stops sending `set_opaque_region` at
+    /// all, having worked out for itself that the surface is no longer opaque,
+    /// and no manual override is needed". Wrong because the override was built
+    /// from the *surface*, which is larger than the window -- it carries the
+    /// client-side decoration shadow, a translucent margin GTK draws around a
+    /// floating window. Measured under sway with the window floated: surface
+    /// 1636x911 against window 1596x871, so forty pixels in each axis of
+    /// translucent margin were being declared opaque. A compositor told a
+    /// region is opaque does not repaint what is behind it, so the window
+    /// dragged a stale halo of the old desktop around with it -- reported as
+    /// "a window just trails behind ... it breaks everything around it".
+    ///
+    /// The override came in with `fb67d71`, whose own message records that
+    /// punching the region was *not* what made the lowered canvas visible --
+    /// the transparent background was. So it was carrying no weight even then.
+    ///
+    /// The input region is a different matter and stays: GTK genuinely does
+    /// not shrink that when its content becomes transparent, which is measured
+    /// in ADR-022 and is why clicks reach the engine at all.
     pub fn set_canvas_cutout(&self, x: i32, y: i32, w: i32, h: i32) {
-        let Some(surface) = self.window.surface() else { return };
-        let (sw, sh) = (surface.width(), surface.height());
-        if sw <= 0 || sh <= 0 || w <= 0 || h <= 0 {
+        if w <= 0 || h <= 0 {
             return;
         }
         self.canvas_rect.set(Some((x, y, w, h)));
-
-        // **The opaque region is the window, not the surface.** `surface`
-        // includes the client-side decoration shadow: a translucent margin
-        // GTK paints around a floating window. Declaring that opaque tells the
-        // compositor it need not repaint what is behind it, and a compositor
-        // that believes it leaves whatever was there last -- so the window
-        // drags a stale halo of the desktop around with it. Reported as
-        // "a window just trails behind ... it breaks everything around it".
-        //
-        // It never showed up here because the headless compositor the tests
-        // run under tiles the window full-screen, where the shadow is zero and
-        // the surface and the window are the same rectangle. It needs a
-        // floating window on a compositor that draws shadows, which is any
-        // ordinary desktop.
-        //
-        // `surface_transform` is exactly the offset of the window inside the
-        // surface -- the same call `content_rect` already uses to put the
-        // canvas in surface coordinates -- so the window's own rectangle is
-        // that offset plus its allocation.
-        //
-        // Measured on a floating window under sway, which draws the shadow the
-        // headless default does not: surface 1636x911, transform (20,20),
-        // window 1596x871, canvas (20,66,1596,825). Forty pixels of translucent
-        // margin in each axis, every one of which the old region claimed was
-        // opaque. What is left after this change is the header bar strip
-        // (20,20,1596,46), which is the only part that actually is.
-        let (dx, dy) = self.window.surface_transform();
-        let (wx, wy) = (dx.round() as i32, dy.round() as i32);
-        let (ww, wh) = (self.window.width(), self.window.height());
-        let (ox, oy, ow, oh) =
-            if ww > 0 && wh > 0 { (wx, wy, ww, wh) } else { (0, 0, sw, sh) };
-
-        // **And nothing is opaque while the canvas is lowered.** In that state
-        // the CSS has made the toplevel transparent so the engine's subsurface
-        // shows through from underneath; claiming any of it is opaque is the
-        // same lie in a second place. GTK stops advertising an opaque region
-        // itself when its content goes transparent, and the right thing here
-        // is to stop as well rather than to override it with a shape that was
-        // computed for the opaque case.
-        if self.canvas_see_through.get() {
-            surface.set_opaque_region(None);
-            self.refresh_input_region();
-            return;
-        }
-
-        let opaque = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(
-            ox, oy, ow, oh,
-        ));
-        if opaque.subtract_rectangle(&gtk::cairo::RectangleInt::new(x, y, w, h)).is_err() {
-            return;
-        }
-        // Deprecated since GDK 4.16, which computes its own from the render
-        // tree -- and its own answer is "the whole surface", because the
-        // drawing area being transparent is not something it can see through
-        // to a subsurface with. Calling it anyway is the only way to say what
-        // is actually true here.
-        #[allow(deprecated)]
-        surface.set_opaque_region(Some(&opaque));
-
         self.refresh_input_region();
     }
 

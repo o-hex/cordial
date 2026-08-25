@@ -2416,6 +2416,35 @@ impl WaylandWindow {
         super::input::pass_mouse_move(x, y);
     }
 
+    /// Deliver a release for every button this side still thinks is down.
+    ///
+    /// Called when the pointer leaves the canvas, where no real release will
+    /// arrive. Goes through `dispatch_pointer_button` rather than clearing the
+    /// mask directly so the engine sees exactly the events it would have seen
+    /// had the user released on the canvas -- a bitmask cleared behind the
+    /// engine's back leaves the two disagreeing, which is the same bug one
+    /// layer down.
+    fn release_held_buttons(&self) {
+        let held = self.pointer_buttons.load(Ordering::Relaxed);
+        if held == 0 {
+            return;
+        }
+        for button in [
+            super::input::BUTTON_PRIMARY,
+            super::input::BUTTON_SECONDARY,
+            super::input::BUTTON_TERTIARY,
+            super::input::BUTTON_BACK,
+            super::input::BUTTON_FORWARD,
+        ] {
+            if held & button != 0 {
+                if super::input::trace_mouse() {
+                    eprintln!("[cordial] pointer left the canvas holding {button}; releasing it");
+                }
+                self.dispatch_pointer_button(button, false);
+            }
+        }
+    }
+
     fn dispatch_pointer_button(&self, android_button: i32, press: bool) {
         let (x, y) = self.pointer_position();
         let handle = self.active_handle.load(Ordering::Relaxed);
@@ -2552,6 +2581,29 @@ unsafe extern "C" fn pointer_enter(
     w.dispatch_pointer_motion(fixed_to_f32(x), fixed_to_f32(y));
 }
 unsafe extern "C" fn pointer_leave(_data: *mut c_void, _pointer: *mut c_void, _serial: u32, _surface: *mut c_void) {
+    // **Let go of anything still held, before the canvas flag drops.**
+    //
+    // Wayland sends no button release on leave, and `pointer_button` below
+    // ignores events while the pointer is off the canvas -- so a button held
+    // as the pointer leaves is a bit in `pointer_buttons` that nothing ever
+    // clears. That bit is one of the two things `sync_pointer_lock` locks the
+    // pointer for, and it is gated on being back on the canvas, so the next
+    // time the pointer comes back the drag-lock engages with no button down
+    // and the camera is captured until something happens to clear it.
+    //
+    // Reported as shift lock that "sometimes won't undo ... so you're kinda
+    // stuck with it, then it works": the "then it works" is the next press and
+    // release on the canvas clearing the stale bit. The engine is told too,
+    // not just this side's bitmask, because it received the press and would
+    // otherwise go on believing the button is down -- which is the other half
+    // of a camera that will not let go.
+    //
+    // Synthesising the release is the correct platform behaviour rather than a
+    // workaround: the protocol guarantees no real one is coming, and Android's
+    // own answer to the same situation is ACTION_CANCEL.
+    if let Some(w) = current() {
+        w.release_held_buttons();
+    }
     POINTER_ON_CANVAS.store(false, Ordering::Release);
     super::input::reset_mouse_delta();
 }

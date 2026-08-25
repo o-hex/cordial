@@ -29,7 +29,9 @@
 # 0, 1 and 5. Read the count, not the verdict, when a row looks odd.
 #
 # Set `CORDIAL_POLL_COALESCE_US=0` to run the looper's idle backoff off as a
-# control, and `TAG=<word>` to keep one arm's logs from overwriting another's.
+# control, `CORDIAL_BRIDGE_DELAY_MS=<n>` to hold the app bridge back before it
+# starts the Lua app, and `TAG=<word>` to keep one arm's logs from overwriting
+# another's.
 #
 # `LOAD=<n>` runs n busy loops for the duration of the launch. **Suspect the
 # machine before the code here:** eight consecutive launches on an otherwise
@@ -128,6 +130,10 @@ fi
 # the rate is a real question -- and it has to be part of the harness rather
 # than "whatever else the developer happened to be running", which is what
 # confounded the first two arms of this survey.
+# The mark the engine log's freshness is judged against; see where it is used.
+STAMP_BEFORE=$OUT/.stamp-${TAG:-run}$RUN
+: > "$STAMP_BEFORE"
+
 LOAD_PIDS=
 for _ in $(seq 1 "${LOAD:-0}"); do
   ( while :; do :; done ) &
@@ -145,6 +151,7 @@ done
 # turned a whole control arm into noise before anyone read the log.
 env WAYLAND_DISPLAY=$DISP GDK_BACKEND=wayland CORDIAL_DEV_CONTROL=1 \
   ${CORDIAL_POLL_COALESCE_US:+CORDIAL_POLL_COALESCE_US=$CORDIAL_POLL_COALESCE_US} \
+  ${CORDIAL_BRIDGE_DELAY_MS:+CORDIAL_BRIDGE_DELAY_MS=$CORDIAL_BRIDGE_DELAY_MS} \
   "$ROOT/target/release/cordial-run" --lib-dir "$LIB" --apk "$APK" --host-libc \
   --game-activity --run 0 --profile "$PROFILE" > "$LOG" 2>&1 &
 CLIENT=$!
@@ -192,8 +199,13 @@ COOKIES=$(grep -oE "\[cookies\] restored [0-9]+ domain" "$LOG" | grep -oE "[0-9]
 # And only if it is *this* run's: a run that produced none would otherwise be
 # scored from the previous run's log, silently, which is the worst kind of
 # wrong number because it looks plausible.
+# **Against a stamp taken before the launch, not against `$LOG`.** The stdout log
+# keeps being written after the engine has stopped, so on a frozen run the
+# engine log is older than it and the freshness test failed -- on exactly the
+# runs whose engine log is the evidence. Six of them were scored `stage=none`
+# and had their logs pruned before anyone noticed.
 ELOG=$(ls -t "$HOME/.local/share/cordial/profiles/$PROFILE/data/files/appData/logs/"*_Player_*.log 2>/dev/null | head -1)
-if [ -n "$ELOG" ] && [ "$ELOG" -nt "$LOG" ]; then
+if [ -n "$ELOG" ] && [ "$ELOG" -nt "$STAMP_BEFORE" ]; then
   STAGE=$(grep -oE "StartupController started: stage = [0-9]+" "$ELOG" | tail -1 | grep -oE "[0-9]+$")
   cp "$ELOG" "$OUT/${TAG:-run}$RUN.engine.log" 2>/dev/null
 else

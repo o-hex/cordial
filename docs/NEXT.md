@@ -465,26 +465,56 @@ produce exactly the reported symptom -- a LAN websocket nobody configured,
 attempted once, timing out. Not a mystery, and not a cause: the runs that freeze
 here have it empty.
 
-### Suspect the machine, not only the code
+### Load is not it, and the rate drifts in bursts
 
-**Eight consecutive launches came back healthy on an idle machine**, against
-nine in twenty-five frozen measured earlier the same evening while builds,
-greps and a second agent were running alongside. At a 36% rate, eight healthy in
-a row is a one-in-thirty-five event.
+Thirty launches, **strictly interleaved**, eight busy loops running through the
+launch against none:
 
-That is not yet a result -- eight is eight -- but it has a consequence that is
-immediate: **the two arms already recorded above compared code while the machine
-load differed**, treatment while the session was busy and control while it was
-idle, and the 9/25-against-3/25 gap they showed is at least as easily explained
-by load as by the change under test. Neither arm should be quoted as evidence
-about code.
+    LOAD=8   1 frozen / 15   6.7%   [1.2%, 29.8%]
+    LOAD=0   5 frozen / 15  33.3%   [15.2%, 58.3%]
+    Fisher two-sided p = 0.17
 
-It also fits everything else. The bug is a race; the person who reported it runs
-a slow laptop and says so; and "give it input while it loads" -- their own
-workaround -- is a way of adding wakeups and work to exactly the window in which
-the race is decided. `tools/startup-freeze-survey.sh` takes `LOAD=<n>` for this
-reason. **Interleave the arms.** Both surveys above ran one arm after the other,
-which is how the confound got in.
+**Load does not raise the freeze rate**, and the point estimate runs the other
+way. The theory is retired.
+
+The more useful thing in that data is the shape rather than the arms. **All six
+freezes fall in runs 6 to 18, a contiguous burst across both arms**, with runs
+1-5 and 19-30 giving twenty-three consecutive healthy launches, also across both
+arms (p = 0.06 for the split). The rate drifts over minutes independently of
+anything being varied. That is exactly what produces "9 in 25, then 3 in 25,
+then 8 consecutive healthy" with no code difference at all -- **so the earlier
+arms above, including the one that made the looper backoff look guilty, are
+confounded and must not be quoted as evidence about code.** Both ran one arm
+after the other. Interleave.
+
+### Frozen runs are the fast ones, and that is probably backwards
+
+With the engine's own timestamps across thirty launches, **a run that freezes
+reaches every startup milestone earlier than one that does not**:
+
+    milestone                         frozen    healthy
+    nativeAppBridgeStartLuaAppDM       0.490      0.665
+    Lua app running status = true      0.625      0.896
+    Forcing finalize coordinator       1.061      1.366
+    sync cookies from engine           1.237      1.558
+
+Medians, consistent in direction at every mark, and the gap is already 0.175s at
+the first line common to all thirty logs. It also explains the load arm: making
+the machine busy slows that window down and froze one in fifteen instead of five.
+
+**The obvious reading is a race lost by arriving too early, and the obvious test
+falsifies it.** `CORDIAL_BRIDGE_DELAY_MS=250` holds Cordial's `StartLuaAppDM`
+back; it moved the whole timeline into the healthy band -- `StartLuaAppDM` at
+0.734s, `sync cookies` at 1.555s -- **and the run froze anyway.** One run, so not
+a result on its own, but it is a direct counterexample and it points at the
+likelier reading: **a frozen run is faster because it skipped something**, not
+frozen because it was fast. Something in the first half-second does not happen,
+and its absence is both why the run arrives early and why it wedges.
+
+That is where to look next: not at the freeze, at the 175 milliseconds of work a
+healthy run does before `StartLuaAppDM` and a frozen one does not. Cordial's own
+stdout is identical between the two, line for line, across fifty runs -- so
+whatever is skipped, Cordial is not logging it.
 
 ### The correlation still standing
 

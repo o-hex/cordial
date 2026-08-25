@@ -3664,6 +3664,44 @@ fn main() -> ExitCode {
                                             println!("[deeplink] outcome: {outcome:?}");
                                         }
 
+                                        // **`CORDIAL_BRIDGE_DELAY_MS`: hold the
+                                        // bridge back before starting the Lua
+                                        // app.**
+                                        //
+                                        // Measured, and it is the reason this
+                                        // exists rather than a guess. Across
+                                        // thirty launches with the engine's own
+                                        // log timestamped, **a run that freezes
+                                        // reaches every startup milestone
+                                        // earlier than one that does not** --
+                                        // `StartLuaAppDM` at a median of 0.490s
+                                        // against 0.665s, `Lua app running
+                                        // status ... true` at 0.625 against
+                                        // 0.896, `sync cookies from engine` at
+                                        // 1.237 against 1.558. Consistently
+                                        // faster, at every mark, in the same
+                                        // direction.
+                                        //
+                                        // Two other results point the same way.
+                                        // Running the machine deliberately busy
+                                        // during startup made the freeze *less*
+                                        // likely, not more -- one in fifteen
+                                        // against five in fifteen -- and the
+                                        // person who reported the bug works
+                                        // around it by giving the client input
+                                        // while it loads, which is another way
+                                        // of slowing that window down.
+                                        //
+                                        // So the shape is a race that is lost by
+                                        // arriving too early, and the crudest
+                                        // possible test of that is to arrive
+                                        // later on purpose.
+                                        if let Ok(ms) = std::env::var("CORDIAL_BRIDGE_DELAY_MS") {
+                                            if let Ok(ms) = ms.parse::<u64>() {
+                                                println!("  holding the bridge back {ms}ms before StartLuaAppDM");
+                                                std::thread::sleep(std::time::Duration::from_millis(ms));
+                                            }
+                                        }
                                         if std::env::var_os("CORDIAL_SKIP_LUA_DM").is_none() {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeStartLuaAppDM",

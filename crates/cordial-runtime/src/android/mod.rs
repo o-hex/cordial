@@ -17,6 +17,7 @@ pub mod asset;
 pub mod capture;
 pub mod clipboard;
 pub mod config;
+pub mod editor_font;
 pub mod gl;
 pub mod glcount;
 pub mod input;

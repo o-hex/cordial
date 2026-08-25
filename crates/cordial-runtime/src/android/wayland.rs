@@ -1581,6 +1581,14 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     };
     let host = WINDOW.get_or_init(|| host);
 
+    // Roblox's own font for the editor, out of the APK the user supplied. Done
+    // here rather than at window construction because it needs the asset
+    // manager, which is configured by the time the engine asks for a window.
+    // A `None` is not an error: the editor falls back to Pango's choice and
+    // only looks slightly wrong, where refusing to draw it would make typing
+    // invisible.
+    host.host.0.set_editor_font_family(super::editor_font::install().map(str::to_owned));
+
     // **The other direction: what the user typed, back to the engine.**
     //
     // The editor widget owns the text now, so this is the only path by which a

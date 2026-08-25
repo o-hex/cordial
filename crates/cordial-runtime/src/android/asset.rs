@@ -178,6 +178,18 @@ pub fn is_configured() -> bool {
     MANAGER.get().is_some()
 }
 
+/// Read `assets/<name>` the same way the engine's own `AAssetManager_open`
+/// does, overlays and all.
+///
+/// Exposed for the parts of Cordial that need something out of the APK for
+/// themselves rather than on the engine's behalf -- the editor font is the
+/// first. Going through the same path means an asset overlay can replace it,
+/// which is the consistent answer even though nobody is likely to re-skin a
+/// font.
+pub fn read_asset(name: &str) -> Option<&'static [u8]> {
+    MANAGER.get()?.read(name)
+}
+
 /// `CORDIAL_TRACE_ASSETS=1` is the one env var this module's tracing is
 /// documented to key off; `CORDIAL_TRACE` is accepted too where it was
 /// already wired in, but never required — `CORDIAL_TRACE=1` wraps variadic

@@ -262,6 +262,10 @@ pub struct HostWindow {
     /// What to tell when the user edits. Installed by the runtime, which owns
     /// the push to `syncTextboxTextAndCursorPosition2`.
     editor_changed: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(&str, i32)>>>>,
+    /// The font family the engine draws with, once the runtime has found it in
+    /// the APK. `None` until then, and `None` for ever if it is not there --
+    /// see [`HostWindow::set_editor_font_family`].
+    editor_font_family: std::cell::RefCell<Option<String>>,
     /// Whether the canvas is currently lowered. Remembered for the CSS class;
     /// the input region no longer depends on it, see [`HostWindow::set_canvas_cutout`].
     canvas_see_through: std::cell::Cell<bool>,
@@ -419,6 +423,15 @@ impl HostWindow {
         // be told the widget was already the right choice. The background and
         // padding an entry would draw are turned off in CSS instead.
         editor.set_overflow(gtk::Overflow::Hidden);
+        // **Keep the canvas's cursor, not a text widget's.** GTK gives text
+        // widgets an I-beam, and the editor sits on a box the engine drew, so
+        // hovering the box swapped the pointer for a GTK one and broke the
+        // illusion that the box belongs to Roblox -- reported as "in sober ...
+        // its like its part of roblox, but in ours we replace the cursor with
+        // some gtk cursor when you hover over it". Nothing else in the canvas
+        // sets a cursor, so the default arrow is what the rest of the surface
+        // shows and what this must match.
+        editor.set_cursor_from_name(Some("default"));
 
         let editor_css = gtk::CssProvider::new();
         let editor_seeding = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -502,6 +515,7 @@ impl HostWindow {
             canvas_rect: std::cell::Cell::new(None),
             editor_seeding,
             editor_changed,
+            editor_font_family: std::cell::RefCell::new(None),
         }
     }
 
@@ -519,6 +533,17 @@ impl HostWindow {
 
     pub fn present(&self) {
         self.window.present();
+    }
+
+    /// Name the font family the editor should draw with.
+    ///
+    /// The runtime supplies this because it is the side that can reach the
+    /// APK; this window only knows it wants to match whatever the engine uses.
+    /// `None` leaves Pango to pick, which is the desktop UI font and visibly
+    /// not what the engine drew -- acceptable as a fallback, never as the
+    /// intent.
+    pub fn set_editor_font_family(&self, family: Option<String>) {
+        *self.editor_font_family.borrow_mut() = family;
     }
 
     /// Install a callback for edits the user makes in the editor.
@@ -603,6 +628,14 @@ impl HostWindow {
         attrs.insert(gtk::pango::AttrSize::new_size_absolute(
             (overlay.font_size.max(1.0) * gtk::pango::SCALE as f32).round() as i32,
         ));
+        // **The family matters as much as the size, and was missing.** Setting
+        // only the size left Pango drawing the desktop's UI font over a string
+        // the engine had drawn in its own, so focusing a box changed the shape
+        // and weight of every character while the height stayed right. With
+        // the engine's own family registered the two renderings agree.
+        if let Some(family) = self.editor_font_family.borrow().as_deref() {
+            attrs.insert(gtk::pango::AttrString::new_family(family));
+        }
         self.editor.set_attributes(Some(&attrs));
 
         // GTK's own masking rather than a string of bullets: the widget then

@@ -39,6 +39,23 @@ What it gives you, and why each one exists:
 - **`cordial_click` / `cordial_move` / `cordial_key` / `cordial_text` /
   `cordial_scroll`** drive Cordial's own input entry points. Never synthesise
   input at the compositor; see the caution near the end of this file.
+- **`cordial_loopers`** reports every `ALooper` in the process: the thread that
+  owns it, how many descriptors it has registered, its poll and event counts,
+  and how long since a poll last found anything. **This is what separates a
+  client that is stuck from one that is merely idle** -- a backtrace shows
+  `epoll_wait` either way, and `fds=0` means nothing but a wake can ever make
+  that poll return. It is also how the engine's busy-poll was quantified: 9.7
+  million polls a second at 99.7% of a core with the idle backoff off, 3,261 a
+  second at 1.2% with it on, same frame rate.
+- **`cordial_textbox`** is the only readback of typed text there is. The editor
+  on a focused Roblox TextBox is a GTK widget, and `cordial_screenshot` reads
+  the engine's swapchain, which cannot see one -- so before this verb existed,
+  every check of typing asserted that the *path* worked and left "did the right
+  characters end up in the box" to a human squinting at a screenshot. It reports
+  the editor's real rectangle and which source placed it, plus the character
+  count; the text itself is withheld unless
+  `CORDIAL_TRACE_TEXT_SHOW_PASSWORDS` is set on the client, because a focused
+  field is as often a password box as a search bar.
 - **`cordial_backtrace`** attaches lldb and quotes the process CPU beside the
   stacks, because a spinning pump and a blocked one produce identical
   backtraces. **`cordial_debugger`** runs arbitrary debugger commands.
@@ -390,6 +407,17 @@ Wayland has no window-targeted injection. To drive Cordial's own input, call
 `input::pass_key_event`/`input::pass_text` directly; Cordial is the client, so
 there is nothing to send through. To drive somebody else's window, nest a
 headless compositor on its own `WAYLAND_DISPLAY` and inject inside that.
+
+**To type real keys at Cordial's own widgets, hold the device open.**
+`tools/build-wl-holders.sh` builds two small clients that create a virtual
+keyboard and a virtual pointer inside a nested compositor and *keep* them:
+`wlrctl` and `swaymsg seat - cursor` both create the device and exit in the same
+breath, and the compositor has not acted on it yet. It matters for more than
+reliability -- a headless seat with no device reports `capabilities: 0`, and
+Cordial reads seat capabilities once at `open()`, so under `cage` it never binds
+its own `wl_keyboard` at all and the guard that stops GDK and Cordial both
+inserting a character never runs. `tools/text-input-e2e.py` is the worked
+example; it asserts on `cordial_textbox` and fails rather than warns.
 
 **Do not test with an account anyone cares about**, and keep test accounts on a
 separate IP. The risk is collateral rather than causal: enforcement is automated,

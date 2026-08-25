@@ -12,6 +12,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// How many times the engine has polled. A game thread that is alive and waiting
 /// for work shows up here; one that never started does not.
@@ -288,6 +289,34 @@ const ZERO_TIMEOUT_COALESCE_US_DEFAULT: u64 = 250;
 /// low enough that an idle spin is caught within a fraction of a millisecond.
 const IDLE_SPIN_THRESHOLD: u64 = 64;
 
+/// Do not touch the poll loop until the engine has drawn this many frames.
+///
+/// The startup freeze (docs/NEXT.md §0) is a race, and the backoff below puts a
+/// 250µs sleep into a loop the engine runs millions of times a second while
+/// that race is being decided. Twenty-five launches with the backoff on froze
+/// nine times; twenty-five with `CORDIAL_POLL_COALESCE_US=0` froze three.
+/// Fisher's exact test puts that at p=0.10, the two arms ran one after the
+/// other rather than interleaved, and **the freeze then went on happening with
+/// this gate in place** -- six of eleven launches, on a build where a frozen
+/// client never presents enough frames for the sleep to run at all. So the
+/// backoff is very probably not the cause and that comparison was noise.
+///
+/// The gate stays anyway, because it costs one atomic load per poll and buys
+/// the one thing worth having: **the core this saves is burned during play, and
+/// the race happens during startup**, so there is no reason for the two to
+/// touch. Below this many frames the poll loop behaves exactly as it did before
+/// the backoff existed.
+///
+/// What the backoff does once it is allowed to engage, measured in one session
+/// against `CORDIAL_POLL_COALESCE_US=0` as the control:
+///
+///     gated (default)   3,261 polls/s   1.2% on that thread    9.0% process
+///     backoff off   9,670,516 polls/s  99.7% on that thread  108.7% process
+///
+/// with median frame rates of 240 and 237. A whole core, and the frames are the
+/// same. `cordial_loopers` is where those poll rates come from.
+const BACKOFF_AFTER_PRESENTS: u64 = 120;
+
 #[repr(C)]
 struct Timespec {
     tv_sec: i64,
@@ -353,7 +382,52 @@ struct Registration {
     data: *mut c_void,
 }
 
+/// Per-looper counters, kept separate from the looper itself so they can be
+/// read from another thread.
+///
+/// **This exists because a frozen client is a thread waiting for a message and
+/// there was no way to ask which message.** The engine's own thread sits in
+/// `ALooper_pollOnce`, and a backtrace cannot tell an empty looper nobody will
+/// ever wake from a busy one between events -- both are `epoll_wait`. The
+/// startup freeze (docs/NEXT.md §0) has been argued about for days from
+/// backtraces that could not distinguish those two states.
+///
+/// All atomics, and no borrow of the looper's `RefCell`, because the reader is
+/// the development control socket's thread and the writer is the looper's own.
+pub struct LooperStats {
+    /// The thread this looper was created on. Loopers are per-thread in
+    /// Android's contract and in ours, so this names the owner for good.
+    pub tid: i64,
+    /// Descriptors registered through `ALooper_addFd`, minus removals. **Zero
+    /// means nothing but `ALooper_wake` can ever make this poll return**, which
+    /// is the reading worth having.
+    pub registered: AtomicUsize,
+    pub polls: AtomicU64,
+    /// Polls that came back with something. The gap between this and `polls`
+    /// is how idle the looper is; the *time* since the last one is whether it
+    /// is stuck.
+    pub events: AtomicU64,
+    pub wakes: AtomicU64,
+    /// Milliseconds since the process's looper clock started, at the last poll
+    /// that returned something and at the last wake.
+    pub last_event_ms: AtomicU64,
+    pub last_wake_ms: AtomicU64,
+}
+
+/// Every looper this process has made, so the control socket can report them
+/// all. Loopers are leaked for the thread's lifetime, so the references stay
+/// valid; only the statistics are shared, never the looper.
+pub static LOOPERS: Mutex<Vec<&'static LooperStats>> = Mutex::new(Vec::new());
+
+/// Milliseconds since the first looper was created. Started lazily so a run
+/// that never makes one pays nothing.
+pub fn clock_ms() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
 pub struct Looper {
+    stats: &'static LooperStats,
     epoll: c_int,
     /// Written to by `ALooper_wake`, so a blocked `pollOnce` returns promptly.
     wake: c_int,
@@ -383,7 +457,26 @@ impl Looper {
         if epoll < 0 || wake < 0 {
             return None;
         }
+        // The owning thread, so a `loopers` reading joins onto a backtrace.
+        // SAFETY: `gettid` takes no arguments and cannot fail.
+        let tid = unsafe {
+            extern "C" {
+                fn gettid() -> c_int;
+            }
+            gettid()
+        } as i64;
+        let stats: &'static LooperStats = Box::leak(Box::new(LooperStats {
+            tid,
+            registered: AtomicUsize::new(0),
+            polls: AtomicU64::new(0),
+            events: AtomicU64::new(0),
+            wakes: AtomicU64::new(0),
+            last_event_ms: AtomicU64::new(clock_ms()),
+            last_wake_ms: AtomicU64::new(0),
+        }));
+        LOOPERS.lock().unwrap_or_else(|e| e.into_inner()).push(stats);
         let looper = Box::leak(Box::new(Looper {
+            stats,
             epoll,
             wake,
             registrations: RefCell::new(Vec::new()),
@@ -1158,12 +1251,16 @@ fn watch_input_fd(fd: c_int) -> bool {
     // A false positive in the one instrument built to catch real blackholes
     // costs more than it saves, and this one already cost a session's worth of
     // suspicion. Claiming the registration makes the count mean what it says.
-    l.registrations.borrow_mut().push(Registration {
-        fd,
-        ident: IDENT_DISPLAY_CONNECTION,
-        callback: None,
-        data: std::ptr::null_mut(),
-    });
+    {
+        let mut regs = l.registrations.borrow_mut();
+        regs.push(Registration {
+            fd,
+            ident: IDENT_DISPLAY_CONNECTION,
+            callback: None,
+            data: std::ptr::null_mut(),
+        });
+        l.stats.registered.store(regs.len(), Ordering::Relaxed);
+    }
     true
 }
 
@@ -1250,13 +1347,17 @@ extern "C" fn looper_add_fd(
         return -1;
     }
 
-    l.registrations.borrow_mut().push(Registration {
-        fd,
-        // With a callback Android reports POLL_CALLBACK rather than the ident.
-        ident: if callback.is_some() { POLL_CALLBACK } else { ident },
-        callback,
-        data,
-    });
+    {
+        let mut regs = l.registrations.borrow_mut();
+        regs.push(Registration {
+            fd,
+            // With a callback Android reports POLL_CALLBACK rather than the ident.
+            ident: if callback.is_some() { POLL_CALLBACK } else { ident },
+            callback,
+            data,
+        });
+        l.stats.registered.store(regs.len(), Ordering::Relaxed);
+    }
     1
 }
 
@@ -1269,6 +1370,7 @@ extern "C" fn looper_remove_fd(looper: *mut c_void, fd: c_int) -> c_int {
     let mut regs = l.registrations.borrow_mut();
     let before = regs.len();
     regs.retain(|r| r.fd != fd);
+    l.stats.registered.store(regs.len(), Ordering::Relaxed);
     if regs.len() < before {
         1
     } else {
@@ -1291,6 +1393,8 @@ extern "C" fn looper_wake(looper: *mut c_void) {
     // Cleared first so there is no instant where the eventfd is readable and
     // this side still believes nothing has happened.
     l.empty_zero_streak.store(0, Ordering::Relaxed);
+    l.stats.wakes.fetch_add(1, Ordering::Relaxed);
+    l.stats.last_wake_ms.store(clock_ms(), Ordering::Relaxed);
     let one: u64 = 1;
     // SAFETY: writing the eight bytes an eventfd requires to our own descriptor.
     unsafe { write(l.wake, &one as *const u64 as *const c_void, 8) };
@@ -1328,6 +1432,7 @@ extern "C" fn looper_poll_once(
         super::trace(format_args!("ALooper_pollOnce on a thread with no looper"));
         return POLL_ERROR;
     };
+    l.stats.polls.fetch_add(1, Ordering::Relaxed);
     let instrumentation = census::on();
     if instrumentation {
         POLLS.fetch_add(1, Ordering::Relaxed);
@@ -1373,7 +1478,9 @@ extern "C" fn looper_poll_once(
     // wake, resets the streak to zero, so a burst of real events is never
     // slowed -- only an idle spin is.
     let backoff_ns = zero_timeout_coalesce_ns();
-    if timeout_millis == 0 && backoff_ns > 0
+    if timeout_millis == 0
+        && backoff_ns > 0
+        && super::glcount::QUEUE_PRESENT.load(Ordering::Relaxed) >= BACKOFF_AFTER_PRESENTS
         && l.empty_zero_streak.load(Ordering::Relaxed) >= IDLE_SPIN_THRESHOLD
     {
         POLLS_COALESCED.fetch_add(1, Ordering::Relaxed);
@@ -1410,6 +1517,10 @@ extern "C" fn looper_poll_once(
         } else {
             l.empty_zero_streak.store(0, Ordering::Relaxed);
         }
+    }
+    if n > 0 {
+        l.stats.events.fetch_add(1, Ordering::Relaxed);
+        l.stats.last_event_ms.store(clock_ms(), Ordering::Relaxed);
     }
     if n == 0 {
         if let Some(s) = seat {

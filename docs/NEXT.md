@@ -92,18 +92,58 @@ paint with. That is why its equivalent bug is still open. See
 records why a nested-compositor protocol trace must be taken under `sway`
 rather than `cage`.
 
-**What is not, and the two things to check on a real desktop:**
+### The editor is now tested end to end, 2026-08-25
 
-1. **The double-insert guard is `INFERRED`.** Cage's headless seat advertises no
-   keyboard and Cordial reads `SEAT_CAPS` once at `open()`, so its key path
-   never runs in this harness. Driving a virtual keyboard in a loop before
-   `open()` does make it bind -- the "advertises no keyboard" line disappears --
-   but the compositor then sends it no keymap and no keys. A real seat has a
-   keyboard from boot and the path does run. **If the guard is wrong the
-   symptom is unmistakable: every character appears twice.**
-2. **Resize with the editor up.** `editor_rect` is in surface coordinates and
-   the region is recomputed on stacking and placement changes only, never on
-   configure. ADR-022 already flagged this and it is still open.
+`tools/text-input-e2e.py`. **Thirty-one assertions, three consecutive runs, none
+failed** -- typing, backspace, Home, End, insertion at the caret, shift-arrow
+selection replaced by the next character, select-all overtyped, click-to-position
+at both ends of the field, a clipboard round trip, Escape, refocus, and no text
+key reaching the game while a box has focus. Run it with `--profile <a signed-in
+one>`; it needs no human and it fails loudly rather than warning.
+
+Three instruments in it are new, and each replaces one that could not see a
+failure:
+
+- **`sway`, not `cage`.** This is the correction to the paragraph that used to
+  stand here. It said the double-insert guard was `INFERRED` because cage's
+  headless seat advertises no keyboard, so Cordial never binds its own
+  `wl_keyboard` and its key path never runs -- true, and the reason every
+  earlier reading was taken with half the code under test switched off.
+- **A virtual keyboard held open from before the client starts**
+  (`tools/wl-keyboard-holder.c`, built by `tools/build-wl-holders.sh`). Under
+  sway the seat then reports `"capabilities": 3` with a real
+  `wlr_virtual_keyboard_v1` on it, from before `open()` until after the client
+  exits. That paragraph's "the compositor then sends it no keymap and no keys"
+  was cage's behaviour and is not sway's. `wlrctl` remains the wrong tool for a
+  different reason: it creates its device and exits in the same breath, which
+  is a race it sometimes wins.
+- **The `textbox` verb on the development control socket**, and
+  `cordial_textbox` in the MCP. There was no readback of typed text at all
+  before: the editor's change signal prints nothing, the `text ->` trace prints
+  a byte count, and `cordial_screenshot` photographs the engine's swapchain,
+  which cannot see a GTK widget. It reports the editor's *actual* rectangle and
+  which source placed it, not the engine's volunteered spec -- those differ, and
+  the difference is the case worth testing.
+
+**So the double-insert guard is measured, not inferred: five keys produce five
+characters.** With the seat carrying a keyboard for the whole run, both Cordial's
+`wl_keyboard` and GDK's see every key, and exactly one insertion happens.
+
+**And one real defect fell out of the first full run.** Clicking the home search
+bar opens a modal; the modal focuses before it has laid out, `showKeyboard`
+volunteers `x=0 y=0 w=0 h=0`, and the editor was being dropped into the placed
+fallback bar at the bottom of the window for the second before
+`nativeGetTextBoxInfo` answers -- then jumping back up to a field ten pixels
+from where it started. Two fallback placements in one focus, both visible. It is
+part of what "the text field looks wrong" has been describing.
+`resolve_textbox_geometry` now holds the editor at the last place the engine
+vouched for, for up to 1.5s, before falling through to the bar. Measured after:
+`carried` then `engine`, no `fallback`, on every run.
+
+**What is still not tested: resize with the editor up.** `editor_rect` is in
+surface coordinates and the region is recomputed on stacking and placement
+changes only, never on configure. ADR-022 already flagged this and it is still
+open.
 
 ## Open: the canvas goes black when a TextBox focuses IN AN EXPERIENCE
 
@@ -279,10 +319,19 @@ identically -- kept it from being blamed on the change under test.
 ## 0. The freeze has a reliable reproduction, 2026-08-24
 
 **It stalls at `StartupController stage = 2`, immediately after `sync cookies
-from engine`, and on a signed-in profile it does this every time.** Three
-consecutive launches on `CordialTest`, three freezes, `presents=1` in all of
-them. That is the first reliable reproduction this bug has had, and it is worth
-more than any of the theories below it.
+from engine`.** That much is exactly right and has now been measured at n=25.
+The rest of this sentence used to read "and on a signed-in profile it does this
+every time", from three consecutive launches on `CordialTest`; **it is not every
+time.** On `default`, signed in, twenty-five launches with no input driven:
+**nine frozen, sixteen healthy -- 36%, Wilson 95% CI 20-56%.** Three-run
+agreement at a 36% base rate happens about one time in twenty, which is roughly
+how often it should be believed. Use `tools/startup-freeze-survey.sh`; the
+interval is wide enough that a candidate fix needs a comparable n in both arms
+before it means anything.
+
+`presents=1` is also not universal. Of the eight, six presented 1, one presented
+0, and one presented **5** before stopping -- and that last one is the reason
+the stall watchdog's `after N frames` is worth reading rather than skimming.
 
     t=2.87  [FLog::RobloxTelemetry] Lua app running status has been updated to true
     t=3.00  [FLog::NativeDM] (callback) initEngine_: ... StartupController started: stage = 2
@@ -307,22 +356,110 @@ Each of these looked right on three to six runs and died on the next test:
   60/s startup phase. The `visible()`-derived focus loss was a genuine bug and is
   fixed in 4f818cc, but the frozen run above shows `APP_CMD_GAINED_FOCUS` and no
   loss at all, so it is not this freeze.
-- **Cookies.** Same profile three times: the run that restored **0** domains
-  froze, both runs that restored 4 were healthy.
+- **Cookies. Dead, 2026-08-25.** This used to read: "Same profile three times:
+  the run that restored **0** domains froze, both runs that restored 4 were
+  healthy." Across twenty-five launches on `default`, **every single run
+  restored 6 domains** -- frozen and healthy alike -- and the freeze still came
+  at 32%. There is no variance left to correlate with. The original reading was
+  three runs on a profile whose restore count was itself unstable, which made a
+  varying number look like a cause.
 - **The OTA cache.** 147 MB of `ota_rbxm_decompressed_cache` and
   `UniversalApp_cache` moved aside; froze identically on the next launch.
+- **A missing Choreographer, 2026-08-25.** `Register rendering frequency during
+  startup` is the first line a healthy run logs past the stall, which makes a
+  frame-callback the engine never receives an obvious suspect --
+  `AChoreographer_postFrameCallback` is how an Android app asks for the next
+  vsync, and Cordial implements none of it. **The engine does not import it.**
+  `readelf --dyn-syms` on `libroblox.so` matches `choreograph` zero times, in
+  any case. `symtab.rs` lists an `AChoreographer` prefix that nothing has ever
+  asked for.
+- **The looper's idle backoff (`2b42e63`), 2026-08-25.** Suspected because it
+  puts a 250µs sleep in a loop the engine spins on while the race is being
+  decided, and because the first two arms measured 9/25 frozen with it and 3/25
+  without (Fisher p=0.10, run sequentially rather than interleaved). It is
+  almost certainly not the cause: gated behind `BACKOFF_AFTER_PRESENTS` -- so
+  that a client which never presents 120 frames never sleeps at all -- **the
+  freeze still happened on six of eleven launches.** Recorded because the
+  suspicion was reasonable and the next person will have it too.
+- **A lost looper wakeup.** The shape fits and the mechanism does not: a lost
+  wake strands a thread in a *blocking* `ALooper_pollOnce`, and both threads in
+  a frozen client are polling with a timeout -- the pump at 50 ms, the engine's
+  own thread at 0. `BLOCK_CEILING_MS` already caps an infinite block for
+  exactly this reason (`CORDIAL_LOOPER_BLOCK=1` is its control). The work item
+  is not being delivered late; it is never being created.
+
+### The marker that separates them, 2026-08-25
+
+**`~UgcExperienceController()` is in all eight surviving healthy engine logs and
+none of the six surviving frozen ones.** (The engine prunes its own log
+directory, so eleven of the twenty-five were already gone when they were read;
+Cordial's stdout survives for all of them.) That is the sharpest discriminator this bug has had, and
+it is one line rather than a rate.
+
+Both kinds of run log `Forcing finalize experience coordinator with state 1` and
+then `finalize: Did not finalize due to state.` -- so that pair reads like the
+failure and is not; it appears once in each. The difference is what happens
+afterwards: on a healthy run the coordinator is destructed and the shell goes on
+through `Register rendering frequency during startup`, `setStage:
+(stage:InitializedLuaApp)`, `startLuaApp_` and `RenderView created[2]`. On a
+frozen run the destructor never runs, `startLuaApp_` is never reached, and the
+log simply stops. Frozen logs are 279-293 lines; healthy ones 607-620.
+
+Cordial's own stdout separates them just as cleanly and is not pruned: **`[stub]
+ZSTD_trace_compress_begin` appears in all sixteen healthy runs and none of the
+nine frozen ones**, along with `DID_LOG_IN`, `HOME_PAGE_INTERACTIVE`,
+`LUA_HOME_PAGE_LOADED` and the two `DataModelPatchConfigurer` downloads. Nothing
+appears in a frozen run that does not appear in a healthy one, except Cordial's
+own stall warning. **There is no failed call, no unresolved symbol and no error
+anywhere in a frozen run** -- the difference is entirely what is missing.
+
+**It is the second Lua app start that never happens, not the first.** Both kinds
+of run call `nativeAppBridgeStartLuaAppDM` and reach
+`initializeLuaAppWithLoggedInUser` at t=0.56-0.57s, log `Lua app running status
+has been updated to true` at t=0.71-0.75, and get `TestServiceLog
+[onServiceProvider]` two milliseconds later. Identical. Then at t=1.16-1.20 both
+log `Forcing finalize experience coordinator with state 1` and `Did not finalize
+due to state`, and there the two part: a healthy run sets the running status back
+to **false**, destructs the coordinator, and calls
+`initializeLuaAppWithLoggedInUser` a *second* time; a frozen run does none of it.
+
+The same fact is visible in Cordial's own stdout, which -- unlike the engine's
+log -- is never pruned: **`app ready: PlatformAccountRouter` appears twice in
+all sixteen healthy runs and once in all nine frozen ones.** The shell mounts
+its router once per Lua app start. That is the cheapest frozen-run detector
+there is, it needs no engine log, and it is 25 for 25.
+
+**So the engine is waiting between "stage 2" and the second `InitializedLuaApp`,
+and whatever releases that destruction is the thing to find.** `load.rs`'s own
+comment on the bridge order is the place to start looking: *"the engine spawns
+its own 'Main' thread inside `nativeGameGlobalInit`, which independently races
+through the same `StartLuaAppDM` machinery our own explicit call drives."* A
+frozen client has two threads named `Main`, and the race that comment describes
+is the right shape for a bug that happens on a third of launches. It is not a rendering
+problem: no thread is inside a Vulkan call, and the engine's own thread sits in
+`ALooper_pollOnce` at about 1% of a core, which is a wait rather than a spin.
+
+`http://10.110.101.222:5052` -- a LAN websocket that times out after 60 s -- was
+recorded here as appearing "in every `CordialTest` log and no healthy one", and
+suspected for being a private address. **It appears in none of the fifty logs
+from the survey above**, stdout or engine, frozen or healthy, and `default`
+freezes at 36% without it. Whatever it is, the freeze does not need it.
+
+`INFERRED`, but it probably has a name: every run above logs `[FLog::
+TestServiceLog] [onServiceProvider] DebugUTPLauncherWebSocketUri='' wsOptIn=0`
+at the same point. On `default` that setting is empty. A `CordialTest` whose
+account or flag cache carries a non-empty `DebugUTPLauncherWebSocketUri` would
+produce exactly the reported symptom -- a LAN websocket nobody configured,
+attempted once, timing out. Not a mystery, and not a cause: the runs that freeze
+here have it empty.
 
 ### The correlation still standing
 
 Signed-in profiles reach `Home` and freeze. Logged-out profiles reach `Landing`
 and mostly do not. Every clean headless run in this repository has been logged
-out. That is the axis to test next, and testing it needs a signed-in profile
-rather than another mechanism guess.
-
-`http://10.110.101.222:5052` -- a LAN websocket that times out after 60 s --
-appears in every `CordialTest` log and no healthy one. It survives clearing the
-OTA caches, so it comes from the account's IXP settings or the flag cache, not
-from the bundle. Unexplained, and suspicious for being a private address.
+out. That is the axis still untested at a useful n, and testing it needs a
+logged-out profile put through the same twenty-five launches -- `tools/` has the
+survey harness the numbers above came from.
 
 ## 0-old. The freeze is the app shell never reaching Landing, 2026-08-24
 
@@ -1385,9 +1522,17 @@ screenshots show Roblox's landing page re-laid out at each size under the header
 bar, the run reached `Landing` and presented 553 frames, and nothing crashed.
 That exercises the same path a compositor-driven resize takes — content
 allocation changes, `sync_canvas_geometry` moves and resizes the subsurface,
-`surface_resized` reaches the engine, Mesa rebuilds the swapchain — with a
-different trigger. Dragging the window edge by hand is still untested, because
-there is no Wayland-safe way to do it from automation.
+`surface_resized` reaches the engine, and the engine rebuilds the swapchain
+itself — with a
+different trigger. **Not Mesa**, as this sentence said until 2026-08-25: nothing
+in Cordial creates or destroys a swapchain. The engine polls
+`vkGetPhysicalDeviceSurfaceCapabilitiesKHR`, Cordial substitutes the extent
+`apply_resize` has just published for Mesa's `0xFFFFFFFF` sentinel, and the
+engine calls `vkCreateSwapchainKHR` on its own. The distinction matters because
+"the swapchain was recreated" reads like something done *to* the engine, and a
+whole afternoon went on looking for the object Cordial had pulled out from under
+it. There is no such object. Dragging the window edge by hand is still untested,
+because there is no Wayland-safe way to do it from automation.
 
 **Experiment 1 below is answered — no, it does not — and it did not need a
 human after all.** `CORDIAL_SCRIPT` clicks and types now, through Cordial's own

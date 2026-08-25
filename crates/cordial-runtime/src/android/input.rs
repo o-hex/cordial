@@ -1499,6 +1499,19 @@ pub fn text_buffer_snapshot() -> (String, i32) {
     (buf.text.clone(), buf.caret as i32)
 }
 
+/// The same reading, taken without touching anything.
+///
+/// [`text_buffer_snapshot`] reseeds from the engine before it answers, which is
+/// right for a caller about to render the field and wrong for one that only
+/// wants to know what is in it. The development control surface is the second
+/// kind: a query that mutates the buffer it is reporting on is an instrument
+/// that changes what it measures, and this project has lost enough time to
+/// those already.
+pub fn text_buffer_peek() -> (String, i32) {
+    let buf = TEXT_BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+    (buf.text.clone(), buf.caret as i32)
+}
+
 /// Take the editor widget's text as the truth, wholesale.
 ///
 /// **This is the buffer stopping being an editor and becoming a mirror.** The

@@ -171,6 +171,8 @@ fn handle(line: &str) -> String {
     match verb {
         "ping" => "ok".into(),
         "info" => info_line(),
+        "textbox" => textbox_line(),
+        "loopers" => loopers_line(),
         "move" => match (num(it.next()), num(it.next())) {
             (Some(x), Some(y)) => {
                 push(Cmd::Move { x, y });
@@ -269,6 +271,83 @@ fn info_line() -> String {
         ACCEPTED.load(Ordering::Relaxed),
         std::process::id(),
     )
+}
+
+/// What the focused field currently contains, so a test can assert on it.
+///
+/// This is the one reading the text harness could not take. Nothing else here
+/// reports it: the editor's own change signal prints nothing, `text ->` prints
+/// a byte count rather than the string, and `cordial_screenshot` reads the
+/// engine's swapchain, which cannot see a GTK widget at all. So every check of
+/// typing before this verb existed asserted on the *path* -- that a spec
+/// arrived, that the client survived -- and left "did the right characters end
+/// up in the box" to a human squinting at a screenshot. A guard that inserted
+/// every character twice would have passed all of it.
+///
+/// **The text itself is withheld by default**, on the same switch the trace
+/// lines use, because a focused field is as often a password box as a search
+/// bar and this socket is a development aid rather than a place to leak one.
+/// The counts and the caret are always given, and they are enough to catch the
+/// failure that switch exists to make visible: doubled characters change
+/// `chars`, and the harness can assert on that without ever seeing a field.
+///
+/// The value is the mirror `adopt_editor_text` keeps of the widget, not the
+/// widget itself -- the widget lives on GTK's thread and this runs on the
+/// socket's. That mirror is one signal-hop behind, and it is also precisely
+/// what `send_current_text` hands the engine, so it is the more useful of the
+/// two to assert on: it is what Roblox will be told.
+fn textbox_line() -> String {
+    let focus = cordial_linker_sys::game_activity::focused_textbox();
+    let (text, caret) = crate::android::input::text_buffer_peek();
+    // Where the editor actually is, not where the engine last said the box is.
+    // Those differ, and the difference is exactly the case worth testing: the
+    // search modal focuses with a zeroed spec and is correctly editable for
+    // the second before the real numbers arrive.
+    let geometry = crate::android::wayland::LAST_EDITOR_RECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(|(x, y, w, h, src)| format!(" x={x} y={y} w={w} h={h} placed={src}"))
+        .unwrap_or_else(|| " x=none y=none w=none h=none placed=none".into());
+    format!(
+        "ok focus={} gen={} rev={} chars={} bytes={} caret={caret}{geometry} text={}",
+        focus.map(|h| h.to_string()).unwrap_or_else(|| "none".into()),
+        cordial_linker_sys::game_activity::textbox_generation(),
+        crate::android::input::text_buffer_revision(),
+        text.chars().count(),
+        text.len(),
+        crate::android::input::redacted(&text),
+    )
+}
+
+/// Every ALooper in the process, and whether anything is still happening on it.
+///
+/// **The reading this exists for is a frozen client.** The startup freeze
+/// leaves the engine's own thread inside `ALooper_pollOnce` with the process
+/// near idle, and a backtrace cannot tell "waiting between events" from
+/// "waiting for an event that can never come" -- both are `epoll_wait`. Three
+/// numbers separate them: how many descriptors the looper has registered (zero
+/// means only `ALooper_wake` can ever make it return), how long since a poll
+/// last found anything, and how long since anybody woke it.
+///
+/// One line per looper, `tid=` first, because loopers are per-thread and the
+/// thread id is what a backtrace gives you to join on.
+fn loopers_line() -> String {
+    let now = crate::android::looper::clock_ms();
+    let stats = crate::android::looper::LOOPERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = format!("ok now={now} loopers={}", stats.len());
+    for s in stats.iter() {
+        out.push_str(&format!(
+            " | tid={} fds={} polls={} events={} wakes={} since_event={}ms since_wake={}ms",
+            s.tid,
+            s.registered.load(Ordering::Relaxed),
+            s.polls.load(Ordering::Relaxed),
+            s.events.load(Ordering::Relaxed),
+            s.wakes.load(Ordering::Relaxed),
+            now.saturating_sub(s.last_event_ms.load(Ordering::Relaxed)),
+            now.saturating_sub(s.last_wake_ms.load(Ordering::Relaxed)),
+        ));
+    }
+    out
 }
 
 /// Monotonic milliseconds since the surface first ran, for the one input path

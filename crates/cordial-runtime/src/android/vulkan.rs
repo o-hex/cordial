@@ -1171,15 +1171,17 @@ extern "C" fn vk_create_swapchain_inner(
     // `maxImageCount == 0` is the specification's own "no limit" and not a
     // limit of zero.
     //
-    // Measured on 2026-08-20 rather than assumed, and the answer was that this
-    // has never fired: the engine asks for `minImageCount 3` on every swapchain
-    // it creates here, including the recreation after the first resize. So the
-    // MAILBOX substitution was already getting a swapchain that could hold a
-    // spare. Kept because the substitution is what makes three a *requirement*
-    // rather than the engine's preference, and a build that asked for two would
-    // otherwise stall silently -- but nobody should go looking here for a
-    // present-mode bug on today's build, because on today's build this branch
-    // is not taken.
+    // Measured rather than assumed, and the answer is that this has never
+    // fired. On 2026-08-20 the engine asked for `minImageCount 3` on every
+    // swapchain; **on 2026-08-25, on the same build of Cordial and a current
+    // APK, every swapchain in the log asks for 4** -- first creation and
+    // recreation alike. The engine's request is not a constant and the older
+    // note read as though it were. The conclusion survives the correction,
+    // because both numbers are already at least three, so the raise below stays
+    // untaken; but nobody should quote "the engine asks for three" as a fact
+    // about this engine. Kept because the substitution is what makes three a
+    // *requirement* rather than the engine's preference, and a build that asked
+    // for two would otherwise stall silently.
     let mut images = info.min_image_count;
     if !matches!(chosen, VK_PRESENT_MODE_FIFO_KHR | VK_PRESENT_MODE_FIFO_RELAXED_KHR)
         && images < 3

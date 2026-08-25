@@ -267,6 +267,32 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "cordial_textbox",
+        "description": (
+            "What the focused Roblox TextBox contains right now: whether one has focus, "
+            "how many characters and bytes are in it, where the caret is, and the box's "
+            "geometry. This is the only readback of typed text there is -- the editor is a "
+            "GTK widget, and cordial_screenshot photographs the engine's swapchain, which "
+            "cannot see a GTK widget at all. The text itself is withheld unless "
+            "CORDIAL_TRACE_TEXT_SHOW_PASSWORDS is set on the client, because a focused "
+            "field is as often a password box as a search bar; the character count is not, "
+            "and it is what catches a key being inserted twice."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "cordial_loopers",
+        "description": (
+            "Every ALooper in the process: which thread owns it, how many descriptors it "
+            "has registered, and how long since a poll last found anything or anybody woke "
+            "it. This is the reading for a client that is stuck rather than slow -- a "
+            "backtrace shows `epoll_wait` whether the looper is waiting between events or "
+            "waiting for one that can never arrive, and only these numbers tell them apart. "
+            "`fds=0` means nothing but a wake can ever make that poll return."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "cordial_click",
         "description": (
             "Click at a coordinate inside the Roblox surface. Sends a move, a press and a "
@@ -400,6 +426,14 @@ def tool_screenshot(c, args):
 
 def tool_info(c, args):
     return [{"type": "text", "text": c.send("info")}]
+
+
+def tool_loopers(c, args):
+    return [{"type": "text", "text": c.send("loopers").replace(" | ", "\n")}]
+
+
+def tool_textbox(c, args):
+    return [{"type": "text", "text": c.send("textbox")}]
 
 
 def tool_click(c, args):
@@ -589,6 +623,8 @@ def tool_gdb(c, args):
 HANDLERS = {
     "cordial_screenshot": tool_screenshot,
     "cordial_info": tool_info,
+    "cordial_textbox": tool_textbox,
+    "cordial_loopers": tool_loopers,
     "cordial_click": tool_click,
     "cordial_move": tool_move,
     "cordial_key": tool_key,

@@ -1082,6 +1082,66 @@ pub struct WaylandWindow {
     /// it, rather than dropping back to the fallback bar and flickering
     /// between the two at half the pump rate.
     polled_textbox_info: Mutex<Option<PolledTextBoxInfo>>,
+    /// See [`WaylandWindow::resolve_textbox_geometry`].
+    last_placement: Mutex<Option<LastPlacement>>,
+}
+
+/// Where the editor was last actually put, for anything outside the pump that
+/// needs to know -- which today is the development control surface.
+///
+/// Published rather than recomputed because the answer is not derivable from
+/// outside: `focused_textbox_info` is the engine's *volunteered* spec, and for
+/// the search modal that is legitimately `0x0` for about a second while the
+/// editor sits correctly on the box from a polled answer. A test that read the
+/// spec would conclude the editor was nowhere, which is what happened on
+/// 2026-08-25 before this existed.
+pub(crate) static LAST_EDITOR_RECT: Mutex<Option<(f32, f32, f32, f32, &'static str)>> =
+    Mutex::new(None);
+
+/// Which source put the editor where it is.
+///
+/// Three, not two, because the middle one is the difference between a smooth
+/// focus and a visible flinch. See [`WaylandWindow::resolve_textbox_geometry`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placed {
+    /// The engine said where this box is, and it is there.
+    Engine,
+    /// The engine has not said yet, so the editor is being held where the last
+    /// box was until it does.
+    Carried,
+    /// Nothing has ever said, so the editor is in a bar Cordial positions.
+    Fallback,
+}
+
+impl Placed {
+    /// For the log, where a sentence reads better than a word.
+    fn source(self) -> &'static str {
+        match self {
+            Placed::Engine => "engine geometry",
+            Placed::Carried => "the previous box, while this one lays out",
+            Placed::Fallback => "fallback bar",
+        }
+    }
+
+    /// For the control socket, whose replies are whitespace-separated fields
+    /// and cannot carry a sentence.
+    fn token(self) -> &'static str {
+        match self {
+            Placed::Engine => "engine",
+            Placed::Carried => "carried",
+            Placed::Fallback => "fallback",
+        }
+    }
+}
+
+/// The last placement the engine actually vouched for, and when.
+///
+/// Kept so a focus whose geometry has not arrived yet has somewhere better to
+/// put the editor than the bottom of the window. See
+/// [`WaylandWindow::resolve_textbox_geometry`].
+struct LastPlacement {
+    info: cordial_linker_sys::game_activity::RawTextBoxInfo,
+    at: std::time::Instant,
 }
 
 /// One focus generation's worth of polling state for
@@ -1586,6 +1646,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         text_overlay_visible: AtomicBool::new(false),
         text_overlay_cache: Mutex::new(None),
         polled_textbox_info: Mutex::new(None),
+        last_placement: Mutex::new(None),
     };
     let host = WINDOW.get_or_init(|| host);
 
@@ -1918,6 +1979,13 @@ impl WaylandWindow {
         // cycle of two otherwise identical 240-second runs, presents totalled
         // ~75 without the call and ~74 with it. Left out rather than kept as a
         // plausible-sounding no-op.
+        //
+        // **It is called again now, and this paragraph must not be read as
+        // saying otherwise.** `apply_resize`, two lines down, sends it once per
+        // accepted resize rather than once per pump, and the comment there says
+        // what is different about that and admits the control has not been run.
+        // The sentence above is about the attempt that was withdrawn; someone
+        // reading it as "nothing drives this native" would be wrong.
         self.apply_resize(w, h);
     }
 
@@ -1960,7 +2028,7 @@ impl WaylandWindow {
         text: &str,
         caret: i32,
         info: cordial_linker_sys::game_activity::RawTextBoxInfo,
-        fallback: bool,
+        placed: Placed,
     ) {
         let mut cache = self.text_overlay_cache.lock().unwrap_or_else(|e| e.into_inner());
         let unchanged = cache.as_ref().is_some_and(|(g, r, old, old_caret, old_info)| {
@@ -1975,6 +2043,8 @@ impl WaylandWindow {
         }
         *cache = Some((generation, revision, text.to_owned(), caret, info));
         drop(cache);
+        *LAST_EDITOR_RECT.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((info.x, info.y, info.width, info.height, placed.token()));
         if super::input::trace_text() {
             // Which of the three sources won, and the numbers it won with.
             // Placement is the question this whole path exists to answer, and
@@ -1983,7 +2053,7 @@ impl WaylandWindow {
             // when the getter or the fallback supplies the geometry instead.
             eprintln!(
                 "[cordial] text editor placed from {} x={} y={} w={} h={}",
-                if fallback { "fallback bar" } else { "engine geometry" },
+                placed.source(),
                 info.x, info.y, info.width, info.height
             );
         }
@@ -1998,7 +2068,10 @@ impl WaylandWindow {
             font_size: info.font_size,
             text_color: info.text_color as u32,
             password: matches!(info.i10, 5 | 9 | 10),
-            fallback,
+            // Only the placed bar draws its own chrome. An editor held at the
+            // previous box's place is still sitting on a real field and must
+            // not suddenly grow a background.
+            fallback: placed == Placed::Fallback,
         }));
         if !self.text_overlay_visible.swap(true, Ordering::SeqCst)
             && self.open_web_view_dialogs.load(Ordering::SeqCst) == 0
@@ -2123,20 +2196,49 @@ impl WaylandWindow {
     fn resolve_textbox_geometry(
         &self,
         generation: u32,
-    ) -> (cordial_linker_sys::game_activity::RawTextBoxInfo, bool) {
-        match cordial_linker_sys::game_activity::focused_textbox_info() {
-            Some(info) if info.width > 0.0 && info.height > 0.0 => (info, false),
-            _ => match self.polled_textbox_info(generation) {
-                Some(info) => (info, false),
-                None => (self.fallback_textbox_info(), true),
-            },
+    ) -> (cordial_linker_sys::game_activity::RawTextBoxInfo, Placed) {
+        /// How long the editor may be held at the last box's place.
+        ///
+        /// Long enough to cover the search modal, which is the case this
+        /// exists for: it focuses with a zeroed spec and `nativeGetTextBoxInfo`
+        /// answers about a second later. Short enough that a box which will
+        /// never report geometry still reaches the fallback bar promptly,
+        /// rather than leaving the editor stranded on a field that is no longer
+        /// on screen.
+        const CARRY_OVER: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+        let found = match cordial_linker_sys::game_activity::focused_textbox_info() {
+            Some(info) if info.width > 0.0 && info.height > 0.0 => Some(info),
+            _ => self.polled_textbox_info(generation),
+        };
+        let mut last = self.last_placement.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(info) = found {
+            *last = Some(LastPlacement { info, at: std::time::Instant::now() });
+            return (info, Placed::Engine);
         }
+        // **Hold still rather than jump.** Clicking the home search bar opens a
+        // modal, and the engine focuses that modal before it has laid out: the
+        // spec is `x=0 y=0 w=0 h=0` and the real numbers arrive about a second
+        // afterwards. Falling straight through to the placed bar sent the
+        // editor to the bottom of the window for that second and then back up
+        // to a field ten pixels from where it started -- measured on
+        // 2026-08-25, two fallback placements in one focus, both of them
+        // visible. The modal replaces the search bar in the same place at the
+        // same height, so staying put is very nearly right and is never as
+        // wrong as the bottom of the screen.
+        if let Some(p) = last.as_ref() {
+            if p.at.elapsed() < CARRY_OVER {
+                return (p.info, Placed::Carried);
+            }
+        }
+        (self.fallback_textbox_info(), Placed::Fallback)
     }
 
     fn sync_text_overlay(&self) {
         let Some(_which) = cordial_linker_sys::game_activity::focused_textbox() else {
             if self.text_overlay_visible.swap(false, Ordering::SeqCst) {
                 *self.text_overlay_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *LAST_EDITOR_RECT.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 self.host.0.set_text_overlay(None);
                 if self.open_web_view_dialogs.load(Ordering::SeqCst) == 0 {
                     self.set_engine_stacking(true);
@@ -2216,7 +2318,7 @@ impl WaylandWindow {
         // invisible -- and, worse, it looks like a real spec so the fallback
         // never runs. Found by `tools/text-entry-check.sh` on its first pass,
         // which is the whole reason that script exists.
-        let (info, fallback) = self.resolve_textbox_geometry(generation);
+        let (info, placed) = self.resolve_textbox_geometry(generation);
         if self
             .text_overlay_cache
             .lock()
@@ -2235,7 +2337,7 @@ impl WaylandWindow {
             &text,
             caret,
             info,
-            fallback,
+            placed,
         );
     }
 
@@ -3908,14 +4010,14 @@ impl WaylandWindow {
         // The same resolution `sync_text_overlay` uses, and through the same
         // function so the two cannot drift apart again.
         let generation = cordial_linker_sys::game_activity::textbox_generation();
-        let (info, fallback) = self.resolve_textbox_geometry(generation);
+        let (info, placed) = self.resolve_textbox_geometry(generation);
         self.update_text_overlay(
             generation,
             super::input::text_buffer_revision(),
             &text,
             caret,
             info,
-            fallback,
+            placed,
         );
     }
 

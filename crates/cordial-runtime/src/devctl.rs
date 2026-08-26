@@ -354,9 +354,13 @@ fn loopers_line() -> String {
     let mut out = format!("ok now={now} loopers={}", stats.len());
     for s in stats.iter() {
         out.push_str(&format!(
-            " | tid={} fds={} polls={} events={} wakes={} since_event={}ms since_wake={}ms",
+            " | tid={} fds={} [{}] polls={} events={} wakes={} since_event={}ms since_wake={}ms",
             s.tid,
             s.registered.load(Ordering::Relaxed),
+            // The descriptors themselves, as `fd:ident:cb`. A count told us a
+            // spinning looper had exactly one registration; naming it is what
+            // turns that into something to go and look at.
+            s.registered_detail.lock().unwrap_or_else(|e| e.into_inner()),
             s.polls.load(Ordering::Relaxed),
             s.events.load(Ordering::Relaxed),
             s.wakes.load(Ordering::Relaxed),

@@ -70,18 +70,71 @@ in `epoll_wait` -- and this project has got that backwards before. Without
 looper census is the other half: `polls=239323738` against `events=9` says the
 same thing in a form that survives being pasted into an issue.
 
+## Three captures agree, and they name the descriptor
+
+`d1` and `d2`, taken the same way, report the same shape as `cap2` -- and the
+census now names what is registered rather than counting it:
+
+```text
+spinning  fds=1  [21:1:-]                    polls 244-254 million, events=9
+main      fds=2  [19:-2:cb, 27:1131377252:-] polls ~500,       events=6-18
+CPU       103% in all three; the spinning thread is the only one in state R
+```
+
+`21:1:-` is fd 21, ident 1, no callback. `/proc` says what it is:
+
+```text
+19 -> pipe:[12929303]      20 -> pipe:[12929303]   (write end, same process)
+21 -> pipe:[12929304]      22 -> pipe:[12929304]   (write end, same process)
+27 -> socket:[12922088]                            (the Wayland display)
+```
+
+So the spinning engine thread is polling **the read end of a pipe whose write
+end is open in this same process**. Nothing is closed and nothing has gone
+away; something simply stops writing. Ident 1 is the app-glue's main command
+channel, and `APP_CMD` appears nowhere in Cordial -- these pipes belong to the
+engine's own glue inside `libroblox.so`, not to anything this project wrote.
+
+And Cordial's main thread is starved too: its Wayland display socket has
+produced no event for twenty-five seconds.
+
+## Input does not recover a frozen client. Measured, and it refutes the obvious theory
+
+The shape above suggests a starvation cycle -- the engine waits for a command,
+the command comes from work the main thread drives, the main thread waits for
+events, the events come from presenting, and presenting needs the engine. If
+that were the whole story, one input event should break it.
+
+It does not. Driven through Cordial's own entry points on a live frozen client:
+
+```text
+before                  presents=2  accepted=0
+after 20 pointer moves  presents=2  accepted=20
+4s later                presents=2  accepted=20
+```
+
+**The moves were accepted -- the count proves they reached the client -- and
+nothing moved.** So whatever the engine thread is waiting for, an input event
+is not it, and a frozen client does not come back.
+
+This does **not** contradict the original report, and the distinction matters:
+that report says input *prevents* the freeze, not that it recovers one. Those
+are different claims and only the second is refuted here.
+
 ## What this does not establish
 
-- **Which descriptor.** The looper has `fds=1` and nothing here says what it
-  is or which side is supposed to write to it. That is the next measurement
-  and it is the one that matters: find the fd, find who signals it on a
-  healthy run, and find what stops them signalling it here.
+- **Which side stops writing.** The descriptor is now named -- the read end of
+  the engine's own app-glue command pipe -- and the write end is open in the
+  same process. What is not known is what would have written to it on a healthy
+  run and why it does not here. That is inside `libroblox.so`, so the way at it
+  is the difference between a healthy and a frozen run's command sequence, not
+  a debugger on engine code.
 - **Whether the main thread is a cause or a casualty.** Seventeen events and
   nothing for twenty-five seconds is consistent with both.
 - **Whether the nested compositor is required**, as above.
-- **Whether this is one bug.** One capture is one capture. At an 80% rate the
-  second and third are minutes away and should be taken before anybody builds
-  a theory on this one.
+- **Whether this is one bug.** Three captures now agree on every reading, which
+  is much better than one. They were taken minutes apart on one machine, so
+  they establish a consistent shape rather than a general one.
 
 ## Repeating it
 

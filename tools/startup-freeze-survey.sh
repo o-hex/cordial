@@ -330,8 +330,60 @@ except Exception as e:
   # thread, twice, and gdb walked the same process and named both halves.
   PATH=/home/linuxbrew/.linuxbrew/bin:$PATH timeout 240 \
     gdb -p "$CLIENT" -batch -ex 'thread apply all bt 16' > "$CAP/bt.txt" 2>&1
+  # **What the descriptors actually are.** The census names them by number;
+  # /proc says whether a number is an eventfd, a pipe, a socket or a file, and
+  # an epoll fd's fdinfo lists the `tfd:` it is watching. Between the two there
+  # is no guessing left about what the spinning looper is waiting on.
+  ls -l "/proc/$CLIENT/fd" > "$CAP/fds.txt" 2>&1
+  for f in /proc/$CLIENT/fdinfo/*; do
+    printf '=== %s\n' "$f" >> "$CAP/fdinfo.txt"
+    cat "$f" >> "$CAP/fdinfo.txt" 2>&1
+  done
+  # Per-thread state, so the spinning thread can be told from the idle ones
+  # without a debugger: R is running, S is sleeping.
+  for t in /proc/$CLIENT/task/*; do
+    printf '%s %s\n' "$(basename "$t")" "$(awk '{print $3}' "$t/stat" 2>/dev/null)" \
+      >> "$CAP/threads.txt"
+  done
   [ -n "$ELOG" ] && cp "$ELOG" "$CAP/engine.log" 2>/dev/null
   cp "$LOG" "$CAP/stdout.log" 2>/dev/null
+  # **The decisive experiment, run on the specimen while it is still alive.**
+  #
+  # Three captures agree on the shape: an engine thread spinning on its own
+  # app-glue command pipe, and Cordial's main thread with no Wayland event for
+  # twenty-five seconds. That is consistent with a starvation cycle -- the
+  # engine waits for a command, the command comes from work the main thread
+  # drives, the main thread waits for events, and the events come from
+  # presenting, which needs the engine. If that is what this is, then one input
+  # event should break it, and the user's original report is exactly that:
+  # it freezes if you do not touch it.
+  #
+  # So: poke it through Cordial's own entry point -- never the compositor --
+  # and read the present count again. A count that climbs after the poke and
+  # not before is the mechanism confirmed.
+  python3 -c "
+import socket, time
+def ask(line):
+    s = socket.socket(socket.AF_UNIX); s.settimeout(8)
+    try:
+        s.connect('$SOCK'); s.sendall((line+'\n').encode())
+        buf=b''
+        while not buf.endswith(b'\n'):
+            c=s.recv(65536)
+            if not c: break
+            buf+=c
+        return buf.decode(errors='replace').strip()
+    except Exception as e:
+        return 'err %s' % e
+print('before   ', ask('info'))
+for i in range(20):
+    ask('move %d %d' % (400+i*3, 300+i*2))
+    time.sleep(0.05)
+time.sleep(4)
+print('after 20 pointer moves', ask('info'))
+time.sleep(4)
+print('4s later ', ask('info'))
+" > "$CAP/poke.txt" 2>&1
   echo "captured a frozen client into $CAP" >&2
 fi
 

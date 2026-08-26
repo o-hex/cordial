@@ -457,6 +457,17 @@ pub struct LooperStats {
     /// means nothing but `ALooper_wake` can ever make this poll return**, which
     /// is the reading worth having.
     pub registered: AtomicUsize,
+    /// **What is registered, not merely how many.** The count answers "can
+    /// anything but a wake return", which is the question that mattered while
+    /// the freeze was a mystery. The capture of 2026-08-26 moved it on: an
+    /// engine thread was found spinning on a looper with exactly one
+    /// registration, and the next question is which descriptor -- so the
+    /// census has to name it.
+    ///
+    /// `fd:ident:cb` per registration, rendered once here rather than held as
+    /// a structure, because this is read by a human through a socket and the
+    /// alternative is a second lock order between the registry and the census.
+    pub registered_detail: Mutex<String>,
     pub polls: AtomicU64,
     /// Polls that came back with something. The gap between this and `polls`
     /// is how idle the looper is; the *time* since the last one is whether it
@@ -523,6 +534,7 @@ impl Looper {
         let stats: &'static LooperStats = Box::leak(Box::new(LooperStats {
             tid,
             registered: AtomicUsize::new(0),
+            registered_detail: Mutex::new(String::new()),
             polls: AtomicU64::new(0),
             events: AtomicU64::new(0),
             wakes: AtomicU64::new(0),
@@ -1380,6 +1392,13 @@ fn watch_input_fd(fd: c_int) -> bool {
             data: std::ptr::null_mut(),
         });
         l.stats.registered.store(regs.len(), Ordering::Relaxed);
+        *l.stats.registered_detail.lock().unwrap_or_else(|e| e.into_inner()) = regs
+            .iter()
+            .map(|r| {
+                format!("{}:{}:{}", r.fd, r.ident, if r.callback.is_some() { "cb" } else { "-" })
+            })
+            .collect::<Vec<_>>()
+            .join(",");
     }
     true
 }
@@ -1477,6 +1496,13 @@ extern "C" fn looper_add_fd(
             data,
         });
         l.stats.registered.store(regs.len(), Ordering::Relaxed);
+        *l.stats.registered_detail.lock().unwrap_or_else(|e| e.into_inner()) = regs
+            .iter()
+            .map(|r| {
+                format!("{}:{}:{}", r.fd, r.ident, if r.callback.is_some() { "cb" } else { "-" })
+            })
+            .collect::<Vec<_>>()
+            .join(",");
     }
     1
 }

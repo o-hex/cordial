@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roblox on Linux compared: Cordial, Sober, mocktail and Waydroid</title>
+<meta name="description" content="An honest comparison of the ways to run Roblox on Linux in 2026 — Cordial, Sober, mocktail and Waydroid — written by Cordial's maintainers, including where the others are better.">
+<link rel="canonical" href="https://luohoa97.github.io/cordial/compare.html">
+<meta property="og:title" content="Roblox on Linux compared: Cordial, Sober, mocktail and Waydroid">
+<meta property="og:description" content="Which Roblox client for Linux should you use? An honest comparison, including where Cordial loses.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://luohoa97.github.io/cordial/compare.html">
+<meta name="twitter:card" content="summary">
+<link rel="icon" href="favicon.svg">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "What is the best way to run Roblox on Linux?",
+      "acceptedAnswer": { "@type": "Answer", "text": "For most people today, Sober or mocktail: both install in one command and need no manual setup. Cordial is worth choosing if you want a GPL-3.0 client you can read and extend, plugins, or two accounts side by side. Waydroid runs Roblox inside a full Android container and is the heaviest option." }
+    },
+    {
+      "@type": "Question",
+      "name": "Is Sober open source?",
+      "acceptedAnswer": { "@type": "Answer", "text": "No. Sober is free to use and widely recommended, but it is not source-available, so it cannot be audited or forked. Cordial and mocktail are both open source." }
+    },
+    {
+      "@type": "Question",
+      "name": "Does Roblox on Linux need Wine or an emulator?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Not any more. Cordial, Sober and mocktail all load Roblox's official Android build natively on Linux, with no Wine, no emulator and no Android container. Waydroid is the exception: it runs a full Android container." }
+    }
+  ]
+}
+</script>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1b1b1f; --muted: #5c5c66; --line: #e3e3e6;
+    --accent: #3584e4; --card: #f7f7f9; --ok: #2ec27e; --part: #e5a50a; --no: #c01c28;
+  }
+  :root:not([data-theme="light"]) { }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1b1b1f; --fg: #f2f2f4; --muted: #9a9aa2; --line: #35353a;
+      --accent: #78aeed; --card: #242429;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #1b1b1f; --fg: #f2f2f4; --muted: #9a9aa2; --line: #35353a;
+    --accent: #78aeed; --card: #242429;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 system-ui, -apple-system, "Cantarell", "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 46rem; margin: 0 auto; padding: 0 1.25rem; }
+  header { text-align: center; padding: 5rem 0 3.5rem; }
+  header img { width: 96px; height: 96px; }
+  h1 { font-size: 2.6rem; margin: 1rem 0 .4rem; letter-spacing: -0.02em; }
+  .tag { font-size: 1.2rem; color: var(--muted); margin: 0 0 2rem; }
+  .cta {
+    display: inline-block; background: var(--accent); color: #fff; text-decoration: none;
+    padding: .8rem 1.6rem; border-radius: 999px; font-weight: 600;
+  }
+  .cta:hover { filter: brightness(1.08); }
+  .under { display: block; margin-top: .75rem; font-size: .9rem; color: var(--muted); }
+  h2 { font-size: 1.35rem; margin: 3rem 0 1rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 1.1rem 1.3rem; }
+  .card + .card { margin-top: .7rem; }
+  .card h3 { margin: 0 0 .3rem; font-size: 1rem; }
+  .card p { margin: 0; color: var(--muted); font-size: .95rem; }
+  code {
+    background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+    padding: .15rem .4rem; font-size: .9em;
+  }
+  pre {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 1rem; overflow-x: auto;
+  }
+  pre code { border: 0; padding: 0; background: none; }
+  table { width: 100%; border-collapse: collapse; font-size: .95rem; }
+  td { padding: .55rem .4rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td:first-child { width: 1.6rem; }
+  .n { color: var(--muted); }
+  footer {
+    margin: 4rem 0 3rem; padding-top: 1.5rem; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: .9rem; text-align: center;
+  }
+  footer a { color: var(--accent); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<p><a href="./">&larr; Cordial</a></p>
+
+<h1>Roblox on Linux, compared</h1>
+
+<p class="under">Written by Cordial's maintainers, in August 2026. It says where
+the alternatives are better than Cordial, because a comparison that does not is
+worth nothing to the person reading it and everybody can tell.</p>
+
+<h2>The short answer</h2>
+
+<div class="card">
+<p><strong>If you just want to play today:</strong> <a href="https://sober.vinegarhq.org/">Sober</a>
+or <a href="https://github.com/komaruworld/mocktail">mocktail</a>. Both install in one
+command and neither asks you to supply anything.</p>
+<p><strong>If you want a client you can read, audit and extend:</strong> Cordial or
+mocktail. Sober is not source-available.</p>
+<p><strong>If you want plugins, or two accounts open at once:</strong> Cordial. Nothing
+else has either.</p>
+<p><strong>If you need voice chat or a controller:</strong> mocktail. Cordial has
+neither yet.</p>
+</div>
+
+<h2>What each one actually is</h2>
+
+<p><strong>Sober</strong> is the incumbent, from VinegarHQ, and the reason most
+people can play Roblox on Linux at all. It loads Roblox's official Android build
+natively. It is free to use and it is <em>not</em> source-available, so you
+cannot read it, audit it, or fix it yourself.</p>
+
+<p><strong>mocktail</strong> is Apache-2.0 and open source, and does the same
+trick in C++. It is on Flathub, in the AUR, and in DNF and APT repositories. It
+has shipped voice chat, controller input, audio device selection, and an update
+system that launches a new Roblox build twice in isolation before trusting it.</p>
+
+<p><strong>Cordial</strong> is GPL-3.0, Rust over a C++ runtime, and the same
+native approach. It is the only one with a plugin system, and the only one that
+runs two accounts side by side in separate profiles.</p>
+
+<p><strong>Waydroid</strong> is not a Roblox client. It is a full Android
+container, and Roblox is one app you can run inside it. Heavier, more moving
+parts, and the general-purpose answer rather than the specific one.</p>
+
+<h2>Where Cordial is behind, specifically</h2>
+
+<div class="card">
+<p><strong>Installing it is harder.</strong> Sober and mocktail are one command
+from Flathub. Cordial needs a Flatpak remote that is <em>not signed</em>, and you
+have to supply Roblox's Android build yourself — usually by installing Sober and
+letting Cordial read the APK Sober downloaded.</p>
+<p><strong>No voice chat, and no controller support.</strong> mocktail has both.</p>
+<p><strong>A startup freeze on roughly a third of launches</strong>, measured
+over eighty runs rather than estimated. The client reaches the home page,
+presents a frame or two and stops; relaunching is the only remedy today. It is
+the top open bug and it is written up in full.</p>
+<p><strong>Fewer people.</strong> mocktail has had nine contributors this month
+and a public issue tracker with real users in it. Cordial is mostly one person.</p>
+</div>
+
+<h2>Where Cordial is ahead, specifically</h2>
+
+<div class="card">
+<p><strong>Typing in Roblox text boxes works.</strong> The engine deliberately
+stops drawing a focused text box's contents and expects the platform to draw
+them — that is what Android's own <code>EditText</code> does. Cordial places a
+real GTK text field on the box, and covers it with a thirty-six assertion
+end-to-end test that drives real keystrokes. mocktail's equivalent is open as
+issue #68, and Sober's has been open since 2025.</p>
+<p><strong>Plugins, with capability grants per profile.</strong> A plugin is
+given effects rather than channels — it can ask Cordial to set your Discord
+presence; it never gets the socket.</p>
+<p><strong>Two accounts at once</strong>, in separate profiles with separate
+storage, settings and plugin permissions.</p>
+<p><strong>It does not lie to the engine.</strong> When Cordial cannot answer
+something Roblox asks for, it reports failure rather than a plausible-looking
+success, and prints a per-run list of everything that went unanswered. A stub
+that returns success sends the engine off to fail somewhere unrelated.</p>
+<p><strong>It writes down what it got wrong.</strong> The handover document
+keeps its retractions instead of editing them away — including measurements that
+looked conclusive and did not replicate.</p>
+</div>
+
+<h2>Honest summary</h2>
+
+<p>These projects are ahead of each other on different axes.
+<strong>mocktail is ahead on everything a user touches</strong> — installing it,
+feature breadth, the number of people working on it.
+<strong>Cordial is ahead on everything a maintainer touches</strong> — the
+fidelity of the platform layer, the refusal to fake an answer, the
+instrumentation, and the written record of what was believed and then
+disproved.</p>
+
+<p>If you are choosing what to run this evening, that probably favours mocktail
+or Sober. If you are choosing something to build on, read both and pick the one
+whose code you would rather be inside.</p>
+
+<p class="under">Corrections welcome — if something here is out of date or
+unfair to another project, <a href="https://github.com/luohoa97/cordial/issues">open an
+issue</a> and it will be fixed. That includes the projects being compared.</p>
+
+<p><a class="cta" href="./">Cordial &rarr;</a></p>
+
+</div>
+</body>
+</html>

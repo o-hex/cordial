@@ -1026,7 +1026,64 @@ It is not failing to open the database. It never tries. So the question is not
 next instrument is a traced run read forward from `initStorageManagerNativeV3`
 rather than another candidate native.
 
-## Voice: the shim Cordial has is for a path this engine does not drive
+## Voice: RETRACTED — it can be written, and the evidence against it was the wrong table
+
+**Everything below this paragraph, until the `AppRtcDeviceWrapper` section, is
+wrong.** Retracted 2026-08-26, kept rather than deleted because the mistake is
+more instructive than the correction.
+
+The argument was: `nativeGetPlayoutData` and `nativeCacheDirectBufferAddress` do
+not appear among `libroblox.so`'s exports, therefore nothing is behind
+`WebRtcAudioTrack`, therefore writing it produces a class with nothing on the
+other side. Every step of that is sound except the first, and the first is a
+category error: **`docs/analysis/jni-natives.tsv` is an exported-symbol table,
+built with `nm -D`, and these natives are not exported. They are registered at
+run time through `RegisterNatives`.**
+
+The tell was in the evidence and was read as proof of the opposite. The one
+WebRTC symbol that *is* exported is
+`Java_com_roblox_universalapp_webrtc_WebRtcLoader_initialize` — **a loader**.
+Registering natives is what a loader does.
+
+Three things confirm it, and all three were already in this repository:
+
+- `native/game_activity.cpp` records the identical pattern and depends on it:
+  `terminateNativeCode` "is not exported the way `initializeNativeCode` is —
+  `nm -D` on the shipping `libroblox.so` shows only
+  `Java_com_google_androidgamesdk_GameActivity_initializeNativeCode` among its
+  defined symbols. It is one of the 24 natives AGDK registers dynamically
+  through `RegisterNatives`". Cordial looks those up by name in `cls->natives`
+  and has done for months.
+- `third_party/libjnivm/src/jnivm/vm.cpp`'s `RegisterNatives` stores exactly
+  that: `clazz->natives[method->name] = method->fnPtr`. The pointers are kept
+  and are reachable by the same lookup AGDK's use.
+- `docs/analysis/observed-java-surface.md` lists
+  `org/webrtc/voiceengine/WebRtcAudioTrack` among the classes the engine
+  **reaches for at run time** — not merely among the classes the dex declares.
+  A class the engine touches is not a class bundled by accident.
+
+So the downlink half is writable, `WebRtcAudioManager.init()` returns false
+because of its absence rather than because the path is dead, and the seven-
+eighths of this Cordial already has — a real `CaptureStream` with the microphone
+lifetime rule, the whole of `WebRtcAudioManager`, the honest parameter answers,
+and the `OutputStream` seam added in `b2837e7` — stops being groundwork for a
+dead path.
+
+**This is the failure the top of AGENTS.md is about**, committed with a table
+rather than a disassembler: nine consecutive conclusions drawn from reading the
+stripped binary were wrong, and this is the tenth. The rule generalises further
+than it is written — *an absence in a table only means what the table indexes*.
+
+**The next step is a measurement and not a feature.** Trace `RegisterNatives`
+for `org/webrtc/voiceengine/*` on a run that reaches a voice-enabled experience
+and print every name and signature registered on `WebRtcAudioRecord` and
+`WebRtcAudioTrack`. Seeing `nativeDataIsRecorded (IJ)V` and
+`nativeGetPlayoutData (IJ)V` in that log settles it in one run, and either
+confirms this retraction or retracts the retraction.
+
+---
+
+*The original section follows, wrong, for the record.*
 
 `org.webrtc.voiceengine.WebRtcAudioManager`/`WebRtcAudioRecord` are implemented
 here, and the downlink half (`WebRtcAudioTrack`) was the recorded next step. **It

@@ -362,7 +362,9 @@ dependencies = [
 name = "cordial-update"
 version = "0.6.0"
 dependencies = [
+ "http",
  "pulldown-cmark",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",

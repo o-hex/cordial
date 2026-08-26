@@ -73,7 +73,9 @@ pub mod download;
 pub mod engine;
 pub mod install;
 pub mod metered;
+pub mod provider;
 pub mod settings;
+pub mod url_policy;
 pub mod version;
 
 /// Public so the probe can ask a URL this crate deliberately does *not* fetch
@@ -105,11 +107,16 @@ pub enum Unreachable {
     /// changed is Roblox having moved something, which is the failure ADR-015
     /// says must not present as "no update available".
     Malformed { url: String, why: String },
+    /// There was nothing to reach. A source that needs no network still fails
+    /// -- the local build is simply absent -- and folding that into a transport
+    /// error would put a URL in a message about a missing file.
+    NoSource { why: String },
 }
 
 impl std::fmt::Display for Unreachable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Unreachable::NoSource { why } => write!(f, "{why}"),
             Unreachable::Transport { url, why } => write!(f, "could not reach {url}: {why}"),
             Unreachable::Status { url, status, body } => {
                 let body = body.trim();

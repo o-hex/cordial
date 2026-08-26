@@ -1,0 +1,644 @@
+//! Fetching the build from APKPure, a mirror that is not Roblox.
+//!
+//! [ADR-025](../../../docs/adr/ADR-025-fetching-from-a-third-party-mirror.md)
+//! is the decision and it turns on one sentence:
+//! [`crate::apk_signature`] verifies that Roblox's own signing certificate
+//! signed these exact bytes, so a mirror cannot alter the file it serves
+//! without the alteration being caught. That check is not a formality bolted on
+//! afterwards -- **it is the entire reason this file is allowed to exist**, and
+//! a caller that fetches through here and skips it has not saved a step, it has
+//! removed the only thing that made the source acceptable.
+//!
+//! What the check does not cover is worth naming, because it is what the user
+//! is actually deciding about when they choose this source. A mirror can be
+//! down. A mirror can decline to serve a version, or serve an older one while
+//! claiming it is current -- **nothing here verifies the version list**, only
+//! the archives. And a mirror sees who asked and when. Those are the terms, and
+//! they are why [`super::local`] is tried first and why this is not the default
+//! on a metered connection.
+//!
+//! ## The protocol has no specification, and this is a reader for it
+//!
+//! The endpoint answers with a length-delimited binary encoding that is
+//! protocol-buffer-shaped and has no published schema, no `.proto`, and no
+//! promise of stability. There is no way to parse it correctly in the sense
+//! that word usually means; what there is, is a set of byte patterns that hold
+//! on the responses this has been measured against. That makes the reader below
+//! **a maintenance surface**, and the only thing that makes a maintenance
+//! surface maintainable is a record of what it looked like when it worked.
+//!
+//! Measured on 2026-08-26 from this machine, `x-abis: x86_64`:
+//!
+//! ```text
+//! HTTP/2 200, 99 073 bytes
+//! 15 version markers, newest first
+//! newest              2.734.917, version code 2908
+//! its download        https://download.pureapk.com/b/APK/...  (a single APK)
+//! second marker       2.734.916, code 2904
+//! ```
+//!
+//! The engine already installed on that machine reads `2.734.0.917`, which is
+//! the same build from a source that shares no code with this one. That
+//! agreement is the control: a reader that mis-parsed the response would have
+//! to mis-parse it into the right answer to pass it.
+//!
+//! ## The download, measured the same day
+//!
+//! `cargo run --release -p cordial-update --example fetch_probe -- --download`:
+//!
+//! ```text
+//! candidate-0.apk   229 140 095 bytes, one monolithic APK
+//! contents          3578 entries, 1835 under assets/,
+//!                   lib/{arm64-v8a,armeabi-v7a,x86_64}/libroblox.so
+//! verified          44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477
+//! ```
+//!
+//! **That fingerprint is the same one the archive Sober downloaded from Google
+//! Play carries**, and the two files are not the same file: 229 MB of every
+//! ABI against 97 MB of assets plus a 53 MB x86-64 split. Two distribution
+//! routes that share nothing, one signing certificate, and this verifier saying
+//! so about both.
+//!
+//! That is the strongest statement available about whether the mirror is
+//! serving Roblox's build, and it is the measurement to repeat when anyone asks
+//! whether this source is safe. It is also, precisely, the thing ADR-025 said
+//! had to be true.
+//!
+//! ## Three field tags do all the work
+//!
+//! Naming them makes the scan below legible rather than magical.
+//!
+//! | Byte | Protobuf meaning |
+//! |---|---|
+//! | `0x2a` | field 5, length-delimited -- the version code, ASCII decimal |
+//! | `0x32` | field 6 -- the version name, ASCII |
+//! | `0x3a` | field 7 -- whatever follows the name; its tag is the ASCII colon the scan anchors on |
+//! | `0x4a` | field 9 -- a download URL |
+//!
+//! Lengths are single-byte varints except in the URLs, which is why every
+//! length check here is against a value under 128 and the URL length is two
+//! bytes.
+//!
+//! ## Nothing downstream trusts this about architecture
+//!
+//! The ABI filter is a hint to the service and not a fact about what arrives.
+//! The archive is opened and `lib/x86_64/libroblox.so` is looked for directly,
+//! which is why the broad-filter retry is safe: widening it buys availability
+//! and cannot buy a wrong answer.
+
+use super::{Archives, Available, Progress, Provider};
+use crate::url_policy::{self, Purpose};
+use crate::Unreachable;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const METADATA: &str =
+    "https://api.pureapk.com/m/v3/cms/app_version?hl=en-US&package_name=com.roblox.client";
+
+/// The APKPure client version code the service keys its response shape on.
+///
+/// **This is the constant most likely to age out.** When the reader below stops
+/// finding markers in a response that is otherwise a healthy 200, this is the
+/// first thing to look at.
+const X_CV: &str = "3172501";
+/// Android 10, the SDK level claimed. Bounds which builds are offered.
+const X_SV: &str = "29";
+/// An opaque flag the client sends. It must be present; its meaning is not
+/// known here and guessing at one would be worse than saying so.
+const X_GP: &str = "1";
+
+/// What Cordial can run.
+const ABI_EXACT: &str = "x86_64";
+/// Every ABI, for the retry. The filtered index is not reliably complete for
+/// older versions -- APKPure sometimes omits a bundle that does contain the
+/// x86-64 split -- so a download that cannot find its version in the narrow
+/// list asks again without one.
+const ABI_BROAD: &str = "arm64-v8a,armeabi-v7a,armeabi,x86,x86_64";
+
+/// Metadata is small. Anything larger than this is not a version list, and
+/// reading it into memory would be this fetcher's own denial of service.
+const MAX_METADATA: u64 = 4 * 1024 * 1024;
+/// One archive. Roblox's is about 150 MB across two files; a gigabyte is
+/// generous and still bounded.
+const MAX_ARCHIVE: u64 = 1024 * 1024 * 1024;
+
+/// More than this many candidate archives for one version means the response
+/// was not understood, and downloading them all to find out would cost
+/// gigabytes to answer a question the first one usually answers.
+const MAX_CANDIDATES: usize = 4;
+
+const CONNECT: Duration = Duration::from_secs(10);
+const METADATA_TRANSFER: Duration = Duration::from_secs(60);
+const ARCHIVE_TRANSFER: Duration = Duration::from_secs(900);
+
+#[derive(Debug, Default)]
+pub struct ApkPure;
+
+/// Bytes that may appear in a version name.
+fn version_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'_' | b'-')
+}
+
+/// Bytes that may appear in a URL, per the shape these URLs actually take.
+fn url_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"-@:%._+~#=?&/()".contains(&b)
+}
+
+/// Where a version name sits in the response.
+#[derive(Debug, Clone)]
+struct Marker {
+    start: usize,
+    /// The offset of the `0x3a` that terminates the name.
+    colon: usize,
+    name: String,
+}
+
+/// Every version name in the response, in file order.
+///
+/// A marker is a byte run that begins with a digit, is not preceded by another
+/// name byte -- so a name is not found inside a longer token -- contains a dot,
+/// and is immediately followed by `0x3a`. The four conditions together are what
+/// separates a version from every other run of digits in a 99 KB binary blob.
+fn markers(d: &[u8]) -> Vec<Marker> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < d.len() {
+        if d[i].is_ascii_digit() && (i == 0 || !version_byte(d[i - 1])) {
+            let mut j = i;
+            while j < d.len() && version_byte(d[j]) {
+                j += 1;
+            }
+            let run = &d[i..j];
+            if run.contains(&b'.') && j < d.len() && d[j] == 0x3a {
+                if let Ok(name) = std::str::from_utf8(run) {
+                    out.push(Marker { start: i, colon: j, name: name.to_string() });
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The version code belonging to `marker`, recovered by scanning backwards.
+///
+/// The code sits in the field immediately before the name, and the five
+/// conditions below are what make "immediately" checkable rather than assumed:
+/// the last of them requires the name field's value to begin exactly where the
+/// marker begins, with nothing in between. Without it this would happily attach
+/// the code of one record to the name of another.
+fn code_before(d: &[u8], marker: &Marker) -> Option<u64> {
+    let name_len = marker.colon - marker.start;
+    if name_len > u8::MAX as usize {
+        return None;
+    }
+    let floor = marker.start.saturating_sub(128);
+    for p in (floor..marker.start).rev() {
+        if d[p] != 0x2a {
+            continue;
+        }
+        let len = *d.get(p + 1)? as usize;
+        if !(1..=20).contains(&len) {
+            continue;
+        }
+        let digits = d.get(p + 2..p + 2 + len)?;
+        if !digits.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        if *d.get(p + 2 + len)? != 0x32 {
+            continue;
+        }
+        if *d.get(p + 3 + len)? as usize != name_len {
+            continue;
+        }
+        if p + 4 + len != marker.start {
+            continue;
+        }
+        let mut code: u64 = 0;
+        for b in digits {
+            code = code.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+        }
+        return (code != 0).then_some(code);
+    }
+    None
+}
+
+/// The download URLs inside one record.
+///
+/// `APKJ` and `XAPKJ` are the artefact kind followed by the `0x4a` tag; the URL
+/// starts two bytes later because the length is a two-byte varint, these URLs
+/// being well over 127 bytes.
+fn urls_in(record: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at + 4 <= record.len() {
+        let Some(found) = record[at..].windows(4).position(|w| w == b"APKJ") else { break };
+        let x = at + found;
+        let begin = x + 4 + 2;
+        let mut j = begin;
+        while j < record.len() && url_byte(record[j]) {
+            j += 1;
+        }
+        if let Ok(url) = std::str::from_utf8(&record[begin..j]) {
+            if url.starts_with("https://") {
+                out.push(url.to_string());
+            }
+        }
+        at = x + 4;
+    }
+    out
+}
+
+/// Ask the service for the version list, with `abi` as the filter.
+fn metadata(abi: &str) -> Result<Vec<u8>, Unreachable> {
+    let agent = url_policy::agent(CONNECT, METADATA_TRANSFER);
+    let headers =
+        [("x-cv", X_CV), ("x-sv", X_SV), ("x-gp", X_GP), ("x-abis", abi)];
+    let (url, mut response) = url_policy::walk(&agent, METADATA, Purpose::Metadata, &headers)?;
+
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(64 * 1024)
+            .read_to_string()
+            .unwrap_or_default();
+        return Err(Unreachable::Status { url, status, body });
+    }
+
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(MAX_METADATA)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Unreachable::Transport { url: url.clone(), why: e.to_string() })?;
+    if bytes.len() as u64 >= MAX_METADATA {
+        return Err(Unreachable::Malformed {
+            url,
+            why: "the version list exceeds its size limit, so it is not a version list".into(),
+        });
+    }
+    Ok(bytes)
+}
+
+/// The download URLs the response offers for exactly `version`.
+fn downloads_for(d: &[u8], version: &str) -> Vec<String> {
+    let marks = markers(d);
+    let mut out: Vec<String> = Vec::new();
+    for (i, m) in marks.iter().enumerate() {
+        if m.name != version {
+            continue;
+        }
+        let end = marks.get(i + 1).map(|n| n.start).unwrap_or(d.len());
+        // One URL per record: the first is the artefact, the rest are the same
+        // file behind other names.
+        if let Some(url) = urls_in(&d[m.colon + 1..end]).into_iter().next() {
+            if !out.contains(&url) {
+                out.push(url);
+            }
+        }
+    }
+    out
+}
+
+/// Stream one URL to `dest`, enforcing the ceiling on bytes that arrive.
+///
+/// **The ceiling is applied to what arrives, not to `Content-Length`.** A
+/// declared length is a claim by the same party supplying the bytes; checking
+/// it is a cheap early refusal and must never be the only check.
+fn download(
+    url: &str,
+    dest: &Path,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<(), Unreachable> {
+    let agent = url_policy::agent(CONNECT, ARCHIVE_TRANSFER);
+    let (final_url, mut response) = url_policy::walk(&agent, url, Purpose::Download, &[])?;
+
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(Unreachable::Status { url: final_url, status, body: String::new() });
+    }
+
+    let total = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(t) = total {
+        if t > MAX_ARCHIVE {
+            return Err(Unreachable::Malformed {
+                url: final_url,
+                why: format!("the archive declares {t} bytes, which exceeds its size limit"),
+            });
+        }
+    }
+
+    let name = dest.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let temporary = dest.with_extension("partial");
+    let outcome = (|| -> Result<(), Unreachable> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)
+            .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+
+        let mut reader = response.body_mut().as_reader();
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut done: u64 = 0;
+        let mut announced: u64 = 0;
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| Unreachable::Transport { url: final_url.clone(), why: e.to_string() })?;
+            if n == 0 {
+                break;
+            }
+            done += n as u64;
+            if done > MAX_ARCHIVE {
+                return Err(Unreachable::Malformed {
+                    url: final_url.clone(),
+                    why: "the archive exceeds its size limit".into(),
+                });
+            }
+            file.write_all(&buf[..n])
+                .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+            if done - announced >= 64 * 1024 * 1024 {
+                announced = done;
+                progress(Progress::Fetching { file: name.clone(), done, total });
+            }
+        }
+        if done == 0 {
+            return Err(Unreachable::Malformed {
+                url: final_url.clone(),
+                why: "the download is empty".into(),
+            });
+        }
+        file.sync_all().map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+        drop(file);
+
+        // A ZIP local header, checked before anything downstream opens it. An
+        // HTML error page served with a 200 is caught here rather than three
+        // steps later inside a zip reader, where it reads as a corrupt archive.
+        let mut head = [0u8; 4];
+        let mut f = std::fs::File::open(&temporary)
+            .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+        f.read_exact(&mut head).map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+        if head[0] != b'P'
+            || head[1] != b'K'
+            || !matches!(head[2], 0x03 | 0x05 | 0x07)
+            || !matches!(head[3], 0x04 | 0x06 | 0x08)
+        {
+            return Err(Unreachable::Malformed {
+                url: final_url.clone(),
+                why: "what arrived is not a ZIP archive, so it is not an APK".into(),
+            });
+        }
+
+        std::fs::rename(&temporary, dest)
+            .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+        progress(Progress::Fetching { file: name.clone(), done, total });
+        Ok(())
+    })();
+
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    outcome
+}
+
+impl Provider for ApkPure {
+    fn name(&self) -> &'static str {
+        "apkpure"
+    }
+
+    fn needs_network(&self) -> bool {
+        true
+    }
+
+    /// **No retry on the broad filter here, deliberately.** Asking what the
+    /// newest version is must be asked about builds Cordial can run; widening
+    /// the filter would let an ARM-only release become "the newest version",
+    /// and every step after this would then be working towards a build that
+    /// cannot start.
+    fn newest(&self, progress: &mut dyn FnMut(Progress)) -> Result<Available, Unreachable> {
+        progress(Progress::Asking { provider: self.name() });
+        let body = metadata(ABI_EXACT)?;
+        let marks = markers(&body);
+        let first = marks.first().ok_or_else(|| Unreachable::Malformed {
+            url: METADATA.into(),
+            why: "the version list carries no versions, so its shape has changed".into(),
+        })?;
+        let code = code_before(&body, first).ok_or_else(|| Unreachable::Malformed {
+            url: METADATA.into(),
+            why: format!(
+                "the version list names {} and carries no version code for it, so its shape \
+                 has changed",
+                first.name
+            ),
+        })?;
+        Ok(Available { name: first.name.clone(), code })
+    }
+
+    fn fetch(
+        &self,
+        version: &Available,
+        into: &Path,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Archives, Unreachable> {
+        if into.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
+            return Err(Unreachable::NoSource {
+                why: format!(
+                    "{} already holds files, and a download writes into an empty directory \
+                     so a previous attempt's leftovers cannot be mistaken for this one's",
+                    into.display()
+                ),
+            });
+        }
+
+        // The narrow filter, then the broad one. See ABI_BROAD: this buys
+        // availability for older versions and cannot buy a wrong answer,
+        // because what arrives is opened and checked for the engine.
+        let mut urls = downloads_for(&metadata(ABI_EXACT)?, &version.name);
+        if urls.is_empty() {
+            urls = downloads_for(&metadata(ABI_BROAD)?, &version.name);
+        }
+        if urls.is_empty() {
+            return Err(Unreachable::Malformed {
+                url: METADATA.into(),
+                why: format!(
+                    "the mirror does not offer version {}. It is reachable and it does not \
+                     have that build.",
+                    version.name
+                ),
+            });
+        }
+        if urls.len() > MAX_CANDIDATES {
+            return Err(Unreachable::Malformed {
+                url: METADATA.into(),
+                why: format!(
+                    "the mirror offers {} different archives for version {}, which is more \
+                     than Cordial will try",
+                    urls.len(),
+                    version.name
+                ),
+            });
+        }
+        for url in &urls {
+            url_policy::check(url, Purpose::Download)?;
+        }
+
+        let mut landed: Vec<PathBuf> = Vec::new();
+        let result = (|| -> Result<(), Unreachable> {
+            for (i, url) in urls.iter().enumerate() {
+                let dest = into.join(format!("candidate-{i}.apk"));
+                download(url, &dest, progress)?;
+                landed.push(dest);
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            // No partial candidate set. There is no such thing as most of a
+            // build, and leftovers a later run mistakes for a complete download
+            // are how assets from one release end up beside an engine from
+            // another.
+            for p in &landed {
+                let _ = std::fs::remove_file(p);
+            }
+            return Err(e);
+        }
+
+        classify(&landed).ok_or_else(|| Unreachable::Malformed {
+            url: METADATA.into(),
+            why: format!(
+                "the mirror served {} archive(s) for version {} and none of them carries \
+                 lib/x86_64/libroblox.so, so there is no engine in what arrived",
+                landed.len(),
+                version.name
+            ),
+        })
+    }
+}
+
+/// Which of the downloaded archives is the base and which holds the engine.
+///
+/// This reads the archives rather than their names, because the names came from
+/// the mirror. A monolithic APK holding both is reported as both, which is what
+/// [`Archives`] is for.
+fn classify(files: &[PathBuf]) -> Option<Archives> {
+    let mut engine: Option<PathBuf> = None;
+    let mut assets: Option<PathBuf> = None;
+    for f in files {
+        let Ok(file) = std::fs::File::open(f) else { continue };
+        let Ok(mut zip) = zip::ZipArchive::new(std::io::BufReader::new(file)) else { continue };
+        if engine.is_none() && zip.by_name("lib/x86_64/libroblox.so").is_ok() {
+            engine = Some(f.clone());
+        }
+        if assets.is_none() && (0..zip.len()).any(|i| {
+            zip.by_index(i).map(|e| e.name().starts_with("assets/")).unwrap_or(false)
+        }) {
+            assets = Some(f.clone());
+        }
+    }
+    let engine = engine?;
+    Some(Archives { base: assets.unwrap_or_else(|| engine.clone()), split: engine })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A response captured from the live service. Absent unless somebody has
+    /// run the probe, so the tests that need it skip rather than fake: a
+    /// synthetic blob written by this file would only prove the reader agrees
+    /// with itself.
+    fn captured() -> Option<Vec<u8>> {
+        let p = std::env::var_os("CORDIAL_APKPURE_FIXTURE")?;
+        std::fs::read(p).ok()
+    }
+
+    #[test]
+    fn a_run_of_digits_with_no_dot_is_not_a_version() {
+        assert!(markers(b"\x00123456\x3a\x00").is_empty());
+    }
+
+    #[test]
+    fn a_version_inside_a_longer_token_is_not_a_marker() {
+        // Preceded by a name byte, so it is part of something else.
+        assert!(markers(b"build9.9.9\x3a").is_empty());
+        assert_eq!(markers(b"\x009.9.9\x3a")[0].name, "9.9.9");
+    }
+
+    #[test]
+    fn a_version_not_terminated_by_the_colon_tag_is_not_a_marker() {
+        assert!(markers(b"\x009.9.9\x40").is_empty());
+    }
+
+    /// **The condition that stops a code being attached to the wrong name.**
+    /// Everything else about the backward scan can hold while the two fields
+    /// belong to different records; only adjacency rules that out.
+    #[test]
+    fn a_version_code_separated_from_its_name_is_not_accepted() {
+        let mut d = Vec::new();
+        d.push(0x2a);
+        d.push(4);
+        d.extend_from_slice(b"2908");
+        d.push(0x32);
+        d.push(5);
+        d.extend_from_slice(&[0, 0, 0, 0]); // something between, so not adjacent
+        d.extend_from_slice(b"1.2.3");
+        d.push(0x3a);
+        let m = markers(&d);
+        assert_eq!(m.len(), 1);
+        assert_eq!(code_before(&d, &m[0]), None);
+    }
+
+    #[test]
+    fn a_well_formed_record_yields_its_code() {
+        let mut d = vec![0u8];
+        d.push(0x2a);
+        d.push(4);
+        d.extend_from_slice(b"2908");
+        d.push(0x32);
+        d.push(5);
+        d.extend_from_slice(b"1.2.3");
+        d.push(0x3a);
+        let m = markers(&d);
+        assert_eq!(m[0].name, "1.2.3");
+        assert_eq!(code_before(&d, &m[0]), Some(2908));
+    }
+
+    #[test]
+    fn a_url_that_is_not_https_is_not_taken_from_a_record() {
+        let mut r = b"XAPKJ".to_vec();
+        r.extend_from_slice(&[0x00, 0x00]);
+        r.extend_from_slice(b"http://evil.example/x.apk");
+        assert!(urls_in(&r).is_empty());
+    }
+
+    /// The reader against a real response, if one has been captured. This is
+    /// the only test here that says anything about the actual service.
+    #[test]
+    fn the_captured_response_reads_the_way_the_module_header_records() {
+        let Some(d) = captured() else {
+            eprintln!("skipped: no captured response (set CORDIAL_APKPURE_FIXTURE)");
+            return;
+        };
+        let marks = markers(&d);
+        assert!(marks.len() > 3, "expected several versions, found {}", marks.len());
+        let code = code_before(&d, &marks[0]).expect("the newest version must have a code");
+        assert!(code > 0);
+        let urls = downloads_for(&d, &marks[0].name);
+        assert!(!urls.is_empty(), "the newest version must offer a download");
+        for u in &urls {
+            url_policy::check(u, Purpose::Download)
+                .unwrap_or_else(|e| panic!("a real download URL must pass the allow-list: {e}"));
+        }
+        eprintln!("captured: {} at code {code}, {} download(s)", marks[0].name, urls.len());
+    }
+}

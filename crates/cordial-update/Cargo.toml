@@ -11,6 +11,11 @@ publish = false
 # settings CDN, so this adds an edge to an already-resolved dependency rather
 # than a second HTTP stack with a second TLS story.
 ureq = "3.3.0"
+# A real URL parser, for the allow-list in `url_policy`. Already in the tree as
+# ureq's own dependency, so this makes a direct user of a crate that is present
+# rather than adding one. String matching is not an option there: the host of
+# `https://api.pureapk.com@evil.example/` is `evil.example`.
+http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Streaming, because the thing being hashed is an APK rather than a plugin

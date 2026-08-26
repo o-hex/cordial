@@ -603,6 +603,69 @@ pub fn verify(path: &Path) -> Result<Signer, Refusal> {
     Ok(Signer { certificate_sha256: hex(&fingerprint) })
 }
 
+/// The certificates Cordial accepts Roblox builds from.
+///
+/// Compiled in from `packaging/trust/roblox-signing-certificates.json` so a
+/// shipped binary carries its own trust and does not depend on a file being
+/// installed beside it. The file is in the repository rather than a constant in
+/// this source so a person can read it, diff it and audit it -- see its own
+/// header for why adding a digest is a decision rather than a chore.
+///
+/// `CORDIAL_TRUSTED_CERTIFICATES` names a file to use instead. That exists for
+/// auditing and for the case where Roblox rotates its key and somebody needs
+/// their client working before a Cordial release can carry the new digest.
+/// **It can only be set by whoever is already running Cordial as this user**,
+/// who could replace the binary anyway, so it widens no boundary that was not
+/// already open.
+///
+/// An unreadable or empty list yields an empty set, and
+/// [`verify_signed_by`] refuses everything against an empty set. That is the
+/// correct direction to fail: trusting nothing stops a download, and trusting
+/// everything installs whatever a mirror felt like serving.
+pub fn pinned() -> Vec<String> {
+    const BUILT_IN: &str =
+        include_str!("../../../packaging/trust/roblox-signing-certificates.json");
+
+    let owned;
+    let text = match std::env::var_os("CORDIAL_TRUSTED_CERTIFICATES") {
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(t) => {
+                owned = t;
+                owned.as_str()
+            }
+            Err(e) => {
+                eprintln!(
+                    "cordial: could not read the certificate list at {}: {e}",
+                    Path::new(&path).display()
+                );
+                return Vec::new();
+            }
+        },
+        None => BUILT_IN,
+    };
+
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) else {
+        eprintln!("cordial: the trusted-certificate list is not valid JSON");
+        return Vec::new();
+    };
+
+    parsed
+        .get("certificates")
+        .and_then(|c| c.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| entry.get("sha256").and_then(|v| v.as_str()))
+                .map(|d| d.trim().to_ascii_lowercase())
+                // A digest that is not 64 hex characters is a typo, and a typo
+                // that silently becomes a trusted value is the one mistake this
+                // file cannot afford. Dropping it means the download fails
+                // closed rather than against a fingerprint nothing can match.
+                .filter(|d| d.len() == 64 && d.chars().all(|c| c.is_ascii_hexdigit()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Verify `path` and require that the certificate is one of `trusted`.
 ///
 /// The two-step shape is deliberate. "This file was tampered with" and "this
@@ -631,7 +694,7 @@ mod tests {
     /// verifier accepts Roblox's actual build — which is exactly the failure
     /// this module had on its first run, when it rejected the shipping APK
     /// because `ring` refuses sub-2048-bit RSA and Roblox's key is 1104 bits.
-    fn shipping_apk() -> Option<std::path::PathBuf> {
+    pub(super) fn shipping_apk() -> Option<std::path::PathBuf> {
         let p = std::env::var_os("HOME").map(std::path::PathBuf::from)?.join(
             ".var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk",
         );
@@ -819,5 +882,53 @@ mod tests {
         // a browser arrives in either case, and refusing one of them would be a
         // refusal nobody could debug from the message.
         assert!(verify_signed_by(&apk, &pinned).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    /// **The shipped list must not be empty and must not contain a typo**, and
+    /// both failures are silent: an empty set refuses every download and a
+    /// malformed digest is dropped, so neither shows up until somebody cannot
+    /// install. This is the test that notices.
+    #[test]
+    fn the_shipped_list_parses_and_holds_real_digests() {
+        let pins = pinned();
+        assert!(!pins.is_empty(), "the shipped certificate list is empty, so nothing installs");
+        for p in &pins {
+            assert_eq!(p.len(), 64, "{p} is not a SHA-256 digest");
+            assert!(p.chars().all(|c| c.is_ascii_hexdigit()), "{p} is not hex");
+            assert_eq!(p, &p.to_ascii_lowercase());
+        }
+    }
+
+    /// An empty set refuses rather than accepts. Stated as a test because the
+    /// opposite is a natural thing to write by accident and would turn a
+    /// missing config file into "trust anybody".
+    #[test]
+    fn an_empty_trust_list_refuses_a_genuine_archive() {
+        let Some(apk) = tests::shipping_apk() else {
+            eprintln!("skipped: no Roblox APK on this machine");
+            return;
+        };
+        assert!(matches!(
+            verify_signed_by(&apk, &[]),
+            Err(Refusal::UntrustedCertificate { .. })
+        ));
+    }
+
+    /// The build on this machine must be accepted by the list Cordial ships,
+    /// or the list is wrong. This is the end-to-end statement the pin exists
+    /// to make.
+    #[test]
+    fn the_shipped_list_accepts_the_build_on_this_machine() {
+        let Some(apk) = tests::shipping_apk() else {
+            eprintln!("skipped: no Roblox APK on this machine");
+            return;
+        };
+        let signer = verify_signed_by(&apk, &pinned()).expect("the shipped pins must accept it");
+        eprintln!("accepted: {}", signer.certificate_sha256);
     }
 }

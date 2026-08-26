@@ -1253,6 +1253,85 @@ fn claim_profile(opt: &Options) -> Result<cordial_shell::profile::Claim, String>
     }
 }
 
+/// Free bytes on the filesystem holding `path`, or `None` if it cannot be asked.
+///
+/// `df` rather than a `statvfs` binding, because this is a diagnostic and
+/// adding a crate for it would be the wrong trade. `None` is "unknown" and must
+/// never be reported as "full".
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    let mut probe = path.to_path_buf();
+    while !probe.exists() {
+        probe = probe.parent()?.to_path_buf();
+    }
+    let out = std::process::Command::new("df")
+        .args(["-Pk", "--output=avail"])
+        .arg(&probe)
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout)
+        .ok()?
+        .lines()
+        .nth(1)?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|kb| kb * 1024)
+}
+
+/// Say so, loudly, when the disk is nearly full.
+///
+/// **A game that dies because it could not write is the least self-explanatory
+/// failure Cordial produces.** Roblox writes its own storage, its logs and its
+/// asset cache under the profile; when those writes fail the engine does not
+/// report a disk error, it crashes or wedges somewhere with no relationship to
+/// the cause, and Cordial said nothing about it either -- not on screen and not
+/// in the log. Reported by a maintainer who hit exactly that.
+///
+/// Two thresholds, because the two moments want different words. Before a
+/// launch there is still time to do something about it; afterwards the only
+/// useful thing to say is that this is probably why.
+fn report_disk(where_: &std::path::Path, when: DiskMoment) {
+    let Some(free) = free_bytes(where_) else { return };
+    if let Some(line) = disk_warning(free, when, where_) {
+        println!("{line}");
+    }
+}
+
+/// What to say about `free` bytes, or nothing.
+///
+/// Split out from [`report_disk`] because the interesting part is the decision
+/// and the decision is untestable through the filesystem: a test cannot fill a
+/// disk, and one that could would be filling the developer's. Same arrangement,
+/// and the same reason, as `updater::dressing`.
+fn disk_warning(free: u64, when: DiskMoment, where_: &std::path::Path) -> Option<String> {
+    const LOW: u64 = 2 * 1024 * 1024 * 1024;
+    const CRITICAL: u64 = 512 * 1024 * 1024;
+    let mb = free / 1_048_576;
+    let at = where_.display();
+    match when {
+        DiskMoment::BeforeLaunch if free < CRITICAL => Some(format!(
+            "\n  *** {mb} MB free on {at}. Roblox writes its storage, logs and asset cache \
+             here, and at this little space it will probably fail in a way that does not \
+             mention the disk. ***\n"
+        )),
+        DiskMoment::BeforeLaunch if free < LOW => Some(format!(
+            "  warning: {mb} MB free on {at}; Roblox writes its storage and asset cache here"
+        )),
+        DiskMoment::AfterExit if free < CRITICAL => Some(format!(
+            "\n  *** the client stopped with only {mb} MB free on {at}. A failed write is the \
+             most likely cause: the engine does not report a full disk, it fails somewhere \
+             unrelated to it. ***"
+        )),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiskMoment {
+    BeforeLaunch,
+    AfterExit,
+}
+
 fn main() -> ExitCode {
     // **Before `parse()`, and that is not stylistic.** `--profile` latches the
     // active profile directory as a side effect of being parsed, and the whole
@@ -1895,6 +1974,10 @@ fn main() -> ExitCode {
                             format!("{}/data", cordial_runtime::profile::active().display())
                         });
                         let files = format!("{root}/files");
+                        // Kept separately because `files` is moved into a
+                        // closure further down, and the disk report needs the
+                        // path at two moments either side of that.
+                        let data_root = std::path::PathBuf::from(&files);
                         let cache = format!("{root}/cache");
                         for d in [&files, &cache] {
                             if let Err(e) = std::fs::create_dir_all(d) {
@@ -3816,6 +3899,7 @@ fn main() -> ExitCode {
                                             }
                                         }
 
+                                        report_disk(&data_root, DiskMoment::BeforeLaunch);
                                         match linker::game_activity::start(
                                             handle, width, height, format,
                                         ) {
@@ -4064,6 +4148,12 @@ fn main() -> ExitCode {
                                                     std::time::Duration::from_secs(secs),
                                                     Some(handle),
                                                 );
+                                                // Ungated, unlike the block below: this
+                                                // is the one line somebody debugging a
+                                                // mysterious crash needs, and hiding it
+                                                // behind a switch they do not know about
+                                                // is how it stayed unsaid.
+                                                report_disk(&data_root, DiskMoment::AfterExit);
                                                 if std::env::var_os("CORDIAL_COUNT_GL").is_some() {
                                                     // What each thread is blocked on. A game thread
                                                     // waiting on a socket, a futex, or nothing at all
@@ -4741,5 +4831,51 @@ mod local_storage_secrets {
     #[no_mangle]
     pub extern "C" fn cordial_local_storage_delete_user(user_id: c_longlong) -> c_int {
         if delete_user(user_id as i64) { 0 } else { -1 }
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// **A disk that is fine says nothing.** A warning on every launch is a
+    /// warning nobody reads, which is how the real one would be missed.
+    #[test]
+    fn a_healthy_disk_is_silent() {
+        let p = Path::new("/tmp");
+        assert!(disk_warning(50 * 1024 * 1024 * 1024, DiskMoment::BeforeLaunch, p).is_none());
+        assert!(disk_warning(50 * 1024 * 1024 * 1024, DiskMoment::AfterExit, p).is_none());
+    }
+
+    /// Before a launch there is still time to act, so a merely low disk is
+    /// worth a line. Afterwards it is not: the run already happened and
+    /// "you were a bit low" explains nothing.
+    #[test]
+    fn low_warns_only_before_a_launch() {
+        let p = Path::new("/tmp");
+        let low = 1024 * 1024 * 1024;
+        assert!(disk_warning(low, DiskMoment::BeforeLaunch, p).is_some());
+        assert!(disk_warning(low, DiskMoment::AfterExit, p).is_none());
+    }
+
+    /// **The case this exists for.** A client that stopped on a nearly-full
+    /// disk has to say so, because the engine will not: it does not report a
+    /// failed write, it fails somewhere with no relationship to the cause.
+    #[test]
+    fn a_nearly_full_disk_is_named_at_both_moments() {
+        let p = Path::new("/home/someone/.local/share/cordial/profiles/x/files");
+        let critical = 100 * 1024 * 1024;
+
+        let before = disk_warning(critical, DiskMoment::BeforeLaunch, p).expect("a warning");
+        assert!(before.contains("100 MB free"), "{before}");
+        assert!(before.contains("asset cache"), "{before}");
+
+        let after = disk_warning(critical, DiskMoment::AfterExit, p).expect("a warning");
+        assert!(after.contains("the client stopped"), "{after}");
+        assert!(after.contains("does not report a full disk"), "{after}");
+        // And it names where, because a machine has more than one filesystem
+        // and the profile is not always on the one the user is watching.
+        assert!(after.contains("profiles/x/files"), "{after}");
     }
 }

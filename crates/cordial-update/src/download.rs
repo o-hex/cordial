@@ -57,11 +57,29 @@
 //! that asked for a Google password would be a different program from the one
 //! that ADR was written about.
 //!
-//! A mirror is worse rather than easier. Aptoide serves the file today, and
-//! taking it would mean Cordial quietly fetching an APK from a third party while
-//! its ADR says it fetches from Roblox — with an MD5 from the mirror as the only
-//! thing vouching for bytes the mirror itself supplied, which is not a check, it
-//! is the mirror agreeing with itself.
+//! A mirror looked worse rather than easier, and this paragraph used to end the
+//! argument there. **Half of it was right and the half that decided the outcome
+//! was wrong**, so it is corrected here rather than quietly dropped.
+//!
+//! What was right: an MD5 supplied by the mirror alongside the file is not a
+//! check, it is the mirror agreeing with itself, and a fetcher resting on one
+//! has no protection at all against the party it is protecting itself from.
+//! That still holds and nothing in this crate relies on a provider-supplied
+//! hash.
+//!
+//! What was wrong: that this left no way to make a mirror safe. Roblox signs
+//! its own APKs, the signature covers every byte of the archive, and the
+//! signing certificate is not something a mirror can forge. So the check that
+//! the mirror cannot fake is not a hash it hands over -- it is the one already
+//! inside the file. [`crate::apk_signature`] performs it and
+//! [`crate::provider`] is the fetcher built on it, permitted by
+//! [ADR-025](../../../docs/adr/ADR-025-fetching-from-a-third-party-mirror.md).
+//!
+//! Measured on 2026-08-26: the archive APKPure serves for 2.734.917 and the
+//! archive Sober downloaded from Google Play are different files -- 229 MB of
+//! every ABI against 97 MB of assets plus a 53 MB x86-64 split -- and both
+//! verify against the same Roblox signing certificate. That is the thing the
+//! old paragraph assumed could not be established.
 //!
 //! So there is no constant here holding a URL, guessed or borrowed.
 //! [`Source::official`] refuses — in three plain sentences, with all of the
@@ -182,8 +200,8 @@ impl Source {
     /// message must not do.
     pub fn official() -> Result<Self, Refusal> {
         Err(Refusal::NoSource(
-            "Cordial cannot download Roblox. Roblox only publishes the Android app through \
-             Google Play and the Amazon Appstore. Get the APK yourself and choose it in Settings."
+            "Roblox only publishes the Android app through Google Play and the Amazon \
+             Appstore, so there is no Roblox address for Cordial to fetch from."
                 .to_string(),
         ))
     }

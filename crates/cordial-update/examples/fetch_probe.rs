@@ -17,6 +17,7 @@ use cordial_update::provider::{self, Progress};
 
 fn main() {
     let download = std::env::args().any(|a| a == "--download");
+    let only = std::env::args().skip(1).find(|a| !a.starts_with("--"));
     let mut say = |p: Progress| match p {
         Progress::Asking { provider } => eprintln!("  asking {provider}"),
         Progress::Fetching { file, done, total } => match total {
@@ -67,4 +68,21 @@ fn main() {
             Err(e) => println!("   fetch failed: {e}"),
         }
     }
+
+    // The entry point everything else should use: pick a source, fetch, and
+    // verify, with no way to get bytes back that nobody has checked.
+    println!("== obtain({}) ==", only.as_deref().unwrap_or("first available"));
+    let into = std::env::temp_dir().join("cordial-obtain-probe");
+    let _ = std::fs::remove_dir_all(&into);
+    std::fs::create_dir_all(&into).expect("scratch");
+    match provider::obtain(only.as_deref(), &into, &mut say) {
+        Ok(got) => {
+            println!("   {} from {}", got.version.name, got.provider);
+            println!("   signed by {}", got.certificate_sha256);
+            println!("   base:  {}", got.archives.base.display());
+            println!("   split: {}", got.archives.split.display());
+        }
+        Err(e) => println!("   {e}"),
+    }
+    let _ = std::fs::remove_dir_all(&into);
 }

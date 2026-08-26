@@ -143,6 +143,117 @@ pub fn named(name: &str) -> Option<Box<dyn Provider>> {
     all().into_iter().find(|p| p.name().eq_ignore_ascii_case(name))
 }
 
+/// A build that was obtained and checked.
+#[derive(Debug, Clone)]
+pub struct Obtained {
+    pub archives: Archives,
+    pub version: Available,
+    /// Which source it came from, for the message that follows.
+    pub provider: &'static str,
+    /// The certificate that signed it, so a caller can say whose build this is
+    /// rather than merely that a check passed.
+    pub certificate_sha256: String,
+}
+
+/// Get the build, from the first source that has it, and verify it.
+///
+/// **The signature check is here rather than left to the caller**, and that is
+/// the point of the function. [ADR-025](../../../docs/adr/ADR-025-fetching-from-a-third-party-mirror.md)
+/// makes a non-Roblox source acceptable only because the archive is verified,
+/// and a fetch API that returned unverified paths would make forgetting the
+/// check the easy thing to do. There is nothing here that hands back bytes
+/// nobody has checked.
+///
+/// ## Which failures move to the next source and which stop everything
+///
+/// [`Unreachable::NoSource`] means a source has nothing -- no local build, an
+/// empty directory -- and the next one is tried. **Anything else stops.** In
+/// particular a signature refusal is never a reason to quietly try somewhere
+/// else: an archive that fails verification is the one event this whole design
+/// exists to notice, and moving on to the next provider would turn the loudest
+/// possible signal into a slightly slower success.
+pub fn obtain(
+    preferred: Option<&str>,
+    into: &Path,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<Obtained, Unreachable> {
+    let sources = match preferred {
+        Some(name) => vec![named(name).ok_or_else(|| Unreachable::NoSource {
+            why: format!(
+                "there is no source called {name}. Cordial knows: {}",
+                all().iter().map(|p| p.name()).collect::<Vec<_>>().join(", ")
+            ),
+        })?],
+        None => all(),
+    };
+
+    let trusted = crate::apk_signature::pinned();
+    let mut absent: Vec<String> = Vec::new();
+
+    for source in sources {
+        let version = match source.newest(progress) {
+            Ok(v) => v,
+            Err(Unreachable::NoSource { why }) => {
+                absent.push(format!("{}: {why}", source.name()));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let archives = match source.fetch(&version, into, progress) {
+            Ok(a) => a,
+            Err(Unreachable::NoSource { why }) => {
+                absent.push(format!("{}: {why}", source.name()));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Every distinct file, and only once each: a monolithic APK is not
+        // hashed twice to satisfy the shape of the rule.
+        let mut certificate: Option<String> = None;
+        for file in archives.distinct() {
+            progress(Progress::Verifying {
+                file: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
+            });
+            let signer = crate::apk_signature::verify_signed_by(file, &trusted).map_err(|e| {
+                Unreachable::Malformed { url: file.display().to_string(), why: e.to_string() }
+            })?;
+            // **The two halves must share a certificate.** Each being signed by
+            // some pinned key is not enough: two archives signed by different
+            // pinned keys would each pass on its own, and pairing them installs
+            // an engine from one release beside assets from another. Android's
+            // installer enforces the same rule for the same reason.
+            match &certificate {
+                None => certificate = Some(signer.certificate_sha256),
+                Some(first) if *first != signer.certificate_sha256 => {
+                    return Err(Unreachable::Malformed {
+                        url: file.display().to_string(),
+                        why: "the two halves of this build were signed by different \
+                              certificates, so they are not two halves of one build"
+                            .into(),
+                    })
+                }
+                Some(_) => {}
+            }
+        }
+        let certificate = certificate.ok_or_else(|| Unreachable::NoSource {
+            why: "the source returned no archives at all".into(),
+        })?;
+
+        return Ok(Obtained {
+            archives,
+            version,
+            provider: source.name(),
+            certificate_sha256: certificate,
+        });
+    }
+
+    Err(Unreachable::NoSource {
+        why: format!("no source had a Roblox build.\n  {}", absent.join("\n  ")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +291,18 @@ mod tests {
         assert_eq!(one.distinct().len(), 1);
         let two = Archives { base: "/x/a.apk".into(), split: "/x/b.apk".into() };
         assert_eq!(two.distinct().len(), 2);
+    }
+
+    /// Naming a source that does not exist must not silently fall back to one
+    /// that does. A typo in a setting should say so, not quietly use the
+    /// network when the user asked for the local build.
+    #[test]
+    fn an_unknown_preferred_source_is_an_error_and_not_a_fallback() {
+        let dir = std::env::temp_dir().join("cordial-obtain-unknown");
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let mut noise = |_: Progress| {};
+        let e = obtain(Some("no-such-source"), &dir, &mut noise).unwrap_err();
+        assert!(e.to_string().contains("no-such-source"), "{e}");
+        assert!(e.to_string().contains("local"), "the error should list what does exist: {e}");
     }
 }

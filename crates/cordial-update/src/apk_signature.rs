@@ -65,6 +65,18 @@ const BLOCK_MAGIC: &[u8; 16] = b"APK Sig Block 42";
 const BLOCK_ID_V2: u32 = 0x7109_871a;
 const BLOCK_ID_V3: u32 = 0xf053_68c0;
 
+/// The stripping-protection attribute, carried in v2 signed data and holding
+/// the highest scheme version the same signer also applied.
+///
+/// **Without this check there is no downgrade protection at all.** An archive
+/// signed with both v2 and v3 verifies under either, so an attacker who wants
+/// the weaker scheme simply deletes the v3 block from the signing block and
+/// leaves a file that is still genuinely v2-signed. Preferring v3 when it is
+/// present does not help, because after the strip it is not present. What
+/// closes it is that the *signed* v2 data says "I also signed this with 3",
+/// and that sentence cannot be edited without breaking the v2 signature.
+const ATTR_STRIPPING_PROTECTION: u32 = 0xbeef_f00d;
+
 /// Content digest algorithm ids from the specification. Only the SHA-256 chunked
 /// form is accepted: SHA-512 is permitted by the scheme and is not what Android
 /// builds use, and a verifier that silently accepts an algorithm it has never
@@ -99,6 +111,9 @@ pub enum Refusal {
     SignatureInvalid(&'static str),
     /// The archive is properly signed, by a certificate Cordial does not trust.
     UntrustedCertificate { fingerprint: String },
+    /// The v2 signature is valid and says the signer also applied a newer
+    /// scheme, which is not in the file. Somebody removed it.
+    SchemeStripped { claimed: u32 },
     /// Reading the file failed.
     Io(String),
 }
@@ -125,6 +140,12 @@ impl std::fmt::Display for Refusal {
                 f,
                 "the archive is correctly signed, but by a certificate Cordial does not trust \
                  ({fingerprint})"
+            ),
+            Refusal::SchemeStripped { claimed } => write!(
+                f,
+                "the archive's v2 signature is valid and states that it was also signed with \
+                 scheme v{claimed}, but no v{claimed} block is present; somebody removed it to \
+                 force this verifier onto the weaker scheme"
             ),
             Refusal::Io(e) => write!(f, "could not read the archive: {e}"),
         }
@@ -392,6 +413,26 @@ fn verify_signature(alg: u32, key_der: &[u8], signed: &[u8], sig: &[u8]) -> Resu
 /// that certificate is Roblox's is [`verify_signed_by`]'s job, and the two are
 /// separate so that an error can distinguish "this file was tampered with" from
 /// "this file is fine and is not Roblox's".
+/// The highest scheme version the v2 signer says it also applied, if it said.
+///
+/// `sd` must be positioned just past the certificate sequence. A malformed or
+/// absent attribute sequence returns `None` and is not an error: the attribute
+/// is optional, older signers omit it, and refusing an archive for lacking an
+/// optional field would reject every v2-only build ever made. What is *not*
+/// tolerated is the attribute being present and saying a higher number than
+/// the block that is actually here -- that is [`Refusal::SchemeStripped`].
+fn stripping_protection(sd: &mut Reader<'_>) -> Option<u32> {
+    let mut attributes = sd.sized()?;
+    while attributes.remaining() > 0 {
+        let mut a = attributes.sized()?;
+        let id = a.u32()?;
+        if id == ATTR_STRIPPING_PROTECTION {
+            return a.u32();
+        }
+    }
+    None
+}
+
 pub fn verify(path: &Path) -> Result<Signer, Refusal> {
     use sha2::{Digest, Sha256};
     let mut file = File::open(path).map_err(|e| Refusal::Io(e.to_string()))?;
@@ -543,6 +584,17 @@ pub fn verify(path: &Path) -> Result<Signer, Refusal> {
         ));
     }
 
+    // The additional attributes come after the certificates, and in v3 after
+    // the two SDK bounds. This is read for one field and one reason: see
+    // [`ATTR_STRIPPING_PROTECTION`].
+    if v3.is_none() {
+        if let Some(claimed) = stripping_protection(&mut sd) {
+            if claimed > 2 {
+                return Err(Refusal::SchemeStripped { claimed });
+            }
+        }
+    }
+
     let certificate = certificates
         .sized()
         .ok_or(Refusal::MalformedSigningBlock("no signing certificate"))?
@@ -631,6 +683,85 @@ mod tests {
         // Cross-checked against an independent implementation on 2026-08-26.
         assert_eq!(signer.certificate_sha256.len(), 64);
         assert!(signer.certificate_sha256.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// **The downgrade attack, performed against the real file.**
+    ///
+    /// Roblox signs with both v2 and v3, so an attacker who wants Cordial on
+    /// the weaker scheme deletes the v3 pair from the signing block. The
+    /// resulting archive is not corrupt and is not a forgery: the v2 signature
+    /// over it still verifies, because the content digest substitutes the
+    /// signing block's offset for the central directory's and so is blind to
+    /// the block being resized. That is the scheme working as designed, and it
+    /// is what makes stripping cheap.
+    ///
+    /// What catches it is one field. The v2 signed data says `0xbeeff00d = 3`,
+    /// and that sentence is inside the bytes the v2 signature covers, so an
+    /// attacker cannot edit it without the forgery this file already refuses.
+    ///
+    /// This test also proves the digest is computed correctly, from the other
+    /// direction: were the offset substitution wrong, the stripped archive
+    /// would fail on the digest and this test would pass for the wrong reason.
+    /// So it asserts the exact refusal rather than merely that one occurred.
+    #[test]
+    fn stripping_the_v3_block_is_caught_by_the_attribute_that_survives_it() {
+        let Some(apk) = shipping_apk() else {
+            eprintln!("skipped: no Roblox APK on this machine");
+            return;
+        };
+        let mut d = std::fs::read(&apk).expect("read the shipping APK");
+
+        // Locate the block the same way the verifier does.
+        let eocd = d.windows(4).rposition(|w| w == b"PK\x05\x06").expect("EOCD");
+        let cd = u32::from_le_bytes(d[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        let magic =
+            d[..cd].windows(16).rposition(|w| w == BLOCK_MAGIC).expect("signing block magic");
+        let trailing = u64::from_le_bytes(d[magic - 8..magic].try_into().unwrap()) as usize;
+        let start = magic + 16 - trailing - 8;
+
+        // Rebuild the pair list without v3.
+        let mut pairs: Vec<u8> = Vec::new();
+        let mut removed = false;
+        let mut at = start + 8;
+        while at < magic - 8 {
+            let len = u64::from_le_bytes(d[at..at + 8].try_into().unwrap()) as usize;
+            let id = u32::from_le_bytes(d[at + 8..at + 12].try_into().unwrap());
+            if id == BLOCK_ID_V3 {
+                removed = true;
+            } else {
+                pairs.extend_from_slice(&d[at..at + 8 + len]);
+            }
+            at += 8 + len;
+        }
+        assert!(removed, "the shipping APK must carry a v3 block for this test to mean anything");
+
+        // Reassemble: leading size, pairs, trailing size, magic. The size
+        // counts everything after the leading field, magic included.
+        let size = (pairs.len() + 8 + 16) as u64;
+        let mut block = Vec::with_capacity(8 + size as usize);
+        block.extend_from_slice(&size.to_le_bytes());
+        block.extend_from_slice(&pairs);
+        block.extend_from_slice(&size.to_le_bytes());
+        block.extend_from_slice(BLOCK_MAGIC);
+
+        let tail = d[cd..].to_vec();
+        d.truncate(start);
+        let new_cd = start + block.len();
+        d.extend_from_slice(&block);
+        d.extend_from_slice(&tail);
+        // The central directory moved, so the EOCD must say where it is now.
+        let new_eocd = d.len() - (tail.len() - (eocd - cd));
+        d[new_eocd + 16..new_eocd + 20].copy_from_slice(&(new_cd as u32).to_le_bytes());
+
+        let p = scratch("v3-stripped.apk");
+        std::fs::write(&p, &d).expect("write the stripped archive");
+
+        assert_eq!(
+            verify(&p),
+            Err(Refusal::SchemeStripped { claimed: 3 }),
+            "a stripped archive must be refused for being stripped, not for anything else"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     /// **The test this module exists for.** One byte changed in the middle of

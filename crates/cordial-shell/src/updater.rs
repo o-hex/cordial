@@ -247,20 +247,57 @@ pub fn header_button(
                     return;
                 }
                 match plan {
-                    // Background would fetch here, and cannot: there is no
-                    // source to fetch from. The refusal is what says so, rather
-                    // than a silent no-op that looks like a download nobody can
-                    // find.
-                    Plan::CheckAndDownload => match Source::configured() {
-                        Ok(source) => println!(
-                            "[update] a newer Roblox build has been published, and {} is set to \
-                             {} — the shell does not stream a file yet",
-                            URL_ENV, source.url
-                        ),
-                        Err(refusal) => {
-                            println!("[update] a newer Roblox build has been published, and {refusal}")
-                        }
-                    },
+                    // **Background now downloads, which is what it says.** It
+                    // used to print that there was no source to fetch from and
+                    // stop, which was true when it was written and stopped
+                    // being true with ADR-025 -- leaving the shipped default
+                    // setting describing a behaviour the code did not have.
+                    //
+                    // Silent by design: no window, no dialog, no toast. The
+                    // user chose "in the background" and the badge is how they
+                    // find out, which is the whole difference between this
+                    // mode and Ask. A failure prints and changes nothing --
+                    // there is no user watching to tell, and the build they
+                    // have is untouched.
+                    //
+                    // `metered` has already been consulted: `plan` is what
+                    // turns Background into CheckAndAsk on a connection
+                    // somebody pays for by the megabyte, so reaching this arm
+                    // means the download is permitted.
+                    Plan::CheckAndDownload => {
+                        let button = button.clone();
+                        let last = last.clone();
+                        on_worker(
+                            || {
+                                let cancel = cordial_update::provider::Cancel::new();
+                                cordial_update::provider::obtain_and_install(
+                                    None,
+                                    cordial_update::provider::Want::Newest,
+                                    &cancel,
+                                    &mut |_| {},
+                                )
+                                .map(|(got, _)| got.version.name)
+                                .map_err(|e| e.to_string())
+                            },
+                            move |outcome| match outcome {
+                                Ok(version) => {
+                                    println!("[update] installed Roblox {version} in the background");
+                                    // The badge has to go out, for the same
+                                    // reason it does after the button: nothing
+                                    // else re-runs the comparison, and a badge
+                                    // pointing at an update already installed
+                                    // is worse than no badge.
+                                    if let Some(checked) = last.borrow_mut().as_mut() {
+                                        checked.reread_installed();
+                                    }
+                                    dress(&button, &last.borrow(), automatic);
+                                }
+                                Err(why) => println!(
+                                    "[update] a background update did not install: {why}"
+                                ),
+                            },
+                        );
+                    }
                     Plan::CheckAndAsk { why } => println!(
                         "[update] a newer Roblox build has been published; not downloading: {}",
                         why.unwrap_or_else(|| "Auto update is Ask".into())

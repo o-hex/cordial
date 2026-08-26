@@ -107,6 +107,16 @@ pub enum Unreachable {
     /// changed is Roblox having moved something, which is the failure ADR-015
     /// says must not present as "no update available".
     Malformed { url: String, why: String },
+    /// The archive arrived intact and was refused.
+    ///
+    /// **Distinct from every other variant here on purpose.** The rest describe
+    /// a network that did not deliver; this one describes a delivery that was
+    /// rejected, which is the single outcome ADR-025 exists to produce and the
+    /// one a user must not read as "try again in a minute". Reported through
+    /// `Malformed` it looked like a transport glitch, which is the most
+    /// misleading possible framing for "somebody served bytes Roblox did not
+    /// sign".
+    Refused { what: String, why: String },
     /// The user asked to stop. Not a failure: nothing is wrong, and the
     /// message must not read as though something is.
     Cancelled,
@@ -119,6 +129,11 @@ pub enum Unreachable {
 impl std::fmt::Display for Unreachable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Unreachable::Refused { what, why } => write!(
+                f,
+                "The downloaded build was refused rather than installed: {why} ({what}). \
+                 Nothing was installed and the build you have is untouched."
+            ),
             Unreachable::Cancelled => write!(f, "Download stopped."),
             Unreachable::NoSource { why } => write!(f, "{why}"),
             Unreachable::Transport { url, why } => write!(f, "could not reach {url}: {why}"),

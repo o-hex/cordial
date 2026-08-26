@@ -269,6 +269,28 @@ fn order_by_version(
     scored.into_iter().map(|(_, _, s)| s).collect()
 }
 
+/// Free bytes on the filesystem holding `path`, or `None` if it cannot be asked.
+///
+/// `None` means "unknown", and an unknown must not refuse a download: a
+/// pre-flight check that guesses wrong in the refusing direction is worse than
+/// no check, because the honest failure it replaces at least happens for a
+/// reason the user can see.
+fn free_bytes(path: &Path) -> Option<u64> {
+    // The nearest existing ancestor: the build directory may not exist yet on
+    // a first run, and statvfs on a missing path answers nothing useful.
+    let mut probe = path.to_path_buf();
+    while !probe.exists() {
+        probe = probe.parent()?.to_path_buf();
+    }
+    let output = std::process::Command::new("df")
+        .args(["-Pk", "--output=avail"])
+        .arg(&probe)
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.lines().nth(1)?.trim().parse::<u64>().ok().map(|kb| kb * 1024)
+}
+
 /// The newest build any source can actually supply, as a version string.
 ///
 /// **Not the newest Roblox announced.** A release can exist for ARM and not for
@@ -400,7 +422,10 @@ pub(crate) fn obtain_from(
                 file: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
             });
             let signer = crate::apk_signature::verify_signed_by(file, trusted).map_err(|e| {
-                Unreachable::Malformed { url: file.display().to_string(), why: e.to_string() }
+                Unreachable::Refused {
+                    what: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                    why: e.to_string(),
+                }
             })?;
             // **The two halves must share a certificate.** Each being signed by
             // some pinned key is not enough: two archives signed by different
@@ -410,8 +435,8 @@ pub(crate) fn obtain_from(
             match &certificate {
                 None => certificate = Some(signer.certificate_sha256),
                 Some(first) if *first != signer.certificate_sha256 => {
-                    return Err(Unreachable::Malformed {
-                        url: file.display().to_string(),
+                    return Err(Unreachable::Refused {
+                        what: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
                         why: "the two halves of this build were signed by different \
                               certificates, so they are not two halves of one build"
                             .into(),
@@ -453,6 +478,29 @@ pub fn obtain_and_install(
     cancel: &Cancel,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(Obtained, crate::install::Installed), Unreachable> {
+    // **Before any network activity.** Disk exhaustion is caught today only as
+    // a write error a few hundred megabytes in, which wastes the transfer and
+    // reports itself as an IO failure rather than as "you do not have room".
+    // This machine reached 353 MB free during a day's work, so it is not a
+    // hypothetical.
+    if let Some(free) = free_bytes(&crate::install::build_dir()) {
+        // The largest archive the mirror is permitted to serve, plus the
+        // engine that comes out of it. Deliberately generous: refusing a fetch
+        // that would have fitted is worse than starting one that might not,
+        // because the second at least fails honestly.
+        const NEEDED: u64 = 700 * 1024 * 1024;
+        if free < NEEDED {
+            return Err(Unreachable::NoSource {
+                why: format!(
+                    "there is not enough room to install a build: about {} MB free where {} MB \
+                     is needed. Nothing was downloaded.",
+                    free / 1_048_576,
+                    NEEDED / 1_048_576
+                ),
+            });
+        }
+    }
+
     let staging = crate::install::build_dir().join(".fetching");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)

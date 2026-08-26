@@ -1,6 +1,6 @@
 # Fetching the Roblox build
 
-**Status:** specification, not yet implemented. This is the read half of a
+**Status:** the source, the transport and the verification are implemented -- see `crates/cordial-update/src/provider/` and `apk_signature.rs`, and ADR-025. Section 5's promotion, canary and rollback are **not**: there is no previous-good record and no launch check before a build is adopted. This document was written as a specification and is now half history and half plan; the half that is plan is section 5.
 clean-room exercise: it describes the observable behaviour of mocktail's update
 module — endpoints, headers, byte layouts, orderings, refusals — so that
 somebody who has never seen that source can build the same thing, and build it

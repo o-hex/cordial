@@ -399,6 +399,14 @@ pub fn adopt(
 
     std::fs::create_dir_all(build)
         .map_err(|e| Failed::Io { path: build.display().to_string(), why: e.to_string() })?;
+    // **Before the archives land, not after.** Written afterwards there is a
+    // window -- the whole rename loop -- in which a killed process leaves a
+    // directory full of Cordial's own archives with no marker beside them.
+    // `ours_to_write` would then read that as somebody else's build and refuse
+    // to install over it for ever, which is the ownership rule turned against
+    // the only program it exists to serve. The marker has no contents, so
+    // writing it early costs nothing and closes the window entirely.
+    let _ = std::fs::write(build.join(OURS), b"Installed by Cordial. Delete to disown.\n");
     let mut base = build.join(BASE_APK);
     let mut carrier_live = build.join(carrier_name);
     for (name, path) in fetched {
@@ -422,10 +430,6 @@ pub fn adopt(
         }
     }
 
-    // Marked as ours the moment the archives are in place, so a process killed
-    // between here and the engine rename does not leave a directory Cordial
-    // wrote and then refuses to touch again.
-    let _ = std::fs::write(build.join(OURS), b"Installed by Cordial. Delete to disown.\n");
 
     let engine_live = engine_into.join(engine::LIBRARY);
     std::fs::rename(&staged_engine, &engine_live)

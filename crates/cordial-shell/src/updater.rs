@@ -738,20 +738,100 @@ fn action_label(checked: &Option<Checked>) -> &'static str {
     }
 }
 
-/// What `Update…` opens, and the one thing it must not do is imply a fetch.
+/// What `Update…` opens.
 ///
-/// It reports what [`Source::configured`] decided — which today is a refusal
-/// naming Google Play and the Amazon Appstore — and stops there. It used to
-/// offer the APK picker as its suggested response, which made this the second
-/// place a build could be chosen; that is now the Roblox page in Settings, and
-/// the text says so rather than growing a shortcut back to it.
+/// **This used to be a refusal and is now a button that works.** Its heading
+/// said "Cordial cannot download this build", which was true for as long as
+/// there was no source to download from and became a lie the moment
+/// [ADR-025](../../../docs/adr/ADR-025-fetching-from-a-third-party-mirror.md)
+/// landed. A dialog whose whole content is an apology for a missing feature is
+/// worse than no dialog once the feature exists.
+///
+/// It stays an `AlertDialog` rather than growing into a window. There are two
+/// facts and one control -- which build is here, what can be fetched, and a
+/// button -- and the body text is rewritten in place as the work runs, which is
+/// all the progress a dialog with one job needs.
 fn update_dialog(parent: &adw::Window) {
+    let installed = cordial_update::engine::installed_version(&crate::install::engine_cache());
+    let here = match &installed {
+        Some(v) => format!("This machine has Roblox {v}."),
+        None => "Cordial cannot read a version from the build on this machine.".to_string(),
+    };
+
     let dialog = adw::AlertDialog::builder()
-        .heading("Cordial cannot download this build")
-        .body(update_body(&Source::configured()))
+        .heading("Update Roblox")
+        .body(format!("{here}\n\n{FETCH_EXPLAINS}"))
         .build();
     dialog.add_response("close", "Close");
+    dialog.add_response("fetch", "Download the latest");
+    dialog.set_response_appearance("fetch", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("fetch"));
+
+    let for_worker = parent.clone();
+    dialog.connect_response(None, move |_dialog, response| {
+        if response != "fetch" {
+            return;
+        }
+        // The dialog closes itself on a response, so the work reports into a
+        // second one. Trying to keep the first alive means fighting
+        // `AlertDialog`, and a dialog that refuses to close when its button is
+        // pressed is its own bug.
+        let working = adw::AlertDialog::builder()
+            .heading("Downloading Roblox")
+            .body("Looking for a build...")
+            .build();
+        working.add_response("close", "Close");
+        working.present(Some(&for_worker));
+
+        let done = working.clone();
+        let progress_into = working.clone();
+        on_worker_reporting(
+            |report| {
+                cordial_update::provider::obtain_and_install(None, &mut |p| {
+                    report(describe_progress(&p))
+                })
+                .map(|(got, _)| (got.version.name, got.provider, got.certificate_sha256))
+                .map_err(|e| e.to_string())
+            },
+            move |line| progress_into.set_body(&line),
+            move |outcome| match outcome {
+                Ok((version, from, certificate)) => {
+                    done.set_heading(Some("Roblox updated"));
+                    done.set_body(&format!(
+                        "Installed Roblox {version} from {from}.\n\nVerified against Roblox's \
+                         signing certificate {}.\n\nRestart Cordial to use it.",
+                        &certificate[..16]
+                    ));
+                }
+                Err(why) => {
+                    done.set_heading(Some("Could not update Roblox"));
+                    // Verbatim. A mirror being down and a machine having no
+                    // network look identical from in here and only one of them
+                    // is the user's to fix.
+                    done.set_body(&why);
+                }
+            },
+        );
+    });
+
     dialog.present(Some(parent));
+}
+
+/// One line of progress, in words rather than in the enum's shape.
+///
+/// Shared with the first-run screen through [`crate::instructions`] would be
+/// one indirection too many for six lines; if a third caller appears this
+/// moves.
+fn describe_progress(p: &cordial_update::provider::Progress) -> String {
+    use cordial_update::provider::Progress;
+    match p {
+        Progress::Asking { provider } => format!("Asking {provider}..."),
+        Progress::Fetching { done, total: Some(t), .. } => {
+            format!("Downloading: {} of {} MB", done / 1_048_576, t / 1_048_576)
+        }
+        Progress::Fetching { done, .. } => format!("Downloading: {} MB", done / 1_048_576),
+        Progress::Verifying { file } => format!("Checking {file} is signed by Roblox..."),
+    }
 }
 
 /// "Updates" — a page of its own, and what it says about a download it cannot
@@ -794,13 +874,15 @@ pub fn build_update_page(
 /// guesses metered is the confusion this row exists to pre-empt.
 fn build_source_group() -> adw::PreferencesGroup {
     let group =
-        // `STORES` itself stays as it is and is still what a *refusal* says --
-        // somebody who has just been told Cordial cannot fetch a build needs
-        // the whole explanation. A settings group nobody has been refused
-        // anything on does not, so this one says the actionable half only.
+        // **This is the one place in the UI that names the mirror**, and it is
+        // the right one: a settings page is where somebody goes to find out
+        // how a thing works, unlike the first-run screen where they are trying
+        // to get moving. Removing the sentence from there and keeping it here
+        // is a trade about where the explanation lands, not about whether it
+        // is made.
         adw::PreferencesGroup::builder()
             .title("Getting a newer build")
-            .description("Cordial cannot download Roblox. Obtain an APK and choose it on the Roblox page.")
+            .description(FETCH_EXPLAINS)
             .build();
 
     let source_row = adw::ActionRow::builder()
@@ -917,9 +999,8 @@ const AUTO_UPDATE_SUBTITLE: &str =
 /// download from. Leaving that out would put live-looking controls in front of
 /// somebody and let them conclude their updates were handled.
 pub const SETTINGS_DESCRIPTION: &str =
-    "Nothing here downloads anything yet. There is none today to download from — Roblox ships \
-     the Android build through Google Play and the Amazon Appstore and publishes no file. \
-     Checking still works.";
+    "Cordial can fetch the build itself. Roblox publishes no Android file of its own, so it \
+     comes from APKPure and is installed only if Roblox's own signing certificate signed it.";
 
 /// Where the build is obtainable, named plainly.
 ///
@@ -928,8 +1009,18 @@ pub const SETTINGS_DESCRIPTION: &str =
 /// exactly what ADR-015 says the refusal must not do.
 const STORES: &str =
     "Roblox publishes no Android build outside Google Play and the Amazon Appstore, and Cordial \
-     will not sign in to a store for you or take the file from a mirror and call it Roblox. \
-     Obtain an APK and choose it on the Roblox page.";
+     will not sign in to a store for you. Press Update to fetch one, or obtain an APK yourself \
+     and choose it on the Roblox page.";
+
+/// What the fetch does, in one sentence, wherever it needs saying.
+///
+/// The second half is the whole of why the first half is acceptable, so they
+/// are one string and cannot be quoted apart. A build is downloaded from
+/// somebody who is not Roblox **and** nothing installs that Roblox did not
+/// sign; either sentence alone misleads.
+const FETCH_EXPLAINS: &str =
+    "Cordial downloads the build from APKPure and installs it only if Roblox's own signing \
+     certificate signed it.";
 
 /// Said on the installed-build group, where the picker used to be.
 ///
@@ -1001,10 +1092,8 @@ fn status_lines(checked: &Option<Checked>, automatic: Automatic) -> (String, Str
 fn update_body(configured: &Result<Source, Refusal>) -> String {
     match configured {
         Ok(source) => format!(
-            "{URL_ENV} points Cordial at {}.\n\nDownloading from this window is not built: \
-             nothing in the shell streams a file yet, and pretending otherwise with a progress \
-             bar that never fills would be worse than saying so. Fetch it yourself and choose \
-             it on the Roblox page in Settings.",
+            "{URL_ENV} points Cordial at {}.\n\nPress Update to fetch a build, or choose an \
+             APK yourself on the Roblox page in Settings.",
             source.url
         ),
         Err(refusal) => format!("{refusal}\n\n{STORES}"),
@@ -1234,16 +1323,34 @@ mod tests {
         assert!(body.contains("one you asked for"), "{body}");
     }
 
+    /// **This test used to assert the opposite** -- that the page said the
+    /// settings could not act yet -- and it was right to, for as long as
+    /// nothing here downloaded anything. Controls that look live and govern
+    /// nothing are the interface version of a stub returning success.
+    ///
+    /// ADR-025 made the page able to act, so the invariant moves rather than
+    /// disappears: **the fetch is never named without the sentence that makes
+    /// it acceptable.** "Cordial downloads from APKPure" on its own is the
+    /// interface version of a different lie -- one that sounds like Cordial
+    /// trusts a mirror, which is exactly what it does not do.
     #[test]
-    fn the_settings_description_says_the_settings_cannot_act_yet() {
-        // The requirement that makes this page honest rather than decorative.
-        // Controls that look live and govern nothing are the interface version
-        // of a stub returning success.
-        assert!(SETTINGS_DESCRIPTION.contains("There is none today"), "{SETTINGS_DESCRIPTION}");
-        assert!(SETTINGS_DESCRIPTION.contains("Google Play"), "{SETTINGS_DESCRIPTION}");
-        assert!(SETTINGS_DESCRIPTION.contains("Amazon Appstore"), "{SETTINGS_DESCRIPTION}");
-        // And it does not overstate the outage either: checking genuinely works.
-        assert!(SETTINGS_DESCRIPTION.contains("Checking still works"), "{SETTINGS_DESCRIPTION}");
+    fn the_settings_description_names_the_mirror_and_the_check_together() {
+        assert!(SETTINGS_DESCRIPTION.contains("APKPure"), "{SETTINGS_DESCRIPTION}");
+        assert!(SETTINGS_DESCRIPTION.contains("signing certificate"), "{SETTINGS_DESCRIPTION}");
+    }
+
+    /// The same rule, applied to every string that offers the fetch. A new one
+    /// that names the mirror and forgets the check fails here rather than in
+    /// front of somebody deciding whether to press it.
+    #[test]
+    fn nothing_offers_the_download_without_saying_what_is_checked() {
+        for text in [SETTINGS_DESCRIPTION, FETCH_EXPLAINS] {
+            assert!(text.contains("APKPure"), "{text}");
+            assert!(
+                text.contains("signing certificate") || text.contains("signed it"),
+                "names the mirror without naming the check: {text}"
+            );
+        }
     }
 
     #[test]
@@ -1269,7 +1376,10 @@ mod tests {
 
         let hash = Sha256Hash::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap();
         let with_source = update_body(&Source::new("https://example.invalid/base.apk", hash));
-        assert!(with_source.contains("not built"), "{with_source}");
+        // This asserted "not built" while downloading from this window was not
+        // built. It is now, so what the body owes the reader is the two ways
+        // forward rather than an apology.
+        assert!(with_source.contains("Update"), "{with_source}");
         assert!(with_source.contains("Roblox page in Settings"), "{with_source}");
     }
 
@@ -1341,7 +1451,12 @@ mod tests {
     fn the_refusal_names_both_stores_rather_than_only_refusing() {
         assert!(STORES.contains("Google Play"), "{STORES}");
         assert!(STORES.contains("Amazon Appstore"), "{STORES}");
-        assert!(STORES.contains("mirror"), "{STORES}");
+        // It used to assert "mirror" here, because the sentence promised
+        // Cordial would never take a file from one. It does now, having first
+        // built the thing that makes that safe, so what the string owes the
+        // reader is the way forward: press Update, or choose your own APK.
+        assert!(STORES.contains("Press Update"), "{STORES}");
+        assert!(STORES.contains("Roblox page"), "{STORES}");
     }
 
     #[test]

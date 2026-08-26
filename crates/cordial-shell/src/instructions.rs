@@ -15,22 +15,21 @@
 //! discovering that Cordial has to be quit and started again before it will
 //! look a second time. It re-runs exactly the check that failed.
 //!
-//! ## The other button, and why the advice above it stays
+//! ## The other button
 //!
 //! Since [ADR-025](../../../docs/adr/ADR-025-fetching-from-a-third-party-mirror.md)
 //! Cordial can fetch the build itself, so there is a second button that does
-//! it. That does not make the instructions redundant and they are not being
-//! removed.
+//! it. The Sober advice stays because it is still the better route for anyone
+//! who would rather go through Google Play on their own account, and because
+//! somebody who already has Sober is finished before they press anything.
 //!
-//! The fetch goes to a mirror that is not Roblox. It is safe in the sense that
-//! matters -- every archive is verified against Roblox's own signing
-//! certificate before anything is installed, and a mirror that alters a byte is
-//! caught -- and it is still a third party that sees who asked, that can be
-//! down, and that some people will simply prefer not to use. Sober going
-//! through Google Play on the user's own account is a different trade and a
-//! reasonable one to want. **Presenting one route and hiding the other would be
-//! deciding that for them**, so both are on the screen with the difference
-//! stated in a sentence.
+//! **Where the download comes from is not written on this screen**, and that
+//! was a deliberate trim rather than an omission. A caption explaining a
+//! button before anybody has pressed it is clutter on the one screen a new
+//! user meets, and the provenance is not hidden: the README says it, the
+//! Updates page in Settings says it, and the line under the button says it
+//! while the download is running. What the screen owes a first-time user is a
+//! way forward, not a disclosure they cannot act on yet.
 
 use libadwaita as adw;
 use libadwaita::gtk;
@@ -51,14 +50,7 @@ const ANY_APK: &str = "Any APK of the official Android x86-64 build works; that 
                        least fiddly way to obtain one.";
 
 /// What the download button says before it is pressed.
-///
-/// It names the third party. A button that said only "Download Roblox" would
-/// be describing where the file comes from by omission, and the whole reason
-/// both routes are offered is so the user can choose between them knowingly.
-const FETCH: &str = "Download it for me";
-
-const FETCH_NOTE: &str = "Downloads from APKPure, a third-party mirror, and refuses to install \
-                          anything that is not signed by Roblox.";
+const FETCH: &str = "Download Roblox";
 
 /// Show the instructions, transient for `parent`.
 ///
@@ -122,10 +114,16 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
     fetch.set_halign(gtk::Align::Center);
     body.append(&fetch);
 
+    // One line under the button, and it is the progress line once the button is
+    // pressed. It starts empty rather than carrying a paragraph nobody asked
+    // for: the screen already says what Cordial does, and a caption explaining
+    // the button before anyone has pressed it is the clutter this screen was
+    // trimmed of.
     let fetch_note = gtk::Label::builder()
-        .label(FETCH_NOTE)
+        .label("")
         .wrap(true)
         .justify(gtk::Justification::Center)
+        .visible(false)
         .build();
     fetch_note.add_css_class("dim-label");
     fetch_note.add_css_class("caption");
@@ -176,7 +174,8 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
     fetch.connect_clicked(move |b| {
         b.set_sensitive(false);
         b.set_label("Working...");
-        note.remove_css_class("dim-label");
+        note.set_visible(true);
+        note.remove_css_class("error");
         note.set_label("Looking for a build...");
 
         let b = b.clone();

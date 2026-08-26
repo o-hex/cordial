@@ -1,0 +1,163 @@
+//! The facts Cordial observes at the platform boundary, and who may hear them.
+//!
+//! **Cordial knows what the engine is doing without hooking it, and that is
+//! not a trick -- it is the position.** Roblox's build runs on a bionic linker
+//! this project ported, against a libc shim it wrote, on a JNI VM standing in
+//! for ART, talking to a framework layer that answers every call the client
+//! makes into the platform. The looper it polls is ours. The surface it draws
+//! to is ours. The sockets, the paths, the audio streams and the input events
+//! all cross a boundary this codebase owns. Nothing has to be patched, traced
+//! or intercepted to know any of it, because it was already coming through
+//! here on its way in.
+//!
+//! That is what makes this bus possible under
+//! [ADR-001](../../../docs/adr/ADR-001-in-process-hooking.md), which forbids
+//! in-process code execution against the Roblox process permanently and in the
+//! strongest terms. An event here is not a hook; it is Cordial reporting what
+//! it was asked to do.
+//!
+//! ## Events are observations. They are never cancellable
+//!
+//! This is the line, and it is the one place this design deliberately parts
+//! company with the modding buses it otherwise resembles. NeoForge's events are
+//! cancellable because mods exist to change the game. A plugin here cannot
+//! change the game, and a cancellable platform event would be exactly the
+//! forbidden thing wearing a friendlier name: a plugin returning "handled" from
+//! a socket event is a plugin that can cut the engine's network; one vetoing a
+//! path event can deny it a file. That is in-process control of the client,
+//! reached through a callback rather than a patched instruction, and the
+//! distinction would not survive contact with anybody who wanted to abuse it.
+//!
+//! So delivery is one-way and the return value is nothing. A plugin that wants
+//! an effect asks for one through a capability Cordial performs -- ADR-007's
+//! rule, unchanged.
+//!
+//! **Cordial's own decisions are a different matter** and are not covered here.
+//! Whether *Cordial* shows a toast, or opens a URL in its own web view, is not
+//! the engine's behaviour and could sensibly be influenced one day. If that is
+//! ever built it wants its own name and its own ADR, precisely so nobody
+//! reaches for it as a way to make platform events vetoable after all.
+//!
+//! ## Delivery is lossy, and the loss is counted
+//!
+//! A push is a blocking write into a plugin's stdin. A plugin that stops
+//! reading fills the pipe -- 64 KiB on Linux -- and then **whoever published
+//! blocks**, which for a platform event is a thread the client is waiting on.
+//! The engine's looper is measured in millions of polls a second; it cannot
+//! wait behind a wedged plugin, and a bus that let it would be a worse bug than
+//! anything it was built to observe.
+//!
+//! So each plugin has a bounded queue and its own writer, and a publish that
+//! finds the queue full **drops the event and counts it**. Dropping is the
+//! honest outcome for an observation -- there is no correct way to make the
+//! client wait for a plugin to catch up -- and the count is what stops it being
+//! a silent one. `native/opensles.cpp` reports failure rather than handing back
+//! a dead engine object for the same reason: a gap that reports itself stays
+//! findable.
+//!
+//! Requests and their responses do **not** go through here and are not lossy.
+//! An answer nobody receives is a plugin hung waiting for it.
+//!
+//! ## Names are closed, and the prefix cannot be forged
+//!
+//! Every event below is a `&'static str` from the table in this file, so there
+//! is no path by which a name is assembled from anything a plugin said. They
+//! all sit under `cordial/`, which [`crate::events`] reserves as
+//! [`CORE_OWNER`](crate::events::CORE_OWNER) and refuses to let any plugin
+//! declare under -- so a plugin cannot mint a convincing `cordial/…` event and
+//! no subscriber has to wonder whether the one it received was real.
+
+use crate::capability::Capability;
+
+/// One thing Cordial observed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoreEvent {
+    /// A name from [`ALL`]. Never constructed from plugin input.
+    pub name: &'static str,
+    pub payload: serde_json::Value,
+}
+
+impl CoreEvent {
+    pub fn new(name: &'static str, payload: serde_json::Value) -> Self {
+        CoreEvent { name, payload }
+    }
+
+    /// The wire name, always namespaced.
+    pub fn wire_name(&self) -> String {
+        format!("{}/{}", crate::events::CORE_OWNER, self.name)
+    }
+}
+
+/// The client was asked to start.
+pub const CLIENT_LAUNCH: &str = "client.launch";
+/// The engine reported itself ready.
+pub const CLIENT_READY: &str = "client.ready";
+/// The client stopped, however it stopped.
+pub const CLIENT_SHUTDOWN: &str = "client.shutdown";
+/// The engine's version, once it is known.
+pub const ENGINE_VERSION: &str = "engine.version";
+/// The window Roblox draws into changed size.
+pub const WINDOW_RESIZED: &str = "window.resized";
+
+/// Every core event, with the capability that gates it.
+///
+/// **A closed table rather than a prefix convention**, for the reason
+/// [`crate::protocol::required_capability`] gives about methods: a typo has to
+/// fail as unknown rather than fall through to a check that happens to pass.
+/// A new event with no entry here is delivered to nobody, which is the safe
+/// direction and is asserted by a test.
+pub const ALL: &[(&str, Capability)] = &[
+    (CLIENT_LAUNCH, Capability::LifecycleRead),
+    (CLIENT_READY, Capability::LifecycleRead),
+    (CLIENT_SHUTDOWN, Capability::LifecycleRead),
+    (ENGINE_VERSION, Capability::LifecycleRead),
+    (WINDOW_RESIZED, Capability::LifecycleRead),
+];
+
+/// Which capability a plugin needs to hear `name`, or `None` if unknown.
+///
+/// **The capability is per event family, not one grant for the whole bus.**
+/// That matters more as the table grows: the events worth adding next are the
+/// ones Cordial is uniquely placed to see -- which paths the engine opened,
+/// which addresses it connected to, what it typed into -- and those are exactly
+/// the ones nobody should receive because they were once granted
+/// `lifecycle.read` to show a Discord status. A family that needs a new
+/// permission gets one.
+pub fn capability_for(name: &str) -> Option<Capability> {
+    ALL.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_event_is_namespaced_under_the_reserved_owner() {
+        for (name, _) in ALL {
+            let e = CoreEvent::new(name, serde_json::Value::Null);
+            assert!(e.wire_name().starts_with("cordial/"), "{}", e.wire_name());
+        }
+    }
+
+    /// **An event with no entry in the table reaches nobody.**
+    ///
+    /// The failure this prevents is the quiet one: somebody adds an event,
+    /// forgets the table, and it is delivered under whatever check the code
+    /// happened to fall through to. `None` here means "no capability admits
+    /// this", and `publish` sends it to no one.
+    #[test]
+    fn an_event_that_is_not_in_the_table_is_gated_by_nothing_and_so_goes_nowhere() {
+        assert_eq!(capability_for("client.launch"), Some(Capability::LifecycleRead));
+        assert_eq!(capability_for("network.connected"), None);
+        assert_eq!(capability_for(""), None);
+    }
+
+    #[test]
+    fn the_table_has_no_duplicate_names() {
+        let mut names: Vec<&str> = ALL.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "two entries share a name");
+    }
+}

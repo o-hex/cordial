@@ -106,9 +106,13 @@ fn discord_presence_follows_lifecycle_events_all_the_way_to_the_wire() {
                 sent_launch = true;
                 session.push_lifecycle("launch");
             }
-            if message.contains("presence.set on launch came back: ok") && !sent_shutdown {
+            if message.contains("presence.set on cordial/client.launch came back: ok") && !sent_shutdown {
                 sent_shutdown = true;
                 session.push_lifecycle("shutdown");
+                // Delivery is asynchronous (ADR-026), so the shutdown event
+                // has to be flushed or it loses the race against teardown --
+                // which is exactly the bug this line exists because of.
+                session.flush_events(std::time::Duration::from_secs(2));
             }
             logs.push(message);
             if logs.iter().any(|l| l.contains("presence.clear on shutdown came back")) {
@@ -124,7 +128,7 @@ fn discord_presence_follows_lifecycle_events_all_the_way_to_the_wire() {
 
     let joined = logs.join("\n");
     assert!(joined.contains("lifecycle.subscribe came back: ok"), "got:\n{joined}");
-    assert!(joined.contains("presence.set on launch came back: ok"), "got:\n{joined}");
+    assert!(joined.contains("presence.set on cordial/client.launch came back: ok"), "got:\n{joined}");
     assert!(joined.contains("presence.clear on shutdown came back: ok"), "got:\n{joined}");
 
     // And the wire: the fake Discord actually received a well-formed

@@ -63,6 +63,109 @@ impl Writer {
     }
 }
 
+/// A plugin's own delivery queue, so publishing never blocks the publisher.
+///
+/// **This exists because [`Plugin::push`] is a blocking write into a pipe.** A
+/// plugin that stops reading its stdin fills it -- 64 KiB on Linux -- and then
+/// whoever called `push` waits, indefinitely, on a process that may never read
+/// again. For a reply that is merely bad. For a platform event it is a thread
+/// the client is waiting on, and the engine's looper is measured in millions of
+/// polls a second; it cannot queue behind a wedged plugin.
+///
+/// So the write happens on a thread of the plugin's own and the publisher hands
+/// over a bounded queue instead. A full queue means the plugin is not keeping
+/// up, and the event is **dropped and counted** rather than waited on. Dropping
+/// is the honest outcome for an observation -- there is no correct way to make
+/// the client wait -- and the count is what keeps it from being silent.
+/// What one [`Session::publish`] achieved.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Delivered {
+    pub sent: usize,
+    /// Plugins whose queue was full. See [`Pump`] for why this is a number
+    /// rather than a stall.
+    pub dropped: usize,
+}
+
+pub struct Pump {
+    tx: std::sync::mpsc::SyncSender<Push>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Queued but not yet written. What [`Pump::flush`] waits on.
+    in_flight: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Deep enough to absorb a burst, shallow enough that a stuck plugin is
+/// noticed rather than accumulating minutes of stale events to deliver in one
+/// go when it wakes up. An event nobody read for a minute is not worth
+/// delivering late.
+const QUEUE_DEPTH: usize = 256;
+
+impl Pump {
+    pub fn start(writer: Writer) -> Pump {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Push>(QUEUE_DEPTH);
+        let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = in_flight.clone();
+        std::thread::spawn(move || {
+            // Ends when the Sender is dropped, which happens when the Plugin
+            // does. A write error ends it too: the plugin is gone, and
+            // retrying into a closed pipe would spin.
+            for push in rx {
+                let failed = writer.push(&push).is_err();
+                counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                if failed {
+                    break;
+                }
+            }
+        });
+        Pump {
+            tx,
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            in_flight,
+        }
+    }
+
+    /// Queue `push`, or count a drop. Never blocks.
+    pub fn offer(&self, push: Push) -> bool {
+        // Counted before the send, so a flush racing an offer waits for it
+        // rather than missing it. An over-count is corrected below.
+        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        match self.tx.try_send(push) {
+            Ok(()) => true,
+            Err(_) => {
+                self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Wait for what is queued to reach the plugin, up to `limit`.
+    ///
+    /// **Without this a plugin never learns the client shut down.** Delivery is
+    /// asynchronous by design, so a publish followed by an exit is a race the
+    /// exit wins: the pump thread is still holding the last event when the
+    /// process goes. That is fine for an observation nobody is waiting on and
+    /// wrong for the final one, which is the whole point of a shutdown event.
+    ///
+    /// Bounded, because a plugin that has stopped reading must not be able to
+    /// hold up Cordial's exit -- which would be the blocking-publish hazard
+    /// arriving at the one moment it is least welcome. Returns whether the
+    /// queue actually drained.
+    pub fn flush(&self, limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while self.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        true
+    }
+}
+
 pub struct Plugin {
     pub id: String,
     /// What this plugin's manifest declares it wants asked (ADR-020), so the
@@ -76,6 +179,9 @@ pub struct Plugin {
     child: Child,
     writer: Writer,
     stdout: BufReader<ChildStdout>,
+    /// Created on first use, because a plugin nobody publishes to should not
+    /// cost a thread.
+    pump: Option<Pump>,
 }
 
 impl Plugin {
@@ -111,6 +217,7 @@ impl Plugin {
             child,
             writer: Writer(Arc::new(Mutex::new(stdin))),
             stdout,
+            pump: None,
         })
     }
 
@@ -147,6 +254,17 @@ impl Plugin {
     /// reply to one of its own requests.
     pub fn push(&mut self, push: &Push) -> std::io::Result<()> {
         self.writer.write_line(&serde_json::to_string(push).expect("Push always serialises"))
+    }
+
+    /// Queue a push without blocking. See [`Pump`].
+    pub fn offer(&mut self, push: Push) -> bool {
+        let writer = self.writer.clone();
+        self.pump.get_or_insert_with(|| Pump::start(writer)).offer(push)
+    }
+
+    /// How many events this plugin was too slow to receive.
+    pub fn dropped(&self) -> u64 {
+        self.pump.as_ref().map(Pump::dropped).unwrap_or(0)
     }
 
     /// A cloneable handle to this plugin's stdin, for a host that wants to
@@ -267,17 +385,96 @@ impl Session {
     /// simply not sent rather than answered with a denial nobody is waiting
     /// for.
     pub fn push_lifecycle(&mut self, event: &str) {
+        // Kept as the shorthand the lifecycle call sites already use. It maps
+        // onto the core bus rather than being a second delivery path, because
+        // two of those would drift and only one of them would have the
+        // capability table.
+        let name = match event {
+            "launch" => crate::core_events::CLIENT_LAUNCH,
+            "ready" => crate::core_events::CLIENT_READY,
+            "shutdown" => crate::core_events::CLIENT_SHUTDOWN,
+            // An unknown lifecycle string reaches nobody rather than being
+            // forwarded raw. The old version pushed whatever it was given,
+            // which meant a typo at a call site became an event no plugin
+            // could match and nothing said so.
+            other => {
+                println!("[plugin] ignoring unknown lifecycle event {other:?}");
+                return;
+            }
+        };
+        self.publish_core(&crate::core_events::CoreEvent::new(name, serde_json::Value::Null));
+    }
+
+    /// Deliver one core event to every plugin entitled to hear it.
+    ///
+    /// `publish_core` rather than `publish`, which belongs to `events.publish`
+    /// and is a plugin publishing to other plugins. Two different buses with
+    /// two different authorisation rules; sharing a name would invite somebody
+    /// to assume they share anything else.
+    ///
+    /// **Never blocks, and never fails.** Publishing is something the client
+    /// does on its way past; there is no answer to wait for and nothing
+    /// sensible to do about a plugin that is not listening. What comes back is
+    /// how many heard it and how many were too slow, so a caller that wants to
+    /// notice can.
+    ///
+    /// A plugin hears an event when it holds the capability the event's family
+    /// requires -- see [`crate::core_events::capability_for`]. An event absent
+    /// from that table requires a capability nobody has, so it reaches no one;
+    /// that is deliberate and is the safe direction for a name somebody added
+    /// and forgot to gate.
+    pub fn publish_core(&mut self, event: &crate::core_events::CoreEvent) -> Delivered {
+        let Some(needed) = crate::core_events::capability_for(event.name) else {
+            println!(
+                "[plugin] core event {:?} has no capability in the table, so nobody receives it",
+                event.name
+            );
+            return Delivered::default();
+        };
+
         let recipients: Vec<String> = self
             .plugins
             .keys()
-            .filter(|id| self.broker.granted(id).contains(&Capability::LifecycleRead))
+            .filter(|id| self.broker.granted(id).contains(&needed))
             .cloned()
             .collect();
+
+        let push = Push { event: event.wire_name(), payload: event.payload.clone() };
+        let mut delivered = Delivered::default();
         for id in recipients {
             if let Some(plugin) = self.plugins.get_mut(&id) {
-                let _ = plugin.push(&Push { event: event.to_string(), payload: serde_json::Value::Null });
+                if plugin.offer(push.clone()) {
+                    delivered.sent += 1;
+                } else {
+                    delivered.dropped += 1;
+                }
             }
         }
+        delivered
+    }
+
+    /// Wait for queued events to reach every plugin, up to `limit` each.
+    ///
+    /// **Call this before Cordial exits.** See [`Pump::flush`]: without it the
+    /// shutdown event loses a race against the process ending, and the last
+    /// thing a plugin is told is the one thing it never hears.
+    pub fn flush_events(&mut self, limit: std::time::Duration) -> bool {
+        let mut all = true;
+        for plugin in self.plugins.values_mut() {
+            if let Some(pump) = plugin.pump.as_ref() {
+                all &= pump.flush(limit);
+            }
+        }
+        all
+    }
+
+    /// Total events each plugin was too slow to receive, for a report.
+    pub fn dropped_by_plugin(&self) -> Vec<(String, u64)> {
+        self.plugins
+            .iter()
+            .map(|(id, p)| (id.clone(), p.dropped()))
+            .filter(|(_, n)| *n > 0)
+            .collect()
     }
 
     /// Authorise, then perform, one call from `plugin_id`.
@@ -394,6 +591,103 @@ mod tests {
 
     fn req(method: &str) -> Request {
         Request { id: 1, method: method.into(), params: serde_json::Value::Null }
+    }
+
+    /// **Publishing takes bounded time however slow the consumer is, and the
+    /// overflow is counted.**
+    ///
+    /// The hazard is real: a push is a blocking write into a pipe, and a
+    /// plugin that stops reading fills it -- 64 KiB on Linux -- after which
+    /// whoever published waits on a process that may never read again. For a
+    /// platform event that is a thread the client is waiting on.
+    ///
+    /// **What this test does *not* do is wedge a plugin**, and the first
+    /// version of this comment claimed it did. Measured: swapping `offer` back
+    /// for the blocking `push` does not hang the loop, it fails it in 0.38 s,
+    /// because the fixture process exits and the pipe then returns `EPIPE`
+    /// immediately rather than blocking. A genuinely wedged consumer -- alive,
+    /// holding the pipe open, never reading -- is a harder fixture than this
+    /// and does not exist here yet.
+    ///
+    /// So what is actually demonstrated is the property that matters anyway:
+    /// 4000 events at 4 KiB each, published in about 6 ms, with 3735 of them
+    /// dropped and counted because the writer thread could not drain that
+    /// fast. The publisher's cost does not depend on the reader's speed. That
+    /// is the guarantee the engine's looper needs, and the drop count is what
+    /// keeps the loss from being silent.
+    #[test]
+    fn publishing_is_bounded_time_and_counts_what_it_could_not_deliver() {
+        if std::process::Command::new("deno").arg("--version").output().is_err() {
+            eprintln!("skipping: deno is not installed");
+            return;
+        }
+        let entry = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/events_subscriber.ts");
+        let mut session = Session::default();
+        session.broker.grant("wedged", [Capability::LifecycleRead]);
+        session
+            .plugins
+            .insert("wedged".into(), Plugin::spawn("wedged", &entry).expect("deno should start"));
+
+        // Comfortably more than QUEUE_DEPTH and more than a pipe will take,
+        // with a payload big enough that it cannot all be buffered.
+        let big = serde_json::json!({ "pad": "x".repeat(4096) });
+        let started = std::time::Instant::now();
+        let mut dropped = 0usize;
+        for _ in 0..4000 {
+            let d = session.publish_core(&crate::core_events::CoreEvent::new(
+                crate::core_events::CLIENT_READY,
+                big.clone(),
+            ));
+            dropped += d.dropped;
+        }
+        let took = started.elapsed();
+
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "publishing 4000 events took {took:?}; the publisher's cost is \
+             tracking the reader's speed, which is the thing the pump exists to \
+             prevent"
+        );
+        // And the loss is counted rather than silent -- that is the whole
+        // trade this design makes.
+        assert!(dropped > 0, "a consumer this far behind should have missed something");
+        assert_eq!(
+            session.dropped_by_plugin().first().map(|(id, _)| id.as_str()),
+            Some("wedged")
+        );
+        eprintln!("published 4000 in {took:?}, {dropped} dropped");
+    }
+
+    /// **The capability is what admits you, not being a plugin.**
+    #[test]
+    fn a_core_event_reaches_only_plugins_holding_its_capability() {
+        if std::process::Command::new("deno").arg("--version").output().is_err() {
+            eprintln!("skipping: deno is not installed");
+            return;
+        }
+        let entry = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/events_subscriber.ts");
+        let mut session = Session::default();
+        session.broker.grant("listener", [Capability::LifecycleRead]);
+        // Granted something else entirely. A plugin with capabilities is not
+        // a plugin with *this* capability, and the bus must not confuse the
+        // two -- which is exactly what a single "may receive events" grant
+        // would do once the table grows past lifecycle.
+        session.broker.grant("bystander", [Capability::Log]);
+        session
+            .plugins
+            .insert("listener".into(), Plugin::spawn("listener", &entry).expect("deno"));
+        session
+            .plugins
+            .insert("bystander".into(), Plugin::spawn("bystander", &entry).expect("deno"));
+
+        let d = session.publish_core(&crate::core_events::CoreEvent::new(
+            crate::core_events::CLIENT_LAUNCH,
+            serde_json::Value::Null,
+        ));
+        assert_eq!(d.sent, 1, "exactly the one holding lifecycle.read");
+        assert_eq!(d.dropped, 0);
     }
 
     /// A cloned [`Writer`] really does deliver to the same process, from a

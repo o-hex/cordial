@@ -80,16 +80,25 @@ function call(method: string, params: unknown = {}): Promise<any> {
 
 const log = (message: string) => call("log.write", { message });
 
+// Core events are namespaced `cordial/...` (ADR-026). The prefix is reserved
+// and cannot be declared by a plugin, so a name that arrives with it is one
+// Cordial published -- which is the point of carrying it. These used to arrive
+// as bare "launch"/"ready"/"shutdown"; anything still matching those is looking
+// for events that no longer exist.
+const LAUNCH = "cordial/client.launch";
+const READY = "cordial/client.ready";
+const SHUTDOWN = "cordial/client.shutdown";
+
 async function onLifecycleEvent(event: string) {
-  if (event === "launch" || event === "ready") {
+  if (event === LAUNCH || event === READY) {
     const res = await call("presence.set", {
       client_id: CLIENT_ID,
       details: "Using Cordial",
-      state: event === "launch" ? "Starting up" : "In session",
+      state: event === LAUNCH ? "Starting up" : "In session",
       start: Math.floor(Date.now() / 1000),
     });
     await log(`presence.set on ${event} came back: ${res.status}`);
-  } else if (event === "shutdown") {
+  } else if (event === SHUTDOWN) {
     const res = await call("presence.clear");
     await log(`presence.clear on shutdown came back: ${res.status}`);
   } else {

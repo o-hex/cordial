@@ -1,6 +1,6 @@
 pkgbase = cordial-git
 	pkgdesc = Roblox's official Android build, run natively on Linux -- you supply the APK, none is shipped or downloadable
-	pkgver = 0.6.0.r108.g9d9c980
+	pkgver = 0.7.0.r0.gbdad524
 	pkgrel = 1
 	url = https://github.com/luohoa97/cordial
 	install = cordial-git.install
@@ -11,6 +11,9 @@ pkgbase = cordial-git
 	makedepends = cmake
 	makedepends = clang
 	makedepends = pkgconf
+	makedepends = libpipewire
+	makedepends = libpulse
+	makedepends = alsa-lib
 	depends = gtk4
 	depends = libadwaita
 	depends = webkitgtk-6.0

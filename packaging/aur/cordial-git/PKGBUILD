@@ -63,7 +63,7 @@ makedepends=(
   # naming neither the tool nor the cause.
   'clang'
   'pkgconf'
-  # Headers only, for the two audio backends. Both libraries are dlopen'd and
+  # Headers only, for the three audio backends. Both libraries are dlopen'd and
   # neither is linked, so these add nothing to `depends` -- but leaving either
   # out silently compiles the "unavailable" arm of that backend instead of
   # failing the build, which is a loss of audio nobody would attribute to

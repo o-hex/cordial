@@ -39,16 +39,19 @@ flatpak run io.github.luohoa97.Cordial
 ```
 
 **You also need Roblox's Android build, which Cordial does not ship and never
-will.** On first run Cordial offers three ways to get one, and you pick:
+will.** First run has one button — **Download Roblox** — and that is the whole
+procedure. Cordial fetches the build from APKPure, a third-party mirror, and
+**refuses to install anything that is not signed by Roblox's own signing
+certificate**, so a mirror that alters a byte is caught rather than trusted.
 
-- **Already have [Sober](https://sober.vinegarhq.org/)?** Then you are done.
-  Cordial finds the APK Sober downloaded and uses it where it lies — no copy, no
-  modification, and Sober keeps working.
-- **Press "Download it for me."** Cordial fetches the build from APKPure, a
-  third-party mirror, and **refuses to install anything that is not signed by
-  Roblox's own signing certificate** — so a mirror that alters a byte is caught
-  rather than trusted. It is still a third party that can be down and that sees
-  who asked, which is why it is a button and not the default.
+It waits for the press rather than starting on its own. This is a few hundred
+megabytes and somebody may be paying for it by the megabyte.
+
+You never have to press it if a build is already on the machine:
+
+- **Already have [Sober](https://sober.vinegarhq.org/)?** Then there is nothing
+  to press. Cordial finds the APK Sober downloaded and uses it where it lies —
+  no copy, no modification, and Sober keeps working.
 - **Supply your own APK** and point Cordial at it in Settings, or see
   [§1](#1-what-you-need). It gets the same signature check.
 
@@ -280,12 +283,15 @@ of memory apiece.
 
 From an installed APK you need the `lib/x86_64/` objects and the base APK.
 
-**The shortest route to one is Sober.** [Sober](https://sober.vinegarhq.org/)
-downloads Roblox's Android build for its own use, and Cordial looks for it
-there — `~/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/`. Nothing is
-copied and nothing is modified; Cordial reads the APK where it already is. So
-"install Sober, then install Cordial" is a complete answer to this requirement,
-and it is what most people in the Discord end up doing. You are free to keep
+**The shortest route to one is the Download Roblox button**, which fetches and
+verifies a build without you leaving Cordial. That is new; it used to be
+"install Sober first", and that answer still works.
+
+[Sober](https://sober.vinegarhq.org/) downloads Roblox's Android build for its
+own use, and Cordial still looks for it there —
+`~/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/`. Nothing is copied
+and nothing is modified; Cordial reads the APK where it already is. If you have
+Sober, Cordial finds its build and never asks you for one. You are free to keep
 using Sober afterwards, or not.
 
 If you have an APK of your own, Settings takes a path to it, and `--apk` takes
@@ -682,9 +688,10 @@ accurate one:
   records what Sober binds at the protocol level, and it exists because a claim
   made here about Sober's text input was wrong and needed checking against the
   real thing.
-- **It is how most people get the Roblox build.** The quickstart above says
-  "install Sober" because Sober downloads the Android build, and Cordial reads
-  it where it lies.
+- **It was how everybody here got the Roblox build**, for as long as Cordial
+  could not fetch one itself. Cordial downloads its own now, but it still reads
+  Sober's where it lies, so an existing Sober install remains a complete answer
+  to the requirement.
 
 **What was not taken, and could not be: Sober's code.** It is not
 source-available. Nothing was decompiled, disassembled or copied. What was used

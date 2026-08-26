@@ -333,6 +333,51 @@ fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
 /// changelog request, and the NetworkManager property the Updates page shows.
 /// `metered::query` is a blocking D-Bus call with zbus's own timeout in front of
 /// it, so building a settings page must not be what waits on it.
+/// [`on_worker`], for work that has something to say while it runs.
+///
+/// The long fetch needed this and the plain version could not give it: it
+/// delivers one value at the end, and a 229 MB download that says nothing for
+/// four minutes is indistinguishable from a hung window. Two channels rather
+/// than one, drained by the same timer, so progress and the result cannot
+/// arrive out of order.
+///
+/// `report` is handed to the worker as a plain closure, so the code doing the
+/// work does not have to know it is being watched.
+pub(crate) fn on_worker_reporting<T: Send + 'static>(
+    work: impl FnOnce(&dyn Fn(String)) -> T + Send + 'static,
+    progress: impl Fn(String) + 'static,
+    then: impl FnOnce(T) + 'static,
+) {
+    let (ptx, prx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::channel::<T>();
+    std::thread::spawn(move || {
+        let value = work(&|line| {
+            // Nobody is owed this if the window has gone.
+            let _ = ptx.send(line);
+        });
+        let _ = tx.send(value);
+    });
+
+    let mut then = Some(then);
+    glib::timeout_add_local(POLL, move || {
+        // Progress first and all of it, so the last line before a result is
+        // the one shown rather than one the result raced past.
+        while let Ok(line) = prx.try_recv() {
+            progress(line);
+        }
+        match rx.try_recv() {
+            Ok(value) => {
+                if let Some(then) = then.take() {
+                    then(value);
+                }
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
+}
+
 fn on_worker<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
     then: impl Fn(T) + 'static,

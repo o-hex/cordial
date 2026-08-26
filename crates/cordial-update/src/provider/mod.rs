@@ -254,6 +254,52 @@ pub fn obtain(
     })
 }
 
+/// Obtain a build and make it the one Cordial launches.
+///
+/// The whole thing, and the one call the shell needs: choose a source, fetch,
+/// verify against the pinned certificates, apply ADR-014's extraction refusals,
+/// extract the engine, and swap it in in an order that keeps a working build
+/// working if any step fails.
+///
+/// `staging` is where a downloading source writes. It is emptied first, because
+/// anything an interrupted attempt left there was never verified and is exactly
+/// the file the ordering exists to keep away from the live build.
+pub fn obtain_and_install(
+    preferred: Option<&str>,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<(Obtained, crate::install::Installed), Unreachable> {
+    let staging = crate::install::build_dir().join(".fetching");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+
+    let outcome = (|| {
+        let obtained = obtain(preferred, &staging, progress)?;
+        let mut named: Vec<(&'static str, PathBuf)> =
+            vec![(crate::install::BASE_APK, obtained.archives.base.clone())];
+        // A monolithic archive is one file and must be named once. Handing the
+        // same path in twice would have `adopt` copy it to both names and then
+        // look for the engine in whichever it found first, which works by
+        // accident and doubles the disk it takes.
+        if obtained.archives.split != obtained.archives.base {
+            named.push((crate::install::SPLIT_APK, obtained.archives.split.clone()));
+        }
+
+        let installed = crate::install::adopt(
+            &named,
+            &crate::install::build_dir(),
+            &crate::install::engine_dir(),
+            &crate::install::engine_dir().join(".incoming"),
+            &mut |_, _, _| {},
+        )
+        .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+        Ok((obtained, installed))
+    })();
+
+    let _ = std::fs::remove_dir_all(&staging);
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -297,9 +297,33 @@ fn staged(
         fetched.push((name, path));
     }
 
+    adopt(&fetched, build, engine_into, incoming, progress)
+}
+
+/// Take archives that are already on disk and make them the build in use.
+///
+/// Split out of [`staged`] so that [`crate::provider`] can reach the same
+/// sequence with files it obtained and verified itself, rather than through
+/// [`Parts`] and a URL. Everything after "the bytes are here" is identical and
+/// having two copies of it would be how the two paths drift.
+///
+/// **A file that is not already in the staging area is copied, not moved.** The
+/// local provider hands back the archive at the path it already occupies, which
+/// on most machines is Sober's own package directory -- renaming it into
+/// Cordial's cache would take Roblox out from underneath Sober and break a
+/// working program to install this one. Inside staging a rename is correct and
+/// is what happens, because those files were fetched for this.
+pub fn adopt(
+    fetched: &[(&'static str, PathBuf)],
+    build: &Path,
+    engine_into: &Path,
+    incoming: &Path,
+    progress: Progress<'_>,
+) -> Result<Installed, Failed> {
+    let _ = progress;
     // Every refusal in ADR-014's list, against each archive, before anything is
     // taken out of any of them.
-    for (_, path) in &fetched {
+    for (_, path) in fetched {
         apk::inspect(path, apk::Limits::default())?;
     }
 
@@ -307,7 +331,7 @@ fn staged(
     // carries it in `base.apk` and a split build does not, and assuming either
     // is the mistake this refuses on behalf of.
     let mut carrier = None;
-    for (name, path) in &fetched {
+    for (name, path) in fetched {
         if apk::holds(path, apk::LIBRARY_IN_APK)? {
             carrier = Some((*name, path.clone()));
             break;
@@ -331,12 +355,23 @@ fn staged(
     // rather than the old engine claiming to belong to the new archives.
     cache::clear_stamp(engine_into);
 
+    std::fs::create_dir_all(build)
+        .map_err(|e| Failed::Io { path: build.display().to_string(), why: e.to_string() })?;
     let mut base = build.join(BASE_APK);
     let mut carrier_live = build.join(carrier_name);
-    for (name, path) in &fetched {
+    for (name, path) in fetched {
         let live = build.join(name);
-        std::fs::rename(path, &live)
-            .map_err(|e| Failed::Io { path: live.display().to_string(), why: e.to_string() })?;
+        if path == &live {
+            // Already where it belongs. Renaming a file onto itself is not an
+            // error but copying one onto itself truncates it, so this case is
+            // checked rather than discovered.
+        } else if path.starts_with(build) {
+            std::fs::rename(path, &live)
+                .map_err(|e| Failed::Io { path: live.display().to_string(), why: e.to_string() })?;
+        } else {
+            std::fs::copy(path, &live)
+                .map_err(|e| Failed::Io { path: live.display().to_string(), why: e.to_string() })?;
+        }
         if *name == BASE_APK {
             base = live.clone();
         }
@@ -371,6 +406,41 @@ mod tests {
     use crate::sha256::Sha256Hash;
     use std::io::{BufRead, Write};
     use std::net::TcpListener;
+
+    /// **A source outside the staging area must be copied and left alone.**
+    ///
+    /// The local provider hands back the archive where it already is, and on
+    /// most machines that is Sober's package directory. Renaming it into
+    /// Cordial's cache would take Roblox out from underneath Sober -- breaking
+    /// a working program in order to install this one, silently, on the happy
+    /// path. This is the test that says it does not.
+    #[test]
+    fn adopting_a_build_from_elsewhere_does_not_move_it_out_of_elsewhere() {
+        let root = scratch("adopt-elsewhere");
+        let theirs = root.join("someone-elses");
+        std::fs::create_dir_all(&theirs).unwrap();
+        let their_apk = theirs.join("base.apk");
+        std::fs::write(&their_apk, zip_of(&[(apk::LIBRARY_IN_APK, b"\x7fELF fake engine 1.2.3")]))
+            .unwrap();
+
+        let build = root.join("build");
+        let engine_into = root.join("engine");
+        std::fs::create_dir_all(&engine_into).unwrap();
+
+        let installed = adopt(
+            &[(BASE_APK, their_apk.clone())],
+            &build,
+            &engine_into,
+            &engine_into.join(STAGING),
+            &mut |_, _, _| {},
+        )
+        .expect("a universal APK carrying the engine installs");
+
+        assert!(their_apk.is_file(), "the source archive was moved rather than copied");
+        assert!(installed.base.starts_with(&build), "the live copy is not under the build dir");
+        assert_ne!(installed.base, their_apk);
+        assert!(installed.engine.is_file());
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("cordial-update-install-{tag}"));

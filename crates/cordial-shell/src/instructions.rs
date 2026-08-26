@@ -14,12 +14,30 @@
 //! instructions means installing Sober, waiting for a download, and then
 //! discovering that Cordial has to be quit and started again before it will
 //! look a second time. It re-runs exactly the check that failed.
+//!
+//! ## The other button, and why the advice above it stays
+//!
+//! Since [ADR-025](../../../docs/adr/ADR-025-fetching-from-a-third-party-mirror.md)
+//! Cordial can fetch the build itself, so there is a second button that does
+//! it. That does not make the instructions redundant and they are not being
+//! removed.
+//!
+//! The fetch goes to a mirror that is not Roblox. It is safe in the sense that
+//! matters -- every archive is verified against Roblox's own signing
+//! certificate before anything is installed, and a mirror that alters a byte is
+//! caught -- and it is still a third party that sees who asked, that can be
+//! down, and that some people will simply prefer not to use. Sober going
+//! through Google Play on the user's own account is a different trade and a
+//! reasonable one to want. **Presenting one route and hiding the other would be
+//! deciding that for them**, so both are on the screen with the difference
+//! stated in a sentence.
 
 use libadwaita as adw;
 use libadwaita::gtk;
 use libadwaita::prelude::*;
 
 use crate::install;
+use crate::updater;
 
 /// The advice itself, kept as one constant so that it is quotable, testable,
 /// and impossible to reword by halves.
@@ -31,6 +49,16 @@ const COMMANDS: &str = "flatpak install flathub org.vinegarhq.Sober\n\
 
 const ANY_APK: &str = "Any APK of the official Android x86-64 build works; that is simply the \
                        least fiddly way to obtain one.";
+
+/// What the download button says before it is pressed.
+///
+/// It names the third party. A button that said only "Download Roblox" would
+/// be describing where the file comes from by omission, and the whole reason
+/// both routes are offered is so the user can choose between them knowingly.
+const FETCH: &str = "Download it for me";
+
+const FETCH_NOTE: &str = "Downloads from APKPure, a third-party mirror, and refuses to install \
+                          anything that is not signed by Roblox.";
 
 /// Show the instructions, transient for `parent`.
 ///
@@ -88,8 +116,22 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
     looked.set_can_focus(false);
     body.append(&looked);
 
+    let fetch = gtk::Button::with_label(FETCH);
+    fetch.add_css_class("suggested-action");
+    fetch.add_css_class("pill");
+    fetch.set_halign(gtk::Align::Center);
+    body.append(&fetch);
+
+    let fetch_note = gtk::Label::builder()
+        .label(FETCH_NOTE)
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .build();
+    fetch_note.add_css_class("dim-label");
+    fetch_note.add_css_class("caption");
+    body.append(&fetch_note);
+
     let button = gtk::Button::with_label("Check again and start Roblox");
-    button.add_css_class("suggested-action");
     button.add_css_class("pill");
     button.set_halign(gtk::Align::Center);
     body.append(&button);
@@ -114,14 +156,82 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
         .content(&toolbar)
         .build();
 
+    let retry = std::rc::Rc::new(retry);
+
     let to_close = window.clone();
+    let on_retry = retry.clone();
     button.connect_clicked(move |_| {
-        if retry() {
+        if on_retry() {
             to_close.close();
         }
     });
 
+    // The fetch runs off the main thread and reports as it goes. **A button
+    // that goes dead for four minutes reads as a crash**, and a 229 MB
+    // download takes about that, so the note underneath becomes the progress
+    // line rather than leaving the user watching a frozen window.
+    let to_close = window.clone();
+    let on_retry = retry;
+    let note = fetch_note.clone();
+    fetch.connect_clicked(move |b| {
+        b.set_sensitive(false);
+        b.set_label("Working...");
+        note.remove_css_class("dim-label");
+        note.set_label("Looking for a build...");
+
+        let b = b.clone();
+        let note = note.clone();
+        let failed_note = note.clone();
+        let to_close = to_close.clone();
+        let on_retry = on_retry.clone();
+        updater::on_worker_reporting(
+            |report| {
+                cordial_update::provider::obtain_and_install(None, &mut |p| report(describe(&p)))
+                    .map(|(got, _)| format!("{} from {}", got.version.name, got.provider))
+                    .map_err(|e| e.to_string())
+            },
+            move |line| note.set_label(&line),
+            move |outcome| match outcome {
+                Ok(what) => {
+                    b.set_label(&format!("Installed {what}"));
+                    // The window closes only if the build actually starts, the
+                    // same rule the other button follows: an install that
+                    // cannot be launched is not a finished task.
+                    if on_retry() {
+                        to_close.close();
+                    }
+                }
+                Err(why) => {
+                    // **The message says what could not be reached, verbatim.**
+                    // "Download failed" is the message this project has spent
+                    // whole afternoons on: a mirror being down and a machine
+                    // having no network look identical from in here, and only
+                    // one of them is the user's to fix.
+                    b.set_sensitive(true);
+                    b.set_label(FETCH);
+                    failed_note.set_label(&why);
+                    failed_note.add_css_class("error");
+                }
+            },
+        );
+    });
+
     window.present();
+}
+
+/// One line of progress, in words rather than in the enum's shape.
+fn describe(p: &cordial_update::provider::Progress) -> String {
+    use cordial_update::provider::Progress;
+    match p {
+        Progress::Asking { provider } => format!("Asking {provider}..."),
+        // Bytes rather than a percentage when the server did not say how many
+        // there are, because a bar that invents a total is worse than no bar.
+        Progress::Fetching { done, total: Some(t), .. } => {
+            format!("Downloading: {} of {} MB", done / 1_048_576, t / 1_048_576)
+        }
+        Progress::Fetching { done, .. } => format!("Downloading: {} MB", done / 1_048_576),
+        Progress::Verifying { file } => format!("Checking {file} is signed by Roblox..."),
+    }
 }
 
 #[cfg(test)]

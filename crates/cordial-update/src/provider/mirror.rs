@@ -570,6 +570,16 @@ impl Provider for ApkPure {
     /// the filter would let an ARM-only release become "the newest version",
     /// and every step after this would then be working towards a build that
     /// cannot start.
+    ///
+    /// That was written as a hypothetical and it is now a measurement. On
+    /// 2026-08-26 the narrow filter answered 2.734.917 while the broad one
+    /// answered 2.735.1138, which looked like the filter hiding a newer build.
+    /// Reading both of 2.735.1138's XAPK bundles -- by their ZIP central
+    /// directories over range requests, 600 kB rather than 276 MB -- shows
+    /// `config.armeabi_v7a.apk` in one and `config.arm64_v8a.apk` in the other
+    /// and **no `config.x86_64.apk` in either**. The narrow filter was right
+    /// and a retry here would have chased a build with nothing in it Cordial
+    /// can execute. `docs/analysis/apk-mirrors.md` has the entry lists.
     fn newest(&self, progress: &mut dyn FnMut(Progress)) -> Result<Available, Unreachable> {
         progress(Progress::Asking { provider: self.name() });
         let mirror = Mirror::configured()?;

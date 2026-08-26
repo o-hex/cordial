@@ -14,8 +14,8 @@ useless, the obvious one is unreachable, and the two that would work are HTML.
 | **APKPure** | 200 | 2.734.917 (code 2908) | binary, no schema | in use |
 | **Aptoide** | 200, documented JSON API | 2.158.48944, code 10 | JSON | **refused by our own verifier** |
 | **APKMirror** | **403** | — | — | out |
-| **APKCombo** | 200 | 2.735.1138 | HTML only | possible, scraping |
-| **Uptodown** | 200 | 2.735 | HTML only | possible, scraping |
+| **APKCombo** | 200 | 2.735.1138 (ARM only) | HTML only | possible, scraping |
+| **Uptodown** | 200 | 2.735 (unchecked) | HTML only | possible, scraping |
 | **F-Droid** | 404 for this package | — | JSON | not applicable; FOSS only |
 
 ## Aptoide is the interesting failure
@@ -70,25 +70,47 @@ whole of the design rather than a formality. The provider with the best API is
 the one serving something unusable, and the check caught it on the first
 property that failed.
 
-## APKPure is one minor version behind, and that is the real argument
+## APKPure is not behind. Settled, and the narrow filter is why
 
-Asked on the same afternoon, minutes apart:
+Asked on the same afternoon:
 
 ```text
 APKPure  (x-abis: x86_64)   newest 2.734.917
 APKCombo (listing page)     2.735.1138, 2.734.917, 2.734.916
 ```
 
-**Read that carefully before treating it as a defect.** Cordial asks APKPure
-with `x-abis: x86_64`, which is deliberately narrow, and APKCombo's listing is
-not filtered by architecture at all. So 2.735.1138 may well exist only for arm64
-so far, in which case APKPure is not behind -- it is answering the question it
-was asked. Establishing which would mean fetching 2.735.1138 and looking inside
-it, and that has not been done.
+That looked like APKPure trailing by a version, and it is not. Asked again with
+the broad filter, `x-abis: arm64-v8a,armeabi-v7a,armeabi,x86,x86_64`, APKPure
+returns 2.735.1138 as its newest -- so it **has** the build and deliberately
+withheld it from the narrow answer.
 
-What the comparison does establish is that a second provider would buy something
-beyond availability if the gap turns out to be real, and that this is worth
-measuring again before anybody builds one.
+Settled by reading each artefact's ZIP central directory over HTTP range
+requests, which costs about 600 kB rather than the 276 MB the two files weigh.
+APKPure offers 2.735.1138 as two XAPK bundles, and here is every entry in each:
+
+```text
+variant 1 (142 443 839 bytes)      variant 2 (133 928 223 bytes)
+  99 207 485  com.roblox.client.apk    85 203 261  com.roblox.client.apk
+  43 226 350  config.armeabi_v7a.apk   48 714 968  config.arm64_v8a.apk
+       6 477  icon.png                      6 477  icon.png
+       2 965  manifest.json                 2 959  manifest.json
+```
+
+**No `config.x86_64.apk` in either.** 2.735.1138 is published for 32-bit ARM and
+64-bit ARM and not for x86-64, so there is nothing in it Cordial could run, and
+2.734.917 genuinely is the newest x86-64 build APKPure has.
+
+This retires the freshness argument for a second provider. It also turns a
+design decision into a measured one. `mirror.rs` sends the narrow filter when
+asking what the newest version is and **never retries broad**, on the reasoning
+that widening it would let an ARM-only release become "the newest version" and
+send every step afterwards chasing a build that cannot start. That was written
+as a hypothetical. It is now a thing that happened, on the current release, on
+the day it was checked.
+
+The broad retry stays where it belongs: on *downloading a named version*, where
+the archive is opened and checked for `lib/x86_64/libroblox.so` directly, so
+widening buys availability and cannot buy a wrong answer.
 
 ## If a second provider is built, APKCombo over Uptodown
 
@@ -110,6 +132,10 @@ guarantee for exactly this case.
 ## Repeating this
 
 ```bash
+# Is a given version built for x86-64? Reads the central directory only.
+curl -sSL -r 0-1 -D - -o /dev/null "$XAPK_URL"        # total size from Content-Range
+curl -sSL -r $((TOTAL-200000))-$((TOTAL-1)) "$XAPK_URL" -o tail.bin
+
 # Aptoide
 curl -sS 'https://ws75.aptoide.com/api/7/app/getMeta?package_name=com.roblox.client'
 

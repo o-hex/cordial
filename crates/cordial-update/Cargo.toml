@@ -17,6 +17,12 @@ serde_json = "1"
 # archive. `cordial_plugins::registry::ContentHash` hashes a slice, which would
 # mean 115 MB resident before the first check.
 sha2 = "0.10"
+# Already in the tree via ureq's rustls, so this adds no new dependency to build
+# or to package -- it makes a direct user of one that is present. Signature
+# verification is the whole of ADR-025's condition for installing a build from a
+# source that is not Roblox, and hand-rolling RSA or ECDSA to avoid a line in a
+# manifest would be the worst trade available.
+ring = "0.17"
 # An APK is a zip, and every refusal in ADR-014's list is about zips. Same
 # version and the same minimal feature set `cordial-runtime` and
 # `cordial-shell` already pin.

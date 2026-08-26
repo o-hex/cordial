@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "SHA-256 digests of the DER certificates Roblox signs com.roblox.client with.",
+    "",
+    "This is the whole of what makes an archive from a source that is not Roblox",
+    "acceptable (ADR-025): a mirror can serve the wrong bytes, and it cannot forge",
+    "the signing key. A digest here is public information -- anyone can compute it",
+    "from any genuine Roblox APK, and `cargo run -p cordial-update --example",
+    "verify-apk -- <path>` prints it -- so this file is a convenience for auditing",
+    "rather than a secret.",
+    "",
+    "It is a file rather than a constant so that a person can read it, diff it, and",
+    "change it without a release. If Roblox rotates its signing certificate every",
+    "download fails closed until a digest is added here, which is the correct",
+    "direction to fail and needs to be a one-line fix somebody can make quickly.",
+    "",
+    "Adding one is a decision, not a chore: a digest added here is a key Cordial",
+    "will accept builds from forever. Take it from an APK you already trust, and",
+    "record where it came from."
+  ],
+  "package": "com.roblox.client",
+  "certificates": [
+    {
+      "sha256": "44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477",
+      "seen_in": "2.734.0.917, x86_64, verified 2026-08-26",
+      "note": "Read from the base.apk Sober downloaded on this machine, and cross-checked with an independent implementation of the v2 signing-block parse before being written down."
+    }
+  ]
+}

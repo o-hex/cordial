@@ -66,6 +66,7 @@
 //! that is quietly six months old.
 
 pub mod apk;
+pub mod apk_signature;
 pub mod cache;
 pub mod changelog;
 pub mod download;

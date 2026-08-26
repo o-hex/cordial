@@ -171,6 +171,42 @@ pub enum Origin {
 }
 
 impl Origin {
+    /// Whether Cordial may replace this build with a newer one.
+    ///
+    /// **Only its own.** Everything else here is either a file somebody named
+    /// deliberately or a file belonging to another program, and Cordial writes
+    /// neither. That is one half of the rule; the other half is
+    /// `cordial_update::install::ours_to_write`, which stops it writing over a
+    /// build it did not install even inside its own directory.
+    ///
+    /// It also decides whether an update is worth *fetching*, which is the part
+    /// that is easy to miss. `effective_apk` prefers a chosen APK over a
+    /// downloaded one, so downloading a newer build while the user has chosen
+    /// their own would spend a few hundred megabytes on a file the launcher
+    /// would then decline to use. Silently. The Updates page says which case
+    /// the user is in rather than leaving them to notice.
+    pub fn updatable(self) -> bool {
+        matches!(self, Origin::Managed)
+    }
+
+    /// Why not, for the one line the Updates page shows.
+    pub fn why_not_updatable(self) -> Option<&'static str> {
+        match self {
+            Origin::Managed => None,
+            Origin::Environment => {
+                Some("CORDIAL_APK names the build for this run, so Cordial will not replace it.")
+            }
+            Origin::Chosen => Some(
+                "You chose this APK, so Cordial will not replace it. Clear it on the Roblox \
+                 page to let Cordial manage a build instead.",
+            ),
+            Origin::Sober => Some(
+                "This build belongs to Sober and Cordial will not write to it. Download one \
+                 and Cordial will manage its own copy.",
+            ),
+        }
+    }
+
     pub fn describe(self) -> &'static str {
         match self {
             Origin::Environment => "Set by CORDIAL_APK for this run only",
@@ -361,6 +397,29 @@ mod tests {
         std::env::remove_var(APK_OVERRIDE);
         assert_eq!(apk, PathBuf::from("/from/env/base.apk"));
         assert_eq!(origin, Origin::Environment);
+    }
+
+    /// **Cordial updates its own build and nothing else.**
+    ///
+    /// The rule is not only about not overwriting somebody's file. It also
+    /// stops Cordial spending a few hundred megabytes fetching a build the
+    /// launcher would then decline to use, because `effective_apk` prefers a
+    /// chosen APK over a downloaded one -- a download that succeeds and changes
+    /// nothing, silently, which is worse than one that fails.
+    #[test]
+    fn only_a_build_cordial_installed_is_one_it_will_replace() {
+        assert!(Origin::Managed.updatable());
+        assert!(!Origin::Chosen.updatable());
+        assert!(!Origin::Environment.updatable());
+        assert!(!Origin::Sober.updatable());
+
+        // And every case that is not updatable says why, because "no updates
+        // for you" with no reason is the silent failure with a label on it.
+        for origin in [Origin::Chosen, Origin::Environment, Origin::Sober] {
+            let why = origin.why_not_updatable().expect("must say why");
+            assert!(!why.is_empty(), "{origin:?}");
+        }
+        assert!(Origin::Managed.why_not_updatable().is_none());
     }
 
     /// **The bug this test exists for was found by pressing the button.**

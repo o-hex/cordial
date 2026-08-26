@@ -37,48 +37,48 @@ use crate::Unreachable;
 use http::Uri;
 use std::time::Duration;
 
-/// Metadata is answered by one host. There is no CDN in front of it and no
-/// reason for it to redirect anywhere, so the list is one exact name.
-const METADATA_HOSTS: &[&str] = &["api.pureapk.com"];
+/// Which hosts a URL may name, and whether subdomains of them count.
+///
+/// **This used to be a fixed pair of lists compiled into this file**, and it
+/// stopped being one when the mirror became configurable. The lists are now
+/// built by whoever is about to make the request -- see
+/// [`crate::provider::mirror::Mirror`] -- because a user who points Cordial at
+/// a different endpoint has to be able to point it at that endpoint's hosts
+/// too, and a check that consulted a hardcoded list would refuse the very
+/// thing they configured.
+///
+/// That does not weaken the check. It moves who writes the list from this file
+/// to the user, and it is still never the mirror: a `302` from an allowed host
+/// to an unlisted one is refused exactly as before, which is the property the
+/// allow-list exists for.
+#[derive(Debug, Clone)]
+pub struct Allowed {
+    pub hosts: Vec<String>,
+    /// Whether a subdomain of an allowed name is also allowed.
+    ///
+    /// True for downloads, because the bytes come off a CDN whose hostnames are
+    /// not enumerable in advance. False for metadata: that is one endpoint, and
+    /// the version list is the one answer in this whole path with no
+    /// cryptographic check behind it -- an archive's signature says Roblox made
+    /// it, and nothing says the version list was honest -- so the host that
+    /// gives it is kept exact.
+    pub subdomains: bool,
+}
 
-/// Downloads redirect through APKPure's own names and land on its CDN.
-const DOWNLOAD_HOSTS: &[&str] = &["pureapk.com", "apkpure.com", "winudf.com"];
+impl Allowed {
+    pub fn exactly(host: impl Into<String>) -> Self {
+        Allowed { hosts: vec![host.into()], subdomains: false }
+    }
+
+    pub fn any_of(hosts: impl IntoIterator<Item = String>) -> Self {
+        Allowed { hosts: hosts.into_iter().collect(), subdomains: true }
+    }
+}
 
 /// At most five hops, so at most six requests. A chain longer than this is
 /// either a loop or a provider doing something Cordial should not be following
 /// blind, and both want the same answer.
 const MAX_REDIRECTS: usize = 5;
-
-/// What a URL is going to be used for, which decides which host list applies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Purpose {
-    /// Asking what versions exist. Small, and to one host.
-    Metadata,
-    /// Fetching an archive. Large, and through a CDN.
-    Download,
-}
-
-impl Purpose {
-    fn hosts(self) -> &'static [&'static str] {
-        match self {
-            Purpose::Metadata => METADATA_HOSTS,
-            Purpose::Download => DOWNLOAD_HOSTS,
-        }
-    }
-
-    /// Whether a subdomain of an allowed name is also allowed.
-    ///
-    /// Downloads need it, because the bytes come off a CDN whose hostnames are
-    /// not enumerable in advance. Metadata does not: it is one endpoint, and
-    /// widening it would mean anything APKPure ever puts under `pureapk.com`
-    /// could tell Cordial what the newest Roblox version is. That answer is
-    /// the one thing in this whole path with **no** cryptographic check behind
-    /// it -- an archive's signature says Roblox made it, and nothing says the
-    /// version list was honest -- so the host that gives it is kept exact.
-    fn allows_subdomains(self) -> bool {
-        matches!(self, Purpose::Download)
-    }
-}
 
 /// Why a URL was not connected to.
 ///
@@ -176,7 +176,7 @@ fn host_matches(candidate: &str, allowed: &str, subdomains: bool) -> bool {
 /// allowed host and its actual host is `evil.example`; the userinfo before the
 /// `@` is a username. A real parser says so, and this refuses userinfo outright
 /// as well, since no URL this project fetches has any business carrying it.
-pub fn check(url: &str, purpose: Purpose) -> Result<String, Rejected> {
+pub fn check(url: &str, allowed: &Allowed) -> Result<String, Rejected> {
     let uri: Uri = url.parse().map_err(|_| Rejected::Unparseable { url: url.to_string() })?;
 
     let scheme = uri.scheme_str().unwrap_or("").to_ascii_lowercase();
@@ -200,7 +200,7 @@ pub fn check(url: &str, purpose: Purpose) -> Result<String, Rejected> {
     }
 
     let host = uri.host().ok_or_else(|| Rejected::Unparseable { url: url.to_string() })?;
-    if !purpose.hosts().iter().any(|a| host_matches(host, a, purpose.allows_subdomains())) {
+    if !allowed.hosts.iter().any(|a| host_matches(host, a, allowed.subdomains)) {
         return Err(Rejected::HostNotAllowed { url: url.to_string(), host: host.to_string() });
     }
 
@@ -238,12 +238,12 @@ pub fn agent(connect: Duration, transfer: Duration) -> ureq::Agent {
 pub fn walk(
     agent: &ureq::Agent,
     url: &str,
-    purpose: Purpose,
+    allowed: &Allowed,
     headers: &[(&str, &str)],
 ) -> Result<(String, ureq::http::Response<ureq::Body>), Unreachable> {
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
-        check(&current, purpose)?;
+        check(&current, allowed)?;
 
         let mut request = agent.get(&current);
         for (name, value) in headers {
@@ -291,34 +291,40 @@ pub fn walk(
 mod tests {
     use super::*;
 
+    fn metadata() -> Allowed {
+        Allowed::exactly("api.pureapk.com")
+    }
+
+    fn downloads() -> Allowed {
+        Allowed::any_of(
+            ["pureapk.com", "apkpure.com", "winudf.com"].map(String::from),
+        )
+    }
+
     /// The two lists are not the same list, and the metadata one is much
-    /// narrower: exactly one host, no subdomains. The CDN is trusted to serve
-    /// an archive whose signature is then checked, and is not trusted to say
-    /// what versions exist -- that answer is not verifiable against anything.
+    /// narrower: one host, no subdomains. A CDN is trusted to serve an archive
+    /// whose signature is then checked, and is not trusted to say what versions
+    /// exist -- that answer is not verifiable against anything.
     #[test]
     fn the_download_cdn_is_not_trusted_to_answer_the_metadata_question() {
-        assert!(check("https://api.pureapk.com/m/v3/cms/app_version", Purpose::Metadata).is_ok());
+        assert!(check("https://api.pureapk.com/m/v3/cms/app_version", &metadata()).is_ok());
         assert!(matches!(
-            check("https://download.winudf.com/m/v3/cms/app_version", Purpose::Metadata),
+            check("https://download.winudf.com/m/v3/cms/app_version", &metadata()),
             Err(Rejected::HostNotAllowed { host, .. }) if host == "download.winudf.com"
         ));
+        // The list is exact, so even a subdomain of the metadata host is not a
+        // second metadata host.
         assert!(matches!(
-            check("https://apkpure.com/m/v3/cms/app_version", Purpose::Metadata),
-            Err(Rejected::HostNotAllowed { .. })
-        ));
-        // Nothing under the metadata host is a *second* metadata host: the list
-        // is exact, so a subdomain of it is refused too.
-        assert!(matches!(
-            check("https://cdn.api.pureapk.com/x", Purpose::Metadata),
+            check("https://cdn.api.pureapk.com/x", &metadata()),
             Err(Rejected::HostNotAllowed { .. })
         ));
     }
 
     #[test]
     fn the_cdn_is_allowed_for_downloads() {
-        assert!(check("https://d.cdnpure.com/b/APK/x", Purpose::Download).is_err());
-        assert!(check("https://download.winudf.com/x.apk", Purpose::Download).is_ok());
-        assert!(check("https://apkpure.com/x.apk", Purpose::Download).is_ok());
+        assert!(check("https://d.cdnpure.com/b/APK/x", &downloads()).is_err());
+        assert!(check("https://download.winudf.com/x.apk", &downloads()).is_ok());
+        assert!(check("https://apkpure.com/x.apk", &downloads()).is_ok());
     }
 
     /// **The one a substring match gets wrong.** Registering `evilapkpure.com`
@@ -327,11 +333,11 @@ mod tests {
     #[test]
     fn a_host_that_merely_ends_with_an_allowed_name_is_not_a_subdomain_of_it() {
         assert!(matches!(
-            check("https://evilapkpure.com/x.apk", Purpose::Download),
+            check("https://evilapkpure.com/x.apk", &downloads()),
             Err(Rejected::HostNotAllowed { host, .. }) if host == "evilapkpure.com"
         ));
         assert!(matches!(
-            check("https://apkpure.com.evil.example/x.apk", Purpose::Download),
+            check("https://apkpure.com.evil.example/x.apk", &downloads()),
             Err(Rejected::HostNotAllowed { .. })
         ));
     }
@@ -341,32 +347,46 @@ mod tests {
     #[test]
     fn userinfo_that_looks_like_an_allowed_host_is_refused() {
         let u = "https://api.pureapk.com@evil.example/m/v3/cms/app_version";
-        assert!(matches!(check(u, Purpose::Metadata), Err(Rejected::CarriesCredentials { .. })));
+        assert!(matches!(check(u, &metadata()), Err(Rejected::CarriesCredentials { .. })));
     }
 
     #[test]
     fn a_trailing_root_dot_does_not_smuggle_a_host_past_the_list() {
-        assert!(check("https://api.pureapk.com./x", Purpose::Metadata).is_ok());
-        assert!(check("https://API.PUREAPK.COM/x", Purpose::Metadata).is_ok());
+        assert!(check("https://api.pureapk.com./x", &metadata()).is_ok());
+        assert!(check("https://API.PUREAPK.COM/x", &metadata()).is_ok());
     }
 
     #[test]
     fn plain_http_and_odd_ports_are_refused_separately() {
         assert!(matches!(
-            check("http://api.pureapk.com/x", Purpose::Metadata),
+            check("http://api.pureapk.com/x", &metadata()),
             Err(Rejected::NotHttps { .. })
         ));
         assert!(matches!(
-            check("https://api.pureapk.com:8443/x", Purpose::Metadata),
+            check("https://api.pureapk.com:8443/x", &metadata()),
             Err(Rejected::UnexpectedPort { port: 8443, .. })
         ));
         // 443 stated explicitly is the same as not stating it.
-        assert!(check("https://api.pureapk.com:443/x", Purpose::Metadata).is_ok());
+        assert!(check("https://api.pureapk.com:443/x", &metadata()).is_ok());
     }
 
     #[test]
     fn a_refusal_says_which_host_it_refused() {
-        let e = check("https://evil.example/x.apk", Purpose::Download).unwrap_err();
+        let e = check("https://evil.example/x.apk", &downloads()).unwrap_err();
         assert!(e.to_string().contains("evil.example"), "{e}");
+    }
+
+    /// **A user-configured list is still a list.** The point of making the
+    /// hosts a value rather than a constant was to let somebody name their own
+    /// endpoint -- not to let whatever they named send Cordial anywhere else.
+    #[test]
+    fn a_custom_list_still_refuses_everything_not_on_it() {
+        let mine = Allowed::any_of(["mirror.example".to_string()]);
+        assert!(check("https://mirror.example/x.apk", &mine).is_ok());
+        assert!(check("https://cdn.mirror.example/x.apk", &mine).is_ok());
+        assert!(matches!(
+            check("https://apkpure.com/x.apk", &mine),
+            Err(Rejected::HostNotAllowed { .. })
+        ));
     }
 }

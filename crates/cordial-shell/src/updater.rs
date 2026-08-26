@@ -678,6 +678,20 @@ pub fn present(
                 return;
             }
 
+            // **Refused before a byte moves, not after.** `effective_apk`
+            // prefers a chosen APK over a downloaded one, so fetching here
+            // would spend a few hundred megabytes on a build the launcher
+            // would then decline to use -- a success that changes nothing,
+            // which is worse than a failure that says so.
+            if let Some((_, origin)) = install::effective_apk(&install::RobloxInstall::default()) {
+                if let Some(why) = origin.why_not_updatable() {
+                    status_line.set_visible(true);
+                    status_line.set_label(why);
+                    status_line.add_css_class("error");
+                    return;
+                }
+            }
+
             // Disabled for the duration. A 229 MB fetch pressed twice is two
             // downloads into one staging directory, and the second one refuses
             // -- correctly, and confusingly, since the first is still working.
@@ -696,7 +710,15 @@ pub fn present(
             let finishing = meter.clone();
             on_worker_reporting(
                 |report| {
-                    cordial_update::provider::obtain_and_install(None, &mut |p| report(p))
+                    // `Newest`, and this is the button where that matters.
+                    // With `Any` a local copy always wins, so anybody with
+                    // Sober installed would press Update, watch it succeed,
+                    // and receive the build they already had -- for ever.
+                    cordial_update::provider::obtain_and_install(
+                        None,
+                        cordial_update::provider::Want::Newest,
+                        &mut |p| report(p),
+                    )
                         .map(|(got, _)| got.version.name)
                         .map_err(|e| e.to_string())
                 },
@@ -829,6 +851,18 @@ fn build_source_group() -> adw::PreferencesGroup {
             .title("Getting a newer build")
             .description(FETCH_EXPLAINS)
             .build();
+
+    // Said where somebody looking at the update settings will see it, rather
+    // than only when they press a button and are refused. A page of switches
+    // that cannot take effect has to say so; that requirement is older than
+    // this feature and it now has a second reason to exist.
+    if let Some((_, origin)) = install::effective_apk(&install::RobloxInstall::default()) {
+        if let Some(why) = origin.why_not_updatable() {
+            let row = adw::ActionRow::builder().title("Updates are off for this build").subtitle(why).build();
+            row.set_subtitle_lines(4);
+            group.add(&row);
+        }
+    }
 
     let source_row = adw::ActionRow::builder()
         .title("Download source")

@@ -121,7 +121,15 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
         let retry = retry.clone();
         updater::on_worker_reporting(
             |report| {
-                cordial_update::provider::obtain_and_install(None, &mut |p| report(p))
+                // `Any`, not `Newest`. This screen has no build at all, so the
+                // cheapest usable one is the right answer -- and on most
+                // machines that is a copy already on the disk, which costs no
+                // request and no bytes.
+                cordial_update::provider::obtain_and_install(
+                    None,
+                    cordial_update::provider::Want::Any,
+                    &mut |p| report(p),
+                )
                     .map(|(got, _)| got.version.name)
                     .map_err(|e| e.to_string())
             },

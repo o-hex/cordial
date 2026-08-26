@@ -207,6 +207,14 @@ pub enum Failed {
     /// catches the two-APK trap.
     NoEngine { fetched: Vec<String> },
     Io { path: String, why: String },
+    /// The managed directory holds a build Cordial did not put there.
+    ///
+    /// **This is the foot-gun the whole ownership rule exists for.** Somebody
+    /// drops an APK into Cordial's own build directory, an update arrives, and
+    /// the file they chose is silently replaced by one from a mirror. Cordial
+    /// writes only what it installed, so an unmarked directory stops the
+    /// install rather than overwriting it.
+    NotOurs { path: String },
 }
 
 impl fmt::Display for Failed {
@@ -219,6 +227,12 @@ impl fmt::Display for Failed {
                 "None of the downloaded files contains the Roblox engine ({}). \
                  It lives in {SPLIT_APK}, not {BASE_APK}.",
                 fetched.join(", ")
+            ),
+            Failed::NotOurs { path } => write!(
+                f,
+                "{path} holds a Roblox build Cordial did not install, so it will not be \
+                 overwritten. Choose that APK on the Roblox page in Settings and Cordial will \
+                 use it and leave it alone, or delete the directory to let Cordial manage one."
             ),
             Failed::Io { path, why } => write!(f, "{path}: {why}"),
         }
@@ -313,6 +327,26 @@ fn staged(
 /// Cordial's cache would take Roblox out from underneath Sober and break a
 /// working program to install this one. Inside staging a rename is correct and
 /// is what happens, because those files were fetched for this.
+/// Written beside a build Cordial installed, so it can tell its own work from
+/// somebody else's.
+///
+/// The contents do not matter and are not parsed; **its presence is the whole
+/// signal.** Anything richer would be a format to keep compatible for the sake
+/// of a question with a yes/no answer.
+pub const OURS: &str = ".cordial-managed";
+
+/// Whether `build` is a directory Cordial installed into, or is empty.
+///
+/// An empty or absent directory is ours to take. One with archives in it and no
+/// marker belongs to whoever put them there.
+pub fn ours_to_write(build: &Path) -> bool {
+    if build.join(OURS).is_file() {
+        return true;
+    }
+    let occupied = [BASE_APK, SPLIT_APK].iter().any(|n| build.join(n).is_file());
+    !occupied
+}
+
 pub fn adopt(
     fetched: &[(&'static str, PathBuf)],
     build: &Path,
@@ -321,6 +355,14 @@ pub fn adopt(
     progress: Progress<'_>,
 ) -> Result<Installed, Failed> {
     let _ = progress;
+
+    // **Before anything is unpacked, not after.** Checking once the engine has
+    // been extracted would mean refusing after several minutes of work, and the
+    // point of the refusal is that the user's file is still there.
+    if !ours_to_write(build) {
+        return Err(Failed::NotOurs { path: build.display().to_string() });
+    }
+
     // Every refusal in ADR-014's list, against each archive, before anything is
     // taken out of any of them.
     for (_, path) in fetched {
@@ -380,6 +422,11 @@ pub fn adopt(
         }
     }
 
+    // Marked as ours the moment the archives are in place, so a process killed
+    // between here and the engine rename does not leave a directory Cordial
+    // wrote and then refuses to touch again.
+    let _ = std::fs::write(build.join(OURS), b"Installed by Cordial. Delete to disown.\n");
+
     let engine_live = engine_into.join(engine::LIBRARY);
     std::fs::rename(&staged_engine, &engine_live)
         .map_err(|e| Failed::Io { path: engine_live.display().to_string(), why: e.to_string() })?;
@@ -406,6 +453,60 @@ mod tests {
     use crate::sha256::Sha256Hash;
     use std::io::{BufRead, Write};
     use std::net::TcpListener;
+
+    /// **The foot-gun this rule exists for, exercised.**
+    ///
+    /// Somebody drops their own APK into Cordial's build directory. Without the
+    /// marker check, the next update replaces it with one from a mirror and
+    /// says nothing -- the user's deliberate choice quietly undone by a feature
+    /// they may not have known was on.
+    #[test]
+    fn a_build_cordial_did_not_install_is_never_overwritten() {
+        let root = scratch("adopt-not-ours");
+        let build = root.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        // Their file, with no marker beside it.
+        std::fs::write(build.join(BASE_APK), b"the APK I chose myself").unwrap();
+
+        let incoming = root.join("incoming");
+        std::fs::create_dir_all(&incoming).unwrap();
+        let fresh = incoming.join("base.apk");
+        std::fs::write(&fresh, zip_of(&[(apk::LIBRARY_IN_APK, b"\x7fELF newer 9.9.9")])).unwrap();
+
+        let err = adopt(
+            &[(BASE_APK, fresh)],
+            &build,
+            &root.join("engine"),
+            &root.join("engine").join(STAGING),
+            &mut |_, _, _| {},
+        )
+        .expect_err("a directory Cordial did not fill must not be written into");
+        assert!(matches!(err, Failed::NotOurs { .. }), "{err:?}");
+
+        // Untouched, byte for byte. This is the assertion that matters.
+        assert_eq!(std::fs::read(build.join(BASE_APK)).unwrap(), b"the APK I chose myself");
+        // And the message says both ways out rather than only refusing.
+        let said = err.to_string();
+        assert!(said.contains("Settings"), "{said}");
+        assert!(said.contains("delete"), "{said}");
+    }
+
+    /// The other half: once Cordial has installed there, it may install again.
+    /// A rule that refused its own directory after the first write would break
+    /// every update after the first one.
+    #[test]
+    fn a_directory_cordial_installed_into_is_one_it_may_write_again() {
+        let root = scratch("adopt-ours-again");
+        let build = root.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        assert!(ours_to_write(&build), "an empty directory is free to take");
+
+        std::fs::write(build.join(BASE_APK), b"whatever").unwrap();
+        assert!(!ours_to_write(&build), "an occupied one without the marker is not");
+
+        std::fs::write(build.join(OURS), b"x").unwrap();
+        assert!(ours_to_write(&build), "the marker is what makes it ours again");
+    }
 
     /// **A source outside the staging area must be copied and left alone.**
     ///
@@ -636,10 +737,14 @@ mod tests {
             &mut silent(),
         )
         .unwrap();
+        // Dotfiles excluded: this asserts which *archives* landed and under
+        // what names, and Cordial's own bookkeeping beside them -- the
+        // `OURS` marker, a stamp -- is not what the test is about.
         let mut names: Vec<String> = std::fs::read_dir(&build)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| !n.starts_with('.'))
             .collect();
         names.sort();
         assert_eq!(names, vec![BASE_APK.to_string(), SPLIT_APK.to_string()]);

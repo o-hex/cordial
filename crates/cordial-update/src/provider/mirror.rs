@@ -87,14 +87,59 @@
 //! and cannot buy a wrong answer.
 
 use super::{Archives, Available, Progress, Provider};
-use crate::url_policy::{self, Purpose};
+use crate::url_policy;
 use crate::Unreachable;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const METADATA: &str =
+/// Where the version list is asked for, and which hosts may serve the bytes.
+///
+/// **The base URL is configurable and the protocol is not**, and that split is
+/// the honest version of "an APKPure-compatible endpoint". The response is an
+/// undocumented, length-delimited binary blob with no schema and no `.proto`,
+/// read by the byte patterns below. Anything answering here has to produce that
+/// exact shape. So this is the same bargain as pointing an OpenAI client at a
+/// different base URL -- the wire format is fixed and the host is yours, be it
+/// a mirror, a caching proxy in front of APKPure, or a copy inside a company
+/// network -- and it is not a plugin interface for arbitrary services.
+///
+/// Saying that plainly matters more than it looks. A setting called "mirror
+/// URL" invites somebody to paste an F-Droid or Aptoide address, get a reader
+/// that finds no version markers, and read the failure as Cordial being broken.
+/// The refusal names the shape for that reason.
+///
+/// ## Why this is allowed to widen the allow-list
+///
+/// [`crate::url_policy`] exists to stop the *mirror* sending Cordial somewhere
+/// of its own choosing, and it still does: every redirect is re-checked and an
+/// unlisted target is refused. What changes is who writes the list, and that is
+/// now the user -- who could replace the binary anyway, and who is the one
+/// person entitled to decide which third party they talk to.
+///
+/// **The property that actually protects them is untouched.** Whatever host
+/// serves the archive, it installs only if Roblox's own signing certificate
+/// signed those exact bytes. A hostile base URL can waste bandwidth, watch who
+/// asked, and serve nothing installable. It cannot serve a modified Roblox.
+/// That is why a mirror was acceptable at all, and it does not care which one.
+#[derive(Debug, Clone)]
+pub struct Mirror {
+    pub metadata_url: String,
+    pub download_hosts: Vec<String>,
+    pub headers: Vec<(String, String)>,
+}
+
+/// The endpoint measured on 2026-08-26; see the module header for the reading.
+const DEFAULT_METADATA: &str =
     "https://api.pureapk.com/m/v3/cms/app_version?hl=en-US&package_name=com.roblox.client";
+
+/// APKPure's own names, plus the CDN it actually serves bytes from.
+///
+/// `winudf.com` looks out of place beside the other two and is where the
+/// download lands, so a list without it refuses every real transfer. It is a
+/// third organisation to trust with the transport, and naming it rather than
+/// quietly widening the rule is the honest version of that.
+const DEFAULT_DOWNLOAD_HOSTS: [&str; 3] = ["pureapk.com", "apkpure.com", "winudf.com"];
 
 /// The APKPure client version code the service keys its response shape on.
 ///
@@ -107,6 +152,96 @@ const X_SV: &str = "29";
 /// An opaque flag the client sends. It must be present; its meaning is not
 /// known here and guessing at one would be worse than saying so.
 const X_GP: &str = "1";
+
+/// Point Cordial at a different endpoint of the same shape.
+///
+/// One variable and one URL is the whole of the common case, deliberately --
+/// a caching proxy in front of APKPure needs nothing else.
+pub const MIRROR_URL_ENV: &str = "CORDIAL_MIRROR_URL";
+
+/// Hosts that may serve the archives, comma separated, when the endpoint above
+/// hands back URLs on names it does not itself use.
+pub const MIRROR_HOSTS_ENV: &str = "CORDIAL_MIRROR_DOWNLOAD_HOSTS";
+
+impl Default for Mirror {
+    fn default() -> Self {
+        Mirror {
+            metadata_url: DEFAULT_METADATA.to_string(),
+            download_hosts: DEFAULT_DOWNLOAD_HOSTS.iter().map(|s| s.to_string()).collect(),
+            headers: vec![
+                ("x-cv".into(), X_CV.into()),
+                ("x-sv".into(), X_SV.into()),
+                ("x-gp".into(), X_GP.into()),
+            ],
+        }
+    }
+}
+
+impl Mirror {
+    /// The configured mirror, or the default one.
+    ///
+    /// A custom URL with no host list gets **its own host and subdomains, and
+    /// nothing else**. That is the conservative reading of what somebody meant
+    /// by naming one endpoint, and it is chosen rather than inherited: keeping
+    /// APKPure's three CDN names against a URL that has nothing to do with
+    /// APKPure would leave three hosts trusted for a reason nobody asked for.
+    pub fn configured() -> Result<Self, Unreachable> {
+        let Some(url) = std::env::var(MIRROR_URL_ENV).ok().filter(|s| !s.trim().is_empty())
+        else {
+            return Ok(Mirror::default());
+        };
+        let url = url.trim().to_string();
+
+        // Checked when it is read, not when it is used, so a typo fails saying
+        // which variable was wrong instead of as a transport error four steps
+        // later. The host is taken from the URL itself, so this cannot refuse
+        // the very endpoint it was just given.
+        let host = host_of(&url)?;
+        url_policy::check(&url, &url_policy::Allowed::exactly(host.clone())).map_err(|e| {
+            Unreachable::Malformed {
+                url: url.clone(),
+                why: format!("{MIRROR_URL_ENV} is not a URL Cordial can fetch from: {e}"),
+            }
+        })?;
+
+        let hosts = match std::env::var(MIRROR_HOSTS_ENV).ok().filter(|s| !s.trim().is_empty()) {
+            Some(list) => list
+                .split(',')
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+            None => vec![host],
+        };
+
+        Ok(Mirror { metadata_url: url, download_hosts: hosts, ..Mirror::default() })
+    }
+
+    fn metadata_allowed(&self) -> Result<url_policy::Allowed, Unreachable> {
+        Ok(url_policy::Allowed::exactly(host_of(&self.metadata_url)?))
+    }
+
+    fn download_allowed(&self) -> url_policy::Allowed {
+        url_policy::Allowed::any_of(self.download_hosts.clone())
+    }
+
+    /// The metadata URL with the ABI filter this request wants.
+    fn headers_with(&self, abi: &str) -> Vec<(String, String)> {
+        let mut h = self.headers.clone();
+        h.push(("x-abis".into(), abi.into()));
+        h
+    }
+}
+
+/// The host of a URL, or a refusal naming the URL rather than a parse error.
+fn host_of(url: &str) -> Result<String, Unreachable> {
+    url.parse::<http::Uri>()
+        .ok()
+        .and_then(|u| u.host().map(|h| h.to_ascii_lowercase()))
+        .ok_or_else(|| Unreachable::Malformed {
+            url: url.to_string(),
+            why: "this is not a URL with a host in it".into(),
+        })
+}
 
 /// What Cordial can run.
 const ABI_EXACT: &str = "x86_64";
@@ -253,11 +388,13 @@ fn urls_in(record: &[u8]) -> Vec<String> {
 }
 
 /// Ask the service for the version list, with `abi` as the filter.
-fn metadata(abi: &str) -> Result<Vec<u8>, Unreachable> {
+fn metadata(mirror: &Mirror, abi: &str) -> Result<Vec<u8>, Unreachable> {
     let agent = url_policy::agent(CONNECT, METADATA_TRANSFER);
-    let headers =
-        [("x-cv", X_CV), ("x-sv", X_SV), ("x-gp", X_GP), ("x-abis", abi)];
-    let (url, mut response) = url_policy::walk(&agent, METADATA, Purpose::Metadata, &headers)?;
+    let owned = mirror.headers_with(abi);
+    let headers: Vec<(&str, &str)> =
+        owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (url, mut response) =
+        url_policy::walk(&agent, &mirror.metadata_url, &mirror.metadata_allowed()?, &headers)?;
 
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
@@ -312,12 +449,14 @@ fn downloads_for(d: &[u8], version: &str) -> Vec<String> {
 /// declared length is a claim by the same party supplying the bytes; checking
 /// it is a cheap early refusal and must never be the only check.
 fn download(
+    mirror: &Mirror,
     url: &str,
     dest: &Path,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(), Unreachable> {
     let agent = url_policy::agent(CONNECT, ARCHIVE_TRANSFER);
-    let (final_url, mut response) = url_policy::walk(&agent, url, Purpose::Download, &[])?;
+    let (final_url, mut response) =
+        url_policy::walk(&agent, url, &mirror.download_allowed(), &[])?;
 
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
@@ -433,14 +572,18 @@ impl Provider for ApkPure {
     /// cannot start.
     fn newest(&self, progress: &mut dyn FnMut(Progress)) -> Result<Available, Unreachable> {
         progress(Progress::Asking { provider: self.name() });
-        let body = metadata(ABI_EXACT)?;
+        let mirror = Mirror::configured()?;
+        let body = metadata(&mirror, ABI_EXACT)?;
         let marks = markers(&body);
         let first = marks.first().ok_or_else(|| Unreachable::Malformed {
-            url: METADATA.into(),
-            why: "the version list carries no versions, so its shape has changed".into(),
+            url: mirror.metadata_url.clone(),
+            why: "the version list carries no versions. If this endpoint was set with \
+                  CORDIAL_MIRROR_URL it is answering in a shape this reader does not \
+                  understand; otherwise the service has changed."
+                .into(),
         })?;
         let code = code_before(&body, first).ok_or_else(|| Unreachable::Malformed {
-            url: METADATA.into(),
+            url: mirror.metadata_url.clone(),
             why: format!(
                 "the version list names {} and carries no version code for it, so its shape \
                  has changed",
@@ -469,13 +612,14 @@ impl Provider for ApkPure {
         // The narrow filter, then the broad one. See ABI_BROAD: this buys
         // availability for older versions and cannot buy a wrong answer,
         // because what arrives is opened and checked for the engine.
-        let mut urls = downloads_for(&metadata(ABI_EXACT)?, &version.name);
+        let mirror = Mirror::configured()?;
+        let mut urls = downloads_for(&metadata(&mirror, ABI_EXACT)?, &version.name);
         if urls.is_empty() {
-            urls = downloads_for(&metadata(ABI_BROAD)?, &version.name);
+            urls = downloads_for(&metadata(&mirror, ABI_BROAD)?, &version.name);
         }
         if urls.is_empty() {
             return Err(Unreachable::Malformed {
-                url: METADATA.into(),
+                url: mirror.metadata_url.clone(),
                 why: format!(
                     "the mirror does not offer version {}. It is reachable and it does not \
                      have that build.",
@@ -485,7 +629,7 @@ impl Provider for ApkPure {
         }
         if urls.len() > MAX_CANDIDATES {
             return Err(Unreachable::Malformed {
-                url: METADATA.into(),
+                url: mirror.metadata_url.clone(),
                 why: format!(
                     "the mirror offers {} different archives for version {}, which is more \
                      than Cordial will try",
@@ -494,15 +638,16 @@ impl Provider for ApkPure {
                 ),
             });
         }
+        let allowed = mirror.download_allowed();
         for url in &urls {
-            url_policy::check(url, Purpose::Download)?;
+            url_policy::check(url, &allowed)?;
         }
 
         let mut landed: Vec<PathBuf> = Vec::new();
         let result = (|| -> Result<(), Unreachable> {
             for (i, url) in urls.iter().enumerate() {
                 let dest = into.join(format!("candidate-{i}.apk"));
-                download(url, &dest, progress)?;
+                download(&mirror, url, &dest, progress)?;
                 landed.push(dest);
             }
             Ok(())
@@ -519,7 +664,7 @@ impl Provider for ApkPure {
         }
 
         classify(&landed).ok_or_else(|| Unreachable::Malformed {
-            url: METADATA.into(),
+            url: mirror.metadata_url.clone(),
             why: format!(
                 "the mirror served {} archive(s) for version {} and none of them carries \
                  lib/x86_64/libroblox.so, so there is no engine in what arrived",
@@ -641,7 +786,7 @@ mod tests {
         let urls = downloads_for(&d, &marks[0].name);
         assert!(!urls.is_empty(), "the newest version must offer a download");
         for u in &urls {
-            url_policy::check(u, Purpose::Download)
+            url_policy::check(u, &Mirror::default().download_allowed())
                 .unwrap_or_else(|e| panic!("a real download URL must pass the allow-list: {e}"));
         }
         eprintln!("captured: {} at code {code}, {} download(s)", marks[0].name, urls.len());

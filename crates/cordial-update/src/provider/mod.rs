@@ -130,10 +130,30 @@ pub trait Provider {
     ) -> Result<Archives, Unreachable>;
 }
 
+/// Why a build is being obtained, which decides how the sources are ordered.
+///
+/// **These are not the same question and treating them as one was a bug.**
+/// `all()` returns the free source first, and for a first run that is exactly
+/// right: most machines that will run Cordial already have this file, and
+/// fetching a second copy from a mirror would be slower, more exposed and no
+/// more trustworthy. But the same ordering applied to an update means the local
+/// copy always wins, so **anybody with Sober installed could never receive a
+/// newer build** -- "Download Roblox" would reinstall the build they already
+/// had, for ever, and report success.
+///
+/// So an update asks every source what it has and takes the newest, and only
+/// falls back to order when the versions cannot be compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    /// Any usable build. Cheapest first.
+    Any,
+    /// The newest available. Compares across sources.
+    Newest,
+}
+
 /// Every source, in the order they should be tried.
 ///
-/// Zero-network first. See the module header for why that ordering is the
-/// feature rather than an implementation detail.
+/// Zero-network first. See [`Want`] for when that ordering is wrong.
 pub fn all() -> Vec<Box<dyn Provider>> {
     vec![Box::new(local::OnThisMachine::default()), Box::new(mirror::ApkPure::default())]
 }
@@ -141,6 +161,57 @@ pub fn all() -> Vec<Box<dyn Provider>> {
 /// The source named `name`, for a user who has chosen one.
 pub fn named(name: &str) -> Option<Box<dyn Provider>> {
     all().into_iter().find(|p| p.name().eq_ignore_ascii_case(name))
+}
+
+/// Sort the sources newest-first, leaving ones that cannot answer at the back.
+///
+/// A source that fails to answer is not dropped here, only deprioritised: it
+/// may still be the only one that can actually deliver, and `obtain` reports
+/// what each one said if none of them can.
+fn order_by_version(
+    sources: Vec<Box<dyn Provider>>,
+    progress: &mut dyn FnMut(Progress),
+    absent: &mut Vec<String>,
+) -> Vec<Box<dyn Provider>> {
+    let mut scored: Vec<(Option<Vec<u64>>, usize, Box<dyn Provider>)> = Vec::new();
+    for (position, source) in sources.into_iter().enumerate() {
+        let version = match source.newest(progress) {
+            Ok(v) => Some(numeric(&v.name)),
+            Err(Unreachable::NoSource { why }) => {
+                absent.push(format!("{}: {why}", source.name()));
+                None
+            }
+            // Not fatal here. A mirror being down must not stop a local build
+            // from being found, and the real attempt below will report it if
+            // it turns out to matter.
+            Err(e) => {
+                absent.push(format!("{}: {e}", source.name()));
+                None
+            }
+        };
+        scored.push((version, position, source));
+    }
+    // Newest first; ties and unanswerables keep `all()`'s order, which puts the
+    // free source ahead of the paid one.
+    scored.sort_by(|a, b| match (&a.0, &b.0) {
+        (Some(x), Some(y)) => y.cmp(x).then(a.1.cmp(&b.1)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.1.cmp(&b.1),
+    });
+    scored.into_iter().map(|(_, _, s)| s).collect()
+}
+
+/// A version as comparable numbers.
+///
+/// **String comparison is wrong here and quietly so**: `2.734.917` sorts below
+/// `2.734.916` only if you compare component by component as numbers, and
+/// lexically `"2.734.9"` beats `"2.734.10"`. The two sources also disagree on
+/// shape -- the engine reads `2.734.0.917` and the mirror says `2.734.917` --
+/// so anything numeric is compared and anything else is ignored rather than
+/// guessed at.
+fn numeric(version: &str) -> Vec<u64> {
+    version.split(|c: char| !c.is_ascii_digit()).filter_map(|p| p.parse().ok()).collect()
 }
 
 /// A build that was obtained and checked.
@@ -174,6 +245,7 @@ pub struct Obtained {
 /// possible signal into a slightly slower success.
 pub fn obtain(
     preferred: Option<&str>,
+    want: Want,
     into: &Path,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Obtained, Unreachable> {
@@ -189,6 +261,14 @@ pub fn obtain(
 
     let trusted = crate::apk_signature::pinned();
     let mut absent: Vec<String> = Vec::new();
+
+    // For Newest, ask everybody first and put the winner in front. Asking is
+    // one small request per source and no bytes; the alternative is the pin
+    // described on `Want`.
+    let sources = match want {
+        Want::Any => sources,
+        Want::Newest => order_by_version(sources, progress, &mut absent),
+    };
 
     for source in sources {
         let version = match source.newest(progress) {
@@ -266,6 +346,7 @@ pub fn obtain(
 /// the file the ordering exists to keep away from the live build.
 pub fn obtain_and_install(
     preferred: Option<&str>,
+    want: Want,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(Obtained, crate::install::Installed), Unreachable> {
     let staging = crate::install::build_dir().join(".fetching");
@@ -274,7 +355,7 @@ pub fn obtain_and_install(
         .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
 
     let outcome = (|| {
-        let obtained = obtain(preferred, &staging, progress)?;
+        let obtained = obtain(preferred, want, &staging, progress)?;
         let mut named: Vec<(&'static str, PathBuf)> =
             vec![(crate::install::BASE_APK, obtained.archives.base.clone())];
         // A monolithic archive is one file and must be named once. Handing the
@@ -342,12 +423,25 @@ mod tests {
     /// Naming a source that does not exist must not silently fall back to one
     /// that does. A typo in a setting should say so, not quietly use the
     /// network when the user asked for the local build.
+    /// **The comparison a string sort gets wrong, both ways.**
+    #[test]
+    fn versions_compare_as_numbers_and_not_as_text() {
+        assert!(numeric("2.734.917") > numeric("2.734.916"));
+        // Lexically "2.734.9" beats "2.734.10". Numerically it does not.
+        assert!(numeric("2.734.10") > numeric("2.734.9"));
+        // The two sources disagree on shape: the engine reads four components
+        // and the mirror says three. Comparing what is there is the honest
+        // answer; inventing the missing one is not.
+        assert_eq!(numeric("2.734.0.917"), vec![2, 734, 0, 917]);
+        assert_eq!(numeric("2.734.917"), vec![2, 734, 917]);
+    }
+
     #[test]
     fn an_unknown_preferred_source_is_an_error_and_not_a_fallback() {
         let dir = std::env::temp_dir().join("cordial-obtain-unknown");
         std::fs::create_dir_all(&dir).expect("scratch");
         let mut noise = |_: Progress| {};
-        let e = obtain(Some("no-such-source"), &dir, &mut noise).unwrap_err();
+        let e = obtain(Some("no-such-source"), Want::Any, &dir, &mut noise).unwrap_err();
         assert!(e.to_string().contains("no-such-source"), "{e}");
         assert!(e.to_string().contains("local"), "the error should list what does exist: {e}");
     }

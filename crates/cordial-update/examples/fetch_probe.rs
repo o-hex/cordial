@@ -13,7 +13,7 @@
 //! Without `--download` it asks every source what it has and stops, which is
 //! the cheap half and the one worth running often.
 
-use cordial_update::provider::{self, Progress};
+use cordial_update::provider::{self, Progress, Want};
 
 fn main() {
     let download = std::env::args().any(|a| a == "--download");
@@ -71,11 +71,11 @@ fn main() {
 
     // The entry point everything else should use: pick a source, fetch, and
     // verify, with no way to get bytes back that nobody has checked.
-    println!("== obtain({}) ==", only.as_deref().unwrap_or("first available"));
+    println!("== obtain(Newest, {}) ==", only.as_deref().unwrap_or("any source"));
     let into = std::env::temp_dir().join("cordial-obtain-probe");
     let _ = std::fs::remove_dir_all(&into);
     std::fs::create_dir_all(&into).expect("scratch");
-    match provider::obtain(only.as_deref(), &into, &mut say) {
+    match provider::obtain(only.as_deref(), Want::Newest, &into, &mut say) {
         Ok(got) => {
             println!("   {} from {}", got.version.name, got.provider);
             println!("   signed by {}", got.certificate_sha256);

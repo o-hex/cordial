@@ -19,17 +19,48 @@
 //! exist, or watch who asks -- which is why the choice of source is the user's
 //! and why the one that needs no network is tried first.
 //!
-//! ## Why this is a trait and not a function with a match in it
+//! ## Two axes of extension, and they are not the same axis
 //!
-//! Because the two sources here are not variations on a theme. [`local`] reads
-//! a file that is already on the disk and touches no network at all; [`mirror`]
-//! speaks an undocumented binary protocol to a third party and validates every
-//! URL it is handed. They share an output type and nothing else, and a single
-//! function covering both would be a long `if` whose branches never meet.
+//! Conflating them is easy and it produces the wrong design, so they are named
+//! separately here.
 //!
-//! It also means the next one is additive. Roblox publishing an Android
-//! deployment path is the source everyone would want, and the day that happens
-//! it is a new file in this directory and a line in [`all`], not a rewrite.
+//! **Same protocol, different host** is configuration, not code:
+//! `CORDIAL_MIRROR_URL` points [`mirror`] at any endpoint that answers in
+//! APKPure's shape -- a caching proxy, a copy inside a company network, a
+//! different deployment of the same software. Nothing is compiled for it.
+//!
+//! **A different protocol is a new [`Provider`]**, because APKMirror, F-Droid
+//! and Aptoide do not merely live at other addresses: they enumerate versions
+//! differently, hand back download URLs differently, and in two of those cases
+//! are not machine-readable at all without scraping HTML. No base URL bridges
+//! that. A new source is a new file in this directory and a line in [`all`],
+//! and the trait exists so that it is only those two things.
+//!
+//! That is also why this is a trait rather than a function with a `match` in
+//! it. [`local`] reads a file already on the disk and touches no network;
+//! [`mirror`] speaks an undocumented binary protocol to a third party and
+//! validates every URL it is handed. They share an output type and nothing
+//! else, and one function covering both would be a long `if` whose branches
+//! never meet.
+//!
+//! ## What a new provider is not allowed to do, and what enforces it
+//!
+//! **A provider returns bytes. It never returns trust.** It does not verify a
+//! signature, does not decide what is installable, and does not put anything
+//! anywhere but the directory it was handed. [`obtain`] performs the signature
+//! check on whatever comes back, from every source, without asking the source
+//! whether it thinks that is necessary.
+//!
+//! This is the property that makes adding a source cheap. A second mirror buys
+//! *availability* and nothing else -- the signature check is what makes any
+//! source acceptable at all, so another one adds no trust and removes no risk,
+//! and the bar for adding one is correspondingly low. It is also the property
+//! most easily lost by accident, by a provider that "helpfully" checks its own
+//! download and a later refactor that takes [`obtain`]'s check out as
+//! duplicated work.
+//!
+//! So it is tested against a deliberately hostile provider rather than
+//! documented and hoped for: see `a_hostile_provider_cannot_get_anything_past_the_check`.
 //!
 //! ## The order matters and is not alphabetical
 //!
@@ -259,7 +290,23 @@ pub fn obtain(
         None => all(),
     };
 
-    let trusted = crate::apk_signature::pinned();
+    obtain_from(sources, want, &crate::apk_signature::pinned(), into, progress)
+}
+
+/// [`obtain`], with the sources and the trusted set handed in.
+///
+/// Split out so a test can supply a provider of its own. That is not a
+/// convenience: the guarantee worth testing is about a source this crate does
+/// not contain, since the whole point of the trait is that somebody will add
+/// one. A test that can only exercise the two built-in providers proves nothing
+/// about the third.
+pub(crate) fn obtain_from(
+    sources: Vec<Box<dyn Provider>>,
+    want: Want,
+    trusted: &[String],
+    into: &Path,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<Obtained, Unreachable> {
     let mut absent: Vec<String> = Vec::new();
 
     // For Newest, ask everybody first and put the winner in front. Asking is
@@ -296,7 +343,7 @@ pub fn obtain(
             progress(Progress::Verifying {
                 file: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
             });
-            let signer = crate::apk_signature::verify_signed_by(file, &trusted).map_err(|e| {
+            let signer = crate::apk_signature::verify_signed_by(file, trusted).map_err(|e| {
                 Unreachable::Malformed { url: file.display().to_string(), why: e.to_string() }
             })?;
             // **The two halves must share a certificate.** Each being signed by
@@ -434,6 +481,151 @@ mod tests {
         // answer; inventing the missing one is not.
         assert_eq!(numeric("2.734.0.917"), vec![2, 734, 0, 917]);
         assert_eq!(numeric("2.734.917"), vec![2, 734, 917]);
+    }
+
+    /// A source that behaves as badly as a source can.
+    ///
+    /// It claims an absurdly high version so it wins any comparison, and it
+    /// writes an archive that is a perfectly good ZIP carrying the engine path
+    /// -- everything a naive check would look for -- and no signature at all.
+    /// This is what a compromised mirror, a hostile fork's extra provider, or
+    /// an honest provider pointed at a poisoned CDN all look like from inside
+    /// this crate.
+    struct Hostile;
+
+    impl Provider for Hostile {
+        fn name(&self) -> &'static str {
+            "hostile"
+        }
+        fn needs_network(&self) -> bool {
+            false
+        }
+        fn newest(&self, _: &mut dyn FnMut(Progress)) -> Result<Available, Unreachable> {
+            Ok(Available { name: "9999.9.9".into(), code: u64::MAX })
+        }
+        fn fetch(
+            &self,
+            _: &Available,
+            into: &Path,
+            _: &mut dyn FnMut(Progress),
+        ) -> Result<Archives, Unreachable> {
+            let path = into.join("base.apk");
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            w.start_file("lib/x86_64/libroblox.so", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            use std::io::Write;
+            w.write_all(b"\x7fELF this is not Roblox 9999.9.9").unwrap();
+            let bytes = w.finish().unwrap().into_inner();
+            std::fs::write(&path, bytes).unwrap();
+            Ok(Archives { base: path.clone(), split: path })
+        }
+    }
+
+    /// **The guarantee that makes adding a provider cheap.**
+    ///
+    /// A second mirror buys availability and nothing else, because the
+    /// signature check is what makes any source acceptable. That sentence is
+    /// only true while nothing a provider does can reach past it, and this is
+    /// the test that says so about a provider this crate does not contain --
+    /// which is the only kind worth testing, since the point of the trait is
+    /// that somebody will add one.
+    ///
+    /// It is also the property most easily lost by accident: a provider that
+    /// checks its own download, and a later refactor that removes `obtain`'s
+    /// check as duplicated work.
+    ///
+    /// **Controlled, because a refusal test that cannot fail is decoration.**
+    /// With the verification taken out of `obtain_from`, this test fails and
+    /// prints what got through:
+    ///
+    /// ```text
+    /// Obtained { version: Available { name: "9999.9.9", .. }, provider: "hostile", .. }
+    /// ```
+    ///
+    /// Note what does *not* discriminate: weakening `verify_signed_by` to a
+    /// bare `verify` leaves this passing, because an archive with no signing
+    /// block is refused either way. The pin is guarded by
+    /// `apk_signature::pin_tests` instead. Two checks, two tests, and neither
+    /// stands in for the other.
+    #[test]
+    fn a_hostile_provider_cannot_get_anything_past_the_check() {
+        let dir = std::env::temp_dir().join("cordial-hostile-provider");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let mut noise = |_: Progress| {};
+
+        let trusted =
+            vec!["44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477".to_string()];
+        let e = obtain_from(vec![Box::new(Hostile)], Want::Newest, &trusted, &dir, &mut noise)
+            .expect_err("an unsigned archive must never be accepted, whatever produced it");
+
+        // And it fails for the right reason. "No such file" would pass an
+        // is_err() assertion while proving nothing about the signature path.
+        let said = e.to_string();
+        assert!(
+            said.contains("signing block") || said.contains("signature") || said.contains("signed"),
+            "must be refused over its signature, not incidentally: {said}"
+        );
+
+        // Nothing was adopted: the caller gets an error, not a half-install.
+        assert!(!dir.join(".cordial-managed").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The control for the test above. **Without it, that test would pass even
+    /// if `obtain_from` refused everything for an unrelated reason** -- a wrong
+    /// path, a broken zip reader, a typo in the trusted list -- and would go on
+    /// passing after the check it exists to guard had been deleted.
+    #[test]
+    fn the_same_path_accepts_a_genuinely_signed_archive() {
+        let Some(apk) = real_apk() else {
+            eprintln!("skipped: no Roblox APK on this machine");
+            return;
+        };
+        let signer = crate::apk_signature::verify(&apk).expect("the shipping APK verifies");
+        struct Genuine(std::path::PathBuf);
+        impl Provider for Genuine {
+            fn name(&self) -> &'static str {
+                "genuine"
+            }
+            fn needs_network(&self) -> bool {
+                false
+            }
+            fn newest(&self, _: &mut dyn FnMut(Progress)) -> Result<Available, Unreachable> {
+                Ok(Available { name: "1.0.0".into(), code: 1 })
+            }
+            fn fetch(
+                &self,
+                _: &Available,
+                _: &Path,
+                _: &mut dyn FnMut(Progress),
+            ) -> Result<Archives, Unreachable> {
+                Ok(Archives { base: self.0.clone(), split: self.0.clone() })
+            }
+        }
+
+        let dir = std::env::temp_dir().join("cordial-genuine-provider");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let mut noise = |_: Progress| {};
+        let got = obtain_from(
+            vec![Box::new(Genuine(apk))],
+            Want::Newest,
+            &[signer.certificate_sha256.clone()],
+            &dir,
+            &mut noise,
+        )
+        .expect("a signed archive from a made-up provider must be accepted");
+        assert_eq!(got.certificate_sha256, signer.certificate_sha256);
+        assert_eq!(got.provider, "genuine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn real_apk() -> Option<std::path::PathBuf> {
+        let p = std::env::var_os("HOME").map(std::path::PathBuf::from)?.join(
+            ".var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk",
+        );
+        p.is_file().then_some(p)
     }
 
     #[test]

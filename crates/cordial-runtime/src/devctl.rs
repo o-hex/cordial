@@ -172,6 +172,23 @@ fn handle(line: &str) -> String {
         "ping" => "ok".into(),
         "info" => info_line(),
         "textbox" => textbox_line(),
+        // `natives <class>` -- what the engine registered on a Java class, as
+        // opposed to what it exported. See `registered_natives`' own doc for
+        // the weeks-old wrong conclusion this exists to settle.
+        "natives" => match it.next() {
+            Some(class) => {
+                let list = cordial_linker_sys::game_activity::registered_natives(class);
+                if list.is_empty() {
+                    format!("ok class={class} natives=0")
+                } else {
+                    format!(
+                        "ok class={class} natives={} {list}",
+                        list.split_whitespace().count()
+                    )
+                }
+            }
+            None => "err natives <java/class/Name>".into(),
+        },
         "loopers" => loopers_line(),
         "move" => match (num(it.next()), num(it.next())) {
             (Some(x), Some(y)) => {

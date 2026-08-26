@@ -128,6 +128,34 @@ also that mocktail's architecture differs in ways that matter: its web view is a
 *separate process* forwarding over a socket, so "how mocktail does it" is not
 always transplantable, only informative.
 
+## Cut releases, and cut them often
+
+**A change that is not in a release has not reached anybody.** This project spent
+six days and 193 commits between `v0.6.0` and `v0.7.0` — text entry, three audio
+backends, a verified web view — and for all of that week the newest thing a user
+could install was none of it. That is the most common way work here goes to
+waste, and it is entirely avoidable.
+
+So: **propose a release when one is due, rather than waiting to be asked.**
+
+- **Patch** (`v0.7.1`) for a fix to something users hit. A crash, a regression,
+  a broken install path. Same day is not too soon.
+- **Minor** (`v0.8.0`) when a feature lands that somebody would notice —
+  typing working, a new audio backend, the web view opening. Roughly weekly if
+  the work is there.
+- **Major** for a change in what Cordial *is*, or one that breaks a user's
+  setup: a new backend becoming the default, a profile layout change, dropping a
+  platform.
+
+Write the notes from what was measured, the way commit messages here are
+written, and **put what is still broken in them** — `v0.7.0`'s notes end with the
+startup freeze and the black canvas because somebody installing it deserves to
+know before they hit them, not after.
+
+Tagging and publishing are outward-facing, so ask first. Preparing the notes,
+the version bump and the packaging is not, so do that without being asked and
+have it ready when you ask.
+
 ## Reporting back
 
 The rule in AGENTS.md about never stating an unobserved result applies hardest

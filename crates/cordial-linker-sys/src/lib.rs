@@ -1817,6 +1817,9 @@ pub mod game_activity {
         fn cordial_textbox_handle() -> i64;
         fn cordial_textbox_generation() -> c_int;
         fn cordial_textbox_text(buf: *mut c_char, n: c_int) -> c_int;
+        fn cordial_registered_natives(
+            class_name: *const c_char, out: *mut c_char, n: usize,
+        ) -> c_int;
         fn cordial_textbox_info(out: *mut RawTextBoxInfo) -> c_int;
         fn cordial_textbox_info_now(
             f: *mut c_void, out: *mut RawTextBoxInfo, err: *mut c_char, n: usize,
@@ -2050,6 +2053,35 @@ pub mod game_activity {
         // and outlives the call, which only copies into it.
         let known = unsafe { cordial_textbox_info(&mut info as *mut RawTextBoxInfo) };
         if known == 0 { None } else { Some(info) }
+    }
+
+    /// Every native the engine has registered on `class_name`, and where each
+    /// points, or an empty list when it has registered none.
+    ///
+    /// **This answers a question that has been argued rather than looked up.**
+    /// A native registered through `RegisterNatives` never appears in `nm -D`,
+    /// so an exported-symbol table says nothing about whether the engine drives
+    /// a class -- and `docs/HANDOVER.md` concluded for weeks that voice chat's
+    /// downlink "cannot be written" from exactly that absence. Cordial has
+    /// depended on the distinction since `terminateNativeCode` (see
+    /// `native/game_activity.cpp`) without being able to see it.
+    ///
+    /// The pointer is reported beside the name because "registered" and
+    /// "registered to something real" are different claims.
+    pub fn registered_natives(class_name: &str) -> String {
+        let Ok(c) = CString::new(class_name) else {
+            return String::new();
+        };
+        let mut buf = vec![0u8; 8192];
+        // SAFETY: both buffers outlive the call and their lengths are passed.
+        let n = unsafe {
+            cordial_registered_natives(c.as_ptr(), buf.as_mut_ptr() as *mut c_char, buf.len())
+        };
+        if n < 0 {
+            return String::new();
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
     }
 
     /// The focused box's contents, as the engine reported them at focus time.

@@ -1527,3 +1527,53 @@ int cordial_game_activity_key(long handle, int down, int key_code, int scan_code
 }
 
 } // extern "C"
+
+// ---------------------------------------------------- registered-native probe
+//
+// **What natives has the engine actually registered on a class?**
+//
+// This exists because a claim in `docs/HANDOVER.md` stood for weeks on the
+// wrong evidence: voice chat's downlink "cannot be written" because
+// `nativeGetPlayoutData` does not appear among `libroblox.so`'s exports. It does
+// not, and that proves nothing -- `docs/analysis/jni-natives.tsv` is an `nm -D`
+// table, and these natives arrive through `RegisterNatives` at run time. The one
+// WebRTC symbol that *is* exported is a loader, which is what registers them.
+//
+// Cordial has depended on that distinction for months without being able to
+// *see* it: `terminateNativeCode` is looked up in `cls->natives` a few hundred
+// lines above precisely because it is absent from `nm -D`. So the machinery to
+// answer this was already here and there was no way to ask.
+//
+// Now there is, and it costs one call: the answer to "is this path dead or is
+// Cordial simply not on it" is a list rather than an argument.
+extern "C" int cordial_registered_natives(const char* class_name, char* out, size_t out_len) {
+    if (!class_name || !out || out_len == 0) return -1;
+    out[0] = '\0';
+    jnivm::ENV* env = cordial::process_env();
+    if (!env) {
+        snprintf(out, out_len, "no JNI environment yet");
+        return -1;
+    }
+    auto cls = env->GetClass(class_name);
+    if (!cls) {
+        snprintf(out, out_len, "class not registered");
+        return 0;
+    }
+    // The class's own lock, held only while copying names out -- the same
+    // discipline the AGDK lookups above use, and for the same reason: the
+    // engine may register more natives at any time.
+    std::lock_guard<std::mutex> lock(cls->mtx);
+    size_t used = 0;
+    int count = 0;
+    for (const auto& entry : cls->natives) {
+        // The pointer is printed as well as the name, because "registered" and
+        // "registered to something real" are different claims and this project
+        // has been caught by that distinction before.
+        int n = snprintf(out + used, out_len - used, "%s%s@%p",
+                         count ? " " : "", entry.first.c_str(), entry.second);
+        if (n < 0 || static_cast<size_t>(n) >= out_len - used) break;
+        used += static_cast<size_t>(n);
+        ++count;
+    }
+    return count;
+}

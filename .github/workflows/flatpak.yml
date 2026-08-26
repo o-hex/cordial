@@ -53,8 +53,13 @@ on:
       - 'Cargo.lock'
   workflow_dispatch:
 
+# `contents: write` because a tagged build attaches its single-file bundle to
+# the release. Read would be enough for everything else here, and the narrower
+# grant is the right default -- but a release with nothing to download is the
+# whole reason the bundle step exists, so the job that builds it is the job that
+# must be able to post it.
 permissions:
-  contents: read
+  contents: write
 
 # One at a time. Two runs exporting into the same Pages deployment would race,
 # and cancelling a half-finished OSTree export is worse than queueing.
@@ -283,6 +288,50 @@ jobs:
           # bigger, and size is the binding constraint on Pages.
           flatpak build-update-repo "${args[@]}" repo
           ostree --repo=repo refs
+
+      # **A release with nothing to download sends everybody through the
+      # unsigned remote**, which is the one step in the install this repository
+      # spends four paragraphs warning people about. A single-file bundle is the
+      # install with no trust decision in it:
+      #
+      #     flatpak install --user ./Cordial-<tag>.flatpak
+      #
+      # Built from the same `repo` the remote is published from, after the debug
+      # extension has been dropped, so it is byte-for-byte the thing a remote
+      # install would have fetched -- not a second build that might differ.
+      - name: Build a single-file bundle
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME:-main}"
+          out="Cordial-${ref}.flatpak"
+          flatpak build-bundle repo "$out" "$APP_ID" master \
+            --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
+          ls -lh "$out"
+          echo "BUNDLE=$out" >> "$GITHUB_ENV"
+
+      # Kept for every build, tag or not: a pull request that changes packaging
+      # is exactly when somebody wants to install the result and try it, and
+      # asking them to build it themselves is how packaging regressions reach a
+      # release.
+      - name: Upload the bundle as a workflow artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordial-flatpak-bundle
+          path: ${{ env.BUNDLE }}
+          if-no-files-found: error
+
+      # Attached to the release only on a tag, and only when the whole build has
+      # got this far -- which is the point. A green run is the condition for
+      # publishing the remote, and it should be the condition for the download
+      # beside it too, rather than a file uploaded by hand from a machine
+      # nobody can audit.
+      - name: Attach the bundle to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" "$BUNDLE" --clobber
 
       - name: Assemble the Pages tree
         run: |

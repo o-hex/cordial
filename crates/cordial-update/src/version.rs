@@ -88,6 +88,47 @@ impl ClientVersion {
 }
 
 /// `0.732.23.7321040` -> `732`.
+/// A version as comparable numbers.
+///
+/// **String comparison is wrong here and quietly so**: lexically `"2.734.9"`
+/// beats `"2.734.10"`, and the sources disagree on shape anyway -- the engine
+/// records `2.734.0.917` while a mirror says `2.734.917`. Anything numeric is
+/// compared and anything else ignored, rather than guessed at.
+pub fn numeric(version: &str) -> Vec<u64> {
+    version.split(|c: char| !c.is_ascii_digit()).filter_map(|p| p.parse().ok()).collect()
+}
+
+/// The two numbers that identify a Roblox build: its major, and its build.
+///
+/// **Comparing the components element-wise is wrong**, and quietly so, because
+/// the two sources that have to be compared do not agree on how many there
+/// are. The engine records `2.734.0.917` and the mirror says `2.734.917` for
+/// the same build; element-wise that reads 0 against 917 at the third position
+/// and calls the identical build an update. Measured against those exact two
+/// strings, which is how it was found.
+///
+/// The major is the second component in both shapes and the build is the last
+/// in both, so those are the two that carry meaning. Everything between them
+/// is padding that differs by source.
+fn major_and_build(version: &str) -> Option<(u64, u64)> {
+    let parts = numeric(version);
+    match parts.len() {
+        0 | 1 => None,
+        _ => Some((parts[1], *parts.last().expect("len >= 2"))),
+    }
+}
+
+/// Is `candidate` a newer build than `installed`?
+///
+/// Both or nothing: an unknown installed version is not an old one, and a
+/// version neither shape can be read from is not a comparison.
+pub fn is_newer(candidate: &str, installed: &str) -> bool {
+    match (major_and_build(candidate), major_and_build(installed)) {
+        (Some(there), Some(here)) => there > here,
+        _ => false,
+    }
+}
+
 pub fn major_of(version: &str) -> Option<u32> {
     version.split('.').nth(1)?.parse().ok()
 }
@@ -136,6 +177,22 @@ pub fn parse(body: &str) -> Result<ClientVersion, String> {
 
 #[cfg(test)]
 mod tests {
+    /// **The pair that produced the bug.** The engine writes four components
+    /// and the mirror three, for the same build.
+    #[test]
+    fn the_two_version_shapes_compare_equal_for_one_build() {
+        assert!(!super::is_newer("2.734.917", "2.734.0.917"), "same build, different shapes");
+        assert!(!super::is_newer("2.734.0.917", "2.734.917"));
+        // And a genuinely newer major still reads as newer, either way round.
+        assert!(super::is_newer("2.735.1138", "2.734.0.917"));
+        assert!(!super::is_newer("2.734.0.917", "2.735.1138"));
+        // A newer build within the same major.
+        assert!(super::is_newer("2.734.918", "2.734.0.917"));
+        // Nonsense compares as nothing rather than as newer.
+        assert!(!super::is_newer("", "2.734.0.917"));
+        assert!(!super::is_newer("2.734.0.917", ""));
+    }
+
     use super::*;
 
     /// Copied from the wire on 2026-08-02, byte for byte.

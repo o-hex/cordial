@@ -131,6 +131,17 @@ pub struct Checked {
     /// claiming to know it. `None` is the ordinary case.
     installed: Option<String>,
     release: Result<(Release, Notes), Unreachable>,
+    /// The newest build a source can actually supply **for this
+    /// architecture**, which is not the same as the newest Roblox announced.
+    ///
+    /// **This is the difference between an honest badge and one that never goes
+    /// out.** Measured on 2026-08-26: Roblox announced 735 and published
+    /// 2.735.1138 as two XAPK bundles carrying `config.armeabi_v7a.apk` and
+    /// `config.arm64_v8a.apk` and no `config.x86_64.apk` in either. So on this
+    /// machine the newest runnable build was 2.734.917, and a comparison
+    /// against the DevForum's number said "update available" for a build that
+    /// could never be installed -- for ever, and with the accent to match.
+    obtainable: Option<String>,
     /// What actually changed, from the Creator Hub table.
     ///
     /// Separate from `release` and allowed to fail on its own: the DevForum
@@ -171,8 +182,26 @@ impl Checked {
     }
 
     fn update_available(&self) -> bool {
-        match (self.installed.as_deref().and_then(version::major_of), self.latest_major()) {
-            (Some(here), Some(latest)) => here < latest,
+        // **Against what can be installed, not against what was announced.**
+        // See `obtainable`. Falling back to the announced major when no source
+        // answered would put the old behaviour back on exactly the runs where
+        // it is least defensible -- a network that failed is not evidence that
+        // a newer build exists for this architecture.
+        match (self.installed.as_deref(), self.obtainable.as_deref()) {
+            (Some(here), Some(there)) => version::is_newer(there, here),
+            _ => false,
+        }
+    }
+
+    /// Roblox announced a build newer than anything installable here.
+    ///
+    /// Worth saying out loud rather than hiding: somebody who reads the
+    /// release notes for 735 and is running 734 deserves to know why, and
+    /// "your architecture has no 735 build" is a better answer than a button
+    /// that does nothing.
+    fn newer_announced_than_obtainable(&self) -> bool {
+        match (self.obtainable.as_deref().and_then(version::major_of), self.latest_major()) {
+            (Some(have), Some(announced)) => have < announced,
             _ => false,
         }
     }
@@ -296,15 +325,77 @@ fn dressing(last: &Option<Checked>, automatic: Automatic) -> (&'static str, &'st
     }
 }
 
+/// What the banner says, or nothing at all.
+///
+/// Split out for the same reason as [`dressing`]: it is the part worth pinning
+/// in a test, and a `gtk::Banner` cannot be built without `gtk::init`.
+///
+/// Order matters. An update waiting outranks a standing setting -- somebody
+/// with automatic updates off who has just been told a build is available does
+/// not also need telling why nobody told them sooner.
+fn banner_text(last: &Option<Checked>, automatic: Automatic) -> Option<(String, bool)> {
+    if let Some(checked) = last {
+        if checked.update_available() {
+            return Some(("A newer Roblox build is available.".to_string(), false));
+        }
+        // Roblox published something this architecture has no build of. Said
+        // plainly, because the alternative is a user reading release notes for
+        // a version they cannot have and concluding Cordial is broken.
+        if checked.newer_announced_than_obtainable() {
+            if let Some(latest) = checked.latest_major() {
+                return Some((
+                    format!(
+                        "Roblox has published {latest}, but there is no build of it for this \
+                         computer's architecture yet. You are on the newest one there is."
+                    ),
+                    false,
+                ));
+            }
+        }
+    }
+    if automatic == Automatic::Manual {
+        return Some((
+            "Automatic update checks are off. Cordial will not look for new Roblox builds \
+             on its own."
+                .to_string(),
+            true,
+        ));
+    }
+    None
+}
+
+fn dress_banner(banner: &adw::Banner, last: &Option<Checked>, automatic: Automatic) {
+    match banner_text(last, automatic) {
+        Some((text, actionable)) => {
+            banner.set_title(&text);
+            // A button only where there is somewhere to send them. When an
+            // update is waiting the window already has a Download button below,
+            // and a banner button restating it is clutter; when checks are off
+            // the fix is in Settings, and a banner that names a problem without
+            // a way to it is the half-pattern this file has been fixing all
+            // day.
+            banner.set_button_label(if actionable { Some("Settings") } else { None });
+            banner.set_revealed(true);
+        }
+        None => banner.set_revealed(false),
+    }
+}
+
 fn dress(button: &gtk::Button, last: &Option<Checked>, automatic: Automatic) {
-    let (icon, tooltip, attention) = dressing(last, automatic);
+    let (icon, tooltip, _attention) = dressing(last, automatic);
     button.set_icon_name(icon);
     button.set_tooltip_text(Some(tooltip));
-    if attention {
-        button.add_css_class("suggested-action");
-    } else {
-        button.remove_css_class("suggested-action");
-    }
+    // **No accent, deliberately.** `.suggested-action` is the interface
+    // guidelines' style for the primary affirmative action -- the confirm
+    // button in a dialog -- and not a way of indicating state. An
+    // accent-filled icon button in a header bar is not a pattern the platform
+    // uses for "something is available", and it read as one thing the
+    // maintainer noticed before anybody else: why is the update button blue.
+    //
+    // The icon still changes, which is the quiet half of the signal, and the
+    // loud half is now an `AdwBanner` -- which is what GNOME's own software
+    // centres use to say exactly this.
+    button.remove_css_class("suggested-action");
 }
 
 /// Ask the network and the cache, off the GTK thread, and hand the answer back
@@ -332,7 +423,12 @@ fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
                         None
                     }
                 });
-            Checked { metered, installed, release, entries }
+            // One more small request, and it is what makes the answer true.
+            // The version list is metadata-sized -- about 100 kB -- against the
+            // two this already makes, and `metered` governs the download rather
+            // than the check, which this file has always said.
+            let obtainable = cordial_update::provider::newest_obtainable();
+            Checked { metered, installed, obtainable, release, entries }
         },
         then,
     )
@@ -588,6 +684,37 @@ pub fn present(
         .default_height(660)
         .build();
 
+    // **A banner rather than an accent-filled header button.** The interface
+    // guidelines reserve `.suggested-action` for the primary affirmative
+    // action -- the confirm in a dialog -- not for indicating state, and an
+    // accented icon button in a header bar is not a pattern the platform uses
+    // for "something is available". `AdwBanner` is: a full-width strip with a
+    // sentence and one button, which is what GNOME's own software centres use
+    // to say this.
+    //
+    // Two things can want saying, and they are different in kind, so the
+    // banner says whichever matters more:
+    //
+    //   - an update is waiting, which is news;
+    //   - automatic updates are off, which is a standing condition and the
+    //     reason no news will arrive by itself.
+    //
+    // The second is deliberately not an error. Manual is a legitimate choice
+    // and a banner that nags about it would be the application arguing with a
+    // setting the user made.
+    let banner = adw::Banner::new("");
+    banner.set_revealed(false);
+    // The button goes to the setting rather than flipping it from here. This
+    // window has no config path to persist through, and reaching for one would
+    // mean threading it through two call sites so a banner could write a value
+    // the Updates page already owns -- ADR-020's rule about one writer, applied
+    // to Cordial's own settings for the same reason.
+    {
+        let banner_for_click = banner.clone();
+        banner.connect_button_clicked(move |_| {
+            let _ = banner_for_click.activate_action("win.settings", Some(&"updates".to_variant()));
+        });
+    }
     // Everything the answer touches, in one closure, so a check started from
     // this dialog and one started at launch put the window into the same state.
     let paint = {
@@ -597,6 +724,7 @@ pub fn present(
         let open = open.clone();
         let action = action.clone();
         let button = button.clone();
+        let banner_for_paint = banner.clone();
         Rc::new(move |checked: &Option<Checked>| {
             // **Which build is here, not a verdict on it.** This line used to
             // carry the outcome — "Up to date", or the longer "Whether this
@@ -609,6 +737,7 @@ pub fn present(
             // So the line answers the question it can: which build you have. The
             // reasoning behind the missing verdict is still one hover away on
             // the button, where somebody who wants it will look for it.
+            dress_banner(&banner_for_paint, checked, automatic);
             let (_, subtitle) = status_lines(checked, automatic);
             let installed = match checked {
                 Some(checked) => version_line(checked.installed.clone()),
@@ -734,24 +863,27 @@ pub fn present(
             meter.start();
             action_for_click.set_label("Cancel");
             action_for_click.remove_css_class("suggested-action");
+            // **The handler has to outlive this block**, because whoever
+            // finishes the download -- success, failure or cancel -- must
+            // disconnect it. It did not, and the button stayed wired to
+            // `cancel.stop()` afterwards: pressing what now read "Check for
+            // updates" stopped a fetch that was no longer running.
+            let cancel_handler: std::rc::Rc<std::cell::RefCell<Option<glib::SignalHandlerId>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(None));
             {
+                let handler = cancel_handler.clone();
                 let cancel = cancel.clone();
-                let handler = std::rc::Rc::new(std::cell::RefCell::new(None));
-                let id = action_for_click.connect_clicked({
-                    let handler = handler.clone();
-                    let cancel = cancel.clone();
-                    move |b| {
-                        cancel.stop();
-                        b.set_sensitive(false);
-                        b.set_label("Stopping...");
-                        // One press is enough; the second would be a second
-                        // stop against a fetch already unwinding.
-                        if let Some(id) = handler.borrow_mut().take() {
-                            b.disconnect(id);
-                        }
+                let id = action_for_click.connect_clicked(move |b| {
+                    cancel.stop();
+                    b.set_sensitive(false);
+                    b.set_label("Stopping...");
+                    // One press is enough; a second would stop a fetch already
+                    // unwinding.
+                    if let Some(id) = handler.borrow_mut().take() {
+                        b.disconnect(id);
                     }
                 });
-                *handler.borrow_mut() = Some(id);
+                *cancel_handler.borrow_mut() = Some(id);
             }
 
             let button = action_for_click.clone();
@@ -782,7 +914,17 @@ pub fn present(
                         .map_err(|e| e.to_string())
                 }},
                 move |step| stepping.step(&step),
-                move |outcome| match outcome {
+                move |outcome| {
+                    // **Whatever happened, the button stops being Cancel.**
+                    // Leaving the handler attached wired the finished button to
+                    // `stop()`; leaving it insensitive after a cancel blocked
+                    // the only control on the window, which is how a stopped
+                    // download became a dead dialog.
+                    if let Some(id) = cancel_handler.borrow_mut().take() {
+                        button.disconnect(id);
+                    }
+                    button.set_sensitive(true);
+                    match outcome {
                     Ok(version) => {
                         finishing.finish(&version);
                         // **The badge is cleared here and nowhere else.**
@@ -807,16 +949,27 @@ pub fn present(
                         // get the memo the APK was updated.
                         done_paint(&done_last.borrow());
                     }
+                    Err(why) if why == cordial_update::Unreachable::Cancelled.to_string() => {
+                        // **A cancel is not a failure and must not look like
+                        // one.** It used to take the error path: red text, and
+                        // STORES underneath explaining where Roblox publishes
+                        // its builds -- advice for somebody who could not
+                        // download, shown to somebody who chose not to.
+                        finishing.stopped();
+                        button.set_label(DOWNLOAD);
+                        button.add_css_class("suggested-action");
+                        line.set_visible(true);
+                    }
                     Err(why) => {
                         // Verbatim, then what to do about it. A mirror being
                         // down and a machine having no network look identical
                         // from in here and only one is the user's to fix.
                         finishing.failed(&format!("{why}\n\n{STORES}"));
-                        button.set_visible(true);
                         button.set_label(DOWNLOAD);
+                        button.add_css_class("suggested-action");
                         line.set_visible(true);
                     }
-                },
+                }},
             );
         });
     }
@@ -833,6 +986,8 @@ pub fn present(
     header.pack_end(&open);
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
+    toolbar.add_top_bar(&banner);
+    toolbar.add_top_bar(&banner);
     toolbar.set_content(Some(&scroller));
     // A bottom bar rather than the last child of the scrolled pane: the button
     // has to stay put while a long changelog moves under it, or the control
@@ -1290,6 +1445,20 @@ mod tests {
         Checked {
             metered: Metered::GuessNo,
             installed: installed.map(str::to_string),
+            // Tests that predate `obtainable` describe a world where the
+            // mirror offers whatever Roblox announced -- the ordinary case,
+            // and the one that keeps their meaning. Where the installed build
+            // is already at the announced major, the mirror offers exactly
+            // what is installed, which is what "nothing newer" means.
+            obtainable: match (installed, latest) {
+                (Some(i), Some(m)) => Some(match version::major_of(i) {
+                    Some(here) if here < m => format!("2.{m}.9999"),
+                    _ => i.to_string(),
+                }),
+                (Some(i), None) => Some(i.to_string()),
+                (None, Some(m)) => Some(format!("2.{m}.9999")),
+                (None, None) => None,
+            },
             release: match latest {
                 Some(major) => Ok((release(major), notes(major))),
                 None => Err(Unreachable::Transport {
@@ -1446,6 +1615,55 @@ mod tests {
         // do the thing they name.
         assert!(!DOWNLOAD.ends_with('…'), "{DOWNLOAD}");
         assert!(!CHECK.ends_with('…'), "{CHECK}");
+    }
+
+    /// **A build Roblox has not published for this architecture is not an
+    /// update.** The case that produced the report: Roblox announced 735, and
+    /// published 2.735.1138 for ARM only, so the newest build this machine
+    /// could run stayed 2.734.917. Comparing against the announcement asked for
+    /// attention that pressing the button could never satisfy.
+    #[test]
+    fn an_announced_build_with_no_obtainable_version_is_not_an_update() {
+        let mut state = checked(Some("2.734.0.917"), Some(735));
+        // What the mirror can actually supply for x86-64.
+        state.obtainable = Some("2.734.917".to_string());
+
+        assert!(
+            !state.update_available(),
+            "the newest obtainable build is installed, so nothing is waiting"
+        );
+        assert!(
+            state.newer_announced_than_obtainable(),
+            "and the window should still be able to explain why 735 is not on offer"
+        );
+
+        let (_, attention) = (0, dressing(&Some(state.clone()), Automatic::Ask).2);
+        assert!(!attention, "no attention for an update that cannot be installed");
+
+        // And once a 735 does appear for this architecture, it is an update again.
+        state.obtainable = Some("2.735.1200".to_string());
+        assert!(state.update_available());
+    }
+
+    /// The banner says the more urgent of two things, and says nothing when
+    /// there is nothing to say.
+    #[test]
+    fn the_banner_prefers_news_over_a_standing_setting() {
+        let waiting = checked(Some("2.700.1.7001000"), Some(732));
+        let (text, has_button) = banner_text(&Some(waiting), Automatic::Manual).expect("a banner");
+        assert!(text.contains("newer Roblox build is available"), "{text}");
+        assert!(!has_button, "the window already has the Download button below it");
+
+        // Nothing waiting, checks off: the standing condition surfaces, with
+        // somewhere to go about it.
+        let current = checked(Some("2.732.9999"), Some(732));
+        let (text, has_button) =
+            banner_text(&Some(current.clone()), Automatic::Manual).expect("a banner");
+        assert!(text.contains("Automatic update checks are off"), "{text}");
+        assert!(has_button, "a banner naming a setting must offer a way to it");
+
+        // Nothing waiting, checks on: no banner at all.
+        assert!(banner_text(&Some(current), Automatic::Ask).is_none());
     }
 
     /// **The badge must go out once the thing it points at is installed.**

@@ -208,6 +208,19 @@ impl Meter {
         self.status.set_label(&format!("Installed Roblox {version}"));
     }
 
+    /// Stopped by the user. Not a failure, and deliberately not styled as one.
+    ///
+    /// The bar goes back to empty rather than staying where it got to, because
+    /// a part-full bar next to an idle button reads as a download still in
+    /// progress -- and nothing was kept: a cancelled fetch removes what it
+    /// wrote, exactly as a failed one does.
+    pub fn stopped(&self) {
+        self.stop_pulsing();
+        self.bar.set_fraction(0.0);
+        self.status.remove_css_class("error");
+        self.status.set_label("Download stopped.");
+    }
+
     /// A failure, said in full and left on screen.
     pub fn failed(&self, why: &str) {
         self.stop_pulsing();

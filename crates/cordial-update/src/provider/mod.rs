@@ -243,7 +243,7 @@ fn order_by_version(
     let mut scored: Vec<(Option<Vec<u64>>, usize, Box<dyn Provider>)> = Vec::new();
     for (position, source) in sources.into_iter().enumerate() {
         let version = match source.newest(progress) {
-            Ok(v) => Some(numeric(&v.name)),
+            Ok(v) => Some(crate::version::numeric(&v.name)),
             Err(Unreachable::NoSource { why }) => {
                 absent.push(format!("{}: {why}", source.name()));
                 None
@@ -269,16 +269,29 @@ fn order_by_version(
     scored.into_iter().map(|(_, _, s)| s).collect()
 }
 
-/// A version as comparable numbers.
+/// The newest build any source can actually supply, as a version string.
 ///
-/// **String comparison is wrong here and quietly so**: `2.734.917` sorts below
-/// `2.734.916` only if you compare component by component as numbers, and
-/// lexically `"2.734.9"` beats `"2.734.10"`. The two sources also disagree on
-/// shape -- the engine reads `2.734.0.917` and the mirror says `2.734.917` --
-/// so anything numeric is compared and anything else is ignored rather than
-/// guessed at.
-fn numeric(version: &str) -> Vec<u64> {
-    version.split(|c: char| !c.is_ascii_digit()).filter_map(|p| p.parse().ok()).collect()
+/// **Not the newest Roblox announced.** A release can exist for ARM and not for
+/// x86-64 -- 2.735.1138 did, on 2026-08-26 -- and a client that compares
+/// against the announcement asks for attention it can never satisfy. Every
+/// provider is asked and the highest answer wins; sources that cannot answer
+/// are skipped rather than treated as zero.
+///
+/// One small request per networked source. `None` means nothing answered,
+/// which callers must treat as "unknown", never as "nothing newer".
+pub fn newest_obtainable() -> Option<String> {
+    let mut best: Option<String> = None;
+    for source in all() {
+        let Ok(available) = source.newest(&mut |_| {}) else { continue };
+        let better = match &best {
+            None => true,
+            Some(have) => crate::version::is_newer(&available.name, have),
+        };
+        if better {
+            best = Some(available.name);
+        }
+    }
+    best
 }
 
 /// A build that was obtained and checked.
@@ -517,6 +530,7 @@ mod tests {
     /// **The comparison a string sort gets wrong, both ways.**
     #[test]
     fn versions_compare_as_numbers_and_not_as_text() {
+        use crate::version::numeric;
         assert!(numeric("2.734.917") > numeric("2.734.916"));
         // Lexically "2.734.9" beats "2.734.10". Numerically it does not.
         assert!(numeric("2.734.10") > numeric("2.734.9"));

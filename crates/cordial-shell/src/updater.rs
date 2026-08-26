@@ -152,6 +152,24 @@ impl Checked {
     /// Both operands or nothing. An unknown installed version is not an old one,
     /// and a DevForum that did not answer is not a Roblox that published
     /// nothing.
+    /// Re-read the installed version from disk.
+    ///
+    /// **Called after an install, so the button stops asking for attention it
+    /// has already been given.** `installed` is a snapshot taken when the check
+    /// ran, and installing a build makes it stale immediately -- so the badge
+    /// stayed lit after a download that had just resolved the thing it was
+    /// pointing at, which reads as the update having failed.
+    ///
+    /// Re-read rather than assigned from the version the install reported,
+    /// because `update_available` compares this against the DevForum's number
+    /// and both operands have to come from the sources the original comparison
+    /// used. A string from somewhere else that happens to look similar is how
+    /// two version formats end up compared and neither is wrong-looking enough
+    /// to notice.
+    fn reread_installed(&mut self) {
+        self.installed = cache::recorded_version(&install::engine_cache());
+    }
+
     fn update_available(&self) -> bool {
         match (self.installed.as_deref().and_then(version::major_of), self.latest_major()) {
             (Some(here), Some(latest)) => here < latest,
@@ -431,6 +449,11 @@ pub fn present(
     button: gtk::Button,
 ) {
     let automatic = config.borrow().automatic_updates;
+    // The header-bar button, kept under a name of its own because `button` is
+    // shadowed further down by this window's own action button and the two
+    // being confused is how the badge would get cleared on the wrong widget.
+    let button_for_badge = button.clone();
+    let last_for_badge = last.clone();
 
     // Two things in this window: the changelog, and the one control that acts
     // on it. It used to open with three `PreferencesGroup`s — a status row, the
@@ -708,6 +731,11 @@ pub fn present(
             let line = status_line.clone();
             let stepping = meter.clone();
             let finishing = meter.clone();
+            // The header-bar button and the knowledge behind it, so a finished
+            // download can put both right. `present` is handed them precisely
+            // so this window can; before this they were only ever read.
+            let done_button = button_for_badge.clone();
+            let done_last = last_for_badge.clone();
             on_worker_reporting(
                 |report| {
                     // `Newest`, and this is the button where that matters.
@@ -724,7 +752,21 @@ pub fn present(
                 },
                 move |step| stepping.step(&step),
                 move |outcome| match outcome {
-                    Ok(version) => finishing.finish(&version),
+                    Ok(version) => {
+                        finishing.finish(&version);
+                        // **The badge is cleared here and nowhere else.**
+                        // Nothing else re-runs the comparison: `last` holds the
+                        // answer from a check that ran before this download
+                        // existed, so without this the header button keeps its
+                        // arrow and its accent for the rest of the session --
+                        // still pointing at an update the user has just
+                        // installed. Local and free: no request, just the
+                        // version now on disk.
+                        if let Some(checked) = done_last.borrow_mut().as_mut() {
+                            checked.reread_installed();
+                        }
+                        dress(&done_button, &done_last.borrow(), automatic);
+                    }
                     Err(why) => {
                         // Verbatim, then what to do about it. A mirror being
                         // down and a machine having no network look identical
@@ -1364,6 +1406,36 @@ mod tests {
         // do the thing they name.
         assert!(!DOWNLOAD.ends_with('…'), "{DOWNLOAD}");
         assert!(!CHECK.ends_with('…'), "{CHECK}");
+    }
+
+    /// **The badge must go out once the thing it points at is installed.**
+    ///
+    /// Reported from the running app: download an update, close the window,
+    /// and the header button keeps its arrow and its accent -- still asking
+    /// for attention it has already been given, which reads as the update
+    /// having failed.
+    ///
+    /// The cause is that `Checked::installed` is a snapshot from before the
+    /// download, and nothing re-ran the comparison afterwards. `dressing` was
+    /// never wrong; it was being asked about stale knowledge. So this pins the
+    /// invariant at the level that has no GTK in it: the moment `installed`
+    /// catches up with what Roblox published, the attention state is false and
+    /// the icon goes back to the package.
+    #[test]
+    fn installing_the_update_puts_the_badge_out() {
+        let automatic = Automatic::Ask;
+
+        // Before: behind by a major, so the button asks for attention.
+        let mut state = checked(Some("0.700.1.7001000"), Some(732));
+        let (icon, _, attention) = dressing(&Some(state.clone()), automatic);
+        assert!(attention, "a build behind the published one must ask for attention");
+        assert_eq!(icon, UPDATE_ICON);
+
+        // After: `reread_installed` would have picked this up off disk.
+        state.installed = Some("0.732.23.7321040".to_string());
+        let (icon, _, attention) = dressing(&Some(state), automatic);
+        assert!(!attention, "the badge must go out once the update is installed");
+        assert_eq!(icon, PACKAGE_ICON, "and the icon goes back to the package");
     }
 
     #[test]

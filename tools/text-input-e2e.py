@@ -593,6 +593,76 @@ def run_cases(case, dev, kbd, ptr, log_path, args, display):
         s = state()
         case.check("typing works after a refocus", s["text"], "second")
 
+    print("\n-- 12c. the editor follows the window when it resizes")
+    # **The case docs/NEXT.md says was never tested.** `editor_rect` is in
+    # surface coordinates and the input region is punched from it, and the
+    # region is rebuilt on placement and stacking changes -- not on a
+    # configure. So the question is whether anything re-places the editor after
+    # the surface changes size, or whether the hole is left where the box used
+    # to be.
+    #
+    # It is not obviously broken: `sync_text_overlay` runs off the pump about
+    # twenty times a second, re-reads the engine's geometry every 100ms, and
+    # rebuilds when what it is about to draw differs from what it drew. If the
+    # engine re-lays-out on resize, that should self-heal within a tick or two.
+    # This asserts it rather than assuming it either way.
+    #
+    # Sober #1026 is the reason to care: same engine, same kind of desktop, and
+    # users report the textbox dying *only* in fullscreen, only on Wayland, one
+    # of them pinning it to the surface being exactly the output size.
+    if box2["focus"] != "none":
+        before = dev.textbox()
+        case.note("editor rect before resize",
+                  f"x={before.get('x')} y={before.get('y')} "
+                  f"w={before.get('w')} h={before.get('h')}")
+        new_w, new_h = int(args.width) - 120, int(args.height) - 80
+        r = in_box(f"SWAYSOCK=$(ls -t $XDG_RUNTIME_DIR/sway-ipc.*.sock | head -1) "
+                   f"swaymsg output HEADLESS-1 mode {new_w}x{new_h}")
+        # **Prove the resize happened before asserting anything about it.**
+        # The first version of this case did not, and passed while reporting a
+        # byte-identical rectangle either side -- which is exactly what a
+        # swaymsg that silently did nothing would produce. An instrument that
+        # cannot fail is not evidence, and this suite exists because that
+        # mistake has already been made here more than once.
+        modes = in_box(f"SWAYSOCK=$(ls -t $XDG_RUNTIME_DIR/sway-ipc.*.sock | head -1) "
+                       f"swaymsg -t get_outputs -r").stdout
+        case.note("swaymsg said", (r.stdout or r.stderr).strip()[:120])
+        got_mode = ""
+        try:
+            for o in json.loads(modes):
+                if o.get("name") == "HEADLESS-1":
+                    cm = o.get("current_mode") or {}
+                    got_mode = f"{cm.get('width')}x{cm.get('height')}"
+        except Exception as e:
+            case.note("could not read the output mode", str(e))
+        case.check("the output really did change size",
+                   got_mode, f"{new_w}x{new_h}")
+        # Generous: the engine has to notice the configure, re-lay-out, and
+        # publish new geometry, and only then does the 100ms poll pick it up.
+        time.sleep(3.0)
+        after = dev.textbox()
+        case.note("editor rect after resize",
+                  f"x={after.get('x')} y={after.get('y')} "
+                  f"w={after.get('w')} h={after.get('h')} placed={after.get('placed')}")
+
+        # Three separate assertions, because they fail independently and the
+        # third passing while the first fails is exactly the "the path worked"
+        # illusion this suite exists to avoid.
+        case.check("the box still has focus after a resize",
+                   after.get("focus") != "none", True)
+        case.check("the editor is still placed from engine geometry",
+                   after.get("placed"), "engine")
+        # And the one that matters: can you still type into it. A rectangle in
+        # the right place proves nothing if keys no longer land.
+        key("ctrl+a")
+        type_("resized")
+        s = state()
+        case.check("typing still reaches the box after a resize", s["text"], "resized")
+
+        in_box(f"SWAYSOCK=$(ls -t $XDG_RUNTIME_DIR/sway-ipc.*.sock | head -1) "
+               f"swaymsg output HEADLESS-1 mode {args.width}x{args.height}")
+        time.sleep(2.0)
+
     print("\n-- 12b. with no box focused, keys reach the game again")
     # Everything after this mark is deliberately sent with nothing focused, so
     # step 13 stops reading here rather than counting this on purpose.

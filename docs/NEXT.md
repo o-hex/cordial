@@ -151,10 +151,32 @@ part of what "the text field looks wrong" has been describing.
 vouched for, for up to 1.5s, before falling through to the bar. Measured after:
 `carried` then `engine`, no `fallback`, on every run.
 
-**What is still not tested: resize with the editor up.** `editor_rect` is in
-surface coordinates and the region is recomputed on stacking and placement
-changes only, never on configure. ADR-022 already flagged this and it is still
-open.
+**Resize with the editor up is now tested, and is not broken.** This used to
+say it was untested and to note that `editor_rect` is in surface coordinates
+while the input region is rebuilt on stacking and placement changes only, never
+on configure -- which reads as a bug waiting to happen and was reported as one
+by a later audit. Measured on 2026-08-26, step 12c of `tools/text-input-e2e.py`:
+with a box focused, the output really resized from 1280x800 to 1160x720, and
+afterwards the box still had focus, the editor was still placed from engine
+geometry rather than falling back, and typing still reached it.
+
+The likely reason nothing breaks is that `sync_text_overlay` runs off the pump
+about twenty times a second and re-reads the engine's geometry every 100ms, so
+a configure heals within a tick or two without the region needing to know about
+it.
+
+**Two things that case does not establish, so do not read it as more than it
+is.** The engine reported the *same* rectangle either side of the resize --
+`x=332 y=10 w=564 h=36` before and after -- so this proves the editor survives a
+resize and does not prove it follows a box that moves. And it says nothing about
+fullscreen at exactly the output size, which is the configuration Sober #1026
+fingers: only in fullscreen, only on Wayland, "stops when either is even a pixel
+below that".
+
+The case asserts the output mode actually changed before asserting anything
+about the editor. The first version did not, passed, and reported a
+byte-identical rectangle either side -- indistinguishable from a `swaymsg` that
+silently did nothing.
 
 ## Frame pacing, measured properly, 2026-08-26
 

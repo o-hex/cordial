@@ -11,7 +11,6 @@
 //! channel is a named, brokered one.
 
 use crate::broker::Broker;
-use crate::capability::Capability;
 use crate::events::EventRegistry;
 use crate::presence::{DiscordPresence, PresencePayload};
 use crate::protocol::{required_capability, Push, Request, Response};

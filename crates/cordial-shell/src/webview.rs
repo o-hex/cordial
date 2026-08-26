@@ -336,6 +336,21 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
     //
     // **Never log the payload** -- it carries whatever the page and the engine
     // are mid-conversation about.
+    // The early return below (`if (!handler) return;`) never retries, which
+    // looks like a race waiting to happen: if `window.webkit.messageHandlers`
+    // were not populated when a document-start script runs, the bridge would
+    // silently never install.
+    //
+    // **It cannot happen, and the reason is structural rather than lucky.**
+    // `WebKitWebView`'s `user-content-manager` property is construct-only, so
+    // a manager cannot be attached after the view exists -- handlers and
+    // scripts are necessarily registered before there is any document to run
+    // them in. Checked in `WebKit-6.0.gir`; this file's own ordering
+    // (handlers, then script, then `WebView::builder()`, then `load_uri`)
+    // satisfies it regardless.
+    //
+    // Recorded because it is an appealing theory that costs a day: it explains
+    // an intermittent symptom neatly and is wrong.
     let shim = format!(
         r#"(() => {{
   "use strict";
@@ -355,6 +370,36 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
 }})();"#,
         a = BRIDGE_EXECUTE_ROBLOX,
     );
+    // **`TopFrame` is load-bearing, not a leftover.** It pairs with the origin
+    // check in `forward_script_message`, and changing one without the other
+    // opens a hole. Written down because the pairing is invisible from either
+    // end and the obvious "fix" for a bridge-in-an-iframe bug is to flip this
+    // constant.
+    //
+    // Measured on this machine with `cargo run -p cordial-shell --example
+    // frame_scope_probe`, against a page with one same-origin `srcdoc` child:
+    //
+    //     TopFrame   -> ["top"]
+    //     AllFrames  -> ["top", "nested"]
+    //
+    // So a nested frame does receive the script under `AllFrames`, and it can
+    // reach `window.webkit.messageHandlers` -- the handler is registered per
+    // script *world*, not per frame. `AllFrames` is in fact WebKitGTK's
+    // documented default; this is a deliberate narrowing away from it.
+    //
+    // The narrowing is what makes the policy check correct. Messages arrive
+    // through `script-message-received`, which does not say which frame sent
+    // them, and `forward_script_message` therefore evaluates
+    // `webview_policy::evaluate(view.uri())` -- **the top-level document's
+    // address**. With `TopFrame` that is the sender's address by construction.
+    // With `AllFrames` it would not be: any nested frame, including a
+    // third-party one embedded in a roblox.com page, could post a bridge
+    // command and have it judged against roblox.com rather than against
+    // itself.
+    //
+    // So if the Join control ever does turn out to live in an iframe, the fix
+    // is **not** one constant. It is `AllFrames` plus per-frame origin
+    // attribution, and this API does not obviously offer the latter.
     user_content.add_script(&webkit6::UserScript::new(
         &shim,
         webkit6::UserContentInjectedFrames::TopFrame,

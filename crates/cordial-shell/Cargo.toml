@@ -32,6 +32,15 @@ webview = ["dep:webkit6"]
 # machine's WebKitGTK do WebAuthn" — see the file. Not built by `cargo test
 # --workspace`, which runs without `webview`: an example whose
 # `required-features` are absent is skipped rather than failed.
+# The frame-scope question webview.rs's TopFrame choice turns on: does a user
+# script reach a nested frame, and can that frame see the message handler at
+# all. Needs a real WebKitGTK and a display, so it is an example rather than a
+# test -- and `required-features` keeps `cargo test --workspace` skipping it
+# rather than failing on a missing dependency.
+[[example]]
+name = "frame_scope_probe"
+required-features = ["webview"]
+
 [[example]]
 name = "webauthn_probe"
 required-features = ["webview"]

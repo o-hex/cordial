@@ -13,6 +13,30 @@
 #
 # Columns:
 #
+# **2026-08-26: forty runs, twenty per arm, and not one freeze.** Nudged versus
+# not, strictly interleaved, on this machine after a reboot. At the 32% base
+# rate above you would expect about thirteen; the chance of none is about three
+# in ten million. So the freeze did not reproduce at all that day, and the arm
+# that was supposed to test it could not be judged -- you cannot measure whether
+# input prevents a freeze when nothing freezes.
+#
+# The nudge instrument was live this time, which is the part worth keeping. The
+# previous NUDGE arm was a silent no-op: the virtual pointer holder was started
+# after the client had already latched seat capabilities at open(), so nothing
+# was ever delivered and the arm measured nothing at all. This one drove
+# Cordial's own entry points through the MCP instead and recorded proof --
+# `first_ok_move_at=0.017 ok=1710 errreply=0` per run. It also had a visible
+# effect on something: nudged runs sit at a p25 median of 3578 presents against
+# 2838, which is the idle throttle being held off, exactly as it should be.
+#
+# What that leaves is an open question rather than an answer. Either the freeze
+# has been fixed by something committed since 2026-08-25, or its conditions
+# differ from this harness. Note that every run here reached `Landing` -- the
+# signed-out screen -- while the original 25-run measurement was taken on a
+# signed-in profile. **Before spending another day on the freeze, re-run this
+# on a signed-in profile that reaches a game**, because a bug that only appears
+# past the login screen would look exactly like this.
+#
 #   run         the number you passed, so rows collate
 #   ready       the last `app ready:` screen the shell reached
 #   presents10  vkQueuePresentKHR count ten seconds after that

@@ -649,17 +649,65 @@ pub fn present(
     {
         // The whole of what the one button does, and which branch it takes is
         // the state rather than a mode the user has to have selected. Check
-        // re-asks the DevForum; Update… opens what Cordial knows about getting
-        // a build it cannot fetch.
+        // re-asks the DevForum; Download fetches the build.
+        //
+        // **The download happens here rather than in a dialog this opens.**
+        // There was a second dialog, and before that a third, both of them
+        // explaining that Cordial could not fetch a build. Once it could, a
+        // dialog whose only content is an apology for a missing feature had
+        // nothing left to say, and stacking a working button behind a window
+        // that has to be opened first is two clicks for one action. This is
+        // the window somebody opened to see what changed; the button under
+        // the changelog is where they will press to get it.
         let run_check = run_check.clone();
         let last_for_click = last.clone();
-        let window_for_update = window.clone();
+        let status_line = status_line.clone();
+        let action_for_click = action.clone();
         action.connect_clicked(move |_| {
-            if last_for_click.borrow().as_ref().is_some_and(Checked::update_available) {
-                update_dialog(&window_for_update);
-            } else {
+            if !last_for_click.borrow().as_ref().is_some_and(Checked::update_available) {
                 run_check();
+                return;
             }
+
+            // Disabled for the duration. A 229 MB fetch pressed twice is two
+            // downloads into one staging directory, and the second one refuses
+            // -- correctly, and confusingly, since the first is still working.
+            action_for_click.set_sensitive(false);
+            action_for_click.set_label("Downloading…");
+            status_line.set_label("Looking for a build…");
+            status_line.remove_css_class("error");
+
+            let button = action_for_click.clone();
+            let line = status_line.clone();
+            let failed_line = status_line.clone();
+            on_worker_reporting(
+                |report| {
+                    cordial_update::provider::obtain_and_install(None, &mut |p| {
+                        report(describe_progress(&p))
+                    })
+                    .map(|(got, _)| (got.version.name, got.provider))
+                    .map_err(|e| e.to_string())
+                },
+                move |what| line.set_label(&what),
+                move |outcome| match outcome {
+                    Ok((version, from)) => {
+                        button.set_label("Installed");
+                        button.remove_css_class("suggested-action");
+                        failed_line.set_label(&format!(
+                            "Roblox {version} installed from {from}. Restart Cordial to use it."
+                        ));
+                    }
+                    Err(why) => {
+                        button.set_sensitive(true);
+                        button.set_label(DOWNLOAD);
+                        // Verbatim, then what to do about it. A mirror being
+                        // down and a machine having no network look identical
+                        // from in here and only one is the user's to fix.
+                        failed_line.set_label(&format!("{why}\n\n{STORES}"));
+                        failed_line.add_css_class("error");
+                    }
+                },
+            );
         });
     }
     // Opening this window is a check in every mode, which is what makes the
@@ -686,30 +734,19 @@ pub fn present(
     window.present();
 }
 
-/// What the one button says before a check, and once one has landed.
+/// The label once a check says there is something newer.
 ///
-/// **`Update…` and not `Download`, when there is nothing to download.** Roblox
-/// publishes the Android build through Google Play and the Amazon Appstore and
-/// no file, and a button labelled Download that opens a panel saying so is the
-/// interface version of the stub that reports success. The ellipsis is load
-/// bearing rather than decoration: GNOME's convention is that `…` means *this
-/// opens something rather than doing it*, which is exactly what this button
-/// does in that state.
-const UPDATE: &str = "Update…";
-
-/// The label the moment a fetch is genuinely possible — see [`DOWNLOAD`]'s
-/// condition in [`action_label`].
-///
-/// This is the state the `UPDATE` comment always described as the day the
-/// ellipsis drops. It arrives when `CORDIAL_UPDATE_URL` and its hash are set,
-/// because then [`Source::configured`] returns a source and the button really
-/// would do the thing its label names.
-const DOWNLOAD: &str = "Download";
+/// **There used to be two labels here.** `Update…` was shown when no source
+/// existed, its ellipsis carrying GNOME's meaning of "this opens something
+/// rather than doing it" -- honest at the time, because what it opened was a
+/// panel explaining that Cordial could not fetch a build. A source exists now,
+/// so the second label and the panel behind it are both gone.
+const DOWNLOAD: &str = "Download Roblox";
 
 /// The resting label, in every mode including Automatic. Roblox publishes no
 /// Android version number this can compare against, so "nothing newer" is the
 /// near-permanent answer and this is the near-permanent word on the button.
-const CHECK: &str = "Check for Updates";
+const CHECK: &str = "Check for updates";
 
 /// What the button says while the request is in flight.
 ///
@@ -717,7 +754,7 @@ const CHECK: &str = "Check for Updates";
 /// pressing this, so this is where somebody is already looking, and a status
 /// line that says "Checking…" and then has to be restored to something else is
 /// two states to keep in step instead of one.
-const CHECKING: &str = "Checking for Updates…";
+const CHECKING: &str = "Checking…";
 
 /// The word the button wears, decided by state rather than by the update mode.
 ///
@@ -727,94 +764,12 @@ const CHECKING: &str = "Checking for Updates…";
 /// that never arrives.
 fn action_label(checked: &Option<Checked>) -> &'static str {
     match checked {
-        Some(checked) if checked.update_available() => {
-            if Source::configured().is_ok() {
-                DOWNLOAD
-            } else {
-                UPDATE
-            }
-        }
+        // This used to ask whether a source existed and say `Update…` when
+        // none did, with the ellipsis meaning "opens a panel that explains why
+        // not". A source exists now, so the button does the thing it names.
+        Some(checked) if checked.update_available() => DOWNLOAD,
         _ => CHECK,
     }
-}
-
-/// What `Update…` opens.
-///
-/// **This used to be a refusal and is now a button that works.** Its heading
-/// said "Cordial cannot download this build", which was true for as long as
-/// there was no source to download from and became a lie the moment
-/// [ADR-025](../../../docs/adr/ADR-025-fetching-from-a-third-party-mirror.md)
-/// landed. A dialog whose whole content is an apology for a missing feature is
-/// worse than no dialog once the feature exists.
-///
-/// It stays an `AlertDialog` rather than growing into a window. There are two
-/// facts and one control -- which build is here, what can be fetched, and a
-/// button -- and the body text is rewritten in place as the work runs, which is
-/// all the progress a dialog with one job needs.
-fn update_dialog(parent: &adw::Window) {
-    let installed = cordial_update::engine::installed_version(&crate::install::engine_cache());
-    let here = match &installed {
-        Some(v) => format!("This machine has Roblox {v}."),
-        None => "Cordial cannot read a version from the build on this machine.".to_string(),
-    };
-
-    let dialog = adw::AlertDialog::builder()
-        .heading("Update Roblox")
-        .body(format!("{here}\n\n{FETCH_EXPLAINS}"))
-        .build();
-    dialog.add_response("close", "Close");
-    dialog.add_response("fetch", "Download the latest");
-    dialog.set_response_appearance("fetch", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("fetch"));
-
-    let for_worker = parent.clone();
-    dialog.connect_response(None, move |_dialog, response| {
-        if response != "fetch" {
-            return;
-        }
-        // The dialog closes itself on a response, so the work reports into a
-        // second one. Trying to keep the first alive means fighting
-        // `AlertDialog`, and a dialog that refuses to close when its button is
-        // pressed is its own bug.
-        let working = adw::AlertDialog::builder()
-            .heading("Downloading Roblox")
-            .body("Looking for a build...")
-            .build();
-        working.add_response("close", "Close");
-        working.present(Some(&for_worker));
-
-        let done = working.clone();
-        let progress_into = working.clone();
-        on_worker_reporting(
-            |report| {
-                cordial_update::provider::obtain_and_install(None, &mut |p| {
-                    report(describe_progress(&p))
-                })
-                .map(|(got, _)| (got.version.name, got.provider, got.certificate_sha256))
-                .map_err(|e| e.to_string())
-            },
-            move |line| progress_into.set_body(&line),
-            move |outcome| match outcome {
-                Ok((version, from, certificate)) => {
-                    done.set_heading(Some("Roblox updated"));
-                    done.set_body(&format!(
-                        "Installed Roblox {version} from {from}.\n\nVerified against Roblox's \
-                         signing certificate {}.\n\nRestart Cordial to use it.",
-                        &certificate[..16]
-                    ));
-                }
-                Err(why) => {
-                    done.set_heading(Some("Could not update Roblox"));
-                    // Verbatim. A mirror being down and a machine having no
-                    // network look identical from in here and only one of them
-                    // is the user's to fix.
-                    done.set_body(&why);
-                }
-            },
-        );
-    });
-
-    dialog.present(Some(parent));
 }
 
 /// One line of progress, in words rather than in the enum's shape.
@@ -989,45 +944,36 @@ fn build_update_group(
 
 /// What the dropdown means, in the three sentences the modes differ by.
 const AUTO_UPDATE_SUBTITLE: &str =
-    "Ask opens the changelog when an update is waiting. Manual checks once, when you press the \
-     button in the header bar.";
+    "Ask opens the changelog when an update is waiting. Manual checks only when you press the \
+     header-bar button.";
 
-/// Said on the settings group rather than left for somebody to discover.
-///
-/// A setting that cannot take effect has to say so. All three of these are real
-/// and none of them causes a download today, because there is nothing to
-/// download from. Leaving that out would put live-looking controls in front of
-/// somebody and let them conclude their updates were handled.
+/// Said on the settings group. One sentence, and both halves matter.
 pub const SETTINGS_DESCRIPTION: &str =
-    "Cordial can fetch the build itself. Roblox publishes no Android file of its own, so it \
-     comes from APKPure and is installed only if Roblox's own signing certificate signed it.";
+    "Builds come from APKPure, and install only if Roblox's signing certificate signed them.";
 
-/// Where the build is obtainable, named plainly.
+/// What to do instead, when something went wrong.
 ///
-/// Somebody meeting a refusal needs to learn the file exists and where from. A
-/// message that only says Cordial cannot reads as Cordial being broken, which is
-/// exactly what ADR-015 says the refusal must not do.
-const STORES: &str =
-    "Roblox publishes no Android build outside Google Play and the Amazon Appstore, and Cordial \
-     will not sign in to a store for you. Press Update to fetch one, or obtain an APK yourself \
-     and choose it on the Roblox page.";
+/// **It used to name Google Play and the Amazon Appstore.** That was the right
+/// thing to say while Cordial could not fetch anything and those were the only
+/// two places the file existed -- a message that says only "Cordial cannot"
+/// reads as Cordial being broken. It is the wrong thing to say now: neither is
+/// a source Cordial can use, nobody reading this can act on either, and naming
+/// them is telling somebody about doors they have no key to.
+const STORES: &str = "Try again, or choose an APK yourself on the Roblox page in Settings.";
 
-/// What the fetch does, in one sentence, wherever it needs saying.
+/// What the fetch does, wherever it needs saying.
 ///
-/// The second half is the whole of why the first half is acceptable, so they
-/// are one string and cannot be quoted apart. A build is downloaded from
-/// somebody who is not Roblox **and** nothing installs that Roblox did not
-/// sign; either sentence alone misleads.
+/// One string and not two, because the second half is the whole of why the
+/// first half is acceptable. "Cordial downloads from APKPure" alone reads as
+/// Cordial trusting a mirror, which is the one thing it does not do.
 const FETCH_EXPLAINS: &str =
-    "Cordial downloads the build from APKPure and installs it only if Roblox's own signing \
-     certificate signed it.";
+    "Builds come from APKPure, and install only if Roblox's signing certificate signed them.";
 
 /// Said on the installed-build group, where the picker used to be.
 ///
 /// It names where the picker went. A group that lost its only control and says
 /// nothing about it reads as a control that failed to appear.
-const INSTALLED_DESCRIPTION: &str =
-    "The APK is chosen on the Roblox page in Settings, the only place it is set.";
+const INSTALLED_DESCRIPTION: &str = "Choose your own APK on the Roblox page in Settings.";
 
 /// The top row: which of the three states this is, and why.
 fn status_lines(checked: &Option<Checked>, automatic: Automatic) -> (String, String) {
@@ -1088,17 +1034,6 @@ fn status_lines(checked: &Option<Checked>, automatic: Automatic) -> (String, Str
     }
 }
 
-/// What the Update button's dialog says.
-fn update_body(configured: &Result<Source, Refusal>) -> String {
-    match configured {
-        Ok(source) => format!(
-            "{URL_ENV} points Cordial at {}.\n\nPress Update to fetch a build, or choose an \
-             APK yourself on the Roblox page in Settings.",
-            source.url
-        ),
-        Err(refusal) => format!("{refusal}\n\n{STORES}"),
-    }
-}
 
 /// Which Roblox version this is, when that is knowable at all.
 ///
@@ -1359,59 +1294,52 @@ mod tests {
         // launch — and a dropdown whose options are three words is where that
         // difference goes missing.
         assert!(AUTO_UPDATE_SUBTITLE.contains("opens the changelog"), "{AUTO_UPDATE_SUBTITLE}");
-        assert!(AUTO_UPDATE_SUBTITLE.contains("checks once"), "{AUTO_UPDATE_SUBTITLE}");
+        assert!(AUTO_UPDATE_SUBTITLE.contains("Manual checks only"), "{AUTO_UPDATE_SUBTITLE}");
     }
 
+    /// **This test used to require the Update panel to name Google Play and
+    /// the Amazon Appstore.** The panel is gone -- the button downloads now --
+    /// and so is the reason to name them: neither is a source Cordial can use,
+    /// so telling somebody about them is describing doors they have no key to.
+    ///
+    /// What survives is the rule underneath: when something fails, say what to
+    /// do next. A message that only reports a failure is the silent failure
+    /// with extra steps.
     #[test]
-    fn the_update_button_names_the_stores_rather_than_implying_a_fetch() {
-        // The Update button is the one control here that could be read as "and
-        // now it downloads". What it opens has to be the honest answer, which is
-        // where the build actually comes from.
-        let body = update_body(&Source::configured());
-        assert!(body.contains("Google Play"), "{body}");
-        assert!(body.contains("Amazon Appstore"), "{body}");
-        // And it points at the one place a build is chosen, rather than
-        // offering a second picker of its own.
-        assert!(body.contains("Roblox page"), "{body}");
-
-        let hash = Sha256Hash::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap();
-        let with_source = update_body(&Source::new("https://example.invalid/base.apk", hash));
-        // This asserted "not built" while downloading from this window was not
-        // built. It is now, so what the body owes the reader is the two ways
-        // forward rather than an apology.
-        assert!(with_source.contains("Update"), "{with_source}");
-        assert!(with_source.contains("Roblox page in Settings"), "{with_source}");
+    fn the_failure_text_says_what_to_do_rather_than_only_what_broke() {
+        assert!(!STORES.contains("Google Play"), "{STORES}");
+        assert!(!STORES.contains("Amazon"), "{STORES}");
+        assert!(STORES.contains("Roblox page"), "{STORES}");
+        assert!(STORES.contains("Try again"), "{STORES}");
     }
 
     #[test]
     fn the_button_says_download_only_when_there_is_something_to_download() {
         // The label is the promise. With no source configured nothing can be
         // downloaded — Roblox publishes no Android artefact — so a button that
-        // said Download would be AGENTS.md's stub-that-reports-success with a
-        // widget around it, and the panel behind it saying "get this from Google
-        // Play" would be the failure arriving somewhere unrelated to the cause.
+        // **This test used to assert the opposite half of the same rule.** It
+        // required the update label to be `Update…` and to not say Download,
+        // because nothing could be downloaded and a Download button that opened
+        // an explanation was AGENTS.md's stub-that-reports-success with a widget
+        // around it.
         //
-        // This test runs with no `CORDIAL_UPDATE_URL` in the environment, which
-        // is the state every user is in until they deliberately leave it, so the
-        // update case here is the refusal case.
+        // ADR-025 built the source, so the rule flips rather than relaxes: the
+        // button says Download exactly when pressing it downloads. What must
+        // still never happen is Check saying Download.
         assert_eq!(action_label(&None), CHECK);
         assert_eq!(action_label(&Some(checked(None, Some(732)))), CHECK);
         assert_eq!(action_label(&Some(checked(Some("0.732.23.7321040"), Some(732)))), CHECK);
 
         let available = checked(Some("0.700.1.7001000"), Some(732));
         assert!(available.update_available());
-        assert!(Source::configured().is_err(), "a source leaked into the test environment");
-        assert_eq!(action_label(&Some(available)), UPDATE);
+        assert_eq!(action_label(&Some(available)), DOWNLOAD);
 
-        // The word only becomes Download alongside a source, never alongside a
-        // mere update. Those two come apart in the ordinary case and that is the
-        // whole point of the gate.
         assert!(!CHECK.contains("Download"), "{CHECK}");
-        assert!(!UPDATE.contains("Download"), "{UPDATE}");
-        // The ellipsis is the GNOME convention for "opens something rather than
-        // doing it", and it is the difference between this button and a lie.
-        assert!(UPDATE.ends_with('…'), "{UPDATE}");
+        // No ellipsis on either. GNOME's convention is that `…` means the
+        // button opens something rather than doing it, and both of these now
+        // do the thing they name.
         assert!(!DOWNLOAD.ends_with('…'), "{DOWNLOAD}");
+        assert!(!CHECK.ends_with('…'), "{CHECK}");
     }
 
     #[test]
@@ -1444,20 +1372,10 @@ mod tests {
         // say where the other one is, or a group with no control in it reads as
         // a control that failed to appear.
         assert!(INSTALLED_DESCRIPTION.contains("Roblox page in Settings"), "{INSTALLED_DESCRIPTION}");
-        assert!(INSTALLED_DESCRIPTION.contains("only place"), "{INSTALLED_DESCRIPTION}");
+        assert!(INSTALLED_DESCRIPTION.contains("your own APK"), "{INSTALLED_DESCRIPTION}");
     }
 
-    #[test]
-    fn the_refusal_names_both_stores_rather_than_only_refusing() {
-        assert!(STORES.contains("Google Play"), "{STORES}");
-        assert!(STORES.contains("Amazon Appstore"), "{STORES}");
-        // It used to assert "mirror" here, because the sentence promised
-        // Cordial would never take a file from one. It does now, having first
-        // built the thing that makes that safe, so what the string owes the
-        // reader is the way forward: press Update, or choose your own APK.
-        assert!(STORES.contains("Press Update"), "{STORES}");
-        assert!(STORES.contains("Roblox page"), "{STORES}");
-    }
+
 
     #[test]
     fn an_unknown_roblox_version_says_why_rather_than_guessing() {
@@ -1502,7 +1420,9 @@ mod tests {
         // Not a second copy of the reasoning: whatever `Source::configured`
         // decides is what the row says, including the half-configured cases.
         let refused = source_line(&Source::configured());
-        assert!(refused.contains("Google Play"), "{refused}");
+        // It said "Google Play" while that was where a user had to go. The row
+        // now reports where Cordial actually gets a build.
+        assert!(refused.contains("APKPure"), "{refused}");
 
         let hash = Sha256Hash::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap();
         let configured = source_line(&Source::new("https://example.invalid/base.apk", hash));

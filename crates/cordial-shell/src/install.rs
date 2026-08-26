@@ -73,73 +73,6 @@ pub struct Build {
     pub lib_dir: PathBuf,
 }
 
-/// What Cordial can honestly say about whether a newer Roblox build exists.
-///
-/// **`Unsupported` is the answer today, and saying so is the point.** The
-/// obvious shape for this type is `UpToDate | Available`, and returning
-/// `UpToDate` when nothing was actually checked is precisely the stub that
-/// lies -- the user reads "you are up to date", believes a check happened, and
-/// never learns their build is six versions old. `native/opensles.cpp` reports
-/// `SL_RESULT_FEATURE_UNSUPPORTED` rather than handing back a dead engine
-/// object for the same reason. A gap that reports itself stays findable.
-///
-/// Why it is unsupported, established by measurement on 2026-08-22 rather than
-/// assumed:
-///
-/// * `clientsettingscdn.roblox.com/v2/client-version/AndroidApp` answers
-///   `{"errors":[{"code":3,"message":"Error while fetching version
-///   information."}]}`.
-/// * The endpoint Roblox's own `FLog::AndroidAppUpdate` forms,
-///   `/v2/android-binaries/<version>/channels/<channel>`, answers
-///   `{"supportsAndroidBinaries": false}` -- it is a capability probe, not a
-///   download.
-///
-/// So unlike the Windows client, which Vinegar can bootstrap because Roblox
-/// publishes those binaries, **Roblox publishes no Android binary Cordial
-/// could fetch**. The APK is distributed through Google Play, and reaching it
-/// needs an authenticated Play session. Aurora Store's "anonymous" mode is not
-/// credential-free -- it is a shared pool of throwaway Google accounts handed
-/// out by a dispenser those maintainers run and pay for. Cordial has neither
-/// that infrastructure nor any business pointing its users at somebody else's,
-/// and it must never use the user's own Google account: unofficial Play clients
-/// get accounts banned, and losing a real Google account to a Roblox launcher
-/// is not a trade anybody would accept.
-///
-/// That is a decision to be argued in an ADR, not smuggled in behind a
-/// convenience function, so this reports the gap and stops.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UpdateCheck {
-    /// No check was performed, and this says why in words a user can act on.
-    Unsupported(String),
-    /// A check ran and the installed build is current.
-    UpToDate,
-    /// A check ran and a newer build exists.
-    Available { version: String },
-}
-
-impl UpdateCheck {
-    /// Whether the launcher should show the "update available" affordance.
-    ///
-    /// Deliberately false for `Unsupported`: a badge that appears when nothing
-    /// was checked trains people to ignore the badge.
-    pub fn wants_attention(&self) -> bool {
-        matches!(self, UpdateCheck::Available { .. })
-    }
-}
-
-/// Whether a newer Roblox build is available. See [`UpdateCheck`].
-///
-/// Takes the build so the signature does not change when a source exists; today
-/// it does not read it, and pretending otherwise would be its own small lie.
-pub fn check_for_update(_build: &Build) -> UpdateCheck {
-    UpdateCheck::Unsupported(
-        "Cordial cannot check for Roblox updates yet. Roblox publishes no Android build to \
-         download -- its own update endpoint answers \"supportsAndroidBinaries: false\" -- and the \
-         APK comes from Google Play, which needs an account Cordial does not have. Update the \
-         build yourself, or let Sober do it: Cordial reads the copy Sober downloads."
-            .into(),
-    )
-}
 
 /// Why a launch cannot proceed, split by what the user can do about it.
 #[derive(Debug)]
@@ -539,42 +472,7 @@ mod tests {
         assert!(err.contains("split_config"), "{err}");
     }
 
-    /// The whole value of `UpdateCheck` is that it refuses to claim a check
-    /// happened. If this ever starts returning `UpToDate` without a real
-    /// source behind it, the launcher will tell users they are current when
-    /// nobody looked.
-    #[test]
-    fn an_update_check_reports_the_gap_rather_than_claiming_to_be_current() {
-        let build = Build {
-            apk: PathBuf::from("/nonexistent/base.apk"),
-            lib_dir: PathBuf::from("/nonexistent/lib"),
-        };
-        let checked = check_for_update(&build);
-        assert!(
-            matches!(checked, UpdateCheck::Unsupported(_)),
-            "must not claim a result it did not measure: {checked:?}"
-        );
-        assert_ne!(checked, UpdateCheck::UpToDate);
-    }
 
-    /// A badge shown when nothing was checked is a badge people learn to
-    /// ignore, so only a real finding earns attention.
-    #[test]
-    fn only_a_real_newer_build_asks_for_attention() {
-        assert!(!UpdateCheck::Unsupported("no source".into()).wants_attention());
-        assert!(!UpdateCheck::UpToDate.wants_attention());
-        assert!(UpdateCheck::Available { version: "2.734.917".into() }.wants_attention());
-    }
 
-    /// The refusal has to tell the user what to actually do. A message that
-    /// says only "unsupported" is the silent failure with extra steps.
-    #[test]
-    fn the_refusal_names_a_way_forward() {
-        let build = Build { apk: PathBuf::from("/a"), lib_dir: PathBuf::from("/b") };
-        let UpdateCheck::Unsupported(why) = check_for_update(&build) else {
-            panic!("expected Unsupported");
-        };
-        assert!(why.contains("Sober"), "must name the route that works: {why}");
-        assert!(why.contains("Google Play"), "must say where the build comes from: {why}");
-    }
+
 }

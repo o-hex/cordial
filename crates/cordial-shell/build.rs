@@ -47,12 +47,41 @@ fn main() {
     // 14 s, 16 s and 21 s instead of 0.3 s. Every developer and every agent would
     // pay a relink on every build to keep one string honest.
     //
-    // So the gap stays, and the workaround is `touch crates/cordial-shell/build.rs`
-    // before a build whose version string anyone is going to quote.
+    // So that gap stays, and the workaround for it is
+    // `touch crates/cordial-shell/build.rs` before a build whose version string
+    // anyone is going to quote. **The separate and worse gap below -- commits
+    // not being noticed at all -- is fixed rather than documented**, because a
+    // stamp that is stale by thirteen commits is not a caveat, it is wrong.
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
     println!("cargo:rerun-if-changed=../../.git/refs");
+    println!("cargo:rerun-if-changed=../../.git/packed-refs");
     println!("cargo:rerun-if-env-changed=CORDIAL_BUILD_VERSION");
+
+    // **`.git/refs` above does not catch a commit, and the three lines before
+    // this one were measured not catching thirteen of them.** A window titled
+    // `Cordial 0.6.0-126-gb735207` was screenshotted out of a binary built from
+    // `v0.7.0-12-gd52e528`, which is precisely the plausible-looking lie the
+    // module comment says an explicit stamp exists to prevent -- arriving
+    // through the mechanism meant to prevent it.
+    //
+    // Why the existing watches miss it: a commit does not rewrite `.git/HEAD`,
+    // which still reads `ref: refs/heads/main`; and rewriting
+    // `.git/refs/heads/main` does not change the mtime of the `.git/refs`
+    // directory that is being watched, because the file is replaced inside a
+    // subdirectory of it. `.git/index` does change, which is why some commits
+    // appear to work and the failure is intermittent -- the worst kind to have
+    // in a version string.
+    //
+    // So watch the file HEAD actually points at. This is one `read_to_string`
+    // of a file under 64 bytes at build-script time and it costs nothing;
+    // unlike forcing a rerun every build, which the comment above rejects on
+    // measured grounds that still hold.
+    if let Ok(head) = std::fs::read_to_string("../../.git/HEAD") {
+        if let Some(reference) = head.trim().strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed=../../.git/{reference}");
+        }
+    }
 
     // Read before the `cargo:rustc-env` line below is emitted, so this is the
     // packager's value from the ambient environment and never our own output;

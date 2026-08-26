@@ -200,8 +200,8 @@ impl Source {
     /// message must not do.
     pub fn official() -> Result<Self, Refusal> {
         Err(Refusal::NoSource(
-            "Roblox only publishes the Android app through Google Play and the Amazon \
-             Appstore, so there is no Roblox address for Cordial to fetch from."
+            "Roblox publishes no download of its own, so Cordial fetches the build from \
+             APKPure and installs it only if Roblox's signing certificate signed it."
                 .to_string(),
         ))
     }
@@ -682,12 +682,17 @@ mod tests {
         // one to rewrite to assert what it is — not to delete quietly.
         let e = Source::official().unwrap_err();
         let shown = e.to_string();
-        // Naming the stores is the point. A refusal that only says Cordial
-        // cannot do it leaves the user believing the file is unobtainable, and
-        // this one has to send them somewhere.
-        assert!(shown.contains("Google Play"), "{shown}");
-        assert!(shown.contains("Amazon Appstore"), "{shown}");
-        assert!(shown.contains("Settings"), "{shown}");
+        // **This asserted that the message named Google Play and the Amazon
+        // Appstore**, because when there was no way to fetch a build the only
+        // useful thing a refusal could do was send the user to a store. There
+        // is a way now, so the stores are not where anybody is being sent and
+        // naming them would be describing doors Cordial has no key to.
+        //
+        // What the refusal still owes is a way forward, which is now a pointer
+        // to the thing that does work rather than a shop.
+        assert!(!shown.contains("Google Play"), "{shown}");
+        assert!(shown.contains("APKPure"), "{shown}");
+        assert!(shown.contains("signing certificate"), "{shown}");
     }
 
     #[test]

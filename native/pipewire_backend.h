@@ -273,6 +273,17 @@ bool pulse_available();
 /// run with no sound proves nothing about the backend.
 std::unique_ptr<OutputStream> make_pulse_stream();
 
+/// Whether an ALSA PCM could be opened, proved by opening one.
+///
+/// Not free, unlike the other two probes -- it opens and closes a device -- and
+/// cached for that reason. ADR-023 requires it anyway: `supportsAAudio()` is a
+/// one-way door, so a backend that claims to work and then cannot open leaves
+/// the whole session silent with no fallback.
+bool alsa_available();
+
+/// An ALSA stream, or null on a build without the headers.
+std::unique_ptr<OutputStream> make_alsa_stream();
+
 /// A stream on whichever host backend this run selected.
 ///
 /// Never null: a backend that cannot work returns an implementation whose

@@ -70,6 +70,7 @@ makedepends=(
   # packaging. ADR-023 has the reasoning.
   'libpipewire'
   'libpulse'
+  'alsa-lib'
 )
 optdepends=(
   # ADR-011 makes Wayland the backend Cordial targets. The X11 path still

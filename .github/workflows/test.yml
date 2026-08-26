@@ -39,7 +39,7 @@ jobs:
             git rust cargo clang cmake gcc-c++ binutils llvm lld \
             pkgconf-pkg-config openssl-devel \
             gtk4-devel libadwaita-devel webkitgtk6.0-devel \
-            pipewire-devel pulseaudio-libs-devel \
+            pipewire-devel pulseaudio-libs-devel alsa-lib-devel \
             wayland-devel vulkan-loader-devel libxkbcommon-devel
       - uses: actions/checkout@v4
         with:

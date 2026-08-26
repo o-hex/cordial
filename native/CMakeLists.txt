@@ -173,7 +173,7 @@ endif()
 # `slCreateEngine` does.
 add_library(cordial_liblog STATIC
   liblog.cpp system_paths.cpp netdb_compat.cpp opensles.cpp pipewire_backend.cpp
-  pulse_backend.cpp aaudio.cpp thread_trace.cpp)
+  pulse_backend.cpp alsa_backend.cpp aaudio.cpp thread_trace.cpp)
 # Compiled unconditionally, like every other file here: without the headers it
 # is its own honest "unavailable" arm, so the selector gets a truthful answer
 # rather than a link error. Only the define is conditional.
@@ -181,6 +181,22 @@ if(PULSE_FOUND)
   target_include_directories(cordial_liblog PRIVATE ${PULSE_INCLUDE_DIR})
   target_compile_definitions(cordial_liblog PRIVATE CORDIAL_HAVE_PULSE=1)
 endif()
+# ALSA, the third backend. Same rule as the two above: headers optional,
+# `libasound.so.2` dlopen'd and never linked, and the same refusal to trust
+# pkg-config for it -- Homebrew's pkgconf answers for `alsa` with its own Cellar
+# headers on this machine, which is a silent wrong answer rather than a loud
+# missing one.
+find_path(ALSA_INCLUDE_DIR alsa/asoundlib.h)
+if(ALSA_INCLUDE_DIR AND NOT ALSA_INCLUDE_DIR MATCHES "linuxbrew|Cellar|homebrew")
+  target_include_directories(cordial_liblog PRIVATE ${ALSA_INCLUDE_DIR})
+  target_compile_definitions(cordial_liblog PRIVATE CORDIAL_HAVE_ALSA=1)
+  message(STATUS "ALSA backend: headers at ${ALSA_INCLUDE_DIR}; libasound.so.2 will be "
+                  "dlopen'd at run time. Selected with CORDIAL_AUDIO_HOST=alsa.")
+else()
+  message(STATUS "ALSA backend: no usable alsa/asoundlib.h; building the honest "
+                  "\"unavailable\" arm. Install alsa-lib-devel for it.")
+endif()
+
 if(PIPEWIRE_FOUND)
   target_include_directories(cordial_liblog PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
   target_compile_definitions(cordial_liblog PRIVATE CORDIAL_HAVE_PIPEWIRE=1)
@@ -197,7 +213,7 @@ if(PIPEWIRE_FOUND)
   # is the arm every machine without pulseaudio-libs-devel will run, and the one
   # a fallback bug would hide in.
   add_executable(cordial_pipewire_backend_test EXCLUDE_FROM_ALL
-    pipewire_backend.cpp pulse_backend.cpp pipewire_backend_test.cpp)
+    pipewire_backend.cpp pulse_backend.cpp alsa_backend.cpp pipewire_backend_test.cpp)
   target_include_directories(cordial_pipewire_backend_test PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
   target_compile_definitions(cordial_pipewire_backend_test PRIVATE CORDIAL_HAVE_PIPEWIRE=1)
   add_custom_command(TARGET cordial_pipewire_backend_test POST_BUILD

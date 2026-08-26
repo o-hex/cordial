@@ -87,6 +87,8 @@ BuildRequires:  pipewire-devel
 # silent-loss shape the line above exists to prevent, and this project has
 # already lost every sample of audio it ever played to it once.
 BuildRequires:  pulseaudio-libs-devel
+# And the third (ADR-023). Headers only; `libasound.so.2` is dlopen'd too.
+BuildRequires:  alsa-lib-devel
 # `-lz` on the native link line.
 BuildRequires:  zlib-ng-compat-devel
 BuildRequires:  desktop-file-utils

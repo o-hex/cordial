@@ -237,11 +237,39 @@ env WAYLAND_DISPLAY=$DISP GDK_BACKEND=wayland CORDIAL_DEV_CONTROL=1 \
 CLIENT=$!
 
 if [ -n "$NUDGING" ]; then
-  ( i=0
+  # **Through Cordial's own entry point, because the compositor route does not
+  # arrive.** This arm has now been a silent no-op three times. The first two
+  # started a virtual pointer after the client had latched seat capabilities;
+  # this version wrote into a holder's fifo and was measured, on 2026-08-27,
+  # delivering exactly nothing -- `accepted=0` on the client's own counter
+  # after a full run of it.
+  #
+  # devctl `move` is the one path proven to arrive: twenty moves into a live
+  # frozen client took `accepted` from 0 to 20. It costs a socket that only
+  # exists once the client has bound it, so this waits for the socket rather
+  # than assuming it and reports what it managed.
+  #
+  # **Read `accepted=` in the client's own `info` before believing this arm.**
+  # An arm that cannot be shown to have delivered has measured nothing, and
+  # three no-ops in a row is what that costs.
+  ( i=0; sent=0
     while kill -0 $CLIENT 2>/dev/null && [ $i -lt 1200 ]; do
-      printf 'move %d %d\n' $((300 + i % 400)) $((300 + i % 200)) >&8
+      SK=$(ls -t "$HOME/.local/share/cordial/profiles/$PROFILE"/**/devctl.sock \
+             "$HOME/.local/share/cordial/profiles/$PROFILE"/devctl.sock 2>/dev/null | head -1)
+      if [ -n "$SK" ]; then
+        python3 -c "
+import socket,sys
+s=socket.socket(socket.AF_UNIX); s.settimeout(2)
+try:
+    s.connect(sys.argv[1]); s.sendall(b'move %s %s\n' % (sys.argv[2].encode(), sys.argv[3].encode()))
+    s.recv(4096)
+except Exception:
+    pass
+" "$SK" $((300 + i % 400)) $((300 + i % 200)) 2>/dev/null && sent=$((sent+1))
+      fi
       i=$((i + 1)); sleep 0.05
-    done ) &
+    done
+    echo "$sent" > "$OUT/nudge-sent-${TAG:-run}$RUN" ) &
   NUDGER=$!
 fi
 

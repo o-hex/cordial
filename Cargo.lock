@@ -363,6 +363,7 @@ name = "cordial-update"
 version = "0.6.0"
 dependencies = [
  "http",
+ "libc",
  "pulldown-cmark",
  "ring",
  "serde",

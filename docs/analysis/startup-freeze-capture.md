@@ -121,6 +121,36 @@ This does **not** contradict the original report, and the distinction matters:
 that report says input *prevents* the freeze, not that it recovers one. Those
 are different claims and only the second is refuted here.
 
+## Input does not prevent it either, with the caveat that matters
+
+The remaining half of the original report -- that input *prevents* the freeze --
+measured on a signed-in profile, ten runs per arm, strictly interleaved:
+
+```text
+arm A, no input     8 / 10 frozen
+arm B, nudged       9 / 10 frozen
+```
+
+No effect, and the point estimate runs the wrong way for the theory.
+
+**Read the instrument note before believing this arm.** It has been a silent
+no-op three times in this project's history. The first two started a virtual
+pointer after the client had latched seat capabilities. The third wrote into a
+holder's fifo and was measured on 2026-08-27 delivering exactly nothing:
+`accepted=0` on the client's own counter after a full run of it. Arm B in the
+earlier ten-per-arm run was that version, and measured nothing at all.
+
+This arm drives devctl `move`, which is the one path proven to arrive -- twenty
+moves into a live frozen client took `accepted` from 0 to 20 -- and one
+verification run showed `accepted=13` during startup. That run froze.
+
+**The caveat, and it is not small.** devctl's socket only exists once the client
+has bound it, which is well into startup. So this arm cannot deliver anything
+during the earliest phase, and if the freeze is decided before the socket
+appears, it has not been tested. What can be said is narrower than "input does
+not prevent it": input delivered from the moment Cordial can accept it does not
+prevent it.
+
 ## What this does not establish
 
 - **Which side stops writing.** The descriptor is now named -- the read end of

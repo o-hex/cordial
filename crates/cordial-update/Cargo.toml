@@ -37,3 +37,4 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # `cordial-plugins` and `cordial-runtime` already pin.
 zbus = { version = "5.18.0", features = ["blocking"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
+libc = "0.2"

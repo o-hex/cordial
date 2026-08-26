@@ -501,6 +501,34 @@ pub fn obtain_and_install(
         }
     }
 
+    // **One install at a time.** ADR-012's lock covers a profile; nothing
+    // covered the build directory, which every profile shares. Two clients --
+    // or one client and a second window -- could reach here together, and the
+    // loser would find its staging directory emptied, its archives renamed
+    // underneath it, or the engine cache stamped for a build it did not
+    // install. Advisory, so it costs nothing when nobody contends.
+    let lock_path = crate::install::build_dir().join(".installing");
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+    // Non-blocking: a second attempt should say so immediately rather than
+    // queue behind a 229 MB download the user cannot see.
+    if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(Unreachable::NoSource {
+            why: "another Cordial is already installing a Roblox build. Only one install can \
+                  run at a time, because they share one build directory."
+                .into(),
+        });
+    }
+    // Held for the whole call; released when this returns, however it returns.
+    let _lock = lock;
+
     let staging = crate::install::build_dir().join(".fetching");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)

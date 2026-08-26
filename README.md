@@ -30,6 +30,30 @@
 
 *A hobby project, not a commercial one. Please don't DMCA it.*
 
+## Get it running
+
+```bash
+flatpak remote-add --if-not-exists cordial https://luohoa97.github.io/cordial/cordial.flatpakrepo
+flatpak install cordial io.github.luohoa97.Cordial
+flatpak run io.github.luohoa97.Cordial
+```
+
+**You also need Roblox's Android build, which Cordial does not ship and never
+will.** The quickest way to get one is to install
+[Sober](https://sober.vinegarhq.org/) — Cordial finds the APK Sober downloads
+and uses it where it lies, without copying or modifying it. If you already have
+Sober, there is nothing else to do. If you would rather supply your own, point
+Cordial at it in Settings, or see [§1](#1-what-you-need).
+
+Two things worth knowing before you type that, rather than after: **the remote
+is not signed**, so `flatpak install` proves the download matches the
+repository's checksums and nothing about who built it — [the full
+explanation](#2-install-it) is below and you should read it. And Cordial is
+early: sign-in, gameplay, mouse and keyboard, text entry and audio all work; the
+[status table](#status-early-but-playable-sign-in-load-a-game-move-around) says
+exactly what does not.
+
+
 Cordial loads Roblox's official Android x86-64 engine directly on Linux through a
 purpose-built runtime: the AOSP bionic linker, a bionic/glibc shim, a JNI VM in
 place of Android's, and a framework layer that answers the client's calls. No
@@ -248,6 +272,19 @@ of memory apiece.
   Roblox code, APK or assets and never will
 
 From an installed APK you need the `lib/x86_64/` objects and the base APK.
+
+**The shortest route to one is Sober.** [Sober](https://sober.vinegarhq.org/)
+downloads Roblox's Android build for its own use, and Cordial looks for it
+there — `~/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/`. Nothing is
+copied and nothing is modified; Cordial reads the APK where it already is. So
+"install Sober, then install Cordial" is a complete answer to this requirement,
+and it is what most people in the Discord end up doing. You are free to keep
+using Sober afterwards, or not.
+
+If you have an APK of your own, Settings takes a path to it, and `--apk` takes
+one on the command line. On a split build the engine is in
+`split_config.x86_64.apk` rather than `base.apk`; Cordial checks the siblings
+itself and says which it tried when it cannot find one.
 
 Nothing else. The Flatpak carries the toolchain and the libraries with it; the
 list of build dependencies moved down to §3, where it belongs.

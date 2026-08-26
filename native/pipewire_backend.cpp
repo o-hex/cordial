@@ -32,6 +32,11 @@
 
 #include "pipewire_backend.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+
 #ifdef CORDIAL_HAVE_PIPEWIRE
 
 #include <spa/param/audio/format-utils.h>
@@ -1648,6 +1653,49 @@ PlaybackStream::QueueState PlaybackStream::state() const { return {0, 0}; }
 } // namespace cordial::audio
 
 #endif // CORDIAL_HAVE_PIPEWIRE
+
+// ---------------------------------------------------------------- the seam
+//
+// Outside the `#ifdef`, because both arms of it define `CallbackStream` and
+// both are legitimate answers to "what backend is there". A tree built without
+// pipewire-devel gets a `CallbackStream` whose `open` fails honestly, which is
+// exactly what a host with no backend at all should hand back.
+
+namespace cordial::audio {
+
+const char* host_backend_name() {
+    // One reader, and it caches. `aaudio.cpp`'s own `CORDIAL_AUDIO` parser
+    // documents the same rule for the same reason: two readers of one variable
+    // is two places for a typo to mean different things.
+    static const char* const name = [] () -> const char* {
+        const char* value = std::getenv("CORDIAL_AUDIO_HOST");
+        if (!value || value[0] == '\0') return "pipewire";
+        if (std::strcmp(value, "pipewire") == 0) return "pipewire";
+        // Falls back rather than failing, and says so. ADR-023 schedules
+        // PulseAudio and then ALSA behind this name; until one of them exists,
+        // a run that asked for one should be told it did not get it rather
+        // than left to infer it from silence.
+        std::fprintf(stderr,
+            "W/Cordial-Audio           CORDIAL_AUDIO_HOST=%s is not a backend this build has "
+            "(pipewire); using pipewire. See docs/adr/ADR-023-host-audio-backends.md.\n",
+            value);
+        return "pipewire";
+    }();
+    return name;
+}
+
+std::unique_ptr<OutputStream> make_output_stream() {
+    // One implementation today, and the factory exists anyway: the point of
+    // ADR-023's first step is that the *caller* stops naming a backend, so
+    // that adding the second one is a change to this function and nowhere
+    // else. `host_backend_name()` is consulted rather than ignored so that the
+    // warning above fires on the first stream rather than never.
+    (void)host_backend_name();
+    return std::make_unique<CallbackStream>();
+}
+
+} // namespace cordial::audio
+
 
 // The includes are repeated here rather than hoisted to the top of the file:
 // everything above this line is inside one arm of the `#ifdef` or the other,

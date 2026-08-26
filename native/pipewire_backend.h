@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -205,6 +206,65 @@ private:
     struct Impl;
     Impl* impl_;
 };
+/// What the AAudio shim needs from a host audio backend, and nothing more.
+///
+/// **The seam exists so a second backend can be written without touching the
+/// caller**, which ADR-023 decided and which the shape of this file made
+/// necessary: `aaudio.cpp` used to hold a `CallbackStream` *by value* and call
+/// it directly, so there was nowhere for PulseAudio or ALSA to go except in
+/// place of PipeWire. The only polymorphism was a compile-time `#ifdef` with an
+/// honest "no audio" arm — a two-way switch, not an n-way choice.
+///
+/// Every signature here is `CallbackStream`'s, unchanged. That is deliberate:
+/// **a refactor that changes nothing is the one refactor that can be proved**,
+/// and PipeWire is what every current user depends on. A second implementation
+/// is a separate change, after this one is shown to have moved no number.
+///
+/// The realtime rule travels with the interface rather than with PipeWire:
+/// whatever implements `FillCallback`'s caller must not lock, allocate, free,
+/// log or make a syscall on that path. See `CallbackStream::set_running` for
+/// the one method that is explicitly safe to call from inside it, and
+/// `aaudio.cpp`'s header for the deadlock that rule was written after.
+class OutputStream {
+public:
+    virtual ~OutputStream() = default;
+
+    /// Fill `frames` frames of interleaved PCM at `dst`, in the negotiated
+    /// format. Returns false to ask that the stream stop being pulled — the
+    /// AAudio callback's `AAUDIO_CALLBACK_RESULT_STOP`.
+    using FillCallback = bool (*)(void* dst, uint32_t frames, void* user);
+
+    virtual bool open(uint32_t sample_bits, bool is_float, const char* node_description,
+                      const char* target_node_name, FillCallback cb, void* user) = 0;
+    virtual void close() = 0;
+    virtual bool is_open() const = 0;
+    virtual void set_running(bool running) = 0;
+    virtual bool is_running() const = 0;
+    virtual uint32_t rate_hz() const = 0;
+    virtual uint32_t channels() const = 0;
+    virtual uint32_t sample_bits() const = 0;
+    virtual bool sample_is_float() const = 0;
+    virtual uint32_t burst_frames() const = 0;
+    virtual uint64_t silence_cycles() const = 0;
+};
+
+/// The host backend this run will use, named the way `CORDIAL_AUDIO_HOST`
+/// spells it. Read once, from one place, and announced at startup.
+///
+/// **A separate variable from `CORDIAL_AUDIO`, and ADR-023 says why.** That one
+/// selects which *Android* API FMOD reaches Cordial through — AAudio, OpenSL,
+/// or FMOD's Java path — and every combination of those with a host backend is
+/// meaningful. One variable for two orthogonal axes is a variable nobody can
+/// document.
+const char* host_backend_name();
+
+/// A stream on whichever host backend this run selected.
+///
+/// Never null: a backend that cannot work returns an implementation whose
+/// `open` fails, because a null here would make every call site test for it and
+/// the failure it is reporting is one `open` already reports honestly.
+std::unique_ptr<OutputStream> make_output_stream();
+
 
 /// One playback stream that is *pulled* rather than pushed: PipeWire asks for
 /// frames and this class asks its owner for them, in the same call, on the
@@ -235,21 +295,13 @@ private:
 /// sample *format* and leaves rate and channel count unconstrained, waits for
 /// PipeWire to negotiate them against whatever sink the session is already
 /// running, and reports those. Nothing resamples on either side.
-class CallbackStream {
+class CallbackStream : public OutputStream {
 public:
     CallbackStream();
-    ~CallbackStream();
+    ~CallbackStream() override;
 
     CallbackStream(const CallbackStream&) = delete;
     CallbackStream& operator=(const CallbackStream&) = delete;
-
-    /// Fill `frames` frames of interleaved PCM at `dst`, in the negotiated
-    /// format. Returns false to ask that the stream stop being pulled — the
-    /// AAudio callback's `AAUDIO_CALLBACK_RESULT_STOP`.
-    ///
-    /// **Called on PipeWire's callback thread.** Realtime rules apply to
-    /// everything it reaches.
-    using FillCallback = bool (*)(void* dst, uint32_t frames, void* user);
 
     /// `sample_bits`/`is_float` describe the sample format to ask for; 0 bits
     /// means "no preference", which offers PipeWire's own float and so
@@ -262,32 +314,32 @@ public:
     /// the session default; see [`resolve_output_target`] for what happens
     /// when the named sink is not there.
     bool open(uint32_t sample_bits, bool is_float, const char* node_description,
-              const char* target_node_name, FillCallback cb, void* user);
+              const char* target_node_name, FillCallback cb, void* user) override;
 
-    void close();
-    bool is_open() const;
+    void close() override;
+    bool is_open() const override;
 
     /// Whether PipeWire is being asked for frames. False writes silence into
     /// every cycle rather than disconnecting, so this is safe to call from
     /// inside the fill callback — which `AAudioStream_requestStop` is
     /// documented to be reached from, and which taking PipeWire's loop lock
     /// here would deadlock against.
-    void set_running(bool running);
-    bool is_running() const;
+    void set_running(bool running) override;
+    bool is_running() const override;
 
-    uint32_t rate_hz() const;
-    uint32_t channels() const;
+    uint32_t rate_hz() const override;
+    uint32_t channels() const override;
     /// Bits per sample of the negotiated format, and whether it is float.
-    uint32_t sample_bits() const;
-    bool sample_is_float() const;
+    uint32_t sample_bits() const override;
+    bool sample_is_float() const override;
     /// Frames PipeWire asked for on the most recent cycle — the graph
     /// quantum, and the only truthful answer to `getFramesPerBurst`.
-    uint32_t burst_frames() const;
+    uint32_t burst_frames() const override;
 
     /// Cycles that had to be filled with silence while the stream was
     /// running. See the note in `aaudio.cpp` on why this is not, and cannot
     /// be, Android's `getXRunCount` number.
-    uint64_t silence_cycles() const;
+    uint64_t silence_cycles() const override;
 
 private:
     struct Impl;

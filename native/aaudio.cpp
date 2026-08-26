@@ -95,6 +95,8 @@
 #include "aaudio.h"
 #include "pipewire_backend.h"
 
+#include <memory>
+
 #include <pthread.h>
 
 #include <atomic>
@@ -311,7 +313,10 @@ struct Stream {
     /// which set of answers is the truthful one.
     aaudio_direction_t direction = AAUDIO_DIRECTION_OUTPUT;
 
-    cordial::audio::CallbackStream pw;
+    /// The host backend, behind ADR-023's seam rather than named here. This
+    /// was a `CallbackStream` by value, which is what left no room for a
+    /// second backend: every call site below said "PipeWire" by holding one.
+    std::unique_ptr<cordial::audio::OutputStream> pw = cordial::audio::make_output_stream();
 
     /// **Input only, and it holds no PipeWire resource until `requestStart`.**
     ///
@@ -470,8 +475,8 @@ bool fill_from_engine(void* dst, uint32_t frames, void* user) {
     if (trace_audio_enabled()) {
         ++s->trace_cycles;
         s->trace_frames += frames;
-        float peak = buffer_peak(dst, frames, s->pw.channels(), s->pw.sample_bits(),
-                                  s->pw.sample_is_float());
+        float peak = buffer_peak(dst, frames, s->pw->channels(), s->pw->sample_bits(),
+                                  s->pw->sample_is_float());
         if (peak > s->trace_peak) s->trace_peak = peak;
         auto now = std::chrono::steady_clock::now();
         if (now - s->trace_last >= std::chrono::seconds(1)) {
@@ -754,19 +759,19 @@ static aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder* build
     // 25 symbols this build dlsyms, so nothing on this path will ever be asked
     // for a particular output and the choice has to arrive from outside the
     // engine entirely. See `docs/analysis/aaudio-contract.md`.
-    if (!s->pw.open(bits, is_float, "Cordial (Roblox via AAudio)",
+    if (!s->pw->open(bits, is_float, "Cordial (Roblox via AAudio)",
                     cordial::audio::configured_output_device().c_str(), &fill_from_engine, s)) {
         delete s;
         return AAUDIO_ERROR_UNAVAILABLE;
     }
 
-    s->format = bits_to_format(s->pw.sample_bits(), s->pw.sample_is_float());
+    s->format = bits_to_format(s->pw->sample_bits(), s->pw->sample_is_float());
     if (s->format == AAUDIO_FORMAT_INVALID) {
         std::fprintf(stderr,
             "E/Cordial-AAudio          PipeWire negotiated a %u-bit %s format with no "
             "aaudio_format_t to describe it; refusing rather than reporting a format the "
             "engine would lay its mixer out against wrongly.\n",
-            s->pw.sample_bits(), s->pw.sample_is_float() ? "float" : "integer");
+            s->pw->sample_bits(), s->pw->sample_is_float() ? "float" : "integer");
         delete s;
         return AAUDIO_ERROR_UNAVAILABLE;
     }
@@ -775,7 +780,7 @@ static aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder* build
         "I/Cordial-AAudio          openStream ok: PipeWire negotiated %u Hz, %u channel(s), "
         "%s, %u frames per burst. Requested format was %s; rate and channel count were left "
         "for PipeWire to choose, which is why nothing resamples.\n",
-        s->pw.rate_hz(), s->pw.channels(), format_name(s->format), s->pw.burst_frames(),
+        s->pw->rate_hz(), s->pw->channels(), format_name(s->format), s->pw->burst_frames(),
         format_name(b->format));
 
     *streamOut = reinterpret_cast<AAudioStream*>(s);
@@ -811,11 +816,11 @@ static aaudio_result_t AAudioStream_close(AAudioStream* stream) {
             "deadlocking PipeWire's loop.\n");
         return AAUDIO_ERROR_INVALID_STATE;
     }
-    s->pw.close();
+    s->pw->close();
     s->state.store(AAUDIO_STREAM_STATE_CLOSED, std::memory_order_relaxed);
     std::fprintf(stderr,
         "I/Cordial-AAudio          stream closed after %llu silence-filled cycle(s).\n",
-        static_cast<unsigned long long>(s->pw.silence_cycles()));
+        static_cast<unsigned long long>(s->pw->silence_cycles()));
     delete s;
     return AAUDIO_OK;
 }
@@ -867,8 +872,8 @@ static aaudio_result_t AAudioStream_requestStart(AAudioStream* stream) {
         return AAUDIO_OK;
     }
 
-    if (!s->pw.is_open()) return AAUDIO_ERROR_INVALID_STATE;
-    s->pw.set_running(true);
+    if (!s->pw->is_open()) return AAUDIO_ERROR_INVALID_STATE;
+    s->pw->set_running(true);
     s->state.store(AAUDIO_STREAM_STATE_STARTED, std::memory_order_relaxed);
     return AAUDIO_OK;
 }
@@ -906,7 +911,7 @@ static aaudio_result_t AAudioStream_requestPause(AAudioStream* stream) {
         stop_capture(s, AAUDIO_STREAM_STATE_PAUSED);
         return AAUDIO_OK;
     }
-    s->pw.set_running(false);
+    s->pw->set_running(false);
     s->state.store(AAUDIO_STREAM_STATE_PAUSED, std::memory_order_relaxed);
     return AAUDIO_OK;
 }
@@ -918,7 +923,7 @@ static aaudio_result_t AAudioStream_requestStop(AAudioStream* stream) {
         stop_capture(s, AAUDIO_STREAM_STATE_STOPPED);
         return AAUDIO_OK;
     }
-    s->pw.set_running(false);
+    s->pw->set_running(false);
     s->state.store(AAUDIO_STREAM_STATE_STOPPED, std::memory_order_relaxed);
     return AAUDIO_OK;
 }
@@ -932,14 +937,14 @@ static int32_t AAudioStream_getSampleRate(AAudioStream* stream) {
     if (!stream) return 0;
     auto* s = reinterpret_cast<Stream*>(stream);
     if (s->direction == AAUDIO_DIRECTION_INPUT) return static_cast<int32_t>(kCaptureRate);
-    return static_cast<int32_t>(s->pw.rate_hz());
+    return static_cast<int32_t>(s->pw->rate_hz());
 }
 
 static int32_t AAudioStream_getChannelCount(AAudioStream* stream) {
     if (!stream) return 0;
     auto* s = reinterpret_cast<Stream*>(stream);
     if (s->direction == AAUDIO_DIRECTION_INPUT) return static_cast<int32_t>(kCaptureChannels);
-    return static_cast<int32_t>(s->pw.channels());
+    return static_cast<int32_t>(s->pw->channels());
 }
 
 static aaudio_format_t AAudioStream_getFormat(AAudioStream* stream) {
@@ -955,7 +960,7 @@ static int32_t AAudioStream_getFramesPerBurst(AAudioStream* stream) {
     if (!stream) return 0;
     auto* s = reinterpret_cast<Stream*>(stream);
     if (s->direction == AAUDIO_DIRECTION_INPUT) return static_cast<int32_t>(kCaptureBurstFrames);
-    return static_cast<int32_t>(s->pw.burst_frames());
+    return static_cast<int32_t>(s->pw->burst_frames());
 }
 
 // On output, capacity and size are both the burst, and that is the truth
@@ -1026,7 +1031,7 @@ static int32_t AAudioStream_getXRunCount(AAudioStream* stream) {
     auto* s = reinterpret_cast<Stream*>(stream);
     uint64_t count = s->direction == AAUDIO_DIRECTION_INPUT
                           ? s->capture.dropped_bytes() / kCaptureBytesPerFrame
-                          : s->pw.silence_cycles();
+                          : s->pw->silence_cycles();
     return static_cast<int32_t>(count > INT32_MAX ? INT32_MAX : count);
 }
 

@@ -17,6 +17,7 @@
 #include "pipewire_backend.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 
@@ -253,6 +254,41 @@ void the_shells_device_list_survives_being_asked_for_nothing() {
     std::printf("ok: the_shells_device_list_survives_being_asked_for_nothing\n");
 }
 
+/// The seam ADR-023 asked for: the caller no longer names a backend, and the
+/// factory always hands back something whose `open` can be called.
+///
+/// Worth a check rather than an assumption because "never null" is the property
+/// every call site in `aaudio.cpp` now relies on without testing for it — the
+/// failure it forecloses is a null dereference on a machine with no PipeWire,
+/// which is the machine least likely to be the one running this test.
+void the_factory_always_returns_a_stream() {
+    auto stream = cordial::audio::make_output_stream();
+    assert(stream != nullptr);
+    assert(!stream->is_open());
+    assert(!stream->is_running());
+    std::printf("ok: the_factory_always_returns_a_stream\n");
+}
+
+/// `CORDIAL_AUDIO_HOST` names a backend, falls back rather than failing, and is
+/// read exactly once.
+///
+/// The once matters and is not tidiness: `host_backend_name` caches in a
+/// function-local static, so a second reader with a different value would get
+/// the first one's answer and no warning. Asserting that the cached answer
+/// survives a later `setenv` is what makes that contract visible instead of
+/// being a thing somebody discovers by changing the variable at runtime.
+void an_unknown_host_backend_falls_back_to_pipewire() {
+    // Whatever the environment says, the only backend this build has is
+    // PipeWire, so every answer is the same one. ADR-023 schedules PulseAudio
+    // and ALSA behind this name.
+    const char* first = cordial::audio::host_backend_name();
+    assert(std::strcmp(first, "pipewire") == 0);
+    ::setenv("CORDIAL_AUDIO_HOST", "something-that-does-not-exist", 1);
+    assert(std::strcmp(cordial::audio::host_backend_name(), first) == 0);
+    ::unsetenv("CORDIAL_AUDIO_HOST");
+    std::printf("ok: an_unknown_host_backend_falls_back_to_pipewire\n");
+}
+
 } // namespace
 
 int main() {
@@ -269,6 +305,8 @@ int main() {
     matching_is_exact_rather_than_by_prefix_or_description();
     a_null_fell_back_pointer_is_allowed();
     the_shells_device_list_survives_being_asked_for_nothing();
+    the_factory_always_returns_a_stream();
+    an_unknown_host_backend_falls_back_to_pipewire();
     std::printf("all pipewire_backend checks passed\n");
     return 0;
 }

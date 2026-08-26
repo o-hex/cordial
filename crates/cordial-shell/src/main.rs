@@ -20,6 +20,7 @@ mod audio_devices;
 mod chooser;
 mod crash;
 mod deep_link;
+mod download_progress;
 mod install;
 mod instructions;
 mod launch;

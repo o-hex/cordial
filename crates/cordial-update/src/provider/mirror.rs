@@ -368,7 +368,12 @@ fn download(
             }
             file.write_all(&buf[..n])
                 .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
-            if done - announced >= 64 * 1024 * 1024 {
+            // Every megabyte, not every 64. The coarse interval was chosen
+            // when the only consumer was a log line; a progress bar that moves
+            // four times during a 229 MB download is not a progress bar. The
+            // callback is a label update, so the cost of the finer interval is
+            // nothing next to the transfer it is reporting.
+            if done - announced >= 1024 * 1024 {
                 announced = done;
                 progress(Progress::Fetching { file: name.clone(), done, total });
             }

@@ -343,17 +343,23 @@ fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
 ///
 /// `report` is handed to the worker as a plain closure, so the code doing the
 /// work does not have to know it is being watched.
-pub(crate) fn on_worker_reporting<T: Send + 'static>(
-    work: impl FnOnce(&dyn Fn(String)) -> T + Send + 'static,
-    progress: impl Fn(String) + 'static,
+///
+/// Generic over what it reports rather than over `String`. It was `String`, and
+/// that meant every caller formatted a sentence on the worker thread before
+/// sending it -- so a widget that wanted the numbers rather than the words had
+/// to parse them back out of prose. `provider::Progress` travels intact and the
+/// widget decides what to say.
+pub(crate) fn on_worker_reporting<T: Send + 'static, P: Send + 'static>(
+    work: impl FnOnce(&dyn Fn(P)) -> T + Send + 'static,
+    progress: impl Fn(P) + 'static,
     then: impl FnOnce(T) + 'static,
 ) {
-    let (ptx, prx) = mpsc::channel::<String>();
+    let (ptx, prx) = mpsc::channel::<P>();
     let (tx, rx) = mpsc::channel::<T>();
     std::thread::spawn(move || {
-        let value = work(&|line| {
+        let value = work(&|update| {
             // Nobody is owed this if the window has gone.
-            let _ = ptx.send(line);
+            let _ = ptx.send(update);
         });
         let _ = tx.send(value);
     });
@@ -362,8 +368,8 @@ pub(crate) fn on_worker_reporting<T: Send + 'static>(
     glib::timeout_add_local(POLL, move || {
         // Progress first and all of it, so the last line before a result is
         // the one shown rather than one the result raced past.
-        while let Ok(line) = prx.try_recv() {
-            progress(line);
+        while let Ok(update) = prx.try_recv() {
+            progress(update);
         }
         match rx.try_recv() {
             Ok(value) => {
@@ -539,7 +545,9 @@ pub fn present(
     // the thing it sits under reads as belonging to a different window.
     footer.set_margin_start(18);
     footer.set_margin_end(18);
+    let meter = crate::download_progress::Meter::new();
     footer.append(&status_line);
+    footer.append(meter.widget());
     footer.append(&action);
 
     let window = adw::Window::builder()
@@ -663,6 +671,7 @@ pub fn present(
         let last_for_click = last.clone();
         let status_line = status_line.clone();
         let action_for_click = action.clone();
+        let meter = meter.clone();
         action.connect_clicked(move |_| {
             if !last_for_click.borrow().as_ref().is_some_and(Checked::update_available) {
                 run_check();
@@ -672,39 +681,36 @@ pub fn present(
             // Disabled for the duration. A 229 MB fetch pressed twice is two
             // downloads into one staging directory, and the second one refuses
             // -- correctly, and confusingly, since the first is still working.
-            action_for_click.set_sensitive(false);
-            action_for_click.set_label("Downloading…");
-            status_line.set_label("Looking for a build…");
-            status_line.remove_css_class("error");
+            // The button goes and the bar takes its place, which is the same
+            // treatment the first-run screen gives it -- see
+            // `crate::download_progress`. A disabled button reading
+            // "Downloading…" with a sentence under it was two widgets saying
+            // one thing and neither of them a bar.
+            action_for_click.set_visible(false);
+            status_line.set_visible(false);
+            meter.start();
 
             let button = action_for_click.clone();
             let line = status_line.clone();
-            let failed_line = status_line.clone();
+            let stepping = meter.clone();
+            let finishing = meter.clone();
             on_worker_reporting(
                 |report| {
-                    cordial_update::provider::obtain_and_install(None, &mut |p| {
-                        report(describe_progress(&p))
-                    })
-                    .map(|(got, _)| (got.version.name, got.provider))
-                    .map_err(|e| e.to_string())
+                    cordial_update::provider::obtain_and_install(None, &mut |p| report(p))
+                        .map(|(got, _)| got.version.name)
+                        .map_err(|e| e.to_string())
                 },
-                move |what| line.set_label(&what),
+                move |step| stepping.step(&step),
                 move |outcome| match outcome {
-                    Ok((version, from)) => {
-                        button.set_label("Installed");
-                        button.remove_css_class("suggested-action");
-                        failed_line.set_label(&format!(
-                            "Roblox {version} installed from {from}. Restart Cordial to use it."
-                        ));
-                    }
+                    Ok(version) => finishing.finish(&version),
                     Err(why) => {
-                        button.set_sensitive(true);
-                        button.set_label(DOWNLOAD);
                         // Verbatim, then what to do about it. A mirror being
                         // down and a machine having no network look identical
                         // from in here and only one is the user's to fix.
-                        failed_line.set_label(&format!("{why}\n\n{STORES}"));
-                        failed_line.add_css_class("error");
+                        finishing.failed(&format!("{why}\n\n{STORES}"));
+                        button.set_visible(true);
+                        button.set_label(DOWNLOAD);
+                        line.set_visible(true);
                     }
                 },
             );
@@ -772,22 +778,6 @@ fn action_label(checked: &Option<Checked>) -> &'static str {
     }
 }
 
-/// One line of progress, in words rather than in the enum's shape.
-///
-/// Shared with the first-run screen through [`crate::instructions`] would be
-/// one indirection too many for six lines; if a third caller appears this
-/// moves.
-fn describe_progress(p: &cordial_update::provider::Progress) -> String {
-    use cordial_update::provider::Progress;
-    match p {
-        Progress::Asking { provider } => format!("Asking {provider}..."),
-        Progress::Fetching { done, total: Some(t), .. } => {
-            format!("Downloading: {} of {} MB", done / 1_048_576, t / 1_048_576)
-        }
-        Progress::Fetching { done, .. } => format!("Downloading: {} MB", done / 1_048_576),
-        Progress::Verifying { file } => format!("Checking {file} is signed by Roblox..."),
-    }
-}
 
 /// "Updates" — a page of its own, and what it says about a download it cannot
 /// perform.

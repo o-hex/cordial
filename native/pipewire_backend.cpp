@@ -1671,13 +1671,16 @@ const char* host_backend_name() {
         const char* value = std::getenv("CORDIAL_AUDIO_HOST");
         if (!value || value[0] == '\0') return "pipewire";
         if (std::strcmp(value, "pipewire") == 0) return "pipewire";
+        if (std::strcmp(value, "pulse") == 0 || std::strcmp(value, "pulseaudio") == 0) {
+            return "pulse";
+        }
         // Falls back rather than failing, and says so. ADR-023 schedules
         // PulseAudio and then ALSA behind this name; until one of them exists,
         // a run that asked for one should be told it did not get it rather
         // than left to infer it from silence.
         std::fprintf(stderr,
             "W/Cordial-Audio           CORDIAL_AUDIO_HOST=%s is not a backend this build has "
-            "(pipewire); using pipewire. See docs/adr/ADR-023-host-audio-backends.md.\n",
+            "(pipewire, pulse); using pipewire. See docs/adr/ADR-023-host-audio-backends.md.\n",
             value);
         return "pipewire";
     }();
@@ -1685,12 +1688,28 @@ const char* host_backend_name() {
 }
 
 std::unique_ptr<OutputStream> make_output_stream() {
-    // One implementation today, and the factory exists anyway: the point of
-    // ADR-023's first step is that the *caller* stops naming a backend, so
-    // that adding the second one is a change to this function and nowhere
-    // else. `host_backend_name()` is consulted rather than ignored so that the
-    // warning above fires on the first stream rather than never.
-    (void)host_backend_name();
+    // The whole point of ADR-023's first step: the caller stopped naming a
+    // backend, so adding one is a change here and nowhere else.
+    //
+    // **PulseAudio is opt-in and PipeWire stays the default**, which is the
+    // decision rather than caution about the code. Every current user's session
+    // runs PipeWire, `pipewire-pulse` already serves libpulse clients on it, and
+    // a default that changed under them would be a change nobody asked for. The
+    // people this exists for are on a machine where PipeWire is not there --
+    // and they are the ones who will set the variable.
+    if (std::strcmp(host_backend_name(), "pulse") == 0) {
+        // Asked before falling back, not after: `pulse_available()` connects to
+        // a server and tears the connection down, so a "no" here is a measured
+        // absence rather than a guess -- and the fallback is announced, because
+        // silently getting a different backend from the one you asked for is
+        // the failure this whole file is arranged to avoid.
+        if (pulse_available()) {
+            if (auto stream = make_pulse_stream()) return stream;
+        }
+        std::fprintf(stderr,
+            "W/Cordial-Audio           CORDIAL_AUDIO_HOST=pulse, but no PulseAudio server "
+            "answered; using pipewire.\n");
+    }
     return std::make_unique<CallbackStream>();
 }
 

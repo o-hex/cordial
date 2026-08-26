@@ -115,6 +115,34 @@ if(NOT PIPEWIRE_FOUND)
   endif()
 endif()
 
+# PulseAudio, the second host backend (ADR-023). Same arrangement as PipeWire
+# above and for the same reasons: headers only, optional, and `libpulse.so.0`
+# is dlopen'd at run time rather than linked, so a machine without it degrades
+# to "that backend is unavailable" instead of to a client that will not start.
+#
+# **`pkg_check_modules` is not trusted for this one, and the failure mode is
+# worse than PipeWire's was.** On the machine this was written on, the
+# `pkg-config` first on PATH is Homebrew's, and it *succeeds* for `libpulse` --
+# resolving to headers under its own Cellar for a library that is not the system
+# one. PipeWire at least failed loudly and could be rescued by `find_path`; this
+# would have compiled against the wrong headers and said nothing. So the header
+# search is the primary here and pkg-config is not consulted at all.
+find_path(PULSE_INCLUDE_DIR pulse/pulseaudio.h)
+if(PULSE_INCLUDE_DIR AND NOT PULSE_INCLUDE_DIR MATCHES "linuxbrew|Cellar|homebrew")
+  set(PULSE_FOUND TRUE)
+  message(STATUS "PulseAudio backend: headers at ${PULSE_INCLUDE_DIR}; libpulse.so.0 will be "
+                  "dlopen'd at run time. Selected with CORDIAL_AUDIO_HOST=pulse.")
+elseif(PULSE_INCLUDE_DIR)
+  message(STATUS "PulseAudio backend: ignoring headers at ${PULSE_INCLUDE_DIR} because they are "
+                  "not the system ones -- a Homebrew prefix here compiles against a different "
+                  "libpulse from the one that will be loaded. Install pulseaudio-libs-devel.")
+  set(PULSE_FOUND FALSE)
+else()
+  message(STATUS "PulseAudio backend: no pulse/pulseaudio.h; building the honest "
+                  "\"unavailable\" arm. Install pulseaudio-libs-devel for it.")
+  set(PULSE_FOUND FALSE)
+endif()
+
 # spa-0.2 ships its own .pc and lives in its own include directory; when
 # pkg-config *did* answer for libpipewire-0.3 it will not have mentioned SPA,
 # and every format-negotiation header this backend includes is SPA's.
@@ -144,7 +172,15 @@ endif()
 # pipewire-devel, and honestly refuses every stream there, exactly as
 # `slCreateEngine` does.
 add_library(cordial_liblog STATIC
-  liblog.cpp system_paths.cpp netdb_compat.cpp opensles.cpp pipewire_backend.cpp aaudio.cpp thread_trace.cpp)
+  liblog.cpp system_paths.cpp netdb_compat.cpp opensles.cpp pipewire_backend.cpp
+  pulse_backend.cpp aaudio.cpp thread_trace.cpp)
+# Compiled unconditionally, like every other file here: without the headers it
+# is its own honest "unavailable" arm, so the selector gets a truthful answer
+# rather than a link error. Only the define is conditional.
+if(PULSE_FOUND)
+  target_include_directories(cordial_liblog PRIVATE ${PULSE_INCLUDE_DIR})
+  target_compile_definitions(cordial_liblog PRIVATE CORDIAL_HAVE_PULSE=1)
+endif()
 if(PIPEWIRE_FOUND)
   target_include_directories(cordial_liblog PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
   target_compile_definitions(cordial_liblog PRIVATE CORDIAL_HAVE_PIPEWIRE=1)
@@ -155,8 +191,13 @@ if(PIPEWIRE_FOUND)
   # property matters here specifically. Run as part of the ordinary build
   # rather than left for someone to remember to invoke separately: a check
   # that only runs when asked for is a check that silently stops running.
+  # `pulse_backend.cpp` comes along because `pipewire_backend.cpp`'s factory
+  # now calls into it. Deliberately built here *without* `CORDIAL_HAVE_PULSE`,
+  # so the test exercises the arm that reports the backend unavailable -- which
+  # is the arm every machine without pulseaudio-libs-devel will run, and the one
+  # a fallback bug would hide in.
   add_executable(cordial_pipewire_backend_test EXCLUDE_FROM_ALL
-    pipewire_backend.cpp pipewire_backend_test.cpp)
+    pipewire_backend.cpp pulse_backend.cpp pipewire_backend_test.cpp)
   target_include_directories(cordial_pipewire_backend_test PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
   target_compile_definitions(cordial_pipewire_backend_test PRIVATE CORDIAL_HAVE_PIPEWIRE=1)
   add_custom_command(TARGET cordial_pipewire_backend_test POST_BUILD

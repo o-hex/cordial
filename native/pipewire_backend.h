@@ -258,6 +258,21 @@ public:
 /// document.
 const char* host_backend_name();
 
+/// Whether a PulseAudio server answered, proved by connecting to one.
+///
+/// As trustworthy as `pipewire_available()` has to be, and for the reason
+/// ADR-023 records: `supportsAAudio()` is a one-way door, so a backend that
+/// says yes and then cannot open leaves the session silent with no fallback.
+bool pulse_available();
+
+/// A PulseAudio stream, or null on a build without the headers.
+///
+/// Declared here rather than only in the factory's own file so the backend can
+/// be exercised directly. **Waiting for the engine to open audio is not a
+/// test**: measured on 2026-08-26, it opened on one healthy launch in six, so a
+/// run with no sound proves nothing about the backend.
+std::unique_ptr<OutputStream> make_pulse_stream();
+
 /// A stream on whichever host backend this run selected.
 ///
 /// Never null: a backend that cannot work returns an implementation whose

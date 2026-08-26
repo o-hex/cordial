@@ -451,6 +451,7 @@ fn downloads_for(d: &[u8], version: &str) -> Vec<String> {
 fn download(
     mirror: &Mirror,
     url: &str,
+    cancel: &super::Cancel,
     dest: &Path,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(), Unreachable> {
@@ -499,6 +500,13 @@ fn download(
                 break;
             }
             done += n as u64;
+            // **Between chunks, which is the only place it can be.** A read
+            // already in flight is not interruptible, so the granularity here
+            // is one 256 KiB read -- imperceptible next to the transfer, and
+            // the error unwinds through the same path a failure does, so the
+            // partial file is removed rather than left to be mistaken for a
+            // resumable download.
+            cancel.check()?;
             if done > MAX_ARCHIVE {
                 return Err(Unreachable::Malformed {
                     url: final_url.clone(),
@@ -606,6 +614,7 @@ impl Provider for ApkPure {
     fn fetch(
         &self,
         version: &Available,
+        cancel: &super::Cancel,
         into: &Path,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Archives, Unreachable> {
@@ -657,7 +666,7 @@ impl Provider for ApkPure {
         let result = (|| -> Result<(), Unreachable> {
             for (i, url) in urls.iter().enumerate() {
                 let dest = into.join(format!("candidate-{i}.apk"));
-                download(&mirror, url, &dest, progress)?;
+                download(&mirror, url, cancel, &dest, progress)?;
                 landed.push(dest);
             }
             Ok(())

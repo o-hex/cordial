@@ -147,6 +147,7 @@ impl Provider for OnThisMachine {
     fn fetch(
         &self,
         version: &Available,
+        _cancel: &super::Cancel,
         _into: &Path,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<super::Archives, Unreachable> {

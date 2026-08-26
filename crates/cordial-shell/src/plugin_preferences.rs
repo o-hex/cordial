@@ -64,7 +64,7 @@ pub fn has_page(plugin: &Plugin) -> bool {
 /// an application that updates itself quietly while nagging about its plugins
 /// is two policies where there should be one.
 pub fn gear_for(
-    window: &adw::PreferencesWindow,
+    window: &adw::PreferencesDialog,
     plugin: &Plugin,
     profile_dir: Option<&PathBuf>,
     update_available: bool,
@@ -99,7 +99,7 @@ pub fn gear_for(
 /// back button that gets the user out of it and libadwaita already draws that.
 /// It is also the honest shape: this page belongs to Cordial's settings, and a
 /// free-floating window would suggest the plugin owns something it does not.
-pub fn push(window: &adw::PreferencesWindow, plugin: &Plugin, profile_dir: Option<&Path>) {
+pub fn push(window: &adw::PreferencesDialog, plugin: &Plugin, profile_dir: Option<&Path>) {
     let title = if plugin.manifest.name.is_empty() {
         plugin.manifest.id.clone()
     } else {
@@ -119,7 +119,7 @@ pub fn push(window: &adw::PreferencesWindow, plugin: &Plugin, profile_dir: Optio
 /// Split from [`push`] so a reset can rebuild the rows without a second copy of
 /// how they are built.
 fn build_page(
-    window: &adw::PreferencesWindow,
+    window: &adw::PreferencesDialog,
     plugin: &Plugin,
     profile_dir: Option<&Path>,
 ) -> adw::PreferencesPage {
@@ -411,7 +411,7 @@ mod tests {
             eprintln!("no display; nothing was verified");
             return;
         }
-        let window = adw::PreferencesWindow::new();
+        let window = adw::PreferencesDialog::new();
         let plugin = plugin_with(serde_json::to_value(fabricated()).unwrap());
         let dir = std::env::temp_dir().join("cordial-prefs-render-test");
         let _ = std::fs::remove_dir_all(&dir);

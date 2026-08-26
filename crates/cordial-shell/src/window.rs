@@ -412,7 +412,10 @@ pub fn build(
         if let Some(name) = page.and_then(|p| p.str()).filter(|n| !n.is_empty()) {
             settings.set_visible_page_name(name);
         }
-        settings.present();
+        // An `AdwDialog` is presented against a parent *widget*, not shown as
+        // a window of its own. That is what lets it become a bottom sheet on a
+        // narrow screen instead of a floating box too wide to fit.
+        settings.present(Some(&window_for_settings));
     });
     // The same arrangement for the profile row: a launch refused because the
     // profile is busy has to be able to reach the control that chooses another

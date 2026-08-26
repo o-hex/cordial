@@ -723,9 +723,36 @@ pub fn present(
             // `crate::download_progress`. A disabled button reading
             // "Downloading…" with a sentence under it was two widgets saying
             // one thing and neither of them a bar.
-            action_for_click.set_visible(false);
+            // **The control stays, and becomes the one that stops it.** That
+            // is the interface guideline and it is also the only way out of a
+            // 229 MB fetch on a slow line that does not involve killing the
+            // client. The first version of this hid the button entirely, which
+            // is the half of the pattern that looks tidy and leaves the user
+            // stuck.
+            let cancel = std::sync::Arc::new(cordial_update::provider::Cancel::new());
             status_line.set_visible(false);
             meter.start();
+            action_for_click.set_label("Cancel");
+            action_for_click.remove_css_class("suggested-action");
+            {
+                let cancel = cancel.clone();
+                let handler = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let id = action_for_click.connect_clicked({
+                    let handler = handler.clone();
+                    let cancel = cancel.clone();
+                    move |b| {
+                        cancel.stop();
+                        b.set_sensitive(false);
+                        b.set_label("Stopping...");
+                        // One press is enough; the second would be a second
+                        // stop against a fetch already unwinding.
+                        if let Some(id) = handler.borrow_mut().take() {
+                            b.disconnect(id);
+                        }
+                    }
+                });
+                *handler.borrow_mut() = Some(id);
+            }
 
             let button = action_for_click.clone();
             let line = status_line.clone();
@@ -736,8 +763,11 @@ pub fn present(
             // so this window can; before this they were only ever read.
             let done_button = button_for_badge.clone();
             let done_last = last_for_badge.clone();
+            let done_paint = paint.clone();
             on_worker_reporting(
-                |report| {
+                {
+                    let cancel = cancel.clone();
+                    move |report: &dyn Fn(cordial_update::provider::Progress)| {
                     // `Newest`, and this is the button where that matters.
                     // With `Any` a local copy always wins, so anybody with
                     // Sober installed would press Update, watch it succeed,
@@ -745,11 +775,12 @@ pub fn present(
                     cordial_update::provider::obtain_and_install(
                         None,
                         cordial_update::provider::Want::Newest,
+                        &cancel,
                         &mut |p| report(p),
                     )
                         .map(|(got, _)| got.version.name)
                         .map_err(|e| e.to_string())
-                },
+                }},
                 move |step| stepping.step(&step),
                 move |outcome| match outcome {
                     Ok(version) => {
@@ -766,6 +797,15 @@ pub fn present(
                             checked.reread_installed();
                         }
                         dress(&done_button, &done_last.borrow(), automatic);
+                        // **And this window, not only the header button.**
+                        // `paint` is the one place that turns a `Checked` into
+                        // what is on screen, so a refresh that skips it leaves
+                        // the installed-build line reading the version that was
+                        // there before the download -- the update visibly
+                        // succeeds and the window goes on insisting nothing has
+                        // changed. Reported exactly that way: Cordial does not
+                        // get the memo the APK was updated.
+                        done_paint(&done_last.borrow());
                     }
                     Err(why) => {
                         // Verbatim, then what to do about it. A mirror being

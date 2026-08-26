@@ -995,7 +995,7 @@ fn refresh_plugin_subtitle(expander: &adw::ExpanderRow, plugin: &Plugin, profile
 /// than a second, drifting copy of this logic living in the install button's
 /// callback.
 fn build_plugin_row(
-    parent: &impl IsA<gtk::Window>,
+    parent: &adw::PreferencesDialog,
     plugin: &Plugin,
     profile_dir: Option<&PathBuf>,
     root: &Path,
@@ -1039,9 +1039,15 @@ fn build_plugin_row(
     // Placed before Remove so the order down the row is configure-then-destroy,
     // and so the destructive control stays furthest from the one people press
     // often.
-    // The real type behind `parent` rather than its static one: every caller
-    // passes the preferences window, but they pass it as a `gtk::Window`.
-    if let Ok(window) = parent.as_ref().clone().downcast::<adw::PreferencesWindow>() {
+    // **The dialog itself, passed as one.** This used to take a
+    // `&impl IsA<gtk::Window>` and downcast it to the preferences window to
+    // reach `push_subpage`. That worked only because every caller happened to
+    // pass the preferences window under a wider static type -- and it would
+    // have failed *silently* the moment one did not, dropping the gear from
+    // every plugin row with no error anywhere. An `AdwPreferencesDialog` is
+    // not a `GtkWindow` at all, so the migration would have done exactly that.
+    {
+        let window = parent.clone();
         // `false`: Cordial has no plugin update detection, so nothing can
         // truthfully ask for the accent-coloured gear yet. Passing the literal
         // rather than omitting the argument keeps the state visible at the one
@@ -1061,7 +1067,7 @@ fn build_plugin_row(
         expander.add_suffix(&remove);
     }
     {
-        let window = parent.as_ref().clone();
+        let window = parent.clone();
         let root = root.to_path_buf();
         let id = id.clone();
         let title = title.clone();
@@ -1245,12 +1251,19 @@ fn build_plugin_row(
 /// user-facing installer, it is the absence of one. Fetching from a remote
 /// index — the marketplace half of ADR-014 — still needs a network fetcher
 /// this change does not add; this is the half that was reachable without one.
+/// `parent` and `dialog` are both here on purpose and are not interchangeable.
+/// `GtkFileDialog` needs a real `GtkWindow` to be modal against; the plugin
+/// rows need the `AdwPreferencesDialog` because that is what owns the subpages
+/// a plugin's gear pushes. An `AdwDialog` is not a `GtkWindow`, so one handle
+/// cannot serve both.
 fn build_install_group(
     parent: &impl IsA<gtk::Window>,
+    dialog: &adw::PreferencesDialog,
     root: &Path,
     profile_dir: Option<PathBuf>,
     installed_group: &adw::PreferencesGroup,
 ) -> adw::PreferencesGroup {
+    let row_dialog = dialog.clone();
     let group = adw::PreferencesGroup::builder()
         .title("Install from a file")
         .description("Installing a plugin does not allow it to do anything. You choose that afterwards.")
@@ -1273,6 +1286,7 @@ fn build_install_group(
         let profile_dir = profile_dir.clone();
         let installed_group = installed_group.clone();
         let row = row_for_status.clone();
+        let row_dialog = row_dialog.clone();
         choose_file(&picker_window, "Choose a plugin archive (.tar.zst)", false, move |path| {
             let bytes = match std::fs::read(&path) {
                 Ok(b) => b,
@@ -1346,7 +1360,7 @@ fn build_install_group(
                     }
                     park_new_plugin_disabled(profile_dir.as_ref(), &plugin);
                     let new_row = build_plugin_row(
-                        &window,
+                        &row_dialog,
                         &plugin,
                         profile_dir.as_ref(),
                         &root,
@@ -1459,6 +1473,7 @@ fn park_new_plugin_disabled(profile_dir: Option<&PathBuf>, plugin: &Plugin) {
 /// GTK callback that outlives the button press that created it.
 fn build_marketplace_entry_row(
     parent: &impl IsA<gtk::Window>,
+    dialog: &adw::PreferencesDialog,
     opened: &Rc<marketplace::Opened>,
     entry: &Entry,
     index_dir: &Path,
@@ -1466,6 +1481,7 @@ fn build_marketplace_entry_row(
     profile_dir: Option<&PathBuf>,
     installed_group: &adw::PreferencesGroup,
 ) -> adw::ActionRow {
+    let row_dialog = dialog.clone();
     let title = if entry.name.is_empty() { entry.id.clone() } else { entry.name.clone() };
     let requests = if entry.capabilities.is_empty() {
         "Requests no capabilities".to_string()
@@ -1552,6 +1568,7 @@ fn build_marketplace_entry_row(
         let window = window.clone();
         let row_for_status = row_for_status.clone();
         let button = button.clone();
+        let row_dialog = row_dialog.clone();
         // The closure consumes its copy, and `present` below still needs one.
         let present_parent = window.clone();
         dialog.connect_response(None, move |dialog, response| {
@@ -1594,7 +1611,7 @@ fn build_marketplace_entry_row(
                                     // act, and it is the user's.
                                     park_new_plugin_disabled(Some(&profile_dir), &plugin);
                                     let new_row = build_plugin_row(
-                                        &window,
+                                        &row_dialog,
                                         &plugin,
                                         Some(&profile_dir),
                                         &root,
@@ -1644,12 +1661,14 @@ fn build_marketplace_entry_row(
 /// into the other group.
 fn build_marketplace_groups(
     parent: &impl IsA<gtk::Window>,
+    dialog: &adw::PreferencesDialog,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
     root: &Path,
     profile_dir: Option<PathBuf>,
     installed_group: &adw::PreferencesGroup,
 ) -> (adw::PreferencesGroup, adw::PreferencesGroup) {
+    let row_dialog = dialog.clone();
     let config_group = adw::PreferencesGroup::builder()
         .title("Marketplace")
         .description(
@@ -1777,6 +1796,7 @@ fn build_marketplace_groups(
             for entry in &opened.index.entries {
                 let row = build_marketplace_entry_row(
                     &window,
+                    &row_dialog,
                     &opened,
                     entry,
                     &index_dir,
@@ -1814,7 +1834,7 @@ fn build_marketplace_groups(
 /// this project has already been bitten by is a second, similar-looking row
 /// built in the installer's callback that drifts from this one.
 fn build_plugins_page(
-    parent: &impl IsA<gtk::Window>,
+    parent: &adw::PreferencesDialog,
     config: Rc<RefCell<ShellConfig>>,
 ) -> (adw::PreferencesPage, adw::PreferencesGroup) {
     let page = adw::PreferencesPage::builder()
@@ -1950,6 +1970,7 @@ fn build_plugins_page(
 /// entry for the same reason. Nothing here changed except where it lives.
 fn build_get_plugins_page(
     parent: &impl IsA<gtk::Window>,
+    dialog: &adw::PreferencesDialog,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
     installed_group: &adw::PreferencesGroup,
@@ -1964,24 +1985,33 @@ fn build_get_plugins_page(
     let profile_name = config.borrow().profile.clone();
     let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
 
-    page.add(&build_install_group(parent, &root, profile_dir.clone(), installed_group));
+    page.add(&build_install_group(parent, dialog, &root, profile_dir.clone(), installed_group));
     let (marketplace_config, marketplace_listing) =
-        build_marketplace_groups(parent, config, config_path, &root, profile_dir, installed_group);
+        build_marketplace_groups(parent, dialog, config, config_path, &root, profile_dir, installed_group);
     page.add(&marketplace_config);
     page.add(&marketplace_listing);
     page
 }
 
-/// Builds the `AdwPreferencesWindow`: Appearance, General and Plugins, one
-/// `AdwPreferencesPage` each.
+/// Builds the settings dialog: Roblox, Updates, Appearance, General, Plugins,
+/// one `AdwPreferencesPage` each.
+///
+/// **`AdwPreferencesDialog`, not `AdwPreferencesWindow`.** The window form has
+/// been deprecated since libadwaita 1.6 and the compiler had been saying so on
+/// every build -- eleven warnings across this file and
+/// `plugin_preferences.rs`, read past all session.
+///
+/// The difference is not cosmetic. An `AdwDialog` is adaptive: it floats over
+/// the parent on a wide screen and becomes a bottom sheet on a narrow one,
+/// which is what the platform now expects of transient in-app content. It also
+/// takes no `transient_for` and no `modal` -- it is presented *against* a
+/// parent widget instead, so those builder calls go away rather than moving.
 pub fn build_preferences_window(
     parent: &impl IsA<gtk::Window>,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
-) -> adw::PreferencesWindow {
-    let window = adw::PreferencesWindow::builder()
-        .transient_for(parent)
-        .modal(true)
+) -> adw::PreferencesDialog {
+    let window = adw::PreferencesDialog::builder()
         .title("Settings")
         .search_enabled(false)
         // Taller than libadwaita's default, which was chosen for the Roblox
@@ -1990,21 +2020,21 @@ pub fn build_preferences_window(
         // warning below the fold is a warning nobody is shown. Only a default —
         // the window resizes, and GTK clamps this to the work area on a screen
         // that cannot hold it.
-        .default_width(640)
-        .default_height(720)
+        .content_width(640)
+        .content_height(720)
         .build();
 
     // First, because it is the one that has to be right before anything else
     // in this window matters: without a build there is nothing to launch, and
     // a renderer preference for a client that cannot start is decoration.
-    window.add(&build_roblox_page(&window, config.clone(), config_path.clone()));
+    window.add(&build_roblox_page(parent, config.clone(), config_path.clone()));
     // Second, next to the page about the build it is about.
     window.add(&crate::updater::build_update_page(config.clone(), config_path.clone()));
     window.add(&build_appearance_page(config.clone(), config_path.clone()));
     window.add(&build_general_page(config.clone(), config_path.clone()));
     let (plugins, installed) = build_plugins_page(&window, config.clone());
     window.add(&plugins);
-    window.add(&build_get_plugins_page(&window, config, config_path, &installed));
+    window.add(&build_get_plugins_page(parent, &window, config, config_path, &installed));
 
     window
 }

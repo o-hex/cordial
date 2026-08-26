@@ -109,9 +109,31 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
     let to_close = window.clone();
     let retry = std::rc::Rc::new(retry);
     fetch.connect_clicked(move |b| {
-        b.set_visible(false);
+        // The button stays and becomes Cancel, rather than vanishing. See
+        // `updater.rs` for the same treatment and the reason: a few hundred
+        // megabytes with no way to stop it is the deviation, not the swap.
         checked.set_visible(false);
         meter.start();
+        let cancel = std::sync::Arc::new(cordial_update::provider::Cancel::new());
+        b.set_label("Cancel");
+        b.remove_css_class("suggested-action");
+        {
+            let cancel = cancel.clone();
+            let handler = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let id = b.connect_clicked({
+                let handler = handler.clone();
+                let cancel = cancel.clone();
+                move |b| {
+                    cancel.stop();
+                    b.set_sensitive(false);
+                    b.set_label("Stopping...");
+                    if let Some(id) = handler.borrow_mut().take() {
+                        b.disconnect(id);
+                    }
+                }
+            });
+            *handler.borrow_mut() = Some(id);
+        }
 
         let b = b.clone();
         let checked = checked.clone();
@@ -120,7 +142,9 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
         let to_close = to_close.clone();
         let retry = retry.clone();
         updater::on_worker_reporting(
-            |report| {
+            {
+                let cancel = cancel.clone();
+                move |report: &dyn Fn(cordial_update::provider::Progress)| {
                 // `Any`, not `Newest`. This screen has no build at all, so the
                 // cheapest usable one is the right answer -- and on most
                 // machines that is a copy already on the disk, which costs no
@@ -128,11 +152,12 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
                 cordial_update::provider::obtain_and_install(
                     None,
                     cordial_update::provider::Want::Any,
+                    &cancel,
                     &mut |p| report(p),
                 )
                     .map(|(got, _)| got.version.name)
                     .map_err(|e| e.to_string())
-            },
+            }},
             move |step| meter.step(&step),
             move |outcome| match outcome {
                 Ok(version) => {
@@ -149,7 +174,9 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
                 }
                 Err(why) => {
                     failed_meter.failed(&why);
-                    b.set_visible(true);
+                    b.set_sensitive(true);
+                    b.set_label(FETCH);
+                    b.add_css_class("suggested-action");
                     checked.set_visible(true);
                 }
             },

@@ -107,6 +107,9 @@ pub enum Unreachable {
     /// changed is Roblox having moved something, which is the failure ADR-015
     /// says must not present as "no update available".
     Malformed { url: String, why: String },
+    /// The user asked to stop. Not a failure: nothing is wrong, and the
+    /// message must not read as though something is.
+    Cancelled,
     /// There was nothing to reach. A source that needs no network still fails
     /// -- the local build is simply absent -- and folding that into a transport
     /// error would put a URL in a message about a missing file.
@@ -116,6 +119,7 @@ pub enum Unreachable {
 impl std::fmt::Display for Unreachable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Unreachable::Cancelled => write!(f, "Download stopped."),
             Unreachable::NoSource { why } => write!(f, "{why}"),
             Unreachable::Transport { url, why } => write!(f, "could not reach {url}: {why}"),
             Unreachable::Status { url, status, body } => {

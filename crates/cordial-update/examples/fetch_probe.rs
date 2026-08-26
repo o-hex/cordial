@@ -13,7 +13,7 @@
 //! Without `--download` it asks every source what it has and stops, which is
 //! the cheap half and the one worth running often.
 
-use cordial_update::provider::{self, Progress, Want};
+use cordial_update::provider::{self, Cancel, Progress, Want};
 
 fn main() {
     let download = std::env::args().any(|a| a == "--download");
@@ -49,7 +49,7 @@ fn main() {
         let _ = std::fs::remove_dir_all(&into);
         std::fs::create_dir_all(&into).expect("scratch");
 
-        match p.fetch(&available, &into, &mut say) {
+        match p.fetch(&available, &Cancel::new(), &into, &mut say) {
             Ok(archives) => {
                 println!("   base:  {}", archives.base.display());
                 println!("   split: {}", archives.split.display());
@@ -75,7 +75,7 @@ fn main() {
     let into = std::env::temp_dir().join("cordial-obtain-probe");
     let _ = std::fs::remove_dir_all(&into);
     std::fs::create_dir_all(&into).expect("scratch");
-    match provider::obtain(only.as_deref(), Want::Newest, &into, &mut say) {
+    match provider::obtain(only.as_deref(), Want::Newest, &Cancel::new(), &into, &mut say) {
         Ok(got) => {
             println!("   {} from {}", got.version.name, got.provider);
             println!("   signed by {}", got.certificate_sha256);

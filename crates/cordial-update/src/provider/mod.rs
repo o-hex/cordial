@@ -73,6 +73,41 @@
 
 use crate::Unreachable;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Somewhere for a caller to say "stop".
+///
+/// **A download of a few hundred megabytes has to be abandonable**, and the
+/// GNOME interface guidelines say so about any long operation: the control that
+/// started it should become the one that stops it. Without this the only way
+/// out of a fetch on a slow connection is to kill the client, which loses the
+/// profile lock cleanly only by luck.
+///
+/// Checked between chunks rather than enforced by killing a thread, because the
+/// thread owns a partly-written file and a socket, and both want unwinding
+/// rather than abandoning. A cancelled fetch removes what it wrote, exactly as
+/// a failed one does.
+#[derive(Debug, Default)]
+pub struct Cancel(AtomicBool);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Cancel(AtomicBool::new(false))
+    }
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+    pub fn stopped(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+    /// `Err` if the caller has asked to stop, for use with `?`.
+    pub fn check(&self) -> Result<(), Unreachable> {
+        if self.stopped() {
+            return Err(Unreachable::Cancelled);
+        }
+        Ok(())
+    }
+}
 
 pub mod local;
 pub mod mirror;
@@ -156,6 +191,7 @@ pub trait Provider {
     fn fetch(
         &self,
         version: &Available,
+        cancel: &Cancel,
         into: &Path,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Archives, Unreachable>;
@@ -277,9 +313,11 @@ pub struct Obtained {
 pub fn obtain(
     preferred: Option<&str>,
     want: Want,
+    cancel: &Cancel,
     into: &Path,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Obtained, Unreachable> {
+    cancel.check()?;
     let sources = match preferred {
         Some(name) => vec![named(name).ok_or_else(|| Unreachable::NoSource {
             why: format!(
@@ -290,7 +328,7 @@ pub fn obtain(
         None => all(),
     };
 
-    obtain_from(sources, want, &crate::apk_signature::pinned(), into, progress)
+    obtain_from(sources, want, cancel, &crate::apk_signature::pinned(), into, progress)
 }
 
 /// [`obtain`], with the sources and the trusted set handed in.
@@ -303,6 +341,7 @@ pub fn obtain(
 pub(crate) fn obtain_from(
     sources: Vec<Box<dyn Provider>>,
     want: Want,
+    cancel: &Cancel,
     trusted: &[String],
     into: &Path,
     progress: &mut dyn FnMut(Progress),
@@ -327,7 +366,8 @@ pub(crate) fn obtain_from(
             Err(e) => return Err(e),
         };
 
-        let archives = match source.fetch(&version, into, progress) {
+        cancel.check()?;
+        let archives = match source.fetch(&version, cancel, into, progress) {
             Ok(a) => a,
             Err(Unreachable::NoSource { why }) => {
                 absent.push(format!("{}: {why}", source.name()));
@@ -340,6 +380,9 @@ pub(crate) fn obtain_from(
         // hashed twice to satisfy the shape of the rule.
         let mut certificate: Option<String> = None;
         for file in archives.distinct() {
+            // Verification hashes a few hundred megabytes; a user who has asked
+            // to stop should not wait through it.
+            cancel.check()?;
             progress(Progress::Verifying {
                 file: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
             });
@@ -394,6 +437,7 @@ pub(crate) fn obtain_from(
 pub fn obtain_and_install(
     preferred: Option<&str>,
     want: Want,
+    cancel: &Cancel,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(Obtained, crate::install::Installed), Unreachable> {
     let staging = crate::install::build_dir().join(".fetching");
@@ -402,7 +446,7 @@ pub fn obtain_and_install(
         .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
 
     let outcome = (|| {
-        let obtained = obtain(preferred, want, &staging, progress)?;
+        let obtained = obtain(preferred, want, cancel, &staging, progress)?;
         let mut named: Vec<(&'static str, PathBuf)> =
             vec![(crate::install::BASE_APK, obtained.archives.base.clone())];
         // A monolithic archive is one file and must be named once. Handing the
@@ -506,6 +550,7 @@ mod tests {
         fn fetch(
             &self,
             _: &Available,
+            _: &Cancel,
             into: &Path,
             _: &mut dyn FnMut(Progress),
         ) -> Result<Archives, Unreachable> {
@@ -556,7 +601,7 @@ mod tests {
 
         let trusted =
             vec!["44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477".to_string()];
-        let e = obtain_from(vec![Box::new(Hostile)], Want::Newest, &trusted, &dir, &mut noise)
+        let e = obtain_from(vec![Box::new(Hostile)], Want::Newest, &Cancel::new(), &trusted, &dir, &mut noise)
             .expect_err("an unsigned archive must never be accepted, whatever produced it");
 
         // And it fails for the right reason. "No such file" would pass an
@@ -597,6 +642,7 @@ mod tests {
             fn fetch(
                 &self,
                 _: &Available,
+                _: &Cancel,
                 _: &Path,
                 _: &mut dyn FnMut(Progress),
             ) -> Result<Archives, Unreachable> {
@@ -611,6 +657,7 @@ mod tests {
         let got = obtain_from(
             vec![Box::new(Genuine(apk))],
             Want::Newest,
+            &Cancel::new(),
             &[signer.certificate_sha256.clone()],
             &dir,
             &mut noise,
@@ -633,7 +680,8 @@ mod tests {
         let dir = std::env::temp_dir().join("cordial-obtain-unknown");
         std::fs::create_dir_all(&dir).expect("scratch");
         let mut noise = |_: Progress| {};
-        let e = obtain(Some("no-such-source"), Want::Any, &dir, &mut noise).unwrap_err();
+        let e = obtain(Some("no-such-source"), Want::Any, &Cancel::new(), &dir, &mut noise)
+            .unwrap_err();
         assert!(e.to_string().contains("no-such-source"), "{e}");
         assert!(e.to_string().contains("local"), "the error should list what does exist: {e}");
     }

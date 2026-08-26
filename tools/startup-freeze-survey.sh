@@ -75,6 +75,21 @@
 # `presents=1` is the usual frozen reading but not the only one: the survey saw
 # 0, 1 and 5. Read the count, not the verdict, when a row looks odd.
 #
+# `GAME_ACTIVITY=0` drops `--game-activity`, which is the arm worth running.
+# **Two working references say that path is the wrong one.** Roblox's own
+# Android build does not take it -- `EnableGameActivity8` resolves to false in
+# `docs/traces/waydroid-roblox-startup.log.gz:626`, and no GameActivity native
+# appears anywhere in that capture -- and mocktail defaults all three of its
+# GameActivity switches off with the comment that the path "currently stalls V2
+# init on surface flags" and that its lifecycle callbacks "can block on
+# `android_app_set_activity_state` in some Linux shims"
+# (`src/legacy/legacy_runtime.cc:2867-2873`, Apache-2.0).
+#
+# Cordial drives the ASMA/V2 app-bridge *and* GameActivity on top of it, which
+# is the combination that comment names. Whether that is this freeze is a
+# measurement and not an argument, and this is the switch that takes it. The
+# default is on, so every row measured before 2026-08-27 stays comparable.
+#
 # Set `CORDIAL_POLL_COALESCE_US=0` to run the looper's idle backoff off as a
 # control, `CORDIAL_BRIDGE_DELAY_MS=<n>` to hold the app bridge back before it
 # starts the Lua app, and `TAG=<word>` to keep one arm's logs from overwriting
@@ -97,6 +112,10 @@
 set -uo pipefail
 RUN="${1:-0}"
 PROFILE="${2:-default}"
+# On unless explicitly turned off, so this switch cannot silently change what
+# every previous row in this file measured.
+GAME_ACTIVITY="${GAME_ACTIVITY:-1}"
+[ "$GAME_ACTIVITY" = "0" ] && GAME_ACTIVITY=""
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${CORDIAL_FREEZE_OUT:-/tmp/cordial-freeze}"
 mkdir -p "$OUT"
@@ -233,7 +252,7 @@ env WAYLAND_DISPLAY=$DISP GDK_BACKEND=wayland CORDIAL_DEV_CONTROL=1 \
   ${CORDIAL_BRIDGE_DELAY_MS:+CORDIAL_BRIDGE_DELAY_MS=$CORDIAL_BRIDGE_DELAY_MS} \
   ${CORDIAL_REPORT_FOCUS:+CORDIAL_REPORT_FOCUS=$CORDIAL_REPORT_FOCUS} \
   "$ROOT/target/release/cordial-run" --lib-dir "$LIB" --apk "$APK" --host-libc \
-  --game-activity --run 0 --profile "$PROFILE" > "$STDOUT_FIFO" 2>&1 &
+  ${GAME_ACTIVITY:+--game-activity} --run 0 --profile "$PROFILE" > "$STDOUT_FIFO" 2>&1 &
 CLIENT=$!
 
 if [ -n "$NUDGING" ]; then

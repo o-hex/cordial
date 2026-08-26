@@ -128,6 +128,41 @@ unless that ABI grows an implementation too.
 sound but leaves the user's output device menu empty or wrong is half a feature,
 and the half that is missing is the one people notice.
 
+## ALSA cannot work in the Flatpak, and that is not going to be fixed
+
+Asked directly on 2026-08-26 -- should ALSA be dropped and the backends be
+PipeWire and PulseAudio only? -- and the answer turns on a fact about the
+sandbox that was not written down anywhere.
+
+**The Flatpak has no route to `/dev/snd`.** `packaging/io.github.luohoa97.Cordial.yml`
+grants `--socket=pulseaudio` and the native PipeWire socket, and `--device=dri`
+and nothing else. `alsa_available()` proves a device by opening a PCM and
+closing it, which is the right probe and which cannot succeed against a
+directory that is not in the sandbox. So for everybody installing Cordial the
+recommended way, `CORDIAL_AUDIO_HOST=alsa` is a variable that reports it did not
+get what it asked for.
+
+**The grant it would need is `--device=all`.** Flatpak has no narrower lever --
+there is no `--device=snd` -- so reaching the sound devices means every device
+node in `/dev`, cameras and input devices included. The manifest already refuses
+that exact widening for FIDO2, in a comment arguing that a permission granting
+far more than the capability needs is a permission that lies. That reasoning
+does not get weaker because the capability this time is audio.
+
+**ALSA stays anyway, and the reason is the users the Flatpak is not for.** The
+AUR package, an RPM, and `cargo build` all produce a Cordial with no sandbox
+around it, and a machine with no sound server at all is exactly the case ALSA
+exists to answer. It is opt-in, it is probed before it is trusted, it compiles
+out entirely without `alsa-lib-devel`, and it costs nothing on a machine that
+never names it. Deleting a working fallback to tidy the backend list would take
+sound away from the only people who need that fallback.
+
+What was wrong was leaving this undocumented, because the failure it produces is
+the expensive kind: the variable is accepted, the probe fails, and the user gets
+PipeWire with no indication that the sandbox was the reason. Anybody debugging
+ALSA under the Flatpak should be sent here in the first minute rather than the
+second hour.
+
 ## What would change this
 
 A measurement showing PipeWire's ALSA plugin or `pipewire-pulse` failing for

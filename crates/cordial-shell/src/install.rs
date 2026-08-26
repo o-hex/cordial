@@ -291,6 +291,36 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
                 // re-extracts every time has an explanation somewhere.
                 println!("  shell: extracted {LIBRARY} but could not stamp the cache: {e}");
             }
+            // **And the version, or this build can never be updated.**
+            //
+            // `Checked::installed` reads `cache::recorded_version`, and
+            // `update_available` is deliberately both-or-nothing: an unknown
+            // installed version is not an old one. So a cache with no recorded
+            // version makes "is there an update" answer no, for ever -- the
+            // badge never lights, and pressing the button re-checks and returns
+            // to the same place.
+            //
+            // Until now the only writer was `cordial_update::install::adopt`,
+            // which runs when *Cordial* downloaded the build. Everyone whose
+            // build came from Sober or from an APK they chose themselves --
+            // which `provider::local` calls the source most users should end up
+            // on -- extracted their engine through this path instead, and could
+            // not update through the interface at all.
+            //
+            // Read from the engine that was just extracted rather than passed
+            // in, so it is the same string, from the same source, that
+            // `adopt` would have recorded.
+            match cordial_update::engine::version_of(&from) {
+                Some(version) => {
+                    if let Err(e) = cordial_update::cache::record_version(&cache, &version) {
+                        println!("  shell: extracted {LIBRARY} but could not record its version: {e}");
+                    }
+                }
+                // Not fatal, and worth saying: an engine whose version cannot
+                // be read leaves the update check unable to compare, which is
+                // the honest state rather than a guessed one.
+                None => println!("  shell: could not read a version out of the extracted {LIBRARY}"),
+            }
             println!("  shell: extracted {LIBRARY} from {} into {}", from.display(), cache.display());
             Ok(Build { apk, lib_dir: cache })
         }

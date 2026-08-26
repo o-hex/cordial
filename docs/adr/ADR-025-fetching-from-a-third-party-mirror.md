@@ -102,9 +102,15 @@ manual one is where the "modded APK" advice actually lands.
 
 ## Consequences
 
-**The install instruction changes** from "obtain an APK" to "press the button",
-and the Sober dependency in the README becomes one option among several rather
-than the recommended route.
+**The install instruction changes** from "obtain an APK" to "press the button".
+
+This originally went on to say the Sober route becomes "one option among
+several rather than the recommended route", and that is **not** what was built,
+so it is corrected here rather than left to describe something else. Both routes
+are on the first-run screen with the difference stated: the mirror is a third
+party that sees who asked and can be down, and Sober going through Google Play
+on the user's own account is a different trade and a reasonable one to prefer.
+Offering one and hiding the other would be deciding that on the user's behalf.
 
 **Cordial acquires a security-critical component.** A signature verifier is code
 where a subtle mistake is invisible until it matters. It needs tests with known
@@ -116,6 +122,59 @@ as the verifier is.
 every download fails closed until the new digest is added. That is the correct
 direction to fail, and it needs to be a one-line change somebody can make
 quickly, with an obvious error message saying what happened.
+
+## What was built, and what it measured
+
+Implemented on 2026-08-26 in `crates/cordial-update/{apk_signature,url_policy,provider}`,
+clean-room from `docs/design/fetching-the-roblox-build.md`. Every protocol fact
+in that spec was re-checked against the live service before being coded against,
+and all of them held.
+
+**The condition this ADR turns on is satisfied, and here is the measurement that
+says so.** APKPure served version 2.734.917 as a single 229 140 095-byte APK.
+The archive Sober downloaded from Google Play for the same build is a different
+file — 97 MB of assets plus a 53 MB x86-64 split, 150 MB against 229 MB, because
+the mirror's copy carries every ABI. Both verify against the same Roblox signing
+certificate:
+
+```text
+44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477
+```
+
+Two distribution routes that share nothing, one signing key, and one verifier
+saying so about both. That is the strongest statement available about whether a
+mirror is serving Roblox's build, and it is the measurement to repeat whenever
+anyone asks whether this source is safe.
+
+**Two sources ship, not one, and the free one is tried first.** A build already
+on the machine costs no request, no disclosure and no bytes on a metered
+connection, and most people who will run Cordial already have this exact file
+because the README told them to install Sober. Reaching a mirror for a file that
+is already present would be the worst version of this feature.
+
+**The pinned set holds one certificate, not the two the design spec names.** The
+second was not observed on this machine, and a digest in that file is a key
+Cordial accepts builds from forever. Taking one from a report rather than from
+an archive somebody verified is the wrong way to spend that, so it is not there.
+Adding it is a one-line change for whoever does observe it.
+
+### One thing the ADR did not anticipate
+
+The design review found that the verifier as first written had **no downgrade
+protection**. Roblox signs with both v2 and v3, and an archive verifies under
+either, so an attacker who wants the weaker scheme deletes the v3 block rather
+than defeating the preference for it. Measured: strip the v3 pair from the
+shipping build, fix the EOCD offset, and the result still verifies under v2 and
+still reports Roblox's genuine certificate — because the content digest
+substitutes the signing block's offset for the central directory's, which is
+what makes a signature survive the block being inserted and equally makes it
+blind to the block being resized.
+
+What closes it is the `0xbeeff00d` attribute inside the v2 signed data, which
+says the signer also applied scheme 3 and cannot be edited without breaking the
+v2 signature. It was being parsed past and ignored. **A verifier for this ADR is
+not finished when it accepts genuine archives**; that was true of the first
+version and it was not secure.
 
 ## What would change this
 

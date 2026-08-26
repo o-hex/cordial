@@ -79,6 +79,14 @@ BuildRequires:  webkitgtk6.0-devel
 # it finds them and the previous link-only stub when it does not -- so leaving
 # this out is a silent loss of audio rather than a build failure.
 BuildRequires:  pipewire-devel
+# The same rule, for the second host backend (ADR-023). `libpulse.so.0` is
+# dlopen'd and never linked, so this is headers only and adds no runtime
+# dependency -- but without it `native/pulse_backend.cpp` compiles its "this
+# backend is unavailable" arm, and a user who sets CORDIAL_AUDIO_HOST=pulse is
+# told there is no PulseAudio on a machine that has one. That is the same
+# silent-loss shape the line above exists to prevent, and this project has
+# already lost every sample of audio it ever played to it once.
+BuildRequires:  pulseaudio-libs-devel
 # `-lz` on the native link line.
 BuildRequires:  zlib-ng-compat-devel
 BuildRequires:  desktop-file-utils

@@ -653,6 +653,52 @@ Start with [`docs/NEXT.md`](docs/NEXT.md). The rest is reference.
 | [`docs/base-evaluation.md`](docs/base-evaluation.md) | Port-vs-write assessment of the prior art |
 | [`docs/multiarch.md`](docs/multiarch.md) | Multi-architecture decision |
 
+## What this is built on, and who it is owed to
+
+**Sober.** VinegarHQ's client is the reason anyone believes a Roblox client can
+run natively on Linux at all, and Cordial owes it more than a link.
+
+Three debts, named specifically, because a vague thank-you is worth less than an
+accurate one:
+
+- **Its issue tracker is a research corpus this project reads constantly.**
+  `tools/sober-corpus/` keeps a local copy of 2,000-odd issues and their
+  comments ([ADR-017](docs/adr/ADR-017-sober-issue-corpus.md)), and the rule at
+  the top of [AGENTS.md](AGENTS.md) is to search it *before* investigating any
+  user-facing bug — because Sober runs the same engine on the same kind of
+  desktop, and almost every symptom seen here has already been reported there,
+  often years earlier and often with the environment that distinguishes it. The
+  invisible-text bug was diagnosed that way in minutes after being investigated
+  here from first principles for days.
+- **Watching it run corrected a conclusion drawn here.**
+  [`docs/analysis/sober-input-stack.md`](docs/analysis/sober-input-stack.md)
+  records what Sober binds at the protocol level, and it exists because a claim
+  made here about Sober's text input was wrong and needed checking against the
+  real thing.
+- **It is how most people get the Roblox build.** The quickstart above says
+  "install Sober" because Sober downloads the Android build, and Cordial reads
+  it where it lies.
+
+**What was not taken, and could not be: Sober's code.** It is not
+source-available. Nothing was decompiled, disassembled or copied. What was used
+is a public issue tracker and the observable behaviour of a running program —
+`/proc` maps, `DT_NEEDED`, and a Wayland protocol trace — which is the same
+class of evidence as watching any program work.
+
+That distinction matters and is worth being exact about rather than defensive.
+Reading somebody's public bug reports and watching their program run is not the
+same as taking their work, and saying so is not a way of avoiding the thanks:
+Sober went first, it went first while it was much harder, and a good deal of
+what this project knows it knows because that tracker exists.
+
+**mocktail**, komaruworld's client, is Apache-2.0 and the second reference this
+project consults. Where its ideas are adapted, they are credited in
+[`NOTICE`](NOTICE) and named at the point of use — the web view's security rules
+are theirs, and `third_party/mocktail-webview/` carries their helper.
+
+**AGDK `GameActivity`** is Apache-2.0 and open source, which is why the activity,
+surface, input and IME contract could be read rather than guessed at.
+
 ## Headline findings
 
 **Roblox ships a complete x86-64 Android build.** `split_config.x86_64.apk`

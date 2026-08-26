@@ -39,11 +39,18 @@ flatpak run io.github.luohoa97.Cordial
 ```
 
 **You also need Roblox's Android build, which Cordial does not ship and never
-will.** The quickest way to get one is to install
-[Sober](https://sober.vinegarhq.org/) — Cordial finds the APK Sober downloads
-and uses it where it lies, without copying or modifying it. If you already have
-Sober, there is nothing else to do. If you would rather supply your own, point
-Cordial at it in Settings, or see [§1](#1-what-you-need).
+will.** On first run Cordial offers three ways to get one, and you pick:
+
+- **Already have [Sober](https://sober.vinegarhq.org/)?** Then you are done.
+  Cordial finds the APK Sober downloaded and uses it where it lies — no copy, no
+  modification, and Sober keeps working.
+- **Press "Download it for me."** Cordial fetches the build from APKPure, a
+  third-party mirror, and **refuses to install anything that is not signed by
+  Roblox's own signing certificate** — so a mirror that alters a byte is caught
+  rather than trusted. It is still a third party that can be down and that sees
+  who asked, which is why it is a button and not the default.
+- **Supply your own APK** and point Cordial at it in Settings, or see
+  [§1](#1-what-you-need). It gets the same signature check.
 
 Two things worth knowing before you type that, rather than after: **the remote
 is not signed**, so `flatpak install` proves the download matches the

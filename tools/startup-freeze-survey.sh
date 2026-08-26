@@ -13,7 +13,30 @@
 #
 # Columns:
 #
-# **2026-08-26: forty runs, twenty per arm, and not one freeze.** Nudged versus
+# **2026-08-26, and this is the finding to start from: the freeze is a
+# signed-in phenomenon.** Twenty runs on a signed-in profile froze SIXTEEN
+# times. Forty runs earlier the same evening on a signed-out one froze not
+# once. Same machine, same binary, same hour.
+#
+#     signed in  (ready=RootSwitchNavigator)   16 / 20 frozen   80%
+#     signed out (ready=Landing)                0 / 40 frozen    0%
+#
+# A frozen signed-in run stops almost immediately -- presents of 1, 2, 4 and 7
+# at ten seconds and unchanged at twenty-five -- against about 320 for a
+# healthy one. There is no ambiguity in the reading and no need for statistics
+# to separate the arms.
+#
+# **So every measurement taken on a signed-out profile is about something
+# else**, including the twenty-per-arm nudge experiment recorded below, which
+# concluded nothing because nothing froze. That was not bad luck. Sign in
+# before measuring this bug.
+#
+# It also turns an intermittent bug into a reproducible one. At 80% a frozen
+# client is two launches away, which makes catching one under gdb -- with
+# `cordial_loopers` for the descriptor counts and the process CPU beside the
+# stacks -- a matter of minutes rather than a day of waiting.
+#
+# **2026-08-26 (earlier): forty runs, twenty per arm, and not one freeze.** Nudged versus
 # not, strictly interleaved, on this machine after a reboot. At the 32% base
 # rate above you would expect about thirteen; the chance of none is about three
 # in ten million. So the freeze did not reproduce at all that day, and the arm

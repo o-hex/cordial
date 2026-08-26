@@ -3875,19 +3875,6 @@ impl WaylandWindow {
         }
         let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else { return };
 
-        // Ctrl+V, before the character is read — see the same binding in
-        // `window.rs` for why there is no engine call behind this and why that
-        // is right: Cordial is the editor Android would have over the surface,
-        // so a paste is an insert on this path and not something the engine
-        // asks for. `paste_into_engine` reads the host selection through the
-        // same broker the copy direction uses.
-        if super::input::is_paste_shortcut(keysym, meta) {
-            if let Err(e) = super::clipboard::paste_into_engine(handle) {
-                super::trace(format_args!("wayland: clipboard paste failed: {e}"));
-            }
-            return;
-        }
-
         // `CORDIAL_NO_TEXT_BUFFER=1` sends key events only and never text.
         //
         // Cordial keeping a shadow copy of a field Roblox owns is a design
@@ -3922,6 +3909,41 @@ impl WaylandWindow {
         // is no longer the authority -- which is what the comment above wanted
         // and could not have until something else was willing to own it.
         if self.editor_owns_text() {
+            return;
+        }
+
+        // Ctrl+V, and **below the guard above rather than before it**.
+        //
+        // See `window.rs` for why there is no engine call behind this and why
+        // that is right: Cordial is the editor Android would have over the
+        // surface, so a paste is an insert on this path rather than something
+        // the engine asks for. `paste_into_engine` reads the host selection
+        // through the same broker the copy direction uses.
+        //
+        // **It used to sit forty lines higher, above every guard, and that was
+        // a bug of exactly the kind the guard's own comment describes.** GDK
+        // delivers Ctrl+V to the `gtk::Text` too, which pastes natively; this
+        // branch returned before `editor_owns_text` was ever consulted, so a
+        // paste ran twice — once by the widget and once by this path — while
+        // every ordinary character was correctly left to the widget alone.
+        // Worse than doubled text: `paste_into_engine` pumps the GLib main
+        // context for up to 400ms waiting on an async clipboard read, so the
+        // two insertions interleave in an order nothing here controls.
+        //
+        // Below the guard it is what it was meant to be: the paste
+        // implementation for the case where no widget owns the field.
+        //
+        // Note which cases those actually are, because the obvious guess is
+        // wrong. `CORDIAL_NO_TEXT_BUFFER` returns *above* the guard, so that
+        // switch now skips this too -- which is right, since it means "send
+        // key events only and never text" and a paste is text. What is left
+        // here is a Wayland session where the editor widget is not up, plus
+        // the X11 path, which has its own copy of this branch in `window.rs`
+        // and no editor widget at all (ADR-024).
+        if super::input::is_paste_shortcut(keysym, meta) {
+            if let Err(e) = super::clipboard::paste_into_engine(handle) {
+                super::trace(format_args!("wayland: clipboard paste failed: {e}"));
+            }
             return;
         }
 

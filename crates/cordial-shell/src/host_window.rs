@@ -650,6 +650,40 @@ impl HostWindow {
         // measured it.
         self.editor.set_visibility(!overlay.password);
 
+        // **And the purpose, which masking does not imply.** GTK's own
+        // documentation for `set_visibility` says so directly: "you probably
+        // want to set input-purpose to password or pin to inform input
+        // methods about the purpose of this widget, *in addition to* setting
+        // visibility to false."
+        //
+        // It matters because an input method decides what to offer from the
+        // purpose, not from whether glyphs are drawn. Left unset, a composing
+        // IME is entitled to show a candidate window containing what is being
+        // typed into a masked field, and to keep it in its own learning
+        // history. Neither is visible from this side, which is why the field
+        // looked fine without it.
+        //
+        // Set on both branches, not just the password one, because the same
+        // editor widget is reused for every box the engine focuses -- a
+        // password box followed by a chat box has to put this back.
+        self.editor.set_input_purpose(if overlay.password {
+            gtk::InputPurpose::Password
+        } else {
+            gtk::InputPurpose::FreeForm
+        });
+
+        // **There is deliberately no clipboard guard here, and that is not an
+        // oversight.** An audit reported that selecting a masked password and
+        // pressing Ctrl+C copies it in clear, which would be worth fixing and
+        // is not true: the same GTK documentation says the invisible char
+        // "will also appear that way when the text in the widget is copied to
+        // the clipboard". GTK masks the copy as well as the display.
+        //
+        // Written down because the fix for the claim is a one-liner that looks
+        // obviously correct -- disable `clipboard.copy` for password fields --
+        // and would cost a real password field its copy behaviour to defend
+        // against nothing.
+
         if self.editor.text() != overlay.text {
             self.editor_seeding.set(true);
             self.editor.set_text(overlay.text);

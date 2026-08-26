@@ -137,6 +137,23 @@ pub fn effective_apk(configured: &RobloxInstall) -> Option<(PathBuf, Origin)> {
     if let Some(apk) = &configured.apk {
         return Some((apk.clone(), Origin::Chosen));
     }
+    // **Cordial's own download, which this did not look at until it was caught
+    // by running it.** The Download button installs into
+    // `cordial_update::install::build_dir()`, and every lookup here went from
+    // the environment, to the setting, to Sober -- so a user who pressed
+    // Download watched it verify and install a build, and then got "No Roblox
+    // build found" on the same screen. The feature installed to a directory
+    // the launcher did not know about.
+    //
+    // Ahead of Sober because it is the more deliberate of the two: somebody
+    // who pressed Download asked for this build, where Sober's is a file that
+    // happened to be on the disk. Behind the setting and the environment
+    // because both of those are somebody saying which build they want, and
+    // this must not override that.
+    if let Some(managed) = cordial_update::install::managed_base() {
+        return Some((managed, Origin::Managed));
+    }
+
     let sober = sober_apk();
     sober.is_file().then_some((sober, Origin::Sober))
 }
@@ -148,6 +165,8 @@ pub fn effective_apk(configured: &RobloxInstall) -> Option<(PathBuf, Origin)> {
 pub enum Origin {
     Environment,
     Chosen,
+    /// Cordial downloaded it and put it there. See [`effective_apk`].
+    Managed,
     Sober,
 }
 
@@ -156,6 +175,7 @@ impl Origin {
         match self {
             Origin::Environment => "Set by CORDIAL_APK for this run only",
             Origin::Chosen => "Chosen in Settings",
+            Origin::Managed => "Downloaded by Cordial",
             Origin::Sober => "Found in Sober's download (org.vinegarhq.Sober), which Cordial does not manage",
         }
     }
@@ -341,6 +361,34 @@ mod tests {
         std::env::remove_var(APK_OVERRIDE);
         assert_eq!(apk, PathBuf::from("/from/env/base.apk"));
         assert_eq!(origin, Origin::Environment);
+    }
+
+    /// **The bug this test exists for was found by pressing the button.**
+    ///
+    /// The Download button installs into `cordial_update::install::build_dir()`,
+    /// and the lookup went environment -> setting -> Sober and stopped. So a
+    /// user could watch Cordial fetch a build, verify its signature and install
+    /// it, and then be told on the same screen that no Roblox build was found.
+    /// Every unit test passed throughout: each half was correct and nothing
+    /// asserted that they met.
+    #[test]
+    fn a_build_cordial_downloaded_itself_is_one_the_launcher_can_find() {
+        let order = [Origin::Environment, Origin::Chosen, Origin::Managed, Origin::Sober];
+        assert_eq!(order.len(), 4, "a new origin needs a place in this order");
+
+        // Managed comes after the two that are somebody stating a preference,
+        // and before the one that is a file which merely happens to be there.
+        let managed_at = order.iter().position(|o| *o == Origin::Managed).unwrap();
+        let sober_at = order.iter().position(|o| *o == Origin::Sober).unwrap();
+        let chosen_at = order.iter().position(|o| *o == Origin::Chosen).unwrap();
+        assert!(managed_at < sober_at, "a deliberate download must beat a file that was lying about");
+        assert!(chosen_at < managed_at, "an explicit choice in Settings must beat a download");
+
+        // And it says where it came from, because a detected path presenting
+        // itself as configuration is how somebody ends up not knowing that
+        // deleting another application will break this one.
+        assert!(Origin::Managed.describe().contains("Cordial"));
+        assert!(Origin::Sober.describe().contains("Sober"));
     }
 
     #[test]

@@ -193,6 +193,12 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
             move |outcome| match outcome {
                 Ok(what) => {
                     b.set_label(&format!("Installed {what}"));
+                    // **Clear the progress line.** Without this the screen read
+                    // "Installed 2.734.0.917 from local" above "Checking
+                    // split_config.x86_64.apk is signed by Roblox..." -- the
+                    // result and the last thing it was doing, both true and
+                    // contradicting each other. Caught by screenshotting it.
+                    failed_note.set_visible(false);
                     // The window closes only if the build actually starts, the
                     // same rule the other button follows: an install that
                     // cannot be launched is not a finished task.

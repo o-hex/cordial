@@ -173,7 +173,7 @@ endif()
 # `slCreateEngine` does.
 add_library(cordial_liblog STATIC
   liblog.cpp system_paths.cpp netdb_compat.cpp opensles.cpp pipewire_backend.cpp
-  pulse_backend.cpp alsa_backend.cpp aaudio.cpp thread_trace.cpp)
+  pulse_backend.cpp alsa_backend.cpp oss_backend.cpp aaudio.cpp thread_trace.cpp)
 # Compiled unconditionally, like every other file here: without the headers it
 # is its own honest "unavailable" arm, so the selector gets a truthful answer
 # rather than a link error. Only the define is conditional.
@@ -197,6 +197,32 @@ else()
                   "\"unavailable\" arm. Install alsa-lib-devel for it.")
 endif()
 
+# OSS, the fourth. Simpler than all three above -- no client library to find, no
+# server to talk to, just <sys/soundcard.h> and /dev/dsp -- so the only question
+# is whether the header exists. Nothing is linked and nothing is dlopen'd.
+#
+# ADR-023 deferred this on the grounds that Linux has not used OSS since ALSA
+# replaced it and the remaining users are on FreeBSD. Somebody asked for it, so
+# "nobody needs this" turned out to be a claim about who had spoken up. It is
+# opt-in behind CORDIAL_AUDIO_HOST=oss and is never selected for anybody who did
+# not ask -- which matters more here than for the others, because /dev/dsp is
+# exclusive on most drivers.
+#
+# This block must stay *after* `add_library(cordial_liblog ...)`. Put before it
+# once, and `target_include_directories` fails on a target that does not exist
+# yet -- which reads as a problem with OSS rather than with where the lines sit.
+find_path(OSS_INCLUDE_DIR sys/soundcard.h)
+if(OSS_INCLUDE_DIR AND NOT OSS_INCLUDE_DIR MATCHES "linuxbrew|Cellar|homebrew")
+  target_include_directories(cordial_liblog PRIVATE ${OSS_INCLUDE_DIR})
+  target_compile_definitions(cordial_liblog PRIVATE CORDIAL_HAVE_OSS=1)
+  message(STATUS "OSS backend: sys/soundcard.h at ${OSS_INCLUDE_DIR}. Selected with "
+                  "CORDIAL_AUDIO_HOST=oss. /dev/dsp is exclusive on most drivers, so "
+                  "nothing else on the machine gets sound while it is held.")
+else()
+  message(STATUS "OSS backend: no sys/soundcard.h; building the honest "
+                  "\"unavailable\" arm.")
+endif()
+
 if(PIPEWIRE_FOUND)
   target_include_directories(cordial_liblog PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
   target_compile_definitions(cordial_liblog PRIVATE CORDIAL_HAVE_PIPEWIRE=1)
@@ -213,7 +239,8 @@ if(PIPEWIRE_FOUND)
   # is the arm every machine without pulseaudio-libs-devel will run, and the one
   # a fallback bug would hide in.
   add_executable(cordial_pipewire_backend_test EXCLUDE_FROM_ALL
-    pipewire_backend.cpp pulse_backend.cpp alsa_backend.cpp pipewire_backend_test.cpp)
+    pipewire_backend.cpp pulse_backend.cpp alsa_backend.cpp oss_backend.cpp
+    pipewire_backend_test.cpp)
   target_include_directories(cordial_pipewire_backend_test PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
   target_compile_definitions(cordial_pipewire_backend_test PRIVATE CORDIAL_HAVE_PIPEWIRE=1)
   add_custom_command(TARGET cordial_pipewire_backend_test POST_BUILD

@@ -163,6 +163,63 @@ PipeWire with no indication that the sandbox was the reason. Anybody debugging
 ALSA under the Flatpak should be sent here in the first minute rather than the
 second hour.
 
+## OSS is built, and the reasoning that deferred it was about who had spoken up
+
+This document said OSS was "an answer to nothing" and scheduled it behind
+everything else, on the grounds that Linux has not used OSS as its sound layer
+since ALSA replaced it and the remaining users are on FreeBSD. The "what would
+change this" section below named the condition: somebody arriving who needs it.
+
+Somebody did, on 2026-08-26. So it exists, and the old reasoning stays above
+rather than being quietly deleted, because it turned out to be a claim about who
+had asked rather than about who was there.
+
+**It is the simplest backend here and the only one that works with no sound
+daemon at all.** No client library to find, no server to connect to, no node
+graph: `/dev/dsp`, three `ioctl`s to agree a format, then `write()`. PipeWire
+and PulseAudio both need something running and ALSA needs a configured `default`
+PCM, so this is the one that serves a machine with none of that.
+
+Three things about it are worth knowing before anybody selects it:
+
+- **The device is exclusive on most drivers.** While Cordial holds `/dev/dsp`,
+  nothing else on the machine gets sound. That is what the interface is, not a
+  bug to work around, and it is why this is opt-in behind
+  `CORDIAL_AUDIO_HOST=oss` and never chosen for anybody who did not ask.
+- **Even the probe takes the device**, briefly, for the same reason. It is
+  cached so it happens once.
+- **OSS speaks integer PCM.** The engine's float frames are converted to
+  `AFMT_S16_NE` on the way out, on the audio thread -- a multiply and a clamp
+  per sample, allocating nothing, per `pipewire_backend.h`'s realtime rule.
+
+The negotiated rate and channel count are read back out of the `ioctl`
+arguments rather than assumed, because OSS negotiates by writing through them:
+a driver that only does 44100 says so there and nowhere else, and reporting the
+requested rate instead is how a stream ends up playing at the wrong speed with
+nothing in the log.
+
+### What has not been verified
+
+**Playback.** This was written and tested on Fedora, which ships no OSS
+emulation and has no `/dev/dsp`, so `oss_available()` correctly answers no here
+and no audio has been produced through this path by anybody yet.
+
+What *is* verified on this machine: it compiles into the build, `find_path`
+detects `sys/soundcard.h`, `CORDIAL_AUDIO_HOST=oss` selects it, the probe
+reports honestly, and the fallback to PipeWire announces itself and names
+`CORDIAL_AUDIO_DEVICE` as the escape hatch:
+
+```text
+W/Cordial-Audio  CORDIAL_AUDIO_HOST=oss, but /dev/dsp would not open
+                 (set CORDIAL_AUDIO_DEVICE for another node); using pipewire.
+host_backend_name(): oss
+oss_available():     NO
+```
+
+Everything from `open()` onwards is **`INFERRED`** and labelled as such here
+rather than in a commit message nobody will find. The first person with a real
+OSS device is the test.
+
 ## What would change this
 
 A measurement showing PipeWire's ALSA plugin or `pipewire-pulse` failing for

@@ -1675,13 +1675,15 @@ const char* host_backend_name() {
             return "pulse";
         }
         if (std::strcmp(value, "alsa") == 0) return "alsa";
+        if (std::strcmp(value, "oss") == 0) return "oss";
         // Falls back rather than failing, and says so. ADR-023 schedules
         // PulseAudio and then ALSA behind this name; until one of them exists,
         // a run that asked for one should be told it did not get it rather
         // than left to infer it from silence.
         std::fprintf(stderr,
             "W/Cordial-Audio           CORDIAL_AUDIO_HOST=%s is not a backend this build has "
-            "(pipewire, pulse, alsa); using pipewire. See docs/adr/ADR-023-host-audio-backends.md.\n",
+            "(pipewire, pulse, alsa, oss); using pipewire. See "
+            "docs/adr/ADR-023-host-audio-backends.md.\n",
             value);
         return "pipewire";
     }();
@@ -1698,6 +1700,14 @@ std::unique_ptr<OutputStream> make_output_stream() {
     // a default that changed under them would be a change nobody asked for. The
     // people this exists for are on a machine where PipeWire is not there --
     // and they are the ones who will set the variable.
+    if (std::strcmp(host_backend_name(), "oss") == 0) {
+        if (oss_available()) {
+            if (auto stream = make_oss_stream()) return stream;
+        }
+        std::fprintf(stderr,
+            "W/Cordial-Audio           CORDIAL_AUDIO_HOST=oss, but /dev/dsp would not open "
+            "(set CORDIAL_AUDIO_DEVICE for another node); using pipewire.\n");
+    }
     if (std::strcmp(host_backend_name(), "alsa") == 0) {
         if (alsa_available()) {
             if (auto stream = make_alsa_stream()) return stream;

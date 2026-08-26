@@ -284,6 +284,17 @@ bool alsa_available();
 /// An ALSA stream, or null on a build without the headers.
 std::unique_ptr<OutputStream> make_alsa_stream();
 
+/// Whether `/dev/dsp` (or `CORDIAL_AUDIO_DEVICE`) can be opened for playback.
+///
+/// **The probe opens the device**, which on most OSS drivers is exclusive, so
+/// asking briefly takes sound from whatever holds it. Cached, and only reached
+/// when `CORDIAL_AUDIO_HOST=oss` names it -- see `oss_backend.cpp`.
+bool oss_available();
+
+/// An OSS output stream. `/dev/dsp` and three ioctls; no server, no library.
+/// The one backend that works on a machine running no sound daemon at all.
+std::unique_ptr<OutputStream> make_oss_stream();
+
 /// A stream on whichever host backend this run selected.
 ///
 /// Never null: a backend that cannot work returns an implementation whose

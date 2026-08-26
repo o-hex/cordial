@@ -80,10 +80,15 @@ stamp, cfg = "/tmp/cordial-freeze-display", "/tmp/cordial-freeze-sway.cfg"
 for f in (stamp, cfg):
     if os.path.exists(f):
         os.unlink(f)
+# `NOFOCUS=1` keeps the client's window from ever taking keyboard focus, which
+# is the user's own report: press Launch, do not click the new window, and it
+# freezes. sway's `no_focus` is the only way to reproduce that without a second
+# real window and a human not clicking it.
 open(cfg, "w").write(
     "xwayland disable\noutput HEADLESS-1 mode 1280x800\ndefault_border none\n"
     "focus_follows_mouse no\n"
-    "exec sh -c 'printf %%s \"$WAYLAND_DISPLAY\" > %s'\n" % stamp)
+    + ('no_focus [app_id="Cordial"]\n' if os.environ.get("NOFOCUS") == "1" else "")
+    + "exec sh -c 'printf %%s \"$WAYLAND_DISPLAY\" > %s'\n" % stamp)
 subprocess.Popen(["distrobox", "enter", "cordial", "--", "bash", "-lc",
   "exec env -u WAYLAND_DISPLAY -u DISPLAY WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 "
   "WLR_HEADLESS_OUTPUTS=1 sway -c %s > /tmp/cordial-freeze-sway.log 2>&1" % cfg],
@@ -169,6 +174,7 @@ STAMPER=$!
 env WAYLAND_DISPLAY=$DISP GDK_BACKEND=wayland CORDIAL_DEV_CONTROL=1 \
   ${CORDIAL_POLL_COALESCE_US:+CORDIAL_POLL_COALESCE_US=$CORDIAL_POLL_COALESCE_US} \
   ${CORDIAL_BRIDGE_DELAY_MS:+CORDIAL_BRIDGE_DELAY_MS=$CORDIAL_BRIDGE_DELAY_MS} \
+  ${CORDIAL_REPORT_FOCUS:+CORDIAL_REPORT_FOCUS=$CORDIAL_REPORT_FOCUS} \
   "$ROOT/target/release/cordial-run" --lib-dir "$LIB" --apk "$APK" --host-libc \
   --game-activity --run 0 --profile "$PROFILE" > "$STDOUT_FIFO" 2>&1 &
 CLIENT=$!

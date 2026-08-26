@@ -7,7 +7,18 @@
 //! swapping — settles it either way.
 //!
 //! These wrap the host's real functions and forward, so they cost a counter
-//! increment per call and change nothing else.
+//! increment and one relaxed atomic load per call and change nothing else.
+//!
+//! **That sentence used to say "a counter increment per call" and was wrong**,
+//! from the day it was written until 2026-08-26. The forwarding macro resolved
+//! the host function *inside* the wrapper body, so every wrapped call also
+//! allocated a `CString`, took glibc's global linker lock, walked the ELF link
+//! map and freed the string again. `glDrawElements` is wrapped. Counting is
+//! gated behind `CORDIAL_COUNT_GL`, so no shipped client ever paid it — but
+//! **anything timed with the counters on was timing the allocator and the
+//! loader too**, which makes this the exact failure this project keeps writing
+//! rules about: an instrument that changes what it measures, next to a comment
+//! saying it does not.
 
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,7 +48,10 @@ counters! {
     QUEUE_PRESENT         => "vkQueuePresentKHR",
 }
 
-/// The host implementation each wrapper forwards to, resolved once.
+/// The host implementation behind `sym`, looked up.
+///
+/// Called once per wrapped symbol now rather than once per call; see
+/// [`forward!`] for the cache and the module doc for what it cost before.
 fn host(sym: &str) -> *mut c_void {
     extern "C" {
         fn dlsym(handle: *mut c_void, symbol: *const std::ffi::c_char) -> *mut c_void;
@@ -61,9 +75,24 @@ macro_rules! forward {
         extern "C" fn wrapper($($a: *mut c_void),*) -> *mut c_void {
             $counter.fetch_add(1, Ordering::Relaxed);
             type Fn_ = extern "C" fn($(replace!($a)),*) -> *mut c_void;
+            // **Resolved once per symbol, not once per call.** Each expansion
+            // of this macro gets its own static, so the cache is per wrapped
+            // function with no map and no lock.
+            //
+            // Relaxed is enough and the race is benign: two threads that arrive
+            // together both resolve the same name to the same address and both
+            // store it. There is no state to publish alongside the pointer, so
+            // there is nothing for an acquire to order against.
+            static CACHED: std::sync::atomic::AtomicPtr<c_void> =
+                std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+            let mut target = CACHED.load(Ordering::Relaxed);
+            if target.is_null() {
+                target = host($sym);
+                CACHED.store(target, Ordering::Relaxed);
+            }
             // SAFETY: resolved from the host for exactly this name, and called
             // with the arguments the caller passed through unchanged.
-            let f: Fn_ = unsafe { std::mem::transmute(host($sym)) };
+            let f: Fn_ = unsafe { std::mem::transmute(target) };
             f($($a),*)
         }
         ($sym, wrapper as *const () as *mut c_void)

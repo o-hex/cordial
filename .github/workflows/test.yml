@@ -1,0 +1,54 @@
+# The 792 tests, on every push and pull request.
+#
+# **They ran nowhere before this.** `just test` runs them and CI did not, so the
+# only thing standing between a broken test and `main` was somebody remembering
+# — and this repository's own rule is that a check which only runs when asked
+# for is a check that has silently stopped running.
+#
+# Fedora 44 in a container rather than `ubuntu-latest`, and the version is not
+# incidental: the workspace pins gtk4 4.22 and libadwaita 1.9, Fedora 43 carries
+# 4.20.3 and 1.8.3, and Ubuntu 24.04 is older still. The failure when the
+# toolchain is too old is three `*-sys` build scripts dying with a pkg-config
+# hint that reads as a missing package rather than an old one, which is a bad
+# hour for whoever meets it first. `justfile`'s `build toolbox` recipe carries
+# the same list and the same reasoning.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install the toolchain
+        # `binutils` is not optional and not obvious: clang arrives without
+        # `ar`, and CMake's static-library step then fails with "Error running
+        # link command: no such file or directory", which names neither the
+        # tool nor the package.
+        #
+        # `webkitgtk6.0-devel` and `pulseaudio-libs-devel` are here so the
+        # optional features compile rather than silently taking their
+        # "unavailable" arms — the shape that made web views do nothing for
+        # months and audio do nothing before that.
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            git rust cargo clang cmake gcc-c++ binutils llvm lld \
+            pkgconf-pkg-config openssl-devel \
+            gtk4-devel libadwaita-devel webkitgtk6.0-devel \
+            pipewire-devel pulseaudio-libs-devel \
+            wayland-devel vulkan-loader-devel libxkbcommon-devel
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: cargo test --workspace
+        # Not `--all-features`: the `webview` feature is exercised separately
+        # below, because enabling only one crate's half leaves the caller
+        # cfg'd out and the linker collects the whole web view — the dead-code
+        # shape that hid this feature being absent for months.
+        run: cargo test --workspace
+      - name: cargo test with the web view
+        run: cargo test --workspace --features cordial-shell/webview,cordial-runtime/webview

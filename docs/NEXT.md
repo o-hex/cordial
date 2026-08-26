@@ -1,10 +1,21 @@
 # Where to start
 
-Cordial loads Roblox's engine on Vulkan, does HTTPS, takes mouse and keyboard,
-and reaches the logged-out landing page — on X11, confirmed by repeated
-screenshot. The Wayland backend now presents frames too (see §1a) — confirmed
-by Vulkan call counts matching X11's, not yet independently confirmed by
-screenshot. Neither is yet usable, because you cannot sign in.
+**You can sign in, and this paragraph said you could not for about a week after
+it stopped being true.** It is corrected here on 2026-08-26 rather than quietly
+edited, because "the sentence outlived the fix" is a failure this file warns
+about further down and had itself committed at the top.
+
+Cordial signs in — the Quick Sign-in code flow and typed credentials both,
+the second verified by composited screenshot on 2026-08-25 — reaches the Home
+page as a signed-in user, plays, takes mouse and keyboard, opens the
+in-experience web view with its JS bridge round-tripping, and puts sound out
+through PipeWire or PulseAudio. Wayland is the backend; X11 is supported again
+under [ADR-024](adr/ADR-024-x11-is-supported-again.md) but has no editor widget
+yet, so typing there is invisible.
+
+What is actually blocking is further down and is much narrower than "sign-in":
+a startup freeze on roughly a third of launches, and the canvas going black
+when a TextBox focuses inside an experience.
 
 This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been

@@ -108,7 +108,17 @@ SOCK="$HOME/.local/share/cordial/profiles/$PROFILE/devctl.sock"
 # Never `pkill -f`: the pattern matches the shell running it, and that has
 # killed the session issuing it five times in one day. `pidof` matches the
 # executable, which the engine's rename of its main thread does not touch.
-for p in $(pidof cordial-run 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
+# **Only this profile's clients, never every client on the machine.** This
+# used to kill every `cordial-run` there was, which is fine on an idle machine
+# and destroys somebody else's session on a shared one -- a developer playing
+# on another profile, or a live specimen of an intermittent bug. The profile
+# lock already stops two clients sharing a profile, so a stale one of ours is
+# all there can be to clear. `/proc/<pid>/cmdline` is NUL-separated, hence tr.
+for p in $(pidof cordial-run 2>/dev/null); do
+  if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- "--profile $PROFILE"; then
+    kill -9 "$p" 2>/dev/null
+  fi
+done
 distrobox enter cordial -- bash -lc 'for p in $(pidof sway); do kill -9 $p 2>/dev/null; done' >/dev/null 2>&1
 sleep 3
 
@@ -287,6 +297,43 @@ VERDICT=HEALTHY
 [ -z "$P10" ] && P10=0
 [ -z "$P25" ] && P25=0
 [ "$P10" = "$P25" ] && [ "$P25" -lt 10 ] && VERDICT=FROZEN
+
+# `CAPTURE=1` photographs a frozen client before it is killed. Off by default
+# because it costs a gdb attach on every frozen run and the survey's job is to
+# count them, not to explain one -- but at an 80% rate on a signed-in profile,
+# catching one alive is two launches away and this is where to do it.
+if [ "${CAPTURE:-0}" = "1" ] && [ "$VERDICT" = "FROZEN" ]; then
+  CAP="$OUT/capture-${TAG:-run}$RUN"
+  mkdir -p "$CAP"
+  # Every ALooper: owning thread, registered descriptor count, poll and event
+  # counts. This is what separates stuck from merely idle -- a backtrace shows
+  # epoll_wait either way, and fds=0 means nothing but a wake can ever make
+  # that poll return.
+  python3 -c "
+import socket
+s = socket.socket(socket.AF_UNIX); s.settimeout(10)
+try:
+    s.connect('$SOCK'); s.sendall(b'loopers\n')
+    buf=b''
+    while not buf.endswith(b'\n'):
+        c=s.recv(65536)
+        if not c: break
+        buf+=c
+    print(buf.decode(errors='replace').strip())
+except Exception as e:
+    print('err', e)
+" > "$CAP/loopers.txt" 2>&1
+  # **The CPU beside the stacks**, because a spinning pump and a blocked one
+  # produce identical backtraces and this is the reading everyone gets wrong.
+  ps -o %cpu=,rss=,stat= -p "$CLIENT" > "$CAP/cpu.txt" 2>&1
+  # gdb, not lldb: on a genuinely deadlocked client lldb produced one frame per
+  # thread, twice, and gdb walked the same process and named both halves.
+  PATH=/home/linuxbrew/.linuxbrew/bin:$PATH timeout 240 \
+    gdb -p "$CLIENT" -batch -ex 'thread apply all bt 16' > "$CAP/bt.txt" 2>&1
+  [ -n "$ELOG" ] && cp "$ELOG" "$CAP/engine.log" 2>/dev/null
+  cp "$LOG" "$CAP/stdout.log" 2>/dev/null
+  echo "captured a frozen client into $CAP" >&2
+fi
 
 kill -9 $CLIENT 2>/dev/null
 kill "${STAMPER:-0}" 2>/dev/null

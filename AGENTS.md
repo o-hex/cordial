@@ -229,6 +229,63 @@ and matching it is not optional.
 - Prefer correcting a stale comment over leaving it. A comment that lies costs
   more than no comment.
 
+## Documentation is part of the change, not after it
+
+**A user who has to ask in Discord is a documentation bug, and it is the kind
+this project keeps shipping.** On 2026-08-28 two people asked, an hour apart,
+where to find plugins and how to install one. Cordial had shipped a plugin
+system, an installer, a signature-checked registry format, a permission model
+and three working plugins -- and the README had no plugins section at all. The
+only writing on the subject was `plugins/README.md`, which is addressed to
+somebody authoring one.
+
+The same day, one of them guessed the archive was a `.tar.gz`. It is a
+`.tar.zst`, and nothing anywhere said so. They would have got a confusing
+failure from a reasonable guess.
+
+So:
+
+- **If a change makes a document wrong, fix it in the same change.** Not in a
+  follow-up, which is where documentation goes to not happen. The commit that
+  renamed the first-run button to "Download Roblox" left the README offering
+  "Download it for me" -- a control the user could not find, which is worse than
+  saying nothing.
+- **Document what exists, never what is planned.** A README describing an
+  unshipped feature costs a reader an evening and costs the project their
+  opinion of it. Where something genuinely does not exist, say so plainly:
+  "there is a registry format and no populated registry to point you at" is a
+  useful sentence and an honest one.
+- **Check the claim against the thing, not against your memory of it.** A guide
+  written here told users to `mkdir` and `tar --zstd -xf` when Settings has a
+  file picker that does it -- teaching the hard path as the real one. One look
+  at the settings window would have caught it.
+- **The same rule as comments, one level up.** `pipewire_backend.h` said the
+  audio backend was "announced at startup" when nothing announced anything, and
+  a user spent an evening unable to tell whether their setting had been read.
+  `android_classes.cpp` said the class had fourteen fields when the dex declares
+  fifteen. `NOTICE` promised a list of third-party software and gave one entry
+  of four, two of which are statically linked into every binary shipped.
+- **A commit message is documentation and inherits the rule about unobserved
+  results.** `35f38f9` listed "`CORDIAL_AUDIO_HOST=oss` selects it" among its
+  verified claims. It was true of the selector, measured by calling the selector
+  directly, and false of the client, where three gates meant the selector never
+  ran. That is the broken instrument this file opens with, in prose.
+
+Where the user-facing writing lives, and who it is for:
+
+| | For |
+|---|---|
+| `README.md` | Somebody deciding whether to install it, and then installing it |
+| `docs/plugin-api.md`, `plugins/README.md` | Somebody writing a plugin |
+| `docs/adr/` | Somebody about to contradict a decision |
+| `docs/analysis/`, `docs/NEXT.md` | Somebody continuing an investigation |
+| Release notes in `docs/releases/` | Somebody who just installed it and hit something |
+
+**Release notes say what is broken.** Every set here does, about a third of the
+way down, because somebody installing a client that freezes on a signed-in
+profile deserves to know before they meet it rather than after. A release note
+that only lists what was added is an advertisement.
+
 ## Build and test
 
 ```bash

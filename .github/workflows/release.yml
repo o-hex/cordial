@@ -365,17 +365,31 @@ jobs:
       - name: Attach them to the release
         env:
           GH_TOKEN: ${{ github.token }}
+          # **`gh` works out which repository it is acting on from the git
+          # checkout, and this job deliberately has none** -- it downloads
+          # artifacts and nothing else. Without this it found the four packages,
+          # printed them, and then died on "failed to run git: fatal: not a git
+          # repository". Naming the repository is cheaper than checking out a
+          # tree only so a tool can read its remote.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # Debug symbols are excluded, not forgotten. rpmbuild emits
+          # `-debuginfo` and `-debugsource` and makepkg emits `cordial-debug`,
+          # so an unfiltered find offers seven files -- and a release page where
+          # three of seven downloads are symbol packages makes somebody choose
+          # wrongly. They stay as workflow artifacts for anyone who needs them.
           mapfile -t files < <(find dist -type f \
               \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
-                 -o -name '*.pkg.tar.zst' \) | sort)
+                 -o -name '*.pkg.tar.zst' \) \
+              -not -name '*debuginfo*' -not -name '*debugsource*' \
+              -not -name '*-debug-*' | sort)
           # Named before uploading, because a release carrying three of four
           # packages is worse than one that fails: nobody notices the gap.
           printf 'attaching:\n'
           printf '  %s\n' "${files[@]}"
-          if [ "${#files[@]}" -lt 4 ]; then
-              echo "error: expected four packages, found ${#files[@]}" >&2
+          if [ "${#files[@]}" -ne 4 ]; then
+              echo "error: expected exactly four packages, found ${#files[@]}" >&2
               exit 1
           fi
           gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber

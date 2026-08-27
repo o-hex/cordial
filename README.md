@@ -617,6 +617,66 @@ questions are answered by the newest file in that directory.
 To check whether input is reaching the engine, run with
 `CORDIAL_ANDROID_TRACE=1` and look for `onTouchEventNative(...) -> true`.
 
+## Plugins
+
+**Three ship with Cordial and you already have them.** Open Settings and go to
+Plugins; they are listed there whether or not you have ever installed anything.
+
+| | What it does | On by default |
+|---|---|---|
+| **FPS Flex** | Takes the frame-rate cap off. Roblox's Android build asks for FIFO, which pins drawing to your display's refresh — right on a phone, wrong on a desktop with a faster panel. | **No** |
+| **Discord Presence** | Shows what you are playing on your Discord profile. | No |
+| **Flag Inspector** | Logs which FastFlags are in effect and where each came from. A diagnostic, not a feature. | No |
+
+FPS Flex ships switched off on purpose rather than out of caution: uncapping
+presentation makes your GPU draw frames nobody asked for, which on a laptop is
+heat and battery. Turning it on is one click and it takes effect next launch.
+
+Nothing runs until you enable it, and a plugin only gets the permissions you
+approve, per profile. Approving something in a profile you made to try it out
+does not approve it in the profile you actually play on.
+
+### Installing somebody else's plugin
+
+There is no plugin store, and this is the honest state of it: there is a
+registry format, signature checking and an installer, and no populated registry
+to point them at. Until there is, a plugin arrives as a directory or an archive
+and you put it in place yourself.
+
+**A plugin is a folder** containing `plugin.json` and its entry module. Drop it
+in:
+
+```
+~/.local/share/cordial/plugins/<plugin-id>/
+```
+
+so that `~/.local/share/cordial/plugins/some-plugin/plugin.json` exists. Restart
+Cordial and it appears in Settings → Plugins, switched off, with the permissions
+it is asking for listed. Nothing runs until you say so.
+
+**An archive is a `.tar.zst`**, not a `.tar.gz` — a tar of the plugin
+directory's *contents*, zstd-compressed. Zstd for ratio and speed; tar because
+zip's Unix mode bits are optional and a plugin that arrives without its execute
+bit is a confusing failure. If somebody hands you a `.tar.gz` it is not a
+Cordial plugin archive, whatever it contains.
+
+```bash
+mkdir -p ~/.local/share/cordial/plugins/some-plugin
+tar --zstd -xf some-plugin.tar.zst -C ~/.local/share/cordial/plugins/some-plugin
+```
+
+Flatpak users want `~/.var/app/io.github.luohoa97.Cordial/data/plugins/`
+instead, since that is where the sandbox's data directory lives.
+
+**Trust the source.** A plugin runs as a real process on your machine. Cordial
+gives it no ambient permissions — no file access, no network, no environment, no
+subprocess, and every capability it uses is one you approved by name — but that
+is a boundary, not a guarantee about intent, and installing something because a
+stranger linked it is the same decision it is anywhere else.
+
+Writing one is [`plugins/README.md`](plugins/README.md), and the capability
+model is [ADR-007](docs/adr/ADR-007-host-resources-are-brokered.md).
+
 ## Discord Rich Presence
 
 Cordial ships a Discord Rich Presence plugin, in

@@ -45,3 +45,35 @@ the protocol expects.
 
 Any Cordial file derived from these carries its origin in its own header, per
 Apache-2.0 section 4(b).
+
+## Nothing here is compiled
+
+**No build script references these files and no binary contains them.** They are
+the reference for code that was derived from them, which lives in Rust:
+
+    crates/cordial-shell/src/webview.rs          the window
+    crates/cordial-shell/src/webview_policy.rs   the security rules, theirs
+    crates/cordial-runtime/src/webview.rs        the cookie handling
+
+Each of those states its own origin in its header, which is where Apache-2.0
+section 4(b) is actually satisfied -- a NOTICE at the repository root is not
+where somebody reading a source file looks.
+
+**The licence does not require this copy to exist.** Apache-2.0 asks for a copy
+of the licence, notice that files were changed, retained attribution, and the
+NOTICE file. It does not ask you to vendor the original. This is kept as the
+provenance trail, deliberately, for two reasons:
+
+It is what makes "derived how, and from what" checkable by somebody who was not
+there. This project's whole practice is checking a claim against a reference
+rather than against a memory of one.
+
+And one argument in the derived code reasons from what is *absent* here.
+`crates/cordial-runtime/src/webview.rs` sets its own bound on a
+`.ROBLOSECURITY` cookie precisely because `webview_roblox_cookie.h` is not among
+the vendored files, so their equivalent constant cannot be read and only their
+reasoning transfers. Delete this directory and that becomes a magic number with
+a citation pointing at nothing.
+
+Its presence has been mistaken for a dependency at least once, which is why this
+section exists.

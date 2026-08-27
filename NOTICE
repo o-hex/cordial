@@ -9,6 +9,42 @@ GPL-3.0, so Apache-licensed work may be incorporated here; the reverse is not
 true, and nothing in this repository may be taken back the other way.
 
 -------------------------------------------------------------------------------
+mcpelauncher-linker
+Copyright (c) 2024 ChristopherHX and MCMrARM
+Licensed under the MIT License.
+https://github.com/minecraft-linux/mcpelauncher-linker
+
+third_party/mcpelauncher-linker/ is the ported AOSP bionic linker Cordial loads
+libroblox.so with. crates/cordial-linker-sys/build.rs compiles bionic/linker and
+bionic/libdl from it, so it is statically linked into every binary shipped here
+and nothing loads without it. The MIT text is kept beside it at
+third_party/mcpelauncher-linker/LICENSE.
+
+Local changes are not committed into the submodule, which belongs to somebody
+else and has nowhere to push. They live as patches in third_party/patches/ with
+a README saying what each one is for.
+-------------------------------------------------------------------------------
+libjnivm
+Copyright (c) 2019 ChristopherHX
+Licensed under the MIT License.
+https://github.com/ChristopherHX/libjnivm
+
+third_party/libjnivm/ stands in for Android's ART: it answers the JNI calls
+libroblox.so makes into what it believes is a Java VM. Statically linked
+(cargo:rustc-link-lib=static=jnivm). The MIT text is at
+third_party/libjnivm/LICENSE.
+-------------------------------------------------------------------------------
+libbadcpu
+Copyright (c) 2026 Sober OSS Contributors
+Licensed under the MIT License.
+
+third_party/libbadcpu/ is vendored and its licence is installed by the
+packaging. No build reference to it was found when this entry was written, so
+whether it reaches a shipped binary is UNVERIFIED -- it is listed here because
+under-listing is the failure this entry exists to fix, and listing something
+that turns out not to ship costs nothing. The MIT text is at
+third_party/libbadcpu/LICENSE.upstream.
+-------------------------------------------------------------------------------
 mocktail
 Copyright 2026 komaruworld
 Licensed under the Apache License, Version 2.0.

@@ -113,12 +113,21 @@ build where="host":
         #     gtk4-devel libadwaita-devel webkitgtk6.0-devel pipewire-devel \
         #     clang cmake gcc-c++ pkgconf-pkg-config openssl-devel \
         #     wayland-devel vulkan-loader-devel libxkbcommon-devel \
-        #     binutils llvm lld
+        #     binutils llvm lld librsvg2-tools patchelf
         #
         # binutils is not optional and not obvious: clang arrives without `ar`,
         # and CMake's static-library step then fails with "Error running link
         # command: no such file or directory", which names neither the tool nor
         # the package.
+        #
+        # The last two are for packaging/appimage/build-appimage.sh rather than
+        # for `just build`, and were added on 2026-08-27 when the first attempt
+        # to run that script in this container stopped at `rsvg-convert is not
+        # installed`. patchelf matters more than it looks: linuxdeploy carries
+        # its own copy from 2022, which relocates .init without updating
+        # DT_INIT on any library with a .relr.dyn section -- every Fedora 44
+        # one -- and the AppImage then dies in the dynamic loader before main
+        # with nothing printed.
         box="${CORDIAL_TOOLBOX:-cordial}"
         if ! distrobox list 2>/dev/null | grep "| $box " >/dev/null; then
             echo "no container called '$box' (set CORDIAL_TOOLBOX to pick another)" >&2

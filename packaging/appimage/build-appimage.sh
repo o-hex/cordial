@@ -10,11 +10,17 @@
 # processes (WebKitWebProcess, WebKitNetworkProcess) are separate executables
 # it spawns rather than links, and GSettings schemas are found by path rather
 # than by symbol. Both are handled below by hand rather than by the bundler,
-# and neither has been exercised on a second machine -- see AppRun's own
-# comment on WEBKIT_EXEC_PATH, which is the single most likely thing to need
-# a follow-up fix once someone runs the result outside this build's own
-# container. Say so in any report of this rather than claiming the AppImage
-# works; nobody has launched one yet.
+# and one of them does not work.
+#
+# This paragraph used to end "nobody has launched one yet". Somebody has, on
+# 2026-08-27: the shell starts and draws on Fedora 44 (Bluefin, GNOME,
+# Wayland), first-run window, profile row, Roblox button. The schema handling
+# below survived that; WEBKIT_EXEC_PATH did not, and AppRun's comment on it
+# carries the measurement. **The web view does not travel** -- WebKitGTK 2.52
+# ignores that variable and spawns its helpers by absolute path, so on a host
+# with no webkitgtk6.0 installed the sign-in window comes up blank. Still
+# unexercised: any machine that is not this one, and any distro that is not
+# Fedora. Say which of those three states a report is about.
 #
 # Built inside registry.fedoraproject.org/fedora:44 -- the one environment
 # this repository has proven builds gtk4 4.22/libadwaita 1.9 correctly
@@ -28,8 +34,10 @@
 # Needs: cargo, clang/clang++, cmake, pkg-config, the GTK4/libadwaita/
 # WebKitGTK development headers, rsvg-convert (for the AppDir's PNG icon --
 # AppImage integration tooling looks for one at the AppDir root even though
-# Cordial's own icon is scalable SVG everywhere else), and network access to
-# fetch linuxdeploy and appimagetool on first use.
+# Cordial's own icon is scalable SVG everywhere else), patchelf (the host's,
+# not linuxdeploy's -- see the NO_STRIP/PATCHELF block below for what its
+# bundled 0.15 does to a library with a .relr.dyn section), and network access
+# to fetch linuxdeploy and appimagetool on first use.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -52,11 +60,19 @@ need() {
         exit 1
     }
 }
-for tool in cargo clang rsvg-convert readelf glib-compile-schemas; do
+for tool in cargo clang rsvg-convert readelf glib-compile-schemas patchelf; do
     need "$tool"
 done
 
-tools_dir="${CORDIAL_APPIMAGE_TOOLS_DIR:-$repo/target/appimage-tools}"
+# Where cargo will actually put the binaries. This used to be spelled `target/`
+# at every use, which is right only when nothing exported CARGO_TARGET_DIR --
+# and CLAUDE.md tells every agent working in a worktree to export one, because
+# two builds sharing a target/ once produced two rlibs neither of which held a
+# symbol plainly in the source. With one exported, cargo wrote into it and the
+# very next line here read `target/release/cordial-run`, which did not exist.
+target_dir="${CARGO_TARGET_DIR:-$repo/target}"
+
+tools_dir="${CORDIAL_APPIMAGE_TOOLS_DIR:-$target_dir/appimage-tools}"
 mkdir -p "$tools_dir"
 
 fetch_pinned() {
@@ -92,6 +108,28 @@ fetch_pinned \
 # variable mocktail's own packages.yml sets around the equivalent step.
 export APPIMAGE_EXTRACT_AND_RUN=1
 
+# linuxdeploy carries its own binutils from 2020 and its own patchelf from
+# 2022, and Fedora 44 emits a `.relr.dyn` (SHT_RELR, type 0x13) section in
+# every system library. Neither bundled tool knows that section type, and both
+# fail in a way that reads as something else entirely:
+#
+#   strip 2.35    -- "unknown type [0x13] section `.relr.dyn'" on 167 of the
+#                    bundled libraries, and linuxdeploy exits 1 on the first.
+#   patchelf 0.15 -- succeeds, and relocates .init to the end of the file
+#                    without updating DT_INIT. 161 of 165 bundled .so files
+#                    came out with DT_INIT still naming the old address; the
+#                    loader called libcbor's at base+0x2cc, which is now the
+#                    ELF header, and the AppImage took SIGSEGV in call_init
+#                    before main. Nothing printed. It looked like a crash in
+#                    Cordial.
+#
+# NO_STRIP costs some size and nothing else -- Fedora's libraries are already
+# stripped, their debug info lives in separate debuginfo packages. $PATCHELF is
+# linuxdeploy's own override; the host's patchelf 0.18 leaves .init at 0x2cc
+# and DT_INIT agreeing with it, checked on the same libcbor both ways.
+export NO_STRIP=1
+export PATCHELF="${PATCHELF:-$(command -v patchelf)}"
+
 export CC=clang CXX=clang++
 export CORDIAL_BUILD_VERSION="$CORDIAL_DESCRIBE"
 
@@ -104,17 +142,17 @@ export CORDIAL_BUILD_VERSION="$CORDIAL_DESCRIBE"
 cargo build --release --locked \
     --features cordial-shell/webview,cordial-runtime/webview
 
-readelf -d target/release/cordial-run | grep -qi webkit || {
+readelf -d "$target_dir/release/cordial-run" | grep -qi webkit || {
     echo "cordial-run linked no WebKitGTK; the webview features did not take" >&2
     exit 1
 }
 
-appdir="$repo/target/appimage/AppDir"
+appdir="$target_dir/appimage/AppDir"
 rm -rf "$appdir"
 mkdir -p "$appdir"
 
-install -Dm755 target/release/cordial-shell "$appdir/usr/bin/cordial-shell"
-install -Dm755 target/release/cordial-run   "$appdir/usr/bin/cordial-run"
+install -Dm755 "$target_dir/release/cordial-shell" "$appdir/usr/bin/cordial-shell"
+install -Dm755 "$target_dir/release/cordial-run"   "$appdir/usr/bin/cordial-run"
 
 install -Dm644 packaging/io.github.luohoa97.Cordial.desktop \
     "$appdir/usr/share/applications/io.github.luohoa97.Cordial.desktop"
@@ -196,6 +234,21 @@ echo "==> bundling the WebKitGTK helper binaries themselves"
 # ProcessLauncher expects to find them. Put the actual helper tree at
 # usr/libexec/webkitgtk-6.0, which is what AppRun's WEBKIT_EXEC_PATH points
 # WebKitGTK back at.
+#
+# **And WebKitGTK does not read WEBKIT_EXEC_PATH, so this directory is at
+# present dead weight.** Measured on 2026-08-27 against webkitgtk6.0-2.52.5:
+# the string does not occur in libwebkitgtk-6.0.so.4, in
+# libjavascriptcoregtk-6.0.so.1, or in any of the three helper binaries, while
+# WEBKIT_INJECTED_BUNDLE_PATH and thirty other WEBKIT_* names do -- and with
+# the variable exported at this very path, MiniBrowser out of the built AppDir
+# spawned /usr/libexec/webkitgtk-6.0/WebKitWebProcess, the *host's* copy
+# (readlink /proc/PID/exe). Hide that host directory behind an empty tmpfs and
+# the same run dies with `Failed to spawn child process
+# "/usr/libexec/webkitgtk-6.0/WebKitNetworkProcess" (No such file or
+# directory)`, where the identical bwrap namespace without the tmpfs runs fine.
+# Leave the copies here anyway: they cost 0.5 MB, they are what any future
+# override would have to point at, and removing them would make the gap harder
+# to find rather than smaller. See AppRun for what still has to be solved.
 install -d "$appdir/usr/libexec/webkitgtk-6.0"
 find "$webkit_libexec" -maxdepth 1 -type f -executable -exec \
     install -m755 {} "$appdir/usr/libexec/webkitgtk-6.0/" \;
@@ -234,6 +287,14 @@ chmod +x "$outfile"
 ls -lh "$outfile"
 echo "built: $outfile"
 echo
-echo "UNVERIFIED: this AppImage has not been launched on a second machine."
-echo "See AppRun's comment on WEBKIT_EXEC_PATH before trusting the web view"
-echo "works, and test on a distro other than Fedora before calling this done."
+echo "The shell starts and draws: launched on Fedora 44 (Bluefin, GNOME,"
+echo "Wayland) on 2026-08-27, first-run window titled with CORDIAL_DESCRIBE,"
+echo "profile row and Roblox button, as a wl_surface with the right app id."
+echo
+echo "The WEB VIEW DOES NOT TRAVEL. WebKitGTK 2.52 ignores WEBKIT_EXEC_PATH"
+echo "and spawns /usr/libexec/webkitgtk-6.0/WebKitNetworkProcess by absolute"
+echo "path, so on a host with no webkitgtk6.0 installed the sign-in window has"
+echo "no process to run in -- which is most of the point of shipping an"
+echo "AppImage. /usr/bin/bwrap, /usr/bin/xdg-dbus-proxy and the injected bundle"
+echo "under /usr/lib64/webkitgtk-6.0 are hardcoded the same way and are not"
+echo "bundled either. Do not offer this to users as a working web view."

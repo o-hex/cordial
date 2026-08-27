@@ -38,16 +38,45 @@ export XDG_DATA_DIRS="${APPDIR}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr
 # and this is WebKitGTK's own override for where to look instead of the
 # compiled-in path.
 #
-# INFERRED, and the highest-risk line in this file. It has not been run: there
-# was no second machine available to launch a built AppImage on that was not
-# already carrying the frame-rate measurement this packaging work was asked
-# not to disturb, and AGENTS.md's rule is to say that plainly rather than
-# imply a result. If a build made from this script opens a blank web view, or
-# WebKitWebProcess fails to spawn at all, this is the first thing to check --
-# confirm the exported path actually holds the helper binaries
-# (readlink -f "$WEBKIT_EXEC_PATH"/WebKit*Process), and if WebKitGTK does not
-# honour this variable on the version this bundles, its ProcessLauncher source
-# is the next place to look for whichever override it does read.
+# This was INFERRED and it is wrong. Measured 2026-08-27 against the
+# webkitgtk6.0-2.52.5 this bundles, on Fedora 44:
+#
+#   - The string WEBKIT_EXEC_PATH does not occur anywhere in
+#     libwebkitgtk-6.0.so.4, libjavascriptcoregtk-6.0.so.1, or the three
+#     helper binaries. Thirty-odd other WEBKIT_* variable names do, including
+#     WEBKIT_INJECTED_BUNDLE_PATH, so this is not an artefact of how the
+#     strings were read. Upstream gates the lookup on ENABLE(DEVELOPER_MODE)
+#     and distributions build with it off -- INFERRED, but it fits.
+#   - With this variable exported at exactly this path, MiniBrowser out of the
+#     built AppDir spawned /usr/libexec/webkitgtk-6.0/WebKitWebProcess: the
+#     *host's* binary, read straight off readlink /proc/PID/exe. It then
+#     loaded the AppImage's own libwebkitgtk into the host's executable, which
+#     is only survivable because both are 2.52.5 here.
+#   - Replace that host directory with an empty tmpfs under bwrap -- which is
+#     what a machine that never installed webkitgtk6.0 looks like -- and the
+#     same run aborts in under a tenth of a second with `Failed to spawn child
+#     process "/usr/libexec/webkitgtk-6.0/WebKitNetworkProcess" (No such file
+#     or directory)`. The control, the identical bwrap namespace with the
+#     directory still visible, ran for the full 25 s without complaint.
+#
+# So the export below is inert and the AppImage's web view works only on hosts
+# that already have WebKitGTK 6.0 installed at the distribution's own path.
+# **The symptom on a host without it is a blank sign-in window** -- the shell
+# starts, draws, and opens a web view with nothing in it, because the process
+# that would have rendered the page could not be spawned. Whether cordial-shell
+# survives that or dies the way MiniBrowser did above is not established; the
+# probe was MiniBrowser, not the shell. Either way: do not read a blank sign-in
+# as a Roblox problem, a network problem, or the URL policy refusing something.
+# Two more absolute paths are compiled into that library the same way and are
+# not bundled either: /usr/bin/bwrap and /usr/bin/xdg-dbus-proxy for its
+# sandbox, and the injected bundle, which the probe above loaded from
+# /usr/lib64/webkitgtk-6.0/injected-bundle. WEBKIT_INJECTED_BUNDLE_PATH would
+# move the last of those; nothing moves the first two.
+#
+# It is kept rather than deleted because it costs nothing, it is what any real
+# fix would have to redirect, and a deleted line takes the finding with it. A
+# real fix is a mount namespace over /usr/libexec/webkitgtk-6.0, or a WebKit
+# built for this, and neither has been tried here.
 export WEBKIT_EXEC_PATH="${APPDIR}/usr/libexec/webkitgtk-6.0"
 
 exec "${APPDIR}/usr/bin/cordial-shell" "$@"

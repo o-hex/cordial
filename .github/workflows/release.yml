@@ -163,11 +163,6 @@ jobs:
           name: cordial-appimage
           path: dist/appimage/*.AppImage
           if-no-files-found: error
-      - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" dist/appimage/*.AppImage --clobber
 
   deb:
     # **Not the LTS, and it cannot be.** `crates/cordial-shell/Cargo.toml` takes
@@ -239,11 +234,6 @@ jobs:
           name: cordial-deb
           path: dist/deb/*.deb
           if-no-files-found: error
-      - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" dist/deb/*.deb --clobber
 
   rpm:
     name: .rpm (Fedora 44)
@@ -286,14 +276,6 @@ jobs:
           name: cordial-rpm
           path: dist/rpm/**/*.rpm
           if-no-files-found: error
-      - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          shopt -s globstar
-          gh release upload "$GITHUB_REF_NAME" dist/rpm/**/*.rpm --clobber
 
   arch:
     name: Arch package (archlinux:base-devel)
@@ -354,16 +336,46 @@ jobs:
             dist/arch/*.pkg.tar.zst
             packaging/aur/cordial/PKGBUILD
           if-no-files-found: error
-      - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/v')
+
+  publish:
+    name: Attach to the release
+    # **On the runner, not in a container, and that is the whole point.** Each of
+    # the four build jobs used to end with its own `gh release upload`, inside
+    # the distro container it built in -- and a stock fedora, ubuntu or
+    # archlinux image has no `gh`, so the step failed with command-not-found on
+    # every tag while the job around it went green, because the artifact upload
+    # had already succeeded. v0.8.0, v0.9.0 and v0.10.0 all published a Flatpak
+    # bundle and no native packages for that reason, and the workflow reported
+    # success each time.
+    #
+    # Doing it once here is also one place to get right rather than four copies
+    # to keep in step, and the artifacts are already in hand: every build job
+    # uploads one with `if-no-files-found: error`.
+    needs: [appimage, deb, rpm, arch]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Collect every built package
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Attach them to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # The PKGBUILD itself travels alongside the compiled package: it is
-          # what packaging/aur/PUBLISHING.md points a maintainer at to submit
-          # to the AUR later, and it is small enough that shipping it costs
-          # nothing.
-          cp packaging/aur/cordial/PKGBUILD "dist/arch/cordial-${GITHUB_REF_NAME#v}.PKGBUILD"
-          gh release upload "$GITHUB_REF_NAME" dist/arch/*.pkg.tar.zst \
-            "dist/arch/cordial-${GITHUB_REF_NAME#v}.PKGBUILD" --clobber
+          mapfile -t files < <(find dist -type f \
+              \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
+                 -o -name '*.pkg.tar.zst' \) | sort)
+          # Named before uploading, because a release carrying three of four
+          # packages is worse than one that fails: nobody notices the gap.
+          printf 'attaching:\n'
+          printf '  %s\n' "${files[@]}"
+          if [ "${#files[@]}" -lt 4 ]; then
+              echo "error: expected four packages, found ${#files[@]}" >&2
+              exit 1
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber

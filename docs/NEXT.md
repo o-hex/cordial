@@ -21,6 +21,48 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## The plugin surface has two hosts, and the tests are on the wrong one, 2026-08-28
+
+**Anything you verify against `crates/cordial-plugins/src/host.rs` says nothing
+about what a user gets.** That file holds `Session`, `Plugin` and `Pump` -- a
+complete plugin host with a bounded per-plugin queue, drop counting, core-event
+publication and a shutdown flush. `Session::new` is called in exactly two
+places, both of them tests in that crate: `tests/events_integration.rs:28` and
+`tests/discord_presence_plugin.rs:84`. The host `cordial-run` runs is
+`crates/cordial-runtime/src/plugin_host.rs`, and it is a different dispatcher.
+
+This was found by a documentation pass that read every handler rather than
+trusting the nearest comment, and it had already cost something. Two of the
+three shipped plugins did nothing:
+
+- **`fps-flex` called two methods that do not exist in that shape**:
+  `settings.read` (a capability name; the method is `settings.get`) and
+  `flags.set` with `{key, value}` where the handler requires `{values: {...}}`.
+  Both refused, neither status checked, `CordialPresentMode` never written on
+  any machine. Fixed in `45f90de`, with
+  `crates/cordial-plugins/tests/plugin_call_shapes.rs` as the guard: it reads
+  the shipped plugins as text and fails all four of its checks on the version
+  that shipped.
+- **`discord-presence` is correct and still receives nothing**, because the
+  client publishes no core events at all. `Session::publish_core` is the only
+  producer of a `cordial/...` push, and nothing outside cordial-plugins'
+  own tests constructs a `Session`. So `lifecycle.subscribe` answers Ok, the
+  plugin waits, and no `cordial/client.launch` ever arrives. ADR-026 describes
+  a bus that is real in one crate and absent from the client.
+
+The general lesson is the one AGENTS.md already records about
+`CORDIAL_AUDIO_HOST=oss`, which was measured by calling the selector directly
+and was false in the client because three gates meant the selector never ran.
+**A green test suite is evidence about whatever it called.** Before believing a
+plugin-surface claim, check which host the test drove -- and prefer a client run
+with the plugin enabled, which is the only instrument that answers the question
+a user is asking.
+
+What is worth doing about the structural half: either the runtime host should
+use cordial-plugins' pieces rather than reimplementing them, or the pieces it
+does not use should go. Two dispatchers that answer the same method names
+differently will drift again, and the drift is invisible from either side.
+
 ## Text entry: where the editor goes, 2026-08-25
 
 **Solved and verified.** A focused Roblox TextBox gets an editor drawn on the

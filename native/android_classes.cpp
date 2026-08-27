@@ -112,6 +112,14 @@
 /// word of that is INFERRED; what is observed is only that 10 and 11 are the
 /// ints that vary between two boxes and the other four do not.
 ///
+/// **Nothing on this side picks between them, and nothing should.** The Rust
+/// editor reads the font id out of whichever of 6, 7, 9, 10 and 11
+/// `CORDIAL_TEXTBOX_FONT_SLOT` names, defaulting to 9 — see `font_slot` in
+/// `crates/cordial-runtime/src/android/editor_font.rs`, which carries the
+/// argument for the default and the reasons it is weak. Compiling the guess in
+/// would have made the one capture that settles it cost a rebuild, and the
+/// capture needs a person in a game that restyled a box, not a change here.
+///
 /// Slot 12 is not multiline. Both boxes are single-line login fields and both
 /// report 1 there, so multiline is slot 5 or slot 13. Which, and which of the
 /// remaining two is textWrapped and which manualFocusRelease, wants a box that
@@ -155,14 +163,21 @@ std::atomic<unsigned> g_textbox_generation{0};
 /// Every slot, named where a name has been earned and numbered where it has
 /// not. `textColor` is printed in hex because that is the form in which it
 /// identified itself as a colour at all.
+///
+/// **`z14` was missing from this line until 2026-08-27**, so the fifteenth
+/// slot — the one whose absence originally made the whole `<init>` hook fail to
+/// match — was invisible in every capture this project holds. A trace that
+/// silently drops a field is worse than no trace of it: three of the four
+/// booleans were being argued about from a log that only ever showed two.
 void trace_textbox_info(const char* source, const CordialTextBoxInfo& i) {
     fprintf(stderr,
             "[cordial] textbox spec from %s x=%g y=%g w=%g h=%g fontSize=%g "
-            "z5=%d i6=%d i7=%d textColor=%#x i9=%d i10=%d i11=%d z12=%d z13=%d\n",
+            "z5=%d i6=%d i7=%d textColor=%#x i9=%d i10=%d i11=%d z12=%d z13=%d z14=%d\n",
             source, static_cast<double>(i.x), static_cast<double>(i.y),
             static_cast<double>(i.width), static_cast<double>(i.height),
             static_cast<double>(i.font_size), i.z5, i.i6, i.i7,
-            static_cast<unsigned>(i.text_color), i.i9, i.i10, i.i11, i.z12, i.z13);
+            static_cast<unsigned>(i.text_color), i.i9, i.i10, i.i11, i.z12, i.z13,
+            i.z14);
 }
 } // namespace
 

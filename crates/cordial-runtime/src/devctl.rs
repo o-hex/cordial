@@ -326,13 +326,49 @@ fn textbox_line() -> String {
         .map(|(x, y, w, h, src)| format!(" x={x} y={y} w={w} h={h} placed={src}"))
         .unwrap_or_else(|| " x=none y=none w=none h=none placed=none".into());
     format!(
-        "ok focus={} gen={} rev={} chars={} bytes={} caret={caret}{geometry} text={}",
+        "ok focus={} gen={} rev={} chars={} bytes={} caret={caret}{geometry}{} text={}",
         focus.map(|h| h.to_string()).unwrap_or_else(|| "none".into()),
         cordial_linker_sys::game_activity::textbox_generation(),
         crate::android::input::text_buffer_revision(),
         text.chars().count(),
         text.len(),
+        textbox_font_fields(),
         crate::android::input::redacted(&text),
+    )
+}
+
+/// The focused box's five candidate font slots and the family they resolved to.
+///
+/// **This is the experiment, made into one call.** Which constructor slot of
+/// `NativeTextBoxInfo` carries the font id is not established -- the only
+/// capture this project holds is of two Login-screen boxes where four of the
+/// five ints never varied -- and settling it means a person focusing a TextBox
+/// in a game that restyled its font and reading which int moved. Before this,
+/// that meant launching under `CORDIAL_TRACE_TEXT=1` and grepping the client's
+/// stderr while playing; now it is `cordial_textbox` twice, once on a restyled
+/// box and once on a default one as the control.
+///
+/// Nothing here is sensitive, so unlike the text there is no switch on it: an
+/// alignment, an input type and a font id say nothing about what was typed.
+fn textbox_font_fields() -> String {
+    let Some(info) = cordial_linker_sys::game_activity::focused_textbox_info() else {
+        return String::new();
+    };
+    let resolved = match crate::android::editor_font::font_id(&info) {
+        Some(id) => match crate::android::editor_font::face_for_id(id) {
+            Some(face) => format!(" fontId={id} family={:?} weight={}", face.family, face.weight),
+            // Said rather than smoothed over: an id with no row is what a
+            // marketplace font looks like from here, and the number is the
+            // whole of what a bug report has to go on.
+            None => format!(" fontId={id} family=unresolved"),
+        },
+        None => " fontId=off family=unresolved".to_owned(),
+    };
+    let slot = crate::android::editor_font::font_slot()
+        .map_or_else(|| "off".to_owned(), |s| s.to_string());
+    format!(
+        " i6={} i7={} i9={} i10={} i11={} fontSlot={slot}{resolved}",
+        info.i6, info.i7, info.i9, info.i10, info.i11
     )
 }
 

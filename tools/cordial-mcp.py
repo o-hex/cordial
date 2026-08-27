@@ -276,7 +276,14 @@ TOOLS = [
             "cannot see a GTK widget at all. The text itself is withheld unless "
             "CORDIAL_TRACE_TEXT_SHOW_PASSWORDS is set on the client, because a focused "
             "field is as often a password box as a search bar; the character count is not, "
-            "and it is what catches a key being inserted twice."
+            "and it is what catches a key being inserted twice. "
+            "It also reports the five constructor slots that might carry the box's font id "
+            "(i6 i7 i9 i10 i11), which of them Cordial is reading (fontSlot), and the font "
+            "family that resolved out of it. Which slot really carries the id is not "
+            "established -- every capture this project holds was taken on the login screen, "
+            "where four of the five never varied -- so focusing a TextBox in a game that "
+            "restyled its font and reading this twice, once there and once on a default box, "
+            "is the whole experiment that settles it."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },

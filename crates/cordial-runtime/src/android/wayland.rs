@@ -2176,16 +2176,62 @@ impl WaylandWindow {
         drop(cache);
         *LAST_EDITOR_RECT.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((info.x, info.y, info.width, info.height, placed.token()));
+        // **Which font this box is in, if the engine named one.**
+        //
+        // A synthesised spec is skipped rather than read: `fallback_textbox_info`
+        // leaves every int at zero, and zero is a value the shipped table has no
+        // row for. Reading it would report "id 0 is unresolvable" about a
+        // number the engine never said, which is a stub lying about where its
+        // input came from.
+        let face = match (placed, super::editor_font::font_id(&info)) {
+            (Placed::Fallback, _) | (_, None) => None,
+            (_, Some(id)) => match super::editor_font::face_for_id(id) {
+                Some(face) => Some((id, face)),
+                None => {
+                    // An id the shipped table has no row for -- a marketplace
+                    // font, or one this build renumbered. Named once and then
+                    // drawn in the default, because the alternatives are worse
+                    // in both directions: drawing nothing makes typing
+                    // invisible, and drawing silently leaves a wrong font
+                    // looking like a rendering bug with no number to report.
+                    let fallback = super::editor_font::default_face();
+                    super::editor_font::log_unresolved(id, fallback);
+                    fallback.map(|face| (id, face))
+                }
+            },
+        };
+
         if super::input::trace_text() {
             // Which of the three sources won, and the numbers it won with.
             // Placement is the question this whole path exists to answer, and
             // it was previously only answerable by photographing the window --
             // `showKeyboard`'s spec is in the log but is not what gets used
             // when the getter or the fallback supplies the geometry instead.
+            //
+            // **All five candidate ints, on the same line as the family that
+            // was resolved from whichever one is selected.** The slot carrying
+            // the font id is not established, and the capture that settles it
+            // is one person focusing a restyled TextBox in a game: with the
+            // candidates and the outcome side by side, whichever int moved
+            // *and* changed the family is the field, and this line is the whole
+            // experiment. Split across two lines or two sources it would need
+            // correlating by hand, which is how the last five candidates
+            // survived a capture each.
+            let (slot, id, family) = match (super::editor_font::font_slot(), face.as_ref()) {
+                (Some(slot), Some((id, face))) => {
+                    (slot.to_string(), id.to_string(), face.family.clone())
+                }
+                (Some(slot), None) => {
+                    (slot.to_string(), "n/a".to_owned(), "(process default)".to_owned())
+                }
+                (None, _) => ("off".to_owned(), "n/a".to_owned(), "(process default)".to_owned()),
+            };
             eprintln!(
-                "[cordial] text editor placed from {} x={} y={} w={} h={}",
+                "[cordial] text editor placed from {} x={} y={} w={} h={} \
+                 i6={} i7={} i9={} i10={} i11={} fontSlot={slot} fontId={id} family={family:?}",
                 placed.source(),
-                info.x, info.y, info.width, info.height
+                info.x, info.y, info.width, info.height,
+                info.i6, info.i7, info.i9, info.i10, info.i11
             );
         }
 
@@ -2198,6 +2244,9 @@ impl WaylandWindow {
             height: info.height,
             font_size: info.font_size,
             text_color: info.text_color as u32,
+            font_family: face.as_ref().map(|(_, f)| f.family.as_str()),
+            font_weight: face.as_ref().map_or(400, |(_, f)| f.weight),
+            font_italic: face.as_ref().is_some_and(|(_, f)| f.italic),
             password: matches!(info.i10, 5 | 9 | 10),
             // Only the placed bar draws its own chrome. An editor held at the
             // previous box's place is still sitting on a real field and must

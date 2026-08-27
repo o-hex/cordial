@@ -288,10 +288,50 @@ pub struct TextOverlay<'a> {
     pub font_size: f32,
     pub text_color: u32,
     pub password: bool,
+    /// The family this particular box is drawn in, when the runtime managed to
+    /// resolve one out of the APK's own font table.
+    ///
+    /// Per box rather than per process because a game restyles individual
+    /// TextBoxes: the login form and an in-experience chat entry are different
+    /// fonts in the same session. `None` falls back to the process-wide family
+    /// [`HostWindow::set_editor_font_family`] installed, which is Roblox's UI
+    /// font and right for everything the game did not touch.
+    pub font_family: Option<&'a str>,
+    /// OpenType/CSS weight -- 400 regular, 700 bold -- meaningful only when
+    /// `font_family` is `Some`. Roblox's own UI uses four weights of one
+    /// family, so a family without a weight collapses Medium, Bold and
+    /// ExtraBold into Regular.
+    pub font_weight: i32,
+    pub font_italic: bool,
     /// True when the engine gave no geometry and Cordial placed the editor
     /// itself. Such an editor is not sitting on the box, so it has to carry its
     /// own chrome to be legible -- see the CSS class below.
     pub fallback: bool,
+}
+
+/// Pango's `Weight` from an OpenType weight number.
+///
+/// A match rather than `Weight::__Unknown`, which is `doc(hidden)` and would be
+/// reaching behind the binding. The ladder is Pango's own constants, and the
+/// nearest-below rule means a font declaring some off-ladder weight still asks
+/// for the closest thing Pango has a name for instead of silently becoming
+/// Normal.
+fn pango_weight(open_type: i32) -> gtk::pango::Weight {
+    use gtk::pango::Weight;
+    match open_type {
+        ..=149 => Weight::Thin,
+        150..=249 => Weight::Ultralight,
+        250..=324 => Weight::Light,
+        325..=364 => Weight::Semilight,
+        365..=389 => Weight::Book,
+        390..=449 => Weight::Normal,
+        450..=549 => Weight::Medium,
+        550..=649 => Weight::Semibold,
+        650..=749 => Weight::Bold,
+        750..=849 => Weight::Ultrabold,
+        850..=949 => Weight::Heavy,
+        _ => Weight::Ultraheavy,
+    }
 }
 
 impl HostWindow {
@@ -638,9 +678,32 @@ impl HostWindow {
         // the engine had drawn in its own, so focusing a box changed the shape
         // and weight of every character while the height stayed right. With
         // the engine's own family registered the two renderings agree.
-        if let Some(family) = self.editor_font_family.borrow().as_deref() {
+        //
+        // The box's own family wins over the process-wide one, because a game
+        // may restyle a single TextBox and the login form in the same session.
+        // The process-wide family stays as the fallback and is what still
+        // works when the APK's font table cannot be read at all -- losing the
+        // family entirely would put the desktop UI font back, which is the
+        // original bug rather than a smaller version of it.
+        //
+        // Weight and style ride with the family and only with the family. A
+        // weight applied over Pango's own choice of face would restyle the
+        // desktop font, which is a second wrong answer rather than a partial
+        // right one.
+        let per_box = overlay.font_family;
+        let process_wide = self.editor_font_family.borrow();
+        if let Some(family) = per_box.or(process_wide.as_deref()) {
             attrs.insert(gtk::pango::AttrString::new_family(family));
         }
+        if per_box.is_some() {
+            attrs.insert(gtk::pango::AttrInt::new_weight(pango_weight(overlay.font_weight)));
+            attrs.insert(gtk::pango::AttrInt::new_style(if overlay.font_italic {
+                gtk::pango::Style::Italic
+            } else {
+                gtk::pango::Style::Normal
+            }));
+        }
+        drop(process_wide);
         self.editor.set_attributes(Some(&attrs));
 
         // GTK's own masking rather than a string of bullets: the widget then
@@ -1182,6 +1245,37 @@ mod tests {
     /// 47px down, and an editor the engine placed 10px into that content.
     fn layout() -> ((i32, i32), (i32, i32, i32, i32), (i32, i32, i32, i32)) {
         ((1280, 720), (0, 47, 1280, 673), (332, 10, 592, 36))
+    }
+
+    /// fontconfig's weight scale is not Pango's, and the conversion is where
+    /// that gets got wrong: Regular is 80 to fontconfig and 400 to Pango, Bold
+    /// 200 and 700. Every number below is one `FcWeightToOpenType` produced
+    /// from a font Roblox actually ships, read with `FcFreeTypeQuery` on
+    /// 2026-08-27, so this asserts on the real inputs rather than on a ladder.
+    #[test]
+    fn shipped_weights_reach_the_pango_face_they_name() {
+        use gtk::pango::Weight;
+        // BuilderSans-Regular.otf, Arimo-Regular.ttf and 36 others.
+        assert_eq!(pango_weight(400), Weight::Normal);
+        // BuilderSans-Medium.otf, Montserrat-Medium.ttf.
+        assert_eq!(pango_weight(500), Weight::Medium);
+        // SourceSansPro-Semibold.ttf.
+        assert_eq!(pango_weight(600), Weight::Semibold);
+        // BuilderSans-Bold.otf, Arimo-Bold.ttf, ComicNeue-Angular-Bold.ttf.
+        assert_eq!(pango_weight(700), Weight::Bold);
+        // BuilderSans-ExtraBold.otf and Montserrat-Black.ttf, both of which
+        // fontconfig reads as 210 and converts to 900 -- so ExtraBold arrives
+        // as Heavy, which is the face that exists rather than the name.
+        assert_eq!(pango_weight(900), Weight::Heavy);
+    }
+
+    /// A weight fontconfig failed to report must not become Thin. It arrives
+    /// as 400 from `query_face`, and 400 has to be Normal for that fallback to
+    /// mean anything.
+    #[test]
+    fn an_unknown_weight_falls_back_to_normal_not_thin() {
+        assert_eq!(pango_weight(400), gtk::pango::Weight::Normal);
+        assert_ne!(pango_weight(400), gtk::pango::Weight::Thin);
     }
 
     #[test]

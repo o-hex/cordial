@@ -206,16 +206,17 @@ What this does not cover is the report itself, which is about being in a game.
 The app shell is not a game, and reproducing "can't play fps games" means
 joining one.
 
-## Open: the editor draws one font, and games choose their own, 2026-08-27
+## Open: the editor draws one font per process, and only the slot is left, 2026-08-27
 
-The editor hardcodes the family `Builder Sans`
-(`crates/cordial-runtime/src/android/editor_font.rs`). That is Roblox's own UI
-font, so it is correct for the login screen, settings, and any box a game left
-alone -- and wrong the moment a game sets a TextBox's `FontFace` to something
-else, at which point this reproduces the bug the module exists to fix with a
-different wrong font.
+**Most of this has shipped; what is left is one capture by a person.** The
+editor no longer hardcodes a single family. It reads
+`assets/android/fonts/font-mappings.json` and `assets/content/fonts/*` out of
+the APK the user supplied, registers every shipped face with fontconfig, and
+draws each box in the family, weight and slant its font id names. What is *not*
+established is which constructor slot the id is in, so that is a runtime
+variable rather than a compile-time guess.
 
-It is not cosmetic. The engine stops drawing a box's own text while it is
+It was never cosmetic. The engine stops drawing a box's own text while it is
 focused and resumes on blur, so during editing the GTK widget's glyphs *are*
 the visible text.
 
@@ -227,36 +228,100 @@ either side by `DeviceStaticParams` and `PlatformParams` so the run is this
 class alone. Fifteen fields, tally 6 I / 5 F / 4 Z, matching the constructor
 descriptor `(FFFFFZIIIIIIZZZ)V`.
 
-And `assets/android/fonts/font-mappings.json` in the same APK is a 48-entry
-table from that integer to a font file: `46` is `BuilderSans-Regular.otf`, in a
-gapless run through `47` Medium, `48` Bold, `49` ExtraBold.
-`assets/content/fonts/families/BuilderSans.json` then gives `"name": "Builder
-Sans"`, the family string Pango needs. **So no hand-maintained id table is
-required and none should be written** -- the authoritative one is already on
-the user's disk and can be read the way the OTF already is, which also means it
-cannot rot when Roblox renumbers.
+### Two things this section used to say that are wrong
 
-### What blocks it, and the experiment that unblocks it
+**"A 48-entry table ... in a gapless run" was half right.** 48 entries is
+right and 44-51 is gapless, but the ids are `1, 2, 6..51`: **0, 3, 4 and 5 have
+no row at all.** That matters twice over. It weakens the slot-6 reading, since
+an `i6` of 0 would resolve to no font file. And 3, 4 and 5 are `SourceSans`,
+`SourceSansBold` and `SourceSansLight` -- the engine's own default face for an
+unstyled TextLabel -- so Roblox's own Android mapping does not cover Roblox's
+own default font, even though `SourceSansPro-Regular.ttf` ships in the same
+archive. That is the strongest available evidence that a fallback is mandatory
+rather than a nicety. Cordial does not paper over it with a hand-written row:
+`3 => SourceSansPro-Regular` is knowledge about Roblox's enum rather than
+something the archive says, nothing would tell us when it stopped being true,
+and it is exactly the hand-maintained table this section already said must not
+be written.
 
-Which constructor slot carries the id. `native/android_classes.cpp` guesses
-slot 9 and marks it INFERRED, and the guess is weak in a specific way worth
-stating: it rests on a single capture of two Login-screen boxes in which slot 9
-read 46 on **both** and never varied. Slot 6 read 0 on both, and
-`Enum.Font.Legacy` is 0 -- a real font value -- so slot 6 fits that evidence
-exactly as well. Only `textColor` is genuinely pinned, by a packed ARGB value
-nothing else could plausibly be. Alphabetical `field_ids` ordering is
-format-mandated and cannot rank the six ints; the constructor's parameter names
-are `NO_INDEX` in the debug info.
+**"`families/BuilderSans.json` gives the family string Pango needs" is right
+for that one file and wrong in general.** Pango asks fontconfig, and fontconfig
+reads the font file rather than Roblox's manifest, and the two disagree.
+`LegacyArimo.json` and `LegacyArial.json` both declare `"name": "Arimo
+(Legacy)"` while both pointing at `Arimo-Regular.ttf`, which fontconfig reads
+as family `Arimo` -- so inverting the manifests is not even a function, one
+file carries three declared names. The weights disagree too:
+`ComicNeue-Angular-Bold.ttf` is declared as the `Regular` face at weight 400
+and fontconfig reads it as 700. `FcFreeTypeQuery` on the extracted file is
+therefore what `editor_font.rs` uses, because it is by construction the answer
+Pango will resolve against.
 
-**The experiment is one capture and it needs a person, not a change.** Run with
-`CORDIAL_TRACE_TEXT=1`, focus a TextBox in a game that restyled its font, and
-see which of slots 6, 7, 9, 10, 11 moves. Whichever varies with the visible
-glyphs is the field; anything that stays at its Login-screen value is excluded.
-The control is a second box on the same screen using the default font.
+Both were checked against the user's own APK on 2026-08-27, all 48 rows, with
+`fc-query` and with `FcFreeTypeQuery` through the same `dlsym` path the code
+takes.
+
+### What is shipped
+
+`crates/cordial-runtime/src/android/editor_font.rs` builds an id-to-face table
+on first use. Measured on this host, 46 distinct files:
+`FcConfigAppFontAddFile` accepted **46 of 46 in 48.8 ms** and `FcFreeTypeQuery`
+read family, weight and slant from all 46 in **10.7 ms** -- so the mechanism
+takes many files and the whole set is cheap. It is still built lazily rather
+than at launch, because it also means extracting about 7.2 MB from the archive
+for a feature that only matters once a game restyles a box; `install()` still
+registers one font at window creation, so a launch costs what it always did.
+
+`TextOverlay` carries `font_family`, `font_weight` and `font_italic` per box,
+with the process-wide family as the fallback. Weight is carried because family
+alone is not enough: the 46 files collapse to 38 fontconfig families, and ids
+46-49 are all `Builder Sans` differing only in weight, so a family-only editor
+would draw Roblox's Medium, Bold and ExtraBold boxes in Regular.
+
+An id with no row falls back and says so once, naming the number. That number
+is the whole of what a bug report has to go on, and it is the only thing this
+channel can ever say about a marketplace font: the class declares no `L` field,
+so a custom font's family asset id -- eleven digits in the manifests
+themselves -- cannot cross a Java `int` at all.
+
+### What is left: which slot, and one capture
+
+`CORDIAL_TEXTBOX_FONT_SLOT=<6|7|9|10|11>` selects the slot at run time and
+defaults to 9; `=none` turns per-box fonts off for a control in the same
+session. The default is `INFERRED` and weakly: it rests on one capture of two
+Login-screen boxes in which slot 9 read 46 on both and never varied, and 46 is
+the id for `BuilderSans-Regular.otf`, which the login screen visibly draws.
+Consistent, but a constant is consistent with any field that happens not to
+vary between two boxes on one screen. Slot 6 read 0 on both and `Enum.Font.Legacy`
+is 0. Only `textColor` is genuinely pinned, by a packed ARGB value nothing else
+could plausibly be.
+
+**The experiment is one capture and it needs a person, not a change.** Focus a
+TextBox in a game that restyled its font and read `cordial_textbox`, which now
+reports `i6 i7 i9 i10 i11 fontSlot fontId family` in its reply; or run under
+`CORDIAL_TRACE_TEXT=1`, where the `text editor placed from` line carries the
+same five ints and the family beside them. Whichever int moves *and* changes
+the visible glyphs is the field. The control is a second box on the same screen
+at the default font, or the same box with `CORDIAL_TEXTBOX_FONT_SLOT=none`.
+
+Take it in a game using a **marketplace** font rather than merely a restyled
+one, because that settles a second question at no extra cost. If one int reads
+**100** -- `Enum.Font.Unknown`, the value a GUI object's legacy `Font` takes
+when its `FontFace` has no enum member -- the legacy-enum reading is confirmed
+and the "custom fonts cannot cross this channel" conclusion is final. If one
+reads a small number outside 1-51, a session-local table exists somewhere and
+that conclusion needs revisiting.
 
 Every capture this project holds was taken on the login screen. That is the
-whole reason one observation could not separate five candidates, and it is why
-this is still open.
+whole reason one observation could not separate five candidates.
+
+`i10` is on the candidate list even though `wayland.rs` already reads it as
+`textInputType` for the password mask -- that reading is itself `INFERRED` from
+the same login capture, nobody has recorded observing the masking engage, and
+this is the experiment that would disprove it.
+
+`z14` was missing from the `textbox spec` trace line until 2026-08-27, so the
+fifteenth slot was invisible in every capture this project holds. It is printed
+now.
 
 ### Two routes that would answer it and are not taken
 
@@ -268,6 +333,18 @@ order outright: declined on AGENTS.md's licence line. Declared shapes, call
 order and descriptors are observation; the body of a method is how it
 implements something. Two independent agents reached that boundary on
 2026-08-27 and both stopped at it rather than crossing it.
+
+### Not applied, and deliberately
+
+Every row of the mapping carries a third field, `fromRbxFontRatio`, a fraction
+below or equal to one that varies by font. It plainly exists to reconcile
+Roblox's text sizing with Android's per font. Nothing in Cordial consumes it,
+and applying it naively would shrink today's editor by 21% -- the symptom that
+motivated `editor_font.rs` was shape and weight, never size, so the size the
+editor draws at is a working observation and a multiplier that contradicts it
+is wrong. `INFERRED`: whatever the ratio multiplies, it is not the quantity
+`font_size` arrives in. Do not apply it without a measurement, and do not let
+it go unnoticed either.
 
 ## Open: the canvas goes black when a TextBox focuses IN AN EXPERIENCE
 

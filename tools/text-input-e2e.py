@@ -81,7 +81,12 @@ class Devctl:
         """Parse the `textbox` reply into a dict; `text` stays a real string."""
         line = self.send("textbox")
         head, _, text = line.partition(" text=")
-        d = dict(p.split("=", 1) for p in head.split() if "=" in p)
+        # Quoted values, not just bare ones: `family` reports what fontconfig
+        # calls the face and half of Roblox's shipped families have a space in
+        # them ("Builder Sans", "Press Start 2P"). A plain `head.split()` cut
+        # those in half and silently kept the first word.
+        d = {k: json.loads(v) if v.startswith('"') else v
+             for k, v in re.findall(r'(\w+)=("[^"]*"|\S*)', head)}
         # `redacted` emits Rust's `{:?}`, which for these strings is JSON.
         try:
             d["text"] = json.loads(text) if text.startswith('"') else None

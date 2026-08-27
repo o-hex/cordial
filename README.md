@@ -38,6 +38,12 @@ flatpak install cordial io.github.luohoa97.Cordial
 flatpak run io.github.luohoa97.Cordial
 ```
 
+Or take the AppImage from [the releases
+page](https://github.com/luohoa97/cordial/releases), which installs nothing and
+runs anywhere: `chmod +x Cordial-x86_64.AppImage && ./Cordial-x86_64.AppImage`.
+[§2](#2-install-it) compares the two and says what is less proven about the
+newer one.
+
 **You also need Roblox's Android build, which Cordial does not ship and never
 will.** First run has one button — **Download Roblox** — and that is the whole
 procedure. Cordial fetches the build from APKPure, a third-party mirror, and
@@ -304,8 +310,23 @@ list of build dependencies moved down to §3, where it belongs.
 
 ### 2. Install it
 
-**This is the way to install Cordial.** Building from source (§3) is for people
-changing it, not for people running it.
+Two ways, and they suit different people. Building from source (§3) is for
+people changing Cordial, not for people running it.
+
+**Flatpak is the one to pick if you have no reason to prefer the other.** It is
+sandboxed, it updates in place, and the manifest is the reference every other
+package here is built to match.
+
+**The AppImage is one file that runs on any distribution.** No remote to add,
+no package manager, nothing installed system-wide -- download it, make it
+executable, run it. It is the right answer on a distribution whose packaging
+Cordial does not build for, or if you would rather not add a third-party
+Flatpak remote to your machine at all.
+
+The AppImage is newer and less proven than the Flatpak, and the honest state of
+it is in [§2.2](#22-appimage). Read that before choosing it.
+
+#### 2.1 Flatpak
 
 ```bash
 flatpak remote-add --if-not-exists cordial \
@@ -323,6 +344,39 @@ flatpak run io.github.luohoa97.Cordial
 `flatpak uninstall io.github.luohoa97.Cordial`, and
 `flatpak uninstall --delete-data io.github.luohoa97.Cordial` if you also want the
 profiles, the sign-in and the extracted Roblox build gone.
+
+#### 2.2 AppImage
+
+Download `Cordial-x86_64.AppImage` from [the releases
+page](https://github.com/luohoa97/cordial/releases), then:
+
+```bash
+chmod +x Cordial-x86_64.AppImage
+./Cordial-x86_64.AppImage
+```
+
+That is the whole procedure. It carries GTK4, libadwaita and WebKitGTK with it,
+so it does not care what your distribution ships. It installs nothing; delete
+the file and Cordial is gone, though your profiles stay in `~/.local/share`
+until you remove them yourself.
+
+It needs FUSE, which nearly every desktop has. If it refuses to start, run it
+with `--appimage-extract-and-run` and it will unpack to a temporary directory
+instead.
+
+**What is not yet established about it.** The AppImage bundles WebKitGTK's
+helper executables by hand, because `linuxdeploy` follows linked libraries and
+WebKitGTK spawns `WebKitWebProcess` and `WebKitNetworkProcess` as separate
+programs rather than linking them. That bundling is believed correct and has
+not been confirmed on a machine other than the one that built it. **If the
+sign-in window comes up blank, that is the reason**, and the Flatpak is
+unaffected -- please report it rather than assuming Cordial is broken.
+
+Updates are manual: the AppImage does not update itself, so download a newer
+one when a release appears. The Flatpak does update itself, which is the main
+practical reason to prefer it.
+
+#### Trust, and what "not signed" means
 
 **Before you extend that trust: the remote is not signed**, and what that does
 and does not protect you from is worth your attention rather than your having

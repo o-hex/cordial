@@ -305,6 +305,17 @@ modules:
           /app/share/licenses/cordial/aosp-NOTICE.txt
       - install -Dm644 third_party/libjnivm/LICENSE
           /app/share/licenses/cordial/libjnivm-MIT.txt
+      # The comment above already named this obligation; these two lines were
+      # the ones missing to meet it. third_party/mocktail-webview/ is Apache-2.0
+      # material — mocktail's implementation of Roblox's in-experience web
+      # window, taken as the basis for Cordial's own — and NOTICE at the
+      # repository root is the section 4(d) attribution for it. Found while
+      # giving three new package formats a licence list to copy from this one;
+      # packaging/rpm/cordial.spec and packaging/aur/cordial-git/PKGBUILD had
+      # the same gap and are fixed alongside this.
+      - install -Dm644 NOTICE /app/share/licenses/cordial/NOTICE
+      - install -Dm644 third_party/mocktail-webview/LICENSE
+          /app/share/licenses/cordial/mocktail-webview-Apache-2.0.txt
     sources:
       # The working tree, minus the three directories that must not come from
       # it. `target` is tens of gigabytes on a developer's machine and every

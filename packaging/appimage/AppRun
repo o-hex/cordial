@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# The AppImage's entry point. appimagetool runs this in place of the
+# executable named in the desktop file, with the mounted (or extracted)
+# AppDir as the working directory.
+#
+# Everything here exists to answer one question: once cordial-shell is moved
+# off the machine it was built on, how does it find the things it needs that
+# are not DT_NEEDED entries and so were not swept up by linuxdeploy's
+# dependency walk in build-appimage.sh? Each export below is one such thing.
+set -euo pipefail
+
+APPDIR="${APPDIR:-$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
+
+# Bundled libraries ahead of the host's own. The whole reason this AppImage
+# exists rather than a bare tarball of the two binaries is that the host's
+# gtk4/libadwaita is routinely older than what this workspace builds and
+# tests against -- Fedora 43 ships gtk4 4.20.3 and libadwaita 1.8.3 against
+# the 4.22/1.9 test.yml pins, and the failure mode for an ordinary build
+# against an old system library is three *-sys build scripts refusing to
+# configure. An AppImage sidesteps that only if it actually carries its own
+# copies rather than linking the host's, which is what this line is for.
+export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${LD_LIBRARY_PATH:-}"
+
+# GSettings schemas are found by path lookup through GIO, not through a
+# symbol linuxdeploy's ELF dependency walk can see -- nothing in
+# cordial-shell references the schema directory by name, so nothing about it
+# survives an ordinary --executable bundling pass. build-appimage.sh compiles
+# a copy into usr/share/glib-2.0/schemas for exactly this reason.
+export GSETTINGS_SCHEMA_DIR="${APPDIR}/usr/share/glib-2.0/schemas"
+
+export XDG_DATA_DIRS="${APPDIR}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+# WebKitGTK does not link its helper processes into cordial-run; it spawns
+# WebKitWebProcess and WebKitNetworkProcess as separate executables read from
+# a compiled-in /usr/libexec/webkitgtk-6.0 path, which is the same kind of gap
+# GSettings has above -- nothing DT_NEEDED can find because nothing links it.
+# build-appimage.sh copies that whole directory to usr/libexec/webkitgtk-6.0
+# and this is WebKitGTK's own override for where to look instead of the
+# compiled-in path.
+#
+# INFERRED, and the highest-risk line in this file. It has not been run: there
+# was no second machine available to launch a built AppImage on that was not
+# already carrying the frame-rate measurement this packaging work was asked
+# not to disturb, and AGENTS.md's rule is to say that plainly rather than
+# imply a result. If a build made from this script opens a blank web view, or
+# WebKitWebProcess fails to spawn at all, this is the first thing to check --
+# confirm the exported path actually holds the helper binaries
+# (readlink -f "$WEBKIT_EXEC_PATH"/WebKit*Process), and if WebKitGTK does not
+# honour this variable on the version this bundles, its ProcessLauncher source
+# is the next place to look for whichever override it does read.
+export WEBKIT_EXEC_PATH="${APPDIR}/usr/libexec/webkitgtk-6.0"
+
+exec "${APPDIR}/usr/bin/cordial-shell" "$@"

@@ -201,6 +201,15 @@ install -Dpm 0644 third_party/libbadcpu/LICENSE.upstream            libbadcpu-MI
 install -Dpm 0644 third_party/mcpelauncher-linker/LICENSE           mcpelauncher-linker-MIT.txt
 install -Dpm 0644 third_party/mcpelauncher-linker/core/NOTICE       aosp-NOTICE.txt
 install -Dpm 0644 third_party/libjnivm/LICENSE                      libjnivm-MIT.txt
+# Apache-2.0 section 4(d): the NOTICE for mocktail-webview, the basis for
+# Cordial's own in-experience web window, has to travel with a binary
+# distribution and not only with the source tree -- see NOTICE at the
+# repository root. Missing from this spec until the packaging pass that added
+# .deb, AppImage and a release Arch package noticed the same gap in the
+# Flatpak manifest and packaging/aur/cordial-git/PKGBUILD while giving the new
+# formats a licence list to copy; all three are fixed in the same change.
+install -Dpm 0644 NOTICE                                            NOTICE
+install -Dpm 0644 third_party/mocktail-webview/LICENSE              mocktail-webview-Apache-2.0.txt
 
 %check
 export CC=clang CXX=clang++
@@ -258,6 +267,8 @@ appstream-util validate-relax --nonet \
 %license mcpelauncher-linker-MIT.txt
 %license aosp-NOTICE.txt
 %license libjnivm-MIT.txt
+%license NOTICE
+%license mocktail-webview-Apache-2.0.txt
 %doc README.md THIRD-PARTY-NOTICES.md
 %{_bindir}/cordial-shell
 %{_bindir}/cordial-run

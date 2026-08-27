@@ -1,0 +1,340 @@
+# Native packages: AppImage, .deb, .rpm and an Arch package, built on every
+# push and pull request that could break them and attached to the GitHub
+# release on every tag.
+#
+# Why this exists at all, in one sentence: seven releases and zero downloadable
+# assets, because the only install route Cordial had was
+# `flatpak remote-add` against an unsigned custom remote. mocktail, a
+# comparable project started ten days later, ships five kinds of artefact on
+# its releases and gets used because of it. Flatpak already has its own
+# workflow -- .github/workflows/flatpak.yml, which additionally publishes an
+# OSTree remote to GitHub Pages -- and this file is deliberately separate from
+# it rather than a fifth job bolted on: that workflow's concurrency group
+# exists because two runs cannot safely publish to the same Pages deployment
+# at once, and nothing here shares that resource, so entangling the two would
+# only add a reason for four independent jobs to queue behind one unrelated
+# one.
+#
+# None of the four jobs below fetch, embed or reference any Roblox material.
+# Every one of them builds Cordial's own source (plus the same third-party OSS
+# Cordial always depends on -- libbadcpu, mcpelauncher-linker, libjnivm,
+# mocktail-webview) and nothing else; the resulting packages start, find no
+# Roblox build, and say so, exactly like every other packaging format already
+# does. See AGENTS.md, "Permanently out of scope".
+#
+# Each job builds in a container image of the distribution family its output
+# targets -- Fedora for .rpm and the AppImage (Fedora 44 specifically, because
+# test.yml already established it as the one environment this workspace
+# proves builds gtk4 4.22/libadwaita 1.9 correctly; Fedora 43 and Ubuntu 24.04
+# are both older and fail three *-sys build scripts with a pkg-config hint
+# that reads as a missing package rather than an old one), Ubuntu for .deb,
+# archlinux:base-devel for the Arch package -- rather than cross-building on
+# one host, which is how mocktail's own packages.yml is shaped too (docker
+# run against a target image per format), and matches this project's own
+# reasoning in packaging/build-flatpak.sh for why a Flatpak is worth building
+# on every change: it is the only check that a runtime's dependencies are
+# declared rather than merely present on the machine that happens to be
+# building it.
+#
+# Every job's own dependency list is read from one place rather than copied
+# into this file and left to drift the way packaging/cargo-sources.json can
+# drift from Cargo.lock: the .rpm job runs `dnf builddep` against the SRPM
+# it just built, and the Arch job sources its own PKGBUILD and reads
+# depends()/makedepends() out of it. The .deb job is the one exception,
+# because there is no equivalent single source of truth for a hand-built
+# .deb -- see packaging/deb/control.in's own comment on why that list is
+# translated by hand from the same soname list the other three formats
+# already carry.
+
+name: Native packages
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'crates/**'
+      - 'native/**'
+      - 'third_party/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'packaging/appimage/**'
+      - 'packaging/deb/**'
+      - 'packaging/rpm/**'
+      - 'packaging/aur/cordial/**'
+      - 'packaging/version.sh'
+      - 'packaging/icons/**'
+      - 'packaging/io.github.luohoa97.Cordial.desktop'
+      - 'packaging/io.github.luohoa97.Cordial.metainfo.xml'
+      - '.github/workflows/release.yml'
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'native/**'
+      - 'third_party/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'packaging/appimage/**'
+      - 'packaging/deb/**'
+      - 'packaging/rpm/**'
+      - 'packaging/aur/cordial/**'
+      - 'packaging/version.sh'
+      - 'packaging/icons/**'
+      - 'packaging/io.github.luohoa97.Cordial.desktop'
+      - 'packaging/io.github.luohoa97.Cordial.metainfo.xml'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+# `contents: write` only where a job actually uploads to a release -- see
+# flatpak.yml, which gives the same reasoning: read is enough for everything
+# else, and a release with nothing attached to it is the whole reason this
+# file exists, so the step that attaches something is the one that needs the
+# broader grant.
+permissions:
+  contents: read
+
+# Per-ref rather than the single global group flatpak.yml uses: these four
+# jobs do not share a publish target the way a Pages deployment does, so
+# there is no reason to serialise a tag build behind an unrelated main-branch
+# build. A second push to the *same* ref supersedes the first, which is the
+# ordinary case of someone pushing twice in a hurry.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  appimage:
+    name: AppImage (Fedora 44)
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:44
+    # Generous rather than measured: nobody has timed a green run of this job,
+    # because authoring it did not include running it (this worktree was
+    # asked not to build, to avoid confounding a frame-rate measurement
+    # running on the same machine). test.yml's own cargo test --workspace
+    # runs in well under this on the same toolchain; linuxdeploy's dependency
+    # walk and appimagetool's squashing add to that, not replace it.
+    timeout-minutes: 75
+    steps:
+      - name: Install build and packaging tools
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            git rust cargo clang cmake gcc-c++ binutils llvm lld \
+            pkgconf-pkg-config openssl-devel \
+            gtk4-devel libadwaita-devel webkitgtk6.0-devel \
+            pipewire-devel pulseaudio-libs-devel alsa-lib-devel \
+            wayland-devel vulkan-loader-devel libxkbcommon-devel \
+            librsvg2-tools glib2 curl
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: git safe.directory
+        # rpmbuild's own container jobs need this too (see the rpm job below)
+        # for the same reason: the container runs as root over a workspace
+        # actions/checkout left owned by the runner's UID, and git 2.35.2+
+        # (CVE-2022-24765) refuses to operate across that boundary.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: actions/cache for the crate registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: appimage-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: appimage-cargo-
+      - name: Build the AppImage
+        run: packaging/appimage/build-appimage.sh --outdir dist/appimage
+      - name: Upload the AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordial-appimage
+          path: dist/appimage/*.AppImage
+          if-no-files-found: error
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/appimage/*.AppImage --clobber
+
+  deb:
+    name: .deb (Ubuntu 24.04)
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    timeout-minutes: 60
+    steps:
+      - name: Install build dependencies
+        # The same package names README.md §3 already documents for building
+        # Cordial on Debian/Ubuntu from source, plus the audio backends'
+        # headers and the packaging tools this job needs on top of that.
+        # rustup rather than apt's own rustc/cargo: Ubuntu's packaged Rust
+        # trails upstream stable and this workspace pins rust-version = 1.75
+        # in Cargo.toml.
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl build-essential clang cmake pkg-config \
+            binutils libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev \
+            libpipewire-0.3-dev libpulse-dev libasound2-dev zlib1g-dev \
+            desktop-file-utils
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: git safe.directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: actions/cache for the crate registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: deb-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: deb-cargo-
+      - name: Validate the desktop file
+        # appstream-util's package name is not verified for Ubuntu 24.04 --
+        # unlike desktop-file-validate, which README.md and the other three
+        # formats' own %check/check() steps already exercise -- so this runs
+        # the one validation this job is confident is installed, rather than
+        # guess a package name and risk failing the whole job on tooling that
+        # was never the point.
+        run: desktop-file-validate packaging/io.github.luohoa97.Cordial.desktop
+      - name: Build the .deb
+        run: packaging/deb/build-deb.sh --outdir dist/deb
+      - name: Upload the .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordial-deb
+          path: dist/deb/*.deb
+          if-no-files-found: error
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/deb/*.deb --clobber
+
+  rpm:
+    name: .rpm (Fedora 44)
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:44
+    # %check runs the workspace's test suite once inside this job (with the
+    # same three session-bus-dependent skips packaging/rpm/cordial.spec
+    # documents), on top of %build's own compile -- more than the deb and
+    # arch jobs, close to what the arch job's check() also repeats.
+    timeout-minutes: 75
+    steps:
+      - name: Install the tools make-srpm.sh itself needs
+        # Not the project's own build dependencies -- those are declared once,
+        # in packaging/rpm/cordial.spec's BuildRequires, and installed below
+        # via `dnf builddep` against the SRPM once it exists. This step only
+        # has to get as far as running make-srpm.sh, which needs git, cargo
+        # (for `cargo vendor`), rpmbuild and zstd -- see that script's header.
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            git cargo rust rpm-build rpmdevtools zstd
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: git safe.directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: actions/cache for the crate registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: rpm-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rpm-cargo-
+      - name: Build the binary RPM
+        run: packaging/rpm/build-rpm.sh --outdir dist/rpm
+      - name: Upload the RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordial-rpm
+          path: dist/rpm/**/*.rpm
+          if-no-files-found: error
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s globstar
+          gh release upload "$GITHUB_REF_NAME" dist/rpm/**/*.rpm --clobber
+
+  arch:
+    name: Arch package (archlinux:base-devel)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+      - name: Install the PKGBUILD's own depends() and makedepends()
+        # Read out of packaging/aur/cordial/PKGBUILD by sourcing it rather
+        # than copied into this file, for the same reason the .rpm job uses
+        # `dnf builddep` instead of a hand-written package list: one place to
+        # keep in step rather than two that can silently drift apart. Sourcing
+        # a PKGBUILD to read its arrays is the ordinary way to do this without
+        # a full makepkg run; it does execute the file's top-level code, which
+        # is accepted here because this is Cordial's own first-party file, not
+        # one fetched from elsewhere.
+        run: |
+          set -euo pipefail
+          mapfile -t pkgs < <(
+            bash -c 'source packaging/aur/cordial/PKGBUILD; printf "%s\n" "${depends[@]}" "${makedepends[@]}"' \
+              | sed -E 's/[<>=].*$//'
+          )
+          pacman -Syu --needed --noconfirm git "${pkgs[@]}"
+      - name: Build the package as a non-root user
+        # makepkg refuses to run as root, and the container is root by
+        # default -- the same requirement mocktail's own packages.yml states
+        # and works around the same way.
+        env:
+          # CI always builds the tag actually being released, or, off a tag,
+          # HEAD of main -- see packaging/aur/cordial/PKGBUILD's own comment
+          # on why this variable exists: the committed PKGBUILD's pkgver is
+          # bumped by hand at each release the way PUBLISHING.md already
+          # documents for .SRCINFO, and CI should not depend on that having
+          # happened yet.
+          CORDIAL_PKGBUILD_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'main' }}
+        run: |
+          set -euo pipefail
+          useradd --create-home builder
+          # $GITHUB_WORKSPACE rather than a guessed container path: that is
+          # the one name Actions guarantees points at the checkout, whatever
+          # the container job happens to mount it at.
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- env CORDIAL_PKGBUILD_TAG="$CORDIAL_PKGBUILD_TAG" \
+            makepkg --dir "$GITHUB_WORKSPACE/packaging/aur/cordial" \
+              --noconfirm --cleanbuild --force
+          install -d dist/arch
+          cp packaging/aur/cordial/*.pkg.tar.zst dist/arch/
+          pacman -Qp dist/arch/*.pkg.tar.zst >/dev/null
+      - name: Upload the Arch package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordial-arch
+          path: |
+            dist/arch/*.pkg.tar.zst
+            packaging/aur/cordial/PKGBUILD
+          if-no-files-found: error
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The PKGBUILD itself travels alongside the compiled package: it is
+          # what packaging/aur/PUBLISHING.md points a maintainer at to submit
+          # to the AUR later, and it is small enough that shipping it costs
+          # nothing.
+          cp packaging/aur/cordial/PKGBUILD "dist/arch/cordial-${GITHUB_REF_NAME#v}.PKGBUILD"
+          gh release upload "$GITHUB_REF_NAME" dist/arch/*.pkg.tar.zst \
+            "dist/arch/cordial-${GITHUB_REF_NAME#v}.PKGBUILD" --clobber

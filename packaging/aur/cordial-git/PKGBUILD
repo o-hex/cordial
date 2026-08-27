@@ -258,4 +258,15 @@ package() {
     "$pkgdir/usr/share/licenses/$pkgname/aosp-NOTICE.txt"
   install -Dm644 third_party/libjnivm/LICENSE \
     "$pkgdir/usr/share/licenses/$pkgname/libjnivm-MIT.txt"
+  # The comment above already named this obligation for mocktail-webview too;
+  # these two lines were the ones missing to meet it. third_party/mocktail-webview/
+  # is Apache-2.0 material -- mocktail's implementation of Roblox's
+  # in-experience web window, taken as the basis for Cordial's own -- and
+  # NOTICE at the repository root is the section 4(d) attribution for it.
+  # Found while giving packaging/aur/cordial/PKGBUILD a licence list to copy
+  # from this one; the Flatpak manifest and packaging/rpm/cordial.spec had the
+  # same gap and are fixed alongside this.
+  install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+  install -Dm644 third_party/mocktail-webview/LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/mocktail-webview-Apache-2.0.txt"
 }

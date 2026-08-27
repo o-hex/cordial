@@ -758,6 +758,10 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
     let mut join_reported = false;
     let mut focus_reported: Option<bool> = Some(true);
     // `focus-off`/`focus-on` -- see the override's own comment at the call site.
+    // Latched by the `redraw` script action and consumed in the pump below,
+    // where the AGDK handle is in scope. The action cannot call through
+    // directly from here for that reason alone.
+    let mut redraw_requested = false;
     let mut focus_override: Option<bool> = None;
     // `visible-off`/`visible-on` -- the same override as `focus_override`, for
     // the other half of the policy. See the call site.
@@ -821,6 +825,33 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                     "visible-off" => visible_override = Some(false),
                     "visible-on" => visible_override = Some(true),
                     "visible-real" => visible_override = None,
+                    // `redraw` sends one `onSurfaceRedrawNeededNative`, which
+                    // nothing else in this process ever sends at cold start.
+                    //
+                    // Every other call site for it is a reaction to something
+                    // that only happens later -- an X11 Expose, a resize, a
+                    // text edit, a clipboard paste (`input.rs:284` and its
+                    // callers). A client that is launched and left alone
+                    // therefore never sends one at all, and mocktail's attested
+                    // bring-up ends with exactly this call before the engine
+                    // reaches steady rendering
+                    // (`src/legacy/legacy_runtime.cc:31121`, Apache-2.0, read
+                    // there and not copied).
+                    //
+                    // What makes that worth an arm rather than a guess is the
+                    // shape of a frozen run measured on 2026-08-27: presents
+                    // stop at exactly 1 while the engine spins at 103% CPU on
+                    // its own command pipe, nine events delivered and no tenth.
+                    // "Drew the first frame and never got permission to draw
+                    // the second" is what that looks like from outside, and
+                    // this is the call that would grant it.
+                    //
+                    // As a script action rather than a switch because the
+                    // timing is the experiment -- too early and the engine has
+                    // not built its renderer, too late and it has already
+                    // wedged. `CORDIAL_SCRIPT=2:redraw` and `0.5:redraw` are
+                    // different arms, and both are one launch each.
+                    "redraw" => redraw_requested = true,
                     "focus-off" => focus_override = Some(false),
                     "focus-on" => focus_override = Some(true),
                     "focus-real" => focus_override = None,
@@ -1207,6 +1238,17 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
             // hand mid-measurement is not a control. It overrides the *report*
             // and nothing else, so what the engine is told is the same call it
             // would get from a real switch away.
+            if redraw_requested {
+                redraw_requested = false;
+                super::input::deliver_surface_redraw(handle);
+                if instr {
+                    eprintln!(
+                        "[instr] t={:5.1}s onSurfaceRedrawNeededNative sent",
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+            }
+
             let observed = match focus_override {
                 Some(f) => Some(f),
                 None => super::backend_focused(),

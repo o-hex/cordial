@@ -124,7 +124,8 @@ jobs:
             pipewire-devel pulseaudio-libs-devel alsa-lib-devel \
             wayland-devel vulkan-loader-devel libxkbcommon-devel \
             librsvg2-tools glib2 curl \
-            patchelf fuse-libs
+            patchelf fuse-libs \
+            squashfs-tools desktop-file-utils file zsync
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

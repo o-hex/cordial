@@ -110,7 +110,21 @@ install -Dm644 third_party/mocktail-webview/LICENSE "$docdir/mocktail-webview-Ap
 install -Dm644 packaging/deb/copyright "$docdir/copyright"
 
 mkdir -p "$root/DEBIAN"
-sed "s/@VERSION@/${debversion}/" packaging/deb/control.in > "$root/DEBIAN/control"
+# `control.in` is a template with a comment header explaining itself, and
+# **a Debian control file has no comment syntax at all** -- dpkg-deb reads a
+# leading `#` as a malformed field and stops with "parsing file ... near line
+# 0", which names the line it could not read rather than the one at fault.
+# That is exactly how this failed in CI on 2026-08-27. Strip the comments and
+# any blank lines they leave in front of the first real field.
+sed -e "s/@VERSION@/${debversion}/" -e "/^#/d" packaging/deb/control.in \
+  | sed -e "/./,$ !d" > "$root/DEBIAN/control"
+# A control file that begins with anything but a field is not worth handing to
+# dpkg-deb, whose error would again name the wrong line.
+head -1 "$root/DEBIAN/control" | grep -q "^Package:" || {
+  echo "error: generated DEBIAN/control does not start with Package:" >&2
+  head -3 "$root/DEBIAN/control" >&2
+  exit 1
+}
 install -m755 packaging/deb/postinst "$root/DEBIAN/postinst"
 
 mkdir -p "$outdir"

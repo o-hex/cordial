@@ -20,6 +20,53 @@
 //! file lands in the cache beside the extracted libraries, and is rewritten
 //! only when its size differs, so a launch does not rewrite it every time.
 //!
+//! ## One font, and games use more than one
+//!
+//! **Builder Sans is a default and a fallback, not an answer.** It is Roblox's
+//! own UI font, so it is right for the login screen, for settings, and for any
+//! box a game did not restyle. It is wrong the moment a game sets a TextBox's
+//! `FontFace` to something else, and then this module reproduces the bug it
+//! exists to fix -- the characters change shape under the cursor -- with a
+//! different wrong font instead of the desktop's UI one.
+//!
+//! That matters more here than it would elsewhere, because the editor is what
+//! the player actually sees. The engine stops drawing the box's own text while
+//! it is focused and resumes on blur, so during editing these glyphs are the
+//! visible text rather than an overlay on top of it.
+//!
+//! **The engine does name the font, and the mapping ships in the APK.**
+//! `com.roblox.engine.jni.model.NativeTextBoxInfo` -- the styling spec handed
+//! to `showKeyboard` -- declares an `int` field called exactly `font`, read out
+//! of `classes2.dex` on 2026-08-27. And `assets/android/fonts/font-mappings.json`
+//! in the same APK is a 48-entry table from that integer to a font file, with
+//! `46` naming `BuilderSans-Regular.otf`; `assets/content/fonts/families/*.json`
+//! then gives the family string Pango wants. So a per-box font needs no
+//! hand-maintained table that would rot across Roblox builds -- the
+//! authoritative one is already on disk, in the archive the user supplied, and
+//! can be read the same way this module already reads the OTF.
+//!
+//! **What blocks it is which constructor slot carries the id.**
+//! `native/android_classes.cpp` guesses slot 9, and that guess is weak in a
+//! specific way: it rests on one capture of two Login-screen boxes where slot 9
+//! read 46 on both and never varied. Slot 6 read 0 on both, and
+//! `Enum.Font.Legacy` is 0 -- a real font value -- so slot 6 fits the evidence
+//! exactly as well. Only `textColor` is genuinely pinned, by a packed ARGB
+//! value nothing else could be.
+//!
+//! The experiment is one capture, and it needs a person rather than a change:
+//! `CORDIAL_TRACE_TEXT=1`, focus a TextBox in a game that restyled its font,
+//! and see which of slots 6, 7, 9, 10 and 11 moves. Whichever varies with the
+//! visible glyphs is the field. Every capture this project holds was taken on
+//! the login screen, which is exactly why one observation could not separate
+//! them.
+//!
+//! Reading `TextBox.FontFace` out of the DataModel would answer it directly and
+//! is permanently out of scope: that is in-process introspection of the engine,
+//! which ADR-001 and ADR-003 rule out. Disassembling the constructor's `iput`
+//! order would also answer it, and is declined on the licence line in
+//! AGENTS.md -- declared shapes and call order are observation, the body of a
+//! method is how it implements something.
+//!
 //! `FcConfigAppFontAddFile` is reached through `dlsym` rather than linked.
 //! fontconfig is already in the process -- GTK cannot render without it -- and
 //! dlsym keeps it from becoming a build-time dependency of this crate for one

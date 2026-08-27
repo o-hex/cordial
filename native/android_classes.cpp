@@ -60,14 +60,26 @@
 /// because the APK does not say which is which and only some of them have been
 /// pinned down by running the thing.
 ///
-/// The dex gives the class's fourteen fields — `x y width height fontSize` (F),
-/// `textWrapped multiline manualFocusRelease` (Z), and `font textColor
-/// textInputType returnKeyType xAlignment yAlignment` (I) — but `field_ids` is
-/// sorted by name, so that is the *set* of fields and not the order the
-/// constructor takes them. Parameter names are stripped from the debug info and
-/// the class carries no annotations, so nothing declared in the APK settles it.
-/// All the declarations settle is the grouping: slots 0-4 are the five floats,
-/// 5, 12 and 13 the three booleans, 6-11 the six ints.
+/// The dex gives the class's **fifteen** fields — `x y width height fontSize`
+/// (F), `editable textWrapped multiline manualFocusRelease` (Z), and `font
+/// textColor textInputType returnKeyType xAlignment yAlignment` (I) — but
+/// `field_ids` is sorted by name, so that is the *set* of fields and not the
+/// order the constructor takes them. Parameter names are stripped from the
+/// debug info and the class carries no annotations, so nothing declared in the
+/// APK settles it. All the declarations settle is the grouping: slots 0-4 are
+/// the five floats, 5, 12, 13 and 14 the four booleans, 6-11 the six ints.
+///
+/// **This paragraph said fourteen fields and three booleans until 2026-08-27,
+/// and it was wrong.** A dex read taken then -- `classes2.dex`,
+/// `class_data_off=0x6e33f5`, `field_idx` 4718-4732, bounded either side by
+/// `DeviceStaticParams` and `PlatformParams` so the run is this class and only
+/// this class -- lists `editable` as a declared field, which this comment had
+/// never mentioned. The type tally is 6 I, 5 F, 4 Z, which matches the
+/// constructor descriptor `(FFFFFZIIIIIIZZZ)V` exactly. `editable` is the
+/// likeliest name for `z14`, the third trailing boolean discovered later and
+/// never reconciled with the count above it -- likeliest, not settled, because
+/// alphabetical order cannot rank the four booleans any more than it can the
+/// six ints.
 ///
 /// The rest came from `CORDIAL_TRACE_TEXT=1` on the Login screen at 1280x720,
 /// where two boxes were focused in turn:

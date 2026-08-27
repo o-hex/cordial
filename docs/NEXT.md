@@ -206,6 +206,69 @@ What this does not cover is the report itself, which is about being in a game.
 The app shell is not a game, and reproducing "can't play fps games" means
 joining one.
 
+## Open: the editor draws one font, and games choose their own, 2026-08-27
+
+The editor hardcodes the family `Builder Sans`
+(`crates/cordial-runtime/src/android/editor_font.rs`). That is Roblox's own UI
+font, so it is correct for the login screen, settings, and any box a game left
+alone -- and wrong the moment a game sets a TextBox's `FontFace` to something
+else, at which point this reproduces the bug the module exists to fix with a
+different wrong font.
+
+It is not cosmetic. The engine stops drawing a box's own text while it is
+focused and resumes on blur, so during editing the GTK widget's glyphs *are*
+the visible text.
+
+**The engine names the font, and the mapping ships in the archive.**
+`com.roblox.engine.jni.model.NativeTextBoxInfo`, the styling spec handed to
+`showKeyboard`, declares an `int` field spelled exactly `font` -- read out of
+`classes2.dex`, `class_data_off=0x6e33f5`, `field_idx` 4718-4732, bounded
+either side by `DeviceStaticParams` and `PlatformParams` so the run is this
+class alone. Fifteen fields, tally 6 I / 5 F / 4 Z, matching the constructor
+descriptor `(FFFFFZIIIIIIZZZ)V`.
+
+And `assets/android/fonts/font-mappings.json` in the same APK is a 48-entry
+table from that integer to a font file: `46` is `BuilderSans-Regular.otf`, in a
+gapless run through `47` Medium, `48` Bold, `49` ExtraBold.
+`assets/content/fonts/families/BuilderSans.json` then gives `"name": "Builder
+Sans"`, the family string Pango needs. **So no hand-maintained id table is
+required and none should be written** -- the authoritative one is already on
+the user's disk and can be read the way the OTF already is, which also means it
+cannot rot when Roblox renumbers.
+
+### What blocks it, and the experiment that unblocks it
+
+Which constructor slot carries the id. `native/android_classes.cpp` guesses
+slot 9 and marks it INFERRED, and the guess is weak in a specific way worth
+stating: it rests on a single capture of two Login-screen boxes in which slot 9
+read 46 on **both** and never varied. Slot 6 read 0 on both, and
+`Enum.Font.Legacy` is 0 -- a real font value -- so slot 6 fits that evidence
+exactly as well. Only `textColor` is genuinely pinned, by a packed ARGB value
+nothing else could plausibly be. Alphabetical `field_ids` ordering is
+format-mandated and cannot rank the six ints; the constructor's parameter names
+are `NO_INDEX` in the debug info.
+
+**The experiment is one capture and it needs a person, not a change.** Run with
+`CORDIAL_TRACE_TEXT=1`, focus a TextBox in a game that restyled its font, and
+see which of slots 6, 7, 9, 10, 11 moves. Whichever varies with the visible
+glyphs is the field; anything that stays at its Login-screen value is excluded.
+The control is a second box on the same screen using the default font.
+
+Every capture this project holds was taken on the login screen. That is the
+whole reason one observation could not separate five candidates, and it is why
+this is still open.
+
+### Two routes that would answer it and are not taken
+
+Reading `TextBox.FontFace` from the DataModel: in-process introspection of the
+engine, ruled out permanently by ADR-001 and ADR-003.
+
+Disassembling the constructor's `iput` order, which would give true parameter
+order outright: declined on AGENTS.md's licence line. Declared shapes, call
+order and descriptors are observation; the body of a method is how it
+implements something. Two independent agents reached that boundary on
+2026-08-27 and both stopped at it rather than crossing it.
+
 ## Open: the canvas goes black when a TextBox focuses IN AN EXPERIENCE
 
 **Reproduced, characterised, not fixed.** This is the top open bug and the

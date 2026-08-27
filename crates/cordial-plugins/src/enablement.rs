@@ -39,7 +39,12 @@ pub fn path_in(profile_dir: &Path) -> PathBuf {
 /// A missing or malformed file reads as "no opinions recorded", the same way
 /// `grants::load` treats one. The consequence differs in direction and is
 /// deliberate: a grants file that will not parse denies everything, and an
-/// enablement file that will not parse enables everything. Neither is a
+/// enablement file that will not parse falls back to each plugin's default —
+/// which is on for anything the user installed and **off** for anything in
+/// [`SHIPS_DISABLED`]. This paragraph said "enables everything" until
+/// 2026-08-28, which was true until `SHIPS_DISABLED` existed and has been wrong
+/// since; a plugin that ships switched off stays off through an unreadable
+/// file, and that is the direction it should stay. Neither is a
 /// fail-open — the grants file is still the thing that decides what a plugin can
 /// do, and it fails closed.
 pub fn load(path: &Path) -> BTreeMap<String, bool> {
@@ -49,7 +54,14 @@ pub fn load(path: &Path) -> BTreeMap<String, bool> {
     match serde_json::from_str(&text) {
         Ok(map) => map,
         Err(e) => {
-            println!("  plugins: {} is not usable ({e}); treating every plugin as enabled", path.display());
+            // Says what actually happens rather than what this used to do.
+            // "Every plugin as enabled" would send somebody whose fps-flex did
+            // not start looking at a file that is not the reason.
+            println!(
+                "  plugins: {} is not usable ({e}); no opinions recorded, so each plugin \
+                 falls back to its own default",
+                path.display()
+            );
             BTreeMap::new()
         }
     }

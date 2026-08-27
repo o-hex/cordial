@@ -173,10 +173,25 @@ pub fn available() -> Sandbox {
 /// can enforce.
 ///
 /// The confinement is deliberately severe, because a plugin has no legitimate
-/// use for any of it: no network, no writable filesystem, no session bus, no
-/// access to the user's home. The entry module is bound read-only, and `/tmp` is
-/// a private empty tmpfs rather than the host's — a plugin that writes there is
-/// writing into something that vanishes with it.
+/// use for any of it: no network, no writable filesystem, no session bus. The
+/// entry module is bound read-only, and `/tmp` is a private empty tmpfs rather
+/// than the host's — a plugin that writes there is writing into something that
+/// vanishes with it.
+///
+/// **This used to say "no access to the user's home", and that was not true.**
+/// [`interpreter`] binds the interpreter's enclosing prefix read-only, because a
+/// versioned install keeps its shared libraries a level up from the binary, and
+/// nothing caps that bind to somewhere outside `$HOME`. Where `deno` lives
+/// decides what a plugin can read: `/home/linuxbrew/.linuxbrew/Cellar/deno/…`
+/// binds Linuxbrew's prefix and nothing of the user's, which is the arrangement
+/// on this machine — but `~/.local/bin/deno` binds `~/.local`, and that contains
+/// `~/.local/share/cordial/profiles/` with the session token in it.
+///
+/// It is read-only in every case, and the reachable set is the interpreter's
+/// prefix rather than the home directory. Narrowing the bind is the fix, and it
+/// wants doing; until then the honest sentence is this one, because a comment
+/// promising an isolation the code does not provide is the shape somebody
+/// reasons about a plugin's reach from and gets wrong.
 ///
 /// `--die-with-parent` is not decoration: without it a sandboxed plugin outlives
 /// a Cordial that crashed, holding a pipe nothing reads.

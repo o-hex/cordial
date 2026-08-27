@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -730,6 +731,90 @@ long cordial_game_activity_init(void* fn, const char* internal_path, const char*
 
 extern "C" {
 
+/// Whether to skip half of the AGDK sequence below, and why either would be.
+///
+/// **Two working references say this path is not the one the engine expects.**
+/// Roblox's own Android build does not take it: `EnableGameActivity8` resolves
+/// to false in `docs/traces/waydroid-roblox-startup.log.gz:626`, and across all
+/// 2432 lines of that capture no GameActivity native is called even once. And
+/// mocktail defaults all three of its equivalent switches off, with its
+/// authors' reason written beside them at `src/legacy/legacy_runtime.cc:2867`
+/// (Apache-2.0): the glue "currently stalls V2 init on surface flags", and the
+/// lifecycle callbacks "can block on `android_app_set_activity_state` in some
+/// Linux shims". Read there; the switches here are ours.
+///
+/// What makes that worth a switch rather than a note is that Cordial delivers
+/// the surface through the app bridge as well -- `appbridge_start_app` and
+/// both `UpdateSurface...WithPlatformParams` calls, at `load.rs:3849-3899` --
+/// so by the time the calls below run, the engine has already been told about
+/// this surface twice. These drop each half of the third delivery, separately,
+/// because a startup that wedges 80% of the time on a signed-in profile is the
+/// symptom mocktail describes and nobody here has ever run the arm without it.
+///
+/// **Not to be confused with `CORDIAL_SKIP_AGDK`**, which is a far larger
+/// switch: it drops `initializeNativeCode` too, and that is what brings the
+/// TaskScheduler up. The engine will not load flags behind a live scheduler,
+/// so that path dies on `Can't initialize the TaskScheduler before flags have
+/// been loaded` about half a second in -- measured three times out of three on
+/// 2026-08-27, and explained in `docs/analysis/flag-init.md` 19.1 long before
+/// that. These two leave all of it alone and change nothing but the calls.
+///
+/// Both default off, so every reading taken before 2026-08-27 still describes
+/// the build it was taken on.
+static bool skip_agdk_surface()
+{
+    static const bool skip = getenv("CORDIAL_SKIP_AGDK_SURFACE") != nullptr;
+    return skip;
+}
+
+static bool skip_agdk_lifecycle()
+{
+    static const bool skip = getenv("CORDIAL_SKIP_AGDK_LIFECYCLE") != nullptr;
+    return skip;
+}
+
+/// The lifecycle half, split where AGDK itself splits it.
+///
+/// Measured 2026-08-27, fifteen runs an arm interleaved against fifteen
+/// controls on a signed-in profile: skipping all three lifecycle natives took
+/// the present-freeze from 9/15 to 2/15, Fisher one-tailed p = 0.011. That is
+/// the first intervention that has ever moved this bug rather than described
+/// it.
+///
+/// It is not a fix, and these two exist because of what else that arm did.
+/// Counting every shape of stall rather than the survey's threshold it was
+/// 4/15 against 9/15, p = 0.14, and two of those runs were a failure the
+/// control never produced once -- stuck on the Startup screen past a hundred
+/// seconds while presenting twenty-six thousand frames. The engine also
+/// stopped logging `StartupController started: stage` in all fifteen, against
+/// four of fifteen controls. Something real changed and not all of it was an
+/// improvement.
+///
+/// The split is where the mechanism is. `onStartNative` and `onResumeNative`
+/// reach `android_app_set_activity_state`, which writes its command and then
+/// **blocks on a condition variable until the engine's own loop acknowledges
+/// it**; `onWindowFocusChangedNative` writes and returns. mocktail names that
+/// function specifically (`legacy_runtime.cc:2872`, Apache-2.0). A wait for an
+/// acknowledgement that never comes is the shape of every capture taken of
+/// this freeze: nine events delivered on the command pipe, a tenth that never
+/// arrives, and the write end of that pipe open in the same process.
+///
+/// So these two arms answer different questions. `CORDIAL_SKIP_AGDK_STATE`
+/// drops only the pair that can block. `CORDIAL_SKIP_AGDK_FOCUS` drops only
+/// the one that cannot, and is the control for it -- if the freeze moves when
+/// focus alone goes, the blocking-ack account is wrong and should be dropped.
+static bool skip_agdk_state()
+{
+    static const bool skip = getenv("CORDIAL_SKIP_AGDK_STATE") != nullptr;
+    return skip || skip_agdk_lifecycle();
+}
+
+static bool skip_agdk_focus()
+{
+    static const bool skip = getenv("CORDIAL_SKIP_AGDK_FOCUS") != nullptr;
+    return skip || skip_agdk_lifecycle();
+}
+
 /// Drive the Activity lifecycle and hand the engine its surface.
 ///
 /// Android's order is onCreate, onStart, onResume, then the surface callbacks as
@@ -778,45 +863,66 @@ int cordial_game_activity_start(long handle, int width, int height, int format,
         using SurfaceFn = void (*)(JNIEnv*, jobject, jlong, jobject);
         using SurfaceChangedFn = void (*)(JNIEnv*, jobject, jlong, jobject, jint, jint, jint);
 
+        // Say which arm this run is, unconditionally and on stdout, because an
+        // arm that silently did nothing has cost this project a day three times
+        // -- see the survey script's header on its two dead NUDGE arms. A
+        // harness can grep this line to prove the switch engaged rather than
+        // assuming it from the environment it thinks it set.
+        std::printf("  agdk natives: state=%s focus=%s surface=%s\n",
+                    skip_agdk_state() ? "skipped" : "on",
+                    skip_agdk_focus() ? "skipped" : "on",
+                    skip_agdk_surface() ? "skipped" : "on");
+        std::fflush(stdout);
+
         // Lifecycle first: the engine builds its renderer on resume and ignores a
         // surface that arrives before it is ready for one.
-        if (auto f = native("onStartNative")) {
-            reinterpret_cast<HandleOnly>(f)(jni, jactivity, (jlong)handle);
-        }
-        if (auto f = native("onResumeNative")) {
-            reinterpret_cast<HandleOnly>(f)(jni, jactivity, (jlong)handle);
-        }
-
-        auto created = native("onSurfaceCreatedNative");
-        if (!created) {
-            snprintf(err, err_len, "onSurfaceCreatedNative was never registered");
-            return -1;
-        }
-        reinterpret_cast<SurfaceFn>(created)(jni, jactivity, (jlong)handle, jsurface);
-
-        // Size and format come after creation; this is what tells the engine how
-        // big its framebuffers have to be.
-        if (auto f = native("onSurfaceChangedNative")) {
-            reinterpret_cast<SurfaceChangedFn>(f)(jni, jactivity, (jlong)handle, jsurface,
-                                                  (jint)format, (jint)width, (jint)height);
+        if (!skip_agdk_state()) {
+            if (auto f = native("onStartNative")) {
+                reinterpret_cast<HandleOnly>(f)(jni, jactivity, (jlong)handle);
+            }
+            if (auto f = native("onResumeNative")) {
+                reinterpret_cast<HandleOnly>(f)(jni, jactivity, (jlong)handle);
+            }
         }
 
-        // The content rectangle, which on Android arrives from the view layout
-        // pass. Nothing here performs one, so the engine would never be told
-        // where inside the window it is allowed to draw.
-        using RectFn = void (*)(JNIEnv*, jobject, jlong, jint, jint, jint, jint);
-        if (auto f = native("onContentRectChangedNative")) {
-            reinterpret_cast<RectFn>(f)(jni, jactivity, (jlong)handle, 0, 0, (jint)width,
-                                        (jint)height);
+        if (!skip_agdk_surface()) {
+            auto created = native("onSurfaceCreatedNative");
+            if (!created) {
+                snprintf(err, err_len, "onSurfaceCreatedNative was never registered");
+                return -1;
+            }
+            reinterpret_cast<SurfaceFn>(created)(jni, jactivity, (jlong)handle, jsurface);
+
+            // Size and format come after creation; this is what tells the engine how
+            // big its framebuffers have to be.
+            if (auto f = native("onSurfaceChangedNative")) {
+                reinterpret_cast<SurfaceChangedFn>(f)(jni, jactivity, (jlong)handle, jsurface,
+                                                      (jint)format, (jint)width, (jint)height);
+            }
+
+            // The content rectangle, which on Android arrives from the view layout
+            // pass. Nothing here performs one, so the engine would never be told
+            // where inside the window it is allowed to draw.
+            using RectFn = void (*)(JNIEnv*, jobject, jlong, jint, jint, jint, jint);
+            if (auto f = native("onContentRectChangedNative")) {
+                reinterpret_cast<RectFn>(f)(jni, jactivity, (jlong)handle, 0, 0, (jint)width,
+                                            (jint)height);
+            }
         }
 
         // Focus, last, and it matters more than it looks. An Android game that
         // has never been told it has the window renders as if it were in the
         // background — which is what about one frame per second is. Cordial
         // drove the lifecycle up to onResume and then never sent this.
+        //
+        // Grouped with the lifecycle half rather than the surface half because
+        // that is what it is, and because dropping it alone is how you get the
+        // one-frame-a-second reading back.
         using FocusFn = void (*)(JNIEnv*, jobject, jlong, jboolean);
-        if (auto f = native("onWindowFocusChangedNative")) {
-            reinterpret_cast<FocusFn>(f)(jni, jactivity, (jlong)handle, JNI_TRUE);
+        if (!skip_agdk_focus()) {
+            if (auto f = native("onWindowFocusChangedNative")) {
+                reinterpret_cast<FocusFn>(f)(jni, jactivity, (jlong)handle, JNI_TRUE);
+            }
         }
         return 0;
     } catch (const std::exception& e) {

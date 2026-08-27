@@ -18,12 +18,35 @@
 // presentation makes the GPU work as hard as it can for frames nobody asked
 // for, which on a laptop is heat and battery. A plugin that shipped enabled
 // would change how somebody's machine behaves without their having chosen it.
+//
+// ## This file did nothing at all until 2026-08-28
+//
+// Both of the calls it made were wrong, and neither failure was visible. It
+// asked for `settings.read`, which is a *capability* name and not a method —
+// the method is `settings.get` — and it sent `flags.set` a `{key, value}` pair
+// when the handler requires `{values: {...}}`. So the present mode was never
+// written, on any machine, for the whole time this shipped as a built-in
+// plugin that Settings advertises by name.
+//
+// Nothing caught it because nothing ran it: the plugin tests in
+// `crates/cordial-plugins` drive `host::Session`, which the client never
+// constructs, and the host the client does run is
+// `crates/cordial-runtime/src/plugin_host.rs`. `plugin_call_shapes.rs` now
+// checks every method these shipped plugins name against the one closed table
+// both hosts agree on, which is the half of this that a test can hold.
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 let nextId = 1;
 const pending = new Map<number, (r: any) => void>();
+
+// **A push is not a reply, and a dispatcher that cannot tell them apart loses
+// every event.** A reply carries `status` and the `id` it answers; a push
+// carries `event` and no id, so `pending.get(res.id)` on a push looks up
+// `undefined`, finds nothing, and drops it silently. That is how the handshake
+// below used to vanish. Copy this shape rather than the lookup-only one.
+let onPush: (p: { event: string; payload: any }) => void = () => {};
 
 (async () => {
   let buf = "";
@@ -34,9 +57,13 @@ const pending = new Map<number, (r: any) => void>();
       const line = buf.slice(0, i);
       buf = buf.slice(i + 1);
       if (!line.trim()) continue;
-      const res = JSON.parse(line);
-      pending.get(res.id)?.(res);
-      pending.delete(res.id);
+      const msg = JSON.parse(line);
+      if (typeof msg.id === "number" && pending.has(msg.id)) {
+        pending.get(msg.id)!(msg);
+        pending.delete(msg.id);
+      } else if (typeof msg.event === "string") {
+        onPush(msg);
+      }
     }
   }
 })();
@@ -50,9 +77,11 @@ function call(method: string, params: unknown = {}): Promise<any> {
 
 const log = (message: string) => call("log.write", { message });
 
-// The spellings Cordial's own parser accepts. Kept here so a typo in settings
-// is refused by the plugin with a list, rather than reaching the flag layer and
-// being reported as an unreadable setting from somewhere the user cannot see.
+// The spellings `parse_present_mode` in `android/vulkan.rs` accepts, and the
+// same set the manifest offers as a preferences page. Kept here so a value that
+// somehow reached the document without going through the page is refused by
+// this plugin with a list, rather than reaching the flag layer and being
+// reported as an unreadable setting from somewhere the user cannot see.
 const MODES = [
   "uncapped",
   "mailbox",
@@ -69,30 +98,72 @@ const MODES = [
 // advertises.
 const DEFAULT_MODE = "uncapped";
 
-const settings = await call("settings.read");
-let mode = DEFAULT_MODE;
+// Cordial pushes `cordial/init` before the plugin has asked for anything,
+// carrying this plugin's settings document and the answers to the preferences
+// its manifest declares. Waiting for it costs no round trip, which is the point
+// of the handshake — but waiting *forever* would mean a host that stopped
+// sending it turned this plugin into a process that starts and never speaks.
+// So: a short wait, then ask.
+function waitForInit(ms: number): Promise<any | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    onPush = (p) => {
+      if (p.event !== "cordial/init") return;
+      clearTimeout(timer);
+      onPush = () => {};
+      resolve(p.payload ?? null);
+    };
+  });
+}
 
-if (settings.status === "ok" && settings.result && typeof settings.result.mode === "string") {
-  const wanted = settings.result.mode.trim().toLowerCase();
-  if (MODES.includes(wanted)) {
-    mode = wanted;
+const init = await waitForInit(2000);
+let answers = init?.preferences ?? null;
+
+if (answers === null || typeof answers !== "object") {
+  // No handshake, or a handshake that carried nothing — which is what a
+  // Cordial with no open profile sends. Ask, and let the refusal be reported
+  // rather than read as "the user chose the default".
+  const got = await call("preferences.get");
+  if (got.status === "ok") {
+    answers = got.result;
   } else {
-    // Said rather than silently corrected. A setting that looks applied and is
-    // not is the failure this project keeps finding in its own code, and it is
-    // no better in a plugin.
     await log(
-      `settings.mode is "${settings.result.mode}", which is not one of ` +
-        `${MODES.join(", ")}. Using ${DEFAULT_MODE}.`,
+      `could not read your preferences: ${got.status}` +
+        (got.capability ? ` (needs ${got.capability})` : "") +
+        (got.message ? ` (${got.message})` : "") +
+        `. Using ${DEFAULT_MODE}.`,
     );
+    answers = {};
   }
 }
 
-const set = await call("flags.set", { key: "CordialPresentMode", value: mode });
+let mode = DEFAULT_MODE;
+const wanted = typeof answers.mode === "string" ? answers.mode.trim().toLowerCase() : "";
+
+if (wanted && MODES.includes(wanted)) {
+  mode = wanted;
+} else if (wanted) {
+  // Said rather than silently corrected. A setting that looks applied and is
+  // not is the failure this project keeps finding in its own code, and it is
+  // no better in a plugin.
+  await log(
+    `mode is "${answers.mode}", which is not one of ${MODES.join(", ")}. ` +
+      `Using ${DEFAULT_MODE}.`,
+  );
+}
+
+// `{values: {...}}`, which is what `plugin_host.rs`'s `flags.set` requires —
+// it refuses anything else with "flags.set needs a values object", and this
+// file spent its entire shipped life collecting that refusal without reporting
+// it, because it never checked.
+const set = await call("flags.set", {
+  values: { CordialPresentMode: mode },
+});
 
 if (set.status === "ok") {
   await log(
     `present mode set to ${mode}. The engine asks for FIFO; this asks Cordial ` +
-      `for something else when the driver has it.`,
+      `for something else when the driver has it. Takes effect at the next launch.`,
   );
 } else {
   // Including the capability, because "denied" without saying what was needed
@@ -100,6 +171,7 @@ if (set.status === "ok") {
   await log(
     `could not set the present mode: ${set.status}` +
       (set.capability ? ` (needs ${set.capability})` : "") +
+      (set.message ? ` (${set.message})` : "") +
       `. The frame rate is whatever the engine asked for.`,
   );
 }

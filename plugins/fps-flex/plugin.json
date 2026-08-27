@@ -1,11 +1,28 @@
 {
   "id": "fps-flex",
   "name": "FPS Flex",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "entry": "main.ts",
   "capabilities": [
     "flags.write",
     "settings.read",
     "log"
+  ],
+  "preferences": [
+    {
+      "key": "mode",
+      "title": "Presentation",
+      "description": "How Cordial asks Vulkan to present frames. Uncapped prefers mailbox where the driver offers it, and falls back to immediate. Leave it on Uncapped unless you are chasing tearing or battery.",
+      "type": "choice",
+      "default": "uncapped",
+      "options": [
+        { "value": "uncapped", "label": "Uncapped (mailbox, else immediate)" },
+        { "value": "mailbox", "label": "Mailbox" },
+        { "value": "immediate", "label": "Immediate (may tear)" },
+        { "value": "fifo", "label": "Locked to the display (what the engine asks for)" },
+        { "value": "fifo-relaxed", "label": "Locked, relaxed" },
+        { "value": "off", "label": "Do not touch it" }
+      ]
+    }
   ]
 }

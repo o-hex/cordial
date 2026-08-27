@@ -26,9 +26,16 @@ const pending = new Map<number, (r: any) => void>();
       const line = buf.slice(0, i);
       buf = buf.slice(i + 1);
       if (!line.trim()) continue;
-      const res = JSON.parse(line);
-      pending.get(res.id)?.(res);
-      pending.delete(res.id);
+      const msg = JSON.parse(line);
+      // A reply carries `status` and the `id` it answers; a push carries
+      // `event` and no id. Looking every line up in `pending` discards every
+      // push silently, which is a plugin that subscribes to events and never
+      // hears one. This plugin subscribes to nothing, and the split is here
+      // anyway because this file is the one people copy.
+      if (typeof msg.id === "number" && pending.has(msg.id)) {
+        pending.get(msg.id)!(msg);
+        pending.delete(msg.id);
+      }
     }
   }
 })();
@@ -55,6 +62,14 @@ if (flags.status !== "ok") {
 
 // Requested flags.read but not flags.write, so this must come back denied.
 // Included so the boundary is visible in the output rather than only in a test.
-const refused = await call("flags.set", { key: "FFlagAnything", value: "true" });
+//
+// `{values: {...}}` is the shape `flags.set` actually takes. The refusal would
+// arrive either way -- the broker checks the capability before the handler ever
+// looks at the params -- but this file is an example, and an example that
+// teaches the wrong shape while still appearing to work is worse than one that
+// fails. It shipped with `{key, value}` until 2026-08-28; `fps-flex` had the
+// same mistake where the call was meant to succeed, and did nothing for its
+// whole shipped life as a result.
+const refused = await call("flags.set", { values: { FFlagAnything: "true" } });
 await log(`writing a flag came back: ${refused.status}` +
   (refused.capability ? ` (needs ${refused.capability})` : ""));

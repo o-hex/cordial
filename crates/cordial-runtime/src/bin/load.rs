@@ -3412,6 +3412,28 @@ fn main() -> ExitCode {
                                                 "Java_com_roblox_engine_jni_NativeInputInterface_nativeGetMainWindowIsMouseLockedCenter",
                                             ).unwrap_or(std::ptr::null_mut());
                                             cordial_runtime::android::input::set_mouse_lock_native(ml);
+                                            // The finger counterpart to
+                                            // nativePassMouseButton, and a
+                                            // native Cordial had never called
+                                            // because it had never had a
+                                            // `wl_touch` to call it from. Its
+                                            // descriptor `(IFFIII)V` is read
+                                            // out of this build's dex; what
+                                            // its three action values mean is
+                                            // still INFERRED -- see
+                                            // `input::TOUCH_DOWN`.
+                                            let pi = lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeInputInterface_nativePassInput",
+                                            ).unwrap_or(std::ptr::null_mut());
+                                            cordial_runtime::android::input::set_pass_input_native(pi);
+                                            println!(
+                                                "  input: nativePassInput {}",
+                                                if pi.is_null() {
+                                                    "NOT exported; touch reaches AGDK only"
+                                                } else {
+                                                    "resolved"
+                                                }
+                                            );
                                             // The other native on this
                                             // interface Cordial reads rather
                                             // than writes: where the focused

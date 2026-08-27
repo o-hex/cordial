@@ -539,12 +539,14 @@ const WL_SURFACE_COMMIT: u32 = 6;
 const WL_SURFACE_SET_OPAQUE_REGION: u32 = 4;
 const WL_SEAT_GET_POINTER: u32 = 0;
 const WL_SEAT_GET_KEYBOARD: u32 = 1;
+const WL_SEAT_GET_TOUCH: u32 = 2;
 
 /// `wl_seat.capabilities` bits.
 const WL_SEAT_CAPABILITY_POINTER: u32 = 1;
 const WL_SEAT_CAPABILITY_KEYBOARD: u32 = 2;
+const WL_SEAT_CAPABILITY_TOUCH: u32 = 4;
 
-/// What the seat said it has, filled in by [`seat_capabilities`] before either
+/// What the seat said it has, filled in by [`seat_capabilities`] before any
 /// device is asked for.
 static SEAT_CAPS: AtomicU32 = AtomicU32::new(0);
 
@@ -558,8 +560,64 @@ struct SeatListener {
     name: unsafe extern "C" fn(*mut c_void, *mut c_void, *const std::ffi::c_char),
 }
 
-unsafe extern "C" fn seat_capabilities(_data: *mut c_void, _seat: *mut c_void, caps: u32) {
-    SEAT_CAPS.store(caps, Ordering::SeqCst);
+/// `wl_seat.capabilities`, which arrives once during `open`'s roundtrip and
+/// again whenever the seat's set of devices changes.
+///
+/// **The later ones are the point.** This used to store and stop, and `open`
+/// read the atomic exactly once to decide which devices to ask for -- so a
+/// touchscreen (or a mouse, or a keyboard) plugged in after startup updated a
+/// number nothing looked at again, and was silently ignored for the life of the
+/// session. Touch is where that stops being theoretical: a tablet whose
+/// keyboard cover is folded back, or a screen on a USB-C dock, arrives long
+/// after the window is up.
+///
+/// Only touch is picked up late here, and that is a stated limit rather than an
+/// oversight. Binding a `wl_pointer` from this callback would mean the pointer
+/// listener, the enter/leave canvas tracking and the pointer-lock objects all
+/// coming into existence halfway through a frame, and `open` currently owns
+/// that whole graph; a keyboard means an xkb state to build from a keymap event
+/// that has not arrived. Touch needs one proxy and one listener, and nothing
+/// downstream of it caches a null. So: **a touchscreen connected after startup
+/// works, a mouse or keyboard connected after startup still does not**, and the
+/// line printed below is how a user finds that out rather than wondering.
+unsafe extern "C" fn seat_capabilities(_data: *mut c_void, seat: *mut c_void, caps: u32) {
+    let previous = SEAT_CAPS.swap(caps, Ordering::SeqCst);
+    if previous == caps {
+        return;
+    }
+    // `current()` is `None` for the first of these events, which arrives inside
+    // `open`'s own roundtrip before the window is published -- and that is the
+    // one case that needs no help, because `open` reads the atomic immediately
+    // afterwards and binds from it.
+    let _ = seat;
+    let Some(w) = current() else { return };
+    if caps & WL_SEAT_CAPABILITY_TOUCH != 0 {
+        w.bind_touch();
+        // Reported for consistency and not because anything reads it: the
+        // engine took `isTouchDevice` during startup and this build exposes no
+        // native by which a platform revises it. Said plainly here rather than
+        // left to be discovered -- a touchscreen plugged in now works as an
+        // input device and is invisible as a declared one. See
+        // `input::report_touchscreen`.
+        super::input::report_touchscreen(true);
+    }
+    // A withdrawn touch capability leaves the `wl_touch` object in place, and
+    // that is a stated limit rather than a considered release policy:
+    // `wl_touch.release` arrives in `wl_seat` version 3 and this file binds the
+    // seat at 1, so there is no request to send and no `wl_proxy_destroy`
+    // wired here. A screen unplugged and plugged back in therefore reuses the
+    // same object. Whether a compositor resumes delivering to it is **not
+    // tested** -- nobody here has a touchscreen to unplug -- and if one does
+    // not, touch would stay dead until the client restarts.
+    //
+    // What must not be left in place is the engine's idea of what is on the
+    // glass, so anything still down is cancelled. A contact nothing ever closes
+    // is a finger the engine believes is held for the rest of the session.
+    else if previous & WL_SEAT_CAPABILITY_TOUCH != 0 {
+        eprintln!("[android] wayland: the seat withdrew its touch capability");
+        let (cw, ch, _) = w.geometry();
+        super::input::touch_cancel(w.active_handle.load(Ordering::Relaxed), (cw, ch), w.now_ms());
+    }
 }
 
 unsafe extern "C" fn seat_name(_data: *mut c_void, _seat: *mut c_void, _name: *const std::ffi::c_char) {}
@@ -616,6 +674,7 @@ struct WlClient {
     seat_interface: *const WlInterface,
     pointer_interface: *const WlInterface,
     keyboard_interface: *const WlInterface,
+    touch_interface: *const WlInterface,
 }
 // SAFETY: every field is either a function pointer (inherently `Send + Sync`
 // — it is a code address, not aliased state) or a pointer into a host shared
@@ -709,6 +768,7 @@ impl WlClient {
             seat_interface: sym!("wl_seat_interface"),
             pointer_interface: sym!("wl_pointer_interface"),
             keyboard_interface: sym!("wl_keyboard_interface"),
+            touch_interface: sym!("wl_touch_interface"),
         })
     }
 }
@@ -838,6 +898,29 @@ struct WlArray {
     size: usize,
     alloc: usize,
     data: *mut c_void,
+}
+
+/// `wl_touch`'s events. **Seven slots, though `wl_seat` is bound at version 1
+/// and version 1 of `wl_touch` has five.**
+///
+/// The reasoning is `PointerListener`'s, and it is the same measured crash:
+/// `dispatch_event` indexes this array by the wire opcode with no bounds check
+/// of its own, `wl_touch_interface` is `dlsym`'d from the host's real
+/// `libwayland-client.so` and so declares whatever event count *that* library
+/// was built with, and a listener shorter than the interface is a jump through
+/// whatever follows it in memory -- which on `xdg_toplevel` came out as address
+/// `0xe0`. `shape` and `orientation` are version 6 and will not be delivered to
+/// an object this file can create today; the slots exist so that the day they
+/// are, nothing jumps.
+#[repr(C)]
+struct TouchListener {
+    down: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void, i32, i32, i32),
+    up: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32, i32),
+    motion: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, i32, i32, i32),
+    frame: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    cancel: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    shape: unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32, i32),
+    orientation: unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32),
 }
 
 #[repr(C)]
@@ -1004,7 +1087,9 @@ pub struct WaylandWindow {
     /// surface `wl_keyboard`/`wl_pointer` report focus against for everything
     /// that is not the canvas.
     parent_surface: *mut c_void,
-    #[allow(dead_code)]
+    /// The seat itself, kept because a device can still be asked for after
+    /// `open` has returned -- see [`WaylandWindow::bind_touch`], which is what
+    /// makes a touchscreen plugged in mid-session work.
     seat: *mut c_void,
     #[allow(dead_code)]
     pointer: *mut c_void,
@@ -1014,6 +1099,16 @@ pub struct WaylandWindow {
     capture_pointer: *mut c_void,
     #[allow(dead_code)]
     keyboard: *mut c_void,
+    /// The seat's `wl_touch`, or null on a seat with no touchscreen.
+    ///
+    /// An atomic rather than a plain pointer like `pointer` and `keyboard`
+    /// beside it, because this is the one device that can appear *after*
+    /// `open` has finished: [`seat_capabilities`] binds it from a later
+    /// `capabilities` event, by which time `WaylandWindow` is behind a
+    /// `OnceLock` and immutable. Read only to answer "have we got one already",
+    /// so `Relaxed` is enough -- every write happens on the pump thread, which
+    /// is also the only reader.
+    touch: std::sync::atomic::AtomicPtr<c_void>,
     text_input: *mut c_void,
     /// `zwp_pointer_constraints_v1`, or null on a compositor that has none.
     /// Null is not an error: everything except pointer capture works without
@@ -1517,6 +1612,37 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         eprintln!("[android] wayland: the seat advertises no keyboard; running without one");
         std::ptr::null_mut()
     };
+    // The touchscreen, on the same terms and for the same protocol reason:
+    // `wl_seat.get_touch` on a seat with no touch capability is a
+    // `missing_capability` error and the compositor answers it by disconnecting
+    // the client. The capability check is not politeness.
+    //
+    // Bound here but *listened to* below, alongside the pointer and keyboard
+    // listeners, because `bind_touch` -- which is what a hot-plugged screen
+    // goes through -- needs the window to exist and this does not yet.
+    let touch = if caps & WL_SEAT_CAPABILITY_TOUCH != 0 && !super::input::no_touch() {
+        unsafe {
+            (wl.marshal_flags)(seat, WL_SEAT_GET_TOUCH, wl.touch_interface, 1, 0, std::ptr::null_mut::<c_void>())
+        }
+    } else {
+        // Worth saying out loud in both directions. A machine with no
+        // touchscreen is the ordinary case and this line is how a developer
+        // reading a log knows the touch path was never exercised rather than
+        // exercised and broken -- which is the ambiguity that made the keyboard
+        // take days.
+        if super::input::no_touch() {
+            eprintln!("[android] wayland: CORDIAL_NO_TOUCH=1; not asking the seat for a touchscreen");
+        } else {
+            eprintln!("[android] wayland: the seat advertises no touchscreen; running without one");
+        }
+        std::ptr::null_mut()
+    };
+    // What the engine will be told about this machine, decided here because
+    // here is where the seat's answer exists and because `open()` runs before
+    // `cordial_appbridge_init` builds the params. `report_touchscreen` owns
+    // what `CORDIAL_INPUT_TOUCH` and `CORDIAL_NO_TOUCH` do to the seat's
+    // answer; this only supplies the answer.
+    super::input::report_touchscreen(caps & WL_SEAT_CAPABILITY_TOUCH != 0);
 
     // ---- pointer capture. Both halves are optional and independent of each
     // other only in principle: a lock with no relative pointer is a pointer
@@ -1619,6 +1745,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         pointer,
         capture_pointer,
         keyboard,
+        touch: std::sync::atomic::AtomicPtr::new(touch),
         text_input: text_input.unwrap_or(std::ptr::null_mut()),
         pointer_constraints,
         relative_pointer: relative_pointer.unwrap_or(std::ptr::null_mut()),
@@ -1703,6 +1830,10 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         }
         if !keyboard.is_null() {
             (host.wl.add_listener)(keyboard, &KEYBOARD_LISTENER as *const KeyboardListener as *const c_void, std::ptr::null_mut());
+        }
+        if !touch.is_null() {
+            (host.wl.add_listener)(touch, &TOUCH_LISTENER as *const TouchListener as *const c_void, std::ptr::null_mut());
+            println!("[android] wayland: the seat has a touchscreen; wl_touch bound");
         }
         if !host.relative_pointer.is_null() {
             (host.wl.add_listener)(
@@ -2578,7 +2709,7 @@ impl WaylandWindow {
         let action =
             if buttons != 0 { super::input::ACTION_MOVE } else { super::input::ACTION_HOVER_MOVE };
         if handle != 0 {
-            super::input::deliver_touch(handle, action, x, y, buttons, 0, now, down_time);
+            super::input::deliver_mouse(handle, action, x, y, buttons, 0, now, down_time);
         }
         super::input::pass_mouse_move(x, y);
     }
@@ -2625,8 +2756,8 @@ impl WaylandWindow {
             let buttons = self.pointer_buttons.load(Ordering::Relaxed);
             let down_time = self.down_time_ms.load(Ordering::Relaxed);
             if handle != 0 {
-                super::input::deliver_touch(handle, super::input::ACTION_DOWN, x, y, buttons, 0, now, down_time);
-                super::input::deliver_touch(
+                super::input::deliver_mouse(handle, super::input::ACTION_DOWN, x, y, buttons, 0, now, down_time);
+                super::input::deliver_mouse(
                     handle, super::input::ACTION_BUTTON_PRESS, x, y, buttons, android_button, now, down_time,
                 );
             }
@@ -2635,10 +2766,10 @@ impl WaylandWindow {
             let buttons = self.pointer_buttons.load(Ordering::Relaxed);
             let down_time = self.down_time_ms.load(Ordering::Relaxed);
             if handle != 0 {
-                super::input::deliver_touch(
+                super::input::deliver_mouse(
                     handle, super::input::ACTION_BUTTON_RELEASE, x, y, buttons, android_button, now, down_time,
                 );
-                super::input::deliver_touch(handle, super::input::ACTION_UP, x, y, buttons, 0, now, down_time);
+                super::input::deliver_mouse(handle, super::input::ACTION_UP, x, y, buttons, 0, now, down_time);
             }
         }
 
@@ -2838,6 +2969,162 @@ static POINTER_LISTENER: PointerListener = PointerListener {
     axis_value120: pointer_axis_value120,
     axis_relative_direction: pointer_axis_relative_direction,
 };
+
+// -------------------------------------------------------------------- touch
+//
+// `wl_touch`, which had never been bound at all: `grep wl_touch` over this
+// tree returned nothing before this, so a touchscreen was not partially
+// supported or mismapped, it was invisible. Everything above the wire lives in
+// `android::input` -- pointer ids, the packed `ACTION_POINTER_DOWN` index, both
+// natives -- and this section is only the part that is genuinely Wayland: which
+// surface a contact landed on, and the fixed-point conversion.
+//
+// **There is deliberately no "is this contact ours" table here.** A contact
+// that went down on GTK's toplevel is simply not forwarded, so the tracker in
+// `input.rs` has never heard of its id and drops the `motion` and `up` that
+// follow on their own -- which is the same guard, in the one place that already
+// has to have it, rather than a second copy that can disagree with the first.
+
+unsafe extern "C" fn touch_down(
+    _data: *mut c_void,
+    _touch: *mut c_void,
+    _serial: u32,
+    _time: u32,
+    surface: *mut c_void,
+    id: i32,
+    x: i32,
+    y: i32,
+) {
+    let Some(w) = current() else { return };
+    // Filtered by surface exactly as `pointer_enter` is, and for the same
+    // reason: Cordial's devices sit on the seat GDK also has devices on, so a
+    // finger on the header bar or the close button arrives here too.
+    if !std::ptr::eq(surface, w.surface) {
+        return;
+    }
+    let (cw, ch, _) = w.geometry();
+    super::input::touch_down(
+        w.active_handle.load(Ordering::Relaxed),
+        id as i64,
+        fixed_to_f32(x),
+        fixed_to_f32(y),
+        (cw, ch),
+        w.now_ms(),
+    );
+}
+
+unsafe extern "C" fn touch_up(_data: *mut c_void, _touch: *mut c_void, _serial: u32, _time: u32, id: i32) {
+    let Some(w) = current() else { return };
+    let (cw, ch, _) = w.geometry();
+    super::input::touch_up(w.active_handle.load(Ordering::Relaxed), id as i64, (cw, ch), w.now_ms());
+}
+
+unsafe extern "C" fn touch_motion(
+    _data: *mut c_void,
+    _touch: *mut c_void,
+    _time: u32,
+    id: i32,
+    x: i32,
+    y: i32,
+) {
+    let Some(w) = current() else { return };
+    let (cw, ch, _) = w.geometry();
+    super::input::touch_motion(
+        w.active_handle.load(Ordering::Relaxed),
+        id as i64,
+        fixed_to_f32(x),
+        fixed_to_f32(y),
+        (cw, ch),
+        w.now_ms(),
+    );
+}
+
+/// The end of one atomic group of touch events.
+///
+/// Empty, and that is a choice rather than an omission. Batching would mean
+/// holding every contact change until the frame and sending one `MotionEvent`
+/// for the lot, which is closer to what Android's InputReader does -- but the
+/// per-contact native this also drives has no batched form that anything here
+/// has established (`nativePassInputBatch([I[FIIII)V` exists in the dex and has
+/// never been called), so a batching implementation could only be tested on one
+/// of the two paths. Sending eagerly is correct on both and one event later at
+/// worst.
+unsafe extern "C" fn touch_frame(_data: *mut c_void, _touch: *mut c_void) {}
+
+/// The compositor has taken the sequence over -- an edge swipe, a system
+/// gesture -- and every contact is void.
+unsafe extern "C" fn touch_cancel(_data: *mut c_void, _touch: *mut c_void) {
+    let Some(w) = current() else { return };
+    let (cw, ch, _) = w.geometry();
+    super::input::touch_cancel(w.active_handle.load(Ordering::Relaxed), (cw, ch), w.now_ms());
+}
+
+// `shape`/`orientation` are `wl_touch` version 6 and cannot reach an object
+// created from a version 1 `wl_seat`. The slots exist because the listener
+// array is indexed by wire opcode with no bounds check -- see `TouchListener`
+// -- not because there is anything to do with an ellipse: `MotionEvent`'s
+// `AXIS_TOUCH_MAJOR`/`_MINOR` are not among the axes AGDK enables, so even a
+// delivered shape would have nowhere to go.
+unsafe extern "C" fn touch_shape(_data: *mut c_void, _touch: *mut c_void, _id: i32, _major: i32, _minor: i32) {}
+unsafe extern "C" fn touch_orientation(_data: *mut c_void, _touch: *mut c_void, _id: i32, _orientation: i32) {}
+
+static TOUCH_LISTENER: TouchListener = TouchListener {
+    down: touch_down,
+    up: touch_up,
+    motion: touch_motion,
+    frame: touch_frame,
+    cancel: touch_cancel,
+    shape: touch_shape,
+    orientation: touch_orientation,
+};
+
+impl WaylandWindow {
+    /// Ask the seat for a `wl_touch` and listen to it, unless there is one
+    /// already.
+    ///
+    /// Called from [`seat_capabilities`] when a touchscreen appears after
+    /// startup. The idempotence is the load-bearing part: `capabilities` fires
+    /// again for every unrelated change to the seat, and a second `get_touch`
+    /// would leave the first proxy listening as well, so every contact would be
+    /// delivered to the engine twice -- which is the shape of the bug
+    /// `CORDIAL_AGDK_KEY` exists to record, arriving by a different route.
+    fn bind_touch(&self) {
+        if super::input::no_touch() || !self.touch.load(Ordering::Relaxed).is_null() {
+            return;
+        }
+        // SAFETY: `self.seat` is the live `wl_seat` proxy `open` bound on this
+        // connection, and the capability has just been advertised -- which is
+        // the precondition `get_touch` has, and getting it wrong disconnects
+        // the client rather than returning null.
+        let touch = unsafe {
+            (self.wl.marshal_flags)(
+                self.seat,
+                WL_SEAT_GET_TOUCH,
+                self.wl.touch_interface,
+                1,
+                0,
+                std::ptr::null_mut::<c_void>(),
+            )
+        };
+        if touch.is_null() {
+            eprintln!("[android] wayland: wl_seat.get_touch returned nothing");
+            return;
+        }
+        // SAFETY: `touch` is the proxy just created, and `TOUCH_LISTENER` is a
+        // `'static` array of function pointers with one slot per event this
+        // interface can carry. See `TouchListener` for why the count matters.
+        unsafe {
+            (self.wl.add_listener)(
+                touch,
+                &TOUCH_LISTENER as *const TouchListener as *const c_void,
+                std::ptr::null_mut(),
+            );
+            (self.wl.flush)(self.display);
+        }
+        self.touch.store(touch, Ordering::Relaxed);
+        println!("[android] wayland: a touchscreen appeared on the seat; wl_touch bound");
+    }
+}
 
 // ----------------------------------------------------------- pointer capture
 //
@@ -3058,7 +3345,7 @@ impl WaylandWindow {
     /// first thing to doubt and `CORDIAL_TRACE_MOUSE=1` prints every argument.
     fn dispatch_relative_motion(&self, dx: f32, dy: f32) {
         let (x, y) = self.pointer_position();
-        // Deliberately not also `deliver_touch`. AGDK's touch path carries an
+        // Deliberately not also `deliver_mouse`. AGDK's touch path carries an
         // absolute position and nothing else; while the pointer is locked that
         // position does not change, so every event would say the finger had not
         // moved. The `NativeInputInterface` path is the one that moves anything

@@ -153,6 +153,22 @@ pub fn open_window(width: u32, height: u32, title: &str) -> Result<WindowHandle,
     }
 }
 
+/// The canvas in pixels, whichever backend is open, and `(0, 0)` before there
+/// is one.
+///
+/// `nativePassInput` takes the surface size as two of its six arguments, and a
+/// scripted touch has no `wl_touch` event to read it off the way
+/// `wayland.rs`'s handlers do. Zero is what "there is no window" honestly looks
+/// like: it is also a handle of 0, so nothing reaches the engine on that path
+/// anyway and there is no wrong size to be believed.
+pub fn canvas_size() -> (i32, i32) {
+    let g = match backend() {
+        Backend::Wayland => wayland::current().map(|w| w.geometry()),
+        Backend::X11 => window::current().map(|w| w.geometry()),
+    };
+    g.map(|(w, h, _)| (w, h)).unwrap_or((0, 0))
+}
+
 /// The active backend's input connection descriptor, for the looper to watch
 /// alongside the engine's own fds. `None` before a window has been opened.
 pub fn connection_fd() -> Option<c_int> {

@@ -387,9 +387,14 @@ fn now_ms() -> i64 {
 pub fn apply_queued(handle: i64) {
     for cmd in drain() {
         match cmd {
-            Cmd::Move { x, y } => crate::android::input::pass_mouse_move(x, y),
+            // Routed by device rather than straight to the mouse natives. On
+            // a host with no touchscreen this is the only way the finger path
+            // gets exercised at all -- `CORDIAL_INPUT_TOUCH=1` and then
+            // `cordial_click` -- and it costs the mouse arm nothing, which
+            // still sends exactly what it always sent.
+            Cmd::Move { x, y } => crate::android::input::script_move(handle, x, y, now_ms()),
             Cmd::Button { x, y, down, button } => {
-                crate::android::input::pass_mouse_button(x, y, down, button)
+                crate::android::input::script_button(handle, x, y, down, button, now_ms())
             }
             Cmd::Key { down, evdev, modifiers } => {
                 crate::android::input::pass_key_event(down, evdev, modifiers)

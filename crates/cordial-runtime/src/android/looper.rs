@@ -773,7 +773,7 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
     let mut motion = false;
     // `touch-on`/`touch-off` and `look-on`/`look-off` isolate the two halves
     // `motion-on` drives together, to find which one the idle throttle
-    // actually watches: `deliver_touch`'s AGDK `onTouchEventNative` queue, or
+    // actually watches: `deliver_mouse`'s AGDK `onTouchEventNative` queue, or
     // `pass_mouse_move`'s `NativeInputInterface.nativePassMouseMove`. Separate
     // from `motion` rather than replacing it, so `motion-on` still means what
     // every existing `CORDIAL_SCRIPT` in this codebase's history already
@@ -989,7 +989,7 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                 if let Some(handle) = game_activity_handle {
                     let (x, y) = (640.0 + 100.0 * (t as f32).sin(), 360.0 + 100.0 * (t as f32).cos());
                     let ms = (t * 1000.0) as i64;
-                    super::input::deliver_touch(
+                    super::input::deliver_mouse(
                         handle,
                         super::input::ACTION_HOVER_MOVE,
                         x,
@@ -1006,7 +1006,7 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                 if let Some(handle) = game_activity_handle {
                     let (x, y) = (640.0 + 100.0 * (t as f32).sin(), 360.0 + 100.0 * (t as f32).cos());
                     let ms = (t * 1000.0) as i64;
-                    super::input::deliver_touch(
+                    super::input::deliver_mouse(
                         handle,
                         super::input::ACTION_HOVER_MOVE,
                         x,

@@ -23,7 +23,7 @@ use std::sync::{Mutex, OnceLock};
 // --------------------------------------------------------- Android vocabulary
 //
 // `android.view.MotionEvent`/`KeyEvent` constants both backends synthesise
-// events against, via `deliver_touch`/`deliver_key` below.
+// events against, via `deliver_mouse`/`deliver_key` below.
 
 pub const BUTTON_PRIMARY: i32 = 1;
 pub const BUTTON_SECONDARY: i32 = 2;
@@ -65,7 +65,7 @@ pub const ACTION_MOVE: i32 = 2;
 pub const ACTION_HOVER_MOVE: i32 = 7;
 pub const ACTION_BUTTON_PRESS: i32 = 11;
 pub const ACTION_BUTTON_RELEASE: i32 = 12;
-/// `ACTION_SCROLL`. Not delivered by [`deliver_touch`] — a scroll carries no
+/// `ACTION_SCROLL`. Not delivered by [`deliver_mouse`] — a scroll carries no
 /// button state and no gesture start, so it has its own call; see
 /// [`deliver_scroll`].
 pub const ACTION_SCROLL: i32 = 8;
@@ -191,10 +191,18 @@ pub(crate) fn report_unregistered(name: &'static str) {
     }
 }
 
-/// Deliver one AGDK touch event, the same `MotionEvent` synthesis both
-/// backends drive their pointer input through.
+/// Deliver one **mouse** event through AGDK's `onTouchEventNative`.
+///
+/// Called `deliver_touch` until the touch path arrived and made the name a
+/// liability: this is the pipe a `wl_pointer` or an X11 pointer event takes,
+/// and the `MotionEvent` it builds reports `SOURCE_MOUSE`/`TOOL_TYPE_MOUSE`.
+/// Fingers go to [`touch_down`] and friends instead, and reach the same native
+/// through [`cordial_linker_sys::game_activity::touch_multi`]. The Android
+/// native has one name for both because on a phone the APK's own Java decides
+/// which is which before calling it; here that decision is Cordial's, and these
+/// two functions are where it is written down.
 #[allow(clippy::too_many_arguments)]
-pub fn deliver_touch(
+pub fn deliver_mouse(
     handle: i64,
     action: i32,
     x: f32,
@@ -240,6 +248,564 @@ fn deliver_scroll(handle: i64, x: f32, y: f32, hscroll: f32, vscroll: f32, event
         Ok(None) => report_unregistered("onTouchEventNative"),
         Err(e) => super::trace(format_args!("onTouchEventNative(ACTION_SCROLL) failed: {e}")),
     }
+}
+
+// --------------------------------------------------------- device identity
+//
+// **The engine discriminates input by which native is called, not by anything
+// in a payload.** `nativePassInput` is a finger, `nativePassMouseMove` and
+// `nativePassMouseButton` are a mouse, `nativePassKeyEvent` is a keyboard, and
+// none of the four carries a source, a tool type or a device id -- the device
+// identity *is* the function name. On a real phone the APK's own Java reads
+// `MotionEvent.getSource()`/`getToolType()` and routes accordingly; Cordial
+// replaces that Java, so the routing is ours to do, per event.
+//
+// Which is what makes it reversible. `UserInputService.PreferredInput` and
+// `LastInputType` follow the last device used and change back the moment the
+// other one is touched, which is the behaviour a phone with a keyboard cover
+// has. (`TouchEnabled`/`KeyboardEnabled`/`MouseEnabled` are a different signal
+// -- a capability latch that goes true on first use and is never revoked. Sober
+// #1577, a hybrid laptop stuck in mobile controls, is a game reading the latch.
+// Nothing on this side can un-latch it, and nothing here tries to.)
+//
+// So there is no mode. Every entry point below names the device it is for, and
+// the backends call the one matching the device the event arrived on.
+
+/// The device Cordial claims for input it produced itself.
+///
+/// Scripted input -- [`script_click`], and the development control surface's
+/// `move`/`click`/`down`/`up` in `devctl.rs` -- has no device behind it, so
+/// something has to choose one. This is that choice, and it is the *only* thing
+/// `CORDIAL_INPUT_TOUCH` still changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntheticDevice {
+    Mouse,
+    Finger,
+}
+
+/// `CORDIAL_INPUT_TOUCH`, which used to be a global mode and is now an override
+/// of two defaults.
+///
+/// It was a `static const bool` in `native/game_activity.cpp` that seeded
+/// `MotionEvent.source` and `toolType` for the whole process, so setting it
+/// relabelled a real mouse as a finger for the life of the session -- the
+/// session-wide decision this file no longer makes anywhere. What it overrides
+/// now:
+///
+/// - what [`synthetic_device`] answers, so a machine with no touchscreen can
+///   still drive the touch path -- through the MCP's own `cordial_click`, which
+///   is how this client is driven anyway (see AGENTS.md), and not by hijacking
+///   the developer's mouse;
+/// - what [`report_touchscreen`] tells the engine `PlatformParams.isTouchDevice`
+///   is.
+///
+/// Three states on purpose. `1` forces a touchscreen the host has not got, `0`
+/// forces it off on a host that has one -- which is what a hybrid-laptop user
+/// who wants the desktop interface asks for, and Sober #1577 is that request
+/// arriving as a bug report -- and unset lets the seat answer. A real mouse
+/// event is a mouse event under all three.
+fn input_touch_override() -> Option<bool> {
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let raw = std::env::var_os("CORDIAL_INPUT_TOUCH");
+        parse_touch_override(raw.map(|v| v.to_string_lossy().into_owned()))
+    })
+}
+
+/// The three states, separated from the environment so the table is testable.
+///
+/// Pure for the reason [`keepalive_wanted`] is: the interesting cases here are
+/// the ones nobody sets deliberately -- an empty value, and a `0` that used to
+/// mean the same as unset and now does not.
+fn parse_touch_override(value: Option<String>) -> Option<bool> {
+    let v = value?;
+    let v = v.trim().to_ascii_lowercase();
+    // An empty value is "unset with extra steps" -- what a shell that expanded
+    // a variable to nothing produces -- and reading it as `false` would
+    // silently disable a real touchscreen for somebody who meant to say
+    // nothing at all.
+    if v.is_empty() {
+        return None;
+    }
+    Some(!matches!(v.as_str(), "0" | "false" | "no" | "off"))
+}
+
+/// What the engine is told, given the seat, the off switch and the override.
+///
+/// Separate from [`report_touchscreen`] because that one talks to the engine
+/// and this one is the whole decision. Reading them apart is also how the
+/// precedence stays reviewable: `CORDIAL_NO_TOUCH` beats `CORDIAL_INPUT_TOUCH`
+/// beats the seat, and the first of those is not a preference but a fact --
+/// with it set nothing can reach either touch native, so a `true` here would be
+/// a stub lying about a device that cannot produce an event.
+fn touchscreen_reported(seat_has_touch: bool, no_touch: bool, over: Option<bool>) -> bool {
+    if no_touch {
+        return false;
+    }
+    over.unwrap_or(seat_has_touch)
+}
+
+/// Which device scripted input claims to be. See [`input_touch_override`].
+pub fn synthetic_device() -> SyntheticDevice {
+    // `CORDIAL_NO_TOUCH=1` wins, and has to: it means nothing reaches either
+    // touch native, so routing scripted input to them would drop it in silence
+    // rather than deliver it as a finger.
+    if no_touch() {
+        return SyntheticDevice::Mouse;
+    }
+    match input_touch_override() {
+        Some(true) => SyntheticDevice::Finger,
+        _ => SyntheticDevice::Mouse,
+    }
+}
+
+/// The platform contact id scripted touches use.
+///
+/// `i64::MIN` rather than a small number because the tracker keys on whatever
+/// id the compositor hands out and `wl_touch`'s is an `int32_t` -- so any value
+/// a real contact could take is a value a scripted one could collide with, and
+/// a collision means one gesture wearing another's pointer id. Nothing outside
+/// `i32` can arrive from `wl_touch`.
+const SYNTHETIC_CONTACT: i64 = i64::MIN;
+
+/// Tell the engine whether this host has a touchscreen, before it asks.
+///
+/// Called from each display backend's `open()` with what the seat advertised.
+/// The engine reads `PlatformParams.isTouchDevice` -- twice, on a cold start,
+/// measured -- and it is the only one of `isTouchDevice`/`isKeyboardDevice`/
+/// `isMouseDevice` it reads at all, so this is the whole of what Cordial can
+/// say about the machine's peripherals.
+///
+/// **"Exists" here means "the seat advertised a touchscreen when the window
+/// opened", and that is a real limit rather than a definition of convenience.**
+/// Wayland's `wl_seat.capabilities` arrives again whenever the seat's devices
+/// change, and `wayland.rs`'s `seat_capabilities` does act on the later ones
+/// -- a touchscreen plugged in mid-session gets a `wl_touch` bound and its
+/// contacts routed to the touch native. What it cannot do is revise this: the
+/// backend's `open()` runs before `cordial_appbridge_init`, the engine reads
+/// `isTouchDevice` during that initialisation, and this build exposes no native
+/// by which a platform amends it afterwards. So a screen that appears late
+/// works as an input device and is invisible as a *declared* one.
+///
+/// That matters less than it sounds, and the reason is worth stating rather
+/// than leaving to be rediscovered: `UserInputService.TouchEnabled` latches on
+/// the first touch that actually arrives, not on this field, and
+/// `PreferredInput`/`LastInputType` follow whichever native was called last. A
+/// late touchscreen still flips both. `isTouchDevice` is what the engine builds
+/// its first interface from, not what it follows.
+pub fn report_touchscreen(seat_has_touch: bool) {
+    let present = touchscreen_reported(seat_has_touch, no_touch(), input_touch_override());
+    let why = match (no_touch(), input_touch_override()) {
+        (true, _) => "CORDIAL_NO_TOUCH=1",
+        (_, Some(_)) => "forced by CORDIAL_INPUT_TOUCH",
+        // Not "from the seat": the X11 backend has no seat and reports false
+        // because that backend cannot carry a contact at all, whatever the
+        // machine has plugged in.
+        (_, None) => "as the display backend found it",
+    };
+    println!("[android] touchscreen: {present} ({why}); PlatformParams.isTouchDevice follows");
+    cordial_linker_sys::game_activity::set_touchscreen_present(present);
+}
+
+// --------------------------------------------------------------------- touch
+//
+// Fingers, and the one place a contact becomes an Android action.
+//
+// Everything here is display-server-independent on purpose: a backend's job is
+// to say "this contact went down at (x, y)", and the translation into
+// `ACTION_POINTER_DOWN` with an index packed into bits 8-15, into pointer ids
+// that survive a finger in the middle lifting, and into the two natives that
+// carry it happens once -- here -- where it can be unit-tested without a
+// compositor, a touchscreen, or a loaded engine. The alternative was a copy per
+// backend, which is the mistake the text-entry state machine at the top of this
+// file exists to record.
+//
+// Only `wayland.rs` produces these today. X11 core has no touch at all and
+// XInput2's is a separate extension nobody here has bound, so `window.rs` is
+// silent rather than wrong.
+
+/// `MotionEvent.ACTION_CANCEL` -- the gesture is over and did not mean
+/// anything. Android's own answer to a contact that vanished rather than
+/// lifted.
+pub const ACTION_CANCEL: i32 = 3;
+/// `MotionEvent.ACTION_POINTER_DOWN`/`_UP`: a second or later finger arriving,
+/// and a finger leaving while others stay.
+///
+/// Both carry the pointer *index* the event is about in bits 8-15, which the
+/// first and last contact do not need -- `ACTION_DOWN` can only ever be about
+/// index 0, and `ACTION_UP` about the sole pointer left.
+pub const ACTION_POINTER_DOWN: i32 = 5;
+pub const ACTION_POINTER_UP: i32 = 6;
+/// `AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT`, whose mask is `0xff00`.
+const ACTION_POINTER_INDEX_SHIFT: u32 = 8;
+
+/// `nativePassInput`'s own action vocabulary, which is **not** `MotionEvent`'s.
+///
+/// The descriptor `nativePassInput(IFFIII)V` is read out of this build's dex.
+/// These three values are not: they come from mocktail (Apache-2.0), which
+/// resolves and drives the same export, and they follow `Enum.UserInputState`'s
+/// Begin/Change/End rather than `MotionEvent`, where UP is 1 and MOVE is 2.
+/// Confusing the two delivers every drag as a release -- a plausible-looking
+/// bug rather than a crash, which is the kind this file collects. `INFERRED`
+/// until one session on a machine with a touchscreen settles it;
+/// `CORDIAL_NO_TOUCH=1` turns off a wrong mapping meanwhile.
+const TOUCH_DOWN: i32 = 0;
+const TOUCH_MOVE: i32 = 1;
+const TOUCH_UP: i32 = 2;
+
+/// How many contacts are tracked at once.
+///
+/// Android's own `MotionEvent` tops out at 16 pointers and no hand asks for
+/// more. The cap is here so that a compositor which sends a down Cordial never
+/// sees the matching up for cannot grow this vector for the life of the
+/// session.
+const MAX_CONTACTS: usize = 16;
+
+pub use cordial_linker_sys::game_activity::TouchContact;
+
+/// `action | (index << 8)`, Android's packing for the two `_POINTER_` actions.
+fn pack_pointer_action(action: i32, index: usize) -> i32 {
+    action | ((index as i32) << ACTION_POINTER_INDEX_SHIFT)
+}
+
+/// The action for a contact arriving at pointer `index`.
+///
+/// Index 0 is a plain `ACTION_DOWN` rather than a packed `ACTION_POINTER_DOWN`
+/// with a zero index. The two are different constants that happen to sit in
+/// different bits; Android's contract is that the first contact of a gesture is
+/// a down, and an engine that switches on the masked action would see a second
+/// finger where there was a first.
+fn contact_down_action(index: usize) -> i32 {
+    if index == 0 { ACTION_DOWN } else { pack_pointer_action(ACTION_POINTER_DOWN, index) }
+}
+
+/// The action for a contact leaving from pointer `index`, given how many are
+/// down *including this one*.
+fn contact_up_action(index: usize, contacts: usize) -> i32 {
+    if contacts <= 1 { ACTION_UP } else { pack_pointer_action(ACTION_POINTER_UP, index) }
+}
+
+/// One touch event, resolved into everything both natives need.
+///
+/// Built while the tracker's lock is held and delivered after it is dropped. A
+/// JNI call into the engine is not something to hold an input-path mutex
+/// across, and the only reason it would be safe today is that nothing
+/// re-enters -- which is a property of this engine rather than of this code.
+#[derive(Debug, PartialEq)]
+struct TouchDispatch {
+    /// The packed `MotionEvent` action for the AGDK path.
+    action: i32,
+    /// Every contact on the glass in pointer-index order, including one that is
+    /// lifting: Android reports a departing pointer in the array of the event
+    /// that says it left, and removing it first tells the engine one fewer
+    /// finger was down than there was.
+    contacts: Vec<TouchContact>,
+    /// When the first contact of this gesture went down.
+    down_time_ms: i64,
+    /// What `nativePassInput` is told, one call per entry: a contact and its own
+    /// down/move/up action. One entry for an ordinary event, every contact for a
+    /// cancel.
+    pass: Vec<(TouchContact, i32)>,
+}
+
+/// The contacts currently on the glass.
+///
+/// Keyed by whatever id the platform uses -- `wl_touch` hands out an `int32_t`
+/// per contact and is free to reuse it the moment the finger is up -- and
+/// translated to an Android pointer id allocated here. Deliberately not the
+/// same number: Android's has to be stable for the life of the contact and
+/// small enough to index by, and a compositor promises neither.
+#[derive(Default)]
+struct TouchContacts {
+    /// `(platform id, contact)` in pointer-index order. The order is the whole
+    /// contract with Android -- an entry's position *is* the pointer index the
+    /// packed actions above refer to.
+    contacts: Vec<(i64, TouchContact)>,
+    down_time_ms: i64,
+}
+
+impl TouchContacts {
+    fn index_of(&self, platform_id: i64) -> Option<usize> {
+        self.contacts.iter().position(|(id, _)| *id == platform_id)
+    }
+
+    /// The lowest pointer id nothing is using.
+    ///
+    /// Android's own InputReader allocates this way, and it is not tidiness: a
+    /// gesture that puts three fingers down and lifts the middle one must give
+    /// the next finger id 1 again, or an engine keeping a per-id slot leaks one
+    /// per contact across a session of pinching.
+    fn free_pointer_id(&self) -> i32 {
+        let mut id = 0;
+        while self.contacts.iter().any(|(_, c)| c.id == id) {
+            id += 1;
+        }
+        id
+    }
+
+    fn snapshot(&self) -> Vec<TouchContact> {
+        self.contacts.iter().map(|(_, c)| *c).collect()
+    }
+
+    fn down(&mut self, platform_id: i64, x: f32, y: f32, time_ms: i64) -> Option<TouchDispatch> {
+        // A second down for a contact already on the glass is not something
+        // this can represent, and guessing which finger the compositor meant is
+        // how one pointer id ends up owned by two. Drop it, and let
+        // `dispatch_touch` say so under the trace.
+        if self.index_of(platform_id).is_some() || self.contacts.len() >= MAX_CONTACTS {
+            return None;
+        }
+        if self.contacts.is_empty() {
+            self.down_time_ms = time_ms;
+        }
+        let contact = TouchContact { id: self.free_pointer_id(), x, y };
+        self.contacts.push((platform_id, contact));
+        let index = self.contacts.len() - 1;
+        Some(TouchDispatch {
+            action: contact_down_action(index),
+            contacts: self.snapshot(),
+            down_time_ms: self.down_time_ms,
+            pass: vec![(contact, TOUCH_DOWN)],
+        })
+    }
+
+    fn motion(&mut self, platform_id: i64, x: f32, y: f32) -> Option<TouchDispatch> {
+        let index = self.index_of(platform_id)?;
+        self.contacts[index].1.x = x;
+        self.contacts[index].1.y = y;
+        let contact = self.contacts[index].1;
+        Some(TouchDispatch {
+            // `ACTION_MOVE` carries every contact and names none: which one
+            // moved is read off the array, not out of the action.
+            action: ACTION_MOVE,
+            contacts: self.snapshot(),
+            down_time_ms: self.down_time_ms,
+            pass: vec![(contact, TOUCH_MOVE)],
+        })
+    }
+
+    fn up(&mut self, platform_id: i64) -> Option<TouchDispatch> {
+        let index = self.index_of(platform_id)?;
+        let contact = self.contacts[index].1;
+        let dispatch = TouchDispatch {
+            action: contact_up_action(index, self.contacts.len()),
+            // Snapshot before the removal, so the lifting contact is still in
+            // the array the engine is handed. See the field's own comment.
+            contacts: self.snapshot(),
+            down_time_ms: self.down_time_ms,
+            pass: vec![(contact, TOUCH_UP)],
+        };
+        self.contacts.remove(index);
+        Some(dispatch)
+    }
+
+    fn cancel(&mut self) -> Option<TouchDispatch> {
+        if self.contacts.is_empty() {
+            return None;
+        }
+        let contacts = self.snapshot();
+        let dispatch = TouchDispatch {
+            action: ACTION_CANCEL,
+            // `nativePassInput` has no cancel anything here has established, so
+            // every contact is reported up. That is the true statement
+            // available -- the fingers are off the glass either way -- rather
+            // than the convenient one of saying nothing and leaving the engine
+            // holding contacts no later event will ever close.
+            pass: contacts.iter().map(|c| (*c, TOUCH_UP)).collect(),
+            contacts,
+            down_time_ms: self.down_time_ms,
+        };
+        self.contacts.clear();
+        Some(dispatch)
+    }
+}
+
+static TOUCH: Mutex<Option<TouchContacts>> = Mutex::new(None);
+
+/// `nativePassInput`, resolved by the loader like the mouse natives above.
+///
+/// Its own static rather than an eighth argument to [`set_input_natives`], for
+/// the reason [`GET_MOUSE_LOCKED_CENTER`] has one: it arrived later, and
+/// threading it through every position would make the existing call site harder
+/// to read than a second setter is.
+static PASS_INPUT: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+pub fn set_pass_input_native(native: *mut c_void) {
+    PASS_INPUT.store(native, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One contact went down.
+///
+/// `platform_id` is the compositor's own id for the contact. `surface` is the
+/// pixel size of the canvas the coordinates are in -- `nativePassInput` takes
+/// it as two of its six arguments, and the engine learns the canvas size
+/// separately through `onSurfaceChangedNative`, so carrying it per event rather
+/// than assuming it keeps a resize from silently rescaling every touch.
+pub fn touch_down(handle: i64, platform_id: i64, x: f32, y: f32, surface: (i32, i32), time_ms: i64) {
+    if no_touch() {
+        return;
+    }
+    let dispatch = {
+        let mut state = TOUCH.lock().unwrap_or_else(|e| e.into_inner());
+        state.get_or_insert_with(TouchContacts::default).down(platform_id, x, y, time_ms)
+    };
+    dispatch_touch(handle, dispatch, surface, time_ms, "down");
+}
+
+/// One contact moved.
+pub fn touch_motion(
+    handle: i64,
+    platform_id: i64,
+    x: f32,
+    y: f32,
+    surface: (i32, i32),
+    time_ms: i64,
+) {
+    if no_touch() {
+        return;
+    }
+    let dispatch = {
+        let mut state = TOUCH.lock().unwrap_or_else(|e| e.into_inner());
+        state.get_or_insert_with(TouchContacts::default).motion(platform_id, x, y)
+    };
+    dispatch_touch(handle, dispatch, surface, time_ms, "motion");
+}
+
+/// One contact left the glass.
+pub fn touch_up(handle: i64, platform_id: i64, surface: (i32, i32), time_ms: i64) {
+    if no_touch() {
+        return;
+    }
+    let dispatch = {
+        let mut state = TOUCH.lock().unwrap_or_else(|e| e.into_inner());
+        state.get_or_insert_with(TouchContacts::default).up(platform_id)
+    };
+    dispatch_touch(handle, dispatch, surface, time_ms, "up");
+}
+
+/// Every contact is gone, and the gesture meant nothing.
+///
+/// `wl_touch.cancel` says the compositor has taken the sequence over -- a
+/// system gesture, an edge swipe -- and that the client must undo whatever it
+/// began. It is also the right thing to send when the canvas loses the touch
+/// focus, for the reason `pointer_leave` synthesises button releases: no real
+/// up is coming, and a contact nothing ever closes is a finger the engine
+/// believes is still down for the rest of the session.
+pub fn touch_cancel(handle: i64, surface: (i32, i32), time_ms: i64) {
+    if no_touch() {
+        return;
+    }
+    let dispatch = {
+        let mut state = TOUCH.lock().unwrap_or_else(|e| e.into_inner());
+        state.get_or_insert_with(TouchContacts::default).cancel()
+    };
+    dispatch_touch(handle, dispatch, surface, time_ms, "cancel");
+}
+
+/// Both pipes, for one resolved event.
+///
+/// The same both-paths policy the mouse already follows: AGDK's
+/// `onTouchEventNative` is a real contract the engine consumes, and
+/// `NativeInputInterface` is the one this project measured the Lua interface
+/// actually hit-testing against for a click. **Which of the two moves a finger
+/// on this build has not been measured** -- nobody here has a touchscreen -- so
+/// both are driven and `CORDIAL_TRACE_TOUCH=1` prints what each was told and
+/// what it answered, which is the reading that settles it in one session.
+fn dispatch_touch(
+    handle: i64,
+    dispatch: Option<TouchDispatch>,
+    surface: (i32, i32),
+    time_ms: i64,
+    what: &str,
+) {
+    let Some(d) = dispatch else {
+        // A move for a contact that never went down, a second down for one that
+        // already has, or a cancel with nothing on the glass. All three are the
+        // compositor and this side disagreeing about what is down, and all
+        // three are dropped rather than guessed at.
+        if trace_touch() {
+            eprintln!("[cordial] touch {what} for an unknown contact; dropped");
+        }
+        return;
+    };
+    if handle != 0 && !no_agdk_touch() {
+        match cordial_linker_sys::game_activity::touch_multi(
+            handle,
+            d.action,
+            &d.contacts,
+            time_ms,
+            d.down_time_ms,
+        ) {
+            Ok(Some(consumed)) => {
+                if trace_touch() {
+                    eprintln!(
+                        "[cordial] onTouchEventNative(action={:#x}, contacts={}) -> {consumed}",
+                        d.action,
+                        d.contacts.len()
+                    );
+                }
+            }
+            Ok(None) => report_unregistered("onTouchEventNative"),
+            Err(e) => super::trace(format_args!("onTouchEventNative(touch) failed: {e}")),
+        }
+    }
+
+    let f = PASS_INPUT.load(std::sync::atomic::Ordering::Relaxed);
+    if f.is_null() {
+        report_unregistered("nativePassInput");
+        return;
+    }
+    let (w, h) = surface;
+    for (contact, action) in d.pass {
+        let r = cordial_linker_sys::game_activity::pass_input(
+            f,
+            contact.id,
+            contact.x,
+            contact.y,
+            action,
+            w,
+            h,
+        );
+        if trace_touch() {
+            eprintln!(
+                "[cordial] nativePassInput(id={}, x={}, y={}, action={action}, w={w}, h={h}) \
+                 -> {r:?}",
+                contact.id, contact.x, contact.y
+            );
+        }
+    }
+}
+
+/// `CORDIAL_NO_TOUCH=1` -- deliver no touch input to the engine at all.
+///
+/// The control arm for every claim this path could make, and the way a user
+/// turns off a wrong mapping without a rebuild. A real off switch rather than a
+/// trace flag: with it set nothing reaches either native, and `wayland.rs` does
+/// not ask the seat for a `wl_touch` in the first place, so the run is the run
+/// that shipped before any of this existed.
+///
+/// It is worth having for a second reason that is not about bugs. Sober #1577
+/// reports a touchscreen laptop flipping irreversibly into the mobile interface
+/// the first time the screen is touched, with the keyboard and mouse still
+/// plugged in -- closed unfixed. Nothing here has reproduced that on Cordial,
+/// and no honest value of `PlatformParams.isTouchDevice` would prevent it if it
+/// does; a switch is what a player has meanwhile.
+pub fn no_touch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_NO_TOUCH").is_some())
+}
+
+/// `CORDIAL_TRACE_TOUCH=1` -- every contact, both calls, and what each
+/// answered.
+///
+/// Its own switch rather than riding on `CORDIAL_TRACE_MOUSE`, because the
+/// question a touch trace answers is which of the two paths carried the
+/// gesture, and on a machine with both a touchscreen and a mouse a shared
+/// switch would bury exactly that.
+pub fn trace_touch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_TRACE_TOUCH").is_some())
 }
 
 /// Deliver one AGDK key event, the `KeyEvent` synthesis both backends drive.
@@ -645,7 +1211,7 @@ fn track_key_held(down: bool, evdev_code: i32) {
 /// collapse — it lands at the same ~15s mark as no input at all, twice.
 /// Redriving `deliver_key`/`pass_key_event` on every tick, simulating what a
 /// repeat timer would send, does not stop it either. Redriving
-/// `deliver_touch`'s AGDK touch queue every tick does not stop it. Only
+/// `deliver_mouse`'s AGDK touch queue every tick does not stop it. Only
 /// `pass_mouse_move` — `NativeInputInterface.nativePassMouseMove`, the "V2"
 /// interface call, not AGDK's `onTouchEventNative` — keeps it away, and it
 /// does so with the delta held at exactly zero: a fixed position resent every
@@ -1586,24 +2152,90 @@ fn ascii_to_evdev(c: char) -> Option<i32> {
     })
 }
 
-/// One left click at a canvas position, as [`super::window::HostWindow`]'s
-/// `dispatch_button` delivers one: `ACTION_DOWN`/`ACTION_BUTTON_PRESS`, then
-/// the release pair, plus `nativePassMouseButton` on each half.
+/// One click at a canvas position, through whichever device
+/// [`synthetic_device`] says this run is pretending to be.
+///
+/// As a mouse it is exactly what [`super::window::HostWindow`]'s
+/// `dispatch_button` delivers: `ACTION_DOWN`/`ACTION_BUTTON_PRESS`, then the
+/// release pair, plus `nativePassMouseButton` on each half. As a finger it is
+/// one contact down and up, through the same tracker a `wl_touch` drives, so
+/// the pointer-id arithmetic and both natives are exercised rather than
+/// bypassed.
 pub fn script_click(handle: i64, x: f32, y: f32, now_ms: i64) {
+    if synthetic_device() == SyntheticDevice::Finger {
+        // No hover. A finger cannot hover, and inventing one would make this a
+        // worse model of a touchscreen than the mouse path it is standing in
+        // for. `touch_down` is where the surface size the touch native wants
+        // comes from, so there is nothing to pass here that the real path does
+        // not also pass.
+        let surface = super::canvas_size();
+        touch_down(handle, SYNTHETIC_CONTACT, x, y, surface, now_ms);
+        touch_up(handle, SYNTHETIC_CONTACT, surface, now_ms + 40);
+        return;
+    }
     // A hover first. Roblox's interface highlights on hover and hit-tests the
     // press against where it believes the pointer is, and a press with no
     // preceding motion is a shape a real mouse never produces.
-    deliver_touch(handle, ACTION_HOVER_MOVE, x, y, 0, 0, now_ms, 0);
+    deliver_mouse(handle, ACTION_HOVER_MOVE, x, y, 0, 0, now_ms, 0);
     pass_mouse_move(x, y);
 
-    deliver_touch(handle, ACTION_DOWN, x, y, BUTTON_PRIMARY, 0, now_ms, now_ms);
-    deliver_touch(handle, ACTION_BUTTON_PRESS, x, y, BUTTON_PRIMARY, BUTTON_PRIMARY, now_ms, now_ms);
+    deliver_mouse(handle, ACTION_DOWN, x, y, BUTTON_PRIMARY, 0, now_ms, now_ms);
+    deliver_mouse(handle, ACTION_BUTTON_PRESS, x, y, BUTTON_PRIMARY, BUTTON_PRIMARY, now_ms, now_ms);
     pass_mouse_button(x, y, true, BUTTON_PRIMARY);
 
     let up = now_ms + 40;
-    deliver_touch(handle, ACTION_BUTTON_RELEASE, x, y, 0, BUTTON_PRIMARY, up, now_ms);
-    deliver_touch(handle, ACTION_UP, x, y, 0, 0, up, now_ms);
+    deliver_mouse(handle, ACTION_BUTTON_RELEASE, x, y, 0, BUTTON_PRIMARY, up, now_ms);
+    deliver_mouse(handle, ACTION_UP, x, y, 0, 0, up, now_ms);
     pass_mouse_button(x, y, false, BUTTON_PRIMARY);
+}
+
+/// The control surface's `move`, routed by device.
+///
+/// As a mouse this is `nativePassMouseMove` and nothing else, which is what
+/// `devctl` has always sent for a bare move -- deliberately not also the AGDK
+/// pipe, because `move` is the arm that isolates the two.
+///
+/// As a finger it is a contact *dragging*, and a `move` for a contact that is
+/// not down does nothing at all. That is not a gap: a finger has no hover, so
+/// the tracker has no contact to move and drops it (loudly under
+/// `CORDIAL_TRACE_TOUCH=1`). An MCP `click`, which pushes a move and then a
+/// press and a release, still works -- the move is discarded and the press
+/// starts the contact.
+pub fn script_move(handle: i64, x: f32, y: f32, now_ms: i64) {
+    match synthetic_device() {
+        SyntheticDevice::Mouse => pass_mouse_move(x, y),
+        SyntheticDevice::Finger => {
+            touch_motion(handle, SYNTHETIC_CONTACT, x, y, super::canvas_size(), now_ms)
+        }
+    }
+}
+
+/// The control surface's `down`/`up`, routed by device.
+///
+/// A finger has no buttons, so anything but the primary is dropped rather than
+/// delivered as a contact -- the same reasoning as [`roblox_mouse_button`]
+/// returning `None` for the side buttons. A right-click that silently became a
+/// tap would be a worse answer than one that visibly does nothing.
+pub fn script_button(handle: i64, x: f32, y: f32, down: bool, android_button: i32, now_ms: i64) {
+    match synthetic_device() {
+        SyntheticDevice::Mouse => pass_mouse_button(x, y, down, android_button),
+        SyntheticDevice::Finger if android_button == BUTTON_PRIMARY => {
+            let surface = super::canvas_size();
+            if down {
+                touch_down(handle, SYNTHETIC_CONTACT, x, y, surface, now_ms);
+            } else {
+                touch_up(handle, SYNTHETIC_CONTACT, surface, now_ms);
+            }
+        }
+        SyntheticDevice::Finger => {
+            if trace_touch() {
+                eprintln!(
+                    "[cordial] scripted button {android_button:#x} has no meaning to a finger; \
+                     dropped"
+                );
+            }
+        }
+    }
 }
 
 /// Type a string into whatever box the engine says has focus, one character at
@@ -1848,6 +2480,145 @@ mod tests {
         reset_mouse_delta();
         assert_eq!(mouse_delta(900.0, 47.0), (0.0, 0.0));
         reset_mouse_delta();
+    }
+
+    /// `CORDIAL_INPUT_TOUCH` has three states, and the third is the one that
+    /// used to be missing.
+    ///
+    /// It was `e && *e && *e != '0'` in C++ -- unset and `0` were the same
+    /// answer, because there was only ever one thing to override. Now that the
+    /// seat can say "there is a touchscreen" on its own, `0` has to be able to
+    /// contradict it or a hybrid laptop has no way to ask for the desktop
+    /// interface. Sober #1577 is that request arriving as a bug report.
+    #[test]
+    fn the_touch_override_can_say_no_and_not_only_yes() {
+        assert_eq!(parse_touch_override(None), None, "unset lets the seat answer");
+        assert_eq!(parse_touch_override(Some("1".into())), Some(true));
+        assert_eq!(parse_touch_override(Some("0".into())), Some(false));
+        assert_eq!(parse_touch_override(Some("off".into())), Some(false));
+        assert_eq!(parse_touch_override(Some("true".into())), Some(true));
+        // A value that survived a shell expanding to nothing is not a `false`.
+        // Reading it as one would turn off a real touchscreen for somebody who
+        // meant to say nothing.
+        assert_eq!(parse_touch_override(Some("".into())), None);
+        assert_eq!(parse_touch_override(Some("  ".into())), None);
+    }
+
+    /// The whole of what `PlatformParams.isTouchDevice` is told, including the
+    /// two cases where it disagrees with the seat.
+    ///
+    /// `isTouchDevice` is the one field of the three the engine actually reads
+    /// -- measured, twice per cold start -- so this table is the entirety of
+    /// what Cordial can say about the machine's peripherals, and getting the
+    /// precedence wrong is a client laying out mobile controls for a device
+    /// that cannot produce a contact.
+    #[test]
+    fn what_the_engine_is_told_about_a_touchscreen_follows_the_seat_unless_overridden() {
+        // Nothing set: the seat is the answer, both ways.
+        assert!(touchscreen_reported(true, false, None));
+        assert!(!touchscreen_reported(false, false, None));
+        // The override contradicts the seat in both directions.
+        assert!(touchscreen_reported(false, false, Some(true)), "a host with no touchscreen can still ask for the mobile interface");
+        assert!(!touchscreen_reported(true, false, Some(false)), "a hybrid laptop can ask for the desktop one");
+        // `CORDIAL_NO_TOUCH` wins over both, and has to: with it set nothing
+        // reaches either touch native, so claiming a touchscreen would be a
+        // promise no code path can keep.
+        assert!(!touchscreen_reported(true, true, Some(true)));
+        assert!(!touchscreen_reported(true, true, None));
+    }
+
+    /// The action byte for a two-finger gesture, contact by contact.
+    ///
+    /// This is the whole of what makes multi-touch different from one finger
+    /// repeated, and none of it can be checked on this machine any other way:
+    /// there is no touchscreen here, so the alternative to a unit test is
+    /// shipping the arithmetic unexercised. The numbers are Android's public
+    /// `MotionEvent` constants and the packing is `action | (index << 8)`.
+    #[test]
+    fn a_second_finger_arrives_and_leaves_as_a_pointer_action() {
+        let mut t = TouchContacts::default();
+
+        let first = t.down(7, 10.0, 20.0, 1_000).expect("a first contact is accepted");
+        assert_eq!(first.action, ACTION_DOWN, "the first contact is a plain down, not 0x0005");
+        assert_eq!(first.contacts, vec![TouchContact { id: 0, x: 10.0, y: 20.0 }]);
+        assert_eq!(first.down_time_ms, 1_000);
+
+        let second = t.down(9, 30.0, 40.0, 1_050).expect("a second contact is accepted");
+        assert_eq!(second.action, ACTION_POINTER_DOWN | (1 << 8));
+        assert_eq!(second.contacts.len(), 2);
+        assert_eq!(
+            second.down_time_ms, 1_000,
+            "down time is the gesture's, not this contact's -- Android measures a \
+             long press from the first finger"
+        );
+
+        // The *first* finger lifts while the second stays. Its index is 0, and
+        // the contact that is leaving must still be in the array.
+        let up = t.up(7).expect("a tracked contact can lift");
+        assert_eq!(up.action, ACTION_POINTER_UP);
+        assert_eq!(up.contacts.len(), 2, "the departing pointer is reported in its own event");
+
+        // The last one out is a plain up.
+        let last = t.up(9).expect("the remaining contact can lift");
+        assert_eq!(last.action, ACTION_UP);
+        assert_eq!(last.contacts.len(), 1);
+    }
+
+    /// A pointer id freed in the middle is handed out again.
+    ///
+    /// Not tidiness: an engine keeping a slot per pointer id would otherwise
+    /// acquire one per contact for the length of a session, and a pinch makes
+    /// contacts by the hundred.
+    #[test]
+    fn a_freed_pointer_id_is_reused_before_a_new_one_is_invented() {
+        let mut t = TouchContacts::default();
+        t.down(1, 0.0, 0.0, 0);
+        t.down(2, 0.0, 0.0, 0);
+        t.down(3, 0.0, 0.0, 0);
+        assert_eq!(t.snapshot().iter().map(|c| c.id).collect::<Vec<_>>(), vec![0, 1, 2]);
+        t.up(2);
+        let next = t.down(4, 0.0, 0.0, 0).expect("a fourth contact is accepted");
+        assert_eq!(next.pass[0].0.id, 1, "the middle id came free and is reused, not made 3");
+        // The pointer *index* of that contact is 2, because it was appended --
+        // which is exactly the case where index and id disagree.
+        assert_eq!(next.action, ACTION_POINTER_DOWN | (2 << 8));
+    }
+
+    /// Events for contacts this side never saw are dropped, not guessed at.
+    ///
+    /// The compositor delivers touches aimed at GTK's header bar to Cordial's
+    /// `wl_touch` as well, and `wayland.rs` forwards only the ones that landed
+    /// on the canvas. That leaves the `motion` and `up` of a foreign contact
+    /// arriving here with no matching down, and it is this guard -- not a
+    /// second table in the backend -- that stops them.
+    #[test]
+    fn an_event_for_an_untracked_contact_produces_nothing() {
+        let mut t = TouchContacts::default();
+        assert_eq!(t.motion(5, 1.0, 1.0), None);
+        assert_eq!(t.up(5), None);
+        assert_eq!(t.cancel(), None, "a cancel with nothing on the glass is not an event");
+        t.down(5, 1.0, 1.0, 0);
+        assert_eq!(t.down(5, 2.0, 2.0, 0), None, "a second down for the same contact is dropped");
+    }
+
+    /// A cancel closes every contact on both paths.
+    ///
+    /// `nativePassInput` has no cancel action anything here has established, so
+    /// the per-contact half reports each one up. Saying nothing instead would
+    /// leave the engine holding fingers no later event could ever close, which
+    /// is the stuck-camera shape `pointer_leave` already had to fix once for
+    /// mouse buttons.
+    #[test]
+    fn a_cancel_closes_every_contact() {
+        let mut t = TouchContacts::default();
+        t.down(1, 0.0, 0.0, 0);
+        t.down(2, 0.0, 0.0, 0);
+        let c = t.cancel().expect("two contacts are on the glass");
+        assert_eq!(c.action, ACTION_CANCEL);
+        assert_eq!(c.contacts.len(), 2);
+        assert_eq!(c.pass.len(), 2);
+        assert!(c.pass.iter().all(|(_, action)| *action == TOUCH_UP));
+        assert_eq!(t.snapshot(), vec![], "nothing is left tracked");
     }
 
     #[test]

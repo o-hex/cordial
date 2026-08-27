@@ -525,11 +525,24 @@ public:
 /// a phone: a desktop has a hardware keyboard, no touchscreen, and no D-pad.
 /// Their values are Android's own documented constants, named below so the
 /// numbers are readable rather than magic.
-namespace cordial {
-/// Defined below, beside its setter. Declared here because the Configuration
-/// field that uses it is built above that point.
+// Both defined at the bottom of this file, beside their setters, and declared
+// here because the fields that use them are built above that point.
+//
+// **Not wrapped in another `namespace cordial {}`, which is what this used to
+// be.** Everything from `namespace cordial {` a few hundred lines up to
+// `} // namespace cordial` well below is already inside it, so the wrapper
+// declared `cordial::cordial::ui_mode_night_bits` -- a different function from
+// the `cordial::ui_mode_night_bits` defined at the bottom, and one nothing
+// anywhere defines. It never became a link error because `Configuration::Create`
+// has no callers at all and `--gc-sections` discards the reference before the
+// linker looks at it; adding a second function the same way, called from
+// `PlatformParams::Create`, which *is* live, is what surfaced it.
+
+/// The desktop's dark/light preference as `Configuration.uiMode` night bits.
 jint ui_mode_night_bits();
-} // namespace cordial
+/// Whether the display backend found a touchscreen on the seat, resolved
+/// against `CORDIAL_INPUT_TOUCH` before it gets here.
+bool host_has_touchscreen();
 
 class Configuration : public Object {
 public:
@@ -538,6 +551,7 @@ public:
     static constexpr jint kOrientationPortrait  = 1;
     static constexpr jint kOrientationLandscape = 2;
     static constexpr jint kTouchscreenNoTouch   = 1;
+    static constexpr jint kTouchscreenFinger    = 3;
     static constexpr jint kKeyboardQwerty       = 2;
     static constexpr jint kKeyboardHiddenNo     = 1;
     static constexpr jint kHardKeyboardHiddenNo = 1;
@@ -576,8 +590,27 @@ public:
     /// as wrong as guessing light.
     jint uiMode = kUiModeTypeNormal | cordial::ui_mode_night_bits();
     jint colorMode = kColorModeWideCgNo;
-    /// Mouse and keyboard, no touch panel. Saying otherwise would ask Roblox
-    /// for touch controls on a machine that cannot produce a touch event.
+    /// `TOUCHSCREEN_FINGER` when the host has a touchscreen, `NOTOUCH` when it
+    /// does not.
+    ///
+    /// Was an unconditional `NOTOUCH` with a comment saying that claiming
+    /// otherwise would ask Roblox for touch controls on a machine that cannot
+    /// produce a touch event. The reasoning was right and the constant was
+    /// wrong the moment Cordial could produce one: this and
+    /// `PlatformParams.isTouchDevice` are two descriptions of the same fact,
+    /// and a client told twice, differently, what kind of machine it is on is
+    /// the inconsistency the `kSource*`/`kToolType*` pairing in
+    /// `game_activity.cpp` exists to avoid.
+    ///
+    /// **This reaches nothing today, and saying so is the point.**
+    /// `Configuration::Create` below has no callers anywhere in the tree --
+    /// only `Register` does -- so no instance of this class is ever built from
+    /// it. The object the engine is actually handed at `initializeNativeCode`
+    /// is a *different* `cordial::Configuration`, the empty one in
+    /// `native/game_activity.cpp`, which has no fields at all. So this is a
+    /// hardcoded answer made honest in a builder nothing runs, not a fix; the
+    /// field it keeps consistent with is `isTouchDevice`, which is measured
+    /// being read and does reach the engine.
     jint touchscreen = kTouchscreenNoTouch;
     jint keyboard = kKeyboardQwerty;
     jint keyboardHidden = kKeyboardHiddenNo;
@@ -594,6 +627,8 @@ public:
 
     static std::shared_ptr<Configuration> Create(ENV* env, int width, int height) {
         auto p = std::make_shared<Configuration>();
+        p->touchscreen =
+            cordial::host_has_touchscreen() ? kTouchscreenFinger : kTouchscreenNoTouch;
         // density is 1.0 at 160 dpi, so dp and px are the same number. Stated
         // rather than multiplied by 1 so the relationship survives a future
         // change to DisplayMetrics::densityDpi — if that moves, this must too.
@@ -1508,16 +1543,22 @@ public:
     static std::shared_ptr<PlatformParams> Create(ENV* env, const char* assets, int width, int height) {
         auto p = std::make_shared<PlatformParams>();
         p->assetFolderPath = S(assets);
-        // The desktop answer, and only one third of it is load-bearing.
-        // `isTouchDevice` is read — twice per cold start, measured — so the
-        // engine genuinely is told this machine has no touchscreen.
-        // `isKeyboardDevice` and `isMouseDevice` are **never read at all**, so
-        // they are documentation rather than configuration: true is what is
-        // honest about the host, and the engine has never asked. Do not reach
+        // Only one third of this is load-bearing. `isTouchDevice` is read —
+        // twice per cold start, measured — so it is the one the engine
+        // genuinely learns from. `isKeyboardDevice` and `isMouseDevice` are
+        // **never read at all**, so they are documentation rather than
+        // configuration: true is what is honest about a host with a keyboard
+        // and a mouse on its seat, and the engine has never asked. Do not reach
         // for these two when input misbehaves; they cannot be the cause.
         p->isKeyboardDevice = true;
         p->isMouseDevice = true;
-        p->isTouchDevice = false;
+        // Was a hardcoded `false`, which was true of every machine this has
+        // been developed on and false of the ones the client is for. It now
+        // reports what the display backend found on the seat, with
+        // `CORDIAL_INPUT_TOUCH` overriding it either way — see
+        // `android::input::report_touchscreen`, which resolves both into the
+        // single answer stored here.
+        p->isTouchDevice = cordial::host_has_touchscreen() ? JNI_TRUE : JNI_FALSE;
         // Roblox lays its UI out in dp and picks image-asset resolutions from
         // this. At 1.0 it builds the interface for a low-density phone, which
         // is why the app shell looks coarse on a desktop panel. Overridable
@@ -2428,7 +2469,59 @@ extern "C" void cordial_set_ui_mode_night(int night) {
     g_ui_mode_night.store(night, std::memory_order_relaxed);
 }
 
+/// Whether this host has a touchscreen, as the display backend found it.
+///
+/// -1 means nobody has said, which reports "no touchscreen" and which
+/// `host_has_touchscreen` distinguishes out loud the first time anything asks.
+/// That is the honest default rather than a convenient one: a run where the
+/// window never opened has not established that a touchscreen exists, and
+/// `isTouchDevice` is the one field of the three the engine actually reads.
+static std::atomic<int> g_touchscreen_present{-1};
+
+/// Set from Rust once the seat's devices are known, before the engine is
+/// initialised.
+///
+/// **This is latched for the session in practice, and the reason is ordering
+/// rather than policy.** `android::input::report_touchscreen` runs from the
+/// display backend's `open()`, which `load.rs` calls before
+/// `cordial_appbridge_init`/`cordial_set_init_params`; the engine reads
+/// `isTouchDevice` during that initialisation and there is no call anywhere in
+/// this build by which a platform revises it afterwards. So a touchscreen
+/// plugged in after startup gets its events routed — `android::input` decides
+/// that per event — but arrives too late to change what the engine was told
+/// about the device. Writing it later is harmless and simply has no reader.
+extern "C" void cordial_set_touchscreen_present(int present) {
+    g_touchscreen_present.store(present ? 1 : 0, std::memory_order_relaxed);
+}
+
+// `extern "C++"` because this whole region sits inside an `extern "C"` block,
+// and a definition in there acquires C language linkage however deep in a
+// namespace it is: `nm` on the object showed a bare `T ui_mode_night_bits`
+// against a mangled `U cordial::...` at the call site. That is the second half
+// of the same latent link failure the declarations near `Configuration`
+// describe -- `ui_mode_night_bits` has had it since it was written and only
+// escaped notice because its one caller is dead code that `--gc-sections`
+// throws away. The linkage specification is the smallest honest fix; splitting
+// the surrounding block would move a dozen unrelated entry points.
+extern "C++" {
 namespace cordial {
+bool host_has_touchscreen() {
+    int reported = g_touchscreen_present.load(std::memory_order_relaxed);
+    // Once, and only from the first caller, because the two fields that ask are
+    // built one after the other and two identical lines in a log read as a bug
+    // in whatever is between them. -1 and 0 are worth distinguishing from a
+    // log: "the backend looked and found no touchscreen" and "the backend never
+    // got as far as looking" are different runs and both report false.
+    static std::once_flag said;
+    std::call_once(said, [reported] {
+        printf("[android] host touchscreen: %s (%s)\n", reported > 0 ? "yes" : "no",
+               reported < 0 ? "no display backend reported a seat"
+                            : "reported by the display backend");
+        fflush(stdout);
+    });
+    return reported > 0;
+}
+
 jint ui_mode_night_bits() {
     // `Configuration.UI_MODE_NIGHT_YES`/`_NO`. Spelled as literals because the
     // named constants are class-scoped members of the InitParams builder above
@@ -2436,6 +2529,7 @@ jint ui_mode_night_bits() {
     return g_ui_mode_night.load(std::memory_order_relaxed) > 0 ? 0x20 : 0x10;
 }
 } // namespace cordial
+} // extern "C++"
 
 extern "C" void cordial_set_display_size(int width, int height) {
     if (width > 0 && height > 0) {

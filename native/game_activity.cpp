@@ -25,6 +25,20 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
+
+/// One contact as it crosses the C ABI, mirrored on the Rust side as
+/// `cordial_linker_sys::game_activity::TouchContact`. The two definitions are
+/// the same three words in the same order and have to stay that way.
+///
+/// At file scope rather than inside `namespace cordial` because it appears in
+/// the signature of an `extern "C"` entry point at the bottom of this file, and
+/// an elaborated `struct CordialTouchContact` written there would silently
+/// declare a *second*, unrelated type rather than referring to this one.
+struct CordialTouchContact {
+    int id;
+    float x, y;
+};
 
 namespace cordial {
 std::shared_ptr<jnivm::Object> make_display_metrics(jnivm::ENV* env);
@@ -221,7 +235,46 @@ public:
     }
 };
 
-/// `android.view.MotionEvent`, synthesised from an X11 pointer event.
+/// `InputDevice.SOURCE_*` and `MotionEvent.TOOL_TYPE_*`, the two fields that
+/// together say what produced an event.
+///
+/// `SOURCE_CLASS_POINTER` is 0x2 in both, so a mouse is 0x2000|0x2 and a
+/// touchscreen 0x1000|0x2. They travel in pairs everywhere below: claiming to
+/// be a mouse in one and a finger in the other is the kind of inconsistency an
+/// input stack is entitled to reject.
+constexpr jint kSourceMouse = 0x00002002;
+constexpr jint kSourceTouchscreen = 0x00001002;
+constexpr jint kToolTypeFinger = 1;
+constexpr jint kToolTypeMouse = 3;
+
+// There used to be an `input_is_touch()` here: one `static const bool` read out
+// of `CORDIAL_INPUT_TOUCH` at first use, seeding `source` and `toolType` for
+// every event the process would ever build. Its own comment already named the
+// bug — "an input device that changed identity mid-session would be a stranger
+// thing than either choice" — and the answer is that a *device* does not
+// change identity but a *seat* has several, and which one moved is a per-event
+// fact. A laptop with a touchscreen and a trackpad had one of the two
+// mislabelled for the whole session, whichever way the variable went.
+//
+// So the fields below are set by the factory that builds the event, from the
+// device that produced it, and nothing in this file reads the environment any
+// more. On a real phone the APK's own Java is what reads
+// `MotionEvent.getSource()` and picks a native; Cordial replaces that Java, so
+// the routing is ours and it lives one layer up in `android::input`, where the
+// origin of an event is still known.
+
+/// One contact in a `MotionEvent`: where it is, and which contact it is.
+///
+/// `id` is Android's *pointer id* — stable for as long as that finger stays
+/// down — which is a different number from the pointer *index* AGDK addresses
+/// it by. They agree until a finger that is not the last one lifts, and every
+/// multi-touch bug worth having comes from assuming they always do.
+struct MotionPointer {
+    jint id;
+    jfloat x, y;
+};
+
+/// `android.view.MotionEvent`, synthesised from a host pointer or touch event.
 ///
 /// `onTouchEventNative`'s signature carries the event's scalar fields as
 /// unpacked primitive arguments (see `cordial_game_activity_touch`, below) — that
@@ -233,44 +286,47 @@ public:
 /// `getAxisValue` for whichever axes AGDK has enabled — X and Y by default,
 /// which is all a single mouse pointer needs.
 ///
-/// This mapping is not guessed: it is read directly out of AGDK's own
-/// `GameActivityEvents.cpp` (Apache-2.0, google/agdk via the game-activity
-/// prefab), which is the code that actually calls back onto whatever object
-/// Roblox was handed here. With `historySize` always 0 in this implementation
-/// (no motion coalescing), `getHistoricalEventTime`/`getHistoricalAxisValue` are
-/// registered — because AGDK unconditionally resolves the method IDs at
-/// `initializeNativeCode` time — but never actually invoked.
-/// Whether to present input as a touchscreen rather than a mouse.
+/// The single-pointer half of that mapping is not guessed: it is read directly
+/// out of AGDK's own `GameActivityEvents.cpp` (Apache-2.0, google/agdk via the
+/// game-activity prefab), which is the code that actually calls back onto
+/// whatever object Roblox was handed here. **The multi-pointer half is
+/// `INFERRED`**, because there is no copy of that file on this machine any
+/// more: that a real `pointerCount` with per-index accessors and an
+/// `ACTION_POINTER_DOWN` carrying its index in bits 8-15 is what AGDK expects
+/// is Android's own documented `MotionEvent` contract, not something read back
+/// off the code that consumes it here. Fetching the prefab again would turn
+/// that back into a lookup.
 ///
-/// Read once. An input device that changed identity mid-session would be a
-/// stranger thing than either choice.
-bool input_is_touch() {
-    static const bool v = [] {
-        const char* e = getenv("CORDIAL_INPUT_TOUCH");
-        return e && *e && *e != '0';
-    }();
-    return v;
-}
-
+/// With `historySize` always 0 in this implementation (no motion coalescing),
+/// `getHistoricalEventTime`/`getHistoricalAxisValue` are registered — because
+/// AGDK unconditionally resolves the method IDs at `initializeNativeCode` time
+/// — but never actually invoked. The Waydroid capture agrees that this costs
+/// nothing: `AndroidProcessHistoricalTouchEvents = false` on the real client.
 class MotionEvent : public Object {
 public:
     jint deviceId = 1;
-    // InputDevice.SOURCE_MOUSE = SOURCE_CLASS_POINTER(0x2) | 0x2000, or
-    // SOURCE_TOUCHSCREEN = SOURCE_CLASS_POINTER(0x2) | 0x1000 with
-    // CORDIAL_INPUT_TOUCH=1. Roblox's Android UI may bind only touch handlers,
-    // in which case a perfectly well-formed mouse event is consumed by the
-    // input dispatcher and then ignored by the interface — which is exactly the
-    // symptom: onTouchEventNative returns true and nothing moves.
-    jint source = cordial::input_is_touch() ? 0x00001002 : 0x00002002;
+    // A mouse unless the factory that built this event says otherwise, and set
+    // per event rather than once per process. Roblox's Android UI may bind only
+    // touch handlers, in which case a perfectly well-formed mouse event is
+    // consumed by the input dispatcher and then ignored by the interface —
+    // which is exactly the symptom: onTouchEventNative returns true and nothing
+    // moves. That is a reason to send fingers *as* fingers when there are
+    // fingers, not a reason to relabel a mouse.
+    jint source = kSourceMouse;
     jint action = 0;
     jlong eventTime = 0, downTime = 0;
     jint flags = 0, metaState = 0, actionButton = 0, buttonState = 0;
-    jfloat x = 0.0f, y = 0.0f;
-    // TOOL_TYPE_MOUSE, or TOOL_TYPE_FINGER under CORDIAL_INPUT_TOUCH=1. Kept
-    // consistent with `source` and with PlatformParams' isMouseDevice/
-    // isTouchDevice, because claiming to be a mouse in one place and a finger in
-    // another is the kind of inconsistency an input stack is entitled to reject.
-    jint toolType = cordial::input_is_touch() ? 1 : 3;
+    /// Every contact in this event, in *pointer index* order — the order
+    /// Android and AGDK both address them by, and the order `getPointerId`
+    /// translates out of.
+    ///
+    /// Never empty. A mouse and a wheel are one contact and fill slot 0;
+    /// `getPointerCount() == 0` is not something Android can produce and
+    /// nothing downstream checks for it.
+    std::vector<MotionPointer> pointers{MotionPointer{0, 0.0f, 0.0f}};
+    // Paired with `source` above and set by the same factory; see the
+    // `kSource*`/`kToolType*` constants for why the two never disagree.
+    jint toolType = kToolTypeMouse;
     // The wheel, in detents: +1 is one notch away from the user (or one notch
     // to the right), matching what `android.view.MotionEvent` documents for
     // AXIS_VSCROLL/AXIS_HSCROLL. Zero on every event that is not ACTION_SCROLL,
@@ -278,10 +334,29 @@ public:
     // makes.
     jfloat vscroll = 0.0f, hscroll = 0.0f;
 
-    jint getPointerId(ENV*, jint) { return 0; }
+    /// The contact at a pointer *index*, clamped rather than trusted.
+    ///
+    /// AGDK reads indices 0..`getPointerCount()-1` and so cannot go out of
+    /// range unless this file has got its own count wrong — but "cannot" and
+    /// "does not" differ by one undefined-behaviour read of a `std::vector`,
+    /// and a caller that has already been handed a wrong count is exactly the
+    /// caller that will ask. Slot 0 always exists, so answering with it is the
+    /// bounded wrong answer rather than the unbounded one.
+    const MotionPointer& at(jint index) const {
+        if (index < 0 || static_cast<size_t>(index) >= pointers.size()) {
+            return pointers.front();
+        }
+        return pointers[static_cast<size_t>(index)];
+    }
+
+    jint getPointerId(ENV*, jint index) { return at(index).id; }
+    // One tool type for the whole event: every contact in a `MotionEvent` here
+    // comes from the same device, because Cordial builds one event per device
+    // rather than merging a finger and a mouse into a single dispatch the way a
+    // real Android InputReader could.
     jint getToolType(ENV*, jint) { return toolType; }
-    jfloat getRawX(ENV*, jint) { return x; }
-    jfloat getRawY(ENV*, jint) { return y; }
+    jfloat getRawX(ENV*, jint index) { return at(index).x; }
+    jfloat getRawY(ENV*, jint index) { return at(index).y; }
     jfloat getXPrecision(ENV*) { return 1.0f; }
     jfloat getYPrecision(ENV*) { return 1.0f; }
     // AMOTION_EVENT_AXIS_X = 0, AXIS_Y = 1, AXIS_VSCROLL = 9, AXIS_HSCROLL = 10.
@@ -293,9 +368,9 @@ public:
     // half of the pair — an axis nothing asks about on an event that does not
     // say a wheel moved — so the two landed together, and the scroll path in
     // `cordial_game_activity_scroll` is the only thing that sets them.
-    jfloat getAxisValue(ENV*, jint axis, jint) {
-        if (axis == 0) return x;
-        if (axis == 1) return y;
+    jfloat getAxisValue(ENV*, jint axis, jint index) {
+        if (axis == 0) return at(index).x;
+        if (axis == 1) return at(index).y;
         if (axis == 9) return vscroll;
         if (axis == 10) return hscroll;
         return 0.0f;
@@ -318,14 +393,13 @@ public:
     jint getClassification(ENV*) { return 0; }
     jint getEdgeFlags(ENV*) { return 0; }
     jint getHistorySize(ENV*) { return 0; }
-    jint getPointerCount(ENV*) { return 1; }
+    jint getPointerCount(ENV*) { return static_cast<jint>(pointers.size()); }
 
     static std::shared_ptr<MotionEvent> Create(ENV* env, jfloat x, jfloat y, jint action,
                                                jint buttonState, jint actionButton,
                                                jlong eventTime, jlong downTime) {
         auto p = std::make_shared<MotionEvent>();
-        p->x = x;
-        p->y = y;
+        p->pointers[0] = MotionPointer{0, x, y};
         p->action = action;
         p->buttonState = buttonState;
         p->actionButton = actionButton;
@@ -345,14 +419,46 @@ public:
     static std::shared_ptr<MotionEvent> CreateScroll(ENV* env, jfloat x, jfloat y, jfloat hscroll,
                                                      jfloat vscroll, jlong eventTime) {
         auto p = std::make_shared<MotionEvent>();
-        p->x = x;
-        p->y = y;
+        p->pointers[0] = MotionPointer{0, x, y};
         // AMOTION_EVENT_ACTION_SCROLL.
         p->action = 8;
         p->hscroll = hscroll;
         p->vscroll = vscroll;
         p->eventTime = eventTime;
         p->downTime = eventTime;
+        to_jni(env, p);
+        return p;
+    }
+
+    /// A finger gesture: one entry per contact currently down, and the source
+    /// and tool type that say so.
+    ///
+    /// Unconditionally touchscreen and finger, the way `Create` is
+    /// unconditionally mouse and wheel. Nothing here consults an environment
+    /// variable: these contacts arrived on a `wl_touch`, so there is a true
+    /// answer to what produced them. Which factory an event reaches is decided
+    /// once, in `android::input`, from the device it came in on.
+    ///
+    /// `action` arrives already packed: for `ACTION_POINTER_DOWN`/`_UP` Android
+    /// carries the index of the contact the event is *about* in bits 8-15, and
+    /// the caller in `android::input` is where that packing is done and tested.
+    static std::shared_ptr<MotionEvent> CreateTouch(ENV* env, const CordialTouchContact* contacts,
+                                                    int count, jint action, jlong eventTime,
+                                                    jlong downTime) {
+        auto p = std::make_shared<MotionEvent>();
+        if (contacts && count > 0) {
+            p->pointers.clear();
+            p->pointers.reserve(static_cast<size_t>(count));
+            for (int i = 0; i < count; ++i) {
+                p->pointers.push_back(
+                    MotionPointer{(jint)contacts[i].id, contacts[i].x, contacts[i].y});
+            }
+        }
+        p->source = kSourceTouchscreen;
+        p->toolType = kToolTypeFinger;
+        p->action = action;
+        p->eventTime = eventTime;
+        p->downTime = downTime;
         to_jni(env, p);
         return p;
     }
@@ -660,6 +766,86 @@ void register_game_activity_classes(ENV* env) {
     KeyEvent::Register(env);
     TextInputState::Register(env);
     InputConnection::Register(env);
+}
+
+/// `GameActivity.onTouchEventNative(J, MotionEvent, IIIIIJJIIIIIIFF) -> Z`.
+///
+/// The one place that call is made. Three entry points below build three
+/// different `MotionEvent`s — a mouse pointer, a wheel, and a set of finger
+/// contacts — and every one of them then makes the identical eighteen-argument
+/// call. It was written out twice before the third arrived, and the two copies
+/// had already drifted: the wheel's passed literal zeros where the pointer's
+/// passed the event's own `actionButton`/`buttonState`, which was harmless
+/// only because a scroll has neither. Reading every scalar back off the event
+/// object closes that by construction — there is now exactly one description
+/// of what the engine is told, and it is the object AGDK will call back into.
+///
+/// `Build` is a callable taking `ENV*` and returning the event, so that
+/// construction happens inside the local frame this pushes. Returns 0 with
+/// `*consumed` set, -1 on error, or -2 if the native is not registered yet —
+/// the ordinary race against `initializeNativeCode` during startup.
+template <typename Build>
+int deliver_motion(long handle, Build&& build, int* consumed, char* err, size_t err_len) {
+    auto* env = cordial::process_env();
+    if (!env || handle == 0) {
+        snprintf(err, err_len, "no JavaVM, or no native handle");
+        return -1;
+    }
+    try {
+        JNIEnv* jni = env->GetJNIEnv();
+        auto cls = env->GetClass("com/google/androidgamesdk/GameActivity");
+        if (!cls) {
+            snprintf(err, err_len, "GameActivity class is not registered");
+            return -1;
+        }
+        void* fn;
+        {
+            std::lock_guard<std::mutex> lock(cls->mtx);
+            auto it = cls->natives.find("onTouchEventNative");
+            fn = it == cls->natives.end() ? nullptr : it->second;
+        }
+        if (!fn) {
+            return -2;
+        }
+
+        // Wrapped in `PushLocalFrame`/`PopLocalFrame`: unlike the
+        // once-per-launch calls elsewhere in this file, this runs once per
+        // input event, and `cordial::to_jni` parks every object it touches in
+        // the current local frame — without popping, a long session would grow
+        // that frame without bound. The contacts are plain C++ in the event
+        // object rather than a Java array, so the frame holds two references
+        // however many fingers are down.
+        jni->PushLocalFrame(8);
+
+        auto jactivity = cordial::to_jni(env, cordial::shared_activity(env));
+        auto event = build(env);
+        auto jevent = cordial::to_jni(env, event);
+
+        using TouchFn = jboolean (*)(JNIEnv*, jobject, jlong, jobject, jint, jint, jint, jint,
+                                     jint, jlong, jlong, jint, jint, jint, jint, jint, jint,
+                                     jfloat, jfloat);
+        jboolean r = reinterpret_cast<TouchFn>(fn)(
+            jni, jactivity, (jlong)handle, jevent,
+            /*pointerCount=*/(jint)event->pointers.size(), /*historySize=*/0,
+            /*deviceId=*/event->deviceId, /*source=*/event->source,
+            /*action=*/event->action, /*eventTime=*/event->eventTime,
+            /*downTime=*/event->downTime, /*flags=*/event->flags,
+            /*metaState=*/event->metaState, /*actionButton=*/event->actionButton,
+            /*buttonState=*/event->buttonState, /*classification=*/0, /*edgeFlags=*/0,
+            /*precisionX=*/1.0f, /*precisionY=*/1.0f);
+
+        jni->PopLocalFrame(nullptr);
+        if (consumed) {
+            *consumed = r ? 1 : 0;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
 }
 
 } // namespace cordial
@@ -1466,6 +1652,49 @@ int cordial_input_mouse_wheel(void* fn, float x, float y, float delta, char* err
     }
 }
 
+/// `NativeInputInterface.nativePassInput(I pointerId, F x, F y, I action, I width, I height)`.
+///
+/// Roblox's own touch path, the finger counterpart to `nativePassMouseButton`
+/// — one call per contact per event, with the pointer id as a first-class
+/// argument rather than something to be read back off a `MotionEvent`.
+///
+/// **The descriptor is read out of this build's own dex**, not inferred:
+/// `nativePassInput(IFFIII)V` on `com/roblox/engine/jni/NativeInputInterface`.
+/// **The three `action` values are not.** 0/1/2 for down/move/up come from
+/// mocktail (Apache-2.0), which resolves and drives this same export; they are
+/// `Enum.UserInputState`'s Begin/Change/End ordering and specifically *not*
+/// `MotionEvent`'s, where UP is 1 and MOVE is 2. Nothing readable in this build
+/// settles which of the two this native wants, and one session on a machine
+/// with a touchscreen would. Until that happens the mapping is `INFERRED` and
+/// `CORDIAL_NO_TOUCH=1` is how a user turns off a wrong one.
+///
+/// `width`/`height` are the surface the coordinates are in. Passed rather than
+/// assumed because the engine has been told the canvas size separately through
+/// `onSurfaceChangedNative` and the two disagreeing during a resize is a
+/// mis-scaled touch, not a crash — which is the kind of bug that gets blamed on
+/// the mapping above.
+int cordial_input_pass_input(void* fn, int pointer_id, float x, float y, int action, int width,
+                             int height, char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jint, jfloat, jfloat, jint, jint, jint);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or nativePassInput is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeInputInterface");
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls), pointer_id,
+                                   x, y, action, width, height);
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
 /// Deliver a wheel movement through AGDK's `onTouchEventNative` as ACTION_SCROLL.
 ///
 /// The same both-pipes policy the button and move paths already follow: AGDK's
@@ -1478,118 +1707,60 @@ int cordial_input_mouse_wheel(void* fn, float x, float y, float delta, char* err
 int cordial_game_activity_scroll(long handle, float x, float y, float hscroll, float vscroll,
                                  long long event_time_ms, int* consumed, char* err,
                                  size_t err_len) {
-    auto* env = cordial::process_env();
-    if (!env || handle == 0) {
-        snprintf(err, err_len, "no JavaVM, or no native handle");
-        return -1;
-    }
-    try {
-        JNIEnv* jni = env->GetJNIEnv();
-        auto cls = env->GetClass("com/google/androidgamesdk/GameActivity");
-        if (!cls) {
-            snprintf(err, err_len, "GameActivity class is not registered");
-            return -1;
-        }
-        void* fn;
-        {
-            std::lock_guard<std::mutex> lock(cls->mtx);
-            auto it = cls->natives.find("onTouchEventNative");
-            fn = it == cls->natives.end() ? nullptr : it->second;
-        }
-        if (!fn) {
-            return -2;
-        }
-
-        jni->PushLocalFrame(8);
-
-        auto jactivity = cordial::to_jni(env, cordial::shared_activity(env));
-        auto event = cordial::MotionEvent::CreateScroll(env, x, y, hscroll, vscroll,
-                                                        (jlong)event_time_ms);
-        auto jevent = cordial::to_jni(env, event);
-
-        using TouchFn = jboolean (*)(JNIEnv*, jobject, jlong, jobject, jint, jint, jint, jint,
-                                     jint, jlong, jlong, jint, jint, jint, jint, jint, jint,
-                                     jfloat, jfloat);
-        jboolean r = reinterpret_cast<TouchFn>(fn)(
-            jni, jactivity, (jlong)handle, jevent,
-            /*pointerCount=*/1, /*historySize=*/0, /*deviceId=*/event->deviceId,
-            /*source=*/event->source, /*action=*/event->action,
-            /*eventTime=*/(jlong)event_time_ms, /*downTime=*/(jlong)event_time_ms,
-            /*flags=*/0, /*metaState=*/0, /*actionButton=*/0,
-            /*buttonState=*/0, /*classification=*/0, /*edgeFlags=*/0,
-            /*precisionX=*/1.0f, /*precisionY=*/1.0f);
-
-        jni->PopLocalFrame(nullptr);
-        if (consumed) {
-            *consumed = r ? 1 : 0;
-        }
-        return 0;
-    } catch (const std::exception& e) {
-        snprintf(err, err_len, "%s", e.what());
-        return -1;
-    } catch (...) {
-        snprintf(err, err_len, "non-standard C++ exception");
-        return -1;
-    }
+    return cordial::deliver_motion(
+        handle,
+        [&](cordial::ENV* env) {
+            return cordial::MotionEvent::CreateScroll(env, x, y, hscroll, vscroll,
+                                                      (jlong)event_time_ms);
+        },
+        consumed, err, err_len);
 }
 
 int cordial_game_activity_touch(long handle, int action, float x, float y, int button_state,
                                 int action_button, long long event_time_ms,
                                 long long down_time_ms, int* consumed, char* err,
                                 size_t err_len) {
-    auto* env = cordial::process_env();
-    if (!env || handle == 0) {
-        snprintf(err, err_len, "no JavaVM, or no native handle");
+    return cordial::deliver_motion(
+        handle,
+        [&](cordial::ENV* env) {
+            return cordial::MotionEvent::Create(env, x, y, action, button_state, action_button,
+                                                (jlong)event_time_ms, (jlong)down_time_ms);
+        },
+        consumed, err, err_len);
+}
+
+/// Deliver a set of finger contacts through `onTouchEventNative`.
+///
+/// The multi-contact counterpart to `cordial_game_activity_touch`, and the
+/// reason `MotionEvent` grew a contact vector: the single-contact path hard-
+/// coded `pointerCount=1`, `getPointerId` ignored its index argument and
+/// returned 0, and `getPointerCount` returned the literal 1 — so a second
+/// finger had nowhere to go even though AGDK asks for it by index.
+///
+/// `contacts` is every contact currently down, in pointer-index order,
+/// including the one lifting on an `ACTION_UP`/`ACTION_POINTER_UP` — Android
+/// keeps the departing pointer in the array for the event that reports it
+/// leaving, and a caller that removes it first reports one fewer finger than
+/// were on the glass. `action` arrives already packed with the index for the
+/// two `_POINTER_` actions; see `android::input`, which owns that arithmetic
+/// and has the tests for it.
+///
+/// Returns 0 / -1 / -2 exactly as `cordial_game_activity_touch` does.
+int cordial_game_activity_touch_multi(long handle, int action,
+                                      const struct CordialTouchContact* contacts, int count,
+                                      long long event_time_ms, long long down_time_ms,
+                                      int* consumed, char* err, size_t err_len) {
+    if (!contacts || count <= 0) {
+        snprintf(err, err_len, "a touch event with no contacts");
         return -1;
     }
-    try {
-        JNIEnv* jni = env->GetJNIEnv();
-        auto cls = env->GetClass("com/google/androidgamesdk/GameActivity");
-        if (!cls) {
-            snprintf(err, err_len, "GameActivity class is not registered");
-            return -1;
-        }
-        void* fn;
-        {
-            std::lock_guard<std::mutex> lock(cls->mtx);
-            auto it = cls->natives.find("onTouchEventNative");
-            fn = it == cls->natives.end() ? nullptr : it->second;
-        }
-        if (!fn) {
-            return -2;
-        }
-
-        jni->PushLocalFrame(8);
-
-        auto jactivity = cordial::to_jni(env, cordial::shared_activity(env));
-        auto event = cordial::MotionEvent::Create(env, x, y, action, button_state, action_button,
-                                                  (jlong)event_time_ms, (jlong)down_time_ms);
-        auto jevent = cordial::to_jni(env, event);
-
-        using TouchFn = jboolean (*)(JNIEnv*, jobject, jlong, jobject, jint, jint, jint, jint,
-                                     jint, jlong, jlong, jint, jint, jint, jint, jint, jint,
-                                     jfloat, jfloat);
-        jboolean r = reinterpret_cast<TouchFn>(fn)(
-            jni, jactivity, (jlong)handle, jevent,
-            /*pointerCount=*/1, /*historySize=*/0, /*deviceId=*/event->deviceId,
-            /*source=*/event->source, /*action=*/(jint)action,
-            /*eventTime=*/(jlong)event_time_ms, /*downTime=*/(jlong)down_time_ms,
-            /*flags=*/0, /*metaState=*/0, /*actionButton=*/(jint)action_button,
-            /*buttonState=*/(jint)button_state, /*classification=*/0, /*edgeFlags=*/0,
-            /*precisionX=*/1.0f, /*precisionY=*/1.0f);
-
-        jni->PopLocalFrame(nullptr);
-        if (consumed) {
-            *consumed = r ? 1 : 0;
-        }
-        return 0;
-    } catch (const std::exception& e) {
-        snprintf(err, err_len, "%s", e.what());
-        return -1;
-    } catch (...) {
-        snprintf(err, err_len, "non-standard C++ exception");
-        return -1;
-    }
+    return cordial::deliver_motion(
+        handle,
+        [&](cordial::ENV* env) {
+            return cordial::MotionEvent::CreateTouch(env, contacts, count, action,
+                                                     (jlong)event_time_ms, (jlong)down_time_ms);
+        },
+        consumed, err, err_len);
 }
 
 /// Deliver a synthesised key event through `onKeyDownNative`/`onKeyUpNative`.

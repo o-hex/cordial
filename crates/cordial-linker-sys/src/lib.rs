@@ -1623,6 +1623,17 @@ pub mod game_activity {
             err: *mut c_char,
             err_len: usize,
         ) -> c_int;
+        fn cordial_game_activity_touch_multi(
+            handle: i64,
+            action: c_int,
+            contacts: *const TouchContact,
+            count: c_int,
+            event_time_ms: i64,
+            down_time_ms: i64,
+            consumed: *mut c_int,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> c_int;
         fn cordial_game_activity_scroll(
             handle: i64,
             x: f32,
@@ -1680,6 +1691,65 @@ pub mod game_activity {
                 y,
                 button_state,
                 action_button,
+                event_time_ms,
+                down_time_ms,
+                &mut consumed,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        match rc {
+            0 => Ok(Some(consumed != 0)),
+            -2 => Ok(None),
+            _ => Err(take_err(err)),
+        }
+    }
+
+    /// One finger on the glass, as the C side receives it.
+    ///
+    /// Mirrors `CordialTouchContact` in `native/game_activity.cpp`; the two
+    /// definitions are the same three words in the same order and have to stay
+    /// that way. `id` is Android's stable *pointer id*, not the position of
+    /// this contact in the slice — the slice's order is the pointer *index*,
+    /// and the two stop agreeing the moment a finger that is not the last one
+    /// lifts.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct TouchContact {
+        pub id: i32,
+        pub x: f32,
+        pub y: f32,
+    }
+
+    /// Deliver a set of finger contacts through `onTouchEventNative`.
+    ///
+    /// `contacts` is every contact still on the glass in pointer-index order,
+    /// including the one being lifted on an up action — Android reports a
+    /// departing pointer in the array of the event that says it left. `action`
+    /// is already packed with the pointer index for `ACTION_POINTER_DOWN`/`_UP`;
+    /// `android::input` owns that arithmetic. See `touch`'s doc comment for the
+    /// `Ok(None)` convention.
+    pub fn touch_multi(
+        handle: i64,
+        action: i32,
+        contacts: &[TouchContact],
+        event_time_ms: i64,
+        down_time_ms: i64,
+    ) -> Result<Option<bool>, String> {
+        if contacts.is_empty() {
+            return Err("a touch event with no contacts".into());
+        }
+        let mut err = vec![0u8; 512];
+        let mut consumed: c_int = 0;
+        // SAFETY: `handle` came from `initialize`; `contacts` is a live slice
+        // borrowed for the duration of the call and the C side neither keeps
+        // nor frees it; `err`/`consumed` are live.
+        let rc = unsafe {
+            cordial_game_activity_touch_multi(
+                handle,
+                action,
+                contacts.as_ptr(),
+                contacts.len() as c_int,
                 event_time_ms,
                 down_time_ms,
                 &mut consumed,
@@ -1814,6 +1884,11 @@ pub mod game_activity {
             f: *mut c_void, x: f32, y: f32, delta: f32,
             err: *mut c_char, n: usize,
         ) -> c_int;
+        fn cordial_input_pass_input(
+            f: *mut c_void, pointer_id: c_int, x: f32, y: f32, action: c_int,
+            width: c_int, height: c_int, err: *mut c_char, n: usize,
+        ) -> c_int;
+        fn cordial_set_touchscreen_present(present: c_int);
         fn cordial_textbox_handle() -> i64;
         fn cordial_textbox_generation() -> c_int;
         fn cordial_textbox_text(buf: *mut c_char, n: c_int) -> c_int;
@@ -2188,6 +2263,47 @@ pub mod game_activity {
         // SAFETY: as above.
         let rc = unsafe {
             cordial_input_mouse_wheel(native, x, y, delta, err.as_mut_ptr() as *mut c_char, err.len())
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
+    /// Tell `PlatformParams`/`Configuration` whether this host has a
+    /// touchscreen, before the engine is initialised and asks.
+    ///
+    /// `android::input::report_touchscreen` is the only caller and owns the
+    /// policy — the seat's answer, and what `CORDIAL_INPUT_TOUCH` and
+    /// `CORDIAL_NO_TOUCH` do to it. This is only the wire. Nothing on the C
+    /// side reads it after startup; see `cordial_set_touchscreen_present` in
+    /// `native/init_params.cpp` for why that is ordering rather than policy.
+    pub fn set_touchscreen_present(present: bool) {
+        // SAFETY: a plain store into a C++ `std::atomic<int>`; no pointers, no
+        // allocation, and safe to call from any thread at any time.
+        unsafe { cordial_set_touchscreen_present(if present { 1 } else { 0 }) }
+    }
+
+    /// `NativeInputInterface.nativePassInput(I,F,F,I,I,I)` — one finger, one
+    /// call.
+    ///
+    /// The descriptor is read out of this build's dex; the three `action`
+    /// values are `INFERRED` from mocktail. See `cordial_input_pass_input` in
+    /// `native/game_activity.cpp` for both, and `android::input::TOUCH_*` for
+    /// the constants themselves.
+    pub fn pass_input(
+        native: *mut c_void,
+        pointer_id: i32,
+        x: f32,
+        y: f32,
+        action: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), String> {
+        let mut err = vec![0u8; 512];
+        // SAFETY: as above.
+        let rc = unsafe {
+            cordial_input_pass_input(
+                native, pointer_id, x, y, action, width, height,
+                err.as_mut_ptr() as *mut c_char, err.len(),
+            )
         };
         if rc == 0 { Ok(()) } else { Err(take_err(err)) }
     }

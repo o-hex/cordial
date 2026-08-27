@@ -591,6 +591,14 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         pointer_grabbed: AtomicBool::new(false),
         fullscreen: AtomicBool::new(place.fullscreen),
     };
+    // No touchscreen, and that is a statement about this backend rather than
+    // about the machine: X11 core input has no touch at all, XInput2's is a
+    // separate extension nothing here binds, and so a touchscreen on this host
+    // could not reach Cordial through this path however present it is. Saying
+    // false is therefore true of what the client can actually receive, which is
+    // what `isTouchDevice` is for. A user on a touchscreen who wants the mobile
+    // interface on X11 has `CORDIAL_INPUT_TOUCH=1`, which overrides this.
+    super::input::report_touchscreen(false);
     Ok(WINDOW.get_or_init(|| host))
 }
 
@@ -812,7 +820,7 @@ fn android_meta_state(x11_state: c_uint) -> i32 {
 // why the keysym table in particular carries over unchanged: X11 keysyms and
 // XKB keysyms are the same numbering.
 use super::input::{
-    deliver_key, deliver_surface_redraw, deliver_touch, edit_text_buffer, keysym_to_android,
+    deliver_key, deliver_surface_redraw, deliver_mouse, edit_text_buffer, keysym_to_android,
     pass_key_event, pass_mouse_button, pass_mouse_move, pass_text, report_keyboard_state, Caret,
     Edit, ACTION_BUTTON_PRESS, ACTION_BUTTON_RELEASE, ACTION_DOWN, ACTION_HOVER_MOVE, ACTION_MOVE,
     ACTION_UP, BUTTON_BACK, BUTTON_FORWARD, BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_TERTIARY,
@@ -972,8 +980,8 @@ impl HostWindow {
             // Real Android mouse input delivers exactly this pair for a
             // click: ACTION_DOWN establishes the gesture, then
             // ACTION_BUTTON_PRESS names which button did it.
-            deliver_touch(handle, ACTION_DOWN, x, y, buttons, 0, now, down_time);
-            deliver_touch(handle, ACTION_BUTTON_PRESS, x, y, buttons, android_button, now, down_time);
+            deliver_mouse(handle, ACTION_DOWN, x, y, buttons, 0, now, down_time);
+            deliver_mouse(handle, ACTION_BUTTON_PRESS, x, y, buttons, android_button, now, down_time);
             if camera_button {
                 self.set_pointer_capture(true);
             }
@@ -981,8 +989,8 @@ impl HostWindow {
             state.buttons &= !android_button;
             let (buttons, down_time) = (state.buttons, state.down_time_ms);
             drop(state);
-            deliver_touch(handle, ACTION_BUTTON_RELEASE, x, y, buttons, android_button, now, down_time);
-            deliver_touch(handle, ACTION_UP, x, y, buttons, 0, now, down_time);
+            deliver_mouse(handle, ACTION_BUTTON_RELEASE, x, y, buttons, android_button, now, down_time);
+            deliver_mouse(handle, ACTION_UP, x, y, buttons, 0, now, down_time);
             const CAMERA_BUTTONS: i32 = BUTTON_SECONDARY | BUTTON_TERTIARY;
             if buttons & CAMERA_BUTTONS == 0 {
                 self.set_pointer_capture(false);
@@ -1007,7 +1015,7 @@ impl HostWindow {
         // makes it a hover, which is what a mouse (as opposed to touch) sends
         // when it moves without a button down.
         let action = if buttons != 0 { ACTION_MOVE } else { ACTION_HOVER_MOVE };
-        deliver_touch(handle, action, x, y, buttons, 0, now, down_time);
+        deliver_mouse(handle, action, x, y, buttons, 0, now, down_time);
         // And the path the interface reads. Both are driven: AGDK's contract is
         // real and the engine consumes it, it is simply not what hit-tests the
         // Lua UI.

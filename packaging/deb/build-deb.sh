@@ -125,6 +125,19 @@ head -1 "$root/DEBIAN/control" | grep -q "^Package:" || {
   head -3 "$root/DEBIAN/control" >&2
   exit 1
 }
+# **No substitution variables may survive into the finished control.**
+# `${misc:Depends}` and `${shlibs:Depends}` are debhelper's, expanded by
+# `dh_gencontrol` -- and this script builds the package by hand, so nothing
+# expands them and dpkg-deb rejects the literal text with "invalid package name
+# '${misc'". That reached CI on 2026-08-27, one round after a different
+# malformed control, and each round costs a full workspace build to discover a
+# defect visible in the file itself. Catch it here instead.
+if grep -n '\${' "$root/DEBIAN/control" >&2; then
+  echo "error: unexpanded substitution variable in DEBIAN/control (see above)." >&2
+  echo "       debhelper expands those and this package is built without it;" >&2
+  echo "       list the dependency literally or drop it." >&2
+  exit 1
+fi
 install -m755 packaging/deb/postinst "$root/DEBIAN/postinst"
 
 mkdir -p "$outdir"

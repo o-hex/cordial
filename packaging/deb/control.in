@@ -30,7 +30,7 @@ Homepage: https://github.com/luohoa97/cordial
 # anyway. Debian's dependency resolution has no dlopen-aware equivalent to
 # rpm's soname Requires, so it is listed here too, as an ordinary Depends,
 # rather than left implicit.
-Depends: ${misc:Depends}, libgtk-4-1, libadwaita-1-0, libwebkitgtk-6.0-4,
+Depends: libgtk-4-1, libadwaita-1-0, libwebkitgtk-6.0-4,
  libglib2.0-0, libpango-1.0-0, libgraphene-1.0-0, libsoup-3.0-0,
  libgcc-s1, libstdc++6, libc6, libvulkan1, libwayland-client0,
  libwayland-egl1, libxkbcommon0, libegl1, libgles2, libpipewire-0.3-0,

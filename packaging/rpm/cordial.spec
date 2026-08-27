@@ -208,7 +208,12 @@ install -Dpm 0644 third_party/libjnivm/LICENSE                      libjnivm-MIT
 # .deb, AppImage and a release Arch package noticed the same gap in the
 # Flatpak manifest and packaging/aur/cordial-git/PKGBUILD while giving the new
 # formats a licence list to copy; all three are fixed in the same change.
-install -Dpm 0644 NOTICE                                            NOTICE
+# NOTICE itself needs no install line: %license below picks it up from the
+# build directory where %autosetup already put it, the same way README.md
+# reaches %doc. The line that used to sit here copied it onto itself --
+# `install -Dpm 0644 NOTICE NOTICE` -- and install refuses that with "'NOTICE'
+# and 'NOTICE' are the same file", failing %install and taking the whole RPM
+# with it. The neighbours above work because each renames as it copies.
 install -Dpm 0644 third_party/mocktail-webview/LICENSE              mocktail-webview-Apache-2.0.txt
 
 %check

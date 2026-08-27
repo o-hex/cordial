@@ -733,6 +733,16 @@ extern "C" {
 
 /// Whether to skip half of the AGDK sequence below, and why either would be.
 ///
+/// **None of these is a candidate fix, and each produces a client that renders
+/// nothing.** Measured 2026-08-27: skipping either half took the present-freeze
+/// from 13/15 to 0/15 with p = 1.75e-06, and photographing the result through
+/// the swapchain showed a blank grey window in both arms, byte-identical to
+/// each other, presenting about 255 empty frames a second. The comment further
+/// down this function had already said why -- the engine builds its renderer on
+/// resume -- and the survey scored those blank clients healthy because its
+/// verdict counts presents. They are instruments for locating the freeze. Do
+/// not ship one.
+///
 /// **Two working references say this path is not the one the engine expects.**
 /// Roblox's own Android build does not take it: `EnableGameActivity8` resolves
 /// to false in `docs/traces/waydroid-roblox-startup.log.gz:626`, and across all
@@ -803,6 +813,13 @@ static bool skip_agdk_lifecycle()
 /// drops only the pair that can block. `CORDIAL_SKIP_AGDK_FOCUS` drops only
 /// the one that cannot, and is the control for it -- if the freeze moves when
 /// focus alone goes, the blocking-ack account is wrong and should be dropped.
+///
+/// **It moved, and the account is dropped.** Fifteen runs an arm against
+/// fifteen controls: 0/15 frozen with the blocking pair gone, 0/15 frozen with
+/// only the non-blocking call gone, 13/15 frozen with neither. No daylight
+/// between them, so waiting on an acknowledgement is not what distinguishes a
+/// frozen run. Kept above rather than deleted because a refuted mechanism that
+/// still reads plausibly is exactly the one somebody re-derives.
 static bool skip_agdk_state()
 {
     static const bool skip = getenv("CORDIAL_SKIP_AGDK_STATE") != nullptr;

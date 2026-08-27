@@ -123,7 +123,8 @@ jobs:
             gtk4-devel libadwaita-devel webkitgtk6.0-devel \
             pipewire-devel pulseaudio-libs-devel alsa-lib-devel \
             wayland-devel vulkan-loader-devel libxkbcommon-devel \
-            librsvg2-tools glib2 curl
+            librsvg2-tools glib2 curl \
+            patchelf fuse-libs
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -157,9 +158,25 @@ jobs:
         run: gh release upload "$GITHUB_REF_NAME" dist/appimage/*.AppImage --clobber
 
   deb:
-    name: .deb (Ubuntu 24.04)
+    # **Not the LTS, and it cannot be.** `crates/cordial-shell/Cargo.toml` takes
+    # gtk4 with the `v4_20` feature, so `gdk4-sys` asks pkg-config for
+    # `gtk4 >= 4.20`. Ubuntu 24.04 LTS ships 4.14.5 and the job failed on
+    # exactly that: "Package 'gtk4' has version '4.14.5', required version is
+    # '>= 4.20'". That is the dependency floor excluding the distribution, not a
+    # container misconfigured -- lowering the floor to reach an LTS is the wrong
+    # direction and would give up the libadwaita the shell is built on.
+    #
+    # So this targets a release new enough to satisfy it, and Debian-family
+    # users on anything older are served by the Flatpak and the AppImage, both
+    # of which carry their own GTK. That is the argument for the AppImage being
+    # the important artifact here rather than a convenience.
+    #
+    # 25.10 is chosen because it is the first Ubuntu that plausibly carries
+    # 4.20, and it is UNVERIFIED until this job goes green -- which is a cheap
+    # way to find out and an honest place to say so.
+    name: .deb (Ubuntu 25.10)
     runs-on: ubuntu-latest
-    container: ubuntu:24.04
+    container: ubuntu:25.10
     timeout-minutes: 60
     steps:
       - name: Install build dependencies

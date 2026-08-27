@@ -365,6 +365,32 @@ client is not itself disqualifying — Sober ships on Flathub as
 Roblox code, asset or APK at all and the user supplies the client where Sober
 fetches it. That was never the obstacle. The AI policy is.
 
+**Checked again on 2026-08-27, against the primary sources rather than repeated
+from memory**, because a claim this load-bearing for a maintainer's week is
+worth re-verifying rather than trusting the paragraph above on faith:
+
+- `docs.flathub.org/docs/for-app-authors/requirements`, "Generative AI policy"
+  section, quoted directly: *"Applications containing AI-generated or
+  AI-assisted code, documentation, or any other content are not allowed"*, with
+  *"exceptions may be granted for mature, well-maintained projects"* and no
+  published criteria or application process for that exception beyond asking —
+  case by case, in a GitHub issue on `flathub/flathub` or the Flathub Matrix
+  room, per public reporting on the policy (effective 2026-05-29). Confirms the
+  paragraph above is still accurate a season later, not that it always will be.
+- **Sober's own published manifest**, `flathub/org.vinegarhq.Sober`, fetched and
+  read directly: `finish-args` grants `--share=network` with the comment "Both
+  Sober & Roblox require network access to work. Non-optional", and the
+  manifest contains no `extra-data` source for the Roblox client at all. So
+  Sober does not smuggle Roblox in at build time through the one Flathub
+  mechanism built for non-redistributable content (`extra-data`) — it fetches
+  the proprietary APK itself, over the network, after install, at runtime,
+  exactly the shape `crates/cordial-update` uses. This is the strongest
+  available evidence that the runtime-download shape is not what Flathub's
+  build-from-source rule is policing, because a project doing precisely that
+  has been live on the store throughout. It does not settle every question a
+  reviewer might raise — a submission is still a human decision — but "we
+  cannot know until we ask" is no longer the honest position on this one point.
+
 ## Why Roblox reports a client-integrity problem, so far
 
 Open, and the most-asked question about this project. What follows is what has

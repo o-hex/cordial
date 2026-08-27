@@ -307,34 +307,6 @@ list of build dependencies moved down to §3, where it belongs.
 **This is the way to install Cordial.** Building from source (§3) is for people
 changing it, not for people running it.
 
-> [!NOTE]
-> **Measured end to end on 2026-08-05, flatpak 1.18.0**, against the published
-> URL rather than a stand-in: `remote-add` accepted, `remote-ls` returning
-> `app/io.github.luohoa97.Cordial/x86_64/master`, `install` placing both
-> `cordial-shell` and `cordial-run` in `/app/bin`, and `flatpak run` bringing up
-> the launcher window and holding it. The appstream branch resolves and the
-> metainfo validates, so a software centre lists it too.
->
-> **Cordial is not on Flathub, and on current policy it cannot be.** Flathub's
-> generative-AI policy does not allow applications containing AI-generated or
-> AI-assisted code, documentation or content, and Cordial contains a great deal
-> of both — the git history records it in `Co-Authored-By` trailers rather than
-> hiding it. The policy allows exceptions for mature, well-maintained projects,
-> and that is the only route; it is not one to take by quietly deleting the
-> evidence. **This remote is therefore the distribution channel, not a stopgap
-> until a better one arrives.**
->
-> **One known limitation of the Flatpak specifically.** The updater asks
-> NetworkManager on the system bus whether your connection is metered, the
-> sandbox has no system bus, and the check fails closed — so a Flatpak install
-> treats every connection as metered and will not download a Roblox build in the
-> background unless you turn on *Download on metered connections*. Manual
-> downloads are unaffected.
->
-> [The workflow](https://github.com/luohoa97/cordial/actions/workflows/flatpak.yml)
-> is worth a glance before a fresh install: it publishes only on a green run, so
-> a red one on `main` means the remote is serving the previous build.
-
 ```bash
 flatpak remote-add --if-not-exists cordial \
     https://luohoa97.github.io/cordial/cordial.flatpakrepo
@@ -352,6 +324,16 @@ flatpak run io.github.luohoa97.Cordial
 `flatpak uninstall --delete-data io.github.luohoa97.Cordial` if you also want the
 profiles, the sign-in and the extracted Roblox build gone.
 
+**Before you extend that trust: the remote is not signed**, and what that does
+and does not protect you from is worth your attention rather than your having
+skimmed past it on the way to a command to paste. It is immediately below
+rather than above the commands, because it deserves reading properly and not
+standing between you and trying the thing first. If you would rather not
+extend that trust at all, §3 builds the same package from source and is the
+whole of the alternative.
+
+#### What "not signed" actually means, and the rest of the fine print
+
 **The remote is not signed.** There is no GPG key on it, so `flatpak install`
 verifies that the download matches the repository's own checksums and nothing
 beyond that. What it does not do is prove who built it: anyone who can write to
@@ -360,11 +342,45 @@ GitHub itself — can serve a different package under the same name and your
 machine will install it without complaint. That is a weaker guarantee than
 Flathub's and you should know which one you are getting. Signing is wired up in
 [`.github/workflows/flatpak.yml`](.github/workflows/flatpak.yml) and switches on
-the day a maintainer adds a key; the commands above do not change when it does,
-but a remote added while it was unsigned stays unverified, so re-add it.
+the day a maintainer adds a key — the precise procedure for that is written down
+in [`docs/design/flatpak-remote-signing.md`](docs/design/flatpak-remote-signing.md)
+so it does not have to be worked out under pressure. The commands above do not
+change when it does, but a remote added while it was unsigned stays unverified,
+so re-add it.
 
-If you would rather not extend that trust, §3 builds the same package from
-source and is the whole of the alternative.
+**Cordial is not on Flathub, and on current policy it cannot be.** Flathub's
+generative-AI policy does not allow applications containing AI-generated or
+AI-assisted code, documentation or content, and Cordial contains a great deal of
+both — the git history records it in `Co-Authored-By` trailers rather than
+hiding it. The policy allows exceptions for mature, well-maintained projects,
+and that is the only route; it is not one to take by quietly deleting the
+evidence. **This remote is therefore the distribution channel, not a stopgap
+until a better one arrives.** Being a third-party client that fetches a
+proprietary build at the user's request is not itself the obstacle — Sober's own
+published manifest for `org.vinegarhq.Sober` grants `--share=network` and
+downloads Roblox's Android build at runtime with no `extra-data` source and
+nothing bundled, the same shape this project uses, and it has been live on
+Flathub throughout. The AI policy is the whole of what stands in the way, not
+what Cordial downloads or when.
+
+> [!NOTE]
+> **Measured end to end on 2026-08-05, flatpak 1.18.0**, against the published
+> URL rather than a stand-in: `remote-add` accepted, `remote-ls` returning
+> `app/io.github.luohoa97.Cordial/x86_64/master`, `install` placing both
+> `cordial-shell` and `cordial-run` in `/app/bin`, and `flatpak run` bringing up
+> the launcher window and holding it. The appstream branch resolves and the
+> metainfo validates, so a software centre lists it too.
+>
+> **One known limitation of the Flatpak specifically.** The updater asks
+> NetworkManager on the system bus whether your connection is metered, the
+> sandbox has no system bus, and the check fails closed — so a Flatpak install
+> treats every connection as metered and will not download a Roblox build in the
+> background unless you turn on *Download on metered connections*. Manual
+> downloads are unaffected.
+>
+> [The workflow](https://github.com/luohoa97/cordial/actions/workflows/flatpak.yml)
+> is worth a glance before a fresh install: it publishes only on a green run, so
+> a red one on `main` means the remote is serving the previous build.
 
 ### 3. Or build it from source
 
@@ -665,6 +681,8 @@ Start with [`docs/NEXT.md`](docs/NEXT.md). The rest is reference.
 | [`docs/design/instances-and-launch.md`](docs/design/instances-and-launch.md) | Multi-instance, multi-account, `roblox://` handling |
 | [`docs/base-evaluation.md`](docs/base-evaluation.md) | Port-vs-write assessment of the prior art |
 | [`docs/multiarch.md`](docs/multiarch.md) | Multi-architecture decision |
+| [`docs/design/flatpak-remote-signing.md`](docs/design/flatpak-remote-signing.md) | The exact procedure for signing the Flatpak remote, for whoever holds the key |
+| [`docs/analysis/desktop-integration-audit.md`](docs/analysis/desktop-integration-audit.md) | What is already native-feeling about the `.desktop` entry, icons and deep links, and what is not |
 
 ## What this is built on, and who it is owed to
 

@@ -152,6 +152,15 @@ rm -rf "$appdir"
 mkdir -p "$appdir"
 
 install -Dm755 "$target_dir/release/cordial-shell" "$appdir/usr/bin/cordial-shell"
+# First-party plugins, read-only beside the binary.
+# Until the native packages existed nothing installed these anywhere, so the settings window listed no built-in plugins for anybody -- including Flatpak users, whose /app/share/cordial/plugins the code has looked in from the start and which has never existed.
+for plugin in plugins/*/; do
+    id=$(basename "$plugin")
+    [ -f "$plugin/plugin.json" ] || continue
+    install -Dm644 "$plugin/plugin.json" "$appdir/usr/share/cordial/plugins/$id/plugin.json"
+    install -Dm644 "$plugin/main.ts"     "$appdir/usr/share/cordial/plugins/$id/main.ts"
+done
+
 install -Dm755 "$target_dir/release/cordial-run"   "$appdir/usr/bin/cordial-run"
 
 install -Dm644 packaging/io.github.luohoa97.Cordial.desktop \

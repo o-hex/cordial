@@ -1,0 +1,11 @@
+{
+  "id": "fps-flex",
+  "name": "FPS Flex",
+  "version": "1.0.0",
+  "entry": "main.ts",
+  "capabilities": [
+    "flags.write",
+    "settings.read",
+    "log"
+  ]
+}

@@ -92,7 +92,29 @@ pub fn is_enabled(profile_dir: &Path, id: &str) -> bool {
     if !opinions.get(ALL).copied().unwrap_or(true) {
         return false;
     }
-    opinions.get(id).copied().unwrap_or(true)
+    opinions.get(id).copied().unwrap_or_else(|| default_for(id))
+}
+
+/// Plugins that ship with Cordial and start switched **off**.
+///
+/// A plugin the user went and installed is one they asked for, so the default
+/// for anything not named here is on. A plugin that arrives because they
+/// installed Cordial is a different thing: nobody chose it, and it should not
+/// change how their machine behaves until somebody does.
+///
+/// `fps-flex` uncaps presentation, which makes the GPU render frames as fast as
+/// the driver allows. On a desktop that is the point; on a laptop it is heat and
+/// battery spent on frames nobody asked for. Listing it here is what makes the
+/// settings entry an offer rather than a change.
+///
+/// Deliberately a list of ids and not a manifest field. A plugin declaring its
+/// own default would let any plugin declare itself on, and the question this
+/// answers -- what may run without being asked for -- is Cordial's to answer.
+const SHIPS_DISABLED: &[&str] = &["fps-flex"];
+
+/// What [`is_enabled`] answers for a plugin nobody has an opinion about.
+pub fn default_for(id: &str) -> bool {
+    !SHIPS_DISABLED.contains(&id)
 }
 
 /// Record that `id` should or should not run in this profile.
@@ -106,11 +128,20 @@ pub fn set_enabled(profile_dir: &Path, id: &str, on: bool) -> std::io::Result<()
     let mut map = load(&path);
     // Only the exceptions are stored. Writing `true` for everything would make
     // the file grow a permanent entry for every plugin ever installed, and
-    // "absent means enabled" would stop being true of a file anyone inspects.
-    if on {
+    // "absent means the default" would stop being true of a file anyone
+    // inspects.
+    //
+    // **The exception is measured against this plugin's own default, not
+    // against `true`.** This removed the entry whenever `on` was set, which was
+    // right while every plugin defaulted on and silently wrong the moment one
+    // shipped disabled: enabling `fps-flex` deleted the only record that it had
+    // been enabled, `is_enabled` fell back to the shipped default, and the
+    // switch appeared to revert itself on the next launch. Caught by a test
+    // rather than by a user, which is the only reason it is not a bug report.
+    if on == default_for(id) {
         map.remove(id);
     } else {
-        map.insert(id.to_string(), false);
+        map.insert(id.to_string(), on);
     }
 
     std::fs::create_dir_all(profile_dir)?;
@@ -123,6 +154,43 @@ pub fn set_enabled(profile_dir: &Path, id: &str, on: bool) -> std::io::Result<()
 
 #[cfg(test)]
 mod tests {
+    /// A plugin that ships with Cordial must not run until somebody says so.
+    ///
+    /// The failure this catches: `is_enabled` defaults to true, which is right
+    /// for a plugin the user went and installed and wrong for one that arrived
+    /// because they installed Cordial. If `fps-flex` ever defaults on, every
+    /// user gets uncapped presentation -- their GPU rendering as fast as the
+    /// driver allows, on a laptop, without having asked -- and the first they
+    /// hear of it is the fan.
+    #[test]
+    fn a_built_in_that_changes_the_machine_ships_off() {
+        let dir = scratch("ships-disabled");
+        assert!(!super::is_enabled(&dir, "fps-flex"), "fps-flex must ship disabled");
+        assert!(super::is_enabled(&dir, "some-plugin-a-user-installed"));
+    }
+
+    /// Turning it on has to stick, and turning it off again has to stick too.
+    ///
+    /// A default-off plugin whose "on" is not recorded would appear to enable
+    /// and revert on the next launch, which reads as the switch not working.
+    #[test]
+    fn the_user_can_overrule_the_shipped_default_both_ways() {
+        let dir = scratch("ships-disabled-override");
+        super::set_enabled(&dir, "fps-flex", true).unwrap();
+        assert!(super::is_enabled(&dir, "fps-flex"));
+        super::set_enabled(&dir, "fps-flex", false).unwrap();
+        assert!(!super::is_enabled(&dir, "fps-flex"));
+    }
+
+    /// The master switch still wins over a shipped default.
+    #[test]
+    fn turning_plugins_off_beats_an_enabled_built_in() {
+        let dir = scratch("ships-disabled-master");
+        super::set_enabled(&dir, "fps-flex", true).unwrap();
+        super::set_plugins_allowed(&dir, false).unwrap();
+        assert!(!super::is_enabled(&dir, "fps-flex"));
+    }
+
     use super::*;
 
     fn scratch(tag: &str) -> PathBuf {

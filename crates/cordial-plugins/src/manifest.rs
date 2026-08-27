@@ -237,9 +237,33 @@ pub fn plugin_root() -> PathBuf {
 /// fixed, which is the argument `is_valid_id` below already makes about path
 /// checks. `flags.rs` now calls this.
 pub fn system_plugin_root() -> PathBuf {
-    std::env::var_os("CORDIAL_SYSTEM_PLUGIN_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/app/share/cordial/plugins"))
+    if let Some(explicit) = std::env::var_os("CORDIAL_SYSTEM_PLUGIN_DIR") {
+        return PathBuf::from(explicit);
+    }
+    // **`/app` is Flatpak's prefix and nothing else's.** This returned it
+    // unconditionally, which was correct while the Flatpak was the only way to
+    // install Cordial and became wrong the day the deb, rpm, Arch package and
+    // AppImage started building -- on all four, the built-in plugins are
+    // installed under the real prefix and this looked for them somewhere that
+    // does not exist, so the settings window would list none of them.
+    //
+    // Derived from the running binary rather than compiled in, because an
+    // AppImage is unpacked to a different path on every launch and a fixed
+    // prefix cannot be right for it. `…/bin/cordial-shell` gives `…/share/
+    // cordial/plugins`, which is correct for /usr, for /usr/local, for /app and
+    // for whatever temporary directory an AppImage mounted itself at.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(prefix) = exe.parent().and_then(|bin| bin.parent()) {
+            let beside = prefix.join("share/cordial/plugins");
+            if beside.is_dir() {
+                return beside;
+            }
+        }
+    }
+    // Flatpak last and still present: inside the sandbox the check above
+    // already finds `/app/share/cordial/plugins`, and this keeps a build that
+    // somehow runs the binary from elsewhere behaving as it always did.
+    PathBuf::from("/app/share/cordial/plugins")
 }
 
 /// Whether a string may be used as a plugin id.

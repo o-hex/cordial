@@ -90,6 +90,15 @@ install -Dm644 packaging/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.
 # Exec=cordial-shell %u, and the %u is not decorative: the entry registers
 # x-scheme-handler/roblox-player, which is how a Play button on the website
 # reaches a client at all.
+# First-party plugins, read-only beside the binary -- see the same block in
+# packaging/rpm/cordial.spec for why this is per-package rather than a path
+# compiled in.
+for plugin in plugins/*/; do
+    id=$(basename "$plugin")
+    [ -f "$plugin/plugin.json" ] || continue
+    install -Dm644 "$plugin/plugin.json" "$root/usr/share/cordial/plugins/$id/plugin.json"
+    install -Dm644 "$plugin/main.ts"     "$root/usr/share/cordial/plugins/$id/main.ts"
+done
 install -Dm644 packaging/io.github.luohoa97.Cordial.desktop \
     "$root/usr/share/applications/io.github.luohoa97.Cordial.desktop"
 install -Dm644 packaging/io.github.luohoa97.Cordial.metainfo.xml \

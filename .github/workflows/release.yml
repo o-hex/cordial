@@ -90,8 +90,19 @@ on:
 # else, and a release with nothing attached to it is the whole reason this
 # file exists, so the step that attaches something is the one that needs the
 # broader grant.
+# **`write`, and it has to be, however much read would suit the rest.** Each of
+# the four jobs ends with a `gh release upload` that runs only on a tag, and
+# with `contents: read` that step gets a 403 -- which is why v0.8.0 and v0.9.0
+# both published with a Flatpak bundle and no native packages while every push
+# to main went green. On main the attach step is skipped, so the missing grant
+# is invisible; on a tag it is the only step that matters.
+#
+# A comment elsewhere in this file used to claim the grant was made per-job
+# "only where a job actually uploads". It never was. Narrowing it again means
+# a `permissions:` block inside each of the four jobs, and is worth doing the
+# day somebody adds a job that should not be able to write.
 permissions:
-  contents: read
+  contents: write
 
 # Per-ref rather than the single global group flatpak.yml uses: these four
 # jobs do not share a publish target the way a Pages deployment does, so

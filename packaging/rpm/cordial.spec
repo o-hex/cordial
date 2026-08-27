@@ -189,6 +189,17 @@ install -Dpm 0644 packaging/icons/hicolor/scalable/apps/io.github.luohoa97.Cordi
 install -Dpm 0644 packaging/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.Frostbite.svg \
     %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.Frostbite.svg
 
+# The first-party plugins, read-only beside the binary. `system_plugin_root()`
+# derives this path from the running executable, so `%{_datadir}` is what it
+# finds -- and until the native packages existed it returned Flatpak's `/app`
+# unconditionally, which meant a deb or rpm user's settings window listed no
+# built-in plugins at all.
+for plugin in plugins/*/; do
+    id=$(basename "$plugin")
+    [ -f "$plugin/plugin.json" ] || continue
+    install -Dpm 0644 "$plugin/plugin.json" %{buildroot}%{_datadir}/cordial/plugins/$id/plugin.json
+    install -Dpm 0644 "$plugin/main.ts"     %{buildroot}%{_datadir}/cordial/plugins/$id/main.ts
+done
 install -Dpm 0644 packaging/io.github.luohoa97.Cordial.desktop \
     %{buildroot}%{_datadir}/applications/io.github.luohoa97.Cordial.desktop
 install -Dpm 0644 packaging/io.github.luohoa97.Cordial.metainfo.xml \
@@ -281,6 +292,7 @@ appstream-util validate-relax --nonet \
 %license libjnivm-MIT.txt
 %license NOTICE
 %license mocktail-webview-Apache-2.0.txt
+%{_datadir}/cordial/plugins/
 %doc README.md THIRD-PARTY-NOTICES.md
 %{_bindir}/cordial-shell
 %{_bindir}/cordial-run

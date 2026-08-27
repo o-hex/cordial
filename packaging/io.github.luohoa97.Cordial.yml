@@ -269,6 +269,15 @@ modules:
       # /app/bin and no configurable path — so shipping the shell without
       # `cordial-run` beside it gives a launcher whose Launch button cannot
       # find anything to launch.
+      # First-party plugins, read-only beside the binary.
+      # Until the native packages existed nothing installed these anywhere, so the settings window listed no built-in plugins for anybody -- including Flatpak users, whose /app/share/cordial/plugins the code has looked in from the start and which has never existed.
+      - |
+        for plugin in plugins/*/; do
+          id=$(basename "$plugin")
+          [ -f "$plugin/plugin.json" ] || continue
+          install -Dm644 "$plugin/plugin.json" "/app/share/cordial/plugins/$id/plugin.json"
+          install -Dm644 "$plugin/main.ts" "/app/share/cordial/plugins/$id/main.ts"
+        done
       - install -Dm755 target/release/cordial-shell /app/bin/cordial-shell
       - install -Dm755 target/release/cordial-run /app/bin/cordial-run
       # The square icon, not packaging/icons/io.github.luohoa97.Cordial.svg, which is

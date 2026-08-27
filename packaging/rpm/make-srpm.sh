@@ -112,7 +112,20 @@ tar --zstd -cf "$srcdir/${archive}-vendor.tar.zst" -C "$work" vendor
 
 echo "==> writing the spec"
 spec="$work/cordial.spec"
-sed -e "s|^%global snapinfo .*|%global snapinfo ${snapinfo}|" \
+# **On an exact tag `snapinfo` is empty, and `%global snapinfo` with nothing
+# after it is a hard rpm error** -- "Macro %snapinfo has empty body", at parse
+# time, before anything is built. This path only runs when building from a tag,
+# which is the only time it matters and the reason it went unnoticed until
+# v0.9.0: every push to main has commits after the tag and takes the other
+# branch. `archivename` is rewritten to drop the trailing component too, since
+# `cordial-0.9.0-` is not the tarball that was just written.
+if [ -z "$snapinfo" ]; then
+    snap_edit=(-e "/^%global snapinfo /d"
+               -e "s|^%global archivename .*|%global archivename %{name}-%{version}|")
+else
+    snap_edit=(-e "s|^%global snapinfo .*|%global snapinfo ${snapinfo}|")
+fi
+sed "${snap_edit[@]}" \
     -e "s|^%global commit   .*|%global commit   ${commit}|" \
     -e "s|^%global describe .*|%global describe ${describe#v}|" \
     -e "s|^Version: *.*|Version:        ${version}|" \

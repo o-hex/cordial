@@ -279,16 +279,24 @@ mod tests {
         );
     }
 
+    /// **Uses a user-installed id, not a built-in one, and that matters.**
+    /// This read `fps-flex` when the name was an arbitrary fixture, and broke
+    /// the day `fps-flex` became a real plugin that ships disabled: switching
+    /// off something already off writes no entry, because `set_enabled` stores
+    /// only exceptions to a plugin's default. The property under test here is
+    /// about a plugin whose default is on, so it needs a name whose default is
+    /// on -- and a fixture that silently starts meaning something is worth a
+    /// sentence rather than a rename.
     #[test]
     fn being_switched_off_is_data_and_forgetting_restores_the_default() {
         let dir = scratch("disabled");
-        enablement::set_enabled(&dir, "fps-flex", false).unwrap();
-        assert!(footprint(&dir, "fps-flex").has_enablement);
+        enablement::set_enabled(&dir, "a-plugin-the-user-installed", false).unwrap();
+        assert!(footprint(&dir, "a-plugin-the-user-installed").has_enablement);
 
-        forget(&dir, "fps-flex").unwrap();
-        assert!(footprint(&dir, "fps-flex").is_empty());
+        forget(&dir, "a-plugin-the-user-installed").unwrap();
+        assert!(footprint(&dir, "a-plugin-the-user-installed").is_empty());
         assert!(
-            enablement::is_enabled(&dir, "fps-flex"),
+            enablement::is_enabled(&dir, "a-plugin-the-user-installed"),
             "absent means enabled, so a reinstall comes back on"
         );
     }

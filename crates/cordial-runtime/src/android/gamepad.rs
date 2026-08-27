@@ -244,7 +244,17 @@ fn decode(buf: &[u8; JS_EVENT_LEN]) -> (u8, u8, i16) {
 /// disconnect carries no type, the engine is evidently keeping the type against
 /// that id from this call onwards.
 fn announce(id: i32, n_buttons: u8, n_axes: u8) {
-    let ty = gamepad_type();
+    let name = device_name(id);
+    let family = name.as_deref().map(classify);
+    let ty = family.map_or_else(gamepad_type, type_for);
+    // Printed for every pad, because the sweep that establishes the ordinals
+    // needs to know which pad produced which glyphs, and a photograph of a
+    // screen does not record what was plugged in.
+    eprintln!(
+        "[cordial] gamepad {id}: {} -> {:?}, announcing gamepadType={ty} (UNVERIFIED)",
+        name.as_deref().unwrap_or("(no name in /sys)"),
+        family.unwrap_or(Family::Unrecognised)
+    );
     input::deliver_gamepad_connect(id, ty);
     for i in 0..n_buttons {
         if let Some(code) = button_keycode(i) {
@@ -267,6 +277,88 @@ fn send_axis(id: i32, index: u8, value: i16) {
         return;
     };
     input::deliver_gamepad_axis(id, code, value as f32 / JS_AXIS_MAX, 0.0, 0.0);
+}
+
+/// What kind of pad this is, as far as the host can tell.
+///
+/// The engine wants a `gamepadType` and nothing here knows its ordinals -- but
+/// **the host knows perfectly well what is plugged in**, and that is the half
+/// that was missing. A wrong ordinal shows PlayStation owners Xbox glyphs;
+/// knowing which pad it actually is turns that from an unanswerable question
+/// into one lookup somebody can fill in once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    Xbox,
+    PlayStation,
+    Nintendo,
+    /// Something real that matched nothing above. Distinct from "no name to
+    /// read": a pad whose name is unrecognised is evidence about the table, and
+    /// a pad whose name could not be read is evidence about the machine.
+    Unrecognised,
+}
+
+/// Classify a joydev device name.
+///
+/// Matching on substrings of the kernel's name rather than on USB ids, because
+/// the name is what `/sys` publishes as text and the ids would need an `ioctl`
+/// and therefore a `libc` dependency this module exists without -- the same
+/// reasoning as counting the init burst instead of calling `JSIOCGBUTTONS`.
+///
+/// The strings are the ones Linux's own drivers report: `xpad` names every Xbox
+/// pad with "X-Box" or "Xbox", `hid-playstation` and `hid-sony` report "Sony",
+/// "DualSense", "DualShock" or "PLAYSTATION", and `hid-nintendo` reports
+/// "Nintendo" or "Pro Controller". Third-party pads usually imitate one of
+/// those because they imitate its protocol.
+pub fn classify(name: &str) -> Family {
+    let n = name.to_ascii_lowercase();
+    let has = |needle: &str| n.contains(needle);
+    if has("dualsense") || has("dualshock") || has("playstation") || has("sony") || has("ps3")
+        || has("ps4") || has("ps5")
+    {
+        return Family::PlayStation;
+    }
+    if has("nintendo") || has("switch pro") || has("joy-con") || has("joycon") {
+        return Family::Nintendo;
+    }
+    if has("xbox") || has("x-box") || has("xinput") {
+        return Family::Xbox;
+    }
+    Family::Unrecognised
+}
+
+/// The pad's name, as the kernel reports it.
+///
+/// Read out of `/sys` rather than through `JSIOCGNAME`, for the reason
+/// [`classify`] gives. `None` means the file was not there or was not readable,
+/// which happens on a device node without a matching sysfs entry and must not
+/// be confused with a name that matched nothing.
+fn device_name(id: i32) -> Option<String> {
+    let path = format!("/sys/class/input/js{id}/device/name");
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
+}
+
+/// The `gamepadType` to announce for a pad of this family.
+///
+/// **Every entry is unknown and the function says so by returning the same
+/// fallback for all of them.** This is deliberately a table with nothing in it
+/// rather than a plausible guess: the ordinals of `RBX::GamepadType` are not
+/// readable from anything available here, and a table of invented numbers would
+/// look exactly like a table of established ones six months from now.
+///
+/// Filling it in is one session's work and needs no code change. With a pad
+/// plugged in, sweep `CORDIAL_GAMEPAD_TYPE=N` and photograph the button glyphs
+/// the engine draws; the N that draws this family's glyphs is this family's
+/// ordinal. The log line in [`announce`] names the family it detected, so the
+/// sweep's result can be attributed to a pad rather than to a guess.
+fn type_for(family: Family) -> i32 {
+    match family {
+        // Left as one arm on purpose. When the first ordinal is established,
+        // give it its own arm and leave the rest here -- a partially filled
+        // table is honest and a fully invented one is not.
+        Family::Xbox | Family::PlayStation | Family::Nintendo | Family::Unrecognised => {
+            gamepad_type()
+        }
+    }
 }
 
 fn open_pad(id: i32) -> Option<std::fs::File> {
@@ -460,6 +552,58 @@ fn poll_probe() {
 
 #[cfg(test)]
 mod tests {
+    /// The names Linux's own drivers report, classified.
+    ///
+    /// The failure this catches: somebody adds a substring that is too greedy
+    /// and swallows a family it should not. "Controller" alone would match every
+    /// pad ever made; "pro" would match "Xbox Elite Wireless Controller Pro".
+    /// Each string below is one a real driver emits.
+    #[test]
+    fn real_pad_names_land_in_the_right_family() {
+        use super::{classify, Family};
+        for (name, want) in [
+            ("Microsoft X-Box 360 pad", Family::Xbox),
+            ("Xbox Wireless Controller", Family::Xbox),
+            ("Microsoft Xbox Series S|X Controller", Family::Xbox),
+            ("Sony Interactive Entertainment Wireless Controller", Family::PlayStation),
+            ("Sony Computer Entertainment Wireless Controller", Family::PlayStation),
+            ("DualSense Wireless Controller", Family::PlayStation),
+            ("PS5 Controller", Family::PlayStation),
+            ("Nintendo Switch Pro Controller", Family::Nintendo),
+            ("Nintendo Switch Left Joy-Con", Family::Nintendo),
+            ("8BitDo SN30 Pro", Family::Unrecognised),
+            ("Generic USB Joystick", Family::Unrecognised),
+        ] {
+            assert_eq!(classify(name), want, "{name}");
+        }
+    }
+
+    /// Case must not decide a family.
+    ///
+    /// Drivers are inconsistent about it -- "X-Box" and "Xbox" both occur, and a
+    /// third-party pad imitating one may capitalise differently. A classifier
+    /// that works on the exact strings above and fails on a shouted one would
+    /// pass the test above and still be wrong in the field.
+    #[test]
+    fn case_does_not_decide_a_family() {
+        use super::{classify, Family};
+        assert_eq!(classify("SONY WIRELESS CONTROLLER"), Family::PlayStation);
+        assert_eq!(classify("xbox wireless controller"), Family::Xbox);
+        assert_eq!(classify("NINTENDO SWITCH PRO CONTROLLER"), Family::Nintendo);
+    }
+
+    /// An unreadable name and an unrecognised one are different facts.
+    ///
+    /// `Unrecognised` says the host named a pad this table does not cover, which
+    /// is evidence the table needs a row. A missing `/sys` entry says nothing
+    /// about the table at all. Collapsing them would make the first invisible.
+    #[test]
+    fn an_empty_name_is_unrecognised_rather_than_a_family() {
+        use super::{classify, Family};
+        assert_eq!(classify(""), Family::Unrecognised);
+        assert_eq!(classify("   "), Family::Unrecognised);
+    }
+
     use super::*;
 
     /// The packet layout, which is the one thing here that can be checked

@@ -1,0 +1,527 @@
+//! Gamepads, from the host's joystick devices into `NativeInputInterface`.
+//!
+//! **This is off by default, and the reason is a blocker rather than caution.**
+//!
+//! The six gamepad natives are real: `tools/dex_method.py` reads all six
+//! descriptors out of the shipping APK's dex, and `readelf --dyn-syms` finds all
+//! six exported by `libroblox.so`. What is missing is one integer's meaning.
+//! This build ships no type-less connect entry point -- `nativeGamepadConnectEvent`
+//! returns `no match` from the dex and `0` from `readelf | grep -c` -- so a pad
+//! cannot be announced without supplying a `gamepadType`, and nothing available
+//! here says what the ordinals are:
+//!
+//! `docs/traces/waydroid-roblox-startup.log.gz` has no gamepad line in it at
+//! all, because the capture was taken with no pad plugged in. The dex declares
+//! no class with `Gamepad` in its name, and the Java caller is obfuscated.
+//! mocktail resolves all six symbols and never calls one of them. The only
+//! signal in the binary is three glyph asset folders -- `DefaultController`,
+//! `PlayStationController`, `XboxController` -- beside a reflected
+//! `RBX::GamepadType`, which suggests how *many* values there are and says
+//! nothing about which is which.
+//!
+//! Reading that as "0 = unknown, 1 = PlayStation, 2 = Xbox" would be exactly the
+//! wrong-but-plausible conclusion AGENTS.md's opening rule is about, and the
+//! wrong outcome is already a live bug next door: Sober #1018 is
+//! *"Sober detects my PS4 controller as a XBOX one"*. So Cordial does not guess
+//! it on a user's behalf. Nothing here calls the connect native until somebody
+//! sets `CORDIAL_GAMEPAD=1`, and when they do they are told the type is unverified.
+//!
+//! **The experiment that settles it, and what this module exists to make
+//! possible.** Because the glyph folders are per-type, the engine's own UI is a
+//! readout of `gamepadType`: announce a pad with type N, open something that
+//! draws button glyphs, and photograph the frame with `cordial_screenshot` out
+//! of Cordial's swapchain. The N that draws PlayStation glyphs *is* PlayStation,
+//! and a different N drawing different glyphs is the control. `CORDIAL_GAMEPAD_TYPE=N`
+//! is that sweep, and `CORDIAL_GAMEPAD_PROBE=1` runs it with no hardware at all
+//! -- it announces one synthetic pad and sends nothing, which is enough to draw
+//! the glyphs. Second best is re-capturing the logcat with a pad attached.
+//!
+//! **No rumble.** `android/os/Vibrator` is declared in the dex and implemented
+//! nowhere in Cordial. Force feedback is out of scope here and is absent rather
+//! than stubbed, because a rumble call that silently does nothing is the stub
+//! that lies.
+//!
+//! **The host half is a placeholder and is meant to be replaced.** It reads
+//! Linux's legacy joydev nodes (`/dev/input/js*`) with plain `std::fs` and no
+//! new dependency, because the alternative -- gilrs, which is the right answer
+//! -- carries `libudev-sys`, whose `build.rs` is an unconditional
+//! `pkg_config::find_library("libudev").unwrap()` and whose binaries link
+//! `libudev.so.1`. Cordial has no udev anywhere in `Cargo.lock` today, and
+//! taking that on touches the flatpak, deb, rpm and AppImage manifests and CI.
+//! That is a packaging decision, not an implementation detail, and it should not
+//! ride in on a feature that cannot be switched on yet.
+//!
+//! What is lost by waiting is real and worth naming: joydev reports *indices*
+//! rather than button codes, so [`button_keycode`] and [`axis_code`] are a fixed
+//! table for the standard layout rather than a per-device mapping. gilrs carries
+//! `SDL_GameControllerDB`, which is that mapping for thousands of pads, and it
+//! also exposes the vendor and product ids a `gamepadType` classifier would want
+//! once the ordinals are known. When the udev dependency is accepted, this
+//! module's [`poll`] is the seam to swap underneath.
+//!
+//! TASKS.md recommends `libmanette` for this and should not: it has no Rust
+//! binding at all (`cargo search libmanette` returns nothing), so adopting it
+//! means hand-written GObject FFI. TASKS.md also points this work at the
+//! GameActivity motion-event path, which is the pipe
+//! `native/game_activity.cpp` records as accepted-and-ignored -- every click
+//! delivered that way was taken and nothing on screen moved. Gamepad goes
+//! through `NativeInputInterface` for the same reason the mouse does.
+
+use std::io::Read;
+use std::sync::OnceLock;
+
+use super::input;
+
+/// `CORDIAL_GAMEPAD=1`. The off switch, defaulting to off.
+///
+/// Off is the honest default while `gamepadType` is unestablished -- see the
+/// module comment. It is also the switch that makes the glyph sweep possible,
+/// so this is a knob for finishing the work rather than a setting to forget.
+fn enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_GAMEPAD").is_some())
+}
+
+/// `CORDIAL_GAMEPAD_PROBE=1` — announce one pad that does not exist, and send it
+/// no events.
+///
+/// This is the sweep harness. Establishing what `gamepadType` means needs the
+/// engine to *draw* something for a connected pad, and drawing needs only the
+/// connect call and the capability declaration; it does not need a thumbstick to
+/// move, and it does not need anybody to own a controller. Without this the
+/// experiment is blocked on hardware that the machine this was written on does
+/// not have.
+fn probe() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_GAMEPAD_PROBE").is_some())
+}
+
+/// `CORDIAL_GAMEPAD_TYPE=N` — the argument nothing here can establish.
+///
+/// **Defaults to 0 and 0 is a guess.** The engine takes this as an
+/// `RBX::GamepadType`, which is a reflected enum whose ordinals are not readable
+/// from anything available here; 0 is chosen only because it is the value least
+/// likely to be a specific console, on the usual convention that an enum's zero
+/// is its unknown. That convention is not evidence, and a client that shows the
+/// wrong button glyphs is what being wrong here looks like.
+pub fn gamepad_type() -> i32 {
+    static TYPE: OnceLock<i32> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let Some(v) = std::env::var_os("CORDIAL_GAMEPAD_TYPE") else {
+            return 0;
+        };
+        match v.to_string_lossy().trim().parse::<i32>() {
+            Ok(n) => n,
+            _ => {
+                eprintln!(
+                    "[cordial] CORDIAL_GAMEPAD_TYPE={} is not a number; using 0",
+                    v.to_string_lossy()
+                );
+                0
+            }
+        }
+    })
+}
+
+// ------------------------------------------------------------------- joydev
+//
+// `struct js_event` is 8 bytes: a little-endian u32 of milliseconds, an i16
+// value, a u8 type and a u8 index. Decoded by hand rather than through a crate
+// because it is eight bytes with a stable layout and the alternative pulls in a
+// C library -- see the module comment.
+
+const JS_EVENT_BUTTON: u8 = 0x01;
+const JS_EVENT_AXIS: u8 = 0x02;
+/// Set on the burst joydev queues at open, one packet per button and per axis,
+/// reporting the device's current state. Cordial counts that burst to learn the
+/// device's shape: it is the same information `JSIOCGBUTTONS`/`JSIOCGAXES` carry
+/// and it arrives without an `ioctl`, which would mean a `libc` dependency this
+/// module does not otherwise need.
+const JS_EVENT_INIT: u8 = 0x80;
+
+const JS_EVENT_LEN: usize = 8;
+
+/// Full-scale deflection on a joydev axis, which reports `-32767..=32767`.
+const JS_AXIS_MAX: f32 = 32767.0;
+
+/// `O_NONBLOCK`. Hardcoded rather than taken from `libc`, whose only use in this
+/// crate would be this constant; joydev is a Linux interface and this file does
+/// not build for anything else.
+const O_NONBLOCK: i32 = 0o4000;
+
+/// How many `/dev/input/js*` nodes to look at.
+///
+/// Four is Roblox's own limit on connected gamepads, and scanning a fixed small
+/// range is what lets this avoid udev: there is no hotplug notification, so
+/// [`poll`] re-stats the range on a timer instead.
+const MAX_PADS: i32 = 4;
+
+/// How often to look for a pad that was plugged in after startup.
+///
+/// Without udev there is nothing to wake on, so this is a poll, and it is slow
+/// on purpose: four `open` attempts a second on a path that usually does not
+/// exist is not free, and the pump this runs on is the one that must not
+/// acquire work per tick. Two seconds is a delay a human notices once when
+/// plugging a pad in and never again.
+const RESCAN: std::time::Duration = std::time::Duration::from_secs(2);
+
+struct Pad {
+    /// The `jsN` index, used as the engine's device id. That the engine wants a
+    /// small dense id is INFERRED -- the dex says only `int`.
+    id: i32,
+    file: std::fs::File,
+    /// False until the init burst has been counted and the capability
+    /// declaration made. No button or axis event is sent before this is true,
+    /// which is the whole reason the flag exists: an event for a device the
+    /// engine has not been told the shape of is the half-working gamepad
+    /// support this module refuses to ship.
+    announced: bool,
+}
+
+static PADS: std::sync::Mutex<Vec<Pad>> = std::sync::Mutex::new(Vec::new());
+
+/// Android `KeyEvent.KEYCODE_BUTTON_*` for a joydev button index.
+///
+/// **INFERRED twice over.** That the engine's `keyCode` argument is an Android
+/// keycode at all is read from the platform contract the Java caller would have
+/// been working to -- it is handed a `KeyEvent` from an `InputDevice` and has
+/// `getKeyCode()` to forward -- and not observed. That joydev index *i* is the
+/// button below is the standard layout the mainline HID drivers report
+/// (`hid-playstation`, `xpad`, `hid-nintendo` all normalise to `BTN_SOUTH` and
+/// friends, which joydev then numbers in ascending code order). A pad whose
+/// driver omits `BTN_C`/`BTN_Z` shifts every index after it, and that is the
+/// case `SDL_GameControllerDB` exists to handle and this table does not.
+///
+/// `None` for an index past the end of the table: unknown is reported as unknown
+/// rather than folded onto a real button, because a stray keycode is worse than
+/// a missing one.
+pub fn button_keycode(index: u8) -> Option<i32> {
+    // KEYCODE_BUTTON_A, _B, _C, _X, _Y, _Z, _L1, _R1, _L2, _R2,
+    // _SELECT, _START, _MODE, _THUMBL, _THUMBR.
+    const KEYS: [i32; 15] = [96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 109, 108, 110, 106, 107];
+    KEYS.get(index as usize).copied()
+}
+
+/// Android `MotionEvent.AXIS_*` for a joydev axis index.
+///
+/// INFERRED on the same two counts as [`button_keycode`]. The index order is
+/// joydev's ascending-`ABS_*` numbering for a standard pad -- left stick, left
+/// trigger, right stick, right trigger, hat -- and the Android side follows the
+/// convention that a gamepad's right stick is `AXIS_Z`/`AXIS_RZ` rather than
+/// `AXIS_RX`/`AXIS_RY`.
+pub fn axis_code(index: u8) -> Option<i32> {
+    // AXIS_X, AXIS_Y, AXIS_LTRIGGER, AXIS_Z, AXIS_RZ, AXIS_RTRIGGER,
+    // AXIS_HAT_X, AXIS_HAT_Y.
+    const AXES: [i32; 8] = [0, 1, 17, 11, 14, 18, 15, 16];
+    AXES.get(index as usize).copied()
+}
+
+/// `InputDevice.SOURCE_GAMEPAD | SOURCE_JOYSTICK`, the `source` half of the
+/// `(axis, source)` pair `nativeSetGamepadSupportedMotionWithGamepadType`'s
+/// middle two ints are read as. INFERRED, and the least established argument of
+/// the six natives -- see the trampoline's own comment.
+const SOURCE_GAMEPAD_JOYSTICK: i32 = 0x0000_0401 | 0x0100_0010;
+
+/// `KeyEvent.ACTION_DOWN` / `ACTION_UP`.
+const ACTION_DOWN: i32 = 0;
+const ACTION_UP: i32 = 1;
+
+/// Decode one 8-byte joydev packet into `(type, index, value)`.
+///
+/// Split out from the reader so the packet layout is testable without a device,
+/// which on the machine this was written on is the only way it can be tested at
+/// all -- there is no gamepad attached and no `/dev/input/js*` to open.
+fn decode(buf: &[u8; JS_EVENT_LEN]) -> (u8, u8, i16) {
+    let value = i16::from_le_bytes([buf[4], buf[5]]);
+    (buf[6], buf[7], value)
+}
+
+/// Tell the engine what this pad is and what it has, in the order the engine
+/// needs it: the device first, then its buttons and axes.
+///
+/// `n_buttons`/`n_axes` come from the init burst. Connect has to lead, because
+/// every declaration names the pad by the id connect established -- and because
+/// disconnect carries no type, the engine is evidently keeping the type against
+/// that id from this call onwards.
+fn announce(id: i32, n_buttons: u8, n_axes: u8) {
+    let ty = gamepad_type();
+    input::deliver_gamepad_connect(id, ty);
+    for i in 0..n_buttons {
+        if let Some(code) = button_keycode(i) {
+            input::deliver_gamepad_supported_key(id, code, true, ty);
+        }
+    }
+    for i in 0..n_axes {
+        if let Some(code) = axis_code(i) {
+            input::deliver_gamepad_supported_motion(id, code, SOURCE_GAMEPAD_JOYSTICK, true, ty);
+        }
+    }
+}
+
+/// Send one axis movement as the `Vector3` the native's three floats are read as.
+///
+/// The two components this axis is not carries 0.0 rather than a repeat of the
+/// value. Both are guesses; a zero is the guess that stays recognisable as one.
+fn send_axis(id: i32, index: u8, value: i16) {
+    let Some(code) = axis_code(index) else {
+        return;
+    };
+    input::deliver_gamepad_axis(id, code, value as f32 / JS_AXIS_MAX, 0.0, 0.0);
+}
+
+fn open_pad(id: i32) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        // Without this the first read blocks the pump, and the pump is the loop
+        // that drives every other input path and the engine's own idle
+        // keepalive. A gamepad that stops the mouse working is a worse bug than
+        // no gamepad at all.
+        .custom_flags(O_NONBLOCK)
+        .open(format!("/dev/input/js{id}"))
+        .ok()
+}
+
+/// Drain everything this pad has queued, announcing it first if this is the
+/// first look at it.
+///
+/// Returns false when the device has gone -- an unplugged pad fails its read
+/// with `ENODEV` rather than reporting EOF -- which is the caller's cue to send
+/// the disconnect and drop it.
+fn drain(pad: &mut Pad) -> bool {
+    let mut buf = [0u8; JS_EVENT_LEN];
+    let mut init_buttons = 0u8;
+    let mut init_axes = 0u8;
+    // Held until the init burst has been counted, because the declaration has to
+    // reach the engine before any of them do.
+    let mut deferred: Vec<(u8, u8, i16)> = Vec::new();
+    loop {
+        match pad.file.read(&mut buf) {
+            Ok(JS_EVENT_LEN) => {
+                let (kind, index, value) = decode(&buf);
+                let init = kind & JS_EVENT_INIT != 0;
+                match (init, kind & !JS_EVENT_INIT) {
+                    // `saturating_add` rather than `+ 1`: an index of 255 would
+                    // overflow, and a debug build turns that into a panic in the
+                    // input pump. No real pad has 256 buttons, but "no real
+                    // device does that" is not a reason to let a byte off a
+                    // character device decide whether the client stays up.
+                    (true, JS_EVENT_BUTTON) => init_buttons = init_buttons.max(index.saturating_add(1)),
+                    (true, JS_EVENT_AXIS) => init_axes = init_axes.max(index.saturating_add(1)),
+                    (false, k) if pad.announced => dispatch(pad.id, k, index, value),
+                    (false, k) => deferred.push((k, index, value)),
+                    _ => {}
+                }
+            }
+            // A short read on an 8-byte record interface should not happen; if
+            // it does, treating it as "nothing more to say this tick" is safer
+            // than looping on a partial packet.
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    if !pad.announced && (init_buttons > 0 || init_axes > 0) {
+        announce(pad.id, init_buttons, init_axes);
+        pad.announced = true;
+        for (k, index, value) in deferred {
+            dispatch(pad.id, k, index, value);
+        }
+    } else if !pad.announced && !deferred.is_empty() {
+        // Events arriving from a device that never sent an init burst, which
+        // joydev is documented to queue at open and which every driver here is
+        // expected to produce. Dropping them is right -- the engine has not been
+        // told this device exists -- but dropping them *quietly* would be the
+        // half-working gamepad this module refuses to ship, arriving by the one
+        // route the all-or-nothing symbol gate cannot see. Said once, because it
+        // would otherwise repeat every tick the pad is touched.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[cordial] gamepad: /dev/input/js{} sent events without an init burst; \
+                 its shape is unknown so nothing is being forwarded",
+                pad.id
+            );
+        }
+    }
+    true
+}
+
+fn dispatch(id: i32, kind: u8, index: u8, value: i16) {
+    match kind {
+        JS_EVENT_BUTTON => {
+            if let Some(code) = button_keycode(index) {
+                input::deliver_gamepad_button(
+                    id,
+                    code,
+                    if value != 0 { ACTION_DOWN } else { ACTION_UP },
+                );
+            }
+        }
+        JS_EVENT_AXIS => send_axis(id, index, value),
+        _ => {}
+    }
+}
+
+/// One tick's worth of gamepad, called from [`super::looper::pump`] beside
+/// `input::idle_keepalive`.
+///
+/// Cheap when there is nothing to do, which is the common case and the one that
+/// matters: with the feature off this is one relaxed `OnceLock` read and a
+/// return, and with it on and no pad attached it is a `Vec::is_empty` plus four
+/// `open` attempts every two seconds.
+///
+/// Deliberately does *not* drive the engine's idle throttle. `idle_keepalive`
+/// exists because the engine watches `nativePassMouseMove` landing rather than
+/// input in general, and whether a gamepad counts to it is unmeasured -- a pad
+/// held at full deflection may or may not hold presents up. Claiming either way
+/// would be a timing result taken with no instrument, so this claims neither and
+/// leaves the keepalive to the path it was measured on.
+pub fn poll() {
+    if !enabled() {
+        return;
+    }
+    // The all-or-nothing gate. A build that exported some of the six but not the
+    // registration natives must send nothing at all, not events for a device it
+    // never described.
+    if !input::gamepad_natives_ready() {
+        return;
+    }
+    if probe() {
+        poll_probe();
+        return;
+    }
+
+    let mut pads = PADS.lock().unwrap_or_else(|e| e.into_inner());
+
+    static LAST_SCAN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let due = {
+        let mut last = LAST_SCAN.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        match *last {
+            Some(t) if now.duration_since(t) < RESCAN => false,
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
+    };
+    if due {
+        for id in 0..MAX_PADS {
+            if pads.iter().any(|p| p.id == id) {
+                continue;
+            }
+            if let Some(file) = open_pad(id) {
+                if input::trace_gamepad() {
+                    eprintln!("[cordial] gamepad: opened /dev/input/js{id}");
+                }
+                pads.push(Pad { id, file, announced: false });
+            }
+        }
+    }
+
+    let mut gone: Vec<i32> = Vec::new();
+    for pad in pads.iter_mut() {
+        if !drain(pad) {
+            gone.push(pad.id);
+        }
+    }
+    for id in gone {
+        pads.retain(|p| p.id != id);
+        input::deliver_gamepad_disconnect(id);
+        if input::trace_gamepad() {
+            eprintln!("[cordial] gamepad: /dev/input/js{id} went away");
+        }
+    }
+}
+
+/// The glyph sweep: announce one pad that does not exist, once, and stop.
+///
+/// A standard sixteen-button, eight-axis layout is declared so the engine has
+/// something complete to draw, and nothing is ever sent afterwards -- the
+/// question this answers is what `gamepadType` N makes the UI look like, and
+/// that is settled by the connect and the declaration alone.
+fn poll_probe() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let ty = gamepad_type();
+    eprintln!(
+        "[cordial] gamepad: CORDIAL_GAMEPAD_PROBE announcing a synthetic pad, \
+         gamepadType={ty}. The ordinals are UNVERIFIED -- compare the button \
+         glyphs the engine draws against rbxasset textures/ui/Controls/\
+         {{DefaultController,PlayStationController,XboxController}} and sweep \
+         CORDIAL_GAMEPAD_TYPE to find which N is which."
+    );
+    announce(0, 15, 8);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The packet layout, which is the one thing here that can be checked
+    /// without a device. Little-endian u32 time, i16 value, u8 type, u8 index.
+    #[test]
+    fn decodes_a_js_event() {
+        // time = 1, value = -32767, type = JS_EVENT_AXIS | JS_EVENT_INIT, index = 3.
+        let buf = [0x01, 0x00, 0x00, 0x00, 0x01, 0x80, 0x82, 0x03];
+        let (kind, index, value) = decode(&buf);
+        assert_eq!(kind, JS_EVENT_AXIS | JS_EVENT_INIT);
+        assert_eq!(index, 3);
+        assert_eq!(value, -32767);
+        assert!(kind & JS_EVENT_INIT != 0);
+        assert_eq!(kind & !JS_EVENT_INIT, JS_EVENT_AXIS);
+    }
+
+    #[test]
+    fn a_button_press_decodes_as_a_button() {
+        let buf = [0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00];
+        let (kind, index, value) = decode(&buf);
+        assert_eq!(kind, JS_EVENT_BUTTON);
+        assert_eq!(index, 0);
+        assert_eq!(value, 1);
+    }
+
+    /// An index past the table is reported as unknown rather than folded onto a
+    /// real button. A pad with more buttons than the standard layout would
+    /// otherwise send presses that the engine attributes to the wrong control.
+    #[test]
+    fn unknown_indices_stay_unknown() {
+        assert_eq!(button_keycode(0), Some(96));
+        assert_eq!(button_keycode(14), Some(107));
+        assert_eq!(button_keycode(15), None);
+        assert_eq!(axis_code(0), Some(0));
+        assert_eq!(axis_code(7), Some(16));
+        assert_eq!(axis_code(8), None);
+    }
+
+    /// No two indices may share a keycode or an axis code. A duplicate would
+    /// make two physical controls indistinguishable to the engine, which is the
+    /// kind of mistake a hand-written table acquires silently.
+    #[test]
+    fn the_tables_have_no_duplicates() {
+        let keys: Vec<i32> = (0..15).filter_map(button_keycode).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "duplicate keycode in button_keycode");
+
+        let axes: Vec<i32> = (0..8).filter_map(axis_code).collect();
+        let mut sorted = axes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), axes.len(), "duplicate axis in axis_code");
+    }
+
+    /// Full deflection is +/-1.0 and centre is 0.0. joydev's range is
+    /// `-32767..=32767`, so the scale is symmetric and needs no offset.
+    #[test]
+    fn axis_scale_is_symmetric() {
+        assert_eq!(32767i16 as f32 / JS_AXIS_MAX, 1.0);
+        assert_eq!(-32767i16 as f32 / JS_AXIS_MAX, -1.0);
+        assert_eq!(0i16 as f32 / JS_AXIS_MAX, 0.0);
+    }
+}

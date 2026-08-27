@@ -356,6 +356,183 @@ pub fn set_input_natives(
     UPDATE_KEYBOARD_SIZE.store(update_keyboard_size, std::sync::atomic::Ordering::Relaxed);
 }
 
+// ------------------------------------------------------------------- gamepad
+//
+// The same passthrough pattern as the mouse and keyboard natives above, with
+// one rule they do not need: these six are stored all together or not at all.
+//
+// A partial set is worse than none. `nativeSetGamepadSupportedKeyWithGamepadType`
+// is the call that tells the engine which buttons the pad has, and a build that
+// exported the event natives but not the registration ones would take button and
+// axis events for a device it had never been told the shape of. That looks
+// exactly like working gamepad support with half the inputs silently dead --
+// which is the failure `report_unregistered` exists to make visible, arriving in
+// the one form it cannot see, because each individual call would have succeeded.
+//
+// mocktail reaches the same conclusion from the other end and nulls its whole
+// gamepad symbol set when the `WithGamepadType` trio is incomplete
+// (`src/runtime/roblox_capability_resolver.cc`, Apache-2.0). The idea, not the
+// code.
+
+static GAMEPAD_CONNECT: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static GAMEPAD_DISCONNECT: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static GAMEPAD_BUTTON: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static GAMEPAD_AXIS: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static GAMEPAD_SUPPORTED_KEY: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static GAMEPAD_SUPPORTED_MOTION: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Store the gamepad natives, or refuse the lot and say which were missing.
+///
+/// Returns the names that did not resolve, empty when all six did. The caller
+/// prints them once at bring-up; nothing here logs, so that this stays testable
+/// without a loaded library.
+///
+/// The names are in the order the six arguments are, which is the order they are
+/// listed in `load.rs`.
+#[allow(clippy::too_many_arguments)]
+pub fn set_gamepad_natives(
+    connect: *mut c_void,
+    disconnect: *mut c_void,
+    button: *mut c_void,
+    axis: *mut c_void,
+    supported_key: *mut c_void,
+    supported_motion: *mut c_void,
+) -> Vec<&'static str> {
+    let all = [
+        ("nativeGamepadConnectEventWithGamepadType", connect),
+        ("nativeGamepadDisconnectEvent", disconnect),
+        ("nativeGamepadButtonEvent", button),
+        ("nativeGamepadAxisEvent", axis),
+        ("nativeSetGamepadSupportedKeyWithGamepadType", supported_key),
+        ("nativeSetGamepadSupportedMotionWithGamepadType", supported_motion),
+    ];
+    let missing: Vec<&'static str> =
+        all.iter().filter(|(_, p)| p.is_null()).map(|(n, _)| *n).collect();
+    if !missing.is_empty() {
+        // Deliberately not a partial store. See the comment above.
+        return missing;
+    }
+    GAMEPAD_CONNECT.store(connect, std::sync::atomic::Ordering::Relaxed);
+    GAMEPAD_DISCONNECT.store(disconnect, std::sync::atomic::Ordering::Relaxed);
+    GAMEPAD_BUTTON.store(button, std::sync::atomic::Ordering::Relaxed);
+    GAMEPAD_AXIS.store(axis, std::sync::atomic::Ordering::Relaxed);
+    GAMEPAD_SUPPORTED_KEY.store(supported_key, std::sync::atomic::Ordering::Relaxed);
+    GAMEPAD_SUPPORTED_MOTION.store(supported_motion, std::sync::atomic::Ordering::Relaxed);
+    Vec::new()
+}
+
+/// Whether all six gamepad natives resolved. False also means false for every
+/// one of them individually, by [`set_gamepad_natives`]'s all-or-nothing rule,
+/// so one load answers for the set.
+pub fn gamepad_natives_ready() -> bool {
+    !GAMEPAD_CONNECT.load(std::sync::atomic::Ordering::Relaxed).is_null()
+}
+
+/// `nativeGamepadConnectEventWithGamepadType`. See
+/// [`super::gamepad`] for where `gamepad_type` comes from and why it is a
+/// number a human has to supply.
+pub fn deliver_gamepad_connect(id: i32, gamepad_type: i32) {
+    let f = GAMEPAD_CONNECT.load(std::sync::atomic::Ordering::Relaxed);
+    if f.is_null() {
+        report_unregistered("nativeGamepadConnectEventWithGamepadType");
+        return;
+    }
+    let r = cordial_linker_sys::game_activity::gamepad_connect(f, id, gamepad_type);
+    if trace_gamepad() {
+        eprintln!("[cordial] nativeGamepadConnect(id={id}, type={gamepad_type}) -> {r:?}");
+    }
+}
+
+pub fn deliver_gamepad_disconnect(id: i32) {
+    let f = GAMEPAD_DISCONNECT.load(std::sync::atomic::Ordering::Relaxed);
+    if f.is_null() {
+        report_unregistered("nativeGamepadDisconnectEvent");
+        return;
+    }
+    let r = cordial_linker_sys::game_activity::gamepad_disconnect(f, id);
+    if trace_gamepad() {
+        eprintln!("[cordial] nativeGamepadDisconnect(id={id}) -> {r:?}");
+    }
+}
+
+pub fn deliver_gamepad_button(id: i32, key_code: i32, action: i32) {
+    let f = GAMEPAD_BUTTON.load(std::sync::atomic::Ordering::Relaxed);
+    if f.is_null() {
+        report_unregistered("nativeGamepadButtonEvent");
+        return;
+    }
+    let r = cordial_linker_sys::game_activity::gamepad_button(f, id, key_code, action);
+    if trace_gamepad() {
+        eprintln!("[cordial] nativeGamepadButton(id={id}, key={key_code}, action={action}) -> {r:?}");
+    }
+}
+
+pub fn deliver_gamepad_axis(id: i32, axis: i32, x: f32, y: f32, z: f32) {
+    let f = GAMEPAD_AXIS.load(std::sync::atomic::Ordering::Relaxed);
+    if f.is_null() {
+        report_unregistered("nativeGamepadAxisEvent");
+        return;
+    }
+    let r = cordial_linker_sys::game_activity::gamepad_axis(f, id, axis, x, y, z);
+    if trace_gamepad() {
+        eprintln!("[cordial] nativeGamepadAxis(id={id}, axis={axis}, {x}, {y}, {z}) -> {r:?}");
+    }
+}
+
+pub fn deliver_gamepad_supported_key(id: i32, key_code: i32, supported: bool, gamepad_type: i32) {
+    let f = GAMEPAD_SUPPORTED_KEY.load(std::sync::atomic::Ordering::Relaxed);
+    if f.is_null() {
+        report_unregistered("nativeSetGamepadSupportedKeyWithGamepadType");
+        return;
+    }
+    let r = cordial_linker_sys::game_activity::gamepad_supported_key(
+        f, id, key_code, supported, gamepad_type,
+    );
+    if trace_gamepad() {
+        eprintln!(
+            "[cordial] nativeSetGamepadSupportedKey(id={id}, key={key_code}, \
+             supported={supported}, type={gamepad_type}) -> {r:?}"
+        );
+    }
+}
+
+pub fn deliver_gamepad_supported_motion(
+    id: i32,
+    axis: i32,
+    source: i32,
+    supported: bool,
+    gamepad_type: i32,
+) {
+    let f = GAMEPAD_SUPPORTED_MOTION.load(std::sync::atomic::Ordering::Relaxed);
+    if f.is_null() {
+        report_unregistered("nativeSetGamepadSupportedMotionWithGamepadType");
+        return;
+    }
+    let r = cordial_linker_sys::game_activity::gamepad_supported_motion(
+        f, id, axis, source, supported, gamepad_type,
+    );
+    if trace_gamepad() {
+        eprintln!(
+            "[cordial] nativeSetGamepadSupportedMotion(id={id}, axis={axis}, source={source}, \
+             supported={supported}, type={gamepad_type}) -> {r:?}"
+        );
+    }
+}
+
+/// `CORDIAL_TRACE_GAMEPAD=1`. Its own switch rather than riding on
+/// `CORDIAL_TRACE_MOUSE`, because a pad at rest still emits a steady trickle of
+/// axis noise and mixing that into the mouse trace would bury it.
+pub fn trace_gamepad() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_TRACE_GAMEPAD").is_some())
+}
+
 /// `NativeInputInterface.nativeGetMainWindowIsMouseLockedCenter()Z`, resolved
 /// separately from [`set_input_natives`] because it is the only one of these
 /// that Cordial *reads* rather than writes.

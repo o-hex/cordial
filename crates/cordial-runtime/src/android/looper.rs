@@ -1290,6 +1290,17 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
             if super::input::keepalive_wanted(policy, observed, visible) {
                 super::input::idle_keepalive();
             }
+            // Gamepads, from the host's joydev nodes. Off unless
+            // `CORDIAL_GAMEPAD=1`, and a single `OnceLock` read when it is off
+            // -- see `android::gamepad`, whose module comment carries why the
+            // default is off and what would let it change.
+            //
+            // Not inside the `keepalive_wanted` branch above it: that gate is
+            // about whether Cordial should defeat the engine's idle throttle,
+            // which is a separate question from whether a pad's input should
+            // reach the engine at all. Backgrounding the window should slow the
+            // game down, not drop a button press.
+            super::gamepad::poll();
         }
         looper_poll_once(
             if watching { 50 } else { 8 },

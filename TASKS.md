@@ -279,17 +279,57 @@ layer above it has not.
 
 ### Gamepad and extended input
 
-`InputDevice`/`MotionEvent` is the Android surface, so the engine will take
-gamepad input if something feeds it. Cordial's own input path is
-`input::pass_key_event`/`pass_text` into GameActivity.
+**Partly done, and blocked on one integer.** `android/gamepad.rs` and the six
+`NativeInputInterface` trampolines in `native/game_activity.cpp` are in place;
+the feature is off unless `CORDIAL_GAMEPAD=1`, because the engine cannot be told
+a pad exists without being told what *kind* of pad it is, and nothing available
+here says what the values mean.
 
-Use **`libmanette`**, not SDL3 — it is GNOME's gamepad library, integrates with
-the GTK4 main loop Cordial already runs, and carries the SDL gamepad mapping
-database without bringing a second platform layer.
+**Two things this entry used to say were wrong, and are corrected here rather
+than deleted, because both are easy to re-derive.**
 
-- **Touches:** `crates/cordial-runtime/src/android/input.rs` (or equivalent),
-  the GameActivity motion-event path.
-- **Scope:** moderate. Isolated PR.
+It recommended `libmanette`. There is no Rust binding: `cargo search libmanette`
+returns nothing, and `cargo search manette` returns one unrelated crate. Adopting
+it means hand-written GObject FFI, so the recommendation was not actionable as
+written. **gilrs** is the real candidate — it carries `SDL_GameControllerDB` and
+exposes the vendor and product ids a type classifier wants — but it pulls
+`libudev-sys`, whose `build.rs` is an unconditional
+`pkg_config::find_library("libudev").unwrap()` and whose output links
+`libudev.so.1`. Cordial has no udev in `Cargo.lock` today, so that is a
+packaging decision (flatpak, deb, rpm, AppImage, CI) and not an implementation
+detail. Until it is taken, `gamepad.rs` reads `/dev/input/js*` directly with no
+new dependency and a fixed mapping table for the standard layout.
+
+It also pointed the work at the GameActivity motion-event path. That is the pipe
+`native/game_activity.cpp` records as accepted-and-ignored — every click
+delivered through `onTouchEventNative` was taken by the engine and nothing on
+screen moved, pixel-identical before and after. Gamepad goes through
+`NativeInputInterface`, for the same reason the mouse does.
+
+**The blocker.** `nativeGamepadConnectEventWithGamepadType(II)V` is the only
+connect entry point this build has — the type-less `nativeGamepadConnectEvent`
+returns `no match` from `tools/dex_method.py` and `0` from `readelf | grep -c`.
+`docs/traces/waydroid-roblox-startup.log.gz` has no gamepad line in it, because
+the capture was taken with no pad attached; the dex declares no gamepad class;
+mocktail resolves all six symbols and never calls one. Either of these settles
+it:
+
+1. **Re-capture the logcat with a controller attached.** This is the project's
+   own "grep the traces first" rule, and it has never been run for this question.
+   Needs a pad and the Waydroid setup in `docs/traces/README.md`.
+2. **Sweep the argument against the engine's own glyphs.** The binary carries
+   three glyph folders — `DefaultController`, `PlayStationController`,
+   `XboxController` — so the UI is a readout of the type. `CORDIAL_GAMEPAD=1
+   CORDIAL_GAMEPAD_PROBE=1 CORDIAL_GAMEPAD_TYPE=N` announces a synthetic pad with
+   no hardware at all; read the frame with `cordial_screenshot` and sweep N. A
+   different N drawing different glyphs is the control.
+
+Getting this wrong is not theoretical — Sober #1018 is *"Sober detects my PS4
+controller as a XBOX one"*.
+
+- **Touches:** `crates/cordial-runtime/src/android/gamepad.rs`,
+  `android/input.rs`, `native/game_activity.cpp`, `cordial-linker-sys`.
+- **Scope:** the remaining work is one measurement, then a mapping layer.
 
 ### Camera
 

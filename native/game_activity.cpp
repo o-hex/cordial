@@ -1466,6 +1466,219 @@ int cordial_input_mouse_wheel(void* fn, float x, float y, float delta, char* err
     }
 }
 
+// ------------------------------------------------------------------- gamepad
+//
+// `NativeInputInterface`'s six gamepad natives. Every descriptor below was read
+// out of the shipping APK's dex with `tools/dex_method.py` and cross-checked
+// against `readelf --dyn-syms` on `libroblox.so`; none of them is guessed. What
+// *is* guessed, and is marked INFERRED wherever it appears, is what the integer
+// arguments mean -- the dex carries types and not parameter names.
+//
+// The thing worth knowing before reading any of this: this build has no
+// type-less connect entry point. `nativeGamepadConnectEvent` is absent from both
+// the dex (`dex_method.py` prints `no match`) and the export table (`readelf |
+// grep -c` prints 0), so a pad cannot be announced to this engine without
+// supplying a `gamepadType` whose ordinals nothing available here establishes.
+// `android::gamepad` is off by default for exactly that reason; that module's
+// comment carries the whole argument.
+//
+// No rumble. `android/os/Vibrator` is declared in the dex and implemented
+// nowhere in Cordial, and a force-feedback call that silently does nothing is
+// the stub that lies. It is absent rather than stubbed.
+//
+// The atomic-gating rule these serve -- resolve all of the registration natives
+// or use none of them -- is mocktail's (Apache-2.0,
+// `src/runtime/roblox_capability_resolver.cc`), which nulls its whole gamepad
+// symbol set when the `WithGamepadType` trio is incomplete rather than falling
+// back to the removed exports. The idea, not the code.
+
+/// `NativeInputInterface.nativeGamepadConnectEventWithGamepadType(I id, I gamepadType)`.
+///
+/// The engine remembers the type against the id: `nativeGamepadDisconnectEvent`
+/// takes the id alone, so the pairing has to be established here and cannot be
+/// restated later.
+///
+/// `gamepadType` is INFERRED as the trailing argument, not read. Every method on
+/// this interface whose name ends `WithGamepadType` is its type-less TV-remote
+/// counterpart plus exactly one trailing `int` -- `nativeTVRemoteConnectEvent(I)`
+/// against `(II)` here, and `nativeSetTVRemoteSupportedKey(IIZ)` against
+/// `(IIZI)`. Three for three is a structural control rather than a hunch, but it
+/// is still not an observation.
+int cordial_input_gamepad_connect(void* fn, int id, int gamepad_type, char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jint, jint);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len,
+                 "no JavaVM, or nativeGamepadConnectEventWithGamepadType is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeInputInterface");
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls), id,
+                                   gamepad_type);
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// `NativeInputInterface.nativeGamepadDisconnectEvent(I id)`.
+///
+/// The only one of the six that carries no type, which is itself the evidence
+/// that the engine keeps the type it was handed at connect.
+int cordial_input_gamepad_disconnect(void* fn, int id, char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jint);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or nativeGamepadDisconnectEvent is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeInputInterface");
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls), id);
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// `NativeInputInterface.nativeGamepadButtonEvent(I id, I keyCode, I action)`.
+///
+/// Slot meanings INFERRED, and the weakest of the set. `nativeTVRemoteButtonEvent`
+/// carries the identical `(III)` descriptor, which says the two share a shape but
+/// not what the shape is. The reading taken here -- id, then an Android
+/// `KeyEvent.KEYCODE_BUTTON_*` constant, then an `ACTION_DOWN`/`ACTION_UP` -- is
+/// the one the Android platform contract implies, because the Java caller on a
+/// real device is handed a `KeyEvent` from an `InputDevice` and has
+/// `getKeyCode()` and `getAction()` to forward. Nothing here observed it.
+int cordial_input_gamepad_button(void* fn, int id, int key_code, int action, char* err,
+                                 size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jint, jint, jint);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or nativeGamepadButtonEvent is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeInputInterface");
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls), id,
+                                   key_code, action);
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// `NativeInputInterface.nativeGamepadAxisEvent(I id, I axis, F x, F y, F z)`.
+///
+/// Three floats for one axis event, which is the shape of a `Vector3` -- and
+/// Roblox's Lua `InputObject.Position` for a thumbstick is a `Vector3`, so
+/// `(id, axis, x, y, z)` is the reading taken. INFERRED, with no control behind
+/// it at all: the TV-remote family has no axis counterpart to difference
+/// against, so unlike the three `WithGamepadType` methods there is nothing
+/// structural supporting this one. `android::gamepad` sends the unused
+/// components as 0.0 rather than repeating a value into them, because an
+/// invented number is harder to recognise as wrong than a zero.
+int cordial_input_gamepad_axis(void* fn, int id, int axis, float x, float y, float z, char* err,
+                               size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jint, jint, jfloat, jfloat, jfloat);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or nativeGamepadAxisEvent is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeInputInterface");
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls), id, axis,
+                                   x, y, z);
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// `nativeSetGamepadSupportedKeyWithGamepadType(I id, I keyCode, Z supported, I gamepadType)`.
+///
+/// The capability declaration: which buttons this pad has, one call per button,
+/// before any button event is sent. Wiring button and axis events without first
+/// running this would produce a client that looks like it has gamepad support
+/// and drops half of it on the floor, so `android::gamepad` refuses to send
+/// anything at all until the declaration has been made.
+///
+/// Slots INFERRED from the difference against `nativeSetTVRemoteSupportedKey(IIZ)`,
+/// which is this method minus the trailing type.
+int cordial_input_gamepad_supported_key(void* fn, int id, int key_code, int supported,
+                                        int gamepad_type, char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jint, jint, jboolean, jint);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len,
+                 "no JavaVM, or nativeSetGamepadSupportedKeyWithGamepadType is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeInputInterface");
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls), id,
+                                   key_code, supported ? JNI_TRUE : JNI_FALSE, gamepad_type);
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// `nativeSetGamepadSupportedMotionWithGamepadType(I id, I axis, I source, Z supported, I gamepadType)`.
+///
+/// The axis half of the capability declaration, and the least established
+/// descriptor of the six: `(IIIZI)` has one more `int` than the key variant and
+/// there is no TV-remote counterpart to difference it against, so the middle
+/// pair is read here as Android's own way of naming one motion range --
+/// `InputDevice.getMotionRange(axis, source)` is keyed on exactly that pair.
+/// INFERRED, and the argument names in this signature are a hypothesis rather
+/// than a reading. If a logcat capture taken with a pad attached ever lands in
+/// `docs/traces/`, this is the line it settles first.
+int cordial_input_gamepad_supported_motion(void* fn, int id, int axis, int source, int supported,
+                                           int gamepad_type, char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jint, jint, jint, jboolean, jint);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len,
+                 "no JavaVM, or nativeSetGamepadSupportedMotionWithGamepadType is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeInputInterface");
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls), id, axis,
+                                   source, supported ? JNI_TRUE : JNI_FALSE, gamepad_type);
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
 /// Deliver a wheel movement through AGDK's `onTouchEventNative` as ACTION_SCROLL.
 ///
 /// The same both-pipes policy the button and move paths already follow: AGDK's

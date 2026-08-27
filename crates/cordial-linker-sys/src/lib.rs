@@ -1814,6 +1814,30 @@ pub mod game_activity {
             f: *mut c_void, x: f32, y: f32, delta: f32,
             err: *mut c_char, n: usize,
         ) -> c_int;
+        fn cordial_input_gamepad_connect(
+            f: *mut c_void, id: c_int, gamepad_type: c_int,
+            err: *mut c_char, n: usize,
+        ) -> c_int;
+        fn cordial_input_gamepad_disconnect(
+            f: *mut c_void, id: c_int,
+            err: *mut c_char, n: usize,
+        ) -> c_int;
+        fn cordial_input_gamepad_button(
+            f: *mut c_void, id: c_int, key_code: c_int, action: c_int,
+            err: *mut c_char, n: usize,
+        ) -> c_int;
+        fn cordial_input_gamepad_axis(
+            f: *mut c_void, id: c_int, axis: c_int, x: f32, y: f32, z: f32,
+            err: *mut c_char, n: usize,
+        ) -> c_int;
+        fn cordial_input_gamepad_supported_key(
+            f: *mut c_void, id: c_int, key_code: c_int, supported: c_int, gamepad_type: c_int,
+            err: *mut c_char, n: usize,
+        ) -> c_int;
+        fn cordial_input_gamepad_supported_motion(
+            f: *mut c_void, id: c_int, axis: c_int, source: c_int, supported: c_int,
+            gamepad_type: c_int, err: *mut c_char, n: usize,
+        ) -> c_int;
         fn cordial_textbox_handle() -> i64;
         fn cordial_textbox_generation() -> c_int;
         fn cordial_textbox_text(buf: *mut c_char, n: c_int) -> c_int;
@@ -2188,6 +2212,110 @@ pub mod game_activity {
         // SAFETY: as above.
         let rc = unsafe {
             cordial_input_mouse_wheel(native, x, y, delta, err.as_mut_ptr() as *mut c_char, err.len())
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
+    // `NativeInputInterface`'s six gamepad natives. Descriptors read from the
+    // shipping APK's dex, not guessed; what the integer arguments *mean* is
+    // INFERRED and is argued out in `native/game_activity.cpp` beside each
+    // trampoline, and in `cordial_runtime::android::gamepad`. Callers should go
+    // through that module rather than these directly -- it is what holds the
+    // all-or-nothing resolution gate and the off switch.
+
+    /// `nativeGamepadConnectEventWithGamepadType(I id, I gamepadType)`.
+    ///
+    /// **This build ships no type-less connect**, so there is no way to announce
+    /// a pad without naming a type, and no evidence available here says what the
+    /// ordinals are. See `android::gamepad::gamepad_type`.
+    pub fn gamepad_connect(native: *mut c_void, id: i32, gamepad_type: i32) -> Result<(), String> {
+        let mut err = vec![0u8; 512];
+        // SAFETY: `native` is the exported JNI native; `err` outlives the call.
+        let rc = unsafe {
+            cordial_input_gamepad_connect(
+                native, id, gamepad_type,
+                err.as_mut_ptr() as *mut c_char, err.len(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
+    /// `nativeGamepadDisconnectEvent(I id)` — no type, because the engine kept
+    /// the one it was given at connect.
+    pub fn gamepad_disconnect(native: *mut c_void, id: i32) -> Result<(), String> {
+        let mut err = vec![0u8; 512];
+        // SAFETY: as above.
+        let rc = unsafe {
+            cordial_input_gamepad_disconnect(native, id, err.as_mut_ptr() as *mut c_char, err.len())
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
+    /// `nativeGamepadButtonEvent(I id, I keyCode, I action)`.
+    ///
+    /// `key_code` is read as an Android `KeyEvent.KEYCODE_BUTTON_*` and `action`
+    /// as `ACTION_DOWN`/`ACTION_UP`. INFERRED from the Android platform contract
+    /// the Java caller would have been working to; nothing observed it.
+    pub fn gamepad_button(native: *mut c_void, id: i32, key_code: i32, action: i32) -> Result<(), String> {
+        let mut err = vec![0u8; 512];
+        // SAFETY: as above.
+        let rc = unsafe {
+            cordial_input_gamepad_button(
+                native, id, key_code, action,
+                err.as_mut_ptr() as *mut c_char, err.len(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
+    /// `nativeGamepadAxisEvent(I id, I axis, F x, F y, F z)`.
+    ///
+    /// Three floats read as a `Vector3`, which is what Roblox's Lua
+    /// `InputObject.Position` is for a thumbstick. INFERRED with no control
+    /// behind it — the TV-remote family has no axis method to difference against.
+    pub fn gamepad_axis(native: *mut c_void, id: i32, axis: i32, x: f32, y: f32, z: f32) -> Result<(), String> {
+        let mut err = vec![0u8; 512];
+        // SAFETY: as above.
+        let rc = unsafe {
+            cordial_input_gamepad_axis(
+                native, id, axis, x, y, z,
+                err.as_mut_ptr() as *mut c_char, err.len(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
+    /// `nativeSetGamepadSupportedKeyWithGamepadType(I id, I keyCode, Z supported, I gamepadType)`
+    /// — one call per button, before any button event.
+    pub fn gamepad_supported_key(
+        native: *mut c_void, id: i32, key_code: i32, supported: bool, gamepad_type: i32,
+    ) -> Result<(), String> {
+        let mut err = vec![0u8; 512];
+        // SAFETY: as above.
+        let rc = unsafe {
+            cordial_input_gamepad_supported_key(
+                native, id, key_code, if supported { 1 } else { 0 }, gamepad_type,
+                err.as_mut_ptr() as *mut c_char, err.len(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
+    }
+
+    /// `nativeSetGamepadSupportedMotionWithGamepadType(I id, I axis, I source, Z supported, I gamepadType)`.
+    ///
+    /// The middle pair is read as Android's `(axis, source)` motion-range key.
+    /// The least established of the six: `(IIIZI)` has one more `int` than the
+    /// key variant and nothing to difference it against.
+    pub fn gamepad_supported_motion(
+        native: *mut c_void, id: i32, axis: i32, source: i32, supported: bool, gamepad_type: i32,
+    ) -> Result<(), String> {
+        let mut err = vec![0u8; 512];
+        // SAFETY: as above.
+        let rc = unsafe {
+            cordial_input_gamepad_supported_motion(
+                native, id, axis, source, if supported { 1 } else { 0 }, gamepad_type,
+                err.as_mut_ptr() as *mut c_char, err.len(),
+            )
         };
         if rc == 0 { Ok(()) } else { Err(take_err(err)) }
     }

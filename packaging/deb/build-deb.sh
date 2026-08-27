@@ -78,6 +78,24 @@ trap 'rm -rf "$root"' EXIT
 install -Dm755 target/release/cordial-shell "$root/usr/bin/cordial-shell"
 install -Dm755 target/release/cordial-run   "$root/usr/bin/cordial-run"
 
+# **Strip our own two binaries, which are almost entirely debug info.**
+# `[profile.release]` in Cargo.toml sets `debug = true`, deliberately -- AGENTS.md
+# leans on lldb and gdb against a running client and says so at length, and a
+# runtime you cannot get a backtrace out of is not worth the disk it saves. But
+# that is an argument about the build on a developer's machine, not about what a
+# user downloads: `cordial-run` is 207.4 MB unstripped and 15.7 MB with
+# `--strip-debug`, measured here, and `cordial-shell` is another 175.7 MB.
+#
+# Stripping at packaging time keeps both: full DWARF where somebody is debugging,
+# and a package that is not thirteen times larger than it needs to be. rpmbuild
+# and makepkg already do this by themselves, which is the whole reason the rpm
+# and the Arch package were a tenth the size of the others.
+#
+# This package is built with plain `dpkg-deb` rather than debhelper -- see the
+# note above the control file for why -- so `dh_strip`, which every ordinary
+# Debian package gets for free, never runs here. Nothing else was going to.
+strip --strip-debug "$root/usr/bin/cordial-shell" "$root/usr/bin/cordial-run"
+
 # The square icons under packaging/icons/hicolor/, not the 680x480 README
 # banner. Both of them: Frostbite is the twice-a-year name in
 # crates/cordial-shell/src/branding.rs, and a missing one is a blank icon in

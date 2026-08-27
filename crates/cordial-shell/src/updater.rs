@@ -575,12 +575,50 @@ pub fn update_settings(config: &ShellConfig) -> UpdateSettings {
 /// second settings window. The settings are a tab in the real one now, the
 /// picker is on the Roblox page, and what is left is the question the button can
 /// answer: which build am I on, and is there a newer engine.
+thread_local! {
+    /// The update window, if one is open.
+    ///
+    /// **Two callers can want this window at the same time and neither knows
+    /// about the other.** The header button opens it on click, and the
+    /// launch-time check opens it by itself when the mode is Ask and it finds
+    /// something -- so pressing the button while that check is still in flight
+    /// gave you a second window on top of the first, reported on 2026-08-28 as
+    /// "you get another update window this time because you got an available
+    /// update". Both callers were right to ask; nothing was deciding that one
+    /// window is enough.
+    ///
+    /// Weak, so the window closing is what ends its own entry rather than a
+    /// close handler that has to be kept in step with every way a window can go
+    /// away. A dead weak reference and no reference at all mean the same thing
+    /// here, which is the property that makes this safe to get wrong.
+    static OPEN: RefCell<Option<glib::WeakRef<adw::Window>>> = const { RefCell::new(None) };
+}
+
+/// Raise the update window if it is already open.
+///
+/// Returns whether it did. Presenting an already-present `adw::Window` brings it
+/// forward, which is the behaviour somebody pressing the button a second time is
+/// asking for -- they want to see it, and they have no way of knowing a check
+/// opened it a moment ago.
+fn raise_if_open() -> bool {
+    OPEN.with(|open| {
+        let Some(existing) = open.borrow().as_ref().and_then(glib::WeakRef::upgrade) else {
+            return false;
+        };
+        existing.present();
+        true
+    })
+}
+
 pub fn present(
     parent: &gtk::Window,
     config: Rc<RefCell<ShellConfig>>,
     last: Rc<RefCell<Option<Checked>>>,
     button: gtk::Button,
 ) {
+    if raise_if_open() {
+        return;
+    }
     let automatic = config.borrow().automatic_updates;
     // The header-bar button, kept under a name of its own because `button` is
     // shadowed further down by this window's own action button and the two
@@ -1024,7 +1062,6 @@ pub fn present(
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.add_top_bar(&banner);
-    toolbar.add_top_bar(&banner);
     toolbar.set_content(Some(&scroller));
     // A bottom bar rather than the last child of the scrolled pane: the button
     // has to stay put while a long changelog moves under it, or the control
@@ -1033,6 +1070,7 @@ pub fn present(
     window.set_content(Some(&toolbar));
     // The button, not the changelog — see `notes_body.set_can_focus(false)`.
     GtkWindowExt::set_focus(&window, Some(&action));
+    OPEN.with(|open| *open.borrow_mut() = Some(window.downgrade()));
     window.present();
 }
 

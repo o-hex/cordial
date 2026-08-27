@@ -123,8 +123,15 @@ export APPIMAGE_EXTRACT_AND_RUN=1
 #                    before main. Nothing printed. It looked like a crash in
 #                    Cordial.
 #
-# NO_STRIP costs some size and nothing else -- Fedora's libraries are already
-# stripped, their debug info lives in separate debuginfo packages. $PATCHELF is
+# NO_STRIP costs nothing for the bundled libraries -- Fedora's are already
+# stripped and their debug info lives in separate debuginfo packages. **It cost
+# a great deal for ours, and this comment used to say otherwise.** Cordial's own
+# two binaries carry full DWARF by `[profile.release]`, so leaving linuxdeploy's
+# stripping off left roughly 350 MB of symbol tables inside the AppImage --
+# which is why it was 176 MB against the rpm's 6. They are stripped above,
+# before linuxdeploy runs, which is the right place: the reason to disable its
+# stripping is what its 2020 binutils does to a `.relr.dyn` section, and that
+# reason has nothing to do with our output. $PATCHELF is
 # linuxdeploy's own override; the host's patchelf 0.18 leaves .init at 0x2cc
 # and DT_INIT agreeing with it, checked on the same libcbor both ways.
 export NO_STRIP=1
@@ -162,6 +169,25 @@ for plugin in plugins/*/; do
 done
 
 install -Dm755 "$target_dir/release/cordial-run"   "$appdir/usr/bin/cordial-run"
+
+# **Strip our own two binaries, which are almost entirely debug info.**
+# `[profile.release]` in Cargo.toml sets `debug = true`, deliberately -- AGENTS.md
+# leans on lldb and gdb against a running client and says so at length, and a
+# runtime you cannot get a backtrace out of is not worth the disk it saves. But
+# that is an argument about the build on a developer's machine, not about what a
+# user downloads: `cordial-run` is 207.4 MB unstripped and 15.7 MB with
+# `--strip-debug`, measured here, and `cordial-shell` is another 175.7 MB.
+#
+# Stripping at packaging time keeps both: full DWARF where somebody is debugging,
+# and a package that is not thirteen times larger than it needs to be. rpmbuild
+# and makepkg already do this by themselves, which is the whole reason the rpm
+# and the Arch package were a tenth the size of the others.
+#
+# Done here, with the host's strip, before linuxdeploy sees the AppDir. NO_STRIP
+# below turns off linuxdeploy's own stripping because its bundled binutils is
+# from 2020 and mangles a `.relr.dyn` section -- but that is a reason to keep it
+# away from Fedora's libraries, not a reason to ship ours unstripped.
+strip --strip-debug "$appdir/usr/bin/cordial-shell" "$appdir/usr/bin/cordial-run"
 
 install -Dm644 packaging/io.github.luohoa97.Cordial.desktop \
     "$appdir/usr/share/applications/io.github.luohoa97.Cordial.desktop"

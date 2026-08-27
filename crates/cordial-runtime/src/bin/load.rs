@@ -3397,6 +3397,43 @@ fn main() -> ExitCode {
                                                 if wh.is_null() { "NOT exported; the scroll wheel will do nothing" } else { "resolved" }
                                             );
 
+                                            // The six gamepad natives, resolved
+                                            // together and stored together.
+                                            //
+                                            // Reported once here rather than at
+                                            // first use, and named individually
+                                            // when any is missing, because the
+                                            // failure this guards against is
+                                            // silent by construction: a build
+                                            // exporting the event natives but
+                                            // not the registration ones would
+                                            // take every button event and have
+                                            // been told nothing about the
+                                            // device they belong to.
+                                            // `set_gamepad_natives` stores none
+                                            // of them in that case, so the
+                                            // gap is here in the log rather
+                                            // than in a player's hands.
+                                            {
+                                                let sym = |n: &str| lib.symbol(n).unwrap_or(std::ptr::null_mut());
+                                                let missing = cordial_runtime::android::input::set_gamepad_natives(
+                                                    sym("Java_com_roblox_engine_jni_NativeInputInterface_nativeGamepadConnectEventWithGamepadType"),
+                                                    sym("Java_com_roblox_engine_jni_NativeInputInterface_nativeGamepadDisconnectEvent"),
+                                                    sym("Java_com_roblox_engine_jni_NativeInputInterface_nativeGamepadButtonEvent"),
+                                                    sym("Java_com_roblox_engine_jni_NativeInputInterface_nativeGamepadAxisEvent"),
+                                                    sym("Java_com_roblox_engine_jni_NativeInputInterface_nativeSetGamepadSupportedKeyWithGamepadType"),
+                                                    sym("Java_com_roblox_engine_jni_NativeInputInterface_nativeSetGamepadSupportedMotionWithGamepadType"),
+                                                );
+                                                if missing.is_empty() {
+                                                    println!("  input: gamepad natives resolved (all six)");
+                                                } else {
+                                                    println!(
+                                                        "  input: gamepad disabled; not exported: {}",
+                                                        missing.join(", ")
+                                                    );
+                                                }
+                                            }
+
                                             // The one native on this interface
                                             // Cordial reads rather than writes:
                                             // whether the engine wants the

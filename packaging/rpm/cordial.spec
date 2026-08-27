@@ -208,12 +208,19 @@ install -Dpm 0644 third_party/libjnivm/LICENSE                      libjnivm-MIT
 # .deb, AppImage and a release Arch package noticed the same gap in the
 # Flatpak manifest and packaging/aur/cordial-git/PKGBUILD while giving the new
 # formats a licence list to copy; all three are fixed in the same change.
-# NOTICE itself needs no install line: %license below picks it up from the
-# build directory where %autosetup already put it, the same way README.md
-# reaches %doc. The line that used to sit here copied it onto itself --
+# NOTICE itself needs no install line: %%license below picks it up from the
+# build directory where %%autosetup already put it, the same way README.md
+# reaches %%doc. The line that used to sit here copied it onto itself --
 # `install -Dpm 0644 NOTICE NOTICE` -- and install refuses that with "'NOTICE'
-# and 'NOTICE' are the same file", failing %install and taking the whole RPM
+# and 'NOTICE' are the same file", failing %%install and taking the whole RPM
 # with it. The neighbours above work because each renames as it copies.
+#
+# The doubled percents are not decoration. **rpm expands macros inside comments
+# too**, so the first version of this comment wrote %%autosetup unescaped, rpm
+# replaced it with its definition, and `%%setup -q` landed in the middle of the
+# generated %%install script -- where bash read a leading percent as a job spec
+# and said "fg: no job control". Every other comment in this file already
+# doubles them; this one did not, and it cost a CI round.
 install -Dpm 0644 third_party/mocktail-webview/LICENSE              mocktail-webview-Apache-2.0.txt
 
 %check

@@ -120,6 +120,20 @@ sed -e "s|^%global snapinfo .*|%global snapinfo ${snapinfo}|" \
     "$here/cordial.spec" > "$spec"
 
 echo "==> rpmbuild -bs"
+# **rpm expands macros inside comments.** An unescaped %macro in a comment is
+# replaced with its definition and the result is emitted into the generated
+# script, where bash reads a leading percent as a job spec and fails with "fg:
+# no job control" -- which names neither the macro nor the comment. That reached
+# CI on 2026-08-27 from a single comment that wrote %autosetup instead of
+# %%autosetup, while every other comment in the spec already doubled them.
+# Checked here because the spec is plain text and this costs nothing, whereas
+# finding it in CI costs a full workspace build first.
+if grep -n '^#' "$spec" | grep -E '[^%]%[a-zA-Z_]+' >&2; then
+  echo "error: unescaped rpm macro in a spec comment (see above)." >&2
+  echo "       rpm expands macros in comments; double the percent: %%macro." >&2
+  exit 1
+fi
+
 rpmbuild -bs "$spec" \
     --define "_sourcedir $srcdir" \
     ${outdir:+--define "_srcrpmdir $outdir"}

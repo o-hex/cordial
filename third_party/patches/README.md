@@ -1,43 +1,42 @@
-# Patches to the vendored submodules
+# Local changes to vendored third-party source
 
-**These are changes Cordial has made to `third_party/` submodules that cannot be
-committed as submodule pointers**, and this directory exists so they are not
-lost.
+`third_party/mcpelauncher-linker` and the `bionic` tree nested inside it are
+other people's repositories. Changes to them cannot be committed as a submodule
+pointer bump, because there is nowhere to push the commit the pointer would
+name. They live here instead, as patches, and this file exists because the
+alternative was what was actually happening: **132 lines of local edits to the
+AOSP linker sitting uncommitted in a working tree for an unknown length of
+time, in the three files `crates/cordial-linker-sys/build.rs` compiles.**
 
-`third_party/mcpelauncher-linker` and its nested `bionic` point at
-`minecraft-linux` repositories nobody here can push to. Committing into a
-submodule locally moves Cordial's recorded pointer to a commit that exists on
-one machine and nowhere else, so `git submodule update` fails for every clone —
-which is a worse outcome than a dirty tree, and is why the tree has been dirty
-rather than the pointer wrong.
-
-So the diff lives here instead. It is the source of truth for these changes;
-the working tree is a convenience.
-
-## What is in them
-
-`bionic-cordial-tracing.patch` — tracing hooks in the guest-visible `libdl.so`
-and the linker, all of them behind environment variables and inert when unset:
-
-| Variable | What it prints |
-|---|---|
-| `CORDIAL_TRACE_DLSYM` | every `dlopen` and `dlsym` the engine makes through the guest's own `libdl.so`, with the resolved address |
-| `CORDIAL_TRACE_DLADDR` | every `dladdr`, with the file name and base it answered |
-
-They exist because the alternative is reading a stripped binary, which is the
-mistake `AGENTS.md` opens by warning about. The `dlsym` trace is unfiltered on
-purpose: deciding which symbols count before running anything is precisely the
-guessing it replaces.
+That is the failure mode AGENTS.md keeps returning to, in a new shape. The
+edits were behaviourally inert -- every one is gated on an environment variable
+that defaults off -- so a release built from a fresh checkout would have run
+identically and nobody would have noticed anything was missing. What would have
+been lost is the instrument, and with it the ability to reproduce any
+measurement taken using it.
 
 ## Applying them
 
-```bash
-git -C third_party/mcpelauncher-linker/bionic apply ../../patches/bionic-cordial-tracing.patch
-```
+    git -C third_party/mcpelauncher-linker/bionic apply \
+        ../../patches/0001-cordial-linker-tracing.patch
 
-## Getting rid of them
+Nothing applies these automatically. A build without them is a correct build
+and differs only in that the trace variables below do nothing.
 
-Two ways, both better than this directory. Upstream them, or fork the
-submodules under an account this project controls and point `.gitmodules` at
-the fork. Until one of those happens, a fresh clone builds a Cordial without
-these traces and nothing warns you.
+## What is in them
+
+`0001-cordial-linker-tracing.patch` adds two traces to the guest linker, both
+off unless asked for:
+
+- `CORDIAL_TRACE_DLSYM=1` prints every `dlopen` and every `dlsym` the guest
+  makes through the virtual `libdl.so`, symbol names unfiltered. Unfiltered on
+  purpose: deciding in advance which names are interesting is the guessing the
+  trace exists to replace. It is what established that the `mi_option_*`
+  strings in `libroblox.so` are mimalloc option names for its own log line
+  rather than symbols anything resolves.
+- `CORDIAL_TRACE_DLADDR=1` prints every `dladdr` and `dl_iterate_phdr`. Those
+  are the two ways guest code can ask the linker where it is loaded from, and
+  `docs/analysis/flag-init.md` §31 asks whether the engine finds its private
+  data directory by walking up from its own library path the way an Android app
+  does. `/proc/self/maps`, the third route, is a plain file read and already
+  visible under `CORDIAL_TRACE_PATHS=1`, where it has never once appeared.

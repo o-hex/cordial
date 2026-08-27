@@ -643,30 +643,25 @@ registry format, signature checking and an installer, and no populated registry
 to point them at. Until there is, a plugin arrives as a directory or an archive
 and you put it in place yourself.
 
-**A plugin is a folder** containing `plugin.json` and its entry module. Drop it
-in:
+**Settings → Get Plugins → Plugin archive (`.tar.zst`)**, and choose the file.
+Cordial unpacks it into place, and it then appears under Plugins, switched off,
+with the permissions it is asking for listed. Nothing runs until you say so.
 
-```
-~/.local/share/cordial/plugins/<plugin-id>/
-```
+That is the whole procedure. You do not need a terminal and you do not need to
+know where plugins live.
 
-so that `~/.local/share/cordial/plugins/some-plugin/plugin.json` exists. Restart
-Cordial and it appears in Settings → Plugins, switched off, with the permissions
-it is asking for listed. Nothing runs until you say so.
+**The archive is how a plugin travels; a folder is what it is.** A `.tar.zst`
+holds the plugin directory's contents, zstd-compressed — zstd for ratio and
+speed, tar because zip's Unix mode bits are optional and a plugin arriving
+without its execute bit is a confusing failure. **It is not a `.tar.gz`.** If
+somebody hands you one of those it is not a Cordial plugin archive, whatever is
+inside it, and the picker will not take it.
 
-**An archive is a `.tar.zst`**, not a `.tar.gz` — a tar of the plugin
-directory's *contents*, zstd-compressed. Zstd for ratio and speed; tar because
-zip's Unix mode bits are optional and a plugin that arrives without its execute
-bit is a confusing failure. If somebody hands you a `.tar.gz` it is not a
-Cordial plugin archive, whatever it contains.
-
-```bash
-mkdir -p ~/.local/share/cordial/plugins/some-plugin
-tar --zstd -xf some-plugin.tar.zst -C ~/.local/share/cordial/plugins/some-plugin
-```
-
-Flatpak users want `~/.var/app/io.github.luohoa97.Cordial/data/plugins/`
-instead, since that is where the sandbox's data directory lives.
+If you are writing a plugin rather than installing one, skip the archive: put
+the folder straight into `~/.local/share/cordial/plugins/<plugin-id>/` so that
+its `plugin.json` is at `…/<plugin-id>/plugin.json`, and restart. Under Flatpak
+that path is `~/.var/app/io.github.luohoa97.Cordial/data/plugins/` instead,
+since that is where the sandbox keeps its data.
 
 **Trust the source.** A plugin runs as a real process on your machine. Cordial
 gives it no ambient permissions — no file access, no network, no environment, no

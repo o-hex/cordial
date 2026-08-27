@@ -1668,14 +1668,28 @@ const char* host_backend_name() {
     // documents the same rule for the same reason: two readers of one variable
     // is two places for a typo to mean different things.
     static const char* const name = [] () -> const char* {
-        const char* value = std::getenv("CORDIAL_AUDIO_HOST");
-        if (!value || value[0] == '\0') return "pipewire";
+        const char* raw = std::getenv("CORDIAL_AUDIO_HOST");
+        // **Unset means detect, not PipeWire.** It used to mean PipeWire, so a
+        // machine without it was told "no audio" while ALSA and OSS sat
+        // unexamined a few lines below -- reported by a user on 2026-08-27 who
+        // reasonably concluded the variable did nothing. Nobody with a PipeWire
+        // session sees a difference: detection asks for it first.
+        if (!raw || raw[0] == '\0') return "auto";
+        // Lowercased before comparing. `CORDIAL_AUDIO_HOST=OSS` used to fall
+        // through to the warning and silently become PipeWire, which is a sharp
+        // edge on a variable somebody only ever types when audio is already
+        // broken.
+        static std::string folded;
+        folded.assign(raw);
+        for (char& c : folded) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const char* value = folded.c_str();
         if (std::strcmp(value, "pipewire") == 0) return "pipewire";
         if (std::strcmp(value, "pulse") == 0 || std::strcmp(value, "pulseaudio") == 0) {
             return "pulse";
         }
         if (std::strcmp(value, "alsa") == 0) return "alsa";
         if (std::strcmp(value, "oss") == 0) return "oss";
+        if (std::strcmp(value, "auto") == 0) return "auto";
         // Falls back rather than failing, and says so. ADR-023 schedules
         // PulseAudio and then ALSA behind this name; until one of them exists,
         // a run that asked for one should be told it did not get it rather
@@ -1690,6 +1704,58 @@ const char* host_backend_name() {
     return name;
 }
 
+/// The backend this run will actually use, resolved once.
+///
+/// **This is what makes "detect" mean anything.** `host_backend_name()` reports
+/// what was *asked for*; this reports what is *there*, by probing in the order
+/// ADR-023 sets out -- and the probes are real: `oss_available()` opens
+/// `/dev/dsp`, `pulse_available()` connects to a server and tears the
+/// connection down, `pipewire_available()` waits for a session to answer. A
+/// "no" here is a measured absence rather than a guess about the machine.
+///
+/// PipeWire first, so nobody who has one sees any change. The order after it is
+/// PulseAudio, ALSA, OSS -- most to least likely on a desktop, and OSS last
+/// because the machines that have it are the ones that have nothing else.
+///
+/// Cached, because these probes cost a connection attempt each and the answer
+/// cannot change while the process runs.
+const char* effective_backend_name() {
+    static const char* const chosen = [] () -> const char* {
+        const char* asked = host_backend_name();
+        if (std::strcmp(asked, "auto") != 0) {
+            // Somebody named one. `make_output_stream` already announces a
+            // fallback if it will not open, and being told what you asked for
+            // is what lets that message make sense.
+            return asked;
+        }
+        if (pipewire_available()) return "pipewire";
+        if (pulse_available()) return "pulse";
+        if (alsa_available()) return "alsa";
+        if (oss_available()) return "oss";
+        // Nothing answered. PipeWire is returned so the existing path runs and
+        // prints its own diagnosis, which names the library and what to install
+        // -- a better message than anything that could be invented here.
+        return "pipewire";
+    }();
+    return chosen;
+}
+
+/// Whether audio can work at all on this host.
+///
+/// The predicate the one-way doors must ask. They asked `pipewire_available()`,
+/// which is the question "is PipeWire here" rather than "can we play sound", so
+/// on an OSS-only machine `supportsAAudio()` answered false, FMOD never loaded
+/// the AAudio path, and the selector that would have chosen OSS was never
+/// reached. ADR-023 says this predicate must be consulted "before the door
+/// closes"; it never was.
+bool host_backend_available() {
+    const char* name = effective_backend_name();
+    if (std::strcmp(name, "oss") == 0) return oss_available();
+    if (std::strcmp(name, "alsa") == 0) return alsa_available();
+    if (std::strcmp(name, "pulse") == 0) return pulse_available();
+    return pipewire_available();
+}
+
 std::unique_ptr<OutputStream> make_output_stream() {
     // The whole point of ADR-023's first step: the caller stopped naming a
     // backend, so adding one is a change here and nowhere else.
@@ -1700,7 +1766,7 @@ std::unique_ptr<OutputStream> make_output_stream() {
     // a default that changed under them would be a change nobody asked for. The
     // people this exists for are on a machine where PipeWire is not there --
     // and they are the ones who will set the variable.
-    if (std::strcmp(host_backend_name(), "oss") == 0) {
+    if (std::strcmp(effective_backend_name(), "oss") == 0) {
         if (oss_available()) {
             if (auto stream = make_oss_stream()) return stream;
         }
@@ -1708,7 +1774,7 @@ std::unique_ptr<OutputStream> make_output_stream() {
             "W/Cordial-Audio           CORDIAL_AUDIO_HOST=oss, but /dev/dsp would not open "
             "(set CORDIAL_AUDIO_DEVICE for another node); using pipewire.\n");
     }
-    if (std::strcmp(host_backend_name(), "alsa") == 0) {
+    if (std::strcmp(effective_backend_name(), "alsa") == 0) {
         if (alsa_available()) {
             if (auto stream = make_alsa_stream()) return stream;
         }
@@ -1716,7 +1782,7 @@ std::unique_ptr<OutputStream> make_output_stream() {
             "W/Cordial-Audio           CORDIAL_AUDIO_HOST=alsa, but no ALSA device would "
             "open; using pipewire.\n");
     }
-    if (std::strcmp(host_backend_name(), "pulse") == 0) {
+    if (std::strcmp(effective_backend_name(), "pulse") == 0) {
         // Asked before falling back, not after: `pulse_available()` connects to
         // a server and tears the connection down, so a "no" here is a measured
         // absence rather than a guess -- and the fallback is announced, because

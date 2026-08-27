@@ -249,7 +249,7 @@ public:
 };
 
 /// The host backend this run will use, named the way `CORDIAL_AUDIO_HOST`
-/// spells it. Read once, from one place, and announced at startup.
+/// spells it. Read once, from one place, and announced at startup -- which was written here before it was true and became true on 2026-08-28, after a user set the variable, got silence, and had nothing to read that would tell them whether it had been seen.
 ///
 /// **A separate variable from `CORDIAL_AUDIO`, and ADR-023 says why.** That one
 /// selects which *Android* API FMOD reaches Cordial through — AAudio, OpenSL,
@@ -257,6 +257,19 @@ public:
 /// meaningful. One variable for two orthogonal axes is a variable nobody can
 /// document.
 const char* host_backend_name();
+
+/// The backend this run will actually use, after probing when nobody named one.
+///
+/// `host_backend_name()` says what was asked for; this says what is there. See
+/// the definition for the probe order and why PipeWire is still asked first.
+const char* effective_backend_name();
+
+/// Whether sound can come out on this host, by whichever backend was resolved.
+///
+/// **The predicate a one-way door must ask.** Asking `pipewire_available()`
+/// instead is what made `CORDIAL_AUDIO_HOST` inert on the machines that needed
+/// it: the door closed on PipeWire's absence before the selector ever ran.
+bool host_backend_available();
 
 /// Whether a PulseAudio server answered, proved by connecting to one.
 ///

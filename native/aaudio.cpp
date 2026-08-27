@@ -706,7 +706,7 @@ static aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder* build
         return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
     }
 
-    if (!cordial::audio::pipewire_available()) {
+    if (!cordial::audio::host_backend_available()) {
         // Should be unreachable: `org.fmod.FMOD.supportsAAudio()` in
         // `audio_classes.cpp` asks the same question first and answers false
         // when there is no session, precisely so that FMOD never gets here.
@@ -1192,6 +1192,26 @@ int cordial_audio_backend_is_aaudio(void) {
     return selected_backend() == Backend::Java ? 0 : 1;
 }
 
-void cordial_audio_backend_announce(void) { (void)selected_backend(); }
+void cordial_audio_backend_announce(void) {
+    (void)selected_backend();
+    // **Said out loud, because `pipewire_backend.h` has claimed for some time
+    // that it was and it never was.** A user on 2026-08-27 set
+    // `CORDIAL_AUDIO_HOST=oss`, got "no audio", and had no way to tell whether
+    // their variable had been seen -- it had not, and one line here would have
+    // said so in ten seconds rather than costing a diagnosis.
+    //
+    // Both names, because they answer different questions: what was asked for,
+    // and what is actually there. When nobody asked, the first reads `auto` and
+    // the second is the probe's answer.
+    const char* asked = cordial::audio::host_backend_name();
+    const char* got = cordial::audio::effective_backend_name();
+    if (std::strcmp(asked, got) == 0) {
+        std::fprintf(stderr, "I/Cordial-Audio           host backend: %s\n", got);
+    } else {
+        std::fprintf(stderr,
+            "I/Cordial-Audio           host backend: %s (CORDIAL_AUDIO_HOST=%s)\n",
+            got, asked);
+    }
+}
 
 } // extern "C"

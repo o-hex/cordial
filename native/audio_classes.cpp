@@ -969,7 +969,7 @@ public:
     /// the same failure in the one place people already know to look.
     static jboolean supportsAAudio(jnivm::ENV*, jnivm::Class*) {
         if (!cordial_audio_backend_is_aaudio()) return JNI_FALSE;
-        if (!audio::pipewire_available()) {
+        if (!audio::host_backend_available()) {
             std::fprintf(stderr,
                 "W/Cordial-FMOD            AAudio is selected but no PipeWire session is "
                 "reachable; answering supportsAAudio() false so FMOD keeps its "

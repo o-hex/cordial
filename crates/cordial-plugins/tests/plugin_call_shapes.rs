@@ -199,3 +199,65 @@ fn every_shipped_plugin_tells_a_push_from_a_reply() {
         );
     }
 }
+
+/// A manifest that is valid JSON and not a valid `Manifest` loads as nothing.
+///
+/// `discover` reports it as "not loadable" and moves on, so a shipped plugin
+/// with a typo in a preferences declaration presents to the user as a plugin
+/// that has simply vanished from Settings. Parsing as JSON is not the check;
+/// parsing as the struct is.
+#[test]
+fn every_shipped_manifest_deserialises_as_a_manifest() {
+    for (id, _, manifest) in shipped() {
+        let text = std::fs::read_to_string(&manifest).expect("readable");
+        let parsed: Result<cordial_plugins::manifest::Manifest, _> = serde_json::from_str(&text);
+        let m = parsed.unwrap_or_else(|e| {
+            panic!("plugins/{id}/plugin.json is not a Manifest: {e}");
+        });
+        assert_eq!(m.id, id, "a plugin's id must match its directory name");
+        assert!(!m.entry.is_empty(), "plugins/{id} has an entry module and should declare it");
+    }
+}
+
+/// Every capability a shipped manifest names must parse.
+///
+/// An unparseable one is not refused loudly -- it is simply not in the granted
+/// set, so the plugin runs with less than it asked for and the prompt the user
+/// answered did not mention it.
+#[test]
+fn every_capability_a_shipped_manifest_names_is_real() {
+    for (id, _, manifest) in shipped() {
+        for name in requested_capabilities(&manifest) {
+            assert!(
+                cordial_plugins::capability::Capability::parse(&name).is_some(),
+                "plugins/{id}/plugin.json asks for {name:?}, which is not a capability"
+            );
+        }
+    }
+}
+
+/// A choice field whose default is not one of its own options.
+///
+/// `Field::default_value` hands the default straight back, so the row opens
+/// showing a value the combo cannot select and the plugin is given a string its
+/// own list would reject. Cheap to get wrong by editing the options and not the
+/// default, which is exactly what happens when a mode is renamed.
+#[test]
+fn a_declared_choice_defaults_to_one_of_its_own_options() {
+    use cordial_plugins::preferences::Field;
+    for (id, _, manifest) in shipped() {
+        let text = std::fs::read_to_string(&manifest).expect("readable");
+        let m: cordial_plugins::manifest::Manifest =
+            serde_json::from_str(&text).expect("covered by the test above");
+        for field in &m.preferences {
+            let Field::Choice { default, options } = &field.field else { continue };
+            assert!(
+                options.iter().any(|o| &o.value == default),
+                "plugins/{id}: preference {:?} defaults to {default:?}, which is not \
+                 one of its options {:?}",
+                field.key,
+                options.iter().map(|o| &o.value).collect::<Vec<_>>()
+            );
+        }
+    }
+}

@@ -276,7 +276,9 @@ pub fn build(
     // was an avatar in the top-right corner first; see `profile_switcher.rs` for
     // why that was a browser convention borrowed into an application that is not
     // one.
-    let profile_row = profile_switcher::build(config.clone(), config_path.clone());
+    let switcher = profile_switcher::build(config.clone(), config_path.clone());
+    let profile_row = switcher.group.clone();
+    let profile_combo = switcher.row.clone();
 
     // Two controls, centred, and the empty space around them is the point.
     //
@@ -422,9 +424,27 @@ pub fn build(
     // one. It is in this window rather than behind a button now, so the action
     // only has to move the focus there.
     let profile_action = gtk::gio::SimpleAction::new("profile", None);
-    let profile_row_for_action = profile_row.clone();
+    // **Open the list, do not merely focus the container.** This called
+    // `grab_focus()` on the `PreferencesGroup`, which is a box around the row:
+    // nothing visible happened, so pressing "Choose a Profile" on the
+    // profile-busy dialog looked exactly like pressing "Cancel". Reported on
+    // 2026-08-28 as the two buttons doing the same thing -- and from outside
+    // the process they did, since the only difference was where keyboard focus
+    // landed behind a dialog that was disappearing.
+    //
+    // Deferred to an idle callback because the usual caller is that dialog's
+    // response handler, and the dialog is still tearing down when it fires; a
+    // popover asked to open underneath a closing modal does not.
+    let profile_combo_for_action = profile_combo.clone();
     profile_action.connect_activate(move |_, _| {
-        profile_row_for_action.grab_focus();
+        let row = profile_combo_for_action.clone();
+        row.grab_focus();
+        glib::idle_add_local_once(move || {
+            // Disambiguated: `WidgetExt` and `ListBoxRowExt` both offer an
+            // `activate`, and the one that opens an `AdwComboRow`'s list is the
+            // row's, which is what a keyboard Enter on it does.
+            gtk::prelude::WidgetExt::activate(&row);
+        });
     });
 
     // Fullscreen, on F11, because until now there was no way for a user to ask

@@ -237,7 +237,21 @@ impl Switcher {
 }
 
 /// The profile chooser, as a group ready to sit above the Launch button.
-pub fn build(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> adw::PreferencesGroup {
+/// The switcher, and the row inside it that opens the list.
+///
+/// **The row is handed back rather than kept private**, because `win.profile`
+/// has to be able to open the chooser and a `PreferencesGroup` is a container
+/// with nothing to open. The action used to call `grab_focus()` on the group;
+/// that focuses something that is not the control, changes nothing anybody can
+/// see, and made "Choose a Profile" on the profile-busy dialog indistinguishable
+/// from "Cancel" -- reported on 2026-08-28 as the two buttons doing the same
+/// thing, which from the outside they did.
+pub struct Chooser {
+    pub group: adw::PreferencesGroup,
+    pub row: adw::ComboRow,
+}
+
+pub fn build(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> Chooser {
     let model = gtk::StringList::new(&[]);
     let row = adw::ComboRow::builder().title("Profile").model(&model).build();
     // Three rather than two, and only the `Unusable` case will ever want the
@@ -289,8 +303,9 @@ pub fn build(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> adw:
 
     let group = adw::PreferencesGroup::new();
     group.add(&row);
+    let returned_row = row.clone();
 
-    group
+    Chooser { group, row: returned_row }
 }
 
 /// How one profile is drawn inside the dropdown.

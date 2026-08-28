@@ -26,6 +26,23 @@
 //! see the line and edit it -- which is the argument for a block of plain text
 //! over a button that uploads something.
 //!
+//! ## Two fields that were asked for and are deliberately absent
+//!
+//! **An `Engine` line, separate from `Roblox`.** There is no second number to
+//! report: the version on the `Roblox` line is the engine's own, and reading it
+//! again means `cordial_update::engine::scan` walking the whole 118 MB
+//! `libroblox.so` — it has no early exit, because it must reach EOF to notice a
+//! second differing candidate. A diagnostics command that takes several seconds
+//! is one people stop running.
+//!
+//! **An `Audio` line.** The shell does not know. The backend is probed by the
+//! client at startup — PipeWire, then PulseAudio, then ALSA, then OSS, first
+//! one that answers — and the only thing the shell holds is a sink name, which
+//! answers a different question. The client prints `Cordial-Audio host backend:
+//! <name>` on its own first lines, so a report about sound wants those lines,
+//! and the templates ask for them. Printing a guess here would be the shape
+//! this whole file is written against.
+//!
 //! ## Unknown is a value
 //!
 //! A field that cannot be established says `unknown`. It is not omitted, and it

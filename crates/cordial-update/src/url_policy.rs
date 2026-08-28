@@ -207,6 +207,22 @@ pub fn check(url: &str, allowed: &Allowed) -> Result<String, Rejected> {
     Ok(host.to_ascii_lowercase())
 }
 
+/// The host of a URL, or a refusal naming the URL rather than a parse error.
+///
+/// Shared rather than copied: `mirror` had its own private version of this
+/// exact function, one file over, and a fix made to one of the two would have
+/// left the other silently different the next time somebody needed a host
+/// pulled out of a URL.
+pub fn host_of(url: &str) -> Result<String, Unreachable> {
+    url.parse::<Uri>()
+        .ok()
+        .and_then(|u| u.host().map(|h| h.to_ascii_lowercase()))
+        .ok_or_else(|| Unreachable::Malformed {
+            url: url.to_string(),
+            why: "this is not a URL with a host in it".into(),
+        })
+}
+
 /// The client used for everything in this module.
 ///
 /// Three settings do the work. Redirects are off, because [`walk`] follows them
@@ -268,23 +284,47 @@ pub fn walk(
             })?
             .to_string();
 
-        // An origin-relative target is resolved against the hop it came from,
-        // which is the only form worth supporting: CDNs use it and it cannot
-        // move Cordial to another host by construction. Anything else is
-        // refused rather than guessed at.
-        current = if target.starts_with("https://") {
-            target
-        } else if let Some(rest) = target.strip_prefix('/') {
-            let base: Uri = current.parse().map_err(|_| Unreachable::Malformed {
-                url: current.clone(),
-                why: "this hop stopped being a URL".into(),
-            })?;
-            format!("https://{}/{rest}", base.authority().map(|a| a.as_str()).unwrap_or_default())
-        } else {
-            return Err(Rejected::RelativeRedirect { url: current, target }.into());
-        };
+        current = resolve_redirect(&current, target)?;
     }
     Err(Rejected::TooManyRedirects { url: url.to_string() }.into())
+}
+
+/// Resolve one redirect's `Location` target against the hop it came from.
+///
+/// Split out of [`walk`] so the classification below — an origin-relative
+/// path, an absolute `https://` target, an absolute target naming some other
+/// scheme, or a bare relative one — is one function a test can call directly,
+/// with no server needed to drive a real redirect through it. Returns
+/// [`Rejected`] rather than [`Unreachable`] for the same reason: a test can
+/// match the specific variant instead of parsing a rendered sentence back
+/// apart to ask what kind of refusal it was.
+///
+/// An origin-relative target is resolved against the hop it came from, which
+/// is the only form worth supporting: CDNs use it and it cannot move Cordial
+/// to another host by construction. Anything else is refused rather than
+/// guessed at.
+fn resolve_redirect(current: &str, target: String) -> Result<String, Rejected> {
+    if target.starts_with("https://") {
+        Ok(target)
+    } else if let Some(rest) = target.strip_prefix('/') {
+        // `current` was already parsed successfully by `check` a few lines
+        // above this call in `walk`, so this can only fail if a URL stops
+        // being one between those two parses -- not reachable in practice,
+        // and `Unparseable` is the honest name for it if it ever is.
+        let base: Uri =
+            current.parse().map_err(|_| Rejected::Unparseable { url: current.to_string() })?;
+        Ok(format!("https://{}/{rest}", base.authority().map(|a| a.as_str()).unwrap_or_default()))
+    } else if let Some((scheme, _)) = target.split_once("://") {
+        // An absolute URL naming some other scheme -- `http://`, most often a
+        // downgrade -- which is refused for being that scheme and not for
+        // being relative. The two used to share a branch and a message, and
+        // "relative" is not what an absolute `http://` target is; saying so
+        // cost nothing here and would have cost whoever read the refusal a
+        // wrong mental model of the redirect.
+        Err(Rejected::NotHttps { url: current.to_string(), scheme: scheme.to_ascii_lowercase() })
+    } else {
+        Err(Rejected::RelativeRedirect { url: current.to_string(), target })
+    }
 }
 
 #[cfg(test)]
@@ -388,5 +428,61 @@ mod tests {
             check("https://apkpure.com/x.apk", &mine),
             Err(Rejected::HostNotAllowed { .. })
         ));
+    }
+
+    #[test]
+    fn host_of_reads_the_host_out_of_a_url() {
+        assert_eq!(host_of("https://api.pureapk.com/x").unwrap(), "api.pureapk.com");
+        assert_eq!(host_of("https://API.PUREAPK.COM/x").unwrap(), "api.pureapk.com");
+        assert!(host_of("not a url").is_err());
+    }
+
+    /// **The bug this guards.** An absolute `http://` redirect target used to
+    /// fall into the same `else` as a bare relative path and come back
+    /// labelled `RelativeRedirect`, which it is not — it is a URL with a
+    /// scheme, refused for the scheme, and the message somebody reads should
+    /// say that rather than call an absolute URL relative.
+    #[test]
+    fn an_absolute_non_https_redirect_target_is_refused_for_its_scheme_not_as_relative() {
+        let e = resolve_redirect("https://good.example/start", "http://evil.example/x.apk".into())
+            .unwrap_err();
+        assert!(
+            matches!(e, Rejected::NotHttps { ref scheme, .. } if scheme == "http"),
+            "an absolute http:// target must be refused for its scheme, not called relative: {e:?}"
+        );
+    }
+
+    /// A same-origin absolute target is still followed and re-checked as
+    /// `https`, unaffected by the branch above — the control that says the fix
+    /// did not turn every redirect into a scheme refusal.
+    #[test]
+    fn an_absolute_https_target_is_followed_as_is() {
+        assert_eq!(
+            resolve_redirect("https://good.example/start", "https://good.example/next".into())
+                .unwrap(),
+            "https://good.example/next"
+        );
+    }
+
+    /// An origin-relative target is resolved against the hop it came from —
+    /// unaffected by the fix above, which only changes how a target *with* a
+    /// scheme is classified.
+    #[test]
+    fn an_origin_relative_target_resolves_against_its_hop() {
+        assert_eq!(
+            resolve_redirect("https://good.example/a/b", "/c/d".into()).unwrap(),
+            "https://good.example/c/d"
+        );
+    }
+
+    /// The residual bucket is still reachable: a target with no scheme and no
+    /// leading slash — the shape a same-page fragment or a bare filename
+    /// takes — is genuinely relative, and this is what `RelativeRedirect`
+    /// exists for once the absolute-but-wrong-scheme case has its own name.
+    #[test]
+    fn a_target_with_no_scheme_and_no_leading_slash_is_still_relative() {
+        let e = resolve_redirect("https://good.example/start", "updates/latest.json".into())
+            .unwrap_err();
+        assert!(matches!(e, Rejected::RelativeRedirect { .. }), "{e:?}");
     }
 }

@@ -235,15 +235,24 @@ pub fn named(name: &str) -> Option<Box<dyn Provider>> {
 /// A source that fails to answer is not dropped here, only deprioritised: it
 /// may still be the only one that can actually deliver, and `obtain` reports
 /// what each one said if none of them can.
+///
+/// **Compared by [`crate::version::major_and_build`], not by raw digits.**
+/// This used to rank by `version::numeric`, the plain digit vector, and that
+/// is wrong for exactly the reason `version.rs`'s own doc warns about: the
+/// sources do not agree on shape. The local provider reads the engine and
+/// reports four components, `2.734.0.917`; the mirror reports three,
+/// `2.734.917`. Compared element-wise those read as position two being `0`
+/// against `917` -- the identical build losing to itself on a padding zero,
+/// with the outcome deciding which source `obtain` tries first.
 fn order_by_version(
     sources: Vec<Box<dyn Provider>>,
     progress: &mut dyn FnMut(Progress),
     absent: &mut Vec<String>,
 ) -> Vec<Box<dyn Provider>> {
-    let mut scored: Vec<(Option<Vec<u64>>, usize, Box<dyn Provider>)> = Vec::new();
+    let mut scored: Vec<(Option<(u64, u64)>, usize, Box<dyn Provider>)> = Vec::new();
     for (position, source) in sources.into_iter().enumerate() {
         let version = match source.newest(progress) {
-            Ok(v) => Some(crate::version::numeric(&v.name)),
+            Ok(v) => crate::version::major_and_build(&v.name),
             Err(Unreachable::NoSource { why }) => {
                 absent.push(format!("{}: {why}", source.name()));
                 None
@@ -551,9 +560,19 @@ pub fn obtain_and_install(
             &crate::install::build_dir(),
             &crate::install::engine_dir(),
             &crate::install::engine_dir().join(".incoming"),
+            cancel,
             &mut |_, _, _| {},
         )
-        .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+        .map_err(|e| match e {
+            // **Named, not folded into `NoSource`.** A cancel that reached
+            // `adopt` still has to come back as `Unreachable::Cancelled`, the
+            // one string `cordial-shell`'s button matches on to show "stopped"
+            // rather than a red failure. Before this, `adopt` had no way to
+            // hear about a cancel at all, so this arm was unreachable and the
+            // button's Stop label ran the install to completion regardless.
+            crate::install::Failed::Cancelled => Unreachable::Cancelled,
+            other => Unreachable::NoSource { why: other.to_string() },
+        })?;
         Ok((obtained, installed))
     })();
 
@@ -615,6 +634,75 @@ mod tests {
         // answer; inventing the missing one is not.
         assert_eq!(numeric("2.734.0.917"), vec![2, 734, 0, 917]);
         assert_eq!(numeric("2.734.917"), vec![2, 734, 917]);
+    }
+
+    /// A provider that answers a fixed version and is never asked to fetch —
+    /// `order_by_version` only calls `newest`, and a test of it that could
+    /// reach `fetch` at all would be testing more than it means to.
+    struct Fixed(&'static str, &'static str);
+    impl Provider for Fixed {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn needs_network(&self) -> bool {
+            false
+        }
+        fn newest(&self, _: &mut dyn FnMut(Progress)) -> Result<Available, Unreachable> {
+            Ok(Available { name: self.1.to_string(), code: 0 })
+        }
+        fn fetch(
+            &self,
+            _: &Available,
+            _: &Cancel,
+            _: &Path,
+            _: &mut dyn FnMut(Progress),
+        ) -> Result<Archives, Unreachable> {
+            unreachable!("order_by_version does not fetch")
+        }
+    }
+
+    /// **The bug, reproduced directly against `order_by_version`.** Two
+    /// sources reporting the identical build in the two shapes this crate
+    /// actually sees — the engine's four components and the mirror's three —
+    /// must tie and keep `all()`'s order, not have the free source demoted
+    /// behind the paid one because of a padding zero at the position where
+    /// the shapes diverge. Ranking by `version::numeric` did exactly that:
+    /// `[2,734,0,917]` compares less than `[2,734,917]` at index 2, so the
+    /// identical build in its four-component shape sorted *behind* itself in
+    /// its three-component shape.
+    #[test]
+    fn order_by_version_does_not_let_a_padding_zero_decide() {
+        let sources: Vec<Box<dyn Provider>> =
+            vec![Box::new(Fixed("local", "2.734.0.917")), Box::new(Fixed("mirror", "2.734.917"))];
+        let mut absent = Vec::new();
+        let ordered = order_by_version(sources, &mut |_| {}, &mut absent);
+        let names: Vec<&str> = ordered.iter().map(|p| p.name()).collect();
+        assert_eq!(
+            names,
+            vec!["local", "mirror"],
+            "the same build named in two shapes must not reorder the sources: {names:?}"
+        );
+    }
+
+    /// **The control for the fix above, and the case `Checked::obtainable`
+    /// records.** A comparison that stopped distinguishing versions at all —
+    /// to make the tie above hold — would be a different, equally wrong, fix.
+    /// Measured 2026-08-26: Roblox announced engine 735 and shipped no
+    /// x86-64 build for it, so 2.734.917 was the newest anything could
+    /// actually run, and a genuinely newer build still has to win regardless
+    /// of which shape either source reports it in.
+    #[test]
+    fn order_by_version_still_prefers_a_genuinely_newer_build() {
+        let sources: Vec<Box<dyn Provider>> =
+            vec![Box::new(Fixed("older", "2.734.0.917")), Box::new(Fixed("newer", "2.735.1"))];
+        let mut absent = Vec::new();
+        let ordered = order_by_version(sources, &mut |_| {}, &mut absent);
+        assert_eq!(ordered[0].name(), "newer");
+        // And the reverse input order does not launder the answer either.
+        let sources: Vec<Box<dyn Provider>> =
+            vec![Box::new(Fixed("newer", "2.735.1")), Box::new(Fixed("older", "2.734.0.917"))];
+        let ordered = order_by_version(sources, &mut |_| {}, &mut absent);
+        assert_eq!(ordered[0].name(), "newer");
     }
 
     /// A source that behaves as badly as a source can.

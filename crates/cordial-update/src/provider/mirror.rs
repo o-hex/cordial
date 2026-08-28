@@ -196,7 +196,7 @@ impl Mirror {
         // which variable was wrong instead of as a transport error four steps
         // later. The host is taken from the URL itself, so this cannot refuse
         // the very endpoint it was just given.
-        let host = host_of(&url)?;
+        let host = url_policy::host_of(&url)?;
         url_policy::check(&url, &url_policy::Allowed::exactly(host.clone())).map_err(|e| {
             Unreachable::Malformed {
                 url: url.clone(),
@@ -217,7 +217,7 @@ impl Mirror {
     }
 
     fn metadata_allowed(&self) -> Result<url_policy::Allowed, Unreachable> {
-        Ok(url_policy::Allowed::exactly(host_of(&self.metadata_url)?))
+        Ok(url_policy::Allowed::exactly(url_policy::host_of(&self.metadata_url)?))
     }
 
     fn download_allowed(&self) -> url_policy::Allowed {
@@ -230,17 +230,6 @@ impl Mirror {
         h.push(("x-abis".into(), abi.into()));
         h
     }
-}
-
-/// The host of a URL, or a refusal naming the URL rather than a parse error.
-fn host_of(url: &str) -> Result<String, Unreachable> {
-    url.parse::<http::Uri>()
-        .ok()
-        .and_then(|u| u.host().map(|h| h.to_ascii_lowercase()))
-        .ok_or_else(|| Unreachable::Malformed {
-            url: url.to_string(),
-            why: "this is not a URL with a host in it".into(),
-        })
 }
 
 /// What Cordial can run.
@@ -668,6 +657,18 @@ impl Provider for ApkPure {
                 let dest = into.join(format!("candidate-{i}.apk"));
                 download(&mirror, url, cancel, &dest, progress)?;
                 landed.push(dest);
+                // **Stop as soon as what has landed is enough.** The measured
+                // ordinary case is one monolithic archive carrying both the
+                // engine and the assets -- see the module header, 229 MB in
+                // about thirteen seconds -- and downloading the remaining
+                // candidates after that one lands would double or quadruple
+                // that transfer to answer a question the first archive already
+                // answered. `held` is the same check `classify` ends with, run
+                // early enough to matter.
+                let (engine, assets) = held(&landed);
+                if engine.is_some() && assets.is_some() {
+                    break;
+                }
             }
             Ok(())
         })();
@@ -694,12 +695,14 @@ impl Provider for ApkPure {
     }
 }
 
-/// Which of the downloaded archives is the base and which holds the engine.
+/// Which of `files`, if any, holds the engine and which holds the assets.
 ///
-/// This reads the archives rather than their names, because the names came from
-/// the mirror. A monolithic APK holding both is reported as both, which is what
-/// [`Archives`] is for.
-fn classify(files: &[PathBuf]) -> Option<Archives> {
+/// Split out of [`classify`] so a caller downloading one candidate at a time
+/// can ask, after each one lands, whether it already has enough — a monolithic
+/// archive sets both from the one file in a single pass here, which is what
+/// lets `fetch` stop after the first download in the ordinary case rather than
+/// fetching every candidate before anything is inspected.
+fn held(files: &[PathBuf]) -> (Option<PathBuf>, Option<PathBuf>) {
     let mut engine: Option<PathBuf> = None;
     let mut assets: Option<PathBuf> = None;
     for f in files {
@@ -714,6 +717,16 @@ fn classify(files: &[PathBuf]) -> Option<Archives> {
             assets = Some(f.clone());
         }
     }
+    (engine, assets)
+}
+
+/// Which of the downloaded archives is the base and which holds the engine.
+///
+/// This reads the archives rather than their names, because the names came from
+/// the mirror. A monolithic APK holding both is reported as both, which is what
+/// [`Archives`] is for.
+fn classify(files: &[PathBuf]) -> Option<Archives> {
+    let (engine, assets) = held(files);
     let engine = engine?;
     Some(Archives { base: assets.unwrap_or_else(|| engine.clone()), split: engine })
 }
@@ -809,5 +822,87 @@ mod tests {
                 .unwrap_or_else(|e| panic!("a real download URL must pass the allow-list: {e}"));
         }
         eprintln!("captured: {} at code {code}, {} download(s)", marks[0].name, urls.len());
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cordial-update-mirror-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A zip holding whatever entries are named. Same shape as `apk`'s and
+    /// `install`'s own fixture: the entry path is what `held` acts on, and
+    /// nothing here is a real Roblox byte.
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in entries {
+            w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut w, body).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    /// **The common case, and the reason `fetch`'s download loop can stop
+    /// after one candidate.** A monolithic archive sets both `engine` and
+    /// `assets` from the same file in one pass, because the two conditions in
+    /// `held`'s loop are independent checks against the same open zip rather
+    /// than a match on which one it "is".
+    #[test]
+    fn held_finds_both_halves_in_one_monolithic_archive() {
+        let dir = scratch("monolithic");
+        let one = dir.join("one.apk");
+        std::fs::write(
+            &one,
+            zip_of(&[("assets/x.json", b"{}" as &[u8]), ("lib/x86_64/libroblox.so", b"\x7fELF")]),
+        )
+        .unwrap();
+        let (engine, assets) = held(std::slice::from_ref(&one));
+        assert_eq!(engine.as_deref(), Some(one.as_path()));
+        assert_eq!(assets.as_deref(), Some(one.as_path()));
+    }
+
+    /// **The case that must not stop the loop early.** A real split build
+    /// needs both files; asking after only the first has landed must say so
+    /// plainly rather than reporting the archive that has arrived as enough.
+    #[test]
+    fn held_needs_both_files_when_the_build_is_genuinely_split() {
+        let dir = scratch("split");
+        let base = dir.join("base.apk");
+        let split = dir.join("split.apk");
+        std::fs::write(&base, zip_of(&[("assets/x.json", b"{}")])).unwrap();
+        std::fs::write(&split, zip_of(&[("lib/x86_64/libroblox.so", b"\x7fELF")])).unwrap();
+
+        let (engine, assets) = held(std::slice::from_ref(&base));
+        assert!(engine.is_none(), "the base half alone carries no engine");
+        assert!(assets.is_some(), "and it does carry the assets it was checked for");
+
+        let (engine, assets) = held(&[base.clone(), split.clone()]);
+        assert_eq!(engine.as_deref(), Some(split.as_path()));
+        assert_eq!(assets.as_deref(), Some(base.as_path()));
+    }
+
+    #[test]
+    fn held_finds_neither_in_an_archive_with_no_engine_and_no_assets() {
+        let dir = scratch("neither");
+        let apk = dir.join("nothing.apk");
+        std::fs::write(&apk, zip_of(&[("AndroidManifest.xml", b"x")])).unwrap();
+        let (engine, assets) = held(&[apk]);
+        assert!(engine.is_none() && assets.is_none());
+    }
+
+    /// `classify` still has to agree with `held` once both halves are in:
+    /// this is the seam between the two, kept as a test now that `classify`
+    /// is a thin wrapper rather than its own copy of the scan.
+    #[test]
+    fn classify_still_pairs_a_split_build_correctly() {
+        let dir = scratch("classify-split");
+        let base = dir.join("base.apk");
+        let split = dir.join("split.apk");
+        std::fs::write(&base, zip_of(&[("assets/x.json", b"{}")])).unwrap();
+        std::fs::write(&split, zip_of(&[("lib/x86_64/libroblox.so", b"\x7fELF")])).unwrap();
+        let archives = classify(&[base.clone(), split.clone()]).expect("both halves are present");
+        assert_eq!(archives.base, base);
+        assert_eq!(archives.split, split);
     }
 }

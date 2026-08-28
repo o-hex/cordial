@@ -110,7 +110,7 @@ pub fn numeric(version: &str) -> Vec<u64> {
 /// The major is the second component in both shapes and the build is the last
 /// in both, so those are the two that carry meaning. Everything between them
 /// is padding that differs by source.
-fn major_and_build(version: &str) -> Option<(u64, u64)> {
+pub(crate) fn major_and_build(version: &str) -> Option<(u64, u64)> {
     let parts = numeric(version);
     match parts.len() {
         0 | 1 => None,

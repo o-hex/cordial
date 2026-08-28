@@ -235,6 +235,16 @@ pub fn header_button(
     let parent = parent.as_ref().clone();
     let button = gtk::Button::from_icon_name(PACKAGE_ICON);
     let last: Rc<RefCell<Option<Checked>>> = Rc::new(RefCell::new(None));
+    // **One process, one install, whichever control started it.** Background
+    // mode can start a silent `obtain_and_install` on launch, and a person can
+    // open this window and press Download while that is still running --
+    // `provider::obtain_and_install`'s own flock only stops a *second
+    // process*, so two calls from this one raced each other for it and the
+    // loser's refusal named "another Cordial", which was this one. Checked
+    // and set around every call in this file, so the second attempt is
+    // refused here, honestly, instead of by a lock that cannot tell the two
+    // callers apart.
+    let installing: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
 
     let automatic = config.borrow().automatic_updates;
     dress(&button, &last.borrow(), automatic);
@@ -247,9 +257,10 @@ pub fn header_button(
         let last = last.clone();
         let parent = parent.clone();
         let config = config.clone();
+        let installing = installing.clone();
         glib::timeout_add_local_once(AFTER_WINDOW, move || {
-            let apk = install::effective_apk(&config.borrow().roblox).map(|(p, _)| p);
-            check(apk, move |checked| {
+            let origin = install::effective_apk(&config.borrow().roblox).map(|(_, origin)| origin);
+            check(origin, move |checked| {
                 let available = checked.update_available();
                 // The plan is asked for even though only one branch of it can be
                 // acted on today, because the settings are what decide it and a
@@ -283,6 +294,8 @@ pub fn header_button(
                     Plan::CheckAndDownload => {
                         let button = button.clone();
                         let last = last.clone();
+                        let installing = installing.clone();
+                        installing.set(true);
                         on_worker(
                             || {
                                 let cancel = cordial_update::provider::Cancel::new();
@@ -295,22 +308,28 @@ pub fn header_button(
                                 .map(|(got, _)| got.version.name)
                                 .map_err(|e| e.to_string())
                             },
-                            move |outcome| match outcome {
-                                Ok(version) => {
-                                    println!("[update] installed Roblox {version} in the background");
-                                    // The badge has to go out, for the same
-                                    // reason it does after the button: nothing
-                                    // else re-runs the comparison, and a badge
-                                    // pointing at an update already installed
-                                    // is worse than no badge.
-                                    if let Some(checked) = last.borrow_mut().as_mut() {
-                                        checked.reread_installed();
+                            move |outcome| {
+                                installing.set(false);
+                                match outcome {
+                                    Ok(version) => {
+                                        println!(
+                                            "[update] installed Roblox {version} in the background"
+                                        );
+                                        // The badge has to go out, for the
+                                        // same reason it does after the
+                                        // button: nothing else re-runs the
+                                        // comparison, and a badge pointing at
+                                        // an update already installed is
+                                        // worse than no badge.
+                                        if let Some(checked) = last.borrow_mut().as_mut() {
+                                            checked.reread_installed();
+                                        }
+                                        dress(&button, &last.borrow(), automatic);
                                     }
-                                    dress(&button, &last.borrow(), automatic);
+                                    Err(why) => println!(
+                                        "[update] a background update did not install: {why}"
+                                    ),
                                 }
-                                Err(why) => println!(
-                                    "[update] a background update did not install: {why}"
-                                ),
                             },
                         );
                     }
@@ -325,7 +344,7 @@ pub fn header_button(
                 // button on it, on launch, and that dialog is the whole
                 // difference between the two settings.
                 if automatic == Automatic::Ask {
-                    present(&parent, config.clone(), last.clone(), button.clone());
+                    present(&parent, config.clone(), last.clone(), button.clone(), installing.clone());
                 }
             });
         });
@@ -336,8 +355,9 @@ pub fn header_button(
         let parent = parent.clone();
         let config = config.clone();
         let button_for_click = button.clone();
+        let installing = installing.clone();
         button.connect_clicked(move |_| {
-            present(&parent, config.clone(), last.clone(), button_for_click.clone());
+            present(&parent, config.clone(), last.clone(), button_for_click.clone(), installing.clone());
         });
     }
 
@@ -488,14 +508,37 @@ fn short_reason(why: &str) -> String {
     }
 }
 
-fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
-    // `apk` is taken here rather than read on the worker so that nothing off the
-    // main thread touches config the main thread owns.
-    let _ = apk;
+/// The version to show as "installed", given which build is actually in
+/// effect.
+///
+/// **Only trustworthy for the build Cordial itself manages.**
+/// `cache::recorded_version` is the version stamped after an install this
+/// crate performed -- see `cordial_update::cache` -- and it is paired with the
+/// managed engine cache, not with whatever `effective_apk` resolves to right
+/// now. A user who chose their own APK, or is running Sober's directly, has an
+/// effective build this cache says nothing about; reading its stamp as
+/// "installed" used to compare one build's badge against a different build's
+/// version. `origin` is `None` on a fresh install with nothing found yet,
+/// which reads the same way here: not known, rather than guessed from
+/// whatever was last fetched.
+///
+/// Shared between [`check`]'s worker and `present`'s provisional paint before
+/// the first check has landed, so the two cannot answer this differently.
+fn installed_version(origin: Option<install::Origin>) -> Option<String> {
+    match origin {
+        Some(install::Origin::Managed) => cache::recorded_version(&install::engine_cache()),
+        _ => None,
+    }
+}
+
+fn check(origin: Option<install::Origin>, then: impl Fn(Checked) + 'static) {
+    // `origin` is resolved here, on the main thread, rather than on the
+    // worker: `effective_apk` reads config the main thread owns, and nothing
+    // off it should touch that.
     on_worker(
-        || {
+        move || {
             let metered = metered::current();
-            let installed = cache::recorded_version(&install::engine_cache());
+            let installed = installed_version(origin);
             let release = changelog::latest().and_then(|r| changelog::notes(&r).map(|n| (r, n)));
             // Two independent requests on the same worker: the DevForum gives
             // the announcement, the Creator Hub gives the table -- found by
@@ -689,6 +732,7 @@ pub fn present(
     config: Rc<RefCell<ShellConfig>>,
     last: Rc<RefCell<Option<Checked>>>,
     button: gtk::Button,
+    installing: Rc<std::cell::Cell<bool>>,
 ) {
     if raise_if_open() {
         return;
@@ -874,6 +918,7 @@ pub fn present(
         let action = action.clone();
         let button = button.clone();
         let banner_for_paint = banner.clone();
+        let config_for_paint = config.clone();
         Rc::new(move |checked: &Option<Checked>| {
             // **Which build is here, not a verdict on it.** This line used to
             // carry the outcome — "Up to date", or the longer "Whether this
@@ -890,7 +935,14 @@ pub fn present(
             let (_, subtitle) = status_lines(checked, automatic);
             let installed = match checked {
                 Some(checked) => version_line(checked.installed.clone()),
-                None => version_line(cache::recorded_version(&install::engine_cache())),
+                // Before the first check has landed: the same gate `check`'s
+                // worker applies, so this provisional line and the one that
+                // replaces it once the check answers cannot disagree.
+                None => {
+                    let origin = install::effective_apk(&config_for_paint.borrow().roblox)
+                        .map(|(_, origin)| origin);
+                    version_line(installed_version(origin))
+                }
             };
             status_line.set_label(&installed);
             action.set_tooltip_text(Some(&format!("{subtitle}\n\n{INSTALLED_DESCRIPTION}")));
@@ -952,11 +1004,11 @@ pub fn present(
             // Roblox <version>", which is the right receipt for that download
             // and the wrong thing to leave sitting under the next check.
             meter.widget().set_visible(false);
-            let apk = install::effective_apk(&config.borrow().roblox).map(|(p, _)| p);
+            let origin = install::effective_apk(&config.borrow().roblox).map(|(_, origin)| origin);
             let last = last.clone();
             let paint = paint.clone();
             let status_line = status_line.clone();
-            check(apk, move |checked| {
+            check(origin, move |checked| {
                 *last.borrow_mut() = Some(checked);
                 paint(&last.borrow());
                 // **After `paint`, because `paint` owns this label** and sets
@@ -1014,6 +1066,8 @@ pub fn present(
         let status_line = status_line.clone();
         let action_for_click = action.clone();
         let meter = meter.clone();
+        let config_for_click = config.clone();
+        let installing_for_click = installing.clone();
         action.connect_clicked(move |_| {
             if !last_for_click.borrow().as_ref().is_some_and(Checked::update_available) {
                 run_check();
@@ -1025,7 +1079,15 @@ pub fn present(
             // would spend a few hundred megabytes on a build the launcher
             // would then decline to use -- a success that changes nothing,
             // which is worse than a failure that says so.
-            if let Some((_, origin)) = install::effective_apk(&install::RobloxInstall::default()) {
+            //
+            // **The user's actual setting, not `RobloxInstall::default()`.**
+            // The guard used to ask about a build nobody configured -- always
+            // "nothing chosen, nothing downloaded" -- so a user who had in
+            // fact picked their own APK never saw this refusal at all and
+            // only found out the download changed nothing once it finished.
+            // `header_button`'s own check, a few hundred lines up, reads the
+            // real setting the same way this now does.
+            if let Some((_, origin)) = install::effective_apk(&config_for_click.borrow().roblox) {
                 if let Some(why) = origin.why_not_updatable() {
                     status_line.set_visible(true);
                     status_line.set_label(why);
@@ -1033,6 +1095,26 @@ pub fn present(
                     return;
                 }
             }
+
+            // **Refused here too, before this races the background install.**
+            // Background mode can already be running `obtain_and_install` on
+            // its own worker thread when this window is opened -- the flock
+            // in `obtain_and_install` only stops a *second process*, so a
+            // second call from inside this one process reached it and lost,
+            // and the refusal it got back named "another Cordial", which was
+            // this same one. Checked and cleared around every call in this
+            // file, so the collision is caught here, honestly, instead of by
+            // a lock that has no way to tell the two callers apart.
+            if installing_for_click.get() {
+                status_line.set_visible(true);
+                status_line.set_label(
+                    "Cordial is already installing a build in the background. Wait for it to \
+                     finish, then try again.",
+                );
+                status_line.add_css_class("error");
+                return;
+            }
+            installing_for_click.set(true);
 
             // Disabled for the duration. A 229 MB fetch pressed twice is two
             // downloads into one staging directory, and the second one refuses
@@ -1080,6 +1162,11 @@ pub fn present(
             let line = status_line.clone();
             let stepping = meter.clone();
             let finishing = meter.clone();
+            // Cloned again here, not moved: `action.connect_clicked` takes an
+            // `Fn`, so this whole handler can run more than once, and the
+            // outer closure's own capture has to survive each call rather
+            // than being consumed by the first one.
+            let installing_for_click = installing_for_click.clone();
             // The header-bar button and the knowledge behind it, so a finished
             // download can put both right. `present` is handed them precisely
             // so this window can; before this they were only ever read.
@@ -1105,6 +1192,10 @@ pub fn present(
                 }},
                 move |step| stepping.step(&step),
                 move |outcome| {
+                    // Whatever happened, this attempt is over and the next
+                    // press -- from this window or a future background check
+                    // -- must not find the flag still set.
+                    installing_for_click.set(false);
                     // **Whatever happened, the button stops being Cancel.**
                     // Leaving the handler attached wired the finished button to
                     // `stop()`; leaving it insensitive after a cancel blocked
@@ -1255,8 +1346,8 @@ pub fn build_update_page(
         .name("updates")
         .icon_name("system-software-install-symbolic")
         .build();
-    page.add(&build_update_group(config, config_path));
-    page.add(&build_source_group());
+    page.add(&build_update_group(config.clone(), config_path));
+    page.add(&build_source_group(config));
     page
 }
 
@@ -1266,7 +1357,7 @@ pub fn build_update_page(
 /// belong: neither answers "which build am I on". They explain the two switches
 /// directly above them — an update that does not download because the desktop
 /// guesses metered is the confusion this row exists to pre-empt.
-fn build_source_group() -> adw::PreferencesGroup {
+fn build_source_group(config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesGroup {
     let group =
         // **This is the one place in the UI that names the mirror**, and it is
         // the right one: a settings page is where somebody goes to find out
@@ -1283,7 +1374,13 @@ fn build_source_group() -> adw::PreferencesGroup {
     // than only when they press a button and are refused. A page of switches
     // that cannot take effect has to say so; that requirement is older than
     // this feature and it now has a second reason to exist.
-    if let Some((_, origin)) = install::effective_apk(&install::RobloxInstall::default()) {
+    //
+    // **The user's actual setting.** This used to ask about
+    // `RobloxInstall::default()` -- nothing chosen, nothing downloaded -- so
+    // the row computed from a build nobody was running rather than the one
+    // this page is meant to describe, and someone who really had chosen their
+    // own APK never saw the row telling them why updates were off for it.
+    if let Some((_, origin)) = install::effective_apk(&config.borrow().roblox) {
         if let Some(why) = origin.why_not_updatable() {
             let row = adw::ActionRow::builder().title("Updates are off for this build").subtitle(why).build();
             row.set_subtitle_lines(4);
@@ -1545,9 +1642,19 @@ fn check_outcome(checked: &Checked) -> (String, bool) {
 fn version_line(recorded: Option<String>) -> String {
     match recorded {
         Some(version) => format!("Roblox {version}, recorded when Cordial fetched this build."),
-        None => "Not known. Cordial only records a version for a build it fetched itself, and it \
-                 has fetched none — an APK you obtained elsewhere carries no version this can \
-                 read, and it will not guess one."
+        // **Not the same claim as "Cordial has fetched none".** That used to
+        // be the only reason this branch fired, and it stopped being true
+        // once `Checked::installed` started asking which build is actually
+        // in effect: Cordial may well have fetched a version before, and this
+        // is still the honest line if the build about to launch is not that
+        // one — a chosen APK, or Sober's own, neither of which this reads a
+        // version out of. Naming a specific cause it cannot verify would be
+        // the same kind of guess the second half of this sentence already
+        // refuses to make.
+        None => "Not known. Cordial only recognises a version for a build it both fetched itself \
+                 and is currently the one in use — an APK you obtained elsewhere, or a fetched \
+                 build that is no longer the effective one, carries no version this reads, and it \
+                 will not guess one."
             .to_string(),
     }
 }
@@ -2052,6 +2159,41 @@ mod tests {
         assert!(line.contains("Not known"), "{line}");
         assert!(line.contains("will not guess"), "{line}");
         assert!(version_line(Some("0.732.23.7321040".into())).contains("0.732.23.7321040"));
+    }
+
+    /// **Finding 6.** `None` used to be explained as "Cordial has fetched
+    /// none", which stopped being the only way to reach it once
+    /// `installed_version` started asking which build is actually in effect:
+    /// a build fetched earlier but superseded by a chosen APK reaches `None`
+    /// too, and still fetched one. The line must not assert the cause it
+    /// cannot verify.
+    #[test]
+    fn the_unknown_version_line_does_not_claim_nothing_was_ever_fetched() {
+        let line = version_line(None);
+        assert!(
+            !line.contains("has fetched none"),
+            "the line names a specific, unverifiable cause: {line}"
+        );
+    }
+
+    /// **Finding 5, as a function.** `installed_version` is what
+    /// `Checked::installed` and the pre-check paint both call, and only
+    /// `Origin::Managed` may answer from the cache Cordial itself stamps.
+    /// Every other origin -- and no build found at all -- must read as "not
+    /// known" regardless of what a previous, unrelated install left in that
+    /// cache.
+    #[test]
+    fn installed_version_is_none_for_every_origin_except_managed() {
+        assert_eq!(installed_version(None), None);
+        assert_eq!(installed_version(Some(install::Origin::Chosen)), None);
+        assert_eq!(installed_version(Some(install::Origin::Sober)), None);
+        assert_eq!(installed_version(Some(install::Origin::Environment)), None);
+        // The one origin that may answer delegates to the same place
+        // `Checked::reread_installed` reads, whatever that currently holds.
+        assert_eq!(
+            installed_version(Some(install::Origin::Managed)),
+            cache::recorded_version(&install::engine_cache())
+        );
     }
 
     #[test]

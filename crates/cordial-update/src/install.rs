@@ -215,6 +215,14 @@ pub enum Failed {
     /// writes only what it installed, so an unmarked directory stops the
     /// install rather than overwriting it.
     NotOurs { path: String },
+    /// The caller asked to stop, and was still owed an answer for it.
+    ///
+    /// Only reachable before the swap begins -- see the `Cancel` checks in
+    /// [`adopt`]. Once a live file has started being replaced, stopping is no
+    /// longer offered: the alternative to finishing a rename is a build left
+    /// half swapped in, which is worse than a cancel button that occasionally
+    /// finishes what it was asked to stop.
+    Cancelled,
 }
 
 impl fmt::Display for Failed {
@@ -235,6 +243,7 @@ impl fmt::Display for Failed {
                  use it and leave it alone, or delete the directory to let Cordial manage one."
             ),
             Failed::Io { path, why } => write!(f, "{path}: {why}"),
+            Failed::Cancelled => write!(f, "the install was stopped before anything was replaced"),
         }
     }
 }
@@ -261,8 +270,12 @@ impl From<apk::Refusal> for Failed {
 pub type Progress<'a> = &'a mut dyn FnMut(&str, u64, Option<u64>);
 
 /// Fetch a build into the directory Cordial owns and make it the one in use.
-pub fn install(parts: &Parts, progress: Progress<'_>) -> Result<Installed, Failed> {
-    install_into(parts, &build_dir(), &engine_dir(), progress)
+pub fn install(
+    parts: &Parts,
+    cancel: &crate::provider::Cancel,
+    progress: Progress<'_>,
+) -> Result<Installed, Failed> {
+    install_into(parts, &build_dir(), &engine_dir(), cancel, progress)
 }
 
 /// The whole sequence, with both directories named so it can be tested without
@@ -277,11 +290,12 @@ pub fn install_into(
     parts: &Parts,
     build: &Path,
     engine_into: &Path,
+    cancel: &crate::provider::Cancel,
     progress: Progress<'_>,
 ) -> Result<Installed, Failed> {
     let staging = build.join(STAGING);
     let incoming = engine_into.join(STAGING);
-    let result = staged(parts, build, engine_into, &staging, &incoming, progress);
+    let result = staged(parts, build, engine_into, &staging, &incoming, cancel, progress);
     let _ = std::fs::remove_dir_all(&staging);
     let _ = std::fs::remove_dir_all(&incoming);
     result
@@ -293,6 +307,7 @@ fn staged(
     engine_into: &Path,
     staging: &Path,
     incoming: &Path,
+    cancel: &crate::provider::Cancel,
     progress: Progress<'_>,
 ) -> Result<Installed, Failed> {
     // Anything left by an interrupted attempt is not something to resume. It was
@@ -311,7 +326,7 @@ fn staged(
         fetched.push((name, path));
     }
 
-    adopt(&fetched, build, engine_into, incoming, progress)
+    adopt(&fetched, build, engine_into, incoming, cancel, progress)
 }
 
 /// Take archives that are already on disk and make them the build in use.
@@ -321,12 +336,20 @@ fn staged(
 /// [`Parts`] and a URL. Everything after "the bytes are here" is identical and
 /// having two copies of it would be how the two paths drift.
 ///
-/// **A file that is not already in the staging area is copied, not moved.** The
-/// local provider hands back the archive at the path it already occupies, which
-/// on most machines is Sober's own package directory -- renaming it into
+/// **A file that is not already in the staging area is copied, not moved, and
+/// the copy lands by way of a temporary file and a rename.** The local
+/// provider hands back the archive at the path it already occupies, which on
+/// most machines is Sober's own package directory -- renaming it into
 /// Cordial's cache would take Roblox out from underneath Sober and break a
-/// working program to install this one. Inside staging a rename is correct and
-/// is what happens, because those files were fetched for this.
+/// working program to install this one. Streaming the copy straight onto the
+/// live path was tried first and was wrong: `fs::copy` opens its destination
+/// with truncation before a byte moves, and `live` is often the *previous*
+/// build, so a process killed mid-copy left an archive exactly as long as the
+/// copy had reached, and no further. Landing it beside `live` and renaming it
+/// in gives this path the same guarantee staging's own rename gets for free --
+/// `live` is either the old archive or the new one, in full, never a partial
+/// third thing. Inside staging a rename is correct and needs no such detour,
+/// because those files were fetched for this.
 /// Written beside a build Cordial installed, so it can tell its own work from
 /// somebody else's.
 ///
@@ -352,6 +375,7 @@ pub fn adopt(
     build: &Path,
     engine_into: &Path,
     incoming: &Path,
+    cancel: &crate::provider::Cancel,
     progress: Progress<'_>,
 ) -> Result<Installed, Failed> {
     let _ = progress;
@@ -361,6 +385,19 @@ pub fn adopt(
     // point of the refusal is that the user's file is still there.
     if !ours_to_write(build) {
         return Err(Failed::NotOurs { path: build.display().to_string() });
+    }
+
+    // **Checked here and once more below, and nowhere else.** The slow,
+    // network-bound part of an install -- fetching and verifying a signature --
+    // already happened in `provider::obtain` before this was ever called, and
+    // its own loop checks `cancel` between chunks. What is left here is
+    // inspecting and extracting archives already on disk, which on a large
+    // local build is still real seconds of hashing and unzipping and is worth
+    // being able to stop. Past the second check, below, everything replaces a
+    // live file, and a cancel honoured mid-replacement would trade a clean stop
+    // for a build half swapped in -- worse than letting a few renames finish.
+    if cancel.stopped() {
+        return Err(Failed::Cancelled);
     }
 
     // Every refusal in ADR-014's list, against each archive, before anything is
@@ -392,6 +429,12 @@ pub fn adopt(
     let staged_engine = apk::extract(&carrier, apk::LIBRARY_IN_APK, incoming)?;
     let version = engine::version_of(&staged_engine);
 
+    // The last point a cancel is honoured -- see the comment on the first
+    // check, above. Everything from here replaces the previous build.
+    if cancel.stopped() {
+        return Err(Failed::Cancelled);
+    }
+
     // From here the previous build is being replaced. The stamp goes first: a
     // process killed between the renames below leaves a cache that re-extracts,
     // rather than the old engine claiming to belong to the new archives.
@@ -419,8 +462,19 @@ pub fn adopt(
             std::fs::rename(path, &live)
                 .map_err(|e| Failed::Io { path: live.display().to_string(), why: e.to_string() })?;
         } else {
-            std::fs::copy(path, &live)
-                .map_err(|e| Failed::Io { path: live.display().to_string(), why: e.to_string() })?;
+            // See the doc comment on `OURS` for why this is a copy into a
+            // temporary file and a rename, rather than `fs::copy(path, &live)`
+            // directly: `live` is frequently the previous build, and streaming
+            // onto it truncates that build before the new one has fully landed.
+            let tmp = build.join(format!(".{name}.incoming"));
+            if let Err(e) = std::fs::copy(path, &tmp) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Failed::Io { path: tmp.display().to_string(), why: e.to_string() });
+            }
+            if let Err(e) = std::fs::rename(&tmp, &live) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Failed::Io { path: live.display().to_string(), why: e.to_string() });
+            }
         }
         if *name == BASE_APK {
             base = live.clone();
@@ -482,6 +536,7 @@ mod tests {
             &build,
             &root.join("engine"),
             &root.join("engine").join(STAGING),
+            &crate::provider::Cancel::new(),
             &mut |_, _, _| {},
         )
         .expect_err("a directory Cordial did not fill must not be written into");
@@ -537,6 +592,7 @@ mod tests {
             &build,
             &engine_into,
             &engine_into.join(STAGING),
+            &crate::provider::Cancel::new(),
             &mut |_, _, _| {},
         )
         .expect("a universal APK carrying the engine installs");
@@ -601,6 +657,11 @@ mod tests {
         |_, _, _| {}
     }
 
+    /// A `Cancel` nobody has stopped, for tests that are not about stopping.
+    fn no_cancel() -> crate::provider::Cancel {
+        crate::provider::Cancel::new()
+    }
+
     /// The engine literal this crate's own scanner looks for, in a file this
     /// test wrote. Nothing here comes from Roblox.
     fn engine_bytes(version: &str) -> Vec<u8> {
@@ -623,7 +684,7 @@ mod tests {
             Parts { base: source_for(&base), split: Some(source_for(&split)) };
 
         let installed =
-            install_into(&parts, &build, &engine_into, &mut silent()).expect("install");
+            install_into(&parts, &build, &engine_into, &no_cancel(), &mut silent()).expect("install");
 
         assert_eq!(installed.base, build.join(BASE_APK));
         assert_eq!(installed.carrier, build.join(SPLIT_APK));
@@ -648,7 +709,7 @@ mod tests {
         let dir = scratch("halfway");
         let base = zip_of(&[("assets/content/fonts/x.json", b"{}")]);
         let parts = Parts { base: source_for(&base), split: None };
-        let e = install_into(&parts, &dir.join("build"), &dir.join("lib"), &mut silent())
+        let e = install_into(&parts, &dir.join("build"), &dir.join("lib"), &no_cancel(), &mut silent())
             .unwrap_err();
         assert!(matches!(e, Failed::NoEngine { .. }), "{e}");
         let shown = e.to_string();
@@ -667,7 +728,8 @@ mod tests {
         ]);
         let parts = Parts { base: source_for(&one), split: None };
         let installed =
-            install_into(&parts, &dir.join("build"), &dir.join("lib"), &mut silent()).unwrap();
+            install_into(&parts, &dir.join("build"), &dir.join("lib"), &no_cancel(), &mut silent())
+                .unwrap();
         assert_eq!(installed.carrier, installed.base);
     }
 
@@ -685,6 +747,7 @@ mod tests {
             &Parts { base: source_for(&base), split: Some(source_for(&split)) },
             &build,
             &engine_into,
+            &no_cancel(),
             &mut silent(),
         )
         .unwrap();
@@ -697,6 +760,7 @@ mod tests {
             &Parts { base: source_for(&base), split: Some(lying) },
             &build,
             &engine_into,
+            &no_cancel(),
             &mut silent(),
         )
         .unwrap_err();
@@ -718,6 +782,7 @@ mod tests {
             &Parts { base: source_for(&hostile), split: None },
             &build,
             &engine_into,
+            &no_cancel(),
             &mut silent(),
         )
         .unwrap_err();
@@ -738,6 +803,7 @@ mod tests {
             &Parts { base: source_for(&base), split: Some(source_for(&split)) },
             &build,
             &dir.join("lib"),
+            &no_cancel(),
             &mut silent(),
         )
         .unwrap();
@@ -764,6 +830,7 @@ mod tests {
             &Parts { base: source_for(&base), split: Some(source_for(&split)) },
             &dir.join("build"),
             &dir.join("lib"),
+            &no_cancel(),
             &mut |name, _, _| {
                 if seen.last().map(String::as_str) != Some(name) {
                     seen.push(name.to_string());
@@ -817,5 +884,95 @@ mod tests {
         assert!(engine_dir().starts_with(cache_root()));
         assert!(ours(&build_dir()));
         assert!(!ours(Path::new("/home/someone/.var/app/org.vinegarhq.Sober")));
+    }
+
+    /// **A cancel asked for before any work starts must be honoured.** This is
+    /// the state a press of Stop leaves things in the moment verification has
+    /// just finished and `adopt` has not yet been called: nothing has been
+    /// touched, so there is nothing to finish.
+    #[test]
+    fn a_cancel_already_asked_for_is_honoured_before_anything_is_touched() {
+        let root = scratch("adopt-cancelled");
+        let build = root.join("build");
+        let engine_into = root.join("engine");
+        let elsewhere = root.join("someone-elses");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let external = elsewhere.join("base.apk");
+        std::fs::write(&external, zip_of(&[(apk::LIBRARY_IN_APK, b"\x7fELF engine")])).unwrap();
+
+        let cancel = crate::provider::Cancel::new();
+        cancel.stop();
+        let err = adopt(
+            &[(BASE_APK, external.clone())],
+            &build,
+            &engine_into,
+            &engine_into.join(STAGING),
+            &cancel,
+            &mut |_, _, _| {},
+        )
+        .expect_err("a cancel asked for up front must be honoured, not raced past");
+        assert!(matches!(err, Failed::Cancelled), "{err:?}");
+        assert!(!build.exists(), "nothing was created for a cancel this early");
+        assert!(external.is_file(), "the source is untouched");
+    }
+
+    /// **The path finding 1 is about, run to completion.** An update landing
+    /// from outside `build` -- the local provider's shape, Sober's package
+    /// directory in practice -- over a build already installed there. The
+    /// control for the interrupted case: this is what a *successful* run
+    /// through the copy-then-rename path leaves behind.
+    #[test]
+    fn updating_from_elsewhere_over_an_existing_install_lands_the_new_content() {
+        let root = scratch("adopt-update-elsewhere");
+        let build = root.join("build");
+        let engine_into = root.join("engine");
+
+        // An existing install, landed the ordinary way -- staged, then
+        // renamed -- exactly as a previous run of this module would leave one.
+        let staging = root.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let old_src = staging.join("base.apk");
+        std::fs::write(&old_src, zip_of(&[(apk::LIBRARY_IN_APK, b"\x7fELF old engine 1.0.0")]))
+            .unwrap();
+        adopt(
+            &[(BASE_APK, old_src)],
+            &build,
+            &engine_into,
+            &engine_into.join(STAGING),
+            &no_cancel(),
+            &mut |_, _, _| {},
+        )
+        .expect("the first install lands");
+        let old_bytes = std::fs::read(build.join(BASE_APK)).unwrap();
+
+        // Now update it from a path outside `build`, which is the copy-then-
+        // rename branch finding 1 fixed rather than the plain rename above.
+        let elsewhere = root.join("someone-elses");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let new_src = elsewhere.join("base.apk");
+        let new_bytes = zip_of(&[(apk::LIBRARY_IN_APK, b"\x7fELF new engine 2.0.0")]);
+        std::fs::write(&new_src, &new_bytes).unwrap();
+
+        let installed = adopt(
+            &[(BASE_APK, new_src.clone())],
+            &build,
+            &engine_into,
+            &engine_into.join(STAGING),
+            &no_cancel(),
+            &mut |_, _, _| {},
+        )
+        .expect("updating over an existing install from outside `build` must still work");
+
+        assert_eq!(std::fs::read(&installed.base).unwrap(), new_bytes);
+        assert_ne!(std::fs::read(&installed.base).unwrap(), old_bytes, "the old content is gone");
+        assert!(new_src.is_file(), "the source is copied, not moved");
+        // No leftover temporary file beside the two archives on the happy path.
+        let stray: Vec<String> = std::fs::read_dir(&build)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".incoming"))
+            .collect();
+        assert!(stray.is_empty(), "leftover temporary file(s): {stray:?}");
     }
 }

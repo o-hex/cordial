@@ -12,13 +12,30 @@
 //! to be the official client, and a request with no user agent at all is a
 //! smaller lie than a copied one but is still not an answer. There is nothing
 //! to gain by hiding: the file is public and the endpoints are public.
+//!
+//! **Redirects are walked and re-checked, the same as a mirror's.** This used
+//! to hand `url` straight to a plain `ureq::Agent` with `https_only` unset and
+//! ureq's own default of ten redirects left in place -- no per-hop host check
+//! at all, on every request this file makes, unlike [`crate::url_policy`],
+//! which this same crate built precisely so a redirect could not walk a
+//! request off the host it was sent to. Every URL here is a compile-time
+//! constant naming `clientsettingscdn.roblox.com`, `devforum.roblox.com` or
+//! `create.roblox.com`, so the request itself was never the risk; a redirect
+//! is, and the fix is the same one `mirror` already needed: follow it by hand
+//! and require every hop to stay on the host the request started on.
 
+use crate::url_policy;
 use crate::Unreachable;
 use std::time::Duration;
 
 /// Identifies this as Cordial, truthfully. ADR-015: never pretends to be the
 /// official client.
 pub const USER_AGENT: &str = concat!("Cordial/", env!("CARGO_PKG_VERSION"), " (Linux)");
+
+/// How long to wait for the connection itself. `url_policy::agent`'s other
+/// knob; `mirror` measured the same number and there is no reason for a
+/// metadata request here to wait longer to find out nobody is answering.
+const CONNECT: Duration = Duration::from_secs(10);
 
 /// Long enough for a CDN having a slow morning, short enough that the
 /// background check after launch does not hold a thread for a minute. Nothing
@@ -33,25 +50,21 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// [`crate::download`], which streams.
 const MAX_BODY: u64 = 8 * 1024 * 1024;
 
-fn agent() -> ureq::Agent {
-    let config = ureq::config::Config::builder()
-        .http_status_as_error(false)
-        .user_agent(USER_AGENT)
-        .timeout_global(Some(TIMEOUT))
-        .build();
-    ureq::Agent::new_with_config(config)
-}
-
 /// GET `url` and return its body, or why there is no body.
 ///
 /// A non-2xx answer comes back as [`Unreachable::Status`] carrying the body
 /// rather than as a bare code, because that body is the difference between "the
 /// endpoint moved" and "Roblox is having a bad day".
+///
+/// Every hop of a redirect has to stay on `url`'s own host: nothing calling
+/// this hands it anything but a Roblox endpoint, and a redirect leaving that
+/// host is exactly the thing [`url_policy::walk`] exists to refuse rather than
+/// follow.
 pub fn get_text(url: &str) -> Result<String, Unreachable> {
-    let mut response = agent()
-        .get(url)
-        .call()
-        .map_err(|e| Unreachable::Transport { url: url.to_string(), why: e.to_string() })?;
+    let host = url_policy::host_of(url)?;
+    let agent = url_policy::agent(CONNECT, TIMEOUT);
+    let (final_url, mut response) =
+        url_policy::walk(&agent, url, &url_policy::Allowed::exactly(host), &[])?;
 
     let status = response.status().as_u16();
     let body = response
@@ -59,10 +72,10 @@ pub fn get_text(url: &str) -> Result<String, Unreachable> {
         .with_config()
         .limit(MAX_BODY)
         .read_to_string()
-        .map_err(|e| Unreachable::Transport { url: url.to_string(), why: e.to_string() })?;
+        .map_err(|e| Unreachable::Transport { url: final_url.clone(), why: e.to_string() })?;
 
     if !(200..300).contains(&status) {
-        return Err(Unreachable::Status { url: url.to_string(), status, body });
+        return Err(Unreachable::Status { url: final_url, status, body });
     }
     Ok(body)
 }

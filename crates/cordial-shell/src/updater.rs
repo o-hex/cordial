@@ -150,6 +150,15 @@ pub struct Checked {
     /// docs page did not answer, and the window falls back to the announcement
     /// post rather than showing nothing.
     entries: Option<Vec<Entry>>,
+    /// Why [`Self::entries`] is `None`, when it is `None` because the request
+    /// failed rather than because there was no release to ask about.
+    ///
+    /// **Kept rather than printed.** This was a `println!` and nothing else, so
+    /// a user pressing Check saw a button flicker and a terminal they were not
+    /// reading say `the release-notes table did not answer: … HTTP 404`. It was
+    /// reported exactly that way. A failure the interface knows about and does
+    /// not mention is the same shape as a stub reporting success.
+    entries_why: Option<String>,
 }
 
 impl Checked {
@@ -450,6 +459,7 @@ fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
             // gives the number, the Creator Hub gives the list. A failure here
             // is recorded as `None` and nothing else changes, because the
             // version comparison does not depend on it.
+            let mut entries_why = None;
             let entries = release
                 .as_ref()
                 .ok()
@@ -457,6 +467,15 @@ fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
                     Ok(entries) => Some(entries),
                     Err(why) => {
                         println!("[update] the release-notes table did not answer: {why}");
+                        // Truncated, because this carries the 404 body -- a
+                        // whole HTML document -- and the window has one line.
+                        // The full text is still on stdout above.
+                        let short = why.to_string();
+                        let short = short.split(':').next().unwrap_or(&short).trim().to_string();
+                        entries_why = Some(format!(
+                            "the release notes for engine {} are not published yet ({short})",
+                            r.major
+                        ));
                         None
                     }
                 });
@@ -465,7 +484,7 @@ fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
             // two this already makes, and `metered` governs the download rather
             // than the check, which this file has always said.
             let obtainable = cordial_update::provider::newest_obtainable();
-            Checked { metered, installed, obtainable, release, entries }
+            Checked { metered, installed, obtainable, release, entries, entries_why }
         },
         then,
     )
@@ -562,19 +581,6 @@ pub fn update_settings(config: &ShellConfig) -> UpdateSettings {
     UpdateSettings { automatic: config.automatic_updates, download_on: config.download_on }
 }
 
-/// The window behind the button: which build is here, what Roblox has published,
-/// and one control.
-///
-/// One window for all three states, with the top group saying which. Three
-/// windows would be three places for the same sentence about where a build comes
-/// from, and they would drift.
-///
-/// **Three groups and no fourth.** This had the APK picker, the extracted-engine
-/// cache row, the download source, the connection NetworkManager reported and
-/// the update settings on it as well, which made a header-bar button open a
-/// second settings window. The settings are a tab in the real one now, the
-/// picker is on the Roblox page, and what is left is the question the button can
-/// answer: which build am I on, and is there a newer engine.
 thread_local! {
     /// The update window, if one is open.
     ///
@@ -594,6 +600,19 @@ thread_local! {
     static OPEN: RefCell<Option<glib::WeakRef<adw::Window>>> = const { RefCell::new(None) };
 }
 
+/// The window behind the button: which build is here, what Roblox has published,
+/// and one control.
+///
+/// One window for all three states, with the top group saying which. Three
+/// windows would be three places for the same sentence about where a build comes
+/// from, and they would drift.
+///
+/// **Three groups and no fourth.** This had the APK picker, the extracted-engine
+/// cache row, the download source, the connection NetworkManager reported and
+/// the update settings on it as well, which made a header-bar button open a
+/// second settings window. The settings are a tab in the real one now, the
+/// picker is on the Roblox page, and what is left is the question the button can
+/// answer: which build am I on, and is there a newer engine.
 /// Raise the update window if it is already open.
 ///
 /// Returns whether it did. Presenting an already-present `adw::Window` brings it
@@ -866,18 +885,53 @@ pub fn present(
         let paint = paint.clone();
         let config = config.clone();
         let action = action.clone();
+        let status_line = status_line.clone();
+        let meter = meter.clone();
         Rc::new(move || {
             // The progress goes on the control that started it, rather than on
             // a line above it that then has to be put back. One thing changes,
             // and it is the thing you just pressed.
             action.set_sensitive(false);
             action.set_label(CHECKING);
+            // A finished download leaves the bar full and reading "Installed
+            // Roblox <version>", which is the right receipt for that download
+            // and the wrong thing to leave sitting under the next check.
+            meter.widget().set_visible(false);
             let apk = install::effective_apk(&config.borrow().roblox).map(|(p, _)| p);
             let last = last.clone();
             let paint = paint.clone();
+            let status_line = status_line.clone();
             check(apk, move |checked| {
                 *last.borrow_mut() = Some(checked);
                 paint(&last.borrow());
+                // **After `paint`, because `paint` owns this label** and sets
+                // it to the installed-build line. The outcome of the press goes
+                // under it rather than replacing it: which build you have and
+                // what the check found are both wanted, and neither answers the
+                // other.
+                let Some(checked) = last.borrow().as_ref().cloned() else { return };
+                let (outcome, is_error) = check_outcome(&checked);
+                let mut text = version_line(checked.installed.clone());
+                if !outcome.is_empty() {
+                    text.push('\n');
+                    text.push_str(&outcome);
+                }
+                // A degraded check is not a failed one and must not be styled
+                // as either silence or a failure. The version number arrived;
+                // it is the Creator Hub's per-entry table that did not, and
+                // saying which is the difference between "Cordial is broken"
+                // and "Roblox has not published that page yet".
+                if let Some(why) = &checked.entries_why {
+                    text.push('\n');
+                    text.push_str(&format!("Changelog unavailable: {why}."));
+                }
+                status_line.set_label(&text);
+                status_line.set_visible(true);
+                if is_error {
+                    status_line.add_css_class("error");
+                } else {
+                    status_line.remove_css_class("error");
+                }
             });
         })
     };
@@ -1377,6 +1431,56 @@ fn status_lines(checked: &Option<Checked>, automatic: Automatic) -> (String, Str
 /// nothing. An APK somebody obtained themselves carries no version Cordial can
 /// read without parsing Android's binary manifest, and a guessed number in front
 /// of a user is a number nothing established.
+/// What a press of Check found, in one line, for the footer.
+///
+/// **A button that changes nothing when pressed has not been pressed.** This
+/// window computed the outcome already -- `status_lines` returns it as a title
+/// -- and then put the title nowhere and the reasoning in a tooltip, so a
+/// manual check showed a label flicker and no result. Reported as "check for
+/// updates is stupid, if you check for updates, it doesn't say No updates
+/// available if there are no new updates", and that is a fair description of
+/// pressing a button into silence.
+///
+/// **It still does not say "up to date"**, and the reason is unchanged and
+/// good: Cordial knows the installed version only for a build it fetched
+/// itself, so for an APK obtained elsewhere there is no second operand and a
+/// verdict would be a guess. What it can always say is what it did and what it
+/// found, which is a fact rather than a verdict.
+///
+/// The bool is whether to style it as an error.
+fn check_outcome(checked: &Checked) -> (String, bool) {
+    // An available update already shows itself: the button becomes Download and
+    // the banner appears. A line repeating it would be a third thing saying one
+    // thing.
+    if checked.update_available() {
+        return (String::new(), false);
+    }
+
+    match (&checked.installed, checked.latest_major()) {
+        (_, None) => {
+            let why = match &checked.release {
+                Err(why) => why.to_string(),
+                Ok(_) => "the release notes carried no engine number.".to_string(),
+            };
+            (format!("Could not check: {why}"), true)
+        }
+        (Some(here), Some(latest)) => (
+            format!("Checked just now: nothing newer. This build is engine {here}, and Roblox's \
+                     newest is {latest}."),
+            false,
+        ),
+        // The ordinary state, and the one that must not be rounded to "up to
+        // date". It still reports that the check happened and what it learned,
+        // which is the half that was missing.
+        (None, Some(latest)) => (
+            format!("Checked just now: Roblox's newest release notes are for engine {latest}. \
+                     Which engine this APK is cannot be read, so whether it is current is not \
+                     something Cordial can say."),
+            false,
+        ),
+    }
+}
+
 fn version_line(recorded: Option<String>) -> String {
     match recorded {
         Some(version) => format!("Roblox {version}, recorded when Cordial fetched this build."),
@@ -1546,7 +1650,45 @@ mod tests {
             // fallback to the announcement post is the state that must keep
             // working when the Creator Hub is unreachable.
             entries: None,
+            // `None` rather than a reason, so these fixtures describe "nobody
+            // asked" and not "the request failed" -- the second is its own
+            // state and gets its own test below.
+            entries_why: None,
         }
+    }
+
+    /// A press of Check must leave a sentence behind in every state.
+    ///
+    /// The bug: `status_lines`'s title -- the outcome -- was computed and then
+    /// put nowhere, with its reasoning in a tooltip. So a manual check showed
+    /// the button flicker to "Checking…" and back, and nothing else, whatever
+    /// it found. Somebody pressing it twice cannot tell it ran.
+    #[test]
+    fn every_check_outcome_says_something() {
+        // Nothing newer, and the version is known because Cordial fetched it.
+        let (line, err) = check_outcome(&checked(Some("2.736.100"), Some(736)));
+        assert!(line.contains("nothing newer"), "{line}");
+        assert!(line.contains("736"), "{line}");
+        assert!(!err);
+
+        // The ordinary state: no installed version to compare. It must report
+        // that the check happened and what it learned, and must NOT claim the
+        // build is current -- that is the guess this whole module refuses.
+        let (line, err) = check_outcome(&checked(None, Some(736)));
+        assert!(line.contains("Checked just now"), "{line}");
+        assert!(line.contains("736"), "{line}");
+        assert!(!line.contains("up to date"), "{line}");
+        assert!(!err);
+
+        // The DevForum did not answer. This one is an error and says why.
+        let (line, err) = check_outcome(&checked(None, None));
+        assert!(line.starts_with("Could not check:"), "{line}");
+        assert!(err, "a failed check must be styled as one");
+
+        // An update waiting says nothing here, because the button and the
+        // banner both already say it.
+        let (line, _) = check_outcome(&checked(Some("2.730.1"), Some(736)));
+        assert!(line.is_empty(), "expected the button to speak for this state: {line}");
     }
 
     #[test]

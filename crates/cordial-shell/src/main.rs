@@ -91,8 +91,38 @@ fn main() -> libadwaita::glib::ExitCode {
     // WebKitGTK, a GTK too old, no display -- because that is exactly the
     // report that most needs the distribution and the package format in it.
     // Reading `argv` directly costs nothing and depends on none of that.
-    if std::env::args().skip(1).any(|a| a == "--diagnostics") {
+    let flags: Vec<String> = std::env::args().skip(1).collect();
+    if flags.iter().any(|a| a == "--diagnostics") {
         print!("{}", diagnostics::report());
+        return libadwaita::glib::ExitCode::SUCCESS;
+    }
+    // **`--help` printed nothing at all and exited 0**, which is how a flag
+    // gets shipped and never found. `GApplication` only prints its own usage
+    // for options it was told about, and this binary registers none -- it takes
+    // a deep link positionally and now one flag. Four lines beat a user
+    // discovering `--diagnostics` from a bug report template they cannot open
+    // because the shell will not start.
+    if flags.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "cordial {version}\n\
+             \n\
+             Usage: cordial [ROBLOX-LINK]\n\
+             \n\
+             With no arguments it opens the launcher. A `roblox-player:` or\n\
+             `roblox:` link joins that experience, which is what your browser\n\
+             hands over when you press Play on the website.\n\
+             \n\
+             Options:\n\
+             \x20 --diagnostics  Print which Cordial and Roblox build this is, the\n\
+             \x20                distribution, and how Cordial was installed. Paste\n\
+             \x20                it into a bug report. Settings has the same block\n\
+             \x20                behind a Copy button.\n\
+             \x20 -h, --help     This.\n\
+             \n\
+             `cordial-run` is the loader this launches and is not meant to be run\n\
+             by hand. Issues: https://github.com/luohoa97/cordial/issues",
+            version = env!("CORDIAL_BUILD_VERSION"),
+        );
         return libadwaita::glib::ExitCode::SUCCESS;
     }
 

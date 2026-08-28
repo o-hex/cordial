@@ -1,8 +1,11 @@
 # Maintainer: luohoa97 <luohoa97@users.noreply.github.com>
 #
-# Cordial ships no Roblox code and cannot download any. The engine is Roblox's
-# official Android x86-64 build, which comes from Google Play and which the
-# user supplies -- see the pkgdesc, the .install note and README section 1.
+# Cordial vendors no Roblox code. The engine is Roblox's official Android
+# x86-64 build; Cordial fetches it on first run from a third-party mirror and
+# installs it only if Roblox's own signing certificate signed it, or reads a
+# copy Sober unpacked, or one the user points it at. It has been able to fetch
+# since v0.9.0, and this comment said it could not until 2026-08-28 -- as did
+# the pkgdesc and the .install note, both now corrected. See README section 1.
 #
 # The release counterpart to packaging/aur/cordial-git/PKGBUILD, which builds
 # whatever commit is at the tip of main. This one tracks tagged releases

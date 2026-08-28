@@ -1,11 +1,14 @@
 # Cordial, for Fedora Copr.
 #
-# Cordial ships no Roblox code and cannot download any. Roblox publishes no
-# Android binary of its own -- its endpoint answers `supportsAndroidBinaries:
-# false` -- so the engine comes from Google Play, and Cordial reads either the
-# copy Sober unpacked or an APK the user points it at. That is said in the
-# summary, in %%description and again in the post-install note, because a
-# package registry is where a false promise costs most.
+# Cordial vendors no Roblox code. Roblox publishes no Android binary of its own
+# -- its endpoint answers `supportsAndroidBinaries: false` -- so the engine
+# comes from a third-party mirror, signature-checked against Roblox's own
+# certificate, or from the copy Sober unpacked, or from an APK the user points
+# it at. That is said in the summary, in %%description and again in the
+# post-install note, because a package registry is where a false promise costs
+# most -- and this file made exactly that promise in the wrong direction until
+# 2026-08-28, telling users Cordial could not fetch a build when it has since
+# v0.9.0.
 #
 # Build an SRPM with packaging/rpm/make-srpm.sh, which is what fills in the
 # %%global lines directly below from `git describe --tags`. Do not edit them by

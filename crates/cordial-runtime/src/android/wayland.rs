@@ -2902,6 +2902,40 @@ const WHEEL_AXIS_STEP: f32 = 10.0;
 /// `hide_pointer` fired for it.
 static POINTER_ON_CANVAS: AtomicBool = AtomicBool::new(false);
 
+/// Whether a web-view dialog of Cordial's own is in front of the engine.
+///
+/// **Stacking and input focus are decided separately, and only stacking was
+/// being handled.** `webview_dialog_opened` lowers the canvas below the parent
+/// surface so a dialog is visible at all -- that half works, which is why the
+/// verification window can be seen. But Cordial runs its own `wl_pointer`
+/// alongside GDK's and forwards to the engine on `POINTER_ON_CANVAS`, a flag
+/// set from `pointer_enter`/`pointer_leave`. A dialog that opens while the
+/// pointer is already over the canvas changes what is on top without the
+/// pointer having moved, so the flag stays true and every motion and click goes
+/// on reaching Roblox underneath.
+///
+/// Reported twice on 2026-08-28, the second time precisely enough to refute the
+/// first explanation: "my cursor never hovers over the webview, its stuck
+/// underneath the webview clicking on roblox stuff". A cursor that moves and
+/// clicks is not a locked pointer -- a locked pointer has no position to move
+/// -- so the pointer-lock gate added earlier that day is not this bug, and this
+/// comment exists partly to stop somebody concluding it was.
+///
+/// **The text overlay is deliberately not included.** `text_overlay_visible` is
+/// a small editor widget on one TextBox, not a modal covering the window, and
+/// treating it the same way would stop every click anywhere else in the game
+/// while somebody is typing. `sync_pointer_lock` does consult both, because
+/// giving the cursor back to type is right in a way that swallowing all input
+/// is not.
+///
+/// `INFERRED`: reasoned from this file and the pointer protocol, not observed
+/// against a live verification dialog. If clicks still land on the game
+/// underneath one, this is the first thing to doubt, and
+/// `CORDIAL_TRACE_MOUSE=1` now prints when it engages.
+fn dialog_in_front(w: &WaylandWindow) -> bool {
+    w.open_web_view_dialogs.load(Ordering::SeqCst) > 0
+}
+
 unsafe extern "C" fn pointer_enter(
     _data: *mut c_void,
     pointer: *mut c_void,
@@ -2959,6 +2993,9 @@ unsafe extern "C" fn pointer_motion(_data: *mut c_void, _pointer: *mut c_void, _
         return;
     }
     if let Some(w) = current() {
+        if dialog_in_front(&w) {
+            return;
+        }
         w.dispatch_pointer_motion(fixed_to_f32(x), fixed_to_f32(y));
     }
 }
@@ -2974,6 +3011,16 @@ unsafe extern "C" fn pointer_button(
         return;
     }
     let Some(w) = current() else { return };
+    if dialog_in_front(&w) {
+        // Said once per press rather than per motion event, which would be a
+        // line per frame while the pointer moves over the dialog.
+        if super::input::trace_mouse() {
+            eprintln!(
+                "[cordial] click withheld from the engine: a web-view dialog is in front"
+            );
+        }
+        return;
+    }
     let Some(android_button) = linux_button_to_android(button) else { return };
     w.dispatch_pointer_button(android_button, state == 1);
 }
@@ -2984,6 +3031,9 @@ unsafe extern "C" fn pointer_axis(_data: *mut c_void, _pointer: *mut c_void, _ti
         return;
     }
     if let Some(w) = current() {
+        if dialog_in_front(&w) {
+            return;
+        }
         w.dispatch_pointer_axis(axis, fixed_to_f32(value));
     }
 }
@@ -3493,8 +3543,8 @@ impl WaylandWindow {
         // experience that opens one. The check is one session: open a group
         // that asks for verification while in first person and see whether the
         // cursor reaches the dialog.
-        let cordial_is_in_front = self.open_web_view_dialogs.load(Ordering::SeqCst) > 0
-            || self.text_overlay_visible.load(Ordering::SeqCst);
+        let cordial_is_in_front =
+            dialog_in_front(self) || self.text_overlay_visible.load(Ordering::SeqCst);
         let asked = asked && !cordial_is_in_front;
 
         // The Escape latch lifts only when nothing is asking any more, so

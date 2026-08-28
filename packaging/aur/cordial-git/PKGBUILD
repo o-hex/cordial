@@ -1,6 +1,7 @@
 # Maintainer: luohoa97 <luohoa97@users.noreply.github.com>
 #
-# Cordial ships no Roblox code and cannot download any. The engine is Roblox's
+# Cordial vendors no Roblox code, and fetches the engine rather than shipping
+# it -- signature-checked, from a mirror, since v0.9.0. The engine is Roblox's
 # official Android x86-64 build, which comes from Google Play and which the
 # user supplies -- see the pkgdesc, the .install note and README section 1.
 # Every other line here follows from packaging/io.github.luohoa97.Cordial.yml,

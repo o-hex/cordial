@@ -21,6 +21,82 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## Open: pointer acceleration, and what it is not, 2026-08-28
+
+Reported by the maintainer: **"pointer acceleration doesn't apply in the Roblox
+window."** Their statement of the intent, quoted rather than paraphrased because
+it reads two ways: *"pointer accel is supposed to be pointer only inside roblox,
+if pointer is locked or you're in a text field, then that setting applies and
+pointer accel is used"*.
+
+**Ruled out first, because it is what Sober's tracker points at and it does not
+transfer.** Sober has this symptom reported at least five times -- #19 (the
+unlocked cursor accelerating when the system has acceleration off, and
+*fullscreen changing it*), #55 ("cursor sensitivity scales with window size",
+answered by Sober as an artifact of enabling SDL relative mode whenever the
+window was fullscreened), #2072 and #1441 (HiDPI and fractional display scale).
+Every one of those is a scale factor. **Cordial applies no scale factor to
+pointer coordinates anywhere.** Grepping both `crates/cordial-runtime/src` and
+`crates/cordial-shell/src` for `buffer_scale`, `fractional_scale`,
+`device_pixel_ratio`, `scale_factor`, `hidpi` and `dpi_scale` returns exactly one
+hit, and it is the help text for `CORDIAL_DPI_SCALE` in `load.rs`. The canvas
+size and the pointer coordinates delivered against it are both GTK surface-local
+logical units; `wl_pointer.motion`'s `wl_fixed_t` is decoded with
+`fixed_to_f32(v) = v / 256.0`, which is the fixed-point inverse and not a scale,
+and `dispatch_pointer_motion` passes the pair to the engine untouched. Sober's
+bugs were in machinery Cordial does not have.
+
+**What the code does, read out of it:**
+
+- **Cursor unlocked over the canvas.** The compositor has already run the
+  position through the desktop's pointer profile before Cordial sees it, and
+  `pass_mouse_move` derives its delta by subtracting the previous absolute
+  position. So the desktop's acceleration reaches the engine here, and the
+  `PointerAcceleration` setting is never consulted -- `pointer_acceleration()`
+  has exactly one call site, inside `relative_pointer_motion`, which returns
+  immediately unless the lock is active. That is what `shell_config.rs` and the
+  Settings subtitle both already say.
+- **Locked.** `relative_pointer_motion` picks the unaccelerated pair unless
+  `CORDIAL_POINTER_ACCEL=always`. Raw is the shipped default and is deliberate.
+  Settings offers "Only the cursor" and "Cursor and camera" for it.
+- **The setting only reaches a client the shell launched.** `launch.rs:397` is
+  the one place `CORDIAL_POINTER_ACCEL` is set, and `just dev`, `just client`
+  and a hand-run `cordial-run` set none of it. **Anybody testing this from a
+  terminal is always testing the default**, whatever Settings says, and that is
+  worth knowing before concluding the switch does nothing.
+
+**The open question, and it is the one worth measuring.**
+`engine_wants_pointer_lock()` polls `nativeGetMainWindowIsMouseLockedCenter`, and
+`input.rs:1120-1129` says plainly that the direction of that call has never been
+confirmed: the native is a getter Cordial had never called, Android has no
+pointer to lock so the real client may never have a true answer to give, and a
+dead getter and an idle one look identical. The engine-driven half of pointer
+capture is `INFERRED`; only the drag-driven half is established.
+
+Both failure directions produce the reported symptom:
+
+- If it never answers true, **first person and shift lock never take the lock**,
+  the relative path never runs there, and the setting is inert in exactly the
+  two modes where camera feel matters -- while `shell_config.rs`'s comment
+  claims Roblox "takes it for exactly the three camera cases".
+- If it answers true when it should not, or the lock sticks, **ordinary cursor
+  movement goes through the raw relative path** and acceleration is stripped
+  from a cursor the user thinks is free.
+
+**The measurement.** One client run with `CORDIAL_TRACE_MOUSE=1`, which prints
+every lock transition, entering first person and then leaving it. The control is
+the same run with `CORDIAL_NO_POINTER_LOCK=1`, which deliberately still polls
+and still traces so the control answers "what would it have done" rather than
+only "it did nothing" -- `sync_pointer_lock` asks the engine before the gate for
+exactly that reason. Nothing here has been run; this section is source reading
+and a Sober corpus search.
+
+**One more gap, found while reading and not yet costed.** `sync_pointer_lock`
+has no check of TextBox focus anywhere. If the engine's own request for a locked
+pointer does not clear when a chat box takes focus, nothing in Cordial notices,
+and the cursor stays captured while the user types. That is the second half of
+the maintainer's sentence and it has no code behind it either way.
+
 ## The plugin surface has two hosts, and the tests are on the wrong one, 2026-08-28
 
 **Anything you verify against `crates/cordial-plugins/src/host.rs` says nothing

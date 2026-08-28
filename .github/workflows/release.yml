@@ -67,12 +67,6 @@ on:
       - 'packaging/io.github.luohoa97.Cordial.desktop'
       - 'packaging/io.github.luohoa97.Cordial.metainfo.xml'
       - '.github/workflows/release.yml'
-  # **A release must be startable by hand.** `paths` above applies to tag pushes
-  # as well as branch pushes, so a tag moved onto a commit that touched none of
-  # those paths produces no run at all -- which is exactly what happened to
-  # v0.11.0 when it was re-pointed, leaving a tag with no build and no release.
-  # This is the way back without inventing a commit to push.
-  workflow_dispatch:
   pull_request:
     paths:
       - 'crates/**'
@@ -89,6 +83,11 @@ on:
       - 'packaging/io.github.luohoa97.Cordial.desktop'
       - 'packaging/io.github.luohoa97.Cordial.metainfo.xml'
       - '.github/workflows/release.yml'
+  # **The way to start a release build by hand, and it is needed.** `paths`
+  # above applies to tag pushes as well as branch pushes, and a tag pointing at
+  # a commit already on main pushes no new commits -- so nothing matches the
+  # filter and no run happens at all. That is what left v0.11.0 tagged twice
+  # with no build and no release page.
   workflow_dispatch:
 
 # `contents: write` only where a job actually uploads to a release -- see

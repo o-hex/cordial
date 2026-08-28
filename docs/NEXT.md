@@ -24,10 +24,15 @@ ruled out**.
 ## Open: pointer acceleration, and what it is not, 2026-08-28
 
 Reported by the maintainer: **"pointer acceleration doesn't apply in the Roblox
-window."** Their statement of the intent, quoted rather than paraphrased because
-it reads two ways: *"pointer accel is supposed to be pointer only inside roblox,
-if pointer is locked or you're in a text field, then that setting applies and
-pointer accel is used"*.
+window."** Clarified by them afterwards, and this is the version to work from:
+
+> It shouldn't ignore it, it's set on only the cursor, it should work and
+> accelerate in roblox ui. It doesn't.
+
+So the state is the **default** -- `PointerAcceleration::UnlockedCursor`, the row
+Settings labels "Only the cursor" -- and the complaint is about the **cursor
+moving over Roblox's own interface**, not the camera. That matters, because it
+is the one case the code says cannot go wrong.
 
 **Ruled out first, because it is what Sober's tracker points at and it does not
 transfer.** Sober has this symptom reported at least five times -- #19 (the
@@ -51,11 +56,19 @@ bugs were in machinery Cordial does not have.
 - **Cursor unlocked over the canvas.** The compositor has already run the
   position through the desktop's pointer profile before Cordial sees it, and
   `pass_mouse_move` derives its delta by subtracting the previous absolute
-  position. So the desktop's acceleration reaches the engine here, and the
-  `PointerAcceleration` setting is never consulted -- `pointer_acceleration()`
-  has exactly one call site, inside `relative_pointer_motion`, which returns
-  immediately unless the lock is active. That is what `shell_config.rs` and the
-  Settings subtitle both already say.
+  position. So on this reading the desktop's acceleration reaches the engine
+  here and the `PointerAcceleration` setting is never consulted --
+  `pointer_acceleration()` has exactly one call site, inside
+  `relative_pointer_motion`, which returns immediately unless the lock is
+  active.
+
+  **This is exactly the state the report says is broken**, so treat the
+  paragraph above as what the code is arranged to do rather than as what
+  happens. `shell_config.rs:300-306` goes further and says the desktop's setting
+  applies to the unlocked cursor "whether Cordial likes it or not"; the report
+  contradicts it, and a comment that confident about a behaviour nobody has
+  measured is the shape this file exists to warn about. Nothing here has been
+  observed in that state.
 - **Locked.** `relative_pointer_motion` picks the unaccelerated pair unless
   `CORDIAL_POINTER_ACCEL=always`. Raw is the shipped default and is deliberate.
   Settings offers "Only the cursor" and "Cursor and camera" for it.
@@ -65,17 +78,72 @@ bugs were in machinery Cordial does not have.
   terminal is always testing the default**, whatever Settings says, and that is
   worth knowing before concluding the switch does nothing.
 
-**The open question, and it is the one worth measuring.**
+**The open question, half of it now measured.**
 `engine_wants_pointer_lock()` polls `nativeGetMainWindowIsMouseLockedCenter`, and
-`input.rs:1120-1129` says plainly that the direction of that call has never been
-confirmed: the native is a getter Cordial had never called, Android has no
-pointer to lock so the real client may never have a true answer to give, and a
-dead getter and an idle one look identical. The engine-driven half of pointer
-capture is `INFERRED`; only the drag-driven half is established.
+`input.rs` said the direction of that call had never been confirmed: a getter
+Cordial had never called, where a dead one and an idle one look identical.
 
-Both failure directions produce the reported symptom:
+Two 30-second runs on 2026-08-28 with `CORDIAL_TRACE_MOUSE=1`, on the home page,
+gave the same two lines both times:
 
-- If it never answers true, **first person and shift lock never take the lock**,
+    input: nativeGetMainWindowIsMouseLockedCenter resolved
+    [cordial] nativeGetMainWindowIsMouseLockedCenter() -> false
+
+**So the getter is alive**: it resolves, it is called on every pump, it answers,
+and it does not throw. The dead-symbol branch is closed and the comment in
+`input.rs` has been corrected. What is still unmeasured is whether it ever
+answers `true`, which needs a session in first person or shift lock and cannot
+be had from the home page.
+
+**Candidate causes, now that the report is narrowed to the unlocked cursor.**
+In the order they are worth eliminating, with what separates them:
+
+1. **The pointer is locked when it looks free.** `sync_pointer_lock` asks the
+   engine every pump with no canvas gate on that half, so a `true` that arrives
+   or sticks while the user is on the home page routes all motion through
+   `relative_pointer_motion`, which takes the *unaccelerated* pair under this
+   very setting. That would present precisely as "no acceleration in the Roblox
+   UI". `CORDIAL_TRACE_MOUSE=1` prints every transition, so one traced session
+   in the UI separates this from everything below -- and the two runs already
+   done show `-> false` on the home page with nobody touching the mouse, which
+   is suggestive and not conclusive, because neither run moved a pointer.
+2. **The engine places its own cursor, and not from the absolute pair.**
+   `pass_mouse_move` sends `nativePassMouseMove(x, y, dx, dy)`, and `input.rs`
+   already records as its load-bearing inference that the engine acts on
+   `dx`/`dy` rather than the first two. Those deltas are differences of
+   already-accelerated absolutes, so acceleration should survive them -- unless
+   the engine applies a gain of its own, in which case what the user is watching
+   is Roblox's cursor and not the compositor's, and Cordial's coordinates are
+   innocent. Distinguished by whether the compositor's own cursor is visible and
+   moving normally over the same window at the same time.
+3. **Stale `DisplayMetrics`, as a gain on anything the engine derives from
+   screen geometry.** Measured elsewhere in this file: the engine constructs
+   `DisplayMetrics` exactly once, from inside `initializeNativeCode`, and gets
+   `1280x720 density=1.000 densityDpi=160` -- and `load.rs:2329` calls
+   `set_display_size` only *after* `initializeNativeCode` has returned
+   (load.rs:2301), so Cordial's correction can never reach that one read, at any
+   resolution, windowed or fullscreen. The comment at that call site already says
+   the framework layer "reported the compiled 1280x720 whatever the window was
+   doing". **Whether any pointer arithmetic in the engine is derived from it is
+   unestablished** -- nothing in `native/` ties mouse deltas to `DisplayMetrics`
+   or to `PlatformParams.dpiScale` -- so this is a structural candidate and not a
+   diagnosis.
+4. **The compositor is not accelerating this window.** Cordial's own motion path
+   performs no arithmetic at all, so if acceleration is genuinely absent from the
+   coordinates that arrive, the cause is upstream of anything in this repository.
+   Separated by comparing the cursor's speed over the Cordial window against the
+   same movement over any other window in the same session.
+
+**There is no way to observe which of these is happening**, and that is its own
+defect: `pointer_acceleration()`'s answer is never printed, so neither a user nor
+a developer can tell whether the setting took effect. One line under
+`CORDIAL_TRACE_MOUSE=1` naming the pair in use would fix it, and this project has
+lost enough time to instruments that measure nothing. Proposed, not written.
+
+The older framing, kept because it still applies to the camera half:
+
+- If it never answers true — still possible, since only `false` has been
+  observed — **first person and shift lock never take the lock**,
   the relative path never runs there, and the setting is inert in exactly the
   two modes where camera feel matters -- while `shell_config.rs`'s comment
   claims Roblox "takes it for exactly the three camera cases".
@@ -83,13 +151,14 @@ Both failure directions produce the reported symptom:
   movement goes through the raw relative path** and acceleration is stripped
   from a cursor the user thinks is free.
 
-**The measurement.** One client run with `CORDIAL_TRACE_MOUSE=1`, which prints
-every lock transition, entering first person and then leaving it. The control is
+**The measurement still owed.** A client run with `CORDIAL_TRACE_MOUSE=1`
+entering first person and then leaving it, watching for a `-> true`. The two
+runs above establish only that the getter answers at all. The control is
 the same run with `CORDIAL_NO_POINTER_LOCK=1`, which deliberately still polls
 and still traces so the control answers "what would it have done" rather than
 only "it did nothing" -- `sync_pointer_lock` asks the engine before the gate for
-exactly that reason. Nothing here has been run; this section is source reading
-and a Sober corpus search.
+exactly that reason. Everything above except the two quoted runs is source
+reading and a Sober corpus search, and is labelled where it is an inference.
 
 **One more gap, found while reading and not yet costed.** `sync_pointer_lock`
 has no check of TextBox focus anywhere. If the engine's own request for a locked
@@ -119,12 +188,18 @@ three shipped plugins did nothing:
   `crates/cordial-plugins/tests/plugin_call_shapes.rs` as the guard: it reads
   the shipped plugins as text and fails all four of its checks on the version
   that shipped.
-- **`discord-presence` is correct and still receives nothing**, because the
-  client publishes no core events at all. `Session::publish_core` is the only
-  producer of a `cordial/...` push, and nothing outside cordial-plugins'
-  own tests constructs a `Session`. So `lifecycle.subscribe` answers Ok, the
-  plugin waits, and no `cordial/client.launch` ever arrives. ADR-026 describes
-  a bus that is real in one crate and absent from the client.
+- **`discord-presence` is correct and now receives three of the five core
+  events**, corrected here on 2026-08-28 rather than quietly edited. This
+  bullet said it "still receives nothing, because the client publishes no core
+  events at all", and every sentence of that has stopped being true:
+  `plugin_host::publish_core` is a second producer, reachable from the client,
+  and `load.rs` publishes `client.launch`, `engine.version` and
+  `client.shutdown` -- all three observed arriving at the plugin in a real
+  `cordial-run`, with a control run that withheld `lifecycle.read` and received
+  none of them. What survives is narrower and still worth knowing:
+  `client.ready` and `window.resized` are in `core_events::ALL` and published
+  by nothing, so the plugin's `READY` branch is unreachable and its presence
+  reads "Starting up" for the whole session.
 
 The general lesson is the one AGENTS.md already records about
 `CORDIAL_AUDIO_HOST=oss`, which was measured by calling the selector directly
@@ -138,6 +213,10 @@ What is worth doing about the structural half: either the runtime host should
 use cordial-plugins' pieces rather than reimplementing them, or the pieces it
 does not use should go. Two dispatchers that answer the same method names
 differently will drift again, and the drift is invisible from either side.
+**Half of that happened on 2026-08-28**: the core bus in the runtime host reuses
+`cordial-plugins`' `Pump` rather than growing a second one, so the queue, the
+drop counting and the flush are one implementation with tests on both sides of
+it. `Session` and its `handle` are still the dispatcher nobody runs.
 
 ## Text entry: where the editor goes, 2026-08-25
 

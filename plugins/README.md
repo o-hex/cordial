@@ -297,11 +297,22 @@ for what Cordial did.
 
 ## Flags have two lifetimes
 
-`flags.write` contributes flags that take effect at the **next launch**.
-`flags.write.dynamic` changes one **while the client runs**, and only works for
-the `DFFlag`/`DFInt`/`DFString` families — the static families are read once at
-startup and cannot be changed live at all. They are separate capabilities so that
-an API call cannot silently do nothing. See
+`flags.write` contributes flags that take effect at the **next launch**. That
+one works, and it is the one to use.
+
+`flags.write.dynamic` is meant for the `DFFlag`/`DFInt`/`DFString` families,
+which are the only ones that can change while the client runs — the static
+families are read once at startup and cannot be changed live at all. **It is not
+implemented, and it is not waiting to be.** `flags.setDynamic` falls to the
+host's catch-all and comes back `flags.setDynamic is not implemented yet`, every
+time, on purpose: a live write into the running engine's own `DFFlag` table
+needs in-process access to the Roblox process, which
+[ADR-001](../docs/adr/ADR-001-in-process-hooking.md) and
+[ADR-003](../docs/adr/ADR-003-plugin-isolation.md) rule out permanently. It is a
+capability whose effect has nowhere to live, not a gap somebody will fill.
+
+They are separate capabilities so that an API call cannot silently do nothing,
+and that is still why the refusal above is an error rather than a success. See
 [ADR-005](../docs/adr/ADR-005-flag-service.md).
 
 ## Examples

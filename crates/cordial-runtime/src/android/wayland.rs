@@ -2138,6 +2138,23 @@ impl WaylandWindow {
         {
             self.set_engine_stacking(false);
         }
+        // A `relative_motion` sample can already be sitting in
+        // `PENDING_UNLOCKED_DELTA`, waiting for the `wl_pointer.motion` that
+        // drains it, at the exact moment this runs -- this is invoked from a
+        // GTK-thread closure answering the engine's own `openWindow`
+        // (`load.rs`), asynchronous to whatever the pointer was doing.
+        // `relative_pointer_motion`'s own `dialog_in_front` check stops
+        // anything *more* from accumulating once the dialog is up, but does
+        // nothing about a sample that got there first -- left alone, it
+        // survives the whole dialog and is handed to the first real report
+        // after `webview_dialog_closed`, applying movement from before the
+        // dialog opened to a cursor position from after it. Called
+        // unconditionally rather than gated on the 0-to-1 edge like the
+        // stacking call above: a second dialog opening while the first is
+        // still up finds nothing to forget, since the same early-return has
+        // been stopping accumulation since the first one opened, so gating
+        // this would add a condition with no observable effect.
+        super::input::forget_pending_unlocked_delta();
     }
 
     /// The mirror of [`Self::webview_dialog_opened`]: call once a dialog has
@@ -2150,6 +2167,12 @@ impl WaylandWindow {
         {
             self.set_engine_stacking(true);
         }
+        // Nothing should have accumulated while a dialog was in front — see
+        // `webview_dialog_opened` — but a last dialog closing is the same
+        // kind of pointer-meaning boundary `pointer_enter`, `pointer_leave`
+        // and the lock transitions already treat as one, and forgetting here
+        // too costs nothing rather than trusting that invariant forever.
+        super::input::forget_pending_unlocked_delta();
     }
 
     fn update_text_overlay(
@@ -2954,6 +2977,7 @@ unsafe extern "C" fn pointer_enter(
     // the pointer travelled, and the distance from wherever it was when it last
     // left the canvas is not a movement the user made.
     super::input::reset_mouse_delta();
+    super::input::forget_pending_unlocked_delta();
     w.hide_pointer(pointer, serial);
     // Subsurface coordinates are relative to the subsurface, so these are
     // already canvas-local — no offset for the header bar has to be
@@ -2987,6 +3011,7 @@ unsafe extern "C" fn pointer_leave(_data: *mut c_void, _pointer: *mut c_void, _s
     }
     POINTER_ON_CANVAS.store(false, Ordering::Release);
     super::input::reset_mouse_delta();
+    super::input::forget_pending_unlocked_delta();
 }
 unsafe extern "C" fn pointer_motion(_data: *mut c_void, _pointer: *mut c_void, _time: u32, x: i32, y: i32) {
     if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
@@ -3326,8 +3351,13 @@ unsafe extern "C" fn locked_pointer_locked(_data: *mut c_void, _lp: *mut c_void)
     }
     // Arriving at a lock is not a movement. Without this the first relative
     // motion after the cursor stops would be added to whatever absolute delta
-    // was outstanding.
+    // was outstanding. The pending unlocked-cursor accumulator gets the same
+    // treatment for the same reason: an accelerated sample from just before
+    // the lock engaged belongs to the cursor, not to the camera the lock is
+    // about to hand relative motion to, and it has no absolute report left to
+    // be drained by.
     super::input::reset_mouse_delta();
+    super::input::forget_pending_unlocked_delta();
     if super::input::trace_mouse() {
         eprintln!("[cordial] pointer lock: compositor sent locked");
     }
@@ -3349,6 +3379,7 @@ unsafe extern "C" fn locked_pointer_unlocked(_data: *mut c_void, _lp: *mut c_voi
         }
     }
     super::input::reset_mouse_delta();
+    super::input::forget_pending_unlocked_delta();
     if super::input::trace_mouse() {
         eprintln!("[cordial] pointer lock: compositor sent unlocked");
     }
@@ -3368,48 +3399,154 @@ unsafe extern "C" fn relative_pointer_motion(
     dy_unaccel: i32,
 ) {
     // Relative motion arrives whenever the seat's pointer has focus, lock or no
-    // lock. Acting on it unlocked would double every ordinary mouse movement,
-    // since `wl_pointer.motion` is still arriving and already produces a delta.
-    if !POINTER_LOCK_ACTIVE.load(Ordering::Acquire) || !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+    // lock — this object is bound to the seat's one `wl_pointer`, not to a
+    // surface, so `POINTER_ON_CANVAS` is the same focus test `wl_pointer.motion`
+    // uses and is checked for the identical reason: nothing else here says
+    // whether the movement belongs to Cordial's canvas or another window
+    // entirely.
+    if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(w) = current() else { return };
+    // A dialog of Cordial's own in front of the engine — see `dialog_in_front`
+    // and `pointer_motion`'s identical check on `wl_pointer.motion` itself.
+    // Without this an accelerated sample made while the user is working the
+    // dialog would sit in `PENDING_UNLOCKED_DELTA` (unlocked motion no longer
+    // returns early below) until the dialog closed and the next real
+    // `wl_pointer.motion` drained it, applying somebody else's movement to the
+    // cursor's first report afterwards -- `webview_dialog_opened` now also
+    // forgets that accumulator directly, which covers a sample that got there
+    // *before* this check could see the dialog; this early-return only stops
+    // new ones arriving while it stays open.
+    //
+    // Placed before the `POINTER_LOCK_ACTIVE` branch below rather than inside
+    // it, which reads as though camera motion could be silently dropped while
+    // locked with a dialog up. That pairing cannot actually happen, and not by
+    // luck: `WaylandWindow::pump` runs `self.host.0.pump()` (which is where
+    // `webview_dialog_opened`'s GTK-thread closure would run) and then
+    // `sync_pointer_lock()` -- which forces `want = false` and calls
+    // `release_pointer`, setting `POINTER_LOCK_ACTIVE` false synchronously,
+    // the instant `dialog_in_front`/`cordial_is_in_front` reads true --
+    // *before* the `prepare_read`/`read_events`/`dispatch_pending` sequence at
+    // `pump`'s own tail that is the only thing able to reach this listener.
+    // Both steps happen inside that same `pump()` call, in that order, so any
+    // `relative_motion` event dispatched for this pump cycle or a later one
+    // sees `dialog_in_front() == true` only after `POINTER_LOCK_ACTIVE` has
+    // already gone false for it. Checking the order the other way round would
+    // read as more careful and change nothing, since the branch it would be
+    // "protecting" cannot be entered either way.
+    if dialog_in_front(&w) {
         return;
     }
     // `zwp_relative_pointer_v1.relative_motion` carries two pairs: `dx`/`dy`,
     // which the compositor has already run through the desktop's pointer
     // profile (acceleration, "mouse speed"), and `dx_unaccel`/`dy_unaccel`,
-    // which have not. This used to send the accelerated pair, which is right
-    // for moving a UI cursor and wrong for a camera: acceleration is
-    // superlinear in speed, so a fast sweep turns the camera disproportionately
-    // more than a slow one covering the same real distance, and it makes the
-    // in-game sensitivity depend on whatever pointer-speed setting the user's
-    // desktop happens to have — neither of which a camera look should do. The
-    // unaccelerated pair is the one `libinput`'s own documentation and every
-    // engine that supports Wayland pointer lock uses for exactly this reason.
-    // `INFERRED` that this is what made the reported camera feel over-sensitive
-    // and speed up through a fast turn — not run against the engine, only
-    // reasoned from what the two fields are documented to mean — but it is not
-    // inferred that Cordial was sending the wrong pair: that part is read
-    // straight off the protocol's own field names.
-    //
-    // Which pair is used is a setting rather than a decision, because the
-    // argument above is strong for a first-person camera and not universal: a
-    // player who has tuned their desktop pointer profile and wants the client
-    // to obey it is not wrong, and neither is one who wants raw input. The
-    // default is unaccelerated because that is what a camera wants and what
-    // the reported bug was about; `CORDIAL_POINTER_ACCEL=1` restores the
-    // accelerated pair, and the settings window offers it as a switch.
-    let (dx, dy) =
-        if pointer_acceleration() { (_dx, _dy) } else { (dx_unaccel, dy_unaccel) };
-    if let Some(w) = current() {
+    // which have not.
+    if POINTER_LOCK_ACTIVE.load(Ordering::Acquire) {
+        // Locked: the camera. This used to send the accelerated pair
+        // unconditionally, which is right for moving a UI cursor and wrong for
+        // a camera: acceleration is superlinear in speed, so a fast sweep turns
+        // the camera disproportionately more than a slow one covering the same
+        // real distance, and it makes the in-game sensitivity depend on
+        // whatever pointer-speed setting the user's desktop happens to have —
+        // neither of which a camera look should do. The unaccelerated pair is
+        // the one `libinput`'s own documentation and every engine that
+        // supports Wayland pointer lock uses for exactly this reason.
+        // `INFERRED` that this is what made the reported camera feel
+        // over-sensitive and speed up through a fast turn — not run against
+        // the engine, only reasoned from what the two fields are documented to
+        // mean — but it is not inferred that Cordial was sending the wrong
+        // pair: that part is read straight off the protocol's own field names.
+        //
+        // Which pair is used is a setting rather than a decision, because the
+        // argument above is strong for a first-person camera and not
+        // universal: a player who has tuned their desktop pointer profile and
+        // wants the client to obey it is not wrong, and neither is one who
+        // wants raw input. The default is unaccelerated because that is what a
+        // camera wants and what the original reported bug was about;
+        // `CORDIAL_POINTER_ACCEL=always` restores the accelerated pair, and
+        // the settings window offers it as a switch. This env var governs the
+        // camera only. The unlocked cursor below has no equivalent switch --
+        // not because an honest "off" is impossible for it, the unaccelerated
+        // pair is sitting right there in the same event exactly as it is
+        // here, but because nobody has asked for a cursor that ignores the
+        // desktop's pointer profile, and the report this fix answers was the
+        // opposite complaint. See `PointerAcceleration`'s own doc in
+        // `shell_config.rs` for that reasoning in full; a `NeverCursor`
+        // variant is a small addition if it is ever needed, not a redesign.
+        let (dx, dy) = if pointer_acceleration() { (_dx, _dy) } else { (dx_unaccel, dy_unaccel) };
         w.dispatch_relative_motion(fixed_to_f32(dx), fixed_to_f32(dy));
+        return;
     }
+    // Unlocked: the cursor over Roblox's own interface, which is what the
+    // maintainer's report narrowed this to — "it's set on only the cursor, it
+    // should work and accelerate in roblox ui. It doesn't" — and their own
+    // fix: use the accelerated pair here too, unconditionally, because an
+    // unlocked cursor has no camera-style reason to want raw input.
+    //
+    // This event does not go to the engine directly. `wl_pointer.motion` is
+    // still the only source of the *absolute* position Roblox's own interface
+    // needs — the relative-pointer protocol has none — so the two are combined
+    // in `pass_mouse_move`: this accumulates the accelerated delta and
+    // `dispatch_pointer_motion` drains it when the matching absolute report
+    // arrives, in place of the arithmetic difference of two absolute positions
+    // it used to compute unconditionally. That split, not a lock check here,
+    // is what stops one physical movement being counted twice — the hazard
+    // this function used to avoid by never acting on unlocked motion at all.
+    //
+    // Nothing here assumes `wl_pointer.motion` and this event arrive in a
+    // particular order. The relative-pointer extension's text does not specify
+    // one, so a compositor is free to write either object's event to the wire
+    // first for the same physical sample. `accumulate_unlocked_delta` sums
+    // rather than overwrites, so a sample that arrives before its absolute
+    // counterpart is simply waiting in `PENDING_UNLOCKED_DELTA` when
+    // `pass_mouse_move` looks, and is used exactly once.
+    //
+    // **This is only harmless, not proven harmless, when a relative sample
+    // never arrives after its own physical sample's absolute report has
+    // already been drained.** If it does -- sample A's `wl_pointer.motion`
+    // dispatches, finds nothing pending, and takes the arithmetic fallback;
+    // A's own `relative_motion` dispatches afterwards and accumulates; then
+    // sample B's `wl_pointer.motion` arrives and drains *A*'s leftover delta
+    // instead of computing its own -- A's movement is sent twice (once as its
+    // own fallback, once standing in for B) and B's real movement is never
+    // sent at all. That is a genuine double count and drop on that one pair
+    // of reports, not the "smear" an earlier version of this comment called
+    // it: a smear implies the total displacement across reports stays right
+    // and only its timing shifts, which is what happens only if *every*
+    // sample in a run has its relative event ordered the same way relative to
+    // the absolute one, so each report ends up quietly replaying the previous
+    // report's delta rather than corrupting an unrelated pair. Nothing here
+    // establishes that a real compositor keeps that ordering consistent
+    // rather than varying it per sample -- see `input.rs`'s
+    // `a_relative_sample_delivered_after_its_own_absolute_report_corrupts_the_next_one`
+    // for the failure demonstrated in isolation, and `docs/NEXT.md`'s
+    // "Ordering was checked rather than assumed" section, which carries the
+    // same correction and the open question of whether this is ever hit in
+    // practice. `INFERRED`, in both places, that it has not been.
+    //
+    // The remaining case — an absolute report with nothing waiting for it at
+    // all — covers a warp, a surface enter, and a compositor with no
+    // `zwp_relative_pointer_v1` (in which case this function is never called
+    // and `PENDING_UNLOCKED_DELTA` is always empty). `resolve_mouse_delta` in
+    // `input.rs` falls back to the arithmetic difference of absolute positions
+    // for exactly that case, which is what every unlocked report did before
+    // this change existed.
+    super::input::accumulate_unlocked_delta(fixed_to_f32(_dx), fixed_to_f32(_dy));
 }
 
 /// Whether to pass the compositor's accelerated deltas through to the camera.
 ///
-/// Read once. This is consulted on every relative-motion event, which arrives
-/// at the pointer's full report rate while the pointer is locked, so an
-/// environment lookup per event would be a syscall-free but still needless cost
-/// on the hottest input path there is.
+/// Read once. Consulted only from the locked branch of
+/// `relative_pointer_motion` — the unlocked cursor takes the accelerated pair
+/// unconditionally and never calls this, see that function's own comment for
+/// why there is no equivalent switch for it. A locked pointer still reports
+/// at the pointer's full rate, though, so an environment lookup on every one
+/// of those would be a syscall-free but still needless cost on the hottest
+/// input path there is. This function used to be the only consumer of a
+/// `relative_motion` event at all, back when the unlocked case returned
+/// before reaching here; it no longer is, which is why "consulted on every
+/// relative-motion event" would now be the wrong claim to make here.
 fn pointer_acceleration() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -3746,8 +3883,13 @@ fn constrain_toplevel() -> bool {
         POINTER_LOCK_ACTIVE.store(false, Ordering::Release);
         *self.lock_requested_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // The cursor is about to be somewhere again, and where it went is not a
-        // movement the user made with it.
+        // movement the user made with it. Nothing should be sitting in the
+        // unlocked-cursor accumulator at this point -- relative motion while
+        // locked goes to `dispatch_relative_motion`, not the accumulator -- but
+        // clearing it here too costs nothing and keeps this call site the same
+        // shape as the compositor-driven unlock in `locked_pointer_unlocked`.
         super::input::reset_mouse_delta();
+        super::input::forget_pending_unlocked_delta();
         if super::input::trace_mouse() {
             eprintln!("[cordial] pointer lock: released, cursor hinted to ({x}, {y})");
         }

@@ -136,7 +136,13 @@ broken instrument AGENTS.md opens with, produced today, by the session that
 knows the rule. Anything reading `Progress::Fetching` for a rate has to notice
 `done` going backwards.
 
-## Open: pointer acceleration, and what it is not, 2026-08-28
+## Pointer acceleration: implemented for the unlocked cursor, 2026-08-28
+
+**Fixed, at the end of this entry.** Everything below the fix is kept as it was
+written during the investigation, because the ruled-out half of it is still
+true and still worth having -- the fix that landed is the maintainer's own
+diagnosis, given directly, and did not come from finishing the candidate list
+below. Read the fix first if all that is wanted is what changed.
 
 Reported by the maintainer: **"pointer acceleration doesn't apply in the Roblox
 window."** Clarified by them afterwards, and this is the version to work from:
@@ -280,6 +286,204 @@ has no check of TextBox focus anywhere. If the engine's own request for a locked
 pointer does not clear when a chat box takes focus, nothing in Cordial notices,
 and the cursor stays captured while the user types. That is the second half of
 the maintainer's sentence and it has no code behind it either way.
+
+**Fixed, 2026-08-28, by the maintainer's own diagnosis rather than by finishing
+the candidate list above:**
+
+> just use xaccel and yaccel when not pointer locked
+
+`relative_pointer_motion` in `wayland.rs` no longer returns immediately when
+`POINTER_LOCK_ACTIVE` is false. Unlocked, it now feeds the accelerated pair
+(`dx`/`dy`, the same one the locked path already knew how to read) into a new
+accumulator, `input::accumulate_unlocked_delta`, instead of discarding the
+event. `pass_mouse_move` -- still the only thing `dispatch_pointer_motion`
+calls for `wl_pointer.motion` -- now asks `resolve_mouse_delta` to choose
+between that accumulated delta and the old arithmetic difference of two
+absolute positions, preferring the accumulated one when there is one.
+
+**What stops one physical movement being counted twice**, which is the whole
+of what the early-return this replaces was there to prevent: the absolute
+*position* still comes from exactly one place, `wl_pointer.motion`, unchanged.
+Only the *delta* is chosen, and it is chosen from exactly one source per
+absolute report -- `take_pending_unlocked_delta` drains the accumulator
+atomically, so a report either gets what accumulated or gets the arithmetic
+fallback, never both.
+
+**Ordering was checked rather than assumed.** The
+`zwp_relative_pointer_v1.relative_motion` protocol text does not say a
+`relative_motion` event for a given physical sample is written to the wire
+before, after, or interleaved with the matching `wl_pointer.motion` -- there is
+no framing available to settle it either, since Cordial binds `wl_pointer` at
+version 1 and `wl_pointer.frame` is never sent (see `PointerListener`'s own
+comment on that). So the design does not lean on an order: a relative sample
+that arrives first sits in the accumulator until the absolute report drains it;
+one that arrives after is not lost, it accumulates for whichever absolute
+report comes next, which is a smear of at most one report and not a double
+count. An absolute report with nothing accumulated at all -- a warp, a surface
+enter, or a compositor with no `zwp_relative_pointer_v1` -- falls back to the
+arithmetic difference, which is exactly what every unlocked report did before
+this change existed, so a compositor that never sends the extension is
+unaffected.
+
+Two comments that the fix made wrong were corrected in the same change:
+`relative_pointer_motion`'s early-return comment, which said acting on
+unlocked motion "would double every ordinary mouse movement" -- true of the
+naive version, not of the accumulate-and-drain one that replaced it -- and
+`shell_config.rs`'s `PointerAcceleration` doc, which said there was "no
+unaccelerated absolute to fall back to" for the unlocked cursor. There is now,
+in principle; a `Never` variant is still not offered, for the reason given
+where that comment now stands.
+
+**Not fixed in the same change, because the file was out of bounds**:
+`crates/cordial-shell/src/settings.rs` around line 640 gives the identical
+now-superseded reasoning ("there is no unaccelerated absolute to fall back to")
+in the comment above the Settings row itself, and needs the same correction
+`shell_config.rs` got here. Left for whoever is editing that file next.
+
+**Tested**: `crates/cordial-runtime/src/android/input.rs` gained
+`unaccelerated_diff_is_only_a_fallback_for_a_relative_sample`, which checks
+`resolve_mouse_delta`'s precedence with no global state at all -- the same
+shape `vulkan.rs`'s `resolve_present_mode` test uses, for the same reason --
+and `pending_unlocked_delta_sums_until_taken_and_then_is_gone`, which checks
+that `accumulate_unlocked_delta` sums rather than overwrites, that taking
+drains it, and that `reset_mouse_delta` discards a pending sample the way it
+already discarded `MOUSE_LAST`. **This originally said the `cargo test
+--release --workspace` output was "in the pull request"; there was no pull
+request, this went straight to a branch, and that sent a reader looking for a
+document that does not exist.** The real output is in the "Corrected on
+review" entry below, pasted rather than pointed at.
+
+**What this does not establish, and could not from this machine.** A client
+run proves the code path executes and does not crash; it cannot prove the
+cursor feels accelerated, because that is a human judgement about a physical
+mouse, and no session here moved one. Nothing above resolves which of the four
+candidate causes this file recorded earlier was the actual mechanism behind the
+report -- the maintainer's fix was implemented directly rather than derived
+from finishing that narrowing, so the candidate list stands as unfinished
+investigation, not as an explanation for why the fix works. Whether real
+compositors in practice ever deliver `relative_motion` after its matching
+`wl_pointer.motion` -- as opposed to merely being permitted to by the protocol
+text -- was reasoned from the specification and from the absence of
+`wl_pointer.frame` at this binding's version, not observed on a running
+compositor with a logging patch; if the accumulate-then-drain path turns out
+never to run in practice because every compositor tested happens to send
+`relative_motion` first, this is the place that inference should be checked.
+
+**Corrected on review, 2026-08-28.** Two reviewers read the change above; seven
+findings came back, six of them against source that held up and one already
+answered by a comment the same change had added. What changed as a result:
+
+- **The "smear of at most one report and not a double count" line above
+  overstates it.** That is only true if a relative sample never arrives after
+  its *own* physical sample's absolute report has already been drained. If it
+  does -- sample A's absolute report goes out on the arithmetic fallback,
+  A's own `relative_motion` turns up afterwards and accumulates, and sample
+  B's absolute report then drains *A*'s leftover delta instead of computing
+  its own -- A's movement is sent twice and B's is never sent at all, which is
+  a double count and a drop, not a delay that leaves the total right.
+  `input.rs` gained
+  `a_relative_sample_delivered_after_its_own_absolute_report_corrupts_the_next_one`
+  to demonstrate exactly this with no compositor involved, and
+  `relative_pointer_motion`'s own comment in `wayland.rs` carries the same
+  correction. **Still `INFERRED`, in both places, whether a real compositor
+  ever produces this ordering for consecutive samples** -- nothing available
+  here can settle that without a live compositor and a logging patch, which is
+  the same gap the paragraph above already named. What is no longer claimed is
+  that the design is safe against it either way.
+- **A real, fixable gap, found and closed:** a `relative_motion` sample
+  already sitting in `PENDING_UNLOCKED_DELTA` when a web-view dialog opens was
+  never cleared. `dialog_in_front`'s early-return in `relative_pointer_motion`
+  stops anything *more* accumulating once the dialog is up, but did nothing
+  about a sample that arrived first -- left alone, it survived the whole
+  dialog and was handed to the first real report after `webview_dialog_closed`,
+  applying movement from before the dialog to a cursor position from after it.
+  `webview_dialog_opened` and `webview_dialog_closed` now both forget the
+  accumulator directly.
+- **The `dialog_in_front` check's placement, before rather than inside the
+  `POINTER_LOCK_ACTIVE` branch, was checked rather than changed.** Read on its
+  own it looks like camera motion could be silently dropped while locked with
+  a dialog up; tracing `WaylandWindow::pump`'s own order shows that state
+  cannot occur -- `sync_pointer_lock` forces the lock off, synchronously,
+  before the same `pump()` call reaches the Wayland dispatch that is the only
+  way to invoke this listener, so `dialog_in_front() == true` never coincides
+  with `POINTER_LOCK_ACTIVE == true` there. The comment now says why rather
+  than only that.
+- **Two stale comments, corrected.** `pointer_acceleration`'s own doc still
+  said it was "consulted on every relative-motion event, which arrives ... while
+  the pointer is locked" -- true when the unlocked case returned before
+  reaching it, false now that unlocked motion reaches this function too
+  (`pointer_acceleration` just is not called from that branch). And the locked
+  branch's comment on `CORDIAL_POINTER_ACCEL` said the unlocked cursor "has no
+  equivalent switch because it has no honest \"off\"" -- which `shell_config.rs`'s
+  own `PointerAcceleration` doc already contradicted: the unaccelerated pair is
+  sitting right there in the same event, and a `NeverCursor` variant would be
+  "a small addition ... not a redesign". Nobody having asked for it is the
+  actual reason there is no switch, not impossibility, and the comment now says
+  that.
+- **`forget_pending_unlocked_delta` is now called at every site that also
+  calls `reset_mouse_delta`, which its own doc already claimed.** It was not:
+  `window.rs`'s X11 pointer-grab release called only the latter. Harmless
+  today, because only `wayland.rs`'s `relative_pointer_motion` ever writes
+  `PENDING_UNLOCKED_DELTA` -- X11 has no relative-pointer source, so there was
+  never anything there to forget -- but the claim was wrong regardless, and is
+  fixed rather than just noted.
+- **This file's own claim that `cargo test --release --workspace` output "is in
+  the pull request" was wrong** -- this work went straight to a branch and no
+  pull request exists. The real output is below.
+
+```
+     Running unittests src/lib.rs (target/release/deps/cordial_linker_sys-d3d7578fc0a74ce5)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/release/deps/cordial_plugins-8efeb9a8f0fbdf7f)
+test result: ok. 220 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.05s
+     Running tests/discord_presence_plugin.rs (target/release/deps/discord_presence_plugin-d9293d643fdccd73)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+     Running tests/events_integration.rs (target/release/deps/events_integration-9bdb2ab199be9c5a)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests/flag_inspector.rs (target/release/deps/flag_inspector-1e33d0d989b082e3)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests/plugin_call_shapes.rs (target/release/deps/plugin_call_shapes-9467128a9b514e01)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/registry_example.rs (target/release/deps/registry_example-450e7b1f6a1f7605)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/roundtrip.rs (target/release/deps/roundtrip-87c0fc995a8fea80)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+     Running tests/settings_roundtrip.rs (target/release/deps/settings_roundtrip-656bccef8478b430)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+     Running unittests src/lib.rs (target/release/deps/cordial_runtime-c46babe52385b404)
+test result: ok. 311 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.50s
+     Running unittests src/bin/load.rs (target/release/deps/cordial_run-df3337dc06fabae5)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/apk_read_cost.rs (target/release/deps/apk_read_cost-124096876b108917)
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/gamepad_gate.rs (target/release/deps/gamepad_gate-a49174f2db62c86e)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/profile_configuration.rs (target/release/deps/profile_configuration-8b46ce4abfcbd812)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+     Running unittests src/lib.rs (target/release/deps/cordial_shell-c3156df5d9254881)
+test result: ok. 75 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.39s
+     Running unittests src/main.rs (target/release/deps/cordial_shell-eff526c383cb69da)
+test result: ok. 136 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.12s
+     Running unittests src/lib.rs (target/release/deps/cordial_update-efc58d59d56c2db1)
+test result: ok. 136 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.65s
+   Doc-tests cordial_linker_sys / cordial_plugins / cordial_runtime / cordial_shell / cordial_update
+   -- all "test result: ok", 0 passed or 1 ignored placeholder each, 0 failed
+```
+
+902 passed, 0 failed, 10 ignored, across every unit-test binary, integration-test binary and
+doc-test crate in the workspace -- `cordial_runtime`'s 311 includes both new tests named above.
+`cargo build --release` was also run on its own first and finished clean (`Finished \`release\`
+profile [optimized + debuginfo] target(s)`); its only warnings were pre-existing dead-code ones in
+`cordial-shell`, unrelated to this change and not touched here since that crate is out of bounds
+for this pass.
+
+**One thing observed while capturing this that is not this change's to fix.** The `cargo test`
+process itself did not exit even once every crate had reported "ok" -- something under
+`cordial_plugins`'s test suite starts a sandboxed `bwrap`/`deno` process (consistent with
+ADR-003's plugin isolation) that inherited this shell's stdout/stderr and was still running,
+holding the pipe open, well after every test result had printed. Not chased further: it is in
+`cordial-plugins`, outside this pass's boundary, and the actual pass/fail result above was already
+complete and readable in the file `tee` wrote before that process needed to exit.
 
 ## The plugin surface has two hosts, and the tests are on the wrong one, 2026-08-28
 

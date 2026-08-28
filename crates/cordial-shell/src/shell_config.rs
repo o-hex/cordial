@@ -297,13 +297,24 @@ impl ThrottleWhen {
 /// slow one covering the same distance, and in-game sensitivity would
 /// otherwise follow whatever pointer speed the desktop happens to be set to.
 ///
-/// **There is deliberately no `Never`.** With the cursor unlocked, Cordial is
-/// handed an absolute position the compositor has *already* accelerated;
-/// there is no unaccelerated absolute to fall back to, so the desktop's
-/// setting applies whether Cordial likes it or not. Offering "never" would be
-/// a switch that silently does nothing outside the lock, which is the same
-/// shape as a stub that returns success. Naming the default after what
-/// actually happens says the true thing instead.
+/// **There is still no `Never`, but not for the reason this comment used to
+/// give.** It used to say that, with the cursor unlocked, Cordial was handed
+/// an absolute position the compositor had already accelerated and so had no
+/// unaccelerated absolute to fall back to -- making the desktop's setting
+/// apply outside the lock whether Cordial liked it or not, and a "never" a
+/// switch that would silently do nothing. That stopped being true on
+/// 2026-08-28: reported as "it's set on only the cursor, it should work and
+/// accelerate in roblox ui. It doesn't", `relative_pointer_motion` now feeds
+/// the unlocked cursor from `zwp_relative_pointer_v1`'s own accelerated pair
+/// rather than from the arithmetic difference of two absolute positions --
+/// see that function and `input.rs`'s `resolve_mouse_delta`. An unaccelerated
+/// *cursor* is therefore possible now, the same way the camera's is: the
+/// unaccelerated pair is sitting right there in the same event. It is
+/// deliberately not offered here anyway: nobody asked for a cursor that
+/// ignores the desktop's pointer profile, and the report this enum exists to
+/// answer was the opposite complaint. Adding it would be a third menu entry
+/// with no user behind it -- if that changes, `PointerAcceleration` is a
+/// two-variant enum and `NeverCursor` is a small addition, not a redesign.
 ///
 /// Keyed on the pointer lock rather than on "first person" because first
 /// person is engine state and Cordial cannot see it -- Roblox exposes no

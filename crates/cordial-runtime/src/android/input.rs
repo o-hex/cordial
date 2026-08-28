@@ -1594,6 +1594,26 @@ fn mouse_last_position() -> Option<(f32, f32)> {
     (position != NO_MOUSE_POSITION).then(|| unpack_mouse_position(position))
 }
 
+/// An accelerated relative-motion delta waiting for the absolute position
+/// report it belongs to.
+///
+/// `zwp_relative_pointer_v1.relative_motion` and `wl_pointer.motion` describe
+/// the same physical movement through two different protocol objects on the
+/// same seat, and nothing in the relative-pointer extension's text says which
+/// one a compositor writes to the wire first — see `relative_pointer_motion`
+/// in `wayland.rs` for what was checked before settling on "unspecified"
+/// rather than guessing an order. Stashing the delta here rather than handing
+/// it straight to the engine is what lets [`pass_mouse_move`] decide, once the
+/// matching absolute position turns up, whether to use it or fall back to the
+/// old arithmetic — see [`resolve_mouse_delta`] for that choice and
+/// [`accumulate_unlocked_delta`]/[`take_pending_unlocked_delta`] for the
+/// producer and consumer either side of it.
+///
+/// The same packing as `MOUSE_LAST` and the same sentinel, because the trick
+/// — two `f32`s in one atomic word — is about the storage and not about what
+/// the pair means.
+static PENDING_UNLOCKED_DELTA: AtomicU64 = AtomicU64::new(NO_MOUSE_POSITION);
+
 /// Forget the last reported pointer position, so the next move reports a zero
 /// delta rather than the distance from wherever the pointer was before.
 ///
@@ -1601,8 +1621,40 @@ fn mouse_last_position() -> Option<(f32, f32)> {
 /// that left at one edge and came back at the other would report the whole
 /// width of the window as a single movement — and a delta is what turns the
 /// camera, so that is not a cosmetic error but a view that snaps round.
+///
+/// Deliberately touches only `MOUSE_LAST` and not [`PENDING_UNLOCKED_DELTA`],
+/// even though every call site also wants that one forgotten — see
+/// [`forget_pending_unlocked_delta`], kept separate for exactly the reason its
+/// own doc gives: two statics behind one reset function would coincidentally
+/// couple this function's own test to that one's.
 pub fn reset_mouse_delta() {
     MOUSE_LAST.store(NO_MOUSE_POSITION, Ordering::Release);
+}
+
+/// Discard any accelerated relative-motion sample waiting for an absolute
+/// position report that is no longer coming.
+///
+/// Called at every site that also calls [`reset_mouse_delta`] — the pointer
+/// entering or leaving the canvas, and a lock being taken or released — for
+/// the same reason that function exists: a relative-motion sample that
+/// arrived just before the pointer left the canvas, or just before a lock
+/// engaged, describes movement that is about to become meaningless once the
+/// thing it was going to be attached to changes. Carrying it forward would
+/// apply somebody else's movement to whatever happens next, which is the same
+/// "distance from wherever it was before" bug `reset_mouse_delta` already
+/// exists to prevent, arriving through the other producer.
+///
+/// Kept as a second function rather than folded into `reset_mouse_delta`
+/// itself, even though every current call site wants both: that function has
+/// its own test (`the_first_move_after_the_pointer_arrives_has_no_delta`) built
+/// on the same "one test, not several, because two tests sharing global state
+/// would race" reasoning [`PENDING_UNLOCKED_DELTA`]'s own test relies on, and
+/// folding the two statics behind one call would silently make each test's
+/// `reset_mouse_delta()` call touch the other test's state too — turning two
+/// independent, deliberately single-owner tests back into the exact kind of
+/// shared-global race this file's tests already go out of their way to avoid.
+pub fn forget_pending_unlocked_delta() {
+    PENDING_UNLOCKED_DELTA.store(NO_MOUSE_POSITION, Ordering::Release);
 }
 
 /// Split a new absolute position into itself and the movement since the last
@@ -1618,6 +1670,50 @@ fn mouse_delta(x: f32, y: f32) -> (f32, f32) {
     }
 }
 
+/// Add one accelerated relative-motion sample to what is waiting for the next
+/// absolute position report.
+///
+/// Called from `relative_pointer_motion` for every `relative_motion` event
+/// that arrives while the pointer is *not* locked — see that function for why
+/// unlocked motion is acted on at all now. Summed rather than overwritten
+/// because a mouse reports at its own rate and `wl_pointer.motion` at the
+/// compositor's; a fast mouse or a slow compositor frame can put several
+/// relative samples between two absolute ones, and overwriting would silently
+/// drop all but the last.
+pub fn accumulate_unlocked_delta(dx: f32, dy: f32) {
+    let previous = PENDING_UNLOCKED_DELTA.load(Ordering::Acquire);
+    let (px, py) =
+        if previous == NO_MOUSE_POSITION { (0.0, 0.0) } else { unpack_mouse_position(previous) };
+    PENDING_UNLOCKED_DELTA.store(pack_mouse_position(px + dx, py + dy), Ordering::Release);
+}
+
+/// Take whatever accelerated delta has accumulated since the last absolute
+/// position report, leaving nothing behind for the one after it.
+///
+/// `None` means no `relative_motion` event has arrived since the last time
+/// this was called — either this compositor has no
+/// `zwp_relative_pointer_v1`, or (see `relative_pointer_motion`'s ordering
+/// note) the matching one has not been written to the wire yet. Either way,
+/// [`pass_mouse_move`] falls back to the arithmetic difference of absolute
+/// positions, which is what this whole path replaces only when it has
+/// something better to offer.
+fn take_pending_unlocked_delta() -> Option<(f32, f32)> {
+    let previous = PENDING_UNLOCKED_DELTA.swap(NO_MOUSE_POSITION, Ordering::AcqRel);
+    (previous != NO_MOUSE_POSITION).then(|| unpack_mouse_position(previous))
+}
+
+/// Which delta an absolute position report should carry: the desktop's own
+/// accelerated relative motion if one arrived for it, or the arithmetic
+/// fallback otherwise.
+///
+/// Pure and separate from [`pass_mouse_move`] so the precedence is testable
+/// without a compositor to send either kind of event — the same reason
+/// `vulkan.rs`'s `resolve_present_mode` takes its inputs as plain values
+/// rather than reading the environment itself.
+fn resolve_mouse_delta(pending: Option<(f32, f32)>, from_position_diff: (f32, f32)) -> (f32, f32) {
+    pending.unwrap_or(from_position_diff)
+}
+
 /// `nativePassMouseMove(F x, F y, F dx, F dy)`.
 ///
 /// The last two arguments used to be sent as constant zeros, which is the
@@ -1627,8 +1723,19 @@ fn mouse_delta(x: f32, y: f32) -> (f32, f32) {
 /// delta" is `INFERRED` — but it is the shape this file already assumed when it
 /// hardcoded zeros, and a real delta is strictly closer to the truth than a
 /// value that says the pointer never moves.
+///
+/// While the pointer is unlocked, `dx`/`dy` prefer the compositor's own
+/// accelerated relative motion over the arithmetic difference of two absolute
+/// positions — see [`resolve_mouse_delta`] for the precedence and
+/// `relative_pointer_motion` in `wayland.rs` for why the two used to disagree
+/// only in theory and the maintainer's report says they do not in practice.
+/// `mouse_delta` still runs unconditionally: `MOUSE_LAST` has to track the
+/// true absolute position regardless of which delta gets sent, because a
+/// later report with no matching relative sample falls back to subtracting
+/// from it.
 pub fn pass_mouse_move(x: f32, y: f32) {
-    let (dx, dy) = mouse_delta(x, y);
+    let from_position_diff = mouse_delta(x, y);
+    let (dx, dy) = resolve_mouse_delta(take_pending_unlocked_delta(), from_position_diff);
     pass_mouse_move_delta(x, y, dx, dy);
 }
 
@@ -2667,6 +2774,98 @@ mod tests {
         assert_eq!(mouse_delta(103.0, 47.0), (0.0, 0.0));
         reset_mouse_delta();
         assert_eq!(mouse_delta(900.0, 47.0), (0.0, 0.0));
+        reset_mouse_delta();
+    }
+
+    #[test]
+    fn unaccelerated_diff_is_only_a_fallback_for_a_relative_sample() {
+        // `resolve_mouse_delta` is the whole of the precedence, and it wants no
+        // global state at all — the same reason `resolve_present_mode` takes
+        // plain values instead of reading the environment.
+        assert_eq!(resolve_mouse_delta(Some((5.0, -2.0)), (1.0, 1.0)), (5.0, -2.0));
+        assert_eq!(resolve_mouse_delta(None, (1.0, 1.0)), (1.0, 1.0));
+    }
+
+    #[test]
+    fn pending_unlocked_delta_sums_until_taken_and_then_is_gone() {
+        // One test rather than several, for the reason given above
+        // `mouse_delta`'s own test: `PENDING_UNLOCKED_DELTA` is process-wide,
+        // and parallel tests sharing it would race.
+        //
+        // A fast mouse can put several `relative_motion` samples between two
+        // `wl_pointer.motion` reports — that is what `accumulate_unlocked_delta`
+        // is for, and summing rather than overwriting is the property this
+        // checks. Taking it has to both return the sum and clear it, or the
+        // next absolute position would reapply movement that was already sent.
+        forget_pending_unlocked_delta();
+        assert_eq!(take_pending_unlocked_delta(), None, "nothing accumulated yet");
+        accumulate_unlocked_delta(2.0, -1.0);
+        accumulate_unlocked_delta(1.5, 0.5);
+        assert_eq!(take_pending_unlocked_delta(), Some((3.5, -0.5)));
+        assert_eq!(take_pending_unlocked_delta(), None, "taking drains it");
+        // A lock or a canvas transition invalidates whatever was waiting, the
+        // same way `reset_mouse_delta` invalidates `MOUSE_LAST` — see
+        // `forget_pending_unlocked_delta`'s own comment for why carrying it
+        // forward would be the bug that function exists to prevent, arriving
+        // through the other producer.
+        accumulate_unlocked_delta(9.0, 9.0);
+        forget_pending_unlocked_delta();
+        assert_eq!(take_pending_unlocked_delta(), None, "reset discards a pending sample");
+    }
+
+    /// Characterises a gap `relative_pointer_motion`'s own comment on
+    /// ordering used to undersell, calling the residual case "a smear of at
+    /// most one report and not a double count". That is only true if a
+    /// relative sample never arrives after its *own* physical sample's
+    /// absolute report has already been drained. This test is the case where
+    /// it does: sample A's absolute report goes out first, using the
+    /// arithmetic fallback because nothing has accumulated yet, and only then
+    /// does A's own `relative_motion` turn up and accumulate. The next
+    /// absolute report, for an unrelated sample B, then drains *A*'s leftover
+    /// delta instead of computing its own — A's movement is sent twice and
+    /// B's is not sent at all, which is a double count and a drop on that one
+    /// pair of reports, not a harmless one-report delay.
+    ///
+    /// One test, not several, for the reason this file's other
+    /// `PENDING_UNLOCKED_DELTA`/`MOUSE_LAST` tests already give: both are
+    /// process-wide statics and parallel tests sharing them would race.
+    ///
+    /// This does not establish that any real compositor delivers events in
+    /// this order for consecutive samples — see this test's own name being
+    /// cited from `relative_pointer_motion`'s comment in `wayland.rs`, and
+    /// `docs/NEXT.md`'s "Ordering was checked rather than assumed" section,
+    /// both of which mark that question `INFERRED` rather than observed. What
+    /// this test does establish is that the code does not defend against it
+    /// if it happens.
+    #[test]
+    fn a_relative_sample_delivered_after_its_own_absolute_report_corrupts_the_next_one() {
+        forget_pending_unlocked_delta();
+        reset_mouse_delta();
+
+        // Sample A's absolute report: first-ever position, so the fallback is
+        // (0, 0) regardless — nothing to corrupt yet, but it establishes
+        // `MOUSE_LAST` for B's diff below.
+        let from_diff_a = mouse_delta(10.0, 10.0);
+        let (dx_a, dy_a) = resolve_mouse_delta(take_pending_unlocked_delta(), from_diff_a);
+        assert_eq!((dx_a, dy_a), (0.0, 0.0), "first report has nothing to diff against");
+
+        // A's own relative sample, arriving late — after A's absolute report
+        // already went out and was resolved above.
+        accumulate_unlocked_delta(4.0, -2.0);
+
+        // Sample B's absolute report. The true movement since A was
+        // (12.0, 8.0); `resolve_mouse_delta` computes that correctly as the
+        // fallback, but prefers the stale accumulated value unconditionally.
+        let from_diff_b = mouse_delta(22.0, 18.0);
+        assert_eq!(from_diff_b, (12.0, 8.0), "B's own true movement, computed correctly");
+        let (dx_b, dy_b) = resolve_mouse_delta(take_pending_unlocked_delta(), from_diff_b);
+        assert_eq!(
+            (dx_b, dy_b),
+            (4.0, -2.0),
+            "B is sent A's leftover delta instead of its own — the gap this test records"
+        );
+
+        forget_pending_unlocked_delta();
         reset_mouse_delta();
     }
 

@@ -943,6 +943,16 @@ impl HostWindow {
                 (self.xlib.flush)(self.display);
             }
             super::input::reset_mouse_delta();
+            // `forget_pending_unlocked_delta`'s own doc says it is called "at
+            // every site that also calls `reset_mouse_delta`" -- this was the
+            // one exception, harmless only because nothing on the X11 path
+            // ever writes `PENDING_UNLOCKED_DELTA` (only `wayland.rs`'s
+            // `relative_pointer_motion` does), so there is never anything
+            // here to forget. Added anyway so the doc's claim stays true
+            // rather than true of Wayland only, and so this backend does not
+            // become a silent trap if it ever grows a relative-motion source
+            // of its own.
+            super::input::forget_pending_unlocked_delta();
             if super::input::trace_mouse() {
                 eprintln!("[cordial] X11 pointer capture released");
             }

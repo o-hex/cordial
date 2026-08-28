@@ -194,59 +194,227 @@ fn major_in_title(title: &str) -> Option<u32> {
 //
 // The DevForum post announces a release; it does not list what changed. Its body
 // is five lines of "732 has landed, enjoy" and a set of links, one of which goes
-// to the page below — so a window showing the post was showing the covering note
-// and calling it a changelog.
+// to the Creator Hub — so a window showing the post was showing the covering
+// note and calling it a changelog.
 //
-// `https://create.roblox.com/docs/release-notes/release-notes-<major>` is the
-// actual list, as a table of note/status. **The rendered table is empty in the
-// HTML**: every `<td>` in the note column contains one empty `<div>`, because
-// the text is written in by script after load. Scraping the table would have
-// produced thirty blank rows and looked like Roblox had published nothing.
+// **This used to be keyed by the DevForum's engine number, and that was the
+// bug.** `release-notes-<major>` was a real route once, but it answers a plain
+// 404 now, and the version-keyed fallback this file grew in its place —
+// looking three majors back for whichever one existed — was the wrong fix for
+// the wrong problem: it kept the version arithmetic that was never the actual
+// question. Reported exactly this way: "it shouldnt check the next release, it
+// should find the latest release in roblox's release notes. Use their api using
+// a browser and checking network requests, id rather a stable API than an
+// unstable HTML."
 //
-// What does carry it is the `__NEXT_DATA__` blob the page ships for hydration,
-// where each entry is `{"ReleaseNotesText", "ReleaseNotesType", "Status"}`.
-// Measured on 732, 2026-08-03: thirty entries, twelve Improvements and eighteen
-// Fixes, each Live or Pending. That is a document Roblox publishes for people to
-// read, fetched at run time and shown — nothing is vendored into this repository.
+// Measured on 2026-08-28 with a browser's own network panel:
+//
+//   - `create.roblox.com/docs/release-notes/release-notes-736` -> 404.
+//     `-735` and `-734` -> 301, to `/docs/updates/2026-08-17` and
+//     `/docs/updates/2026-08-10`. The old route is a legacy alias into the
+//     replacement, not a route of its own any more.
+//   - `create.roblox.com/docs/updates` -> 200, a Next.js page. Its
+//     `__NEXT_DATA__` carries the *site's whole navigation tree* and zero
+//     `ReleaseNotesText` entries — this is the index, not the content.
+//   - That page's navigation lists the release pages Roblox itself keeps, and
+//     names one of them for us: a "Release notes" section whose entries are
+//     titled `Current release`, `Pending release`, and a `Recent releases`
+//     list of `Week of <date>` pages. **"Current release" is the answer to the
+//     complaint, by Roblox's own label** — no version comparison required.
+//   - `.../_next/data/<buildId>/updates.json` answers with exactly that
+//     navigation, as data, once `<buildId>` is known — Next.js's own
+//     per-deploy id, stamped into the shell page's `__NEXT_DATA__` as
+//     `"buildId":"..."` and changing on every Roblox deploy, which is why it
+//     is read fresh each call rather than assumed.
+//   - `.../_next/data/<buildId>/updates/2026-08-24.json` (the path the
+//     navigation gave for "Current release") answers with clean JSON:
+//     `pageProps.data.releaseNoteContents.content`, an array of
+//     `{"ReleaseNotesText", "ReleaseNotesType", "Status"}` — the same three
+//     fields the old HTML scrape parsed out of a `__NEXT_DATA__` script tag,
+//     now the entire body of a JSON response with nothing else to strip away.
+//
+// **This is not a documented public API.** It is Next.js's own hydration data,
+// and Roblox did not design it for outside callers. What makes it a fair trade
+// against the HTML scrape it replaces is which parts are load-bearing: the
+// `buildId` key and the `pageProps` envelope are the framework's own
+// constants, no more Roblox's to rearrange than an HTTP header is, while what
+// the old code parsed — the page's rendered markup — was entirely Roblox's
+// content to change and did, twice, inside one release cycle.
 
-/// The Creator Hub release-notes page for one engine major.
-pub fn docs_url(major: u32) -> String {
-    format!("https://create.roblox.com/docs/release-notes/release-notes-{major}")
+/// The Creator Hub's release-notes index. Fetched first, and only for its
+/// build id — see the module section above for why a build id rather than an
+/// engine number is the key everything else here runs on.
+pub const DOCS_UPDATES_URL: &str = "https://create.roblox.com/docs/updates";
+
+const DOCS_HOST: &str = "https://create.roblox.com/docs";
+
+/// `https://create.roblox.com/docs/_next/data/<build_id><path>.json`
+///
+/// Next.js serves a page's own props at this URL once its build id is known,
+/// `path` being the ordinary site path — `/updates` for the index,
+/// `/updates/2026-08-24` for one week — with `.json` appended. It is the data
+/// the shell HTML asks a browser to hydrate with; asking for it directly is
+/// what turns "scrape what the page renders" into "read what Roblox already
+/// serves as data".
+fn docs_data_url(build_id: &str, path: &str) -> String {
+    format!("{DOCS_HOST}/_next/data/{build_id}{path}.json")
 }
 
-/// One row of the release-notes table.
+/// One row of a release page's table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub text: String,
     /// `Improvements` or `Fixes`, as Roblox groups them.
     pub kind: String,
-    /// `Live` or `Pending`.
+    /// `Live` or `Pending`. Every dated page measured 2026-08-28 answered
+    /// `Live` throughout — the `Pending` distinction now lives on its own
+    /// `/updates/pending` page, in a different shape with no per-entry status
+    /// at all — so this is carried rather than assumed, in case that changes
+    /// back.
     pub status: String,
 }
 
-/// Fetch and read the table for one major.
-pub fn docs_notes(major: u32) -> Result<Vec<Entry>, Unreachable> {
-    let url = docs_url(major);
-    let html = http::get_text(&url)?;
-    parse_docs_notes(&html).map_err(|why| Unreachable::Malformed { url, why })
+/// Which rule found the changelog on screen. Kept distinct from a bare
+/// `Vec<Entry>` so a caller can say when the ordinary path did not apply,
+/// rather than silently passing off a fallback as Roblox's own current
+/// release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocsSource {
+    /// Roblox's navigation named this one "Current release" — the direct
+    /// answer to "find the latest release", with no version comparison
+    /// anywhere in reaching it.
+    CurrentRelease,
+    /// The navigation carried no entry titled "Current release" — renamed,
+    /// restructured — so this is the newest `/updates/<date>` entry instead,
+    /// found by comparing the dates spelled out in the navigation's own
+    /// paths rather than giving up.
+    Newest { date: String },
 }
 
-/// Pull the entries out of the page's hydration blob.
+/// Fetch and read whatever Roblox currently calls the latest release.
 ///
-/// Split from the request so the shape stays pinned to a page that was observed,
-/// the same arrangement as [`parse_releases`].
-pub fn parse_docs_notes(html: &str) -> Result<Vec<Entry>, String> {
-    const OPEN: &str = r#"<script id="__NEXT_DATA__" type="application/json">"#;
-    let start = html.find(OPEN).ok_or("the page carried no __NEXT_DATA__ block")?;
-    let rest = &html[start + OPEN.len()..];
-    let end = rest.find("</script>").ok_or("__NEXT_DATA__ was not closed")?;
-    let value: serde_json::Value =
-        serde_json::from_str(&rest[..end]).map_err(|e| format!("__NEXT_DATA__ is not JSON: {e}"))?;
+/// Three requests, run in order because each needs what the last one found,
+/// and none of them an engine number:
+///
+/// 1. [`DOCS_UPDATES_URL`], for its build id.
+/// 2. That build's navigation data, to find the path Roblox filed under
+///    "Current release" — or, failing that, the newest dated entry.
+/// 3. The page at that path.
+pub fn docs_notes() -> Result<(DocsSource, Vec<Entry>), Unreachable> {
+    let shell = http::get_text(DOCS_UPDATES_URL)?;
+    let build_id = find_build_id(&shell).ok_or_else(|| Unreachable::Malformed {
+        url: DOCS_UPDATES_URL.into(),
+        why: "the page carried no buildId".into(),
+    })?;
 
+    let nav_url = docs_data_url(&build_id, "/updates");
+    let nav = http::get_json(&nav_url)?;
+    let (source, path) =
+        pick_release(&nav).map_err(|why| Unreachable::Malformed { url: nav_url, why })?;
+
+    let page_url = docs_data_url(&build_id, &path);
+    let value = http::get_json(&page_url)?;
+    let entries =
+        parse_docs_notes(&value).map_err(|why| Unreachable::Malformed { url: page_url, why })?;
+    Ok((source, entries))
+}
+
+/// Pull the build id Next.js stamped this deploy with out of the shell page.
+///
+/// A plain substring search rather than a JSON parse of the whole blob: the
+/// shell's `__NEXT_DATA__` is the entire site's navigation tree, over 100 kB
+/// measured 2026-08-28, and every byte of it other than this one field is
+/// discarded here.
+fn find_build_id(html: &str) -> Option<String> {
+    const NEEDLE: &str = "\"buildId\":\"";
+    let start = html.find(NEEDLE)? + NEEDLE.len();
+    let end = html[start..].find('"')?;
+    Some(html[start..start + end].to_string())
+}
+
+/// Find "Current release" in the navigation, or the newest dated entry if
+/// that label is gone.
+fn pick_release(nav: &serde_json::Value) -> Result<(DocsSource, String), String> {
+    let mut items = Vec::new();
+    collect_nav_items(nav, &mut items);
+    if items.is_empty() {
+        return Err("no navigation item carried both a title and a path".into());
+    }
+    if let Some((_, path)) = items.iter().find(|(title, _)| *title == "Current release") {
+        return Ok((DocsSource::CurrentRelease, (*path).to_string()));
+    }
+    // Roblox renaming or restructuring a label is the ordinary hazard for a
+    // documentation site, not a reason to show nothing — so fall back to the
+    // newest dated entry. `/updates/<date>` sorts correctly as a plain string
+    // because the date inside it is fixed-width and big-endian.
+    items
+        .iter()
+        .filter_map(|(_, path)| date_of_updates_path(path).map(|date| (date, *path)))
+        .max_by_key(|(date, _)| date.clone())
+        .map(|(date, path)| (DocsSource::Newest { date }, path.to_string()))
+        .ok_or_else(|| {
+            "no entry titled \"Current release\" and no /updates/<date> entry either".into()
+        })
+}
+
+/// Walk the navigation tree for every `{title, path}` pair, at any depth.
+///
+/// By shape rather than by the `heading`/`navigation`/`section` route to it —
+/// the same reasoning as [`collect_entries`] below: that nesting is Roblox's
+/// own content structure to rearrange, and a title next to a path is the part
+/// that would have to change for this to break.
+fn collect_nav_items<'a>(value: &'a serde_json::Value, out: &mut Vec<(&'a str, &'a str)>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let (Some(title), Some(path)) = (
+                map.get("title").and_then(|v| v.as_str()),
+                map.get("path").and_then(|v| v.as_str()),
+            ) {
+                out.push((title, path));
+            }
+            for v in map.values() {
+                collect_nav_items(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                collect_nav_items(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `/updates/2026-08-24` -> `Some("2026-08-24")`. Anything else —
+/// `/updates/pending`, a `null` path, a reference page — is `None`, which is
+/// what keeps the fallback from ever landing on the pending page: it carries
+/// no `ReleaseNotesType`/`Status` at all, a different shape from every dated
+/// page, measured 2026-08-28.
+fn date_of_updates_path(path: &str) -> Option<String> {
+    let date = path.strip_prefix("/updates/")?;
+    let bytes = date.as_bytes();
+    let is_date = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes.iter().enumerate().all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+    is_date.then(|| date.to_string())
+}
+
+/// Pull the entries out of one release page's data.
+///
+/// Split from the request so the shape stays pinned to a page that was
+/// observed, the same arrangement as [`parse_releases`]. Reading `value` by
+/// shape in [`collect_entries`] rather than by its
+/// `pageProps.data.releaseNoteContents.content` path is what would let this
+/// keep working if Roblox nests the same three fields somewhere else again —
+/// it is exactly that nesting that changed, from an HTML table's
+/// `__NEXT_DATA__` script to a dedicated JSON response, between when this
+/// module was first written and 2026-08-28.
+pub fn parse_docs_notes(value: &serde_json::Value) -> Result<Vec<Entry>, String> {
     let mut out = Vec::new();
-    collect_entries(&value, &mut out);
+    collect_entries(value, &mut out);
     if out.is_empty() {
-        return Err("__NEXT_DATA__ carried no ReleaseNotesText entries".into());
+        return Err("no ReleaseNotesText entries were found in the page".into());
     }
     Ok(out)
 }
@@ -457,27 +625,33 @@ mod tests {
          "title":"Release Notes for 732","created_at":"2026-07-29T18:44:52.923Z"}
     ]}}"#;
 
-    /// The shape observed on the 732 page, 2026-08-03, nested the way Next puts
-    /// it and trimmed to four of the thirty entries. The wrapper levels are kept
-    /// deliberately: walking by shape rather than by path is the thing being
+    /// Trimmed from the real response to
+    /// `.../_next/data/<buildId>/updates/2026-07-27.json`, fetched 2026-08-28.
+    /// Four of the real fifteen entries, kept whole rather than edited: entry
+    /// zero is the same `Class.Decal.Rotation|Rotation` note this file has
+    /// quoted since 2026-08-03, when it was read out of the old HTML scrape --
+    /// Roblox's own text has outlived the two page shapes this module has
+    /// parsed it from. The wrapper levels are kept deliberately: walking by
+    /// shape rather than by path in [`collect_entries`] is the thing being
     /// tested, because that nesting is the framework's to rearrange.
-    const DOCS: &str = r#"<!doctype html><html><body><table><tr><td><div></div></td></tr></table>
-        <script id="__NEXT_DATA__" type="application/json">
-        {"props":{"pageProps":{"content":{"releaseNotes":[
-          {"ReleaseNotesText":"Adds the `Class.Decal.Rotation|Rotation` property to `Class.Texture` and `Class.Decal` instances.","ReleaseNotesType":"Improvements","Status":"Live"},
-          {"ReleaseNotesText":"Adds `Enum.PreferredInput.MicroGamepad` for gamepads.","ReleaseNotesType":"Improvements","Status":"Pending"},
-          {"ReleaseNotesText":"Fixed a crash when `true` was passed twice.","ReleaseNotesType":"Fixes","Status":"Live"},
-          {"ReleaseNotesText":"Fixed audio in some scenes.","ReleaseNotesType":"Fixes","Status":"Pending"}
-        ]}}}}
-        </script></body></html>"#;
+    const DOCS_PAGE: &str = r#"{"pageProps":{"data":{"releaseNoteContents":{"title":"Week of July 27, 2026","lastUpdated":"2026-08-25T21:10:17.410Z","content":[
+        {"ReleaseNotesText":"Adds the `Class.Decal.Rotation|Rotation` property to `Class.Texture` and `Class.Decal` instances to support UV map rotations.","ReleaseNotesType":"Improvements","Status":"Live"},
+        {"ReleaseNotesText":"Adds `Class.InputBinding.DisplayName` and `Class.InputBinding.DisplayImage` in service of `Class.InputActionLabel`. Also adds the read-only `Class.InputAction.PreferredBinding` property for creators who want full control over how bindings are displayed in custom UI.","ReleaseNotesType":"Improvements","Status":"Live"},
+        {"ReleaseNotesText":"Fixes `Class.ImageHandleAdornment` edge sampling.","ReleaseNotesType":"Fixes","Status":"Live"},
+        {"ReleaseNotesText":"Fixes night sky star twinkle rate at high FPS.","ReleaseNotesType":"Fixes","Status":"Live"}
+    ],"prev":"/updates/2026-07-20"}}}}"#;
+
+    fn docs_page() -> serde_json::Value {
+        serde_json::from_str(DOCS_PAGE).unwrap()
+    }
 
     #[test]
-    fn the_notes_come_out_of_the_hydration_blob_not_the_rendered_table() {
-        // The table in `DOCS` is the real one's shape: a `<td>` holding one empty
-        // `<div>`, because the text is written in by script after load. Scraping
-        // it produces blank rows that look like Roblox published nothing, which
-        // is why this reads `__NEXT_DATA__` instead.
-        let entries = parse_docs_notes(DOCS).unwrap();
+    fn the_entries_come_out_of_the_per_page_json_directly() {
+        // No `__NEXT_DATA__` script and no rendered table to fall back to any
+        // more -- the endpoint this module asks for now answers with exactly
+        // this, and nothing else, which is the whole improvement over the HTML
+        // scrape it replaced.
+        let entries = parse_docs_notes(&docs_page()).unwrap();
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].kind, "Improvements");
         assert_eq!(entries[0].status, "Live");
@@ -485,17 +659,31 @@ mod tests {
     }
 
     #[test]
-    fn the_rendering_groups_improvements_first_and_marks_what_is_not_live_yet() {
-        let out = render_entries(&parse_docs_notes(DOCS).unwrap());
+    fn the_rendering_groups_improvements_first() {
+        let out = render_entries(&parse_docs_notes(&docs_page()).unwrap());
         let improvements = out.find("Improvements").expect("no Improvements heading");
         let fixes = out.find("Fixes").expect("no Fixes heading");
         assert!(improvements < fixes, "{out}");
-        // Pending is the useful distinction: a Live note describes the build you
-        // can be running now and a Pending one does not. Live is unmarked
-        // because marking the ordinary case is noise on every line.
-        assert!(out.contains("Adds <tt>MicroGamepad</tt> for gamepads. <i>(Pending)</i>"), "{out}");
-        assert!(!out.contains("(Live)"), "{out}");
         assert!(out.starts_with("<b>Improvements</b>"), "{out}");
+    }
+
+    #[test]
+    fn the_rendering_marks_whatever_is_not_live_yet() {
+        // Every dated page measured 2026-08-28 answered `Live` throughout -- the
+        // `Pending` distinction now lives on `/updates/pending`, in a shape with
+        // no per-entry status at all -- so `DOCS_PAGE` cannot exercise this any
+        // more and these are constructed directly instead, to keep the marking
+        // logic itself covered against the day a dated page carries one again.
+        let entries = vec![
+            Entry { text: "Shipped already.".into(), kind: "Improvements".into(), status: "Live".into() },
+            Entry { text: "Not out yet.".into(), kind: "Improvements".into(), status: "Pending".into() },
+        ];
+        let out = render_entries(&entries);
+        // Pending is the useful distinction: a Live note describes the build
+        // you can be running now and a Pending one does not. Live is unmarked
+        // because marking the ordinary case is noise on every line.
+        assert!(out.contains("Not out yet. <i>(Pending)</i>"), "{out}");
+        assert!(!out.contains("(Live)"), "{out}");
     }
 
     #[test]
@@ -538,41 +726,40 @@ mod tests {
 
     #[test]
     fn the_docs_cross_reference_syntax_survives_the_markdown_parser() {
-        let entries = parse_docs_notes(DOCS).unwrap();
+        let entries = parse_docs_notes(&docs_page()).unwrap();
         // The reference reduction runs inside code spans, so it still applies
         // once markdown owns the parse -- and what comes out is a `<tt>` run
         // rather than bare words.
         assert_eq!(
             entries[0].text,
-            "Adds the <tt>Rotation</tt> property to <tt>Texture</tt> and <tt>Decal</tt> instances."
+            "Adds the <tt>Rotation</tt> property to <tt>Texture</tt> and <tt>Decal</tt> \
+             instances to support UV map rotations."
         );
-        assert_eq!(entries[1].text, "Adds <tt>MicroGamepad</tt> for gamepads.");
-        assert_eq!(entries[2].text, "Fixed a crash when <tt>true</tt> was passed twice.");
+        assert_eq!(entries[2].text, "Fixes <tt>ImageHandleAdornment</tt> edge sampling.");
     }
 
     #[test]
     fn a_page_that_changed_shape_fails_loudly_rather_than_showing_an_empty_changelog() {
-        // The failure that matters. If Roblox renames the fields or drops the
-        // blob, an empty list reads exactly like a release with nothing in it,
-        // and the window would quietly claim Roblox published no changes.
-        assert!(parse_docs_notes("<html><body>no blob here</body></html>").is_err());
-        let empty = r#"<script id="__NEXT_DATA__" type="application/json">{"props":{}}</script>"#;
-        assert!(parse_docs_notes(empty).is_err());
+        // The failure that matters. If Roblox renames the fields or moves them
+        // somewhere `collect_entries` does not reach, an empty list reads
+        // exactly like a release with nothing in it, and the window would
+        // quietly claim Roblox published no changes.
+        assert!(parse_docs_notes(&serde_json::json!({"pageProps": {"data": {}}})).is_err());
+        assert!(parse_docs_notes(&serde_json::json!(null)).is_err());
     }
 
-    /// The live page, on request only.
+    /// The live service, on request only.
     ///
     /// `cargo test -p cordial-update -- --ignored --nocapture` prints what the
-    /// window would show. Ignored by default because it is a network request and
-    /// the rest of this file is pinned to captured shapes -- but the whole point
-    /// of this module is a page somebody else controls, and a fixture cannot
-    /// tell you the day they rename a field.
+    /// window would show. Ignored by default because it is three network
+    /// requests and the rest of this file is pinned to captured shapes -- but
+    /// the whole point of this module is a service somebody else controls, and
+    /// a fixture cannot tell you the day they rename a field.
     #[test]
     #[ignore = "fetches create.roblox.com"]
-    fn the_real_page_still_parses() {
-        let release = latest().expect("the DevForum listing");
-        let entries = docs_notes(release.major).expect("the docs table");
-        println!("engine {} -- {} entries", release.major, entries.len());
+    fn the_real_service_still_answers() {
+        let (source, entries) = docs_notes().expect("the current release");
+        println!("{source:?} -- {} entries", entries.len());
         println!("{}", render_entries(&entries));
         assert!(!entries.is_empty());
         // Every entry has to survive the parse with something in it: an entry
@@ -581,11 +768,88 @@ mod tests {
     }
 
     #[test]
-    fn the_docs_url_is_built_from_the_major_the_devforum_gave() {
+    fn a_data_url_is_the_build_id_and_the_site_path_joined() {
         assert_eq!(
-            docs_url(732),
-            "https://create.roblox.com/docs/release-notes/release-notes-732"
+            docs_data_url("LkiE_NqiUYTmYBZV17_Xx", "/updates"),
+            "https://create.roblox.com/docs/_next/data/LkiE_NqiUYTmYBZV17_Xx/updates.json"
         );
+        assert_eq!(
+            docs_data_url("LkiE_NqiUYTmYBZV17_Xx", "/updates/2026-08-24"),
+            "https://create.roblox.com/docs/_next/data/LkiE_NqiUYTmYBZV17_Xx/updates/2026-08-24.json"
+        );
+    }
+
+    /// The tail of the real shell page's `__NEXT_DATA__`, fetched 2026-08-28.
+    /// The rest of that blob is the whole site's navigation tree -- over
+    /// 100 kB -- and none of it is the field this is pinning.
+    const DOCS_SHELL_TAIL: &str = r#"{"props":{"pageProps":{}},"page":"/updates","query":{},"buildId":"LkiE_NqiUYTmYBZV17_Xx","assetPrefix":"https://assets.create.roblox.com/docs/93e5457f3047d1f35c22c74cf428dec3fa9f2006","isFallback":false,"isExperimentalCompile":false,"gsp":true,"scriptLoader":[]}"#;
+
+    #[test]
+    fn the_build_id_is_read_out_of_the_shells_next_data() {
+        let html = format!(
+            r#"<!doctype html><html><body><script id="__NEXT_DATA__" type="application/json">{DOCS_SHELL_TAIL}</script></body></html>"#
+        );
+        assert_eq!(find_build_id(&html).as_deref(), Some("LkiE_NqiUYTmYBZV17_Xx"));
+    }
+
+    #[test]
+    fn a_shell_with_no_build_id_is_a_named_failure_not_a_panic() {
+        assert_eq!(find_build_id("<html><body>no script here</body></html>"), None);
+    }
+
+    /// Trimmed from the real response to
+    /// `.../_next/data/<buildId>/updates.json`, fetched 2026-08-28: the
+    /// "Release notes" section of the navigation, with `Recent releases` cut
+    /// to two of its real nine entries. `Current release` and the `null` path
+    /// on `Recent releases` itself are both real and both worth keeping --
+    /// the second is what [`collect_nav_items`] has to skip rather than
+    /// mistake for a release.
+    const DOCS_NAV: &str = r#"{"pageProps":{"navigation":{"navigationContent":[
+        {"heading":"Release notes","navigation":[
+            {"title":"Current release","path":"/updates/2026-08-24"},
+            {"title":"Pending release","path":"/updates/pending"},
+            {"title":"Recent releases","path":null,"section":[
+                {"title":"Week of August 17, 2026","path":"/updates/2026-08-17"},
+                {"title":"Week of August 10, 2026","path":"/updates/2026-08-10"}
+            ]}
+        ]}
+    ]}}}"#;
+
+    #[test]
+    fn pick_release_finds_current_release_by_name() {
+        let nav = serde_json::from_str(DOCS_NAV).unwrap();
+        let (source, path) = pick_release(&nav).unwrap();
+        assert_eq!(source, DocsSource::CurrentRelease);
+        assert_eq!(path, "/updates/2026-08-24");
+    }
+
+    #[test]
+    fn pick_release_falls_back_to_the_newest_dated_entry_if_the_label_is_gone() {
+        // Roblox renaming the label is the hazard this exists for -- not a
+        // hypothetical, since the DevForum-keyed route this replaced was itself
+        // a rename. `Current release` is edited out here to force the path
+        // this function must not treat as a failure.
+        let without_label = DOCS_NAV.replace("Current release", "This week");
+        let nav = serde_json::from_str(&without_label).unwrap();
+        let (source, path) = pick_release(&nav).unwrap();
+        assert_eq!(source, DocsSource::Newest { date: "2026-08-24".into() });
+        assert_eq!(path, "/updates/2026-08-24");
+    }
+
+    #[test]
+    fn pick_release_never_falls_back_to_the_pending_page() {
+        // `/updates/pending` is not a date and must never win the "newest"
+        // comparison just because it sorts after every real date as a string.
+        let without_label = DOCS_NAV.replace("Current release", "This week");
+        let nav = serde_json::from_str(&without_label).unwrap();
+        let (_, path) = pick_release(&nav).unwrap();
+        assert_ne!(path, "/updates/pending");
+    }
+
+    #[test]
+    fn a_navigation_with_no_dates_at_all_is_a_named_failure() {
+        let nav = serde_json::json!({"pageProps": {"navigation": {"navigationContent": []}}});
+        assert!(pick_release(&nav).is_err());
     }
 
     #[test]

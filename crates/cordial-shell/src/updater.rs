@@ -74,7 +74,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use cordial_update::cache;
-use cordial_update::changelog::{self, Entry, Notes, Release};
+use cordial_update::changelog::{self, DocsSource, Entry, Notes, Release};
 use cordial_update::download::{Refusal, Source, URL_ENV};
 use cordial_update::metered::{self, Metered};
 use cordial_update::settings::{Automatic, DownloadOn, Plan, UpdateSettings};
@@ -142,22 +142,29 @@ pub struct Checked {
     /// against the DevForum's number said "update available" for a build that
     /// could never be installed -- for ever, and with the accent to match.
     obtainable: Option<String>,
-    /// What actually changed, from the Creator Hub table.
+    /// What actually changed, from the Creator Hub -- whatever page its own
+    /// navigation currently calls the current release, found by that label
+    /// rather than by an engine number.
     ///
     /// Separate from `release` and allowed to fail on its own: the DevForum
     /// listing is what establishes the version number, and losing the changelog
     /// must not take the version comparison down with it. `None` here means the
-    /// docs page did not answer, and the window falls back to the announcement
+    /// docs site did not answer, and the window falls back to the announcement
     /// post rather than showing nothing.
     entries: Option<Vec<Entry>>,
-    /// Why [`Self::entries`] is `None`, when it is `None` because the request
-    /// failed rather than because there was no release to ask about.
+    /// A line about [`Self::entries`], when one is owed: the request failed, or
+    /// it answered with a fallback rather than the release Roblox's own
+    /// navigation calls current. `None` covers both "nothing to say" cases --
+    /// no release to ask about, and the ordinary case where the current
+    /// release answered cleanly -- since a line explaining a non-problem is
+    /// noise.
     ///
     /// **Kept rather than printed.** This was a `println!` and nothing else, so
     /// a user pressing Check saw a button flicker and a terminal they were not
-    /// reading say `the release-notes table did not answer: … HTTP 404`. It was
-    /// reported exactly that way. A failure the interface knows about and does
-    /// not mention is the same shape as a stub reporting success.
+    /// reading say `the release-notes page did not answer: … HTTP 404`. It was
+    /// reported exactly that way, of the page this replaced. A failure the
+    /// interface knows about and does not mention is the same shape as a stub
+    /// reporting success.
     entries_why: Option<String>,
 }
 
@@ -446,6 +453,41 @@ fn dress(button: &gtk::Button, last: &Option<Checked>, automatic: Automatic) {
 
 /// Ask the network and the cache, off the GTK thread, and hand the answer back
 /// on it.
+/// The short form of a transport error, for a window with one line to spare.
+///
+/// **`split(':').next()` was the first attempt and it produced "(https)".** The
+/// error begins with the URL it failed on, so the first colon is the one in
+/// `https://` -- and the window told the user their changelog was unavailable
+/// "(https)", which is not a reason. Reported with a screenshot.
+///
+/// The HTTP status is the part worth keeping; the rest is a whole 404 HTML
+/// document and stays on stdout, where the full error is already printed.
+fn short_reason(why: &str) -> String {
+    if let Some(at) = why.find("HTTP ") {
+        let tail = &why[at..];
+        let end = tail.find(|c: char| c == ':' || c == '\n').unwrap_or(tail.len());
+        return tail[..end].trim().to_string();
+    }
+    // No status in it -- a DNS failure, a timeout. Take the first line and
+    // bound it, rather than a fragment cut at a character that means nothing.
+    //
+    // **By characters, not bytes.** The first version of this bound was
+    // `&line[..59]` behind a `line.len() > 60` check, and `len()` counts bytes:
+    // a multi-byte character straddling offset 59 panics with "byte index 59 is
+    // not a char boundary". This branch is reached by transport errors -- DNS,
+    // TLS, a timeout -- whose text comes from the C library and is translated
+    // per `LC_MESSAGES`, so it is the users least likely to be writing the bug
+    // report who would have hit it. The panic lands inside the worker closure
+    // before it can send, so the window would have sat on "Checking…" for ever.
+    // `cordial_update::first_line` already did this correctly and is the
+    // pattern; this now matches it.
+    let line = why.lines().next().unwrap_or(why).trim();
+    match line.char_indices().nth(60) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    }
+}
+
 fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
     // `apk` is taken here rather than read on the worker so that nothing off the
     // main thread touches config the main thread owns.
@@ -455,30 +497,43 @@ fn check(apk: Option<PathBuf>, then: impl Fn(Checked) + 'static) {
             let metered = metered::current();
             let installed = cache::recorded_version(&install::engine_cache());
             let release = changelog::latest().and_then(|r| changelog::notes(&r).map(|n| (r, n)));
-            // Two requests rather than one, on the same worker: the DevForum
-            // gives the number, the Creator Hub gives the list. A failure here
-            // is recorded as `None` and nothing else changes, because the
-            // version comparison does not depend on it.
+            // Two independent requests on the same worker: the DevForum gives
+            // the announcement, the Creator Hub gives the table -- found by
+            // asking Roblox's own navigation which page it calls the current
+            // release, not by matching this major, which is the version
+            // arithmetic that used to live here and was the wrong question.
+            // A failure here is recorded as `None` and nothing else changes,
+            // because the version comparison does not depend on it, and
+            // fetching it at all is gated on `release` only because nothing
+            // shows it otherwise -- see `release_lines_full`.
             let mut entries_why = None;
-            let entries = release
-                .as_ref()
-                .ok()
-                .and_then(|(r, _)| match changelog::docs_notes(r.major) {
-                    Ok(entries) => Some(entries),
-                    Err(why) => {
-                        println!("[update] the release-notes table did not answer: {why}");
-                        // Truncated, because this carries the 404 body -- a
-                        // whole HTML document -- and the window has one line.
-                        // The full text is still on stdout above.
-                        let short = why.to_string();
-                        let short = short.split(':').next().unwrap_or(&short).trim().to_string();
-                        entries_why = Some(format!(
-                            "the release notes for engine {} are not published yet ({short})",
-                            r.major
-                        ));
-                        None
-                    }
-                });
+            let entries = release.as_ref().ok().and_then(|_| match changelog::docs_notes() {
+                Ok((DocsSource::CurrentRelease, entries)) => Some(entries),
+                // Roblox's navigation no longer named one "Current release" --
+                // renamed, restructured -- so the newest dated page stood in.
+                // Worth a line, the same way a stale table used to be, but
+                // this is not that: nothing here is behind an announcement,
+                // it is a label this window went looking for and did not find.
+                Ok((DocsSource::Newest { date }, entries)) => {
+                    // Not the same claim as the old "behind the announcement"
+                    // message: the entries below did arrive, and are shown.
+                    // This says only that the label this window looked for
+                    // was not the one Roblox's navigation used.
+                    entries_why = Some(format!(
+                        "Roblox's navigation did not label a current release; showing the \
+                         newest one listed instead, the week of {date}."
+                    ));
+                    Some(entries)
+                }
+                Err(why) => {
+                    println!("[update] the release-notes page did not answer: {why}");
+                    entries_why = Some(format!(
+                        "Changelog unavailable: Roblox's release notes ({}).",
+                        short_reason(&why.to_string())
+                    ));
+                    None
+                }
+            });
             // One more small request, and it is what makes the answer true.
             // The version list is metadata-sized -- about 100 kB -- against the
             // two this already makes, and `metered` governs the download rather
@@ -918,12 +973,18 @@ pub fn present(
                 }
                 // A degraded check is not a failed one and must not be styled
                 // as either silence or a failure. The version number arrived;
-                // it is the Creator Hub's per-entry table that did not, and
-                // saying which is the difference between "Cordial is broken"
-                // and "Roblox has not published that page yet".
+                // it is the Creator Hub's changelog that came back with a
+                // caveat or not at all, and `entries_why` already carries
+                // whichever sentence that was -- "unavailable" for the second,
+                // and a plainer note for the first, since a fallback that
+                // found something is not the same claim as one that found
+                // nothing. When neither applies -- the ordinary case, showing
+                // whatever Roblox calls the current release -- `entries_why`
+                // is `None` and this prints nothing, because a line explaining
+                // a non-problem is noise.
                 if let Some(why) = &checked.entries_why {
                     text.push('\n');
-                    text.push_str(&format!("Changelog unavailable: {why}."));
+                    text.push_str(why);
                 }
                 status_line.set_label(&text);
                 status_line.set_visible(true);
@@ -1618,6 +1679,43 @@ mod tests {
             created_at: "2026-07-29T18:44:52.923Z".into(),
             html: "<p>Hi all,<br>\nPleased to announce that it has landed.</p>".into(),
         }
+    }
+
+    /// **The reason shown to a user must be a reason.**
+    ///
+    /// The first version took everything before the first colon -- and the
+    /// error begins with the URL it failed on, so the colon it found was the
+    /// one in `https://`. The window told somebody their changelog was
+    /// unavailable "(https)", which was reported with a screenshot.
+    #[test]
+    fn a_short_reason_is_the_status_and_not_the_url_scheme() {
+        let real = "https://create.roblox.com/docs/release-notes/release-notes-736 \
+                    answered HTTP 404: <!DOCTYPE html><html lang=\"en-US\">";
+        assert_eq!(short_reason(real), "HTTP 404");
+        assert_ne!(short_reason(real), "https");
+
+        // No status at all: a first line, bounded, rather than a fragment cut
+        // at a character that means nothing here.
+        let dns = "https://create.roblox.com/x: could not resolve host";
+        let short = short_reason(dns);
+        assert!(!short.is_empty());
+        assert!(!short.contains('\n'));
+
+        // **The bound is in characters, and this is the case that panicked.**
+        // A multi-byte character straddling the old byte offset 59 aborted the
+        // worker thread. Transport errors come from the C library and are
+        // translated, so this is the ordinary shape of the message in any
+        // locale that is not English.
+        let translated = format!("{}é rest of a translated message", "x".repeat(58));
+        let short = short_reason(&translated);
+        assert!(short.ends_with('…'), "{short}");
+        assert_eq!(short.chars().count(), 61, "60 characters and the ellipsis");
+
+        // And a message that is entirely multi-byte, so every boundary is one
+        // the byte arithmetic would have got wrong.
+        let all_wide = "ネットワークに接続できません".repeat(8);
+        let short = short_reason(&all_wide);
+        assert!(short.chars().count() <= 61, "{short}");
     }
 
     fn checked(installed: Option<&str>, latest: Option<u32>) -> Checked {

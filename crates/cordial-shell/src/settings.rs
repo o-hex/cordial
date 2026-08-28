@@ -7,9 +7,11 @@
 //! the offending one off, plus enough of Cordial's own appearance and
 //! graphics preference to be usable, without a terminal.
 //!
-//! `AdwPreferencesWindow` with several `AdwPreferencesPage`s — Roblox, Updates,
-//! Appearance, General, Plugins — each becomes its own tab/sidebar entry for
-//! free; that is libadwaita's own page-switcher, not something built here.
+//! `AdwPreferencesDialog` with several `AdwPreferencesPage`s — Roblox, Updates,
+//! General, Plugins, Report — each becomes its own tab/sidebar entry for free;
+//! that is libadwaita's own page-switcher, not something built here. Appearance
+//! used to be its own page; its two groups live inside General now, and
+//! `build_preferences_window`'s own comment explains why.
 //!
 //! The Roblox page is newer than the argument above and is here for a different
 //! reason: nothing in Cordial used to record where a Roblox build lived, so the
@@ -578,13 +580,13 @@ fn build_performance_group(
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
 ) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder()
-        .title("Performance")
-        // Where these are applied -- the client's environment at launch rather
-        // than Roblox's own settings document -- is a fact about the
-        // implementation. What a user needs from it is only the consequence.
-        .description("Takes effect the next time you press Roblox.")
-        .build();
+    // No group description here or on Audio below: Graphics, the first group
+    // on this same page, already says "takes effect the next time you press
+    // Roblox", and this page has no search (search_enabled(false)), so every
+    // reader meets that sentence before reaching this one. Saying it a third
+    // time in a row is the exact restated-boilerplate the Appearance group's
+    // own history argues against.
+    let group = adw::PreferencesGroup::builder().title("Performance").build();
 
     let gamemode = adw::SwitchRow::builder()
         .title("Feral GameMode")
@@ -750,10 +752,13 @@ fn build_audio_group(
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
 ) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder()
-        .title("Audio")
-        .description("Takes effect the next time you press Roblox.")
-        .build();
+    // No description: the Graphics group is first on the General page this
+    // group is added to, and it already carries "takes effect the next time
+    // you press Roblox" -- with no search on this dialog
+    // (search_enabled(false)), every reader meets that sentence before this
+    // group, so repeating it here is the boilerplate the Appearance group's
+    // own history argues against.
+    let group = adw::PreferencesGroup::builder().title("Audio").build();
 
     let sinks = audio_devices::sinks();
     let chosen = config.borrow().audio_output.clone();
@@ -2130,8 +2135,8 @@ fn add_get_plugins_groups(
     page.add(&marketplace_listing);
 }
 
-/// Builds the settings dialog: Roblox, Updates, Appearance, General, Plugins,
-/// one `AdwPreferencesPage` each.
+/// Builds the settings dialog: Roblox, Updates, General, Plugins, Report, one
+/// `AdwPreferencesPage` each.
 ///
 /// **`AdwPreferencesDialog`, not `AdwPreferencesWindow`.** The window form has
 /// been deprecated since libadwaita 1.6 and the compiler had been saying so on

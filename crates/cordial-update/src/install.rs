@@ -53,12 +53,31 @@
 //! archive — and only then move anything into place. Every failure before that
 //! last step leaves the previous build exactly as it was.
 //!
-//! The swap itself is renames within one filesystem. It is not one atomic
-//! operation and cannot be; what makes the gap harmless is that the cache stamp
-//! is cleared *first*, so a process killed mid-swap leaves a cache that
-//! re-extracts on the next launch rather than an engine paired with the wrong
-//! assets. That pairing is the bug [`cache`](crate::cache) exists for and it is
-//! not worth reintroducing at the one moment it is easiest to hit.
+//! Two things move into place, separately, and each is made safe for a
+//! different reason.
+//!
+//! **The engine** is a single rename from the directory it was extracted into
+//! onto [`engine_dir`], so it is atomic on its own. The cache stamp is cleared
+//! *before* that rename rather than after, so a process killed on either side
+//! of it leaves a cache that re-extracts on the next launch rather than an
+//! engine claiming to belong to archives it does not match — the pairing bug
+//! [`cache`](crate::cache) exists for.
+//!
+//! **The two archives are not one rename**, and an earlier version of this
+//! swapped them one after the other with nothing to undo the first if the
+//! second failed — a process killed, or simply a copy that ran out of disk,
+//! between the two could leave an engine's carrier from one build sitting
+//! beside assets from another, on disk, with the marker and the (by-then
+//! cleared) stamp giving no sign anything was wrong. `adopt`'s `swap_archives`
+//! step fixes that by preparing every archive fully inside a directory of its
+//! own, off to the side of anything live, before touching `build` at all, and
+//! then promoting the whole set with each promoted file's previous content
+//! kept until every other file has landed too — so a failure partway through
+//! puts back what had already been swapped, and `build` ends up wholly the old
+//! pair or wholly the new one. What that cannot close is a kill landing in the
+//! gap between one rename syscall and the next during promotion itself; on one
+//! filesystem, without a further directory indirection this crate does not
+//! add, no set of plain renames can.
 
 use crate::apk;
 use crate::cache;
@@ -336,22 +355,28 @@ fn staged(
 /// [`Parts`] and a URL. Everything after "the bytes are here" is identical and
 /// having two copies of it would be how the two paths drift.
 ///
-/// **A file that is not already in the staging area is copied, not moved, and
-/// the copy lands by way of a temporary file and a rename.** The local
-/// provider hands back the archive at the path it already occupies, which on
-/// most machines is Sober's own package directory -- renaming it into
-/// Cordial's cache would take Roblox out from underneath Sober and break a
-/// working program to install this one. Streaming the copy straight onto the
-/// live path was tried first and was wrong: `fs::copy` opens its destination
-/// with truncation before a byte moves, and `live` is often the *previous*
-/// build, so a process killed mid-copy left an archive exactly as long as the
-/// copy had reached, and no further. Landing it beside `live` and renaming it
-/// in gives this path the same guarantee staging's own rename gets for free --
-/// `live` is either the old archive or the new one, in full, never a partial
-/// third thing. Inside staging a rename is correct and needs no such detour,
-/// because those files were fetched for this.
-/// Written beside a build Cordial installed, so it can tell its own work from
-/// somebody else's.
+/// **A file that is not already inside `build` is copied, not moved.** The
+/// local provider hands back the archive at the path it already occupies,
+/// which on most machines is Sober's own package directory -- renaming it
+/// into Cordial's cache would take Roblox out from underneath Sober and break
+/// a working program to install this one.
+///
+/// **Neither kind of file ever lands on `live` directly, and neither lands
+/// alone.** Streaming a copy straight onto the live path was tried first and
+/// was wrong: `fs::copy` opens its destination with truncation before a byte
+/// moves, and `live` is often the *previous* build, so a process killed
+/// mid-copy left an archive exactly as long as the copy had reached, and no
+/// further. `swap_archives` instead copies or renames every fetched archive
+/// into a `prepared` directory first, entirely off to the side of `build`,
+/// and only then promotes the whole set -- each promoted file's previous
+/// content parked in a `displaced` directory until every other file in the
+/// set has landed too, so one failing does not leave the rest half swapped.
+/// Both directories live inside [`STAGING`], which gets cleared with
+/// everything else fetched for this attempt; see `swap_archives` for why the
+/// promotion step itself is nothing but renames.
+///
+/// This constant's own file is written beside a build Cordial installed, so
+/// it can tell its own work from somebody else's.
 ///
 /// The contents do not matter and are not parsed; **its presence is the whole
 /// signal.** Anything richer would be a format to keep compatible for the sake
@@ -450,40 +475,13 @@ pub fn adopt(
     // the only program it exists to serve. The marker has no contents, so
     // writing it early costs nothing and closes the window entirely.
     let _ = std::fs::write(build.join(OURS), b"Installed by Cordial. Delete to disown.\n");
-    let mut base = build.join(BASE_APK);
-    let mut carrier_live = build.join(carrier_name);
-    for (name, path) in fetched {
-        let live = build.join(name);
-        if path == &live {
-            // Already where it belongs. Renaming a file onto itself is not an
-            // error but copying one onto itself truncates it, so this case is
-            // checked rather than discovered.
-        } else if path.starts_with(build) {
-            std::fs::rename(path, &live)
-                .map_err(|e| Failed::Io { path: live.display().to_string(), why: e.to_string() })?;
-        } else {
-            // See the doc comment on `OURS` for why this is a copy into a
-            // temporary file and a rename, rather than `fs::copy(path, &live)`
-            // directly: `live` is frequently the previous build, and streaming
-            // onto it truncates that build before the new one has fully landed.
-            let tmp = build.join(format!(".{name}.incoming"));
-            if let Err(e) = std::fs::copy(path, &tmp) {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(Failed::Io { path: tmp.display().to_string(), why: e.to_string() });
-            }
-            if let Err(e) = std::fs::rename(&tmp, &live) {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(Failed::Io { path: live.display().to_string(), why: e.to_string() });
-            }
-        }
-        if *name == BASE_APK {
-            base = live.clone();
-        }
-        if *name == carrier_name {
-            carrier_live = live;
-        }
-    }
 
+    swap_archives(fetched, build)?;
+    // Every name in `fetched` lands at `build.join(name)` or is refused before
+    // this point, so these are not read back out of the swap -- they are what
+    // it promises.
+    let base = build.join(BASE_APK);
+    let carrier_live = build.join(carrier_name);
 
     let engine_live = engine_into.join(engine::LIBRARY);
     std::fs::rename(&staged_engine, &engine_live)
@@ -502,6 +500,140 @@ pub fn adopt(
     }
 
     Ok(Installed { base, carrier: carrier_live, engine: engine_live, version })
+}
+
+/// Land every archive in `fetched` under `build`, as one unit: either all of
+/// them replace what was there, or none do.
+///
+/// **Two passes, not one.** The first -- "prepare" -- copies or moves each
+/// archive to a file inside [`STAGING`] named for its final slot, and touches
+/// nothing under `build` itself. A failure here, including a real one forced
+/// mid-copy with `ulimit -f`, leaves the previous build exactly as it was,
+/// because nothing live has been opened for writing yet. The second --
+/// "promote" -- does nothing but rename: every rename in it is a metadata
+/// change on one filesystem, not a write, so there is no data left for a size
+/// limit or a full disk to interrupt partway through. What is left is the gap
+/// between one rename syscall and the next, and that is what keeping the
+/// displaced originals is for: each promoted file's previous content is
+/// renamed aside rather than deleted, and kept until every file in the set has
+/// been promoted, so a later failure can put back everything that already
+/// landed. This is the fix for the bug this pair of passes replaced: an
+/// earlier version promoted each file as soon as it was ready, so a failure on
+/// the second of two files left the first one swapped and the second one not
+/// -- an engine's carrier from one build sitting beside assets from another,
+/// silently, because the marker and the (already-cleared) stamp gave no sign
+/// anything had gone wrong.
+fn swap_archives(fetched: &[(&'static str, PathBuf)], build: &Path) -> Result<(), Failed> {
+    let staging = build.join(STAGING);
+    let prepared_dir = staging.join("prepared");
+    let displaced_dir = staging.join("displaced");
+    // Cleared here rather than trusted to a caller. `install_into` clears the
+    // whole of `staging` before and after every attempt, but `adopt` -- and
+    // therefore this -- is also reachable directly from `provider`, which has
+    // no such wrapper, and a directory only one of two callers ever empties is
+    // exactly the shape of the bug that put a `.incoming` file outside every
+    // directory anything cleared.
+    let _ = std::fs::remove_dir_all(&prepared_dir);
+    let _ = std::fs::remove_dir_all(&displaced_dir);
+
+    let result = (|| -> Result<(), Failed> {
+        std::fs::create_dir_all(&prepared_dir).map_err(|e| Failed::Io {
+            path: prepared_dir.display().to_string(),
+            why: e.to_string(),
+        })?;
+        std::fs::create_dir_all(&displaced_dir).map_err(|e| Failed::Io {
+            path: displaced_dir.display().to_string(),
+            why: e.to_string(),
+        })?;
+
+        // Prepare: get every archive into `prepared_dir`, or note that it is
+        // already where it belongs. What is already inside `build` -- in
+        // practice `staging` itself, where a network fetch lands -- is moved
+        // rather than copied, because it was fetched for this install and
+        // nothing else needs it afterward; that is a rename, not a write of
+        // 100+ MB, and nothing that only limits bytes written can catch it
+        // mid-way. What is from outside `build` -- the local provider's
+        // shape, Sober's package directory in practice -- is copied, per the
+        // doc comment on `OURS`: it is not this install's to move away from
+        // whoever else is using it.
+        let mut ready: Vec<(&'static str, Option<PathBuf>)> = Vec::with_capacity(fetched.len());
+        for (name, path) in fetched {
+            let name = *name;
+            let live = build.join(name);
+            if path == &live {
+                // Already where it belongs -- the local provider returns this
+                // shape when `CORDIAL_APK_DIR` points at `build` itself.
+                // Nothing to prepare and nothing to promote.
+                ready.push((name, None));
+                continue;
+            }
+            let target = prepared_dir.join(name);
+            if path.starts_with(build) {
+                std::fs::rename(path, &target).map_err(|e| Failed::Io {
+                    path: target.display().to_string(),
+                    why: e.to_string(),
+                })?;
+            } else if let Err(e) = std::fs::copy(path, &target) {
+                let _ = std::fs::remove_file(&target);
+                return Err(Failed::Io { path: target.display().to_string(), why: e.to_string() });
+            }
+            ready.push((name, Some(target)));
+        }
+
+        // Promote: rename every prepared file into `build`, keeping enough
+        // behind to undo it. `applied` records, for each file already
+        // promoted, where its previous content went -- `None` when there was
+        // none, which a name fetched for the first time hits.
+        let mut applied: Vec<(PathBuf, Option<PathBuf>)> = Vec::with_capacity(ready.len());
+        for (name, target) in &ready {
+            let Some(target) = target else { continue };
+            let live = build.join(name);
+            let displaced = displaced_dir.join(name);
+            let had_previous = live.is_file();
+            if had_previous {
+                if let Err(e) = std::fs::rename(&live, &displaced) {
+                    unwind(&applied);
+                    return Err(Failed::Io {
+                        path: displaced.display().to_string(),
+                        why: e.to_string(),
+                    });
+                }
+            }
+            if let Err(e) = std::fs::rename(target, &live) {
+                if had_previous {
+                    let _ = std::fs::rename(&displaced, &live);
+                }
+                unwind(&applied);
+                return Err(Failed::Io { path: live.display().to_string(), why: e.to_string() });
+            }
+            applied.push((live, had_previous.then_some(displaced)));
+        }
+        Ok(())
+    })();
+
+    // Whatever `prepare` left unmoved on failure, and whatever `promote` left
+    // behind on success, is scratch this attempt owned start to finish.
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// Put back whatever [`swap_archives`] had already promoted.
+///
+/// Each entry names a different file, so nothing here depends on the order
+/// they are undone in -- reverse is just the shape a rollback conventionally
+/// takes, not a correctness requirement the way it would be if one entry
+/// could depend on another.
+fn unwind(applied: &[(PathBuf, Option<PathBuf>)]) {
+    for (live, displaced) in applied.iter().rev() {
+        match displaced {
+            Some(displaced) => {
+                let _ = std::fs::rename(displaced, live);
+            }
+            None => {
+                let _ = std::fs::remove_file(live);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

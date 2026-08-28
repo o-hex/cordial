@@ -128,16 +128,19 @@ a ported AOSP bionic linker, a bionic/glibc shim, libjnivm in place of Android's
 ART, and a framework layer that answers the calls the client makes into the
 platform. There is no emulation and no CPU translation.
 
-CORDIAL SHIPS NO ROBLOX BUILD AND CANNOT DOWNLOAD ONE. Roblox publishes no
+CORDIAL SHIPS NO ROBLOX BUILD. On first run it offers to fetch one and installs
+it only if Roblox's own signing certificate signed it. Roblox publishes no
 Android binary of its own -- its own endpoint answers supportsAndroidBinaries:
-false -- so the client comes from Google Play. Cordial runs the copy Sober has
-already unpacked, or an APK you supply yourself. Installed on its own it starts,
-finds no Roblox build and tells you so; that is the whole of what it can do
-until you give it one.
+false -- so the build comes from a third-party mirror, from a copy Sober has
+already unpacked, or from an APK you supply yourself. A local copy is preferred
+when there is one, and gets the same signature check either way.
 
-Cordial is early. You can sign in, load an experience and play it with a
-keyboard and mouse; text fields do not draw what you type, and the pointer is
-not captured in first person. The project's README says which claims were
+Run it by typing `cordial`.
+
+Cordial is early. You can sign in, load an experience, play with a keyboard and
+mouse, type into text fields and hear sound. Voice chat does not work, and on
+roughly one launch in three a signed-in client reaches the home screen and
+freezes; reopening usually works. The project's README says which claims were
 measured and how.
 
 %prep
@@ -177,6 +180,14 @@ export CORDIAL_BUILD_VERSION=%{describe}
 # configure -- so a shell installed without cordial-run beside it is a launcher
 # whose Launch button cannot find anything to launch.
 install -Dpm 0755 target/release/cordial-shell %{buildroot}%{_bindir}/cordial-shell
+# **`cordial` is the command; `cordial-shell` is the file.** Asked for on
+# 2026-08-28: nobody wants to type the second word. A symlink rather than a
+# rename so anything already invoking `cordial-shell` keeps working.
+# `cordial-run` deliberately gets no alias -- it is the loader the shell
+# launches and is not what anyone should run by hand. Note the doubled percent
+# signs above and below are not needed here, but a bare %%name in a comment is
+# expanded by rpm before the script runs, which has broken this file before.
+ln -sf cordial-shell %{buildroot}%{_bindir}/cordial
 install -Dpm 0755 target/release/cordial-run   %{buildroot}%{_bindir}/cordial-run
 
 # The square icons under packaging/icons/hicolor/, not the 680x480 banner at
@@ -295,6 +306,7 @@ appstream-util validate-relax --nonet \
 %{_datadir}/cordial/plugins/
 %doc README.md THIRD-PARTY-NOTICES.md
 %{_bindir}/cordial-shell
+%{_bindir}/cordial
 %{_bindir}/cordial-run
 %{_datadir}/applications/io.github.luohoa97.Cordial.desktop
 %{_datadir}/metainfo/io.github.luohoa97.Cordial.metainfo.xml

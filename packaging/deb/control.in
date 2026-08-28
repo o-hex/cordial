@@ -43,13 +43,14 @@ Description: run Roblox's official Android build natively on Linux
  makes into the platform. There is no emulator, no container and no virtual
  machine.
  .
- CORDIAL SHIPS NO ROBLOX BUILD AND CANNOT DOWNLOAD ONE. Roblox publishes no
- Android binary of its own, so the client comes from Google Play. Cordial
- runs the copy Sober has already unpacked, or an APK you supply yourself.
- Installed on its own it starts, finds no Roblox build, and tells you so;
- that is the whole of what it can do until you give it one.
+ CORDIAL SHIPS NO ROBLOX BUILD. On first run it offers to fetch one and
+ installs it only if Roblox's own signing certificate signed it. Roblox
+ publishes no Android binary of its own, so the build comes from a
+ third-party mirror, from a copy Sober has already unpacked, or from an APK
+ you supply yourself. Run it by typing `cordial`.
  .
  Cordial is early. You can sign in, load an experience and play it with a
- keyboard and mouse; text fields do not draw what you type, and the pointer
- is not captured in first person. See the project's README for what was
+ keyboard and mouse, type into text fields and hear sound. Voice chat does
+ not work, and on roughly one launch in three a signed-in client reaches the
+ home screen and freezes; reopening usually works. See the README for what was
  measured and how: https://github.com/luohoa97/cordial#readme

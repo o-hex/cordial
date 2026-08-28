@@ -157,6 +157,15 @@ jobs:
           restore-keys: appimage-cargo-
       - name: Build the AppImage
         run: packaging/appimage/build-appimage.sh --outdir dist/appimage
+      - name: Refuse a binary that needs a newer glibc than the floor
+        # One `log10f@GLIBC_2.43`, from a single `std::log10` on a float, made
+        # v0.10.0's .rpm uninstallable anywhere older than Fedora 44 and would
+        # have made the AppImage -- which bundles no libc -- run on nothing
+        # else. It was invisible because every builder and every developer
+        # machine is newer than every user. A container's glibc moving forward
+        # changes no line in this repository, so it needs a check rather than a
+        # habit.
+        run: ./packaging/check-glibc-floor.sh target/release/cordial-run target/release/cordial-shell
       - name: Upload the AppImage
         uses: actions/upload-artifact@v4
         with:
@@ -228,6 +237,15 @@ jobs:
         run: desktop-file-validate packaging/io.github.luohoa97.Cordial.desktop
       - name: Build the .deb
         run: packaging/deb/build-deb.sh --outdir dist/deb
+      - name: Refuse a binary that needs a newer glibc than the floor
+        # One `log10f@GLIBC_2.43`, from a single `std::log10` on a float, made
+        # v0.10.0's .rpm uninstallable anywhere older than Fedora 44 and would
+        # have made the AppImage -- which bundles no libc -- run on nothing
+        # else. It was invisible because every builder and every developer
+        # machine is newer than every user. A container's glibc moving forward
+        # changes no line in this repository, so it needs a check rather than a
+        # habit.
+        run: ./packaging/check-glibc-floor.sh target/release/cordial-run target/release/cordial-shell
       - name: Upload the .deb
         uses: actions/upload-artifact@v4
         with:

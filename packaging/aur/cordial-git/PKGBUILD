@@ -223,6 +223,9 @@ package() {
   # configure -- so a shell installed without cordial-run beside it is a
   # launcher whose Launch button cannot find anything to launch.
   install -Dm755 target/release/cordial-shell "$pkgdir/usr/bin/cordial-shell"
+  # See packaging/aur/cordial/PKGBUILD: `cordial` is the command and
+  # `cordial-shell` is the file. cordial-run gets no alias on purpose.
+  ln -sf cordial-shell "$pkgdir/usr/bin/cordial"
   # First-party plugins, read-only beside the binary.
   # Until the native packages existed nothing installed these anywhere, so the settings window listed no built-in plugins for anybody -- including Flatpak users, whose /app/share/cordial/plugins the code has looked in from the start and which has never existed.
   for plugin in plugins/*/; do

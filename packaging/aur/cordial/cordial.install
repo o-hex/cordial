@@ -6,24 +6,27 @@
 _note() {
   cat <<'MSG'
 
-Cordial ships no Roblox build, and it cannot download one.
+Cordial ships no Roblox build. On first run it offers to fetch one, and
+installs it only if Roblox's own signing certificate signed it.
 
 Roblox publishes no Android binary of its own -- its endpoint answers
-supportsAndroidBinaries: false -- so the client comes from Google Play. Cordial
-runs the copy Sober has already unpacked, or an APK you point it at yourself:
+supportsAndroidBinaries: false -- so the build comes from a third-party mirror,
+or from a copy Sober has already unpacked, or from an APK you point it at:
 
     ~/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/
 
-Without one, Cordial starts and tells you it found no Roblox build. That is the
-whole of what it can do until you supply one.
+A local copy is preferred when there is one: it costs no request and no bytes,
+and it gets the same signature check either way.
 
 Start it with `cordial-shell`, or from your application list. `cordial-run` is
 the loader the shell launches and is not what you run by hand.
 
-Cordial is early: you can sign in, load an experience and play with keyboard and
-mouse. Text fields do not draw what you type, and the pointer is not captured in
-first person. https://github.com/luohoa97/cordial#readme says which claims were
-measured and how.
+Cordial is early. You can sign in, load an experience, play with keyboard and
+mouse, type into text fields and hear sound. Not working: voice chat, and on
+roughly one launch in three a signed-in client reaches the home screen and
+freezes -- reopening usually works.
+https://github.com/luohoa97/cordial#readme says which claims were measured and
+how.
 
 MSG
 }

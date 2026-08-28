@@ -809,8 +809,21 @@ SLresult volume_GetVolumeLevel(SLVolumeItf self, SLmillibel* pLevel) {
     if (linear <= 0.0f) {
         *pLevel = SL_MILLIBEL_MIN;
     } else {
-        float mb = 2000.0f * std::log10(linear);
-        *pLevel = static_cast<SLmillibel>(std::max<float>(SL_MILLIBEL_MIN, std::min<float>(SL_MILLIBEL_MAX, mb)));
+        // **`double`, and the reason is packaging rather than precision.**
+        // glibc 2.43 added a correctly-rounded `log10f` and made it the
+        // default binding, so building this line against a 2.43 host emitted
+        // `log10f@GLIBC_2.43` -- and that one symbol, the only one in either
+        // binary above 2.39, made the `.rpm` refuse to install anywhere older
+        // with "nothing provides libm.so.6(GLIBC_2.43)(64bit)". It would have
+        // done the same to the AppImage, which bundles no libc and is supposed
+        // to be the portable one.
+        //
+        // `log10` has been `GLIBC_2.2.5` since before any of this and there is
+        // no version of glibc without it. The result is cast to an integer
+        // millibel two lines down, so nothing here wanted single precision in
+        // the first place.
+        double mb = 2000.0 * std::log10(static_cast<double>(linear));
+        *pLevel = static_cast<SLmillibel>(std::max<double>(SL_MILLIBEL_MIN, std::min<double>(SL_MILLIBEL_MAX, mb)));
     }
     return SL_RESULT_SUCCESS;
 }

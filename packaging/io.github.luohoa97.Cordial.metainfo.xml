@@ -37,8 +37,10 @@
     </p>
     <p>
       It is early. Signing in, loading an experience and playing it with keyboard
-      and mouse all work; text fields do not draw what you type, and the pointer
-      is not captured in first person. Install it expecting rough edges.
+      and mouse all work, text fields draw what you type, and sound plays. Voice
+      chat does not, and on roughly one launch in three a signed-in client
+      reaches the home screen and freezes; reopening usually works. Install it
+      expecting rough edges.
     </p>
   </description>
   <launchable type="desktop-id">io.github.luohoa97.Cordial.desktop</launchable>

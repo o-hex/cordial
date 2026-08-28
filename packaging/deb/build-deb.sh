@@ -76,6 +76,14 @@ trap 'rm -rf "$root"' EXIT
 # of current_exe and nowhere else, so a shell installed without cordial-run
 # beside it is a launcher whose Launch button cannot find anything to launch.
 install -Dm755 target/release/cordial-shell "$root/usr/bin/cordial-shell"
+# **`cordial` is the command; `cordial-shell` is the file.** Asked for on
+# 2026-08-28: nobody wants to type the second word, and every other launcher on
+# a desktop answers to its own name. A symlink rather than a rename so that
+# anything already invoking `cordial-shell` -- a .desktop file somebody edited,
+# a script, a bug report -- keeps working, and so the two binaries stay
+# obviously related in `ls /usr/bin`. `cordial-run` deliberately gets no alias:
+# it is the loader the shell launches and is not what anyone should run by hand.
+ln -sf cordial-shell "$root/usr/bin/cordial"
 install -Dm755 target/release/cordial-run   "$root/usr/bin/cordial-run"
 
 # **Strip our own two binaries, which are almost entirely debug info.**

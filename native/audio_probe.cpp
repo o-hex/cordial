@@ -10,6 +10,10 @@
 // above all does the microphone close when recording stops — cannot be answered
 // without a live PipeWire session, and were therefore not answered at all.
 //
+// `record-interlock` (added 2026-08-28) answers a fifth: does a second capture
+// owner get refused while a first is already recording, now that
+// `CaptureStream::open()` enforces that process-wide. See its own comment.
+//
 // This binary answers them. It links `opensles.cpp` and `pipewire_backend.cpp`
 // and calls `slCreateEngine` through the same C entry point the engine links
 // against, using the same Khronos vtable layouts, so what it exercises is the
@@ -20,7 +24,16 @@
 //     clang++ -std=c++17 -DCORDIAL_HAVE_PIPEWIRE=1 \
 //         -I/usr/include/pipewire-0.3 -I/usr/include/spa-0.2 \
 //         native/opensles.cpp native/pipewire_backend.cpp native/aaudio.cpp \
+//         native/alsa_backend.cpp native/pulse_backend.cpp native/oss_backend.cpp \
 //         native/audio_probe.cpp -ldl -lpthread -o /tmp/audio_probe
+//
+// The three backend files on the second line are not optional even though
+// this probe only ever exercises PipeWire: `pipewire_backend.cpp`'s own
+// `effective_backend_name`/`host_backend_available`/`make_output_stream` call
+// straight through to `pulse_available`/`alsa_available`/`oss_available` and
+// their `make_*_stream` counterparts (ADR-023's fallback chain), so without
+// them the link fails on those symbols rather than on anything PipeWire-shaped
+// — caught by actually running this command on 2026-08-28, not by reading it.
 //
 // It needs a running PipeWire session and it makes a real stream appear in it,
 // which is exactly why it must not run as part of an ordinary build.
@@ -553,6 +566,85 @@ int cmd_record(double seconds) {
     return cordial::audio::active_capture_streams() == 0 ? 0 : 1;
 }
 
+// ------------------------------------------------------ the interlock, live
+//
+// Review found that `opensles.cpp`'s `AudioRecorderObject` and
+// `audio_classes.cpp`'s `WebRtcAudioRecord` each open their own
+// `CaptureStream` with no shared state between them, so nothing stopped two
+// concurrent microphone captures. The fix lives in `CaptureStream::open()`
+// itself — refuse a second stream while `g_open_capture_streams` is already
+// nonzero — because that is the one place every capture owner in this file
+// funnels through, OpenSL's recorder and WebRTC's alike. This exercises that
+// primitive directly: real Android's own `AudioRecorderObject` for the first
+// stream (the same object `cmd_record` above drives), and a bare
+// `cordial::audio::CaptureStream` standing in for `WebRtcAudioRecord`'s own
+// member for the second, since `audio_classes.cpp`'s jnivm hooks are not
+// reachable from this probe without a JVM.
+int cmd_record_interlock() {
+    if (!create_engine()) return 1;
+
+    SLDataLocator_IODevice src_loc{SL_DATALOCATOR_IODEVICE, SL_IODEVICE_AUDIOINPUT,
+                                   SL_DEFAULTDEVICEID_AUDIOINPUT, nullptr};
+    SLDataSource source{&src_loc, nullptr};
+    SLDataLocator_AndroidSimpleBufferQueue snk_loc{SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 2};
+    SLDataFormat_PCM fmt{SL_DATAFORMAT_PCM, 1, 48000000, 16, 16,
+                         SL_SPEAKER_FRONT_CENTER, SL_BYTEORDER_LITTLEENDIAN};
+    SLDataSink sink{&snk_loc, &fmt};
+    SLInterfaceID ids[1] = {SL_IID_ANDROIDSIMPLEBUFFERQUEUE};
+    SLboolean req[1] = {SL_BOOLEAN_TRUE};
+
+    SLObjectItf recorder = nullptr;
+    SLresult r = (*g_engine)->CreateAudioRecorder(g_engine, &recorder, &source, &sink, 1, ids, req);
+    if (r != SL_RESULT_SUCCESS || !recorder) { mark("CreateAudioRecorder -> %u", r); return 1; }
+    (*recorder)->Realize(recorder, SL_BOOLEAN_FALSE);
+    SLRecordItf record = nullptr;
+    (*recorder)->GetInterface(recorder, SL_IID_RECORD, &record);
+    if (!record) { mark("no SLRecordItf"); return 1; }
+
+    r = (*record)->SetRecordState(record, SL_RECORDSTATE_RECORDING);
+    mark("FIRST-OPEN (OpenSL) SetRecordState(RECORDING) -> %u  (capture streams open: %u)", r,
+         cordial::audio::active_capture_streams());
+    if (r != SL_RESULT_SUCCESS || cordial::audio::active_capture_streams() != 1) {
+        mark("FAIL: the first, uncontested capture stream did not open");
+        return 1;
+    }
+
+    // The second owner: not the OpenSL surface again, but the same primitive
+    // `WebRtcAudioRecord::startRecording` opens, standing in for it directly.
+    cordial::audio::CaptureStream second;
+    bool opened_second = second.open(48000, 1, std::string());
+    mark("SECOND-OPEN (bare CaptureStream, first still recording) open() -> %s  "
+         "(capture streams open: %u)", opened_second ? "true" : "false",
+         cordial::audio::active_capture_streams());
+    if (opened_second || cordial::audio::active_capture_streams() != 1) {
+        mark("FAIL: a second capture stream opened while the first was still recording -- "
+              "the interlock did not hold");
+        (*recorder)->Destroy(recorder);
+        (*g_engine_obj)->Destroy(g_engine_obj);
+        return 1;
+    }
+    mark("interlock held: second capture stream was refused, first is undisturbed");
+
+    r = (*record)->SetRecordState(record, SL_RECORDSTATE_STOPPED);
+    mark("FIRST-CLOSE SetRecordState(STOPPED) -> %u  (capture streams open: %u)", r,
+         cordial::audio::active_capture_streams());
+    sleep_ms(500); // give the destroyed pw_stream's fetch_sub a moment to land
+
+    opened_second = second.open(48000, 1, std::string());
+    mark("SECOND-OPEN-RETRY (first closed) open() -> %s  (capture streams open: %u)",
+         opened_second ? "true" : "false", cordial::audio::active_capture_streams());
+    bool ok = opened_second && cordial::audio::active_capture_streams() == 1;
+    second.close();
+    mark("second closed (capture streams open: %u)", cordial::audio::active_capture_streams());
+
+    (*recorder)->Destroy(recorder);
+    (*g_engine_obj)->Destroy(g_engine_obj);
+    ok = ok && cordial::audio::active_capture_streams() == 0;
+    mark(ok ? "PASS: interlock refused concurrent capture, allowed sequential capture"
+            : "FAIL: see the marks above");
+    return ok ? 0 : 1;
+}
+
 // ------------------------------------------------ stopping from the callback
 //
 // The one recorder path that cannot be reached by driving the API politely
@@ -1020,13 +1112,14 @@ int main(int argc, char** argv) {
     if (cmd == "play") return cmd_play(seconds, amplitude, hz, false);
     if (cmd == "silence") return cmd_play(seconds, amplitude, hz, true);
     if (cmd == "record") return cmd_record(seconds);
+    if (cmd == "record-interlock") return cmd_record_interlock();
     if (cmd == "record-selfstop") return cmd_record_selfstop();
     if (cmd == "aaudio-record") return cmd_aaudio_record(seconds);
     if (cmd == "aaudio-record-never") return cmd_aaudio_record_never();
     if (cmd == "aaudio-play") return cmd_aaudio_play(seconds, amplitude, hz);
     std::fprintf(stderr,
-                  "usage: audio_probe devices|play|silence|record|record-selfstop|"
-                  "aaudio-play|aaudio-record|aaudio-record-never "
+                  "usage: audio_probe devices|play|silence|record|record-interlock|"
+                  "record-selfstop|aaudio-play|aaudio-record|aaudio-record-never "
                   "[--seconds N] [--amplitude A] [--hz F]\n");
     return 2;
 }

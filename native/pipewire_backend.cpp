@@ -1200,6 +1200,36 @@ CaptureStream::~CaptureStream() {
 bool CaptureStream::open(uint32_t rate_hz, uint32_t channels, const std::string& target_node_name) {
     if (impl_->stream) return true;
 
+    // Cordial has three independent owners of a `CaptureStream`:
+    // `AudioRecord` and `WebRtcAudioRecord` in `audio_classes.cpp`, and
+    // `AudioRecorderObject` in `opensles.cpp`. Nothing about the engine's own
+    // calling pattern rules out two of them recording at once -- Roblox could
+    // legitimately have a live voice call open through WebRTC while something
+    // else opens the OpenSL recorder that `SL_IID_RECORD` being linked implies
+    // exists -- and until review found it, nothing here stopped that: each
+    // owner opens its own stream against its own object, with no shared state
+    // between the files. Found, not merely unlikely, is the standard
+    // `AGENTS.md` sets for "make it impossible rather than unlikely" -- this
+    // is that fix, made here rather than divided across the three callers,
+    // because this is the one place all three funnel through and the one
+    // place the answer can be enforced rather than merely hoped for.
+    //
+    // A hard refusal rather than a queue or a shared handle: this project has
+    // no observed case of Cordial genuinely needing two concurrent captures,
+    // real Android's own microphone is a scarcer resource than PipeWire lets
+    // it look, and a caller told "no" gets exactly the same honest failure
+    // path every other refusal in this file already produces -- see
+    // `AGENTS.md`'s rule against a stub that reports success it did not
+    // deliver, which a second, silently-degraded capture stream would be a
+    // quieter version of.
+    if (g_open_capture_streams.load() != 0) {
+        std::fprintf(stderr,
+            "E/Cordial-OpenSLES         refusing a second capture stream while %u is already "
+            "open; Cordial does not support two microphone paths recording at once.\n",
+            g_open_capture_streams.load());
+        return false;
+    }
+
     Session* session = get_session();
     if (!session) return false;
     if (channels == 0 || channels > SPA_AUDIO_MAX_CHANNELS || rate_hz == 0) {

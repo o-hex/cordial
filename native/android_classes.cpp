@@ -1727,6 +1727,82 @@ void register_shared_preferences(ENV* env) {
     env->GetClass<Object>("java/lang/Object");
 }
 
+/// `Context.checkSelfPermission(String)`, needed for voice chat's uplink:
+/// `native/audio_classes.cpp`'s `WebRtcAudioRecord` implements
+/// `RECORD_AUDIO` capture, and the real Android class this stands in for
+/// checks this before ever calling `startRecording`.
+///
+/// `tools/dex_method.py` finds exactly one declared caller-side shape —
+/// `android/content/Context.checkSelfPermission(Ljava/lang/String;)I` — and no
+/// `android/support/v4/content/ContextCompat` or
+/// `androidx/core/content/ContextCompat`/`ActivityCompat` in this dex at all,
+/// so there is no compat shape to answer as well as the platform one. Two
+/// close relatives are declared and are not implemented here on the same
+/// "not observed" grounds `platform_classes.cpp`'s own header applies to
+/// `PackageManager` — `checkPermission(String,int,int)` and
+/// `checkCallingOrSelfPermission(String)` — both answerable identically if
+/// something is ever seen calling them.
+///
+/// **Always grants**, regardless of which permission string is asked about.
+/// That is not a shortcut specific to `RECORD_AUDIO`: Cordial has no
+/// permission system to consult for any permission, on this platform or any
+/// other Android one Roblox might ask about, so "granted" is the only honest
+/// answer available rather than one this file happens to prefer. The
+/// microphone rule at the top of `audio_classes.cpp` is what actually keeps
+/// the capture stream honest — tied to `startRecording`/`stopRecording`, not
+/// to a permission dialog nothing here can show. `PackageManager
+/// .PERMISSION_GRANTED` is `0`, a stable, long-public Android SDK constant
+/// the calling bytecode already has inlined at every call site rather than
+/// something this file looks up.
+static jint context_check_self_permission(ENV*, Object*, std::shared_ptr<String>) {
+    return 0; // PackageManager.PERMISSION_GRANTED
+}
+
+/// **`tools/hook_descriptors.py` does not check the hooks this function
+/// registers, and an earlier report claimed it did.** That tool only reads
+/// hook calls textually inside a method literally named `Register` (its own
+/// regex: `static void Register\s*\([^)]*\)\s*\{...`), because "each
+/// `Register()` body names one Java class then hooks onto it" is the shape
+/// every other class in this file follows. This function is a free function
+/// registering the same class three times in a loop instead, so it is
+/// invisible to that regex — silently, the same way a descriptor mismatch
+/// itself is silent, which is the exact failure mode the tool exists to
+/// catch and here does not.
+///
+/// Checked by hand instead, against the shipping dex, on 2026-08-28:
+///
+///     $ python3 tools/dex_method.py <dex-dir> checkSelfPermission
+///     android/content/Context.checkSelfPermission(Ljava/lang/String;)I
+///
+/// which matches what `context_check_self_permission` above registers --
+/// instance (`HookInstanceFunction`), one `String` parameter, `jint` return --
+/// and the same lookup restricted to `--class android/app/Activity` and
+/// `--class android/app/Application` found no match in either, confirming the
+/// comment above that only `Context` declares this call in the dex. This
+/// hand check covers exactly the one descriptor below; it is not a substitute
+/// for `hook_descriptors.py` learning to see free-function registrations, and
+/// nobody has made that change.
+void register_permission_checks(ENV* env) {
+    // Same three-class loop as `register_shared_preferences` above, and for
+    // the identical reason: the engine resolved this call against
+    // `android/content/Context` but the receiver it holds at any given call
+    // site may actually be the `Activity` or `Application` object
+    // `platform_classes.cpp` hands back from `ActivityThread.getApplication()`,
+    // and libjnivm dispatches on the receiver's own registered class rather
+    // than walking from it to a same-shaped differently-named one.
+    for (const char* klass :
+         {"android/content/Context", "android/app/Activity", "android/app/Application"}) {
+        env->GetClass<Object>(klass);
+        env->GetClass(klass)->HookInstanceFunction(env, "checkSelfPermission",
+                                                    &context_check_self_permission);
+    }
+    // Same reset as `register_shared_preferences` above, and required for the
+    // same measured reason: the loop just above leaves `jnivm::Object` mapped
+    // to whichever of the three classes it last touched, and every hook
+    // registered after this point derives its descriptor from that mapping.
+    env->GetClass<Object>("java/lang/Object");
+}
+
 } // namespace cordial
 
 extern "C" void cordial_register_android_classes(void* env_ptr) {
@@ -1750,6 +1826,7 @@ extern "C" void cordial_register_android_classes(void* env_ptr) {
     cordial::register_audio_classes(env);
     cordial::register_clipboard_classes(env);
     cordial::register_shared_preferences(env);
+    cordial::register_permission_checks(env);
     cordial::register_local_storage_classes(env);
     cordial::register_platform_classes(env);
     cordial::register_battery_classes(env);

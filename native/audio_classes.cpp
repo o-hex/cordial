@@ -44,15 +44,28 @@
 // user can see. `CaptureStream::close()` therefore destroys the `pw_stream`
 // rather than deactivating it.
 //
-// There are exactly two callers of `CaptureStream::open()` in Cordial:
-// `AudioRecord::startRecording` below, and
-// `AudioRecorderObject::start_capture` in `opensles.cpp`, which runs only from
-// `SLRecordItf::SetRecordState(SL_RECORDSTATE_RECORDING)`. Both close on stop,
-// on pause and on destroy. The OpenSL half of that was observed against
-// PipeWire's own registry on 2026-08-02: no capture node existed while the
-// recorder was merely realized, one appeared within half a second of
-// `RECORDING`, and it was gone again on `PAUSED`, on `STOPPED` and after
-// `Destroy` — including when the stop came from inside the buffer callback.
+// There are exactly three callers of `CaptureStream::open()` in Cordial:
+// `AudioRecord::startRecording` and `WebRtcAudioRecord::startRecording` below,
+// and `AudioRecorderObject::start_capture` in `opensles.cpp`, which runs only
+// from `SLRecordItf::SetRecordState(SL_RECORDSTATE_RECORDING)`. All three close
+// on stop, on pause (the OpenSL path only — neither `AudioRecord` nor
+// `WebRtcAudioRecord` has a pause state to close on) and on destroy. The
+// OpenSL half of that was observed against PipeWire's own registry on
+// 2026-08-02: no capture node existed while the recorder was merely realized,
+// one appeared within half a second of `RECORDING`, and it was gone again on
+// `PAUSED`, on `STOPPED` and after `Destroy` — including when the stop came
+// from inside the buffer callback. Re-run on 2026-08-28 against this same
+// `audio_probe.cpp` OpenSL path — the identical `CaptureStream` primitive
+// `WebRtcAudioRecord::startRecording`/`stop` call below, not a second one —
+// it held again: a `pw-dump` sampler independently caught the node while
+// `SL_RECORDSTATE_RECORDING` and not otherwise, and 590 buffers of real
+// samples were read across two record/pause cycles, proving data flowed
+// rather than the stream merely existing. A real `cordial-run` session with
+// this change built in, 25 s at Roblox's Landing screen with no voice call
+// joined, showed zero `cordial-`-named nodes in `pw-dump` throughout. What
+// that does not cover — `WebRtcAudioRecord`'s own JNI glue actually being
+// driven by the engine end to end — needs a live voice call; see this class's
+// own comment and the report accompanying the change that added it.
 //
 // Two consequences worth stating because they are the kind of thing a later
 // change makes by accident:
@@ -81,12 +94,22 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "aaudio.h"
 #include "pipewire_backend.h"
 
 namespace cordial {
+
+// Defined in `jni_shim.cpp`. Declared here, outside the anonymous namespace
+// below, because a declaration written *inside* it would name a distinct,
+// unique-per-translation-unit symbol rather than the real
+// externally-linked `cordial::process_env` -- a link error waiting to
+// happen the day `WebRtcAudioTrack`'s pump thread below actually needs it,
+// rather than the compile error it should be.
+jnivm::ENV* process_env();
+
 namespace {
 
 using jnivm::Class;
@@ -639,6 +662,64 @@ private:
     static AudioRecord* as(Object* o) { return dynamic_cast<AudioRecord*>(o); }
 };
 
+// ---------------------------------------------------------- WebRTC JNI plumbing
+//
+// Two things the three classes below share, lifted out here because
+// `WebRtcAudioManager`, `WebRtcAudioRecord` and `WebRtcAudioTrack` all need
+// both and a third copy is how a helper drifts out of sync with itself.
+
+/// Convert a C++ object into the `jobject` libjnivm expects, the way
+/// `init_params.cpp` does and for the same reason its own comment gives: a
+/// bare `Object*` has no `clazz` set, `GetObjectClass` then returns null, and
+/// every field or method lookup on it resolves against nothing. Needed here
+/// because `WebRtcAudioTrack`'s pump thread and `WebRtcAudioManager::init`
+/// both have to hand their own `this` back to a raw native function pointer
+/// as its `jobject thiz`.
+template <class T>
+static auto to_jni(ENV* env, const std::shared_ptr<T>& p) {
+    return jnivm::JNITypes<std::shared_ptr<T>>::ToJNIType(env, p);
+}
+
+/// Look up a native function pointer the *engine* registered on one of its
+/// own classes via `RegisterNatives`, the way `cordial_game_activity_start` in
+/// `game_activity.cpp` reaches AGDK's lifecycle natives.
+///
+/// This is not a style choice: `docs/analysis/jni-natives.tsv` -- the
+/// exported-symbol table every other JNI binding in this codebase is checked
+/// against -- has no `Java_org_webrtc_voiceengine_WebRtcAudioTrack_native...`
+/// entry for either `nativeCacheDirectBufferAddress` or `nativeGetPlayoutData`
+/// (nor a `nativeDataIsRecorded` for the record side), which means WebRTC's
+/// own C++ audio glue binds them dynamically instead of exporting them under
+/// the classic `javah` naming convention. libjnivm's ordinary method dispatch
+/// deliberately excludes anything bound this way -- `AllowNative` is false for
+/// a plain `GetMethodID`, and `CallVoidMethod` dispatches on `nativehandle`,
+/// which `RegisterNatives` never sets -- so a hook cannot reach these through
+/// `CallVoidMethod` and has to go through `Class::natives` directly instead,
+/// exactly as `game_activity.cpp`'s own comment on this same trick explains.
+///
+/// Returns null, rather than asserting, when nothing has registered the name
+/// yet: at the point `initPlayout` needs
+/// `nativeCacheDirectBufferAddress`, whether the engine's C++ has already
+/// called `RegisterNatives` on this class is a question this project has not
+/// yet had a live voice call to answer, and a null return lets the caller
+/// refuse cleanly rather than dereference nothing.
+void* find_registered_native(ENV* env, const char* class_name, const char* method_name) {
+    auto cls = env->GetClass(class_name);
+    if (!cls) return nullptr;
+    std::lock_guard<std::mutex> lock(cls->mtx);
+    auto it = cls->natives.find(method_name);
+    return it == cls->natives.end() ? nullptr : it->second;
+}
+
+// Defined after `WebRtcAudioManager`, forward-declared here so `init()` below
+// can call it; see the definition for what is verified against the dex and
+// what is recalled from WebRTC's public source. Returns whether the engine's
+// audio device module actually received these parameters -- `init()` reports
+// that back to the caller rather than a bare `true`, on the same stub-that-
+// lies grounds `AGENTS.md` opens on: an `init()` that always answers success
+// is exactly the shape of gap that stub-detection review looks for.
+bool cache_audio_parameters(ENV* env, Object* self, jlong native_audio_manager);
+
 // ------------------------------------- org.webrtc.voiceengine.WebRtcAudioManager
 
 /// `org.webrtc.voiceengine.WebRtcAudioManager`
@@ -650,28 +731,70 @@ private:
 /// finding that governs `MainGameActivity.bootstrapTheApp`), so the class is
 /// implemented here instead and answers from what Cordial can actually do.
 ///
-/// **`init()` reports failure, deliberately, and that is the current state of
-/// voice chat.** The parameter getters below are honest, but the uplink is
-/// only half the path: WebRTC also needs `WebRtcAudioTrack` for the downlink,
-/// which is not implemented, and an audio device module that has been told
-/// initialisation succeeded will proceed to open a microphone in order to
-/// send audio into a session it cannot play the other side of. Reporting
-/// failure here keeps the gap where someone can find it and — the part that
-/// matters for this file — means the microphone is never opened for a voice
-/// session that cannot work. See the report accompanying this change.
+/// **`init()` used to report failure, deliberately** — the parameter getters
+/// were honest, but the uplink was only half the path: WebRTC also needed
+/// `WebRtcAudioTrack` for the downlink, and an audio device module that had
+/// been told initialisation succeeded would proceed to open a microphone in
+/// order to send audio into a session it could not play the other side of.
+///
+/// **It now reports success**, because `WebRtcAudioTrack` below implements the
+/// downlink and `WebRtcAudioRecord` below implements the uplink, and the
+/// reason for refusing — an audio device module told to proceed into a
+/// session it could not complete either half of — is gone from both
+/// directions at once.
+///
+/// **Established, not assumed, and this is the part worth reading before
+/// touching either half again.** Whether WebRTC's own C++ audio device module
+/// has some other reason to treat either half as fatal to the other — the
+/// same shape of one-way door `aaudio.cpp`'s header documents for FMOD, where
+/// one refused `openStream` cost every subsequent path — is **UNVERIFIED**.
+/// It needs a live voice call to answer and neither this change nor the one
+/// that added `WebRtcAudioTrack` had one; see the report accompanying this
+/// change for exactly what was and was not run. If a signed-in session with
+/// voice chat active shows either direction never starting, that one-way-door
+/// question is the first thing to check, ahead of anything in
+/// `WebRtcAudioRecord` or `WebRtcAudioTrack` themselves.
 class WebRtcAudioManager : public Object {
 public:
-    static jboolean init(ENV*, Object*) {
+    /// The engine's own handle from `<init>(J)V`, threaded back through
+    /// `nativeCacheAudioParameters` below so its C++ side can find the object
+    /// it belongs to. Silently discarded before this class hooked its own
+    /// constructor — libjnivm builds a `WebRtcAudioManager` regardless of
+    /// whether `<init>` is hooked, so the gap was invisible rather than a
+    /// crash.
+    jlong nativeAudioManager = 0;
+
+    static std::shared_ptr<WebRtcAudioManager> ctor(ENV*, Class*, jlong native_audio_manager) {
+        auto m = std::make_shared<WebRtcAudioManager>();
+        m->nativeAudioManager = native_audio_manager;
+        return m;
+    }
+
+    /// `init()`. Hands the engine's own audio device module the parameters it
+    /// needs and reports back **whether that actually happened** — see
+    /// `cache_audio_parameters`'s own comment for where the field order comes
+    /// from and what in it is verified against the shipping dex versus
+    /// recalled from WebRTC's public source.
+    ///
+    /// This used to return `true` regardless of `cache_audio_parameters`'
+    /// outcome — found in review as the stub-that-lies shape `AGENTS.md`
+    /// opens on: `nativeCacheAudioParameters` not yet being registered is a
+    /// real, reachable gap (`cache_audio_parameters`'s own header names when),
+    /// and an `init()` that says success anyway sends the engine's audio
+    /// device module forward on parameters it never got, to fail somewhere
+    /// with no visible relationship to the cause.
+    static jboolean init(ENV* env, Object* self) {
+        auto* m = as(self);
+        const bool cached = cache_audio_parameters(env, self, m ? m->nativeAudioManager : 0);
         static bool said = false;
         if (!said) {
             said = true;
             std::fprintf(stderr,
-                "I/Cordial-Audio           WebRtcAudioManager.init reports failure: the "
-                "voice-chat downlink (WebRtcAudioTrack) is not implemented, and starting an "
-                "audio device module without it would open the microphone for a session "
-                "with no playback. Voice chat is unavailable; the microphone stays shut.\n");
+                "I/Cordial-Audio           WebRtcAudioManager.init reports %s: WebRtcAudioTrack "
+                "implements the downlink and WebRtcAudioRecord implements the uplink, so a voice "
+                "session can both send and receive.\n", cached ? "success" : "failure");
         }
-        return false;
+        return cached;
     }
 
     static void dispose(ENV*, Object*) {}
@@ -718,6 +841,7 @@ public:
     static void Register(ENV* env) {
         env->GetClass<WebRtcAudioManager>("org/webrtc/voiceengine/WebRtcAudioManager");
         auto c = env->GetClass("org/webrtc/voiceengine/WebRtcAudioManager");
+        c->Hook(env, "<init>", &WebRtcAudioManager::ctor);
     // Static on all of these, and the difference is not cosmetic. libjnivm binds
     // by descriptor: hooked as instance methods they registered cleanly and the
     // engine never reached one of them, so every answer below was a value
@@ -755,29 +879,157 @@ public:
         c->HookInstanceFunction(env, "isDeviceBlacklistedForOpenSLESUsage",
                                 &WebRtcAudioManager::isDeviceBlacklistedForOpenSLESUsage);
     }
+
+private:
+    static WebRtcAudioManager* as(Object* o) { return dynamic_cast<WebRtcAudioManager*>(o); }
 };
+
+/// `nativeCacheAudioParameters`, called once from `WebRtcAudioManager::init`.
+///
+/// **The argument count and every type are verified against the shipping
+/// dex**: `tools/dex_method.py` reports
+/// `WebRtcAudioManager.nativeCacheAudioParameters(IIIZZZZZZZIIJ)V` — three
+/// ints, seven booleans, two more ints, a long. **The field order and what
+/// each one means is recalled from WebRTC's own public
+/// `WebRtcAudioManager.java` (`storeAudioParameters()`), not read out of
+/// Roblox's bytecode body, and is `INFERRED`** — but the recollection is
+/// corroborated rather than assumed: laid out as sample rate, output
+/// channels, input channels, hardware AEC, hardware AGC, hardware NS, low
+/// latency output, low latency input, pro audio, AAudio, output buffer size,
+/// input buffer size, native handle, it reproduces `IIIZZZZZZZIIJ` exactly,
+/// which a wrong guess at the split between the seven booleans and the
+/// trailing pair of ints would not do by chance.
+///
+/// Every value passed is one this file already answers elsewhere in this
+/// class, so there is nothing here that could disagree with a getter a
+/// caller might check instead: mono both ways
+/// (`getStereoInput`/`getStereoOutput`), no hardware effects
+/// (`isAcousticEchoCancelerSupported` and its neighbours), no low-latency
+/// path (`isLowLatencyInputSupported`/`Output`), and a buffer size of
+/// `getLowLatencyOutputFramesPerBuffer()`'s own 10 ms figure — which is what
+/// `getMinOutputFrameSize` computes too once `sampleRate` is filled in, so
+/// the two formulas agree here regardless of which one real WebRTC actually
+/// evaluates.
+///
+/// Failure is a missing native, not a missing engine: if
+/// `RegisterNatives` has not reached this class yet, this logs once and
+/// returns `false` without inventing a call that has nowhere to land — the
+/// engine's C++ side then runs without the parameters it would have cached,
+/// which is a real gap and is reported as one, all the way out through
+/// `WebRtcAudioManager::init`'s own return value now, rather than silently
+/// skipped and then claimed as success.
+bool cache_audio_parameters(ENV* env, Object* self, jlong native_audio_manager) {
+    void* fn = find_registered_native(env, "org/webrtc/voiceengine/WebRtcAudioManager",
+                                       "nativeCacheAudioParameters");
+    if (!fn) {
+        std::fprintf(stderr,
+            "W/Cordial-Audio           WebRtcAudioManager.init: nativeCacheAudioParameters was "
+            "never registered by the engine; its own audio device module will not have these "
+            "figures cached, and init() is told so rather than reporting success anyway.\n");
+        return false;
+    }
+    using CacheFn = void (*)(JNIEnv*, jobject, jint, jint, jint, jboolean, jboolean, jboolean,
+                              jboolean, jboolean, jboolean, jboolean, jint, jint, jlong);
+    JNIEnv* jni = env->GetJNIEnv();
+    jobject thiz = (jobject)to_jni(env, self->shared_from_this());
+    constexpr jint kBufferFrames = DEFAULT_SAMPLE_RATE / 100; // 10 ms, matching the getters above
+    reinterpret_cast<CacheFn>(fn)(jni, thiz,
+        DEFAULT_SAMPLE_RATE, // sampleRate
+        1,                   // outputChannels (mono)
+        1,                   // inputChannels (mono)
+        JNI_FALSE,           // hardwareAEC
+        JNI_FALSE,           // hardwareAGC
+        JNI_FALSE,           // hardwareNS
+        JNI_FALSE,           // lowLatencyOutput
+        JNI_FALSE,           // lowLatencyInput
+        JNI_FALSE,           // proAudio
+        JNI_FALSE,           // aAudio
+        kBufferFrames,       // outputBufferSize, in frames
+        kBufferFrames,       // inputBufferSize, in frames
+        native_audio_manager);
+    return true;
+}
 
 // -------------------------------------- org.webrtc.voiceengine.WebRtcAudioRecord
 
 /// `org.webrtc.voiceengine.WebRtcAudioRecord`
 ///
 /// Roblox's actual microphone path, and therefore where the rule at the top of
-/// this file has to hold in practice rather than in principle.
+/// this file has to hold in practice rather than in principle: everything
+/// below opens `capture` from exactly one place (`startRecording`) and closes
+/// it from every path that can end a recording — `stopRecording`,
+/// `releaseAudioResources`, and the destructor, for the drop-without-stopping
+/// case `WebRtcAudioTrack::stop` and `opensles.cpp`'s `recorder_Destroy` both
+/// already guard against.
 ///
-/// `initRecording` reports failure. That is not a placeholder: reaching this
-/// class at all means `WebRtcAudioManager.init()` above already declined, so
-/// an engine arriving here has ignored that answer, and the one thing this
-/// file must not do is open the microphone for it anyway. Refusing keeps the
-/// promise; the alternative — opening a capture stream and delivering samples
-/// through `nativeDataIsRecorded` — is real work that belongs with a working
-/// downlink, not ahead of it.
+/// **Implemented now.** `initRecording` used to refuse unconditionally because
+/// this class had not yet hooked its own `<init>(J)V` and so had no
+/// `nativeAudioRecord` handle to hand back through `nativeDataIsRecorded` —
+/// the same handle `WebRtcAudioTrack` threads through its own constructor for
+/// `nativeGetPlayoutData`. `ctor` below closes that gap the same way.
 ///
-/// `stopRecording` still closes, and `setMicrophoneMute` is still recorded,
-/// because both are cheap and both are the sort of thing that must already be
-/// right on the day the rest is filled in.
+/// **The pull loop is `opensles.cpp`'s `AudioRecorderObject::run_pump`,
+/// applied to WebRTC's shape instead of OpenSL's, not a second design.** Both
+/// exist for the same underlying fact: `CaptureStream::read` never blocks —
+/// its own header says why, and it is the reason `AudioRecord::read` above
+/// leaves the polling to whichever Java thread calls it — so whatever drives
+/// this class has to supply its own wait. `opensles.cpp` polls at 2 ms because
+/// that is a quarter of the shortest buffer either caller uses, WebRTC's own
+/// 10 ms frame, and this class is that caller — it uses the same figure
+/// rather than picking a second one that could drift out of step with it.
+///
+/// **What is verified against the shipping dex and what is recalled**, on the
+/// same terms `WebRtcAudioTrack`'s own comment below sets out.
+/// `initRecording(II)I`, `startRecording()Z`, `stopRecording()Z`,
+/// `releaseAudioResources()V`, `nativeCacheDirectBufferAddress
+/// (Ljava/nio/ByteBuffer;J)V` and `nativeDataIsRecorded(IJ)V` all came from
+/// `tools/dex_method.py` against the shipping dex. That `initRecording`
+/// allocates a direct buffer sized to one 10 ms frame and returns its
+/// capacity in bytes, and that a dedicated thread stands in for WebRTC's own
+/// `AudioRecordThread` reading into that buffer and calling
+/// `nativeDataIsRecorded(bytesRead, nativeAudioRecord)` once per full frame,
+/// is recalled from WebRTC's long-public `WebRtcAudioRecord.java` and is
+/// `INFERRED` rather than read out of Roblox's bytecode body — Roblox's copy
+/// of this class is not decompiled anywhere in this tree, only its declared
+/// method table is.
+///
+/// **`setMicrophoneMute` stays exactly as it was: recorded, not acted on.**
+/// Real WebRTC zeroes the delivered buffer while muted rather than closing
+/// anything — a statement about *content*, which this file has no rule about,
+/// not about the *stream*'s existence, which is what the microphone rule
+/// above governs — but wiring that in is separate, small work this change
+/// does not take on, and the flag was already honestly documented as unused
+/// before this change touched anything else in this class.
+///
+/// **The one-way-door question `WebRtcAudioManager`'s own comment raises is
+/// exactly as open as it was**: whether WebRTC's C++ audio device module
+/// treats one half failing as fatal to the other has still not been observed
+/// from a live call, only reasoned about. See that class's comment and the
+/// report accompanying this change for what running signed-in sessions here
+/// actually established versus what still needs the maintainer's rig.
 class WebRtcAudioRecord : public Object {
 public:
     audio::CaptureStream capture;
+
+    /// The engine's own handle from `<init>(J)V`, handed back through
+    /// `nativeDataIsRecorded` exactly as `WebRtcAudioTrack::nativeAudioTrack`
+    /// is handed back through `nativeGetPlayoutData`.
+    jlong nativeAudioRecord = 0;
+
+    uint32_t sampleRate = DEFAULT_SAMPLE_RATE;
+    uint32_t channels = 1;
+
+    /// Same ownership rule as `WebRtcAudioTrack::playoutBuffer`: this is the
+    /// address `nativeCacheDirectBufferAddress` hands the engine, and it must
+    /// stay valid for exactly as long as this member does, independent of
+    /// whatever happens to the `jobject` wrapper built around it.
+    std::unique_ptr<uint8_t[]> recordBuffer;
+    uint32_t bufferBytes = 0;
+
+    std::thread pump;
+    std::atomic<bool> recording{false};
+    std::string targetNode;
+
     /// Process-wide, not per-instance, because `setMicrophoneMute` is static
     /// in the dex -- there is no receiver to hang it off. It was previously
     /// stored on the instance and set through a `dynamic_cast` of the receiver,
@@ -785,31 +1037,136 @@ public:
     /// method and so never bound at all.
     static inline std::atomic<bool> microphoneMuted{false};
 
-    static jint initRecording(ENV*, Object*, jint sampleRate, jint channels) {
-        std::fprintf(stderr,
-            "I/Cordial-Audio           WebRtcAudioRecord.initRecording(%d Hz, %d ch) "
-            "reports failure: voice chat has no downlink (see WebRtcAudioManager.init), so "
-            "the microphone is not opened. No capture stream was created.\n",
-            sampleRate, channels);
-        // Negative is WebRTC's own "initialisation failed" for this method; a
-        // zero frame count would be read as a successful init that produced an
-        // empty buffer, which is the ambiguity a stub should never introduce.
-        return -1;
+    static std::shared_ptr<WebRtcAudioRecord> ctor(ENV*, Class*, jlong native_audio_record) {
+        auto r = std::make_shared<WebRtcAudioRecord>();
+        r->nativeAudioRecord = native_audio_record;
+        return r;
     }
 
-    static jboolean startRecording(ENV*, Object*) {
-        // Unreachable if initRecording is honoured. Reported rather than
-        // silently ignored, because an engine that got here has ignored a
-        // failure and that is worth seeing in a log.
+    /// `initRecording(sampleRate, channels)`. Allocates the direct buffer and
+    /// hands its address to the engine; opens no capture stream yet, matching
+    /// every other object in this file that keeps construction and
+    /// Realize-equivalents silent until something actually asks to run — the
+    /// microphone rule would be worth nothing if this method already touched
+    /// PipeWire ahead of `startRecording`.
+    static jint initRecording(ENV* env, Object* self, jint sample_rate, jint num_channels) {
+        auto* r = as(self);
+        if (!r || sample_rate <= 0 || num_channels <= 0) {
+            std::fprintf(stderr,
+                "E/Cordial-Audio           WebRtcAudioRecord.initRecording(%d Hz, %d ch): "
+                "refusing an impossible format.\n", sample_rate, num_channels);
+            return -1;
+        }
+        // Below this point, a live `recording` means `run_pump` may right now
+        // be inside `capture.read(recordBuffer.get() + filled, ...)` on
+        // another thread. Reallocating `recordBuffer` and handing the engine
+        // a new address while that read is in flight is a use-after-free on
+        // whichever address the pump thread still holds -- not a wrong
+        // sample count, an actual dangling pointer -- so this refuses rather
+        // than risking it. Real WebRTC does not call `initRecording` a second
+        // time without an intervening `stopRecording`; there is nothing here
+        // to migrate a running recording onto a new format, only a refusal.
+        if (r->recording.load()) {
+            std::fprintf(stderr,
+                "E/Cordial-Audio           WebRtcAudioRecord.initRecording(%d Hz, %d ch): called "
+                "while already recording; reallocating recordBuffer now would free memory the "
+                "pump thread may be reading, so refusing rather than risking a use-after-free.\n",
+                sample_rate, num_channels);
+            return -1;
+        }
+        void* cache_fn = find_registered_native(
+            env, "org/webrtc/voiceengine/WebRtcAudioRecord", "nativeCacheDirectBufferAddress");
+        if (!cache_fn) {
+            std::fprintf(stderr,
+                "E/Cordial-Audio           WebRtcAudioRecord.initRecording: "
+                "nativeCacheDirectBufferAddress was never registered by the engine, so there is "
+                "nobody on the other end of a buffer this would hand over; refusing rather than "
+                "opening a microphone nothing will ever read from.\n");
+            return -1;
+        }
+        r->sampleRate = static_cast<uint32_t>(sample_rate);
+        r->channels = static_cast<uint32_t>(num_channels);
+        // 10 ms, WebRTC's own frame period and the same figure
+        // `WebRtcAudioTrack::initPlayout` and `WebRtcAudioManager`'s
+        // low-latency getters above already agree on.
+        uint32_t frames = r->sampleRate / 100;
+        if (frames == 0) frames = 1;
+        r->bufferBytes = frames * r->channels * 2; // S16
+        r->recordBuffer = std::make_unique<uint8_t[]>(r->bufferBytes);
+        std::memset(r->recordBuffer.get(), 0, r->bufferBytes);
+
+        JNIEnv* jni = env->GetJNIEnv();
+        jobject jbuf = jni->NewDirectByteBuffer(r->recordBuffer.get(),
+                                                 static_cast<jlong>(r->bufferBytes));
+        jobject thiz = (jobject)to_jni(env, r->shared_from_this());
+        using CacheFn = void (*)(JNIEnv*, jobject, jobject, jlong);
+        reinterpret_cast<CacheFn>(cache_fn)(jni, thiz, jbuf, r->nativeAudioRecord);
+
         std::fprintf(stderr,
-            "W/Cordial-Audio           WebRtcAudioRecord.startRecording called after "
-            "initRecording reported failure; refusing, and the microphone stays shut.\n");
-        return false;
+            "I/Cordial-Audio           WebRtcAudioRecord.initRecording(%d Hz, %d ch): %u byte "
+            "buffer cached with the engine; no capture stream until startRecording.\n",
+            sample_rate, num_channels, r->bufferBytes);
+        return static_cast<jint>(r->bufferBytes);
+    }
+
+    /// **One of exactly two places in Cordial that open the microphone** —
+    /// `AudioRecord::startRecording` above is the other, and
+    /// `pipewire_backend.h`'s own comment on `CaptureStream::open` names both
+    /// as the only permitted callers.
+    static jboolean startRecording(ENV* env, Object* self) {
+        auto* r = as(self);
+        if (!r || !r->recordBuffer) {
+            std::fprintf(stderr,
+                "W/Cordial-Audio           WebRtcAudioRecord.startRecording called before a "
+                "successful initRecording; refusing.\n");
+            return false;
+        }
+        if (r->recording.load()) return true;
+        void* data_fn = find_registered_native(
+            env, "org/webrtc/voiceengine/WebRtcAudioRecord", "nativeDataIsRecorded");
+        if (!data_fn) {
+            std::fprintf(stderr,
+                "E/Cordial-Audio           WebRtcAudioRecord.startRecording: nativeDataIsRecorded "
+                "was never registered by the engine; there is nowhere to deliver samples, so "
+                "refusing rather than opening a microphone that would record into nothing.\n");
+            return false;
+        }
+        // Read at the moment recording starts rather than cached, so
+        // switching the desktop's default microphone between two voice
+        // sessions is picked up without restarting the client — the same
+        // reasoning `AudioRecord::startRecording` above already applies.
+        r->targetNode = default_source_node_name();
+        if (!r->capture.open(r->sampleRate, r->channels, r->targetNode)) {
+            std::fprintf(stderr,
+                "E/Cordial-Audio           WebRtcAudioRecord.startRecording could not open a "
+                "capture stream; staying stopped rather than reporting a recording that is not "
+                "happening.\n");
+            return false;
+        }
+        r->recording.store(true);
+        // Captures a `shared_ptr`, not `this`, for the identical reason
+        // `WebRtcAudioTrack::startPlayout` does: the pump must not outlive the
+        // object it reads `recordBuffer`/`nativeAudioRecord` off.
+        auto self_ref = std::static_pointer_cast<WebRtcAudioRecord>(r->shared_from_this());
+        r->pump = std::thread([self_ref, data_fn] { self_ref->run_pump(data_fn); });
+        std::fprintf(stderr,
+            "I/Cordial-Audio           WebRtcAudioRecord.startRecording: microphone opened at "
+            "%u Hz, %u channel(s).\n", r->sampleRate, r->channels);
+        return true;
     }
 
     static jboolean stopRecording(ENV*, Object* self) {
-        if (auto* r = dynamic_cast<WebRtcAudioRecord*>(self)) r->capture.close();
+        if (auto* r = as(self)) r->stop();
         return true;
+    }
+
+    /// WebRTC calls this to release the underlying `AudioRecord` after a
+    /// recording has stopped, or on an error path that never started one.
+    /// `stop()` already handles both — it is idempotent whether or not a
+    /// recording is in progress — so this needs no separate logic, matching
+    /// `WebRtcAudioTrack::releaseAudioResources` immediately below in spirit.
+    static void releaseAudioResources(ENV*, Object* self) {
+        if (auto* r = as(self)) r->stop();
     }
 
     static void setMicrophoneMute(ENV*, Class*, jboolean mute) {
@@ -829,13 +1186,588 @@ public:
     static void Register(ENV* env) {
         env->GetClass<WebRtcAudioRecord>("org/webrtc/voiceengine/WebRtcAudioRecord");
         auto c = env->GetClass("org/webrtc/voiceengine/WebRtcAudioRecord");
+        c->Hook(env, "<init>", &WebRtcAudioRecord::ctor);
         c->HookInstanceFunction(env, "initRecording", &WebRtcAudioRecord::initRecording);
         c->HookInstanceFunction(env, "startRecording", &WebRtcAudioRecord::startRecording);
         c->HookInstanceFunction(env, "stopRecording", &WebRtcAudioRecord::stopRecording);
+        c->HookInstanceFunction(env, "releaseAudioResources",
+                                &WebRtcAudioRecord::releaseAudioResources);
         c->Hook(env, "setMicrophoneMute", &WebRtcAudioRecord::setMicrophoneMute);
         c->HookInstanceFunction(env, "enableBuiltInAEC", &WebRtcAudioRecord::enableBuiltInAEC);
         c->HookInstanceFunction(env, "enableBuiltInNS", &WebRtcAudioRecord::enableBuiltInNS);
         c->Hook(env, "getDefaultAudioSource", &WebRtcAudioRecord::getDefaultAudioSource);
+    }
+
+    /// Stops the pump and closes the capture stream. Idempotent — `stopRecording`
+    /// and `releaseAudioResources` both call it, and so does the destructor, on
+    /// the same reasoning `WebRtcAudioTrack::stop` and `opensles.cpp`'s
+    /// `recorder_Destroy` both state: a dropped object must not leave the
+    /// microphone open behind it, including when the engine drops it without
+    /// stopping first.
+    ///
+    /// No self-join guard is needed here the way `opensles.cpp`'s
+    /// `AudioRecorderObject::stop_capture` needs one for its own pump thread:
+    /// that guard exists because OpenSL ES's buffer-queue calling convention
+    /// explicitly permits calling `Destroy` from inside the very callback the
+    /// pump thread invokes, so a naive `join()` there can be a thread joining
+    /// itself. `nativeDataIsRecorded` is a data callback into WebRTC's audio
+    /// processing module, not a call back into `stopRecording`, and stopping a
+    /// real voice call happens from a different native thread — the same
+    /// asymmetry `WebRtcAudioTrack::stop` already relies on for its own
+    /// unconditional `pump.join()`.
+    ///
+    /// **Joins `pump` unconditionally, even down the "was already stopped"
+    /// branch** — found while proving `run_pump`'s guard above closes the
+    /// microphone: that guard can clear `recording` from the pump thread
+    /// itself, on the attach-failure path, without this function ever
+    /// running. A `stop()` that then took the fast branch on those grounds
+    /// used to return without joining, and `std::thread::~thread()` calls
+    /// `std::terminate()` on a still-joinable thread — so the destructor
+    /// below would have crashed the process the first time that rare path
+    /// was ever hit twice (attach fails, then the object is dropped with no
+    /// explicit `stopRecording`/`releaseAudioResources` in between). Not one
+    /// of the eight findings this change answers, but the same review that
+    /// found the leak is what surfaces a fix left half-finished, so it is
+    /// fixed alongside it rather than left for a tenth.
+    void stop() {
+        const bool was_recording = recording.exchange(false);
+        if (pump.joinable()) pump.join();
+        capture.close(); // idempotent; covers a stop before any start
+        if (was_recording) {
+            std::fprintf(stderr,
+                "I/Cordial-Audio           WebRtcAudioRecord: microphone closed.\n");
+        }
+    }
+
+    ~WebRtcAudioRecord() { stop(); }
+
+private:
+    static WebRtcAudioRecord* as(Object* o) { return dynamic_cast<WebRtcAudioRecord*>(o); }
+
+    /// Stands in for WebRTC's own `AudioRecordThread.run()`. Runs until
+    /// `stop()` clears `recording`.
+    ///
+    /// **Every exit from this function closes `capture`, structurally.**
+    /// This used to be an early return's job on the attach-failure path below
+    /// -- `recording.store(false); return;`, with no `capture.close()` beside
+    /// it -- and it was reachable in review: `cordial::process_env()` failing
+    /// left the object believing it was not recording while the PipeWire
+    /// capture stream `startRecording` opened stayed open underneath it. That
+    /// is exactly the state the microphone rule at the top of this file exists
+    /// to prevent, and it does not need to be that rare a path to be a real
+    /// bug: an early return that has to remember to close is the shape that
+    /// produces this, and the shape recurred once already (`WebRtcAudioTrack`'s
+    /// own copy, below). Closing in a guard's destructor removes the choice --
+    /// there is no return statement anywhere in this function, present or
+    /// future, that can skip it.
+    void run_pump(void* data_fn) {
+        // Closes `capture` and clears `recording` no matter which of this
+        // function's exits runs, including the one that used to leak. When
+        // `stop()` gets there first -- the ordinary path -- `recording` is
+        // already false and `capture.close()` is a no-op; see its own header
+        // for why that idempotence is guaranteed rather than assumed.
+        struct PumpCloser {
+            WebRtcAudioRecord* self;
+            ~PumpCloser() {
+                self->recording.store(false);
+                self->capture.close();
+            }
+        } closer{this};
+
+        // This thread did not exist when the process's `JavaVM` stood up, so
+        // without attaching it here every JNI call below finds nothing —
+        // `cordial::process_env()`'s own comment in `jni_shim.cpp` is the
+        // established reason to reach for `AttachCurrentThread` rather than
+        // `GetEnv`, exactly as `WebRtcAudioTrack::run_pump` already relies on
+        // it for the identical problem on the playback side.
+        auto* thread_env = cordial::process_env();
+        if (!thread_env) {
+            std::fprintf(stderr,
+                "E/Cordial-Audio           WebRtcAudioRecord pump: could not attach to the "
+                "process JavaVM; recording stops here.\n");
+            return; // `closer` clears `recording` and closes `capture` here.
+        }
+        JNIEnv* jni = thread_env->GetJNIEnv();
+        jobject thiz = (jobject)to_jni(thread_env, shared_from_this());
+        using DataIsRecordedFn = void (*)(JNIEnv*, jobject, jint, jlong);
+        auto data_is_recorded = reinterpret_cast<DataIsRecordedFn>(data_fn);
+
+        uint32_t filled = 0;
+        while (recording.load()) {
+            uint32_t got = capture.read(recordBuffer.get() + filled, bufferBytes - filled);
+            filled += got;
+            if (filled < bufferBytes) {
+                // `CaptureStream::read` never blocks -- its own header says
+                // why -- so this loop supplies the wait that stands in for
+                // `android.media.AudioRecord.read`'s blocking mode, at
+                // `opensles.cpp`'s own 2 ms figure: a quarter of the 10 ms
+                // frame this class and that one both poll for, chosen there
+                // with this caller already in mind.
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            // The engine reads fresh samples straight out of `recordBuffer` --
+            // the same address `initRecording` cached with it -- so nothing
+            // beyond the byte count and the handle is passed back.
+            data_is_recorded(jni, thiz, static_cast<jint>(bufferBytes), nativeAudioRecord);
+            filled = 0;
+        }
+    }
+};
+
+// --------------------------------------- org.webrtc.voiceengine.WebRtcAudioTrack
+//
+// `org.webrtc.voiceengine.WebRtcAudioTrack`
+//
+// The voice-chat downlink: playing back what the other side of a call sent.
+// Until this class existed, `WebRtcAudioManager::init()` refused specifically
+// because this was missing — see that class's own comment — so this is the
+// change that lets a signed-in client receive voice audio at all.
+//
+// **Which of Cordial's three audio paths carries voice chat was established
+// by running, not assumed.** A signed-in `cordial-run` reaching Roblox's Home
+// screen on 2.736.1408, `--dump-classes` against the real client, shows
+// exactly `org/webrtc/voiceengine/{WebRtcAudioManager,WebRtcAudioRecord,
+// WebRtcAudioTrack}` under `org/webrtc` — no `org/webrtc/audio/*` (the newer,
+// non-deprecated `JavaAudioDeviceModule` some WebRTC builds use instead) and
+// nothing under `com/roblox/audio` beyond the existing `AppRtcDeviceWrapper`.
+// `docs/analysis/observed-java-surface.md` recorded the same three classes
+// from an earlier, Landing-screen-only run, so this is not new information,
+// only fresher: the class list has not changed shape across at least one
+// build. AAudio's own input path (`native/aaudio.cpp`) and OpenSL ES's
+// recorder (`native/opensles.cpp`) are both real, both tested, and both
+// unrelated to voice specifically — their own headers say so, and neither
+// showed a request from a signed-in session that never touched voice chat.
+// **What was not run**: an actual voice call. Reaching one needs GUI
+// navigation into a voice-enabled experience, which this change did not have
+// a way to drive; see the report accompanying it for exactly what that
+// leaves unverified.
+//
+// **`nativeCacheDirectBufferAddress` and `nativeGetPlayoutData` are native
+// methods the *engine* provides, not ones Cordial answers.** Checked against
+// `docs/analysis/jni-natives.tsv` — the same exported-symbol table every other
+// JNI binding in this tree is checked against — and neither name appears
+// there as a `Java_org_webrtc_voiceengine_WebRtcAudioTrack_native...` export.
+// WebRTC's own C++ audio glue therefore binds them the way AGDK binds
+// `GameActivity`'s lifecycle methods: dynamically, through `RegisterNatives`,
+// which is why `find_registered_native` above exists and is used below
+// exactly as `cordial_game_activity_start` uses its own copy of the same
+// trick in `game_activity.cpp`.
+//
+// **The pull loop stands in for WebRTC's own `AudioTrackThread`.** Real
+// Android has a dedicated Java thread that loops calling
+// `nativeGetPlayoutData(sizeInBytes, nativeAudioTrack)` — which fills, in
+// place, the direct `ByteBuffer` whose address `initPlayout` cached with
+// `nativeCacheDirectBufferAddress` — and then blocks on
+// `android.media.AudioTrack.write(..., WRITE_BLOCKING)`. There is no Java
+// thread here, so `startPlayout` starts a C++ one that does the same two
+// things: pull, then block. The block is `PlaybackStream::enqueue` paced by
+// its drain callback, the identical mechanism `AudioDevice::write` above
+// already uses and for the identical reason given there — return immediately
+// instead and this thread pulls playout data as fast as the CPU allows,
+// wildly ahead of anything PipeWire is actually draining, rather than at the
+// rate audio is actually leaving the machine.
+//
+// **What is verified against the shipping dex and what is recalled.** Every
+// method name and full descriptor below — `initPlayout(IID)I`,
+// `nativeCacheDirectBufferAddress(Ljava/nio/ByteBuffer;J)V`,
+// `nativeGetPlayoutData(IJ)V`, and the rest — came from `tools/dex_method.py`
+// against the shipping dex, listed in the report accompanying this change.
+// That a `WebRtcAudioTrack` object is normally driven by an `AudioTrackThread`
+// pulling through a cached direct buffer, and that `initPlayout`'s three
+// arguments are sample rate, channel count and a buffer-size multiplier, is
+// recalled from WebRTC's own long-public `WebRtcAudioTrack.java` and is
+// `INFERRED` rather than read out of Roblox's bytecode body — Roblox's copy
+// of this class is not decompiled anywhere in this tree, only its declared
+// method table is. The buffer-size arithmetic below is Cordial's own choice
+// (WE are standing in for the Java method's entire implementation, so nothing
+// downstream depends on reproducing its exact original formula), not a
+// transcription of anything Roblox or WebRTC ships.
+//
+// **The one-way-door question is open, not answered.** `WebRtcAudioRecord`
+// above still refuses `initRecording`. Whether the engine's own audio device
+// module treats that as fatal to `WebRtcAudioTrack` too — the way a refused
+// `AAudioStreamBuilder_openStream` cost FMOD every subsequent audio path, per
+// `aaudio.cpp`'s header — has not been observed, because observing it needs a
+// live voice call. If a real session shows `startPlayout` never being called
+// at all, that is the first thing to check.
+class WebRtcAudioTrack : public Object {
+public:
+    /// The engine's own handle from `<init>(J)V`, handed back on every native
+    /// call below exactly as `WebRtcAudioManager::nativeAudioManager` is.
+    jlong nativeAudioTrack = 0;
+
+    uint32_t sampleRate = DEFAULT_SAMPLE_RATE;
+    uint32_t channels = 1;
+
+    /// The direct buffer's backing store. Owned here, not by the `jobject`
+    /// `initPlayout` hands the engine — a jnivm `ByteBuffer` is a thin wrapper
+    /// around whatever pointer it was built with
+    /// (`third_party/libjnivm/include/jnivm/bytebuffer.h`), so this address
+    /// stays valid for exactly as long as this member does, independent of
+    /// what happens to that wrapper object afterwards.
+    std::unique_ptr<uint8_t[]> playoutBuffer;
+    uint32_t bufferBytes = 0;
+
+    audio::PlaybackStream stream;
+    std::thread pump;
+    std::atomic<bool> playing{false};
+
+    /// Guards `owned_` and `open_` only. `stream` itself is never touched
+    /// while this is held — see `stop()`'s own comment for the deadlock that
+    /// rule exists to prevent, the same one `AudioDevice::close` documents
+    /// above for the identical reason.
+    std::mutex lock_;
+    std::condition_variable space_;
+    bool open_ = false;
+    std::vector<std::unique_ptr<uint8_t[]>> owned_;
+
+    static std::shared_ptr<WebRtcAudioTrack> ctor(ENV*, Class*, jlong native_audio_track) {
+        auto t = std::make_shared<WebRtcAudioTrack>();
+        t->nativeAudioTrack = native_audio_track;
+        return t;
+    }
+
+    /// `initPlayout(sampleRate, channels, bufferSizeFactor)`. Allocates the
+    /// direct buffer and hands its address to the engine; opens nothing on
+    /// PipeWire's side yet, matching every other object in this file that
+    /// keeps construction and Realize-equivalents silent until something
+    /// actually asks to run.
+    static jint initPlayout(ENV* env, Object* self, jint sample_rate, jint num_channels,
+                             jdouble buffer_size_factor) {
+        auto* t = as(self);
+        if (!t || sample_rate <= 0 || num_channels <= 0) {
+            std::fprintf(stderr,
+                "E/Cordial-Audio           WebRtcAudioTrack.initPlayout(%d Hz, %d ch): refusing "
+                "an impossible format.\n", sample_rate, num_channels);
+            return -1;
+        }
+        void* cache_fn = find_registered_native(
+            env, "org/webrtc/voiceengine/WebRtcAudioTrack", "nativeCacheDirectBufferAddress");
+        if (!cache_fn) {
+            std::fprintf(stderr,
+                "E/Cordial-Audio           WebRtcAudioTrack.initPlayout: "
+                "nativeCacheDirectBufferAddress was never registered by the engine, so there is "
+                "nobody on the other end of a buffer this would hand over; refusing rather than "
+                "caching one nothing will ever fill.\n");
+            return -1;
+        }
+        t->sampleRate = static_cast<uint32_t>(sample_rate);
+        t->channels = static_cast<uint32_t>(num_channels);
+        const double factor = buffer_size_factor > 0.0 ? buffer_size_factor : 1.0;
+        // 10 ms base period, matching `getLowLatencyOutputFramesPerBuffer` above
+        // and `AAudioManager`'s own capture burst -- one buffer size this whole
+        // file already agrees on, scaled by whatever margin the engine asked
+        // for.
+        uint32_t frames = static_cast<uint32_t>((sample_rate / 100.0) * factor);
+        if (frames == 0) frames = 1;
+        t->bufferBytes = frames * t->channels * 2; // S16
+        t->playoutBuffer = std::make_unique<uint8_t[]>(t->bufferBytes);
+        std::memset(t->playoutBuffer.get(), 0, t->bufferBytes);
+
+        JNIEnv* jni = env->GetJNIEnv();
+        jobject jbuf = jni->NewDirectByteBuffer(t->playoutBuffer.get(),
+                                                 static_cast<jlong>(t->bufferBytes));
+        jobject thiz = (jobject)to_jni(env, t->shared_from_this());
+        using CacheFn = void (*)(JNIEnv*, jobject, jobject, jlong);
+        reinterpret_cast<CacheFn>(cache_fn)(jni, thiz, jbuf, t->nativeAudioTrack);
+
+        std::fprintf(stderr,
+            "I/Cordial-Audio           WebRtcAudioTrack.initPlayout(%d Hz, %d ch, factor=%.2f): "
+            "%u byte buffer cached with the engine.\n", sample_rate, num_channels, factor,
+            t->bufferBytes);
+        return static_cast<jint>(t->bufferBytes);
+    }
+
+    /// **One of the paths that opens PipeWire playback for a voice session.**
+    /// Symmetric with `AudioRecorderObject::start_capture` in spirit even
+    /// though this is output rather than input: nothing plays until the
+    /// engine actually asks to start, and a failure here leaves nothing open
+    /// behind it.
+    static jboolean startPlayout(ENV* env, Object* self) {
+        auto* t = as(self);
+        if (!t || !t->playoutBuffer) {
+            std::fprintf(stderr,
+                "W/Cordial-Audio           WebRtcAudioTrack.startPlayout called before a "
+                "successful initPlayout; refusing.\n");
+            return false;
+        }
+        if (t->playing.load()) return true;
+        void* pull_fn = find_registered_native(
+            env, "org/webrtc/voiceengine/WebRtcAudioTrack", "nativeGetPlayoutData");
+        if (!pull_fn) {
+            std::fprintf(stderr,
+                "E/Cordial-Audio           WebRtcAudioTrack.startPlayout: nativeGetPlayoutData "
+                "was never registered by the engine; there is nothing to pull data from, so "
+                "refusing rather than opening a stream that would play silence forever.\n");
+            return false;
+        }
+        if (!t->stream.open(t->sampleRate, t->channels, /*bits_per_sample=*/16,
+                            /*container_bits=*/16, /*big_endian=*/false,
+                            /*max_pending_buffers=*/4, audio::configured_output_device())) {
+            std::fprintf(stderr,
+                "E/Cordial-Audio           WebRtcAudioTrack.startPlayout: PipeWire refused a "
+                "%u Hz, %u channel S16 stream.\n", t->sampleRate, t->channels);
+            return false;
+        }
+        t->stream.set_drain_callback(&WebRtcAudioTrack::drained, t);
+        t->stream.set_active(true);
+        {
+            std::lock_guard<std::mutex> guard(t->lock_);
+            t->open_ = true;
+        }
+        t->playing.store(true);
+        // Captures a `shared_ptr`, not `this` -- the pump must not outlive the
+        // object it reads `bufferBytes`/`nativeAudioTrack` off, and unlike
+        // `AudioRecorderObject`'s raw-pointer pump in `opensles.cpp`, this
+        // object's lifetime is ordinary `shared_ptr` refcounting rather than an
+        // explicit `Destroy()` this file controls the timing of.
+        auto self_ref = std::static_pointer_cast<WebRtcAudioTrack>(t->shared_from_this());
+        t->pump = std::thread([self_ref, pull_fn] { self_ref->run_pump(pull_fn); });
+        std::fprintf(stderr,
+            "I/Cordial-Audio           WebRtcAudioTrack.startPlayout: pulling playout data at "
+            "%u Hz, %u channel(s).\n", t->sampleRate, t->channels);
+        return true;
+    }
+
+    static jboolean stopPlayout(ENV*, Object* self) {
+        auto* t = as(self);
+        if (t) t->stop();
+        return true;
+    }
+
+    static void releaseAudioResources(ENV*, Object* self) {
+        auto* t = as(self);
+        if (t) t->stop();
+    }
+
+    static jint getBufferSizeInFrames(ENV*, Object* self) {
+        auto* t = as(self);
+        if (!t || t->channels == 0) return 0;
+        return static_cast<jint>(t->bufferBytes / (t->channels * 2));
+    }
+
+    // Android's volume steps are 0..`getStreamMaxVolume()`, and the value
+    // means nothing on its own -- only the ratio to the maximum does, which
+    // is why `setStreamVolume` below normalises against the same constant
+    // rather than passing the step count through unscaled.
+    static constexpr jint kVolumeSteps = 15;
+    static jint getStreamMaxVolume(ENV*, Object*) { return kVolumeSteps; }
+    static jint getStreamVolume(ENV*, Object*) { return kVolumeSteps; }
+    static jboolean setStreamVolume(ENV*, Object* self, jint volume) {
+        auto* t = as(self);
+        if (!t) return false;
+        const jint clamped = volume < 0 ? 0 : (volume > kVolumeSteps ? kVolumeSteps : volume);
+        t->stream.set_volume_linear(static_cast<float>(clamped) / kVolumeSteps);
+        return true;
+    }
+
+    /// Static in the dex, not instance -- found by
+    /// `tools/hook_descriptors.py`, exactly the check its own header says it
+    /// exists to make: hooked as instance methods, both of these below
+    /// registered cleanly and the engine would have called neither, ever,
+    /// silently. Static because both are process-wide switches on real
+    /// Android (one speakerphone, one audio-focus bucket per app, not one per
+    /// `AudioTrack`), not because no instance exists yet when they are called.
+    ///
+    /// Recorded, not yet acted on, the same honest gap
+    /// `WebRtcAudioRecord::microphoneMuted` above already documents for its
+    /// own static mute flag: there is currently at most one live
+    /// `WebRtcAudioTrack`, but nothing here tracks *which* one to reach from a
+    /// static context, so wiring this to `PlaybackStream::set_mute` is left
+    /// for whoever needs it rather than guessed at now.
+    static inline std::atomic<bool> speakerMuted{false};
+    static void setSpeakerMute(ENV*, Class*, jboolean mute) { speakerMuted.store(mute); }
+
+    /// Android's `AudioAttributes.USAGE_*`, which routes a stream between the
+    /// call and media audio-focus buckets in Android's own policy layer.
+    /// PipeWire has no equivalent stream property exposed through
+    /// `PlaybackStream`, so this is recorded nowhere and acted on nowhere --
+    /// an honest no-op rather than a claim this file cannot back up.
+    static void setAudioTrackUsageAttribute(ENV*, Class*, jint /*usage*/) {}
+
+    static void Register(ENV* env) {
+        env->GetClass<WebRtcAudioTrack>("org/webrtc/voiceengine/WebRtcAudioTrack");
+        auto c = env->GetClass("org/webrtc/voiceengine/WebRtcAudioTrack");
+        c->Hook(env, "<init>", &WebRtcAudioTrack::ctor);
+        c->HookInstanceFunction(env, "initPlayout", &WebRtcAudioTrack::initPlayout);
+        c->HookInstanceFunction(env, "startPlayout", &WebRtcAudioTrack::startPlayout);
+        c->HookInstanceFunction(env, "stopPlayout", &WebRtcAudioTrack::stopPlayout);
+        c->HookInstanceFunction(env, "releaseAudioResources",
+                                &WebRtcAudioTrack::releaseAudioResources);
+        c->HookInstanceFunction(env, "getBufferSizeInFrames",
+                                &WebRtcAudioTrack::getBufferSizeInFrames);
+        c->HookInstanceFunction(env, "getStreamMaxVolume", &WebRtcAudioTrack::getStreamMaxVolume);
+        c->HookInstanceFunction(env, "getStreamVolume", &WebRtcAudioTrack::getStreamVolume);
+        c->HookInstanceFunction(env, "setStreamVolume", &WebRtcAudioTrack::setStreamVolume);
+        c->Hook(env, "setSpeakerMute", &WebRtcAudioTrack::setSpeakerMute);
+        c->Hook(env, "setAudioTrackUsageAttribute", &WebRtcAudioTrack::setAudioTrackUsageAttribute);
+    }
+
+    /// Stops the pump and tears the stream down. Idempotent — `stopPlayout`
+    /// and `releaseAudioResources` both call it, and so does the destructor,
+    /// on the same reasoning `recorder_Destroy` states in `opensles.cpp`: a
+    /// dropped object must not leave anything playing behind it, including
+    /// when the engine drops it without stopping first.
+    ///
+    /// **Never call into `stream` while holding `lock_`.** `set_active`,
+    /// `clear` and `close` each take PipeWire's own thread-loop lock, and
+    /// `drained` -- called from that same thread -- takes `lock_`. Holding
+    /// `lock_` across any of the three is the identical AB-BA that froze the
+    /// client on 2026-08-22 for `AudioDevice::close`; see that method's own
+    /// comment for the captured stacks. `enqueue`, in `run_pump` below, is
+    /// the one `stream` method this rule does not cover, because
+    /// `PlaybackStream::enqueue`'s own contract is that it never blocks and
+    /// never takes that lock -- `AudioDevice::write` already relies on the
+    /// same fact to call it from inside its own equivalent of `lock_`.
+    ///
+    /// **Joins `pump` unconditionally, even when `open_` was already
+    /// false** — the same fix as `WebRtcAudioRecord::stop`'s own copy, found
+    /// for the identical reason: `run_pump`'s own `PumpCloser` can clear
+    /// `open_` from the pump thread itself, on the attach-failure path,
+    /// without this function running at all. Returning early without joining
+    /// used to leave `pump` joinable, and `std::thread::~thread()` calls
+    /// `std::terminate()` on a still-joinable thread when this object is
+    /// destroyed — a crash on top of whatever the guard already closed.
+    void stop() {
+        bool was_open;
+        {
+            std::lock_guard<std::mutex> guard(lock_);
+            was_open = open_;
+            open_ = false;
+            playing.store(false);
+            space_.notify_all();
+        }
+        if (pump.joinable()) pump.join();
+        if (!was_open) return; // nothing left to close: never opened, or the guard got here first.
+        stream.set_active(false);
+        stream.clear();
+        stream.close();
+        {
+            std::lock_guard<std::mutex> guard(lock_);
+            owned_.clear();
+        }
+        std::fprintf(stderr, "I/Cordial-Audio           WebRtcAudioTrack: playout stream closed.\n");
+    }
+
+    ~WebRtcAudioTrack() { stop(); }
+
+private:
+    static WebRtcAudioTrack* as(Object* o) { return dynamic_cast<WebRtcAudioTrack*>(o); }
+
+    /// Stands in for WebRTC's own `AudioTrackThread.run()`. Runs until `stop()`
+    /// clears `open_`/`playing`.
+    ///
+    /// **Every exit from this function closes `stream`, structurally**, for
+    /// the same reason and against the same bug class as
+    /// `WebRtcAudioRecord::run_pump` above: the attach-failure return below
+    /// used to clear `playing` and stop there, leaving the `PlaybackStream`
+    /// `startPlayout` opened still connected. Playback leaking is a smaller
+    /// harm than the microphone rule this file opens with -- there is no
+    /// desktop indicator for an open playback stream the way there is for
+    /// capture -- but it is the identical shape of bug (an early return that
+    /// had to remember to close, and did not), on the class this file already
+    /// names as `WebRtcAudioRecord`'s structural twin, so it gets the same
+    /// fix rather than a smaller one.
+    void run_pump(void* pull_fn) {
+        // Mirrors `stop()`'s own cleanup exactly -- same order, same "never
+        // call into `stream` while holding `lock_`" rule -- so that whichever
+        // of the two reaches `open_` first does the real work and the other
+        // finds it already false and does nothing. Ordinary shutdown still
+        // goes through `stop()`: it clears `open_`/`playing` and joins this
+        // thread, so by the time this destructor runs on that path `open_` is
+        // already false and this is a no-op, exactly like
+        // `WebRtcAudioRecord`'s `capture.close()` being idempotent above.
+        struct PumpCloser {
+            WebRtcAudioTrack* self;
+            ~PumpCloser() {
+                {
+                    std::lock_guard<std::mutex> guard(self->lock_);
+                    if (!self->open_) return; // stop() got here first; already closed.
+                    self->open_ = false;
+                    self->playing.store(false);
+                }
+                self->stream.set_active(false);
+                self->stream.clear();
+                self->stream.close();
+                {
+                    std::lock_guard<std::mutex> guard(self->lock_);
+                    self->owned_.clear();
+                }
+                std::fprintf(stderr,
+                    "I/Cordial-Audio           WebRtcAudioTrack: playout stream closed (pump "
+                    "exited without stop() -- see run_pump's own comment).\n");
+            }
+        } closer{this};
+
+        // This thread did not exist when the process's `JavaVM` stood up, so
+        // without attaching it here every JNI call below finds nothing --
+        // `cordial::process_env()`'s own comment in `jni_shim.cpp` is the
+        // established reason to reach for `AttachCurrentThread` rather than
+        // `GetEnv` for exactly this situation.
+        auto* thread_env = cordial::process_env();
+        if (!thread_env) {
+            std::fprintf(stderr,
+                "E/Cordial-Audio           WebRtcAudioTrack pump: could not attach to the "
+                "process JavaVM; playout stops here.\n");
+            return; // `closer` clears `open_`/`playing` and closes `stream` here.
+        }
+        JNIEnv* jni = thread_env->GetJNIEnv();
+        jobject thiz = (jobject)to_jni(thread_env, shared_from_this());
+        using GetDataFn = void (*)(JNIEnv*, jobject, jint, jlong);
+        auto get_data = reinterpret_cast<GetDataFn>(pull_fn);
+        static std::atomic<uint64_t> dropped{0};
+
+        while (playing.load()) {
+            // The engine writes fresh samples straight into `playoutBuffer` --
+            // the same address `initPlayout` cached with it -- so there is
+            // nothing to pass back beyond asking for the next block.
+            get_data(jni, thiz, static_cast<jint>(bufferBytes), nativeAudioTrack);
+
+            std::unique_lock<std::mutex> guard(lock_);
+            if (!open_) return;
+            auto owned = std::make_unique<uint8_t[]>(bufferBytes);
+            std::memcpy(owned.get(), playoutBuffer.get(), bufferBytes);
+            uint8_t* raw = owned.get();
+
+            // Blocking, on purpose, for the reason `AudioDevice::write` above
+            // blocks: this is the pacing for the whole path, standing in for
+            // `android.media.AudioTrack.write`'s own blocking mode, which real
+            // WebRTC's `AudioTrackThread` paces itself against. Spin instead
+            // and this thread pulls playout data as fast as the CPU allows.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            bool queued = stream.enqueue(raw, bufferBytes, raw);
+            while (!queued) {
+                if (!open_) return;
+                if (space_.wait_until(guard, deadline) == std::cv_status::timeout) break;
+                queued = stream.enqueue(raw, bufferBytes, raw);
+            }
+            if (queued) {
+                owned_.emplace_back(std::move(owned));
+            } else {
+                const uint64_t n = ++dropped;
+                if ((n & (n - 1)) == 0) {
+                    std::fprintf(stderr,
+                        "W/Cordial-Audio           WebRtcAudioTrack pump: no room after 500 ms, "
+                        "dropped %llu buffer(s) so far -- the playback stream is not draining.\n",
+                        static_cast<unsigned long long>(n));
+                }
+            }
+        }
+    }
+
+    /// Called from PipeWire's own thread once a previously enqueued buffer has
+    /// drained. Identical in shape to `AudioDevice::drained` above, for the
+    /// same reason: `owned_` and the erase-by-pointer match are the same
+    /// pattern, just applied to playout data pulled from the engine instead of
+    /// pushed by FMOD.
+    static void drained(void* buffer_context, void* user) {
+        auto* self = static_cast<WebRtcAudioTrack*>(user);
+        std::lock_guard<std::mutex> guard(self->lock_);
+        for (auto it = self->owned_.begin(); it != self->owned_.end(); ++it) {
+            if (it->get() == buffer_context) { self->owned_.erase(it); break; }
+        }
+        self->space_.notify_one();
     }
 };
 
@@ -1239,6 +2171,7 @@ void register_audio_classes(jnivm::ENV* env) {
     AudioRecord::Register(env);
     WebRtcAudioManager::Register(env);
     WebRtcAudioRecord::Register(env);
+    WebRtcAudioTrack::Register(env);
     FMOD::Register(env);
     AudioDevice::Register(env);
     audio_selftest();

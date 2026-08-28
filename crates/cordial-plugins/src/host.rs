@@ -62,6 +62,22 @@ impl Writer {
     }
 }
 
+/// What one publish achieved: [`Session::publish_core`], or the client's own
+/// `plugin_host::publish_core`, which is the one a running Cordial calls.
+///
+/// Two numbers rather than a `Result` because a publish cannot fail. Every
+/// plugin entitled to the event was either handed it or was too far behind to
+/// take it, and both of those are outcomes the caller may want to report and
+/// neither is an error it could act on.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Delivered {
+    pub sent: usize,
+    /// Plugins that did not take it: the queue was full, or the plugin has
+    /// gone. See [`Pump`] for why this is a number rather than a stall, and
+    /// [`Pump::plugin_gone`] for telling the two apart.
+    pub dropped: usize,
+}
+
 /// A plugin's own delivery queue, so publishing never blocks the publisher.
 ///
 /// **This exists because [`Plugin::push`] is a blocking write into a pipe.** A
@@ -76,18 +92,22 @@ impl Writer {
 /// up, and the event is **dropped and counted** rather than waited on. Dropping
 /// is the honest outcome for an observation -- there is no correct way to make
 /// the client wait -- and the count is what keeps it from being silent.
-/// What one [`Session::publish`] achieved.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Delivered {
-    pub sent: usize,
-    /// Plugins whose queue was full. See [`Pump`] for why this is a number
-    /// rather than a stall.
-    pub dropped: usize,
-}
-
+///
+/// This documentation used to sit on [`Delivered`], one item below, where the
+/// reasoning for the whole mechanism was filed under its counter and `Pump`
+/// itself had none. That was survivable while `Pump` was reachable only from
+/// this crate's own tests; it stopped being so when `plugin_host::publish_core`
+/// made it the primitive the shipping client's core bus is built on.
 pub struct Pump {
     tx: std::sync::mpsc::SyncSender<Push>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Set when a send found the channel disconnected, which means the pump's
+    /// own thread has ended -- the plugin's pipe refused a write, or the
+    /// process is gone. Kept apart from a full queue because the two look
+    /// identical to [`std::sync::mpsc::SyncSender::try_send`]'s caller and
+    /// send a reader of the shutdown report to opposite places: one says the
+    /// plugin was too slow, the other that it was not there.
+    gone: Arc<std::sync::atomic::AtomicBool>,
     /// Queued but not yet written. What [`Pump::flush`] waits on.
     in_flight: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -107,10 +127,19 @@ impl Pump {
             // Ends when the Sender is dropped, which happens when the Plugin
             // does. A write error ends it too: the plugin is gone, and
             // retrying into a closed pipe would spin.
-            for push in rx {
+            while let Ok(push) = rx.recv() {
                 let failed = writer.push(&push).is_err();
                 counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 if failed {
+                    // Whatever is still queued will never be written now, and
+                    // leaving it counted would make `flush` wait its entire
+                    // budget on a plugin that has already gone -- which at
+                    // shutdown is Cordial's exit paying for a dead process.
+                    // Draining is what decrements, so it is done here rather
+                    // than by letting the receiver drop with items in it.
+                    for _ in rx.try_iter() {
+                        counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    }
                     break;
                 }
             }
@@ -118,6 +147,7 @@ impl Pump {
         Pump {
             tx,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_flight,
         }
     }
@@ -127,7 +157,15 @@ impl Pump {
         // Counted before the send, so a flush racing an offer waits for it
         // rather than missing it. An over-count is corrected below.
         self.in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        match self.tx.try_send(push) {
+        let outcome = self.tx.try_send(push);
+        if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) = outcome {
+            // Remembered rather than merely counted, because the shutdown
+            // report is the one place anybody reads these numbers and
+            // "its queue was full" sends them to the queue depth and the
+            // plugin's read loop when the plugin was not slow at all.
+            self.gone.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        match outcome {
             Ok(()) => true,
             Err(_) => {
                 self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -137,8 +175,15 @@ impl Pump {
         }
     }
 
+    /// Everything this plugin did not receive, whatever the reason.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether any of that was because the plugin had stopped reading rather
+    /// than fallen behind. See `gone`.
+    pub fn plugin_gone(&self) -> bool {
+        self.gone.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Wait for what is queued to reach the plugin, up to `limit`.
@@ -607,6 +652,16 @@ mod tests {
     /// immediately rather than blocking. A genuinely wedged consumer -- alive,
     /// holding the pipe open, never reading -- is a harder fixture than this
     /// and does not exist here yet.
+    ///
+    /// **That last sentence stopped being true on 2026-08-28**:
+    /// `tests/fixtures/deaf_plugin.ts` is exactly such a consumer -- alive on a
+    /// timer, holding its stdin open, never reading -- and
+    /// `cordial-runtime`'s `plugin_host` tests use it for this property and for
+    /// the shutdown flush. This test is left on the reading fixture on purpose:
+    /// the numbers below are quoted in ADR-026, and changing what they were
+    /// measured against would make the ADR describe a run nobody did. A wedged
+    /// version of this test belongs beside the ones that already exist on the
+    /// host the client runs, which is where it now is.
     ///
     /// So what is actually demonstrated is the property that matters anyway:
     /// 4000 events at 4 KiB each, published in about 6 ms, with 3735 of them

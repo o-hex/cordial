@@ -1117,16 +1117,27 @@ pub fn set_mouse_lock_native(native: *mut c_void) {
 /// means it; here the caller keeps its own drag-driven lock instead, which is
 /// honest about resting on something other than the engine's word.
 ///
-/// **The direction of this call is the hypothesis worth being explicit about.**
-/// The native is a getter on `NativeInputInterface` and had never been called by
-/// Cordial, so nothing about a running session distinguishes "the platform is
-/// supposed to poll it" from "the engine calls something else and this is dead".
-/// Android has no pointer to lock, so the real client on real Android may never
-/// have a true answer to give — and a false that never changes is exactly what
-/// a dead getter and an idle one both look like. `CORDIAL_TRACE_MOUSE=1` prints
-/// every transition so that a session in first person settles it; until one
-/// has, the *engine-driven* half of pointer capture is `INFERRED` and the
-/// drag-driven half is not.
+/// **The direction of this call was the hypothesis worth being explicit about,
+/// and half of it is now measured.** The native is a getter on
+/// `NativeInputInterface` that Cordial had never called, so nothing
+/// distinguished "the platform is supposed to poll it" from "the engine calls
+/// something else and this is dead" — and a `false` that never changes is what
+/// a dead getter and an idle one both look like.
+///
+/// Two runs on 2026-08-28, `CORDIAL_TRACE_MOUSE=1`, 30 seconds each, identical:
+///
+/// ```text
+/// input: nativeGetMainWindowIsMouseLockedCenter resolved
+/// [cordial] nativeGetMainWindowIsMouseLockedCenter() -> false
+/// ```
+///
+/// So it resolves, it is called every pump, it answers, and it does not throw —
+/// the `FAILED` latch below never fires and `None` is never returned for that
+/// reason. **The dead-getter branch is closed.** What is still unmeasured is
+/// whether it ever answers `true`, which needs a session in first person or
+/// shift lock and cannot be had from the home page. Until one is run the
+/// *engine-driven* half of pointer capture stays `INFERRED` in that narrower
+/// sense, and the drag-driven half is not.
 ///
 /// Called through `call_static_bare_bool`, the same `(JNIEnv*, jclass)` shape
 /// every other `NativeInputInterface` native here is called with — see

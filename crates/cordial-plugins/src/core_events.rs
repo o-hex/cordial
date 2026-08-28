@@ -88,15 +88,34 @@ impl CoreEvent {
     }
 }
 
-/// The client was asked to start.
+/// The client was asked to start. Published by `load.rs` once the plugins are
+/// running, which is the first moment there is anybody to tell.
 pub const CLIENT_LAUNCH: &str = "client.launch";
 /// The engine reported itself ready.
+///
+/// **Declared, and published by nothing.** A plugin holding the capability
+/// will never receive it, and `plugins/discord-presence` has a branch on it
+/// that cannot be reached. Said here rather than left for somebody to find,
+/// because a name in this table reads as a promise: the honest signal is the
+/// engine's own `APP_READY` notification or its first present, and neither has
+/// a publisher yet. Whoever adds one deletes this paragraph and the note in
+/// `Capability::LifecycleRead`'s arm at the same time.
 pub const CLIENT_READY: &str = "client.ready";
-/// The client stopped, however it stopped.
+/// The client stopped, however it stopped. Published by `load.rs` on the way
+/// out, and waited for -- see `plugin_host::flush_core_events`.
 pub const CLIENT_SHUTDOWN: &str = "client.shutdown";
-/// The engine's version, once it is known.
+/// The engine's version, once it is known. Published by `load.rs` beside
+/// `CLIENT_LAUNCH`.
 pub const ENGINE_VERSION: &str = "engine.version";
 /// The window Roblox draws into changed size.
+///
+/// **Declared, and published by nothing**, for the same reason as
+/// `CLIENT_READY` and one of its own: the only place that knows is
+/// `android::window::dispatch_configure`, which the compositor drives and
+/// which runs on every actual size change -- a stream of them through an
+/// interactive drag. A publish there is bounded and would not stall it, but
+/// nobody has measured what a plugin receiving a drag's worth of these does,
+/// so it is left unwired rather than wired on the assumption.
 pub const WINDOW_RESIZED: &str = "window.resized";
 
 /// Every core event, with the capability that gates it.

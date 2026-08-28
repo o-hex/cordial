@@ -196,8 +196,22 @@ impl Capability {
                  settings are read once at startup and cannot be changed this way."
             }
             Capability::Log => "Write lines into Cordial's own log output. Nothing leaves this machine.",
+            // Every word of this arm is what the *payloads* carry, not what
+            // the event names suggest, and it had drifted from them the day
+            // the client started publishing. It said "launches, becomes ready
+            // and shuts down": three timings and a scope disclaimer, for a
+            // grant that also hands over the running profile's name and the
+            // Roblox build string. Profile names are user-chosen and
+            // routinely name the account, so somebody reading this to decide
+            // what a plugin learns about them was getting the wrong answer
+            // from the only place they are shown one -- ADR-007's rule that a
+            // privacy-relevant capability's UI states what it publishes.
+            // "Becomes ready" went for a plainer reason: nothing publishes
+            // `client.ready`, and a permission prompt must not promise an
+            // event Cordial never sends.
             Capability::LifecycleRead => {
-                "Know when the client launches, becomes ready and shuts down. Not what you play."
+                "Know when the client starts and stops, which of your profiles is running, and \
+                 which Roblox build it loaded. Not what you play."
             }
             // ADR-007 calls this out as privacy-relevant and says the UI
             // should state what it publishes rather than merely that it is on.

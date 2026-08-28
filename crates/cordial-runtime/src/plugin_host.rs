@@ -19,19 +19,43 @@
 //!   from the thread serving the publisher's `events.publish` call —
 //!   `cordial_plugins::host::Writer` is what makes that safe without also
 //!   sharing the read half, which stays owned by the one thread that reads
-//!   it.
+//!   it; and
+//! * every running plugin's core-event queue and the capabilities it was
+//!   granted, because the core bus (ADR-026) is published by the *client* --
+//!   from `load.rs`, on threads that never see a plugin at all -- and has to
+//!   find both from outside every serving thread.
 
 use cordial_plugins::broker::Broker;
+use cordial_plugins::capability::Capability;
+use cordial_plugins::core_events::{self, CoreEvent};
 use cordial_plugins::events::EventRegistry;
-use cordial_plugins::host::{authorise, Plugin as PluginProc, Writer};
+use cordial_plugins::host::{authorise, Delivered, Plugin as PluginProc, Pump, Writer};
 use cordial_plugins::presence::{DiscordPresence, PresencePayload};
 use cordial_plugins::protocol::{Push, Request, Response};
 use cordial_plugins::preferences;
 use cordial_plugins::settings::{self, Store};
 use cordial_plugins::{enablement, grants, manifest, notify, urlopen};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// One running plugin's end of the core bus: where an event is queued for it,
+/// and what it is allowed to hear.
+///
+/// The grant is kept here rather than looked up through a `Broker` because
+/// every serving thread owns its own `Broker` holding exactly one plugin's
+/// grant -- there is no shared broker to ask, and inventing one so the client
+/// could ask it would put a lock the engine's threads contend for in front of
+/// something that is only ever read.
+struct Listener {
+    /// Behind an `Arc` so [`flush_core_events`] can take a copy under the map
+    /// lock and then *release* it before waiting. Holding the lock across a
+    /// wait would put every publisher behind the flush, which is the blocking
+    /// publish this whole design exists to prevent, arriving through the lock
+    /// instead of through the pipe.
+    pump: Arc<Pump>,
+    granted: BTreeSet<Capability>,
+}
 
 /// State shared by every plugin's serving thread within one Cordial run.
 ///
@@ -44,12 +68,41 @@ struct Shared {
     /// thread can push into a subscriber's pipe without becoming the thread
     /// that reads that subscriber's own stdout.
     writers: Arc<Mutex<BTreeMap<String, Writer>>>,
+    /// The same plugins again, keyed the same way, for [`publish_core`].
+    ///
+    /// Separate from `writers` rather than folded into it because the two
+    /// paths are deliberately different: `events.publish` writes straight down
+    /// a `Writer` from the publishing plugin's own serving thread, and a core
+    /// event goes through a `Pump` so the client never waits. See
+    /// [`publish_core`] for why that distinction is the whole point.
+    listeners: Arc<Mutex<BTreeMap<String, Listener>>>,
 }
 
 impl Shared {
     fn new() -> Self {
-        Shared { events: Arc::new(Mutex::new(EventRegistry::new())), writers: Arc::new(Mutex::new(BTreeMap::new())) }
+        Shared {
+            events: Arc::new(Mutex::new(EventRegistry::new())),
+            writers: Arc::new(Mutex::new(BTreeMap::new())),
+            listeners: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
+}
+
+/// The one `Shared` this process runs, reachable from the client.
+///
+/// **This exists because the bug it fixes was that nothing reached the
+/// client at all.** ADR-026's core bus landed with its only producer on
+/// `cordial_plugins::host::Session`, which is constructed nowhere outside
+/// that crate's own tests -- so `plugins/discord-presence` called
+/// `lifecycle.subscribe`, was told `ok`, and then waited forever for a
+/// `cordial/client.launch` no code path could ever publish. The client
+/// publishes long after `start_all` has returned, from threads that hold none
+/// of its locals, so the map has to be reachable by name rather than passed
+/// down.
+static SHARED: OnceLock<Shared> = OnceLock::new();
+
+fn shared() -> &'static Shared {
+    SHARED.get_or_init(Shared::new)
 }
 
 /// Start every approved plugin. Returns how many are running.
@@ -72,7 +125,10 @@ pub fn start_all() -> usize {
     grants::migrate_legacy_into(&profile);
     let approved = grants::load(&grants::path_in(&profile));
     let store = Store::new(&profile);
-    let shared = Shared::new();
+    // The process-global one rather than a local, because the client's own
+    // `publish_core` calls arrive from `load.rs` after this function has long
+    // returned and can reach nothing this scope owns.
+    let shared = shared().clone();
     let mut started = 0usize;
 
     for plugin in found {
@@ -145,6 +201,19 @@ pub fn start_all() -> usize {
                 // around to inserting it, which would be a race against
                 // whichever plugin started first getting to publish first.
                 shared.writers.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), proc.writer());
+
+                // The core bus's end of the same plugin, registered at the
+                // same moment and for the same reason: a `client.launch`
+                // published the instant `start_all` returns must find this
+                // plugin, not race the thread that is about to serve it.
+                //
+                // A `Pump` rather than the `Writer` above -- see
+                // `publish_core`. Its own thread does the blocking write, so
+                // the client thread that published never touches this pipe.
+                shared.listeners.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    id.clone(),
+                    Listener { pump: Arc::new(Pump::start(proc.writer())), granted: granted.clone() },
+                );
 
                 let mut broker = Broker::new();
                 broker.grant(&id, granted);
@@ -263,6 +332,12 @@ fn serve(
     // undo (ADR-010). `unregister_plugin_root` is a no-op if this plugin
     // never registered one, so calling it unconditionally costs nothing.
     shared.writers.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    // And its core-event queue, so a plugin that died does not accumulate: a
+    // `Pump` whose plugin is gone would keep a queue, a thread and a grant
+    // alive for the rest of the run, and every later `publish_core` would
+    // count it as a recipient. Dropping the `Pump` closes its channel, which
+    // is what ends that thread.
+    shared.listeners.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     crate::android::asset::unregister_plugin_root(&id);
     proc.kill();
 }
@@ -307,13 +382,20 @@ fn dispatch(
             Err(message) => Response::Error { id: req.id, message },
         },
         "presence.clear" => respond(req.id, presence.clear()),
-        // Acknowledges the capability the way Session's does: there is
-        // nothing to subscribe to yet, because delivering a lifecycle event
-        // means the client's own run loop pushing one down this plugin's
-        // stdin at the moment it happens, and nothing in this file's reach
-        // owns that loop. Answering Ok here is honest about what it claims —
-        // "you hold lifecycle.read" — and not about delivery, which stays
-        // unimplemented rather than silently promised.
+        // An acknowledgement, and nothing more, because delivery is gated on
+        // the capability rather than on this call: `publish_core` sends every
+        // core event to every plugin holding the event's capability, whether
+        // or not it ever made this call. So `Ok` here means exactly "you hold
+        // lifecycle.read", which is what it has always meant.
+        //
+        // This comment used to end "delivery ... stays unimplemented rather
+        // than silently promised", which was honest when it was written and
+        // is not any more: `publish_core` below, and the `client.launch` and
+        // `engine.version` publishes in `load.rs`, are that delivery. Left as
+        // a note rather than deleted, because a plugin author reading only
+        // this arm would otherwise conclude a subscription is what makes
+        // events arrive, and then wonder why one that never subscribed still
+        // hears them.
         "lifecycle.subscribe" => Response::Ok { id: req.id, result: serde_json::Value::Null },
         "flags.list" => {
             let resolved = crate::flags::resolve(crate::flags::collect());
@@ -442,6 +524,14 @@ fn dispatch(
                 events.subscribers(event_type).into_iter().map(str::to_string).collect::<Vec<_>>()
             };
             let payload = req.params.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+            // **Straight down the `Writer`, not through the `Pump` the core
+            // bus uses, and that asymmetry is deliberate.** The reason a core
+            // event may never block is that its publisher is a thread the
+            // client is waiting on; the publisher here is a plugin's own
+            // serving thread, which exists to wait for exactly this plugin
+            // and blocks nothing else in the process. Widening this to the
+            // pump would make one plugin's publish lossy to buy a property
+            // this path does not need. See `publish_core`.
             let writers = shared.writers.lock().unwrap_or_else(|e| e.into_inner());
             for subscriber in subscribers {
                 if let Some(writer) = writers.get(&subscriber) {
@@ -495,6 +585,152 @@ fn respond(id: u64, result: Result<(), String>) -> Response {
         Ok(()) => Response::Ok { id, result: serde_json::Value::Null },
         Err(message) => Response::Error { id, message },
     }
+}
+
+/// Tell every plugin entitled to hear it that Cordial observed `name`.
+///
+/// **Called by the client, from the client's own threads**, which is the
+/// difference between this and everything else in this file. `name` is a
+/// `&'static str` from `cordial_plugins::core_events`; the wire name is built
+/// by `CoreEvent::wire_name` so the reserved `cordial/` prefix is never
+/// spelled at a call site and never assembled from anything a plugin said.
+///
+/// **Never blocks.** A push is a blocking write into a plugin's stdin, and a
+/// plugin that has stopped reading fills the pipe -- 64 KiB on Linux -- after
+/// which whoever published waits on a process that may never read again. For a
+/// core event that is a thread the client is waiting on, and the engine's
+/// looper polls millions of times a second; it cannot queue behind a wedged
+/// plugin. So each plugin has a `Pump` with a bounded queue, and a publish
+/// that finds it full drops the event and counts it rather than waiting.
+/// ADR-026 is explicit that this is the single property the bus must have.
+///
+/// **Gated per event family, never broadcast.** The capability comes from
+/// `core_events::capability_for`, which is a closed table: an event with no
+/// entry there requires a capability nobody holds and so reaches nobody. That
+/// is the safe direction for a name somebody adds and forgets to gate, and
+/// `core_events.rs` has a test asserting it.
+///
+/// What comes back is how many heard it and how many were too slow, so a
+/// caller that wants to notice can. There is nothing to fail: publishing is
+/// something the client does on its way past.
+pub fn publish_core(name: &'static str, payload: serde_json::Value) -> Delivered {
+    let Some(needed) = core_events::capability_for(name) else {
+        println!("  plugin core event {name:?} is not in the capability table, so nobody receives it");
+        return Delivered::default();
+    };
+    let event = CoreEvent::new(name, payload);
+    let push = Push { event: event.wire_name(), payload: event.payload };
+
+    let listeners = shared().listeners.lock().unwrap_or_else(|e| e.into_inner());
+    let mut delivered = Delivered::default();
+    for listener in listeners.values() {
+        if !listener.granted.contains(&needed) {
+            continue;
+        }
+        // Holding the map's lock across `offer` is safe precisely because
+        // every holder of it, this one included, only ever does bounded work
+        // under it: `offer` is a `try_send` that never waits, `start_all` and
+        // a serving thread on its way out do one map insertion or removal,
+        // and `flush_core_events` copies the pumps out and drops the lock
+        // before it waits on any of them. An earlier version of this comment
+        // claimed the flush was not a user of this lock at all, which was
+        // wrong and was the sentence that would have hidden the day somebody
+        // published a core event from the engine's own looper thread and
+        // found it queued behind a 500 ms shutdown wait.
+        if listener.pump.offer(push.clone()) {
+            delivered.sent += 1;
+        } else {
+            delivered.dropped += 1;
+        }
+    }
+    delivered
+}
+
+/// Wait for queued core events to reach every plugin, within `limit` in
+/// total. Names the plugins whose queue had not drained when it ran out.
+///
+/// **Call this before Cordial exits.** Delivery is asynchronous by design, so
+/// a publish followed by an exit is a race the exit wins and the last thing a
+/// plugin is told is the one thing it never hears -- which for
+/// `client.shutdown` is the whole point of the event.
+///
+/// **`limit` is the whole budget, not each plugin's share of it**, and that
+/// distinction is the entire reason this function exists rather than a loop
+/// over [`Pump::flush`] at the call site. `Pump::flush` takes a fresh deadline
+/// per call, so the obvious loop costs `limit` times however many plugins are
+/// running -- a number the *user* chooses by installing plugins -- while the
+/// comment above it and the line it prints both promise a fixed bound. A
+/// shutdown that a plugin can lengthen without limit is the blocking-publish
+/// hazard arriving at the one moment it is least welcome.
+///
+/// The lock is released before any waiting, so a publish arriving from another
+/// thread during shutdown is not held up by it either.
+pub fn flush_core_events(limit: std::time::Duration) -> Vec<String> {
+    let deadline = std::time::Instant::now() + limit;
+    let pumps: Vec<(String, Arc<Pump>)> = shared()
+        .listeners
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(id, l)| (id.clone(), l.pump.clone()))
+        .collect();
+
+    let mut stuck = Vec::new();
+    for (id, pump) in pumps {
+        // Whatever is left of the shared budget. A plugin reached with none of
+        // it left is still asked: `Pump::flush` returns true immediately for a
+        // queue that is already empty, so only a plugin that genuinely has
+        // something outstanding is named.
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if !pump.flush(left) {
+            stuck.push(id);
+        }
+    }
+    stuck
+}
+
+/// One plugin's core events that never arrived, and which of the two reasons
+/// it was.
+pub struct Undelivered {
+    pub id: String,
+    pub events: u64,
+    /// The plugin had stopped reading -- its pump's channel was disconnected,
+    /// which happens when a write to its stdin failed -- rather than merely
+    /// falling behind.
+    ///
+    /// **Separated because the report is the only place these numbers are
+    /// read, and it used to assert the wrong one.** It said "its queue was
+    /// full" for every drop, which sends the reader to `QUEUE_DEPTH` and to
+    /// the plugin's read loop for a plugin that had in fact crashed. That is
+    /// the instrument reporting a cause it cannot see, which is the failure
+    /// AGENTS.md opens with.
+    pub plugin_gone: bool,
+}
+
+/// How many core events each plugin never received, and why.
+///
+/// Only plugins that actually missed something appear. The count exists so a
+/// drop is not silent -- `native/opensles.cpp` reports failure rather than
+/// handing back a dead engine object for the same reason -- and nothing else
+/// in this process would ever print it.
+///
+/// A plugin that has already exited is not listed: `serve` drops its `Listener`
+/// on the way out and the count goes with the queue. Said plainly rather than
+/// left to be discovered, because "nothing was missed" is a weaker claim than
+/// it looks for a plugin that died mid-run.
+pub fn undelivered_core_events() -> Vec<Undelivered> {
+    shared()
+        .listeners
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(id, l)| Undelivered {
+            id: id.clone(),
+            events: l.pump.dropped(),
+            plugin_gone: l.pump.plugin_gone(),
+        })
+        .filter(|u| u.events > 0)
+        .collect()
 }
 
 /// Where plugins are installed, exposed so the loader can report it.
@@ -818,12 +1054,14 @@ mod tests {
     }
 
     /// The property the `Shared`/`Writer` refactor exists for, proven against
-    /// two real Deno processes and the exact `dispatch` a running Cordial
-    /// calls — not `cordial_plugins::host::Session`, which is a separate,
-    /// test-only construct that never runs inside the real client. If this
-    /// regressed, `events.publish` would answer `Ok` while silently reaching
-    /// nobody: exactly the "recorded but not enforced" shape this file's
-    /// wiring exists to close.
+    /// a real Deno process and the exact `dispatch` a running Cordial calls —
+    /// not `cordial_plugins::host::Session::handle`, which is still
+    /// constructed nowhere outside that crate's own tests and still never
+    /// serves a request inside the real client. (Its `Pump` now does: the
+    /// core bus below reuses it rather than growing a second one. `Session`
+    /// itself remains test-only.) If this regressed, `events.publish` would
+    /// answer `Ok` while silently reaching nobody: exactly the "recorded but
+    /// not enforced" shape this file's wiring exists to close.
     #[test]
     fn a_published_event_reaches_a_real_subscriber_through_the_shared_writer_map() {
         if std::process::Command::new("deno").arg("--version").output().is_err() {
@@ -914,6 +1152,310 @@ mod tests {
         assert!(joined.contains("subscribed: ok"), "got:\n{joined}");
         assert!(joined.contains("push: flag-manager/profile-changed"), "got:\n{joined}");
         assert!(joined.contains(r#""slot":3"#), "got:\n{joined}");
+    }
+
+    /// The process-global `SHARED` is one map for the whole test binary, and
+    /// `cargo test` runs these on parallel threads. A second test registering
+    /// a listener holding `lifecycle.read` while the first counts recipients
+    /// would make `sent` two -- a failure that has nothing to do with what
+    /// either test is about and would appear only sometimes. Every test that
+    /// touches the global map takes this first.
+    static GLOBAL_MAP: Mutex<()> = Mutex::new(());
+
+    /// **The bug this change fixes, in one test.** ADR-026's core bus landed
+    /// with `Session::publish_core` as its only producer, and `Session` is
+    /// constructed nowhere outside `cordial-plugins`' own tests — so a plugin
+    /// running under `cordial-run` called `lifecycle.subscribe`, was told
+    /// `ok`, and waited forever for a `cordial/client.launch` nothing
+    /// published. `plugins/discord-presence` is the shipped example that did
+    /// exactly that.
+    ///
+    /// A real Deno process on the receiving end, because a push arriving over
+    /// stdio from a thread that made no request for it is the part that
+    /// cannot be faked. Reuses `cordial-plugins`' own subscriber fixture: it
+    /// reports every push it receives, which is all this needs.
+    ///
+    /// **The control is the second plugin**, granted every capability except
+    /// `lifecycle.read`. Without it this would assert only that publishing
+    /// does something, not that the capability is what decides who hears it —
+    /// and a bus that delivered to everybody would pass just as well.
+    #[test]
+    fn a_core_event_reaches_the_plugin_holding_its_capability_and_no_other() {
+        if std::process::Command::new("deno").arg("--version").output().is_err() {
+            eprintln!("skipping: deno is not installed");
+            return;
+        }
+
+        let _serialised = GLOBAL_MAP.lock().unwrap_or_else(|e| e.into_inner());
+        let store = scratch_store("core-events");
+        let plugin_dir = scratch_plugin_dir("core-events");
+        let entry = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../cordial-plugins/tests/fixtures/events_subscriber.ts");
+
+        let mut listener = PluginProc::spawn("core-listener", &entry).expect("deno should start");
+        let mut deaf = PluginProc::spawn("core-deaf", &entry).expect("deno should start");
+
+        // Everything except lifecycle.read for the control, so the only
+        // difference between the two plugins is the one capability under
+        // test. Granting it nothing at all would leave "it was ignored
+        // because it holds nothing" as an alternative explanation.
+        let hearing: BTreeSet<Capability> = [Capability::LifecycleRead, Capability::Log].into_iter().collect();
+        let deafened: BTreeSet<Capability> = Capability::all()
+            .iter()
+            .copied()
+            .filter(|c| *c != Capability::LifecycleRead)
+            .collect();
+
+        register_for_test("core-listener", &listener, hearing);
+        register_for_test("core-deaf", &deaf, deafened);
+
+        // The client's own call, by name, exactly as `load.rs` makes it.
+        let delivered = publish_core(
+            cordial_plugins::core_events::CLIENT_LAUNCH,
+            serde_json::json!({"profile": "default"}),
+        );
+        assert_eq!(
+            delivered,
+            Delivered { sent: 1, dropped: 0 },
+            "exactly the plugin holding lifecycle.read should have been offered it"
+        );
+        assert!(
+            flush_core_events(std::time::Duration::from_secs(5)).is_empty(),
+            "the queue should have drained well inside five seconds"
+        );
+
+        // Written after the flush, so it cannot overtake the core event on
+        // the way down either pipe — which is what lets the control below
+        // assert an absence rather than merely a timeout. It also guarantees
+        // both processes say *something*, so a regression fails this test
+        // rather than hanging it on a `next_request` that never returns.
+        let sentinel = Push { event: "test/sentinel".into(), payload: serde_json::Value::Null };
+        for id in ["core-listener", "core-deaf"] {
+            let writers = shared().writers.lock().unwrap_or_else(|e| e.into_inner());
+            writers.get(id).expect("registered above").push(&sentinel).unwrap();
+        }
+
+        let heard = drive_until_sentinel(&mut listener, "core-listener", &store, &plugin_dir);
+        let ignored = drive_until_sentinel(&mut deaf, "core-deaf", &store, &plugin_dir);
+
+        listener.kill();
+        deaf.kill();
+        let mut listeners = shared().listeners.lock().unwrap_or_else(|e| e.into_inner());
+        let mut writers = shared().writers.lock().unwrap_or_else(|e| e.into_inner());
+        for id in ["core-listener", "core-deaf"] {
+            listeners.remove(id);
+            writers.remove(id);
+        }
+        drop(listeners);
+        drop(writers);
+
+        let heard = heard.join("\n");
+        assert!(heard.contains("push: cordial/client.launch"), "got:\n{heard}");
+        assert!(heard.contains(r#""profile":"default""#), "got:\n{heard}");
+
+        let ignored = ignored.join("\n");
+        assert!(
+            !ignored.contains("cordial/client.launch"),
+            "a plugin without lifecycle.read must hear nothing, got:\n{ignored}"
+        );
+        assert!(ignored.contains("push: test/sentinel"), "the control should still be alive, got:\n{ignored}");
+    }
+
+    /// The direction `core_events.rs` asserts, held to at this end too: an
+    /// event with no entry in the closed table requires a capability nobody
+    /// holds, so it reaches nobody — rather than falling through to a prefix
+    /// check that happens to pass. Needs no plugin at all, which is the
+    /// point: the refusal happens before anything is looked up.
+    #[test]
+    fn a_core_event_missing_from_the_capability_table_reaches_nobody() {
+        assert_eq!(
+            publish_core("network.connected", serde_json::json!({"host": "example"})),
+            Delivered::default()
+        );
+    }
+
+    /// **The property this change calls its most important, measured on the
+    /// path the client actually calls.**
+    ///
+    /// `cordial-plugins` has a test of the same shape, and it drives
+    /// `Session::publish_core` -- the host nobody runs. ADR-026's one measured
+    /// number comes from there too. That is the exact shape AGENTS.md opens
+    /// with and the shape this whole change exists to correct, so leaving the
+    /// boundedness claim verified only against the helper would have repeated
+    /// it one level up: a regression that made `plugin_host::publish_core`
+    /// block -- swapping the `Pump` for the direct `Writer`, or waiting on the
+    /// listeners lock while somebody else holds it -- would leave the two
+    /// tests above green, because a live reader with an empty queue never
+    /// fills anything.
+    ///
+    /// **This one does wedge a plugin**, which the cordial-plugins version
+    /// says at length it could not: `deaf_plugin.ts` is alive, holds the pipe
+    /// open and never reads a byte, so the pipe fills, the pump blocks on a
+    /// write that will never return, and the queue stays full for as long as
+    /// the test cares to look. Against the reading fixture the same publish
+    /// drained in 35 ms and demonstrated nothing about a reader that stops.
+    #[test]
+    fn publishing_a_core_event_is_bounded_time_however_far_behind_the_plugin_is() {
+        if std::process::Command::new("deno").arg("--version").output().is_err() {
+            eprintln!("skipping: deno is not installed");
+            return;
+        }
+        let _serialised = GLOBAL_MAP.lock().unwrap_or_else(|e| e.into_inner());
+
+        let entry = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../cordial-plugins/tests/fixtures/deaf_plugin.ts");
+        let mut behind = PluginProc::spawn("core-behind", &entry).expect("deno should start");
+        register_for_test(
+            "core-behind",
+            &behind,
+            [Capability::LifecycleRead, Capability::Log].into_iter().collect(),
+        );
+
+        // Comfortably more than QUEUE_DEPTH and more than a pipe will take,
+        // with a payload big enough that it cannot all be buffered.
+        let big = serde_json::json!({ "pad": "x".repeat(4096) });
+        let started = std::time::Instant::now();
+        let mut dropped = 0usize;
+        for _ in 0..4000 {
+            dropped += publish_core(
+                cordial_plugins::core_events::CLIENT_LAUNCH,
+                big.clone(),
+            )
+            .dropped;
+        }
+        let took = started.elapsed();
+
+        let reported = undelivered_core_events();
+        behind.kill();
+        shared().listeners.lock().unwrap_or_else(|e| e.into_inner()).remove("core-behind");
+        shared().writers.lock().unwrap_or_else(|e| e.into_inner()).remove("core-behind");
+
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "publishing 4000 core events took {took:?}; the client's cost is tracking \
+             the plugin's speed, which is the one property ADR-026 says this bus must have"
+        );
+        assert!(dropped > 0, "a plugin this far behind should have missed something");
+        // And the loss is counted rather than silent, by name, which is what
+        // the shutdown report reads.
+        assert_eq!(
+            reported.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+            vec!["core-behind"],
+            "the drop should be attributed to the plugin that could not keep up"
+        );
+        eprintln!("published 4000 in {took:?}, {dropped} dropped");
+    }
+
+    /// **The shutdown budget is the whole budget, not each plugin's share.**
+    ///
+    /// `Pump::flush` takes a fresh deadline per call, so the obvious loop over
+    /// it costs `limit` times however many plugins are running -- a number the
+    /// user chooses by installing plugins -- while `load.rs` prints a line
+    /// promising 500 ms. That is a bound the code could not keep, and this is
+    /// the test that would notice it coming back: two plugins that cannot take
+    /// what they were sent, one budget, and an elapsed time closer to one
+    /// budget than to two.
+    ///
+    /// The margin is wide on purpose. What it has to separate is 400 ms from
+    /// 800 ms, so a slow machine has to be twice as slow before this becomes
+    /// a false failure, and the sleep inside `Pump::flush` is 2 ms.
+    #[test]
+    fn the_shutdown_flush_is_bounded_once_rather_than_once_per_plugin() {
+        if std::process::Command::new("deno").arg("--version").output().is_err() {
+            eprintln!("skipping: deno is not installed");
+            return;
+        }
+        let _serialised = GLOBAL_MAP.lock().unwrap_or_else(|e| e.into_inner());
+
+        let entry = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../cordial-plugins/tests/fixtures/deaf_plugin.ts");
+        let hearing: BTreeSet<Capability> =
+            [Capability::LifecycleRead, Capability::Log].into_iter().collect();
+        let mut procs: Vec<PluginProc> = Vec::new();
+        for id in ["core-stuck-a", "core-stuck-b"] {
+            let proc = PluginProc::spawn(id, &entry).expect("deno should start");
+            register_for_test(id, &proc, hearing.clone());
+            procs.push(proc);
+        }
+
+        // Enough to fill both pipes and both queues, so each has something
+        // outstanding when the flush runs. Against `events_subscriber.ts` this
+        // drained in 35 ms and the test proved nothing: it reads as fast as the
+        // pump writes. `deaf_plugin.ts` never reads at all, which is what puts
+        // and keeps a queue in the state being measured.
+        let big = serde_json::json!({ "pad": "x".repeat(4096) });
+        for _ in 0..1000 {
+            publish_core(cordial_plugins::core_events::CLIENT_LAUNCH, big.clone());
+        }
+
+        let budget = std::time::Duration::from_millis(400);
+        let started = std::time::Instant::now();
+        let stuck = flush_core_events(budget);
+        let took = started.elapsed();
+
+        for mut proc in procs {
+            proc.kill();
+        }
+        let mut listeners = shared().listeners.lock().unwrap_or_else(|e| e.into_inner());
+        let mut writers = shared().writers.lock().unwrap_or_else(|e| e.into_inner());
+        for id in ["core-stuck-a", "core-stuck-b"] {
+            listeners.remove(id);
+            writers.remove(id);
+        }
+        drop(listeners);
+        drop(writers);
+
+        assert_eq!(stuck, vec!["core-stuck-a", "core-stuck-b"], "both should be named, and by name");
+        assert!(
+            took < std::time::Duration::from_millis(600),
+            "the flush took {took:?} against a 400 ms budget for two plugins; a deadline \
+             per plugin rather than one shared is what that looks like"
+        );
+    }
+
+    /// Register a spawned fixture on both shared maps the way `start_all`
+    /// does, so the test exercises the real `publish_core` rather than a
+    /// stand-in for it.
+    fn register_for_test(id: &str, proc: &PluginProc, granted: BTreeSet<Capability>) {
+        shared()
+            .writers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), proc.writer());
+        shared().listeners.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id.to_string(),
+            Listener { pump: Arc::new(Pump::start(proc.writer())), granted },
+        );
+    }
+
+    /// Serve `proc` until it reports the sentinel push, returning every log
+    /// line it produced. Terminates whether or not the core event arrived,
+    /// which is what keeps a regression a failure rather than a hang.
+    fn drive_until_sentinel(
+        proc: &mut PluginProc,
+        id: &str,
+        store: &Store,
+        plugin_dir: &Path,
+    ) -> Vec<String> {
+        let mut presence = DiscordPresence::new();
+        let mut logs: Vec<String> = Vec::new();
+        while let Some(Ok(req)) = proc.next_request() {
+            if req.method == "log.write" {
+                let message = req.params["message"].as_str().unwrap_or_default().to_string();
+                let done = message.contains("test/sentinel");
+                proc.reply(&Response::Ok { id: req.id, result: serde_json::Value::Null }).unwrap();
+                logs.push(message);
+                if done {
+                    break;
+                }
+                continue;
+            }
+            let res = dispatch(id, &req, store, &mut presence, shared(), plugin_dir, &[]);
+            if proc.reply(&res).is_err() {
+                break;
+            }
+        }
+        logs
     }
 
     #[test]

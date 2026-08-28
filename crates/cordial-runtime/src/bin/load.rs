@@ -4148,6 +4148,90 @@ fn main() -> ExitCode {
                                                     println!("  {n} plugin(s) running");
                                                 }
 
+                                                // ADR-026's core bus, from the
+                                                // client rather than from a
+                                                // plugin. Until this line
+                                                // existed the bus had no
+                                                // producer under `cordial-run`
+                                                // at all: `discord-presence`
+                                                // called `lifecycle.subscribe`,
+                                                // was told `ok`, and then waited
+                                                // for a `cordial/client.launch`
+                                                // nothing in the shipping client
+                                                // could publish.
+                                                //
+                                                // Published here rather than at
+                                                // the top of `main`, where the
+                                                // client was actually asked to
+                                                // start, because plugins are
+                                                // deliberately started late --
+                                                // see the comment above -- and a
+                                                // publish before `start_all` has
+                                                // nobody to reach. This is the
+                                                // first moment the fact can be
+                                                // told, not the moment it became
+                                                // true.
+                                                //
+                                                // The profile's *name*, not its
+                                                // path. A plugin may reasonably
+                                                // key what it remembers by which
+                                                // profile is running; it has no
+                                                // business learning where the
+                                                // user's home directory is, and
+                                                // ADR-007's rule that a plugin
+                                                // gets the effect rather than the
+                                                // channel reads the same way here.
+                                                cordial_runtime::plugin_host::publish_core(
+                                                    cordial_plugins::core_events::CLIENT_LAUNCH,
+                                                    serde_json::json!({
+                                                        "profile": cordial_runtime::profile::active()
+                                                            .file_name()
+                                                            .map(|n| n.to_string_lossy().into_owned()),
+                                                    }),
+                                                );
+
+                                                // `engine_ver`, read once
+                                                // during bring-up, rather than
+                                                // `engine_version(&opt.lib_dir)`
+                                                // again here. This line called
+                                                // it a second time, on the
+                                                // reasoning that
+                                                // `build_user_agent` reads the
+                                                // version by the same function
+                                                // -- which is not true.
+                                                // `native/init_params.cpp:372`
+                                                // reads the environment
+                                                // variable set from the very
+                                                // read above. Nothing reads
+                                                // `libroblox.so` twice, and the
+                                                // second read was not free:
+                                                // `cordial_update::engine::scan`
+                                                // has no early exit, because it
+                                                // must reach EOF to notice a
+                                                // second, differing candidate.
+                                                // That is a byte walk over the
+                                                // whole 118 MB library, on the
+                                                // main thread, at the moment
+                                                // the engine is up and waiting
+                                                // for its first pump.
+                                                //
+                                                // Empty means it was not
+                                                // readable, and then nothing is
+                                                // published at all -- inventing
+                                                // a version is exactly the bug
+                                                // `engine_version`'s own
+                                                // comment records.
+                                                if engine_ver.is_empty() {
+                                                    println!(
+                                                        "  plugins: engine version not readable, so cordial/engine.version is not published"
+                                                    );
+                                                } else {
+                                                    cordial_runtime::plugin_host::publish_core(
+                                                        cordial_plugins::core_events::ENGINE_VERSION,
+                                                        serde_json::json!({ "version": engine_ver }),
+                                                    );
+                                                }
+
                                                 // Subscribe to the engine's
                                                 // openWindow before the pump
                                                 // starts, the same point
@@ -4320,6 +4404,45 @@ fn main() -> ExitCode {
     // because the question after a failure is "what did we fail to tell it"
     // and the answer used to be spread across four kinds of line.
     cordial_runtime::unimplemented::report();
+
+    // The last thing any plugin is told, and the one event that has to be
+    // waited for. Delivery is asynchronous by design, so a publish followed by
+    // `_exit` is a race the exit wins -- the pump thread is still holding the
+    // event when the process goes. `flush_core_events` is bounded for the
+    // opposite reason: a plugin that stopped reading must not be able to hold
+    // up Cordial's exit.
+    //
+    // Every path that gets a plugin running comes through here: `start_all` is
+    // called after the engine has the surface, and every `return` in this
+    // function is upstream of that, so there is no exit that skips this except
+    // a crash.
+    cordial_runtime::plugin_host::publish_core(
+        cordial_plugins::core_events::CLIENT_SHUTDOWN,
+        serde_json::Value::Null,
+    );
+    // 500 ms for the whole flush rather than 500 ms per plugin, which is what
+    // a loop over `Pump::flush` would cost: it takes a fresh deadline each
+    // call, and the number of plugins is the user's choice, so the promise
+    // above would have been one the code could not keep. Named, because "a
+    // plugin" sends whoever reads it to look at all of them.
+    for id in cordial_runtime::plugin_host::flush_core_events(std::time::Duration::from_millis(500))
+    {
+        println!("  plugin {id}: still had queued core events when the 500 ms shutdown budget ran out; exiting without it");
+    }
+    // Said once, at the end, because an event that nobody counts is the silent
+    // failure the bounded queue exists to avoid becoming. Which of the two
+    // reasons it was comes from the pump rather than from a guess: this line
+    // used to say "its queue was full" for every one, including a plugin that
+    // had crashed, which points a reader at the queue depth and the plugin's
+    // read loop for a plugin that was not slow at all.
+    for u in cordial_runtime::plugin_host::undelivered_core_events() {
+        let why = if u.plugin_gone {
+            "it had stopped reading"
+        } else {
+            "its queue was full"
+        };
+        println!("  plugin {}: {} core event(s) never delivered, {why}", u.id, u.events);
+    }
 
     // Before `_exit`, which runs nothing. gamemoded would notice the process
     // was gone on its own — it reaps clients whose pid has vanished — but that

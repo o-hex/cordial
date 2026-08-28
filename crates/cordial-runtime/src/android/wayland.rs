@@ -3462,6 +3462,41 @@ impl WaylandWindow {
             && POINTER_ON_CANVAS.load(Ordering::Acquire);
         let asked = engine_wants || dragging || force_pointer_lock();
 
+        // **A dialog on top of the canvas takes the cursor back, whatever the
+        // engine wants.** Reported on 2026-08-28: a verification web view opens
+        // in-experience -- the one that gates joining a group -- and "while in a
+        // game your cursor will always be in the game not the webview... the
+        // cursor breaks and goes under into the game", and once unfocused "the
+        // mouse will never go over the webview again".
+        //
+        // Both halves are this. A locked pointer has no absolute position: the
+        // compositor stops moving the cursor and sends relative motion instead,
+        // so there is no path by which it can travel onto a dialog. In first
+        // person or shift lock the engine goes on answering
+        // `nativeGetMainWindowIsMouseLockedCenter` with true regardless of what
+        // Cordial has drawn over it -- it cannot see the dialog, and asking it
+        // to would be the engine introspection ADR-001 rules out -- so `asked`
+        // stays true, and each pump re-locks the moment the pointer re-enters
+        // the canvas. That is the "never again" half exactly.
+        //
+        // The signal already existed and only the stacking used it.
+        // `webview_dialog_opened` lowers the canvas below the parent surface so
+        // the dialog is visible at all, and `update_text_overlay` raises and
+        // lowers it for the editor. Reusing the same two conditions here keeps
+        // one answer to "is something of Cordial's own in front of the engine",
+        // rather than a second rule that can disagree with the first about
+        // which frame it is.
+        //
+        // `INFERRED` that this is the whole of the reported bug: the reasoning
+        // is read off the pointer-constraints protocol and this file, and has
+        // not been run against a live verification dialog, which needs an
+        // experience that opens one. The check is one session: open a group
+        // that asks for verification while in first person and see whether the
+        // cursor reaches the dialog.
+        let cordial_is_in_front = self.open_web_view_dialogs.load(Ordering::SeqCst) > 0
+            || self.text_overlay_visible.load(Ordering::SeqCst);
+        let asked = asked && !cordial_is_in_front;
+
         // The Escape latch lifts only when nothing is asking any more, so
         // pressing Escape in first person gives the cursor back for as long as
         // the engine keeps wanting it — until the user leaves first person,

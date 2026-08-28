@@ -1,8 +1,15 @@
-blank_issues_enabled: true
+# blank_issues_enabled is false so every new issue goes through one of the
+# five templates above — which is where the required Diagnostics block
+# lives. A blank issue cannot ask for it, and this project has already
+# learned what a report without a build number or an install method costs.
+blank_issues_enabled: false
 contact_links:
   - name: Where to start
     url: https://github.com/luohoa97/cordial/blob/main/docs/NEXT.md
     about: What works, what is blocking, and what has already been ruled out. Read this first.
+  - name: Get help, or just talk to us
+    url: https://discord.gg/qJzU3Xfr9b
+    about: Getting it running, quick questions, what's being worked on. Bugs and feature requests still belong in an issue, not chat, so they don't get lost.
   - name: Security issue
     url: https://github.com/luohoa97/cordial/security/advisories/new
     about: Report privately rather than in a public issue.

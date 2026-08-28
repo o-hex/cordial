@@ -12,8 +12,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://discord.gg/qJzU3Xfr9b">Come and talk to us on Discord</a></strong> — bug reports,
-  help getting it running, and what is being worked on.
+  <strong><a href="https://discord.gg/qJzU3Xfr9b">Come and talk to us on Discord</a></strong> for help getting
+  it running and what is being worked on. Bugs and feature requests go on
+  <a href="https://github.com/luohoa97/cordial/issues/new/choose">GitHub</a>, not in chat, so they don't get lost.
 </p>
 
 <p align="center">
@@ -101,12 +102,44 @@ disabled. Plugins extend *Cordial*.
 - [Install it 🔽](#install)
 - [How it actually works 🔬](docs/findings.md)
 - [Why there is no script execution, ever 🔒](docs/adr/ADR-001-in-process-hooking.md)
-- [Report a bug 🐛](https://github.com/luohoa97/cordial/issues)
+- [Report a bug or suggest a feature 🐛](https://github.com/luohoa97/cordial/issues/new/choose)
 - [Contribute 🛠️](CONTRIBUTING.md)
 
 **New here?** Read the warning below first, then
 [`docs/NEXT.md`](docs/NEXT.md) — it is written for someone picking the project
 up cold and says plainly what is broken and what has already been ruled out.
+
+## Reporting a problem
+
+[GitHub Issues](https://github.com/luohoa97/cordial/issues/new/choose) is
+where a bug, a broken Roblox feature, a failed update, a feature suggestion,
+or a finding goes — not Discord, which is faster for a quick question but
+does not get triaged and is not searchable later. Blank issues are turned
+off on purpose: pick the template that matches and it will ask for the right
+things.
+
+**Every template asks for a Diagnostics block**, and it is required. Get it
+from **Settings → Report a Problem** in Cordial, which has a copy button, or
+from a terminal:
+
+```bash
+cordial --diagnostics                                   # .deb / .rpm / Arch
+flatpak run io.github.luohoa97.Cordial --diagnostics    # Flatpak
+./Cordial-*.AppImage --diagnostics                      # AppImage
+```
+
+It carries the Cordial and Roblox build, `uname -a`, your distribution's
+name, and which package format Cordial was installed from — the four things
+a report here is usually missing. **It does not carry your account, any
+token, your profile name, or any path under your home directory.** It does
+carry your machine's hostname, from `uname -a`, and it is shown on screen
+before it is copied so you can edit that out if you would rather it not
+travel.
+
+[`.github/SUPPORT.md`](.github/SUPPORT.md) has the full list of templates and
+what each is for. Security issues go through [a private
+advisory](https://github.com/luohoa97/cordial/security/advisories/new)
+instead of a public issue.
 
 ### Disclosure
 
@@ -376,6 +409,47 @@ Updates are manual: the AppImage does not update itself, so download a newer
 one when a release appears. The Flatpak does update itself, which is the main
 practical reason to prefer it.
 
+#### 2.3 APT (Debian/Ubuntu)
+
+Cordial's own repository, not a package in Debian or Ubuntu itself -- see
+[`docs/design/apt-repository.md`](docs/design/apt-repository.md) for why
+those are two different things and where this one currently stands.
+
+```bash
+sudo curl -fsSL https://luohoa97.github.io/cordial/apt/cordial-archive-keyring.gpg \
+    -o /usr/share/keyrings/cordial-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/cordial-archive-keyring.gpg] https://luohoa97.github.io/cordial/apt stable main" \
+    | sudo tee /etc/apt/sources.list.d/cordial.list
+sudo apt update
+sudo apt install cordial
+```
+
+That is the modern, `apt-key`-free form: the key lives in one file named on
+the `deb` line, not in a system-wide trusted keyring every other repository
+also writes to. `apt update` after that picks up new releases the same way
+it does for any other repository; `sudo apt remove cordial` uninstalls, and
+your profiles stay in `~/.local/share` until you remove them yourself, same
+as every other package format here.
+
+**Verify the key before you trust it.** A `curl` in a README is exactly the
+kind of instruction a supply-chain attack looks like, so check what you just
+downloaded against the fingerprint published in
+[`docs/design/apt-repository.md`](docs/design/apt-repository.md#the-key), out
+of band from this file:
+
+```bash
+gpg --show-keys --with-fingerprint /usr/share/keyrings/cordial-archive-keyring.gpg
+```
+
+**Nothing is signed yet.** No `APT_GPG_PRIVATE_KEY` secret exists in this
+repository's CI as of this writing, and
+[`packaging/apt/build-repo.sh`](packaging/apt/build-repo.sh) refuses outright
+to build an unsigned repository rather than publish one that only works with
+`[trusted=yes]` -- so the commands above will not install anything until a
+maintainer generates and adds the key. This paragraph is here so that gap
+does not have to be discovered by `apt update` failing; it is removed the day
+signing switches on, in the same commit that adds the fingerprint above.
+
 #### Trust, and what "not signed" means
 
 **Before you extend that trust: the remote is not signed**, and what that does
@@ -617,6 +691,9 @@ questions are answered by the newest file in that directory.
 To check whether input is reaching the engine, run with
 `CORDIAL_ANDROID_TRACE=1` and look for `onTouchEventNative(...) -> true`.
 
+If none of that explains it, [file an issue](#reporting-a-problem) — that
+section says what to include so it can be acted on.
+
 ## Plugins
 
 **Three ship with Cordial and you already have them.** Open Settings and go to
@@ -791,6 +868,7 @@ Start with [`docs/NEXT.md`](docs/NEXT.md). The rest is reference.
 | [`docs/base-evaluation.md`](docs/base-evaluation.md) | Port-vs-write assessment of the prior art |
 | [`docs/multiarch.md`](docs/multiarch.md) | Multi-architecture decision |
 | [`docs/design/flatpak-remote-signing.md`](docs/design/flatpak-remote-signing.md) | The exact procedure for signing the Flatpak remote, for whoever holds the key |
+| [`docs/design/apt-repository.md`](docs/design/apt-repository.md) | The APT repository: the key, how it is published, and why official Debian is a different question |
 | [`docs/analysis/desktop-integration-audit.md`](docs/analysis/desktop-integration-audit.md) | What is already native-feeling about the `.desktop` entry, icons and deep links, and what is not |
 
 ## What this is built on, and who it is owed to

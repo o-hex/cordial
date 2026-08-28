@@ -1,0 +1,199 @@
+# Build Cordial's own APT repository and hand it to flatpak.yml to publish.
+#
+# "Publish Cordial to a Debian repo" has two readings, and this workflow is
+# the one Cordial controls today: a `dists/`+`pool/` tree at a stable URL a
+# user adds to sources.list, not an upload into Debian proper. See
+# docs/design/apt-repository.md for both readings written out, including why
+# the second one is not attempted here.
+#
+# Why this file does not build a .deb: the "Native packages" workflow
+# (release.yml) already does, in its `deb` job, inside ubuntu:25.10 -- the
+# one container this workspace has been shown to satisfy gtk4 >= 4.20 in
+# (see that file's own long comment on why ubuntu-latest's 24.04 fails). This
+# workflow triggers off that job finishing and downloads what it already
+# built rather than compiling Cordial a second time on every push.
+#
+# Why this file does not deploy to Pages itself: GitHub Pages, published
+# through actions/deploy-pages, is one deployment for the whole site -- there
+# is no per-path incremental publish. flatpak.yml already owns that
+# deployment (the OSTree remote, the landing page, the .flatpakrepo). A
+# second workflow calling actions/deploy-pages independently would not add
+# to that site; it would *replace* it, and whichever of the two workflows
+# ran more recently would silently erase the other's output. So this
+# workflow stops at a plain `actions/upload-artifact`, and flatpak.yml's own
+# "Assemble the Pages tree" step reaches across and pulls in the latest
+# green run of this one -- see the comment there for the one consequence
+# that follows from doing it this way: the apt tree in a given Pages deploy
+# can lag the flatpak repo by up to one push, because the two workflows run
+# independently rather than one waiting on the other mid-run.
+#
+# Nothing here fetches, embeds or references any Roblox material -- see
+# AGENTS.md, "Permanently out of scope". This workflow's job is entirely
+# about a .deb Cordial already built of its own source.
+
+name: APT repository
+
+on:
+  # The ordinary path: release.yml's `deb` job finishes building a fresh
+  # .deb and this workflow picks it up. `workflow_run` deliberately reads the
+  # *default branch's* copy of this file regardless of which ref triggered
+  # release.yml, which is what makes it safe to also fire for a
+  # pull-request run of release.yml without handing that PR's branch any
+  # access to APT_GPG_PRIVATE_KEY it would not otherwise have -- the job
+  # below still checks github.event.workflow_run.event and refuses anything
+  # that is not a push, so a PR touching packaging/deb/** gets its .deb
+  # built and checked by release.yml as before but never reaches this
+  # workflow's signing step.
+  workflow_run:
+    workflows: ["Native packages"]
+    types: [completed]
+  # A manual re-publish -- rebuilding the repository tree from the most
+  # recent successful push build without waiting for a new one, for example
+  # right after a maintainer adds the signing secrets for the first time and
+  # wants the remote to start existing without pushing an empty commit.
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: >-
+          Run ID of a "Native packages" run to build from. Leave blank to use
+          the most recent successful push run.
+        required: false
+
+permissions:
+  contents: read
+  # download-artifact needs to read a *different* run's artifacts than the
+  # one this job is executing in -- ordinary same-run artifact access does
+  # not need this, but this workflow's whole reason to exist is reading
+  # release.yml's run instead of its own.
+  actions: read
+
+# One at a time, and cancel a stale one outright: unlike flatpak.yml's
+# publish target, nothing here is a partially-written OSTree repository that
+# a cancelled run could leave corrupt. A second push superseding an
+# in-flight run just means the newer .deb is the one that ends up built.
+concurrency:
+  group: apt-repo
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Only a push build of release.yml is eligible to reach the signing
+    # step; a pull_request-triggered run of it is not (see the comment on
+    # `workflow_run` above), and workflow_dispatch is always eligible
+    # because a human asked for it directly.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Resolve which release.yml run to build from
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_RUN_ID:-}" ]; then
+            run_id="$INPUT_RUN_ID"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            run_id="${{ github.event.workflow_run.id }}"
+          else
+            # workflow_dispatch with no run_id given: the most recent
+            # successful push build, which is the same thing a fresh push
+            # would have picked.
+            run_id=$(gh run list --workflow=release.yml --branch=main \
+                        --status=success --event=push --limit=1 \
+                        --json databaseId --jq '.[0].databaseId')
+            if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+              echo "::error::no successful push run of release.yml found to build from" >&2
+              exit 1
+            fi
+          fi
+          head_sha=$(gh run view "$run_id" --json headSha --jq '.headSha')
+          echo "building from release.yml run $run_id ($head_sha)"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.head_sha }}
+          submodules: false
+
+      # Absent secret means this job stops here, cleanly. Unlike flatpak.yml,
+      # where an unsigned remote is still a meaningful (if weaker) thing to
+      # publish, packaging/apt/build-repo.sh itself refuses to build an
+      # unsigned apt repository at all -- see that script's header -- so
+      # there is nothing downstream of a missing key for this job to do.
+      - name: Import the signing key
+        id: gpg
+        env:
+          KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          KEYID: ${{ secrets.APT_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEY:-}" ]; then
+            echo "no APT_GPG_PRIVATE_KEY secret; the apt repository is not built or published"
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          home="$RUNNER_TEMP/gnupg"
+          mkdir -p "$home"
+          chmod 700 "$home"
+          printf '%s' "$KEY" | gpg --homedir "$home" --batch --import
+          if [ -z "${KEYID:-}" ]; then
+            echo "APT_GPG_PRIVATE_KEY is set but APT_GPG_KEY_ID is not" >&2
+            exit 1
+          fi
+          echo "signing=true" >> "$GITHUB_OUTPUT"
+          echo "gpghome=$home" >> "$GITHUB_OUTPUT"
+
+      - name: Download the .deb release.yml already built
+        if: steps.gpg.outputs.signing == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: cordial-deb
+          path: dist/deb
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.source.outputs.run_id }}
+
+      # apt-utils carries apt-ftparchive, which packaging/apt/build-repo.sh
+      # prefers when present -- see that script's header for what it does
+      # instead when apt-ftparchive is missing, which is the branch this
+      # step exists to avoid exercising here. This is the one place in this
+      # repository's CI that can actually run apt-ftparchive at all: every
+      # other job touching Debian tooling builds inside an Ubuntu
+      # *container* (release.yml's `deb` job), and this one runs on the
+      # bare ubuntu-latest runner, which is Ubuntu but ships neither
+      # apt-utils nor dpkg-dev by default.
+      - name: Install apt-ftparchive
+        if: steps.gpg.outputs.signing == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils
+
+      - name: Build the repository tree
+        if: steps.gpg.outputs.signing == 'true'
+        env:
+          APT_GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+          GNUPGHOME: ${{ steps.gpg.outputs.gpghome }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(dist/deb/*.deb dist/deb/**/*.deb)
+          if [ "${#debs[@]}" -eq 0 ]; then
+            echo "::error::no .deb found under dist/deb after downloading cordial-deb" >&2
+            exit 1
+          fi
+          packaging/apt/build-repo.sh --outdir dist/apt-repo "${debs[@]}"
+
+      - name: Upload the repository tree
+        if: steps.gpg.outputs.signing == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordial-apt-repo
+          path: dist/apt-repo
+          if-no-files-found: error
+          retention-days: 90

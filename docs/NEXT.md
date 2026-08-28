@@ -21,6 +21,57 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## Parallel APK download would be slower, measured, 2026-08-28
+
+**Asked for, tested, and the answer is no.** The proposal was aria2 or ranged
+parallel connections to speed up the 221 MiB APK fetch. Measured on this
+machine over the maintainer's VPN, all within a few minutes, against the real
+artefact (`2.736.1408`, 231,879,817 bytes) on APKPure's CDN:
+
+| arm | run 1 | run 2 |
+|---|---|---|
+| 1 stream | 10.19 MiB/s | 10.14 MiB/s |
+| 4 parallel ranged streams | 10.42 MiB/s | 10.09 MiB/s |
+| 8 parallel ranged streams | 8.22 MiB/s | 8.29 MiB/s |
+
+64 MiB per arm, interleaved `1,4,8,1,4,8` in one run so drift is spread across
+the arms rather than concentrated in one. **Four streams are within noise of
+one, and eight are reproducibly ~19% worse.** The link saturates on a single
+connection and splitting it only adds per-connection TLS and a per-connection
+302 redirect. There is nothing for aria2 to win here, and a second binary in
+the dependency set to lose 19% is a bad trade.
+
+Two facts worth keeping even though the feature is not being built. The CDN
+**does** support ranges -- `206` with `content-range: bytes 0-1023/231879817` --
+so this is a decision about throughput and not about capability. And it
+**refuses `HEAD` with 405**, so anything that wants the length before
+transferring has to use a one-byte ranged `GET`.
+
+**Cordial's own downloader is already the fastest thing measured**: 220.1 MiB
+in 13 s = **16.93 MiB/s**, and 18.00 MiB/s on a second download in the same
+session, taken from its own `Progress::Fetching` stream. The whole APK arrives
+in about thirteen seconds. `ureq` called directly on the same URL managed 15.16
+MiB/s and `curl` 11.1--12.4 on HTTP/1.1 and 7.0--8.1 forced to HTTP/2.
+
+**Do not read that table as "Cordial beats curl".** Only the 1/4/8 comparison
+was interleaved within a single run; the client-to-client numbers were taken
+minutes apart on a VPN whose throughput visibly drifted across the session, and
+the ordering between them is not something these measurements establish. What
+they do establish is that the existing single stream is not leaving bandwidth
+on the table, which is the question that decides the feature.
+
+**One retraction, because the mistake is the reusable part.** An earlier reading
+here said Cordial's downloader managed 2.35 MiB/s against curl's 10 -- a 4x gap
+that would have been the real finding. It was an artefact of the instrument.
+`examples/fetch_probe.rs` fetches once per provider in its loop and then a
+second time through `provider::obtain`, so the progress stream contains two
+downloads; taking the slope from the first sample to the last spanned the reset
+between them and divided a partial second download by the whole elapsed time.
+Splitting the samples into monotonic runs gives 16.93 and 18.00. This is the
+broken instrument AGENTS.md opens with, produced today, by the session that
+knows the rule. Anything reading `Progress::Fetching` for a rate has to notice
+`done` going backwards.
+
 ## Open: pointer acceleration, and what it is not, 2026-08-28
 
 Reported by the maintainer: **"pointer acceleration doesn't apply in the Roblox

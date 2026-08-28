@@ -20,6 +20,7 @@ mod audio_devices;
 mod chooser;
 mod crash;
 mod deep_link;
+mod diagnostics;
 mod download_progress;
 mod install;
 mod instructions;
@@ -79,6 +80,22 @@ use std::rc::Rc;
 const APP_ID: &str = "io.github.luohoa97.Cordial";
 
 fn main() -> libadwaita::glib::ExitCode {
+    // **Answered before the `GApplication` exists, and that is the whole
+    // point.** This binary is a single-instance application: with a Cordial
+    // already running, anything handed to a second invocation is forwarded to
+    // the first over D-Bus and this process exits. A diagnostics flag that went
+    // through that would print nothing, or print into the other process's
+    // terminal, which is worse than printing nothing.
+    //
+    // It also has to work when the shell cannot start at all -- a missing
+    // WebKitGTK, a GTK too old, no display -- because that is exactly the
+    // report that most needs the distribution and the package format in it.
+    // Reading `argv` directly costs nothing and depends on none of that.
+    if std::env::args().skip(1).any(|a| a == "--diagnostics") {
+        print!("{}", diagnostics::report());
+        return libadwaita::glib::ExitCode::SUCCESS;
+    }
+
     // Both flags, and the second one is the load-bearing one.
     //
     // `HANDLES_OPEN` says this application takes URLs at all; a `GApplication`

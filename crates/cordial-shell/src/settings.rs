@@ -821,6 +821,114 @@ fn build_audio_group(
 /// only by the X11 backend and do nothing on the Wayland one the launcher asks
 /// for, so a row for either would be a control that changes nothing — which is
 /// exactly what the Renderer row turned out to be until this change.
+/// Where a report goes. One constant, because the Settings row and the page
+/// description both name it and two copies drift.
+const ISSUES_URL: &str = "https://github.com/luohoa97/cordial/issues/new/choose";
+
+/// The page that turns "it doesn't work" into a report somebody can act on.
+///
+/// **A terminal is not a reasonable thing to require here.** `cordial-shell
+/// --diagnostics` prints the same block and is the right answer for anyone
+/// already in a shell, but the people whose reports are hardest to act on are
+/// the ones who installed a Flatpak from a link and have never opened one. The
+/// button and the flag share `diagnostics::report`, so the two can never drift
+/// into telling different stories about the same machine.
+///
+/// The text is shown as well as copied. Somebody is about to paste it into a
+/// public issue and is entitled to read it first -- and to edit out the
+/// hostname in `uname -a` if they would rather, which is the argument for a
+/// visible block over a button that silently uploads.
+fn build_report_page() -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("Report a Problem")
+        .name("report")
+        .icon_name("dialog-warning-symbolic")
+        .build();
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Diagnostics")
+        .description(
+            "Paste this into a GitHub issue. It says which Cordial and Roblox build you \
+             have, which distribution, and how Cordial was installed -- the four things a \
+             report is usually missing. It carries no account, no token and no profile name.",
+        )
+        .build();
+
+    let text = crate::diagnostics::report();
+
+    // Monospace and selectable: the columns only line up in a fixed-width font,
+    // and somebody who wants one line rather than the block should be able to
+    // take it without the button's all-or-nothing.
+    let view = gtk::TextView::builder()
+        .editable(false)
+        .monospace(true)
+        .cursor_visible(false)
+        .top_margin(12)
+        .bottom_margin(12)
+        .left_margin(12)
+        .right_margin(12)
+        .build();
+    view.buffer().set_text(&text);
+    let frame = gtk::Frame::new(None);
+    frame.set_child(Some(&view));
+    frame.set_margin_top(6);
+
+    let copy = gtk::Button::with_label("Copy");
+    copy.set_valign(gtk::Align::Center);
+    let copied = text.clone();
+    copy.connect_clicked(move |b| {
+        if let Some(display) = gtk::gdk::Display::default() {
+            display.clipboard().set_text(&copied);
+            // The label is the confirmation. A toast needs an overlay this page
+            // does not own, and a button that looks identical after a press is
+            // one people press three times.
+            b.set_label("Copied");
+            let b = b.clone();
+            glib::timeout_add_seconds_local_once(2, move || b.set_label("Copy"));
+        }
+    });
+
+    let row = adw::ActionRow::builder()
+        .title("Copy diagnostics")
+        .subtitle("The block below, on your clipboard")
+        .build();
+    row.add_suffix(&copy);
+    group.add(&row);
+    group.add(&frame);
+    page.add(&group);
+
+    let where_group = adw::PreferencesGroup::builder()
+        .title("Where to report it")
+        .description(
+            "GitHub is the tracker. A bug, a feature you want, or something you \
+             established and want written down -- all of them go there, and the form will \
+             ask for the block above.",
+        )
+        .build();
+
+    // A link row rather than prose with a URL in it: this window is the last
+    // place somebody is before they give up, and it should take one press to
+    // get from here to the form.
+    let issues = adw::ActionRow::builder()
+        .title("Open an issue")
+        .subtitle(ISSUES_URL.trim_start_matches("https://"))
+        .activatable(true)
+        .build();
+    issues.add_suffix(&gtk::Image::from_icon_name("external-link-symbolic"));
+    issues.connect_activated(|_| {
+        // The same brokered path a plugin's `url.open` takes: the XDG portal
+        // rather than a spawned `xdg-open`, so this works identically inside
+        // the Flatpak sandbox and outside it.
+        if let Err(e) = cordial_plugins::urlopen::open(ISSUES_URL) {
+            eprintln!("[cordial] could not open the issue tracker: {e}");
+        }
+    });
+    where_group.add(&issues);
+    page.add(&where_group);
+
+    page
+}
+
 fn build_general_page(
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
@@ -2032,6 +2140,7 @@ pub fn build_preferences_window(
     window.add(&crate::updater::build_update_page(config.clone(), config_path.clone()));
     window.add(&build_appearance_page(config.clone(), config_path.clone()));
     window.add(&build_general_page(config.clone(), config_path.clone()));
+    window.add(&build_report_page());
     let (plugins, installed) = build_plugins_page(&window, config.clone());
     window.add(&plugins);
     window.add(&build_get_plugins_page(parent, &window, config, config_path, &installed));

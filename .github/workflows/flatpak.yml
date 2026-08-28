@@ -53,17 +53,30 @@ on:
       - 'Cargo.lock'
   workflow_dispatch:
 
-# `contents: write` because a tagged build attaches its single-file bundle to
-# the release. Read would be enough for everything else here, and the narrower
-# grant is the right default -- but a release with nothing to download is the
-# whole reason the bundle step exists, so the job that builds it is the job that
-# must be able to post it.
+# `actions: read` is for "Fetch the apt repository" in the build job below,
+# which reads apt.yml's artifacts from a *different* workflow run than this
+# one -- ordinary same-run artifact access does not need it.
 #
-# `actions: read` is for "Fetch the apt repository" below, which reads
-# apt.yml's artifacts from a *different* workflow run than this one --
-# ordinary same-run artifact access does not need it.
+# `contents: write` used to live here too, for an "Attach the bundle to the
+# release" step that ran inline in the build job. That step is now the
+# `publish` job below, calling the shared attach-to-release.yml -- see
+# release.yml for the drift that made sharing it worth doing -- and a
+# reusable workflow does not inherit permissions from the workflow around it,
+# so the calling job has to grant them itself. `publish` carries its own
+# `contents: write` / `id-token: write` for exactly that reason, rather than
+# this block growing to cover a job that, past that one step, never wrote
+# anything.
+#
+# **`contents: read` stays, and dropping it broke everything for a moment.**
+# Declaring this block at all sets every scope not listed to `none`, not to the
+# repository default -- so trimming it to `actions: read` alone left `build`
+# with `contents: none`, and its very first step is `actions/checkout`, which
+# authenticates with the job token and is refused rather than falling back to
+# anonymous access. That is every trigger of this workflow, not the release path
+# the change was about: main, every pull request, every tag. The reasoning that
+# removed it was about `write` and never asked what else the same scope gated.
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 # One at a time. Two runs exporting into the same Pages deployment would race,
@@ -325,18 +338,15 @@ jobs:
           path: ${{ env.BUNDLE }}
           if-no-files-found: error
 
-      # Attached to the release only on a tag, and only when the whole build has
-      # got this far -- which is the point. A green run is the condition for
-      # publishing the remote, and it should be the condition for the download
-      # beside it too, rather than a file uploaded by hand from a machine
-      # nobody can audit.
-      - name: Attach the bundle to the release
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release upload "$GITHUB_REF_NAME" "$BUNDLE" --clobber
+      # Attaching this to the release, on a tag, and signing it, is the
+      # `publish` job below -- not a step here. It used to be a bare
+      # `gh release upload` in this job with no create-if-missing and no
+      # signing, which is the drift release.yml's own header now warns about:
+      # a tag where this build finished first failed release.yml's way of
+      # doing it before that job grew a create-if-missing check, and this was
+      # the one artefact that never got signed. Splitting it into a separate
+      # job rather than a step also means it is not gated on the disk-heavy
+      # Pages assembly below, which this bundle has nothing to do with.
 
       # apt.yml owns building this tree -- see the long comment at the top of
       # that file for why it is a separate workflow and why it stops at a
@@ -491,6 +501,30 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: pages
+
+  publish:
+    name: Attach to the release
+    # Only needs the bundle, which "Upload the bundle as a workflow artefact"
+    # above produces on every run, tag or not -- this job's own `if:` below is
+    # what keeps it from running (and failing on a release that should not
+    # exist yet) off a tag. It deliberately does not need `deploy`: the Pages
+    # publish and the release attachment share no resource, the way the long
+    # comment at the top of this file already argues for the two native and
+    # Flatpak workflows as a whole.
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    # A reusable workflow does not inherit the permissions of the workflow
+    # that calls it -- see the `permissions:` block near the top of this file
+    # for why `contents: write` no longer lives there now that this is the
+    # only job that needs it.
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/attach-to-release.yml
+    with:
+      artifact_pattern: cordial-flatpak-bundle
+      file_globs: '*.flatpak'
+      expected_count: 1
 
   deploy:
     needs: build

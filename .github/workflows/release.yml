@@ -381,142 +381,36 @@ jobs:
 
   publish:
     name: Attach to the release
-    # **On the runner, not in a container, and that is the whole point.** Each of
-    # the four build jobs used to end with its own `gh release upload`, inside
-    # the distro container it built in -- and a stock fedora, ubuntu or
-    # archlinux image has no `gh`, so the step failed with command-not-found on
-    # every tag while the job around it went green, because the artifact upload
-    # had already succeeded. v0.8.0, v0.9.0 and v0.10.0 all published a Flatpak
-    # bundle and no native packages for that reason, and the workflow reported
-    # success each time.
-    #
-    # Doing it once here is also one place to get right rather than four copies
-    # to keep in step, and the artifacts are already in hand: every build job
-    # uploads one with `if-no-files-found: error`.
+    # The create-if-missing / upload / sign logic used to live here entirely.
+    # It now lives in attach-to-release.yml (`on: workflow_call`), because
+    # flatpak.yml grew its own copy of half of it and let the two drift: no
+    # create-if-missing there and nothing signed, so a tag where the Flatpak
+    # build finished first failed the way this job used to fail before it
+    # grew the create-if-missing check, and the Flatpak bundle was the one
+    # artefact nobody ever signed. See that file's header for why the job
+    # runs on the bare runner rather than in a container, why the count is
+    # checked before anything is uploaded, and why signing is keyless
+    # Sigstore rather than a stored key -- none of that changed, it just does
+    # not need saying twice.
     needs: [appimage, deb, rpm, arch]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    # A reusable workflow does not inherit the permissions of the workflow
+    # that calls it -- the calling job has to grant them itself, which is why
+    # this is not left to the `contents: write` already at the top of this
+    # file. Neither grant is new: this job has carried both since keyless
+    # signing landed, and the only thing that changed is that the step
+    # consuming `id-token: write` now lives in attach-to-release.yml instead of
+    # inline here. The genuinely new grant is the same pair on `flatpak.yml`'s
+    # own `publish` job, which never signed anything before.
     permissions:
       contents: write
-      # **The whole of what signing costs.** Sigstore's keyless flow exchanges
-      # this short-lived OIDC token for a certificate binding the signature to
-      # this workflow, in this repository, at this ref. There is no key to
-      # generate, store, back up, rotate, or leak -- which matters because the
-      # alternative was a GPG private half sitting in a repository secret, and a
-      # secret nobody can rotate without breaking every installed keyring is a
-      # worse promise than no signature.
       id-token: write
-    steps:
-      # **Only the release notes, and only because the release has to be
-      # created from them.** This job was deliberately checkout-free -- it
-      # downloads artifacts and nothing else, which is why `GH_REPO` is set
-      # below rather than letting `gh` read a remote. That reasoning still
-      # holds for `gh`; it stopped being the whole story when this job became
-      # the thing that creates the release, because the notes live in the tree.
-      # Sparse, so it is a directory of markdown and not the whole repository
-      # with its submodules.
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          submodules: false
-          sparse-checkout: docs/releases
-          sparse-checkout-cone-mode: false
-
-      - name: Collect every built package
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-
-      - name: Attach them to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          # **`gh` works out which repository it is acting on from the git
-          # checkout.** Without this it found the four packages, printed them,
-          # and then died on "failed to run git: fatal: not a git repository".
-          # There is a sparse checkout above now, for the release notes, but it
-          # is `sparse-checkout: docs/releases` and carries no remote `gh` would
-          # find useful, so naming the repository is still the right answer and
-          # not a leftover.
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # Debug symbols are excluded, not forgotten. rpmbuild emits
-          # `-debuginfo` and `-debugsource` and makepkg emits `cordial-debug`,
-          # so an unfiltered find offers seven files -- and a release page where
-          # three of seven downloads are symbol packages makes somebody choose
-          # wrongly. They stay as workflow artifacts for anyone who needs them.
-          mapfile -t files < <(find dist -type f \
-              \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
-                 -o -name '*.pkg.tar.zst' \) \
-              -not -name '*debuginfo*' -not -name '*debugsource*' \
-              -not -name '*-debug-*' | sort)
-          # Named before uploading, because a release carrying three of four
-          # packages is worse than one that fails: nobody notices the gap.
-          printf 'attaching:\n'
-          printf '  %s\n' "${files[@]}"
-          if [ "${#files[@]}" -ne 4 ]; then
-              echo "error: expected exactly four packages, found ${#files[@]}" >&2
-              exit 1
-          fi
-          # **Nothing has ever created the release, and that is why v0.11.0's
-          # page was empty.** Every workflow here calls `gh release upload`,
-          # which fails outright when the release does not exist -- so every
-          # release so far has quietly depended on somebody making it by hand
-          # first, and the one time nobody did, four green build jobs attached
-          # their output to nothing. `--verify-tag` refuses to invent a release
-          # for a tag that is not pushed, and the notes come from the file this
-          # repository already writes for every version.
-          notes="docs/releases/${GITHUB_REF_NAME}.md"
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-              if [ -f "$notes" ]; then
-                  gh release create "$GITHUB_REF_NAME" --verify-tag \
-                      --title "Cordial ${GITHUB_REF_NAME#v}" --notes-file "$notes"
-              else
-                  # No notes written is worth failing over rather than
-                  # publishing a release with a generated changelog: this
-                  # project's notes say what is still broken, and an
-                  # auto-generated list of commit subjects does not.
-                  echo "error: no release notes at $notes" >&2
-                  exit 1
-              fi
-          fi
-          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
-          # Kept for the signing step below, which must sign exactly the four
-          # files that were attached and not whatever a second `find` turns up.
-          printf '%s\n' "${files[@]}" > "$RUNNER_TEMP/attached.txt"
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign every attached package, and attach the signatures
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # **"Nothing is signed" has been in every release note this project
-          # has published.** It is true, it was honest to say so, and it was
-          # also a thing nobody was ever going to fix while the fix meant
-          # generating a key and finding somewhere safe to keep it.
-          #
-          # Keyless Sigstore removes that step entirely. `--yes` accepts the
-          # transparency-log entry, which is the trade: every signature is
-          # public in Rekor for ever. That is the right trade here -- these are
-          # public release artefacts, and a public log is what lets somebody
-          # check later that a given file was signed by this workflow and not
-          # by whoever has the key today.
-          #
-          # A bundle rather than the older `.sig` + `.pem` pair: it is one file
-          # per artefact, it carries the certificate and the log entry with it,
-          # and `cosign verify-blob --bundle` needs nothing else.
-          while read -r f; do
-              cosign sign-blob --yes --bundle "$f.cosign.bundle" "$f"
-          done < "$RUNNER_TEMP/attached.txt"
-          mapfile -t bundles < <(find dist -name '*.cosign.bundle' | sort)
-          if [ "${#bundles[@]}" -ne 4 ]; then
-              echo "error: expected four signatures, produced ${#bundles[@]}" >&2
-              exit 1
-          fi
-          printf 'signed:\n'
-          printf '  %s\n' "${bundles[@]}"
-          gh release upload "$GITHUB_REF_NAME" "${bundles[@]}" --clobber
+    uses: ./.github/workflows/attach-to-release.yml
+    with:
+      # cordial-* rather than the four names spelled out: this workflow is
+      # the only thing that uploads artifacts under that prefix in a given
+      # run, so the glob is exactly the appimage/deb/rpm/arch jobs above and
+      # nothing else, however many of them there end up being.
+      artifact_pattern: cordial-*
+      file_globs: '*.AppImage *.deb *.rpm *.pkg.tar.zst'
+      expected_count: 4

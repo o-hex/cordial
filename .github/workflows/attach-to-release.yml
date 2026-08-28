@@ -1,0 +1,182 @@
+# Attach a caller's build output to the GitHub release for the tag it built,
+# signing it with keyless Sigstore, and create the release first if nothing
+# has done that yet.
+#
+# This exists because release.yml and flatpak.yml each grew their own copy of
+# "attach this to the release" and let them drift. release.yml's `publish` job
+# creates the release if it is missing and signs everything it uploads;
+# flatpak.yml's own attach step was a bare `gh release upload` with neither --
+# so a tag where the Flatpak build finished first failed the way release.yml
+# used to fail before it grew the create-if-missing check, and the Flatpak
+# bundle was the one artefact nobody ever signed, for no reason better than
+# where the code happened to live. One job, called from both, is the fix.
+#
+# **On the runner, not in a container.** The four native-package jobs each
+# build inside a distro image -- Fedora, Ubuntu, Arch -- and a stock image of
+# any of them has no `gh`. Running the attach step inside one of those
+# containers is exactly the mistake that shipped v0.8.0, v0.9.0 and v0.10.0
+# with a Flatpak bundle and no native packages while every build job went
+# green: the upload step failed on command-not-found and nothing upstream
+# noticed, because the artifact upload the step depended on had already
+# succeeded. `workflow_call` jobs are no different from any other job in
+# this respect, so this one stays on `ubuntu-latest` with nothing named in
+# `container:`.
+#
+# **Only a sparse checkout, and only for the release notes.** The release has
+# to be created from something, and this project's release notes say what is
+# still broken -- an auto-generated list of commit subjects does not, so
+# release creation fails outright rather than falling back to one. Beyond
+# `docs/releases`, this job has no reason to see the tree: it never builds
+# anything, and a `workflow_call` job cannot see the caller's workspace in any
+# case, which is why the caller hands over its build output as an uploaded
+# artifact rather than a path. `GH_REPO` is set explicitly below because that
+# sparse checkout gives `gh` no remote to infer one from.
+#
+# **The count is checked before anything is uploaded**, using whatever the
+# caller says it expects: a release carrying three packages out of four is
+# worse than a failed job, because nobody notices the gap. A caller that
+# passes the wrong `expected_count` gets exactly the same protection against
+# its own mistake.
+#
+# **Signing is keyless Sigstore**, which is the whole of what it costs.
+# `cosign sign-blob --yes --bundle` exchanges the job's own short-lived OIDC
+# token for a certificate binding the signature to this workflow, this
+# repository and this ref -- there is no key to generate, store, rotate or
+# leak, which matters because the alternative was a GPG private half sitting
+# in a repository secret that nobody could rotate without breaking every
+# installed keyring. `--yes` accepts the Rekor transparency-log entry, which
+# is the right trade for artefacts that are public anyway: it is what lets
+# somebody check later that a given file was signed by this workflow and not
+# by whoever holds a key today. This needs `id-token: write`, and a reusable
+# workflow does not inherit that (or any other permission) from the workflow
+# that calls it -- the calling job has to grant it explicitly, in its own
+# `permissions:` block, or the sign step gets a 403 with nothing above this
+# file to explain why.
+
+on:
+  workflow_call:
+    inputs:
+      artifact_pattern:
+        description: >-
+          Glob matched against the names of artifacts already uploaded in
+          this run (passed straight through to actions/download-artifact's
+          `pattern`). The native-packages caller uploads four separately
+          named artifacts and passes a glob that catches all four; the
+          Flatpak caller uploads one and passes its exact name.
+        required: true
+        type: string
+      file_globs:
+        description: >-
+          Which downloaded files actually get attached and signed, as
+          space-separated find(1) -name patterns, e.g. '*.AppImage *.deb'.
+          Matched after debug packages are already excluded, which this
+          workflow does unconditionally -- rpmbuild's -debuginfo and
+          -debugsource and makepkg's cordial-debug are never what a release
+          page should offer as one of a handful of downloads, and no caller
+          has ever wanted them included.
+        required: true
+        type: string
+      expected_count:
+        description: >-
+          Exact number of files file_globs must match. A mismatch fails the
+          job rather than publishing a partial release -- see the header
+          comment on why that is the point rather than a caution.
+        required: true
+        type: number
+
+jobs:
+  attach:
+    name: Attach and sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+          sparse-checkout: docs/releases
+          sparse-checkout-cone-mode: false
+
+      - name: Collect what the caller built
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: ${{ inputs.artifact_pattern }}
+
+      - name: Attach them to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # `gh` works out which repository it is acting on from the git
+          # checkout, and the sparse checkout above carries no remote it can
+          # use for that -- naming it here is the fix, not a leftover.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          read -r -a globs <<< "${{ inputs.file_globs }}"
+          find_expr=()
+          for g in "${globs[@]}"; do
+            [ "${#find_expr[@]}" -eq 0 ] || find_expr+=(-o)
+            find_expr+=(-name "$g")
+          done
+          mapfile -t files < <(find dist -type f \( "${find_expr[@]}" \) \
+              -not -name '*debuginfo*' -not -name '*debugsource*' \
+              -not -name '*-debug-*' | sort)
+          # Named before uploading, because a release carrying only some of
+          # what was expected is worse than one that fails: nobody notices
+          # the gap.
+          printf 'attaching:\n'
+          printf '  %s\n' "${files[@]}"
+          if [ "${#files[@]}" -ne "${{ inputs.expected_count }}" ]; then
+              echo "error: expected exactly ${{ inputs.expected_count }} file(s), found ${#files[@]}" >&2
+              exit 1
+          fi
+          # Every workflow that ends up here calls `gh release upload`, which
+          # fails outright when the release does not exist -- so, absent this,
+          # every release depends on somebody making it by hand first, and the
+          # one time nobody did, a run this had been split into attached its
+          # output to nothing. `--verify-tag` refuses to invent a release for a
+          # tag that has not actually been pushed.
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+              if [ -f "$notes" ]; then
+                  gh release create "$GITHUB_REF_NAME" --verify-tag \
+                      --title "Cordial ${GITHUB_REF_NAME#v}" --notes-file "$notes"
+              else
+                  # No notes written is worth failing over rather than
+                  # publishing a release with a generated changelog: this
+                  # project's notes say what is still broken, and an
+                  # auto-generated list of commit subjects does not.
+                  echo "error: no release notes at $notes" >&2
+                  exit 1
+              fi
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          # Kept for the signing step below, which must sign exactly the
+          # files that were attached and not whatever a second `find` turns up.
+          printf '%s\n' "${files[@]}" > "$RUNNER_TEMP/attached.txt"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign every attached file, and attach the signatures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # A bundle rather than the older `.sig` + `.pem` pair: it is one
+          # file per artefact, it carries the certificate and the log entry
+          # with it, and `cosign verify-blob --bundle` needs nothing else.
+          while read -r f; do
+              cosign sign-blob --yes --bundle "$f.cosign.bundle" "$f"
+          done < "$RUNNER_TEMP/attached.txt"
+          mapfile -t bundles < <(find dist -name '*.cosign.bundle' | sort)
+          if [ "${#bundles[@]}" -ne "${{ inputs.expected_count }}" ]; then
+              echo "error: expected ${{ inputs.expected_count }} signature(s), produced ${#bundles[@]}" >&2
+              exit 1
+          fi
+          printf 'signed:\n'
+          printf '  %s\n' "${bundles[@]}"
+          gh release upload "$GITHUB_REF_NAME" "${bundles[@]}" --clobber

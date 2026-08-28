@@ -21,6 +21,70 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## Open: the corners bleed through, and it is the opaque region again, 2026-08-28
+
+Reported with a screenshot: at the four corners of the window, **the desktop
+behind Cordial is visible** -- the actual terminal underneath, not a white or
+grey fill -- against a sharp-cornered Roblox rectangle inside a rounded window.
+Described first as "white stuff bleeding out, like forming a sharp corner, like
+it fades in and out like roblox is getting layered as we go".
+
+**This is the third instance of one defect, and the first two are already
+fixed.** `b8ae6f7` stopped claiming the CSD drop-shadow margin was opaque --
+measured under sway as `surface 1636x911` against `window 1596x871`, forty
+translucent pixels per axis, all declared solid -- which presented as the window
+dragging a stale halo around with it. `6e5e5a6` fixed the same mechanism for the
+lowered canvas on a different compositor, where a falsely-opaque region left the
+subsurface uncomposited and the window was "a flat sheet of Adwaita grey" while
+the engine presented at sixty frames a second.
+
+`refresh_opaque_region` (`crates/cordial-shell/src/host_window.rs:970-1013`) is
+the one place Cordial tells the compositor which toplevel pixels are solid. In
+the ordinary state it is exactly two calls: `create_rectangle` over the window's
+bounds, then `subtract_rectangle` of the canvas cutout. **Nothing anywhere in
+this tree computes, reads or references a corner radius** -- the only
+`border-radius` in the file is 8px on `.cordial-text-fallback`, an unrelated
+chrome bubble for text entry. So libadwaita clips the toplevel to a rounded
+rect, those corner pixels genuinely carry alpha < 1, and Cordial declares them
+opaque anyway. A compositor that trusts the hint stops repainting what is behind
+them, and what stays there is whatever was on screen before Cordial mapped --
+which is why it is the terminal, and why it fades as damage tracking catches up.
+
+The rectangle is now correctly *sized* and its corners are still lying.
+
+**The awkward part of the fix, and why it is not a one-liner.**
+`gtk::cairo::Region` is `cairo_region_t`, a union of axis-aligned integer
+rectangles. There is no way to subtract an arc from it, so a corner-aware
+version can only approximate the curve with a staircase of small rectangles, or
+inset the whole declared region by the radius and accept a slightly smaller
+opaque area than is true. The second is duller and safer: an under-declared
+opaque region costs a little compositing work and can never produce a stale
+pixel, which is the direction this bug wants erring in.
+
+The radius itself is the theme's, not Cordial's, so it has to be read rather
+than hardcoded -- and it is zero when the window is maximised or tiled, which is
+worth handling because that is how a lot of people run this.
+
+**Not attempted here**, deliberately: the change is easy to get subtly wrong,
+and the only instrument that can see it is a photograph of the window.
+`cordial_screenshot` reads the engine's own swapchain and therefore cannot see
+the GTK surface or anything behind the window at all -- it would show a perfect
+frame while the corners were still wrong.
+
+**Sober has nothing on this**, searched per AGENTS.md: five titles match
+corner/transparency terms and the only one with matching content, #1460
+"transparent/glitched window", is a broken D-Bus session under a custom window
+manager. That is expected -- Sober does not put the engine in a subsurface
+inside a libadwaita toplevel, so this whole class of bug is Cordial's own
+(ADR-011).
+
+**One thing ruled out on the way.** The first guess here was that
+`.cordial-engine-host drawingarea { background-color: transparent; }` was making
+the window see-through. It is not: the toplevel is deliberately kept opaque and
+only becomes transparent under the `.cordial-canvas-below` class, while the
+engine is lowered behind a dialog. The comment above that CSS says so and is
+correct. Changing it would have been a fix to something that was not broken.
+
 ## Parallel APK download would be slower, measured, 2026-08-28
 
 **Asked for, tested, and the answer is no.** The proposal was aria2 or ranged

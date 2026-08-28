@@ -839,7 +839,7 @@ const ISSUES_URL: &str = "https://github.com/luohoa97/cordial/issues/new/choose"
 /// public issue and is entitled to read it first -- and to edit out the
 /// hostname in `uname -a` if they would rather, which is the argument for a
 /// visible block over a button that silently uploads.
-fn build_report_page() -> adw::PreferencesPage {
+fn build_report_page(parent: &impl IsA<gtk::Window>) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Report")
         .name("report")
@@ -925,13 +925,30 @@ fn build_report_page() -> adw::PreferencesPage {
     // (`symbolic/actions/`) and is the affordance libadwaita already uses for a
     // row that takes you somewhere.
     issues.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-    issues.connect_activated(|_| {
-        // The same brokered path a plugin's `url.open` takes: the XDG portal
-        // rather than a spawned `xdg-open`, so this works identically inside
-        // the Flatpak sandbox and outside it.
-        if let Err(e) = cordial_plugins::urlopen::open(ISSUES_URL) {
-            eprintln!("[cordial] could not open the issue tracker: {e}");
-        }
+    // **`GtkUriLauncher`, not `cordial_plugins::urlopen`, and the difference is
+    // focus.** Both reach `org.freedesktop.portal.OpenURI`, so both work inside
+    // the Flatpak sandbox where a spawned `xdg-open` would not. But `urlopen`
+    // is the *plugin* path: a plugin has no window, so it passes an empty
+    // parent handle and no activation token, and GNOME's focus-stealing
+    // prevention answers that by declining to raise the browser -- you get a
+    // "Firefox is ready" notification instead of the page you asked for.
+    //
+    // This row has a window to offer. `UriLauncher::launch` takes the parent
+    // and hands the portal what it needs to raise the browser properly, which
+    // is the whole reason to use the GTK wrapper rather than call the portal by
+    // hand a second time. `urlopen` is left exactly as it is: it is correct for
+    // the caller it has, which never has a window (ADR-007).
+    let parent_for_link = parent.as_ref().clone();
+    issues.connect_activated(move |_| {
+        gtk::UriLauncher::new(ISSUES_URL).launch(
+            Some(&parent_for_link),
+            gtk::gio::Cancellable::NONE,
+            |result| {
+                if let Err(e) = result {
+                    eprintln!("[cordial] could not open the issue tracker: {e}");
+                }
+            },
+        );
     });
     where_group.add(&issues);
     page.add(&where_group);
@@ -2160,7 +2177,7 @@ pub fn build_preferences_window(
     let (plugins, installed) = build_plugins_page(&window, config.clone());
     add_get_plugins_groups(parent, &window, config, config_path, &installed, &plugins);
     window.add(&plugins);
-    window.add(&build_report_page());
+    window.add(&build_report_page(parent));
 
     window
 }

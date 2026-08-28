@@ -108,6 +108,10 @@ fn main() {
     // This build script emits only the short commit, and only when there is
     // one. `option_env!` on the reading side means no git is not a build
     // failure, which is the property the old scheme lacked.
+    // The manifest's version, needed below to tell "this is the release" from
+    // "this is somewhere after it".
+    let crate_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+
     let sha = Command::new("git")
         .args(["rev-parse", "--short=9", "HEAD"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -141,6 +145,33 @@ fn main() {
             println!("cargo:rustc-env=CORDIAL_GIT_SHA={supplied}");
             return;
         }
+    }
+    // **A release shows no commit, and that is not a style choice -- it is what
+    // this did before and I broke it.** The old scheme stamped `git describe
+    // --tags --always --dirty`, which on an exact tag is just `0.2.0`, so a
+    // release read `Cordial 0.2.0` and only a development build carried a hash.
+    // Replacing it with an unconditional sha made every release read
+    // `Cordial 0.11.0 (0fdbb4425)`, and it was spotted immediately: "why did
+    // you put the version in ( ), thats new".
+    //
+    // On a clean checkout of a tag matching the manifest, the version already
+    // identifies the build exactly -- the tag names the commit -- so the hash
+    // adds nothing and puts build plumbing in front of every ordinary user. Off
+    // a tag, or with uncommitted changes, it is the only thing that says which
+    // build this is, and AGENTS.md leans on it.
+    let exact_release = !dirty
+        && Command::new("git")
+            .args(["describe", "--tags", "--exact-match", "HEAD"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|t| t.trim().trim_start_matches('v').to_string())
+            .is_some_and(|t| t == crate_version);
+
+    if exact_release {
+        return;
     }
     if let Some(sha) = sha {
         let suffix = if dirty { "-dirty" } else { "" };

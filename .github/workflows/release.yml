@@ -393,6 +393,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # **The whole of what signing costs.** Sigstore's keyless flow exchanges
+      # this short-lived OIDC token for a certificate binding the signature to
+      # this workflow, in this repository, at this ref. There is no key to
+      # generate, store, back up, rotate, or leak -- which matters because the
+      # alternative was a GPG private half sitting in a repository secret, and a
+      # secret nobody can rotate without breaking every installed keyring is a
+      # worse promise than no signature.
+      id-token: write
     steps:
       - name: Collect every built package
         uses: actions/download-artifact@v4
@@ -430,3 +438,42 @@ jobs:
               exit 1
           fi
           gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          # Kept for the signing step below, which must sign exactly the four
+          # files that were attached and not whatever a second `find` turns up.
+          printf '%s\n' "${files[@]}" > "$RUNNER_TEMP/attached.txt"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign every attached package, and attach the signatures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # **"Nothing is signed" has been in every release note this project
+          # has published.** It is true, it was honest to say so, and it was
+          # also a thing nobody was ever going to fix while the fix meant
+          # generating a key and finding somewhere safe to keep it.
+          #
+          # Keyless Sigstore removes that step entirely. `--yes` accepts the
+          # transparency-log entry, which is the trade: every signature is
+          # public in Rekor for ever. That is the right trade here -- these are
+          # public release artefacts, and a public log is what lets somebody
+          # check later that a given file was signed by this workflow and not
+          # by whoever has the key today.
+          #
+          # A bundle rather than the older `.sig` + `.pem` pair: it is one file
+          # per artefact, it carries the certificate and the log entry with it,
+          # and `cosign verify-blob --bundle` needs nothing else.
+          while read -r f; do
+              cosign sign-blob --yes --bundle "$f.cosign.bundle" "$f"
+          done < "$RUNNER_TEMP/attached.txt"
+          mapfile -t bundles < <(find dist -name '*.cosign.bundle' | sort)
+          if [ "${#bundles[@]}" -ne 4 ]; then
+              echo "error: expected four signatures, produced ${#bundles[@]}" >&2
+              exit 1
+          fi
+          printf 'signed:\n'
+          printf '  %s\n' "${bundles[@]}"
+          gh release upload "$GITHUB_REF_NAME" "${bundles[@]}" --clobber

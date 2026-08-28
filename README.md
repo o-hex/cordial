@@ -450,6 +450,38 @@ maintainer generates and adds the key. This paragraph is here so that gap
 does not have to be discovered by `apt update` failing; it is removed the day
 signing switches on, in the same commit that adds the fingerprint above.
 
+#### Release downloads are signed, and here is how to check
+
+**Every `.deb`, `.rpm`, `.AppImage` and Arch package on a release page is signed**,
+and each has a `.cosign.bundle` beside it. The signature is keyless: there is no
+Cordial signing key anywhere, and there is nothing for a maintainer to lose. What
+the signature proves is that the file came out of this repository's own release
+workflow, at that tag, and not from someone who obtained a key.
+
+Install [cosign](https://docs.sigstore.dev/cosign/system_config/installation/), then,
+for whichever file you downloaded:
+
+```bash
+cosign verify-blob \
+  --bundle cordial_0.11.0-1_amd64.deb.cosign.bundle \
+  --certificate-identity-regexp '^https://github\.com/luohoa97/cordial/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  cordial_0.11.0-1_amd64.deb
+```
+
+`Verified OK` is the whole of the answer. **Do not drop the two `--certificate-*`
+flags** — without them cosign will happily confirm that *somebody* signed the
+file, which is not the question you are asking.
+
+The trade is that every signature is recorded permanently in Sigstore's public
+transparency log. For public release artefacts that is the point rather than a
+cost: it is what lets you check, a year later, that a file was signed by this
+workflow at that tag.
+
+This covers the release page. **The Flatpak remote and the APT repository are a
+different question and are still unsigned** — those need an OpenPGP key that
+Sigstore cannot supply, and the next two sections say what that means.
+
 #### Trust, and what "not signed" means
 
 **Before you extend that trust: the remote is not signed**, and what that does

@@ -157,6 +157,25 @@ jobs:
           restore-keys: appimage-cargo-
       - name: Build the AppImage
         run: packaging/appimage/build-appimage.sh --outdir dist/appimage
+      - name: Refuse a tag that disagrees with Cargo.toml
+        # **The one thing that actually bites when the manifest is the version.**
+        # `Cargo.toml` is now the only source of the version -- see
+        # crates/cordial-shell/src/version.rs -- so a `v0.11.0` tag cut against a
+        # tree whose manifest still says 0.10.0 produces a release whose binaries
+        # announce the wrong number, and nothing else would notice. Package
+        # filenames come from the tag and the binary comes from the manifest, so
+        # the two must not drift.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          manifest=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag $tag does not match Cargo.toml $manifest" >&2
+            exit 1
+          fi
+          echo "tag $tag matches Cargo.toml"
       - name: Refuse a binary that needs a newer glibc than the floor
         # One `log10f@GLIBC_2.43`, from a single `std::log10` on a float, made
         # v0.10.0's .rpm uninstallable anywhere older than Fedora 44 and would

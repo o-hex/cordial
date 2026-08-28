@@ -56,7 +56,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../.git/index");
     println!("cargo:rerun-if-changed=../../.git/refs");
     println!("cargo:rerun-if-changed=../../.git/packed-refs");
-    println!("cargo:rerun-if-env-changed=CORDIAL_BUILD_VERSION");
+    println!("cargo:rerun-if-env-changed=CORDIAL_GIT_SHA");
 
     // **`.git/refs` above does not catch a commit, and the three lines before
     // this one were measured not catching thirteen of them.** A window titled
@@ -83,16 +83,33 @@ fn main() {
         }
     }
 
-    // Read before the `cargo:rustc-env` line below is emitted, so this is the
-    // packager's value from the ambient environment and never our own output;
-    // `rustc-env` applies to the rustc invocation, not to this process.
-    let supplied = std::env::var("CORDIAL_BUILD_VERSION")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let described = Command::new("git")
-        .args(["describe", "--tags", "--always", "--dirty"])
+    // **`Cargo.toml` is the version. `git` is provenance. They are not
+    // alternatives, and treating them as alternatives was the bug.**
+    //
+    // This used to stamp `git describe --tags --always --dirty` as *the*
+    // version, so a tree whose manifest said 0.11.0 displayed `0.10.0-26-g...`
+    // -- the previous release -- and was reported as "wheres 0.11.0". The first
+    // repair here was worse: it synthesised `0.11.0-dev-26-g...`, which is a
+    // version-shaped string that is not a version, and anything wanting to
+    // order two of them would need a parser for Cordial's own build metadata.
+    //
+    // The binary was already carrying the contradiction. `cordial-update`'s
+    // User-Agent has always been `concat!("Cordial/", env!("CARGO_PKG_VERSION"))`
+    // -- so one build announced itself to a mirror as 0.11.0 while its title
+    // bar read 0.10.0-26-g571e69b-dirty. Two numbers that can disagree
+    // eventually do.
+    //
+    // So: `CARGO_PKG_VERSION` is the version, read directly by
+    // `crate::version::VERSION` and never computed here. It survives a tarball,
+    // an AUR source package, a `cargo publish` and the Flatpak's `type: dir`
+    // source -- none of which has a usable `.git` -- and it compares as semver,
+    // which is what anything asking "is the remote newer" needs.
+    //
+    // This build script emits only the short commit, and only when there is
+    // one. `option_env!` on the reading side means no git is not a build
+    // failure, which is the property the old scheme lacked.
+    let sha = Command::new("git")
+        .args(["rev-parse", "--short=9", "HEAD"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .ok()
@@ -101,16 +118,32 @@ fn main() {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // `CARGO_PKG_VERSION` rather than a literal: a tarball build has no git and
-    // should still report the version the crate was cut at.
-    let stamp = supplied
-        .or(described)
-        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
+    // Kept, because AGENTS.md leans on it: a `-dirty` build came from a tree
+    // with uncommitted changes and is otherwise indistinguishable from a
+    // committed one, which cost an afternoon of chasing an input regression
+    // nobody could attribute to a tree. It rides on the *provenance* string
+    // now rather than on the version, which is where it always belonged.
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
 
-    // Tags are `v0.2.0` by convention, but "Cordial v0.2.0" reads as a typo in a
-    // title bar and the `v` carries nothing the word "Cordial" does not already
-    // imply. Stripped after the choice rather than inside it, so a packager who
-    // passes the tag through verbatim gets the same treatment git's answer does.
-    let stamp = stamp.strip_prefix('v').unwrap_or(&stamp).to_string();
-    println!("cargo:rustc-env=CORDIAL_BUILD_VERSION={stamp}");
+    // A packager with no `.git` may supply this instead; the three native
+    // package scripts do. Nothing may supply the *version* any more -- that is
+    // the manifest's, and a CI gate checks the tag against it.
+    if let Ok(supplied) = std::env::var("CORDIAL_GIT_SHA") {
+        let supplied = supplied.trim();
+        if !supplied.is_empty() {
+            println!("cargo:rustc-env=CORDIAL_GIT_SHA={supplied}");
+            return;
+        }
+    }
+    if let Some(sha) = sha {
+        let suffix = if dirty { "-dirty" } else { "" };
+        println!("cargo:rustc-env=CORDIAL_GIT_SHA={sha}{suffix}");
+    }
 }

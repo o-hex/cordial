@@ -53,7 +53,7 @@ pub fn title() -> String {
     // The name rather than a literal, so the twice-a-year joke reaches the one
     // place a user actually reads it. See `branding`: decided once, never
     // polled, and never applied to anything in the repository.
-    format!("{} {}", crate::branding::current().name(), env!("CORDIAL_BUILD_VERSION"))
+    format!("{} {}", crate::branding::current().name(), crate::version::full())
 }
 
 /// How much of a monitor to leave for whatever else is on it.

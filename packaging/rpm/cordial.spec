@@ -163,7 +163,12 @@ export CC=clang CXX=clang++
 
 # See the %%describe comment at the top: the tarball has no .git, so the stamp
 # has to be handed in or the client misreports its own version.
-export CORDIAL_BUILD_VERSION=%{describe}
+# `CORDIAL_GIT_SHA`, not a version: Cargo.toml is the version and a packager
+# may not override it. See crates/cordial-shell/src/version.rs.
+# Derived from %%{describe}, which make-srpm.sh already substitutes, rather
+# than a %%{shorthash} macro -- there is no such macro, and rpm would have
+# shipped the literal text. `0.6.0-108-g9d9c980` -> `9d9c980`.
+export CORDIAL_GIT_SHA=$(printf %s %{describe} | sed "s/.*-g//")
 
 # Both crates' `webview` features, and one without the other is the trap. The
 # shell holds the WebKit window and cordial-runtime holds the presenter that

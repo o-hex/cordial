@@ -353,13 +353,27 @@ minutes later.
 
 ## Say which build you are talking about
 
-The window title is `git describe --tags --always --dirty` with the leading `v`
-stripped, stamped at compile time by `crates/cordial-shell/build.rs`. A release
-reads `Cordial 0.2.0`; a development build reads `Cordial 0.2.0-14-g8db7100` and
-still sorts, which a bare hash does not.
+The window title is `Cordial <version> (<commit>)` -- the version from
+`Cargo.toml` and the commit from `git rev-parse --short=9`, stamped at compile
+time by `crates/cordial-shell/build.rs`. A release reads `Cordial 0.11.0
+(0fdbb4425)`; a build from a source drop with no git reads `Cordial 0.11.0`.
 
-**`-dirty` means the binary was built from a tree with uncommitted changes.**
-Quote the full string in any report. A build made from a working tree several
+**This used to be `git describe --tags --always --dirty`, and that was wrong.**
+The version and the commit are two facts, not two spellings of one: a tree whose
+manifest said 0.11.0 displayed `0.10.0-26-g571e69b-dirty`, the *previous*
+release, while the same binary told a mirror it was `Cordial/0.11.0` in the
+User-Agent `cordial-update` builds from `CARGO_PKG_VERSION`. Two numbers that
+can disagree eventually do. `Cargo.toml` is the version, it compares as semver,
+and it survives a tarball, an AUR source package and the Flatpak's `type: dir`
+source -- none of which has a usable `.git`. See
+`crates/cordial-shell/src/version.rs`; a CI gate refuses a tag that disagrees
+with the manifest.
+
+**`-dirty` on the commit means the binary was built from a tree with
+uncommitted changes.** It rides on the commit now rather than the version, which
+is where it belonged. Quote the full string in any report -- or better, the
+whole block from `cordial --diagnostics`, which carries it along with the
+distribution and how Cordial was installed. A build made from a working tree several
 agents were editing is otherwise indistinguishable from a committed one, which
 cost an afternoon of chasing an input regression nobody could attribute to a
 tree.

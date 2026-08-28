@@ -121,7 +121,7 @@ fn main() -> libadwaita::glib::ExitCode {
              \n\
              `cordial-run` is the loader this launches and is not meant to be run\n\
              by hand. Issues: https://github.com/luohoa97/cordial/issues",
-            version = env!("CORDIAL_BUILD_VERSION"),
+            version = cordial_shell::version::full(),
         );
         return libadwaita::glib::ExitCode::SUCCESS;
     }

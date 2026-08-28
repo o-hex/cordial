@@ -138,7 +138,11 @@ export NO_STRIP=1
 export PATCHELF="${PATCHELF:-$(command -v patchelf)}"
 
 export CC=clang CXX=clang++
-export CORDIAL_BUILD_VERSION="$CORDIAL_DESCRIBE"
+# `CORDIAL_GIT_SHA`, not a version. `Cargo.toml` is the version now and a
+# packager may not override it -- a release job that stamped its own would
+# be the second, disagreeing number this scheme exists to remove. The build
+# happens outside a git checkout here, so the commit has to be passed in.
+export CORDIAL_GIT_SHA="$CORDIAL_SHORTHASH"
 
 # Both crates' `webview` features, never one alone -- see the identical
 # comment in packaging/rpm/cordial.spec's %build and packaging/deb/build-deb.sh

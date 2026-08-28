@@ -78,7 +78,12 @@ fn install_method() -> String {
     // A checkout, before any packaging is involved. Named rather than left as
     // `unknown`, because "the maintainer's own build" and "we could not tell"
     // are different answers and only one of them needs following up.
-    if shown.contains("/target/debug/") || shown.contains("/target/release/") {
+    //
+    // `/target/` anywhere rather than the two profile paths: `CARGO_TARGET_DIR`
+    // moves the whole tree, a custom profile is neither debug nor release, and
+    // this repository routinely builds into `target-toolbox/` from a container.
+    // The narrow check missed all three and reported `unknown`.
+    if shown.contains("/target/") || shown.contains("/target-") {
         return "cargo (built from a checkout)".into();
     }
 
@@ -103,7 +108,21 @@ fn install_method() -> String {
             return name.into();
         }
     }
-    "unknown".into()
+    // **`unknown` on its own tells nobody anything**, which is what the first
+    // version of this printed and what it was reported as. When no package
+    // manager claims the binary there is still a useful fact left: roughly
+    // where it is. The top-level directory only -- never the path, which under
+    // `$HOME` is usually somebody's name, and this block is written to be
+    // pasted in public.
+    let root = std::path::Path::new(&shown)
+        .components()
+        .nth(1)
+        .map(|c| c.as_os_str().to_string_lossy().to_string());
+    match root.as_deref() {
+        Some("usr") | Some("opt") => "unknown (installed under /usr or /opt, no package owns it)".into(),
+        Some("home") | Some("var") | Some("root") => "unknown (a local copy, not from a package)".into(),
+        _ => "unknown".into(),
+    }
 }
 
 /// `PRETTY_NAME` out of `/etc/os-release`, which is the one field every
@@ -163,7 +182,12 @@ fn roblox() -> String {
 pub fn report() -> String {
     let mut out = String::new();
     let rows = [
-        ("Cordial", format!("{} ({})", env!("CORDIAL_BUILD_VERSION"), install_method())),
+        // Two rows, not one. `0.11.0 (0fdbb4425-dirty) (rpm)` has two bracket
+        // groups meaning different things and reads as a mistake; and the
+        // version and how it got here are separate questions a reader scans
+        // for separately.
+        ("Cordial", cordial_shell::version::full()),
+        ("Install", install_method()),
         ("Roblox", roblox()),
         ("System", uname()),
         ("Distro", distro()),
@@ -187,7 +211,7 @@ mod tests {
     #[test]
     fn every_field_is_present_and_says_something() {
         let text = report();
-        for label in ["Cordial", "Roblox", "System", "Distro", "Session"] {
+        for label in ["Cordial", "Install", "Roblox", "System", "Distro", "Session"] {
             let line = text
                 .lines()
                 .find(|l| l.starts_with(label))
@@ -195,7 +219,7 @@ mod tests {
             let value = line[label.len()..].trim();
             assert!(!value.is_empty(), "{label} has no value in:\n{text}");
         }
-        assert_eq!(text.lines().count(), 5, "unexpected line count:\n{text}");
+        assert_eq!(text.lines().count(), 6, "unexpected line count:\n{text}");
     }
 
     /// **Nothing here may carry a home directory.**

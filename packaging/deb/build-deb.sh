@@ -52,7 +52,11 @@ export CC=clang CXX=clang++
 # See the %describe comment in packaging/rpm/cordial.spec: without this the
 # packaged binary's window title falls back to the bare Cargo version and
 # disagrees with the package that shipped it.
-export CORDIAL_BUILD_VERSION="$CORDIAL_DESCRIBE"
+# `CORDIAL_GIT_SHA`, not a version. `Cargo.toml` is the version now and a
+# packager may not override it -- a release job that stamped its own would
+# be the second, disagreeing number this scheme exists to remove. The build
+# happens outside a git checkout here, so the commit has to be passed in.
+export CORDIAL_GIT_SHA="$CORDIAL_SHORTHASH"
 
 # Both crates' `webview` features, never one alone. The shell holds the
 # WebKit window and cordial-runtime holds the presenter that calls it, so

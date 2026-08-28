@@ -1,0 +1,119 @@
+name: Roblox updated and something broke
+description: A new Roblox build fails to load, or needs symbols Cordial does not provide
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Roblox ships new builds constantly and Cordial tracks a moving target. This is expected breakage, not a defect report — it is the most useful routine contribution anyone can make.
+
+  - type: input
+    id: build-number
+    attributes:
+      label: Roblox build number
+      description: |
+        Required, and the whole point of this form — the first thing anyone needs to act on this. Find it in the **`Roblox` line of the diagnostics block below**, but only if Cordial fetched this build itself; for an APK obtained elsewhere it says `unknown (an APK Cordial did not fetch records no version)`. It is also in **Roblox's own log filename**, regardless of where the APK came from: `<files>/appData/logs/<version>_<timestamp>_Player_*.log`.
+      placeholder: e.g. 2.736.1408
+    validations:
+      required: true
+
+  - type: input
+    id: apk-source
+    attributes:
+      label: Where you got the APK
+      description: Cordial fetched it itself, Sober's cache, a manual download, or somewhere else.
+    validations:
+      required: false
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        Required. Get it from the **Copy diagnostics** button at **Settings → Report a Problem**, or from a terminal — `cordial --diagnostics` (.deb/.rpm/Arch), `flatpak run io.github.luohoa97.Cordial --diagnostics` (Flatpak), `./Cordial-*.AppImage --diagnostics` (AppImage), or `cordial-shell --diagnostics` (built from source). It works even when the client cannot start at all — a missing library, a GTK too old, no display — because it is answered before anything else in the process runs, which is exactly the report that most needs it.
+
+        Six rows, looking like this:
+        ```
+        Cordial   0.11.0 (0fdbb4425)
+        Install   rpm
+        Roblox    2.736.1408 (fetched by Cordial)
+        System    Linux host 7.1.8-200.fc44.x86_64 ... x86_64 GNU/Linux
+        Distro    Fedora Linux 44
+        Session   wayland (GNOME)
+        ```
+
+        It carries your hostname and your distribution's name, and no account name, session token, or profile name. You are about to paste this in public — edit the hostname out first if you would rather it not travel.
+      render: text
+      placeholder: Paste the output of `cordial --diagnostics` here.
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ### What it did
+
+        Paste the failure below. The two shapes worth recognising:
+
+        ```text
+        LOAD FAILED: dlopen failed: cannot locate symbol "SL_IID_ENGINE" referenced by "libroblox.so"
+        ```
+
+        A **missing symbol** at load time. Data symbols fail the `DT_NEEDED` walk outright rather than at first use, so the client will not start at all.
+
+        ```text
+        === stubs called: N distinct of TOTAL ===
+        ```
+
+        A **called stub** — it loaded, but the engine reached for something Cordial answers with nothing. Paste the names. TOTAL is however many stubs this build compiles in and grows over time, so it will not match this example.
+
+  - type: textarea
+    id: failure
+    attributes:
+      label: What it did
+      description: Paste the failure — the load error, or the stub-call list.
+      render: text
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Which symbols are new
+
+        `docs/analysis/undefined-symbols.tsv` is the list the stub table is generated from. This is how to find what your build needs that it does not contain:
+
+        ```bash
+        readelf --dyn-syms -W /path/to/lib/x86_64/libroblox.so \
+          | awk '$7=="UND" {print $8}' | sed 's/@.*//' | sort -u > /tmp/new.txt
+        cut -f2 docs/analysis/undefined-symbols.tsv | sort -u > /tmp/old.txt
+        comm -23 /tmp/new.txt /tmp/old.txt
+        ```
+
+        Paste the output below. If it is short, that is the whole fix: append each as `libroblox.so<TAB><symbol>` and rebuild. Plain libc names resolve against the host automatically once listed.
+
+  - type: textarea
+    id: new-symbols
+    attributes:
+      label: Which symbols are new
+      description: Output of the `comm -23` command above, if you ran it.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: needs-implementation
+    attributes:
+      label: If a symbol needs a real implementation
+      description: |
+        Say what it belongs to. A symbol that needs behaviour rather than a name gets a file in `native/` — `native/opensles.cpp` is the worked example, and its comment explains why it reports failure rather than pretending to succeed.
+
+        **Please do not make a stub return success.** A stub that lies moves the failure somewhere unrelated and costs the next person far more than the missing symbol did.
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Reading the binary
+
+        Reading the symbol table, `DT_NEEDED`, call order and argument shapes is fine and expected. Transcribing how Roblox *implements* anything is not, and nothing from a decompiler belongs in this repository. See [CONTRIBUTING.md](../../CONTRIBUTING.md).

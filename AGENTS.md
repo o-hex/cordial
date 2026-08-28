@@ -143,16 +143,17 @@ an earlier claim. That is the highest-value contribution here.
 
 ## Which issue this is
 
-Route work by shape. The templates in `.github/ISSUE_TEMPLATE/` carry the
-diagnostics for each.
+Route work by shape. The templates in `.github/ISSUE_TEMPLATE/` are GitHub issue
+forms — required fields, not just headings a submitter can delete — and carry
+the diagnostics for each.
 
 | Shape | Template | Recognise it by |
 |---|---|---|
-| A new Roblox build fails to load, or needs symbols we lack | `roblox_update.md` | `cannot locate symbol` at load, or a called stub on exit |
-| An Android expectation is unanswered, so a feature silently does nothing | `broken_feature.md` | `Constructed Unresolved symbol` in the jnivm log; audio is the live example |
-| Something Cordial or a plugin should be able to do | `feature.md` | No engine call is involved |
-| Cordial misbehaves at something it already does | `bug_report.md` | It used to work, or clearly should |
-| You established or disproved something | `finding.md` | The output is knowledge, not code |
+| A new Roblox build fails to load, or needs symbols we lack | `roblox_update.yml` | `cannot locate symbol` at load, or a called stub on exit |
+| An Android expectation is unanswered, so a feature silently does nothing | `broken_feature.yml` | `Constructed Unresolved symbol` in the jnivm log; audio is the live example |
+| Something Cordial or a plugin should be able to do | `feature.yml` | No engine call is involved |
+| Cordial misbehaves at something it already does | `bug_report.yml` | It used to work, or clearly should |
+| You established or disproved something | `finding.yml` | The output is knowledge, not code |
 
 **Missing symbols.** `docs/analysis/undefined-symbols.tsv` generates the stub
 table. To find what a build needs that it lacks:

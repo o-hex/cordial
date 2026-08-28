@@ -1,0 +1,92 @@
+name: Bug report
+description: Something behaves differently from what you expected
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The exact command, including any `CORDIAL_*` environment variables.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        Required. Get it from the **Copy diagnostics** button at **Settings → Report a Problem**, or from a terminal — `cordial --diagnostics` (.deb/.rpm/Arch), `flatpak run io.github.luohoa97.Cordial --diagnostics` (Flatpak), `./Cordial-*.AppImage --diagnostics` (AppImage), or `cordial-shell --diagnostics` (built from source). It works even when the client cannot start at all — a missing library, a GTK too old, no display — because it is answered before anything else in the process runs, which is exactly the report that most needs it.
+
+        Six rows, looking like this:
+        ```
+        Cordial   0.11.0 (0fdbb4425)
+        Install   rpm
+        Roblox    2.736.1408 (fetched by Cordial)
+        System    Linux host 7.1.8-200.fc44.x86_64 ... x86_64 GNU/Linux
+        Distro    Fedora Linux 44
+        Session   wayland (GNOME)
+        ```
+
+        It carries your hostname and your distribution's name, and no account name, session token, or profile name. You are about to paste this in public — edit the hostname out first if you would rather it not travel.
+      render: text
+      placeholder: Paste the output of `cordial --diagnostics` here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: engine-log
+    attributes:
+      label: The engine's own log
+      description: |
+        This is the most useful thing you can attach. Roblox writes its own log to `<files>/appData/logs/<version>_<timestamp>_Player_*.log` — by default under `~/.local/share/cordial/instances/default/data/files/appData/logs/`. Attach the newest one, or paste the last ~50 lines.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: runs-attempted
+    attributes:
+      label: Runs attempted
+      description: Some bugs here reproduce on roughly one launch in three, and at least one moved with machine load. If you can, say how many times you tried.
+    validations:
+      required: false
+
+  - type: input
+    id: runs-failed
+    attributes:
+      label: Runs that failed
+    validations:
+      required: false
+
+  - type: input
+    id: gpu-driver
+    attributes:
+      label: GPU and driver
+      description: Not covered by Diagnostics above.
+    validations:
+      required: false
+
+  - type: input
+    id: renderer
+    attributes:
+      label: Renderer
+      description: The engine's own log says `Vulkan Device:` or `GL Renderer:` — paste that line.
+    validations:
+      required: false

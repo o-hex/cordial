@@ -1,0 +1,59 @@
+name: Finding
+description: Something you established about the engine — including something that turned out to be wrong
+body:
+  - type: textarea
+    id: what-you-established
+    attributes:
+      label: What you established
+    validations:
+      required: true
+
+  - type: textarea
+    id: how-you-established-it
+    attributes:
+      label: How you established it
+      description: Cordial's rule is that claims are worth what they were measured with. Say what you ran, not only what you concluded.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        Required. Get it from the **Copy diagnostics** button at **Settings → Report a Problem**, or from a terminal — `cordial --diagnostics` (.deb/.rpm/Arch), `flatpak run io.github.luohoa97.Cordial --diagnostics` (Flatpak), `./Cordial-*.AppImage --diagnostics` (AppImage), or `cordial-shell --diagnostics` (built from source). It works even when the client cannot start at all — a missing library, a GTK too old, no display — because it is answered before anything else in the process runs, which is exactly the report that most needs it.
+
+        Six rows, looking like this:
+        ```
+        Cordial   0.11.0 (0fdbb4425)
+        Install   rpm
+        Roblox    2.736.1408 (fetched by Cordial)
+        System    Linux host 7.1.8-200.fc44.x86_64 ... x86_64 GNU/Linux
+        Distro    Fedora Linux 44
+        Session   wayland (GNOME)
+        ```
+
+        It carries your hostname and your distribution's name, and no account name, session token, or profile name. You are about to paste this in public — edit the hostname out first if you would rather it not travel.
+      render: text
+      placeholder: Paste the output of `cordial --diagnostics` here.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: confidence
+    attributes:
+      label: Confidence
+      description: Both are welcome. Only the labelling matters.
+      options:
+        - "Verified — I ran something and this is what it did"
+        - "INFERRED — this follows from evidence but I could not test it directly"
+    validations:
+      required: true
+
+  - type: textarea
+    id: contradicts
+    attributes:
+      label: Does this contradict something already written down?
+      description: Several commits in this repository exist only to retract an earlier claim. If `docs/NEXT.md` or a comment says something you have now disproved, say so — that is the highest-value contribution here.
+    validations:
+      required: false

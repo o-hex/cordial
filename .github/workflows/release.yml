@@ -67,6 +67,12 @@ on:
       - 'packaging/io.github.luohoa97.Cordial.desktop'
       - 'packaging/io.github.luohoa97.Cordial.metainfo.xml'
       - '.github/workflows/release.yml'
+  # **A release must be startable by hand.** `paths` above applies to tag pushes
+  # as well as branch pushes, so a tag moved onto a commit that touched none of
+  # those paths produces no run at all -- which is exactly what happened to
+  # v0.11.0 when it was re-pointed, leaving a tag with no build and no release.
+  # This is the way back without inventing a commit to push.
+  workflow_dispatch:
   pull_request:
     paths:
       - 'crates/**'
@@ -402,6 +408,21 @@ jobs:
       # worse promise than no signature.
       id-token: write
     steps:
+      # **Only the release notes, and only because the release has to be
+      # created from them.** This job was deliberately checkout-free -- it
+      # downloads artifacts and nothing else, which is why `GH_REPO` is set
+      # below rather than letting `gh` read a remote. That reasoning still
+      # holds for `gh`; it stopped being the whole story when this job became
+      # the thing that creates the release, because the notes live in the tree.
+      # Sparse, so it is a directory of markdown and not the whole repository
+      # with its submodules.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+          sparse-checkout: docs/releases
+          sparse-checkout-cone-mode: false
+
       - name: Collect every built package
         uses: actions/download-artifact@v4
         with:
@@ -411,11 +432,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           # **`gh` works out which repository it is acting on from the git
-          # checkout, and this job deliberately has none** -- it downloads
-          # artifacts and nothing else. Without this it found the four packages,
-          # printed them, and then died on "failed to run git: fatal: not a git
-          # repository". Naming the repository is cheaper than checking out a
-          # tree only so a tool can read its remote.
+          # checkout.** Without this it found the four packages, printed them,
+          # and then died on "failed to run git: fatal: not a git repository".
+          # There is a sparse checkout above now, for the release notes, but it
+          # is `sparse-checkout: docs/releases` and carries no remote `gh` would
+          # find useful, so naming the repository is still the right answer and
+          # not a leftover.
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -436,6 +458,28 @@ jobs:
           if [ "${#files[@]}" -ne 4 ]; then
               echo "error: expected exactly four packages, found ${#files[@]}" >&2
               exit 1
+          fi
+          # **Nothing has ever created the release, and that is why v0.11.0's
+          # page was empty.** Every workflow here calls `gh release upload`,
+          # which fails outright when the release does not exist -- so every
+          # release so far has quietly depended on somebody making it by hand
+          # first, and the one time nobody did, four green build jobs attached
+          # their output to nothing. `--verify-tag` refuses to invent a release
+          # for a tag that is not pushed, and the notes come from the file this
+          # repository already writes for every version.
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+              if [ -f "$notes" ]; then
+                  gh release create "$GITHUB_REF_NAME" --verify-tag \
+                      --title "Cordial ${GITHUB_REF_NAME#v}" --notes-file "$notes"
+              else
+                  # No notes written is worth failing over rather than
+                  # publishing a release with a generated changelog: this
+                  # project's notes say what is still broken, and an
+                  # auto-generated list of commit subjects does not.
+                  echo "error: no release notes at $notes" >&2
+                  exit 1
+              fi
           fi
           gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
           # Kept for the signing step below, which must sign exactly the four

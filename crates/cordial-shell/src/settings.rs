@@ -162,16 +162,18 @@ enum Tier {
 /// "Appearance" — Cordial's own theme preference, independent of anything
 /// else on the desktop. `AppearanceScheme::apply` is what makes this take
 /// effect immediately; this function only wires the row to it and to disk.
-fn build_appearance_page(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> adw::PreferencesPage {
+/// Appearance's two groups, added to a page somebody else owns.
+///
+/// **This was its own tab and did not deserve one.** Reported as "why are there
+/// so many tabs": Settings had seven, and two of them held two groups between
+/// them. A preferences window is a place people arrive at knowing what they
+/// want to change and leave again; a tab per group makes them hunt through
+/// seven pages to find the one row they came for.
+fn add_appearance_groups(page: &adw::PreferencesPage, config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) {
     // Cloned up front: the theme row's closure below takes ownership of both,
     // and the title bar row further down needs them too.
     let config_for_bar = config.clone();
     let config_path_for_bar = config_path.clone();
-    let page = adw::PreferencesPage::builder()
-        .title("Appearance")
-        .name("appearance")
-        .icon_name("applications-graphics-symbolic")
-        .build();
 
     // No group description. What used to be here explained that this is
     // Cordial's own preference rather than the desktop's, that System reads
@@ -242,7 +244,6 @@ fn build_appearance_page(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathB
     window_group.add(&bar_row);
     page.add(&window_group);
 
-    page
 }
 
 /// Save, and say so on stderr rather than swallowing the error.
@@ -840,18 +841,20 @@ const ISSUES_URL: &str = "https://github.com/luohoa97/cordial/issues/new/choose"
 /// visible block over a button that silently uploads.
 fn build_report_page() -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
-        .title("Report a Problem")
+        .title("Report")
         .name("report")
         .icon_name("dialog-warning-symbolic")
         .build();
 
     let group = adw::PreferencesGroup::builder()
         .title("Diagnostics")
-        .description(
-            "Paste this into a GitHub issue. It says which Cordial and Roblox build you \
-             have, which distribution, and how Cordial was installed -- the four things a \
-             report is usually missing. It carries no account, no token and no profile name.",
-        )
+        // **One line.** This said four, explaining what the block contains and
+        // what it does not -- true, and none of it what somebody opening this
+        // page wants. They came to copy the thing. The block is right there and
+        // says what it contains by containing it, and the reasoning about what
+        // is deliberately absent lives in `diagnostics.rs` next to the code
+        // that decides it.
+        .description("Paste this into a GitHub issue.")
         .build();
 
     let text = crate::diagnostics::report();
@@ -863,6 +866,14 @@ fn build_report_page() -> adw::PreferencesPage {
         .editable(false)
         .monospace(true)
         .cursor_visible(false)
+        // **Wrapped, because `uname -a` is longer than any settings window.**
+        // Without this the System line ran off the right edge with no scrollbar
+        // and no way to see the rest -- the Copy button had the whole string,
+        // but somebody checking what they were about to paste into a public
+        // issue could not read the one line most likely to make them think
+        // twice. `WordChar` rather than `Word`: a kernel version has no spaces
+        // to break at.
+        .wrap_mode(gtk::WrapMode::WordChar)
         .top_margin(12)
         .bottom_margin(12)
         .left_margin(12)
@@ -888,22 +899,16 @@ fn build_report_page() -> adw::PreferencesPage {
         }
     });
 
-    let row = adw::ActionRow::builder()
-        .title("Copy diagnostics")
-        .subtitle("The block below, on your clipboard")
-        .build();
+    let row = adw::ActionRow::builder().title("Copy diagnostics").build();
     row.add_suffix(&copy);
     group.add(&row);
     group.add(&frame);
     page.add(&group);
 
     let where_group = adw::PreferencesGroup::builder()
-        .title("Where to report it")
-        .description(
-            "GitHub is the tracker. A bug, a feature you want, or something you \
-             established and want written down -- all of them go there, and the form will \
-             ask for the block above.",
-        )
+        .title("Bugs and feature requests")
+        // The row below says where it goes and the form asks for the block. A
+        // paragraph here repeated both.
         .build();
 
     // A link row rather than prose with a URL in it: this window is the last
@@ -914,7 +919,12 @@ fn build_report_page() -> adw::PreferencesPage {
         .subtitle(ISSUES_URL.trim_start_matches("https://"))
         .activatable(true)
         .build();
-    issues.add_suffix(&gtk::Image::from_icon_name("external-link-symbolic"));
+    // `go-next-symbolic`, and checked on disk rather than guessed: the first
+    // attempt used `external-link-symbolic`, which is in no icon theme here and
+    // rendered as the missing-image glyph. `go-next-symbolic` ships in Adwaita
+    // (`symbolic/actions/`) and is the affordance libadwaita already uses for a
+    // row that takes you somewhere.
+    issues.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
     issues.connect_activated(|_| {
         // The same brokered path a plugin's `url.open` takes: the XDG portal
         // rather than a spawned `xdg-open`, so this works identically inside
@@ -2076,18 +2086,21 @@ fn build_plugins_page(
 /// signing key — configuration for acquiring plugins, in front of somebody who
 /// came to switch one off. GNOME's Extensions app puts browsing behind its own
 /// entry for the same reason. Nothing here changed except where it lives.
-fn build_get_plugins_page(
+/// The install-a-plugin groups, added to the Plugins page rather than a tab.
+///
+/// **Two tabs both about plugins was the worst of the seven.** Somebody looking
+/// at what they had found "Plugins"; somebody wanting another had to guess that
+/// "Get Plugins" was a separate page rather than a button on the first. They
+/// are one page now, in the order the task happens -- what you have, then how
+/// to get more.
+fn add_get_plugins_groups(
     parent: &impl IsA<gtk::Window>,
     dialog: &adw::PreferencesDialog,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
     installed_group: &adw::PreferencesGroup,
-) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::builder()
-        .title("Get Plugins")
-        .name("get-plugins")
-        .icon_name("folder-download-symbolic")
-        .build();
+    page: &adw::PreferencesPage,
+) {
 
     let root = manifest::plugin_root();
     let profile_name = config.borrow().profile.clone();
@@ -2098,7 +2111,6 @@ fn build_get_plugins_page(
         build_marketplace_groups(parent, dialog, config, config_path, &root, profile_dir, installed_group);
     page.add(&marketplace_config);
     page.add(&marketplace_listing);
-    page
 }
 
 /// Builds the settings dialog: Roblox, Updates, Appearance, General, Plugins,
@@ -2138,12 +2150,17 @@ pub fn build_preferences_window(
     window.add(&build_roblox_page(parent, config.clone(), config_path.clone()));
     // Second, next to the page about the build it is about.
     window.add(&crate::updater::build_update_page(config.clone(), config_path.clone()));
-    window.add(&build_appearance_page(config.clone(), config_path.clone()));
-    window.add(&build_general_page(config.clone(), config_path.clone()));
-    window.add(&build_report_page());
+    // **Five pages where there were seven**, reported as "why are there so many
+    // tabs". Appearance held two groups and Get Plugins three; neither was a
+    // destination, and a tab per group makes somebody hunt through seven pages
+    // for the one row they came to change.
+    let general = build_general_page(config.clone(), config_path.clone());
+    add_appearance_groups(&general, config.clone(), config_path.clone());
+    window.add(&general);
     let (plugins, installed) = build_plugins_page(&window, config.clone());
+    add_get_plugins_groups(parent, &window, config, config_path, &installed, &plugins);
     window.add(&plugins);
-    window.add(&build_get_plugins_page(parent, &window, config, config_path, &installed));
+    window.add(&build_report_page());
 
     window
 }

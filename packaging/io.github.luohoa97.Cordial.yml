@@ -295,8 +295,8 @@ modules:
       # exports only files whose names begin with the application id -- which is
       # exactly why this is a suffix of `io.github.luohoa97.Cordial` rather than
       # an id of its own. The app id itself does not change on either day.
-#       - install -Dm644 packaging/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.Frostbite.svg
-#           /app/share/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.Frostbite.svg
+      - install -Dm644 packaging/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.Frostbite.svg
+          /app/share/icons/hicolor/scalable/apps/io.github.luohoa97.Cordial.Frostbite.svg
       - install -Dm644 packaging/io.github.luohoa97.Cordial.desktop
           /app/share/applications/io.github.luohoa97.Cordial.desktop
       # Without this the hosted remote installs but does not browse: a software

@@ -1531,22 +1531,21 @@ impl HostWindow {
             report_keyboard_state((gw, gh));
         }
 
-        let mut pfd = PollFd { fd: self.conn_fd, events: POLLIN, revents: 0 };
-        // SAFETY: `pfd` is a live array of length 1; a 0ms timeout makes this a
-        // pure non-blocking check.
-        let ready = unsafe { poll(&mut pfd as *mut PollFd as *mut c_void, 1, 0) };
-        if ready <= 0 {
-            return;
+        // Drain any events already sitting in Xlib's client queue.
+        // Only if the queue is empty do we poll the connection socket.
+        if unsafe { (self.xlib.pending)(self.display) } <= 0 {
+            let mut pfd = PollFd { fd: self.conn_fd, events: POLLIN, revents: 0 };
+            let ready = unsafe { poll(&mut pfd as *mut PollFd as *mut c_void, 1, 0) };
+            if ready <= 0 {
+                return;
+            }
         }
 
         // Bounded so a burst of queued motion events cannot turn one drain
         // call into unbounded work inside the render loop's own timing
         // budget.
-        const MAX_EVENTS_PER_DRAIN: usize = 64;
+        const MAX_EVENTS_PER_DRAIN: usize = 256;
         for _ in 0..MAX_EVENTS_PER_DRAIN {
-            // SAFETY: `self.display` is open; reached only after `poll` above
-            // found the connection readable (or a previous iteration left
-            // events already queued client-side).
             if unsafe { (self.xlib.pending)(self.display) } <= 0 {
                 break;
             }

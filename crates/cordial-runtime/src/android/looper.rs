@@ -1375,8 +1375,15 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
             // game down, not drop a button press.
             super::gamepad::poll();
         }
+        let poll_timeout = if watching {
+            50
+        } else if let Some(t) = std::env::var("CORDIAL_POLL_TIMEOUT").ok().and_then(|v| v.parse::<i32>().ok()) {
+            t
+        } else {
+            1
+        };
         looper_poll_once(
-            if watching { 50 } else { 8 },
+            poll_timeout,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),

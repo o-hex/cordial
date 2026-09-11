@@ -32,20 +32,29 @@ fn validate_scheme(raw: &str) -> Result<(), String> {
 /// be reachable.
 pub fn open(raw: &str) -> Result<(), String> {
     validate_scheme(raw)?;
-    let conn = Connection::session().map_err(|e| format!("could not reach the session bus: {e}"))?;
-    let options: HashMap<&str, Value> = HashMap::new();
-    // The first argument is a portal "parent window" handle; Cordial has no
-    // portal-aware window identifier to offer here, and the portal accepts
-    // an empty one and opens without trying to be modal to a parent.
-    conn.call_method(
-        Some("org.freedesktop.portal.Desktop"),
-        "/org/freedesktop/portal/desktop",
-        Some("org.freedesktop.portal.OpenURI"),
-        "OpenURI",
-        &("", raw, options),
-    )
-    .map_err(|e| format!("the OpenURI portal refused the call: {e}"))?;
-    Ok(())
+    if let Ok(conn) = Connection::session() {
+        let options: HashMap<&str, Value> = HashMap::new();
+        if conn.call_method(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.OpenURI"),
+            "OpenURI",
+            &("", raw, options),
+        ).is_ok() {
+            return Ok(());
+        }
+    }
+    // Fallback for environments without xdg-desktop-portal (e.g. Termux, direct X11)
+    if std::process::Command::new("termux-open-url").arg(raw).spawn().is_ok() {
+        return Ok(());
+    }
+    if std::process::Command::new("xdg-open").arg(raw).spawn().is_ok() {
+        return Ok(());
+    }
+    if std::process::Command::new("firefox").arg(raw).spawn().is_ok() {
+        return Ok(());
+    }
+    Err("could not open browser via portal, termux-open-url, xdg-open, or firefox".into())
 }
 
 #[cfg(test)]

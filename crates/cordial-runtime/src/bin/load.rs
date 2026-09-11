@@ -492,6 +492,8 @@ struct BootstrapPlan {
 
 static BOOTSTRAP: std::sync::OnceLock<BootstrapPlan> = std::sync::OnceLock::new();
 static BOOTSTRAP_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BOOTSTRAP_FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 
 /// Deliver settings and flags, from inside the engine's own bootstrap call.
 ///
@@ -828,6 +830,7 @@ extern "C" fn run_bootstrap() {
             Err(e) => println!("    flag init failed: {e}"),
         }
     }
+    BOOTSTRAP_FINISHED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn requested_resolution() -> (u32, u32) {
@@ -2856,6 +2859,19 @@ fn main() -> ExitCode {
                                             }
                                         } else {
                                             println!("  initStorageManagerNativeV3 not exported");
+                                        }
+                                        if BOOTSTRAP.get().is_some()
+                                            && std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_none()
+                                        {
+                                            let start = std::time::Instant::now();
+                                            while !BOOTSTRAP_FINISHED.load(std::sync::atomic::Ordering::SeqCst) {
+                                                if start.elapsed() > std::time::Duration::from_secs(10) {
+                                                    eprintln!("  warning: timed out waiting for bootstrap / flags to initialise");
+                                                    break;
+                                                }
+                                                std::thread::sleep(std::time::Duration::from_millis(2));
+                                            }
+                                            println!("  bootstrap / flags ready (waited {:?})", start.elapsed());
                                         }
 
                                         for (name, cls, args) in dirs2 {

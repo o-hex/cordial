@@ -1272,10 +1272,15 @@ fn install_webview_presenter() {
          `just build toolbox` for the embedded one"
     );
     cordial_runtime::webview::set_presenter(|request| {
+        println!("  webview: opening URL in browser: {}", request.url);
         match cordial_plugins::urlopen::open(&request.url) {
             Ok(()) => println!("  webview: openWindow handed to the browser"),
             Err(e) => println!("  webview: openWindow could not be opened: {e}"),
         }
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            cordial_runtime::webview::report_window_closed();
+        });
     });
 }
 

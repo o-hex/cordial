@@ -15,7 +15,7 @@
 //! invented here.
 
 use std::collections::HashMap;
-use std::ffi::{c_void, CStr};
+use std::ffi::{c_char, c_void, CStr};
 
 use crate::symtab;
 
@@ -67,7 +67,7 @@ struct Api {
     clear: extern "C" fn(u32),
     read_pixels: extern "C" fn(i32, i32, i32, i32, u32, u32, *mut c_void),
     viewport: extern "C" fn(i32, i32, i32, i32),
-    gl_get_string: extern "C" fn(u32) -> *const i8,
+    gl_get_string: extern "C" fn(u32) -> *const c_char,
 }
 
 fn address(table: &HashMap<&str, *mut c_void>, name: &str) -> Result<*mut c_void, String> {

@@ -495,6 +495,9 @@ pub fn extract_into(archive_bytes: &[u8], dest: &Path, limits: Limits) -> Result
             .map_err(io_err)?;
         let copied = copy_capped(&mut entry, &mut file, limits.max_total_bytes - written)?;
         written += copied;
+        drop(file);
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644))
+            .map_err(io_err)?;
     }
 
     if capped.tripped {

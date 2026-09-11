@@ -140,35 +140,49 @@ unsafe fn resolve(
 // ---------------------------------------------------------------- condition vars
 
 pub extern "C" fn cond_init(cond: *mut c_void, attr: *const c_void) -> c_int {
-    if cond.is_null() {
-        return libc_einval();
+    #[cfg(target_os = "android")]
+    unsafe {
+        return pthread_cond_init(cond, attr);
     }
-    // SAFETY: bionic's contract is a pointer to a 32-byte pthread_cond_t.
-    let c = unsafe { &mut *(cond as *mut BionicCond) };
-    // An explicit init on an object we already wrapped replaces it, matching
-    // glibc's "undefined behaviour, but do something sane" posture.
-    unsafe { destroy_backing(&c.state, &c.real, pthread_cond_destroy) };
-    c.state.store(UNINIT, Ordering::Release);
-    let backing = unsafe {
-        resolve(&c.state, &c.real, |p| {
-            pthread_cond_init(p, attr);
-        })
-    };
-    if backing.is_null() {
-        libc_einval()
-    } else {
-        0
+    #[cfg(not(target_os = "android"))]
+    {
+        if cond.is_null() {
+            return libc_einval();
+        }
+        // SAFETY: bionic's contract is a pointer to a 32-byte pthread_cond_t.
+        let c = unsafe { &mut *(cond as *mut BionicCond) };
+        // An explicit init on an object we already wrapped replaces it, matching
+        // glibc's "undefined behaviour, but do something sane" posture.
+        unsafe { destroy_backing(&c.state, &c.real, pthread_cond_destroy) };
+        c.state.store(UNINIT, Ordering::Release);
+        let backing = unsafe {
+            resolve(&c.state, &c.real, |p| {
+                pthread_cond_init(p, attr);
+            })
+        };
+        if backing.is_null() {
+            libc_einval()
+        } else {
+            0
+        }
     }
 }
 
 pub extern "C" fn cond_destroy(cond: *mut c_void) -> c_int {
-    if cond.is_null() {
-        return libc_einval();
+    #[cfg(target_os = "android")]
+    unsafe {
+        return pthread_cond_destroy(cond);
     }
-    // SAFETY: as above.
-    let c = unsafe { &mut *(cond as *mut BionicCond) };
-    unsafe { destroy_backing(&c.state, &c.real, pthread_cond_destroy) };
-    0
+    #[cfg(not(target_os = "android"))]
+    {
+        if cond.is_null() {
+            return libc_einval();
+        }
+        // SAFETY: as above.
+        let c = unsafe { &mut *(cond as *mut BionicCond) };
+        unsafe { destroy_backing(&c.state, &c.real, pthread_cond_destroy) };
+        0
+    }
 }
 
 /// Tear down and free a wrapper's backing object, if it has one.
@@ -191,20 +205,27 @@ unsafe fn destroy_backing(
 macro_rules! cond_op {
     ($name:ident, $glibc:ident) => {
         pub extern "C" fn $name(cond: *mut c_void) -> c_int {
-            if cond.is_null() {
-                return libc_einval();
+            #[cfg(target_os = "android")]
+            unsafe {
+                return $glibc(cond);
             }
-            // SAFETY: bionic's contract is a pointer to a 32-byte pthread_cond_t.
-            let c = unsafe { &mut *(cond as *mut BionicCond) };
-            let backing = unsafe {
-                resolve(&c.state, &c.real, |p| {
-                    pthread_cond_init(p, std::ptr::null());
-                })
-            };
-            if backing.is_null() {
-                return libc_einval();
+            #[cfg(not(target_os = "android"))]
+            {
+                if cond.is_null() {
+                    return libc_einval();
+                }
+                // SAFETY: bionic's contract is a pointer to a 32-byte pthread_cond_t.
+                let c = unsafe { &mut *(cond as *mut BionicCond) };
+                let backing = unsafe {
+                    resolve(&c.state, &c.real, |p| {
+                        pthread_cond_init(p, std::ptr::null());
+                    })
+                };
+                if backing.is_null() {
+                    return libc_einval();
+                }
+                unsafe { $glibc(backing) }
             }
-            unsafe { $glibc(backing) }
         }
     };
 }
@@ -213,12 +234,19 @@ cond_op!(cond_signal, pthread_cond_signal);
 cond_op!(cond_broadcast, pthread_cond_broadcast);
 
 pub extern "C" fn cond_wait(cond: *mut c_void, mutex: *mut c_void) -> c_int {
-    let Some(backing) = cond_backing(cond) else {
-        return libc_einval();
-    };
-    // SAFETY: `mutex` is a bionic pthread_mutex_t, which is layout-identical to
-    // glibc's on x86-64 (both 40 bytes) and so passes straight through.
-    unsafe { pthread_cond_wait(backing, mutex) }
+    #[cfg(target_os = "android")]
+    unsafe {
+        return pthread_cond_wait(cond, mutex);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let Some(backing) = cond_backing(cond) else {
+            return libc_einval();
+        };
+        // SAFETY: `mutex` is a bionic pthread_mutex_t, which is layout-identical to
+        // glibc's on x86-64 (both 40 bytes) and so passes straight through.
+        unsafe { pthread_cond_wait(backing, mutex) }
+    }
 }
 
 pub extern "C" fn cond_timedwait(
@@ -226,11 +254,18 @@ pub extern "C" fn cond_timedwait(
     mutex: *mut c_void,
     abstime: *const c_void,
 ) -> c_int {
-    let Some(backing) = cond_backing(cond) else {
-        return libc_einval();
-    };
-    // SAFETY: as above; `struct timespec` is identical between the two libcs.
-    unsafe { pthread_cond_timedwait(backing, mutex, abstime) }
+    #[cfg(target_os = "android")]
+    unsafe {
+        return pthread_cond_timedwait(cond, mutex, abstime);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let Some(backing) = cond_backing(cond) else {
+            return libc_einval();
+        };
+        // SAFETY: as above; `struct timespec` is identical between the two libcs.
+        unsafe { pthread_cond_timedwait(backing, mutex, abstime) }
+    }
 }
 
 fn cond_backing(cond: *mut c_void) -> Option<*mut c_void> {
@@ -250,55 +285,76 @@ fn cond_backing(cond: *mut c_void) -> Option<*mut c_void> {
 // ------------------------------------------------------------------ semaphores
 
 pub extern "C" fn semaphore_init(sem: *mut c_void, pshared: c_int, value: u32) -> c_int {
-    if sem.is_null() {
-        return libc_einval();
+    #[cfg(target_os = "android")]
+    unsafe {
+        return sem_init(sem, pshared, value);
     }
-    // SAFETY: bionic's contract is a pointer to a 16-byte sem_t.
-    let s = unsafe { &mut *(sem as *mut BionicSem) };
-    unsafe { destroy_backing(&s.state, &s.real, sem_destroy) };
-    s.state.store(UNINIT, Ordering::Release);
-    let backing = unsafe {
-        resolve(&s.state, &s.real, |p| {
-            sem_init(p, pshared, value);
-        })
-    };
-    if backing.is_null() {
-        libc_einval()
-    } else {
-        0
+    #[cfg(not(target_os = "android"))]
+    {
+        if sem.is_null() {
+            return libc_einval();
+        }
+        // SAFETY: bionic's contract is a pointer to a 16-byte sem_t.
+        let s = unsafe { &mut *(sem as *mut BionicSem) };
+        unsafe { destroy_backing(&s.state, &s.real, sem_destroy) };
+        s.state.store(UNINIT, Ordering::Release);
+        let backing = unsafe {
+            resolve(&s.state, &s.real, |p| {
+                sem_init(p, pshared, value);
+            })
+        };
+        if backing.is_null() {
+            libc_einval()
+        } else {
+            0
+        }
     }
 }
 
 pub extern "C" fn semaphore_destroy(sem: *mut c_void) -> c_int {
-    if sem.is_null() {
-        return libc_einval();
+    #[cfg(target_os = "android")]
+    unsafe {
+        return sem_destroy(sem);
     }
-    // SAFETY: as above.
-    let s = unsafe { &mut *(sem as *mut BionicSem) };
-    unsafe { destroy_backing(&s.state, &s.real, sem_destroy) };
-    0
+    #[cfg(not(target_os = "android"))]
+    {
+        if sem.is_null() {
+            return libc_einval();
+        }
+        // SAFETY: as above.
+        let s = unsafe { &mut *(sem as *mut BionicSem) };
+        unsafe { destroy_backing(&s.state, &s.real, sem_destroy) };
+        0
+    }
 }
 
 macro_rules! sem_op {
     ($name:ident, $glibc:ident) => {
         pub extern "C" fn $name(sem: *mut c_void) -> c_int {
-            if sem.is_null() {
-                return libc_einval();
+            #[cfg(target_os = "android")]
+            unsafe {
+                return $glibc(sem);
             }
-            // SAFETY: bionic's contract is a pointer to a 16-byte sem_t.
-            let s = unsafe { &mut *(sem as *mut BionicSem) };
-            // Unlike condition variables a semaphore has no static initialiser,
-            // so reaching here uninitialised means sem_init was skipped. Create
-            // a zero-count semaphore rather than crashing.
-            let backing = unsafe {
-                resolve(&s.state, &s.real, |p| {
-                    sem_init(p, 0, 0);
-                })
-            };
-            if backing.is_null() {
-                return libc_einval();
+            #[cfg(not(target_os = "android"))]
+            {
+                if sem.is_null() {
+                    return libc_einval();
+                }
+                // SAFETY: bionic's contract is a pointer to a 16-byte sem_t.
+                let s = unsafe { &mut *(sem as *mut BionicSem) };
+                // Unlike condition variables a semaphore has no static initialiser,
+                // so reaching here uninitialised means sem_init was skipped. Create
+                // a zero-count semaphore rather than crashing.
+                let backing = unsafe {
+                    resolve(&s.state, &s.real, |p| {
+                        sem_init(p, 0, 0);
+                    })
+                };
+                if backing.is_null() {
+                    return libc_einval();
+                }
+                unsafe { $glibc(backing) }
             }
-            unsafe { $glibc(backing) }
         }
     };
 }

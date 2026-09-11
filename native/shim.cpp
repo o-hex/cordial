@@ -13,9 +13,16 @@
 #include <string>
 #include <unordered_map>
 
+#if defined(__aarch64__)
+alignas(64) thread_local int cordial_arm64_bionic_tls_align = 0;
+#endif
+
 extern "C" {
 
 void cordial_linker_init() {
+#if defined(__aarch64__)
+    cordial_arm64_bionic_tls_align = 1;
+#endif
     linker::init();
 }
 

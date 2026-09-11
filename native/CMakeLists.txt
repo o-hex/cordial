@@ -67,6 +67,10 @@ get_target_property(_linker_defs linker COMPILE_DEFINITIONS)
 list(REMOVE_ITEM _linker_defs "PATH_MAX=256")
 list(APPEND _linker_defs "PATH_MAX=4096")
 set_target_properties(linker PROPERTIES COMPILE_DEFINITIONS "${_linker_defs}")
+if(ANDROID OR CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64.*|AARCH64.*|arm64.*|ARM64.*)")
+  target_compile_options(linker PRIVATE --target=aarch64-linux-android30)
+endif()
+
 
 # PipeWire, for opensles.cpp's audio backend. Headers only, and only if
 # present: libpipewire-0.3.so is never linked (dlopen'd at run time instead,

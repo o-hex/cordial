@@ -194,7 +194,10 @@ const LEGACY_FILE_SIZE: usize = 152;
 static STACK_CHK_GUARD: usize = 0x0011_2233_4455_6600usize.to_le();
 
 extern "C" {
+    #[cfg(not(target_os = "android"))]
     fn __errno_location() -> *mut c_int;
+    #[cfg(target_os = "android")]
+    fn __errno() -> *mut c_int;
     fn strlen(s: *const c_char) -> usize;
     fn strchr(s: *const c_char, c: c_int) -> *mut c_char;
     fn strncpy(dst: *mut c_char, src: *const c_char, n: usize) -> *mut c_char;
@@ -291,18 +294,27 @@ extern "C" fn bionic_mallinfo() -> BionicMallinfo {
 /// registers the callback with the thread's exit path, and there is no second
 /// place to put it.
 extern "C" fn bionic_cxa_thread_atexit_impl(
-    func: *mut c_void,
-    arg: *mut c_void,
-    dso_handle: *mut c_void,
+    _func: *mut c_void,
+    _arg: *mut c_void,
+    _dso_handle: *mut c_void,
 ) -> c_int {
-    // SAFETY: the three pointers are passed straight through to the host
-    // implementation of the same function, with the same signature.
-    unsafe { host_cxa_thread_atexit_impl(func, arg, dso_handle) }
+    #[cfg(target_os = "android")]
+    {
+        0
+    }
+    #[cfg(not(target_os = "android"))]
+    unsafe { host_cxa_thread_atexit_impl(_func, _arg, _dso_handle) }
 }
 
 extern "C" fn bionic_errno() -> *mut c_int {
-    // SAFETY: glibc's per-thread errno slot; the same contract as bionic's.
-    unsafe { __errno_location() }
+    #[cfg(target_os = "android")]
+    unsafe {
+        __errno()
+    }
+    #[cfg(not(target_os = "android"))]
+    unsafe {
+        __errno_location()
+    }
 }
 
 unsafe fn cstr(p: *const c_char) -> String {
@@ -507,6 +519,7 @@ extern "C" {
 /// during static initialisation and, untranslated, is told 1000 — which is not a
 /// power of two, so the allocator that asked aborts. Nothing about that failure
 /// points back at `sysconf`, which is why the translation is worth its table.
+#[cfg(not(target_os = "android"))]
 extern "C" fn bionic_sysconf(name: c_int) -> i64 {
     if let Some(&(_, glibc, _)) = sysconf_table::SYSCONF_MAP
         .iter()
@@ -527,6 +540,12 @@ extern "C" fn bionic_sysconf(name: c_int) -> i64 {
     eprintln!("[bionic] sysconf({name}) is not a selector bionic defines; returning -1");
     -1
 }
+
+#[cfg(target_os = "android")]
+extern "C" fn bionic_sysconf(name: c_int) -> i64 {
+    unsafe { sysconf(name) }
+}
+
 
 // ----------------------------------------------------------------------- liblog
 
@@ -821,6 +840,7 @@ pub fn thread_overrides() -> Vec<(&'static str, *mut c_void)> {
 /// Without these the engine cannot resolve a single hostname: bionic's
 /// `AI_DEFAULT` sets a bit glibc rejects with `EAI_BADFLAGS`, and a result that
 /// did come back would have its `ai_addr` and `ai_canonname` transposed.
+#[cfg(not(target_os = "android"))]
 pub fn netdb_overrides() -> Vec<(&'static str, *mut c_void)> {
     #[repr(C)]
     struct Symbol {
@@ -848,3 +868,9 @@ pub fn netdb_overrides() -> Vec<(&'static str, *mut c_void)> {
         })
         .collect()
 }
+
+#[cfg(target_os = "android")]
+pub fn netdb_overrides() -> Vec<(&'static str, *mut c_void)> {
+    Vec::new()
+}
+

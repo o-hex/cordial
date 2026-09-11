@@ -27,9 +27,12 @@ use std::ffi::{c_int, c_void};
 type BionicSigset = u64;
 
 /// Enough room for glibc's `sigset_t` (128 bytes) with margin.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 const GLIBC_SIGSET_BYTES: usize = 192;
 /// Enough room for glibc's `struct sigaction` (152 bytes) with margin.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 const GLIBC_SIGACTION_BYTES: usize = 256;
+
 
 /// The highest signal number worth translating. Linux uses 1..=64.
 const MAX_SIGNAL: c_int = 64;
@@ -55,6 +58,7 @@ extern "C" {
 }
 
 /// Build a glibc set from bionic's bitmask.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn to_glibc(mask: BionicSigset, out: &mut [u8; GLIBC_SIGSET_BYTES]) {
     let p = out.as_mut_ptr() as *mut c_void;
     // SAFETY: `out` is at least as large as glibc's sigset_t.
@@ -68,6 +72,7 @@ fn to_glibc(mask: BionicSigset, out: &mut [u8; GLIBC_SIGSET_BYTES]) {
 }
 
 /// Read a glibc set back into bionic's bitmask.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn from_glibc(set: &[u8; GLIBC_SIGSET_BYTES]) -> BionicSigset {
     let p = set.as_ptr() as *const c_void;
     let mut mask = 0u64;
@@ -130,6 +135,7 @@ extern "C" fn b_sigismember(set: *const BionicSigset, sig: c_int) -> c_int {
 
 // ------------------------------------------------------------------- masking
 
+#[cfg(not(target_os = "android"))]
 fn mask_call(
     how: c_int,
     set: *const BionicSigset,
@@ -162,6 +168,16 @@ fn mask_call(
     rc
 }
 
+#[cfg(target_os = "android")]
+fn mask_call(
+    how: c_int,
+    set: *const BionicSigset,
+    old: *mut BionicSigset,
+    f: unsafe extern "C" fn(c_int, *const c_void, *mut c_void) -> c_int,
+) -> c_int {
+    unsafe { f(how, set as *const c_void, old as *mut c_void) }
+}
+
 extern "C" fn b_sigprocmask(
     how: c_int,
     set: *const BionicSigset,
@@ -186,11 +202,16 @@ extern "C" fn b_pthread_sigmask(
 /// `{ handler; sigset_t mask; int flags; restorer }`, which is *not* bionic's
 /// order, and naming the fields in Rust would only invite someone to reorder
 /// them to match the bionic struct above.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 const GLIBC_SA_HANDLER: usize = 0;
+#[cfg_attr(target_os = "android", allow(dead_code))]
 const GLIBC_SA_MASK: usize = 8;
+#[cfg_attr(target_os = "android", allow(dead_code))]
 const GLIBC_SA_FLAGS: usize = 136;
+#[cfg_attr(target_os = "android", allow(dead_code))]
 const GLIBC_SA_RESTORER: usize = 144;
 
+#[cfg(not(target_os = "android"))]
 extern "C" fn b_sigaction(
     sig: c_int,
     act: *const BionicSigaction,
@@ -250,6 +271,15 @@ extern "C" fn b_sigaction(
         }
     }
     rc
+}
+
+#[cfg(target_os = "android")]
+extern "C" fn b_sigaction(
+    sig: c_int,
+    act: *const BionicSigaction,
+    old: *mut BionicSigaction,
+) -> c_int {
+    unsafe { sigaction(sig, act as *const c_void, old as *mut c_void) }
 }
 
 pub fn overrides() -> Vec<(&'static str, *mut c_void)> {

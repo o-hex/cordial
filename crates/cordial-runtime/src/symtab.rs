@@ -170,20 +170,60 @@ fn classify(symbol: &str) -> Class {
 /// `host_libc` resolves libc symbols from the host as well. It is ABI-unsafe and
 /// exists to see how far execution gets, not to be correct.
 pub fn build(host_libc: bool) -> SymbolTable {
-    // (host soname, Android soname it stands in for)
+    // (host candidate sonames, Android soname it stands in for)
     //
-    // libstdc++ and libgcc_s are here for one symbol: `__gxx_personality_v0`,
-    // the Itanium C++ ABI personality routine. Roblox imports it undefined and
-    // throws during static initialisation; with it stubbed the unwinder cannot
-    // find a handler, calls std::terminate, and the whole load aborts inside
-    // DT_INIT_ARRAY. The ABI is standard, so the host's is the right one.
-    let candidates: &[(&'static str, &'static str)] = &[
-        ("libm.so.6", "libm.so"),
-        ("libz.so.1", "libz.so"),
-        ("libGLESv2.so.2", "libGLESv2.so"),
-        ("libEGL.so.1", "libEGL.so"),
-        ("libstdc++.so.6", "libc.so"),
-        ("libgcc_s.so.1", "libc.so"),
+    // libstdc++, libc++_shared, and libgcc_s are here for one symbol:
+    // `__gxx_personality_v0`, the Itanium C++ ABI personality routine.
+    // Roblox imports it undefined and throws during static initialisation;
+    // with it stubbed the unwinder cannot find a handler, calls std::terminate,
+    // and the whole load aborts inside DT_INIT_ARRAY. The ABI is standard,
+    // so the host's is the right one.
+    let candidate_groups: &[(&[&'static str], &'static str)] = &[
+        (
+            &[
+                "libm.so.6",
+                "libm.so",
+                "/system/lib64/libm.so",
+                "/apex/com.android.runtime/lib64/bionic/libm.so",
+            ],
+            "libm.so",
+        ),
+        (
+            &[
+                "libz.so.1",
+                "libz.so",
+                "/data/data/com.termux/files/usr/lib/libz.so",
+                "/system/lib64/libz.so",
+            ],
+            "libz.so",
+        ),
+        (
+            &[
+                "libGLESv2.so.2",
+                "libGLESv2.so",
+                "/data/data/com.termux/files/usr/lib/libGLESv2.so",
+                "/system/lib64/libGLESv2.so",
+            ],
+            "libGLESv2.so",
+        ),
+        (
+            &[
+                "libEGL.so.1",
+                "libEGL.so",
+                "/data/data/com.termux/files/usr/lib/libEGL.so",
+                "/system/lib64/libEGL.so",
+            ],
+            "libEGL.so",
+        ),
+        (
+            &[
+                "libstdc++.so.6",
+                "libc++_shared.so",
+                "/data/data/com.termux/files/usr/lib/libc++_shared.so",
+                "libgcc_s.so.1",
+            ],
+            "libc.so",
+        ),
     ];
 
     let overrides: BTreeMap<&'static str, *mut c_void> = crate::bionic::function_overrides()
@@ -194,14 +234,26 @@ pub fn build(host_libc: bool) -> SymbolTable {
 
     let mut host_libs = Vec::new();
     let mut missing_host_libs = Vec::new();
-    for (soname, provides) in candidates {
-        match HostLib::open(soname, provides) {
-            Some(lib) => host_libs.push(lib),
-            None => missing_host_libs.push(*soname),
+    for (sonames, provides) in candidate_groups {
+        let mut opened = false;
+        for soname in *sonames {
+            if let Some(lib) = HostLib::open(soname, provides) {
+                host_libs.push(lib);
+                opened = true;
+                break;
+            }
+        }
+        if !opened {
+            missing_host_libs.push(sonames[0]);
         }
     }
-    let libc = host_libc
-        .then(|| HostLib::open("libc.so.6", "libc.so"))
+    let libc = (host_libc || cfg!(target_os = "android"))
+        .then(|| {
+            HostLib::open("libc.so.6", "libc.so")
+                .or_else(|| HostLib::open("libc.so", "libc.so"))
+                .or_else(|| HostLib::open("/system/lib64/libc.so", "libc.so"))
+                .or_else(|| HostLib::open("/apex/com.android.runtime/lib64/bionic/libc.so", "libc.so"))
+        })
         .flatten();
 
     let mut table = SymbolTable {
@@ -355,14 +407,15 @@ impl HostLib {
         let name = CString::new(soname).ok()?;
         // SAFETY: `name` outlives the call and is NUL-terminated.
         let handle = unsafe { host_dlopen(name.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
-        let soname_stem = soname.split_once(".so").map_or(soname, |(stem, _)| {
+        let filename = soname.rsplit('/').next().unwrap_or(soname);
+        let soname_stem = filename.split_once(".so").map_or(filename, |(stem, _)| {
             // "libm.so.6" -> "libm.so"
-            &soname[..stem.len() + 3]
+            &filename[..stem.len() + 3]
         });
         (!handle.is_null()).then_some(HostLib {
             provides,
             soname_stem,
-            accepts_vdso: soname.starts_with("libc."),
+            accepts_vdso: filename.starts_with("libc."),
             handle,
         })
     }

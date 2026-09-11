@@ -1474,7 +1474,6 @@ enum DiskMoment {
     BeforeLaunch,
     AfterExit,
 }
-
 fn main() -> ExitCode {
     // **Before `parse()`, and that is not stylistic.** `--profile` latches the
     // active profile directory as a side effect of being parsed, and the whole

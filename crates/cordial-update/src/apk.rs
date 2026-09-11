@@ -286,6 +286,11 @@ pub fn extract_with(
         let _ = std::fs::remove_file(&partial);
         return Err(e);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o644));
+    }
 
     std::fs::rename(&partial, &target).map_err(|e| {
         let _ = std::fs::remove_file(&partial);

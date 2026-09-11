@@ -357,7 +357,8 @@ const EPOLLHUP: u32 = 0x010;
 const EPOLL_CTL_ADD: c_int = 1;
 const EPOLL_CTL_DEL: c_int = 2;
 
-#[repr(C, packed)]
+#[cfg_attr(target_arch = "x86_64", repr(C, packed))]
+#[cfg_attr(not(target_arch = "x86_64"), repr(C))]
 #[derive(Clone, Copy)]
 struct EpollEvent {
     events: u32,

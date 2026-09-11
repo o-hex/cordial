@@ -15,7 +15,8 @@ fn main() {
     }
 
     // AOSP bionic does not build with GCC; see docs/base-evaluation.md §2.1.
-    let dst = cmake::Config::new(&native)
+    let mut config = cmake::Config::new(&native);
+    config
         .define("CMAKE_C_COMPILER", "clang")
         .define("CMAKE_CXX_COMPILER", "clang++")
         .define("CMAKE_BUILD_TYPE", "Release")
@@ -34,8 +35,12 @@ fn main() {
         .define(
             "CORDIAL_JNI_TRACE",
             if std::env::var_os("CORDIAL_JNI_TRACE").is_some() { "ON" } else { "OFF" },
-        )
-        .build();
+        );
+    if std::env::var("TARGET").map_or(false, |t| t.contains("android")) {
+        config.cflag("--target=aarch64-linux-android30");
+        config.cxxflag("--target=aarch64-linux-android30");
+    }
+    let dst = config.build();
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=cordial_linker_shim");
@@ -46,7 +51,11 @@ fn main() {
     // archive only satisfies symbols from archives listed after it.
     println!("cargo:rustc-link-lib=static=logger");
     println!("cargo:rustc-link-lib=static=linker");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    if std::env::var("TARGET").map_or(false, |t| t.contains("android")) {
+        println!("cargo:rustc-link-lib=dylib=c++_shared");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
     println!("cargo:rustc-link-lib=dylib=z");
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=pthread");

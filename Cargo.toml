@@ -15,4 +15,6 @@ license = "GPL-3.0-or-later"  # see LICENSE; third-party notices in THIRD-PARTY-
 rust-version = "1.75"
 
 [profile.release]
-debug = true      # the runtime is useless to debug without symbols
+debug = false     # Disabled on Android/Termux to prevent excessive UFS 4.1 flash wear and write amplification (reduces build artifacts from ~11.5 GB to ~350 MB)
+strip = "symbols"
+

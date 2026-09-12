@@ -45,6 +45,12 @@ runs anywhere: `chmod +x Cordial-x86_64.AppImage && ./Cordial-x86_64.AppImage`.
 [§2](#2-install-it) compares the two and says what is less proven about the
 newer one.
 
+### Android / Termux (ARM64 Native)
+
+Running natively on Android via Termux with Turnip Vulkan hardware acceleration and PC controls spoofing?
+👉 **[Read the Termux Installation & Setup Guide (INSTALL_TERMUX.md)](INSTALL_TERMUX.md)**
+
+
 **You also need Roblox's Android build, which Cordial does not ship and never
 will.** First run has one button — **Download Roblox** — and that is the whole
 procedure. Cordial fetches the build from APKPure, a third-party mirror, and

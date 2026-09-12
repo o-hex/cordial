@@ -20,6 +20,10 @@ fn main() {
         .define("CMAKE_C_COMPILER", "clang")
         .define("CMAKE_CXX_COMPILER", "clang++")
         .define("CMAKE_BUILD_TYPE", "Release")
+        .cflag("-pipe")
+        .cxxflag("-pipe")
+        .cflag("-g0")
+        .cxxflag("-g0")
         // `CORDIAL_JNI_TRACE=1 cargo build` turns on libjnivm's trace.
         //
         // Not a convenience. libjnivm only emits `Constructed Unresolved

@@ -16,6 +16,7 @@
 //! and a surface role — more moving parts for the same first frame.
 
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CString};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -66,6 +67,8 @@ struct Xlib {
     connection_number: unsafe extern "C" fn(Display) -> c_int,
     pending: unsafe extern "C" fn(Display) -> c_int,
     next_event: unsafe extern "C" fn(Display, *mut c_void) -> c_int,
+    peek_event: Option<unsafe extern "C" fn(Display, *mut c_void) -> c_int>,
+    xkb_set_detectable_auto_repeat: Option<unsafe extern "C" fn(Display, c_int, *mut c_int) -> c_int>,
 
     grab_pointer: unsafe extern "C" fn(
         Display, Window, c_int, c_uint, c_int, c_int, Window, c_ulong, c_ulong,
@@ -163,6 +166,16 @@ impl Xlib {
             create_pixmap_cursor: sym!("XCreatePixmapCursor"),
             define_cursor: sym!("XDefineCursor"),
             free_pixmap: sym!("XFreePixmap"),
+            peek_event: {
+                let name = CString::new("XPeekEvent").unwrap();
+                let p = unsafe { dlsym(lib, name.as_ptr()) };
+                if p.is_null() { None } else { Some(unsafe { std::mem::transmute(p) }) }
+            },
+            xkb_set_detectable_auto_repeat: {
+                let name = CString::new("XkbSetDetectableAutoRepeat").unwrap();
+                let p = unsafe { dlsym(lib, name.as_ptr()) };
+                if p.is_null() { None } else { Some(unsafe { std::mem::transmute(p) }) }
+            },
         })
     }
 }
@@ -198,6 +211,7 @@ struct InputState {
     /// exact meaning: constant across a MOVE/UP sequence, not per-event.
     down_time_ms: i64,
     clock: std::time::Instant,
+    key_down_times: HashMap<i32, i64>,
 }
 
 /// X11 pointer capture state.
@@ -209,7 +223,9 @@ struct PointerLockState {
     locked: bool,
     suppressed: bool,
     ignore_next_warp: bool,
+    needs_warp: bool,
     centre: (i32, i32),
+    last_pos: (i32, i32),
     saved_root: Option<(i32, i32)>,
 }
 
@@ -219,7 +235,9 @@ impl PointerLockState {
             locked: false,
             suppressed: false,
             ignore_next_warp: false,
+            needs_warp: false,
             centre: (0, 0),
+            last_pos: (0, 0),
             saved_root: None,
         }
     }
@@ -430,6 +448,12 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
     // SAFETY: `display` is open; the geometry and border/background pixels are
     // plain values.
     CURRENT_DISPLAY.store(display as usize, std::sync::atomic::Ordering::Relaxed);
+
+    if let Some(set_detectable) = xlib.xkb_set_detectable_auto_repeat {
+        let mut supported: c_int = 0;
+        let r = unsafe { (set_detectable)(display, 1, &mut supported) };
+        println!("[android] XkbSetDetectableAutoRepeat enabled (result={r}, supported={supported})");
+    }
     let place = placement(width as c_int, height as c_int);
     // Reported always, not behind a trace flag: "the window opened on the wrong
     // screen" is a user-visible complaint, and this line is what separates
@@ -625,6 +649,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             buttons: 0,
             down_time_ms: 0,
             clock: std::time::Instant::now(),
+            key_down_times: HashMap::new(),
         }),
         pointer_lock: Mutex::new(PointerLockState::new()),
         fullscreen: AtomicBool::new(place.fullscreen),
@@ -908,7 +933,9 @@ impl HostWindow {
 
             state.locked = true;
             state.ignore_next_warp = true;
+            state.needs_warp = false;
             state.centre = centre;
+            state.last_pos = centre;
             state.saved_root = saved_root;
         }
 
@@ -960,7 +987,9 @@ impl HostWindow {
 
             state.locked = false;
             state.ignore_next_warp = false;
+            state.needs_warp = false;
             state.centre = (0, 0);
+            state.last_pos = (0, 0);
 
             (was_locked, saved_root)
         };
@@ -1002,24 +1031,27 @@ impl HostWindow {
         }
     }
 
-    fn escape_pointer_lock(&self) -> bool {
-        let held = self
+    fn toggle_pointer_lock_suppression(&self) -> Option<bool> {
+        let mut state = self
             .pointer_lock
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .locked;
+            .unwrap_or_else(|e| e.into_inner());
 
-        if !held {
-            return false;
+        if state.suppressed {
+            state.suppressed = false;
+            drop(state);
+            self.sync_pointer_lock();
+            return Some(false);
         }
 
-        self.pointer_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .suppressed = true;
+        if !state.locked {
+            return None;
+        }
 
+        state.suppressed = true;
+        drop(state);
         self.release_pointer_lock();
-        true
+        Some(true)
     }
 
     pub fn close(&self) {
@@ -1230,6 +1262,23 @@ fn is_final_expose(count: c_int) -> bool {
 }
 
 impl HostWindow {
+    fn is_synthetic_key_repeat(&self, release_ev: &XInputEvent) -> bool {
+        let Some(peek) = self.xlib.peek_event else { return false };
+        if unsafe { (self.xlib.pending)(self.display) } <= 0 {
+            return false;
+        }
+        let mut next_buf = [0u8; 256];
+        unsafe { (peek)(self.display, next_buf.as_mut_ptr() as *mut c_void) };
+        let next_type = unsafe { *(next_buf.as_ptr() as *const c_int) };
+        if next_type == KEY_PRESS {
+            let next_ev = unsafe { &*(next_buf.as_ptr() as *const XInputEvent) };
+            if next_ev.detail == release_ev.detail && next_ev.time == release_ev.time {
+                return true;
+            }
+        }
+        false
+    }
+
     fn now_ms(&self) -> i64 {
         let state = self.input.lock().unwrap_or_else(|e| e.into_inner());
         state.clock.elapsed().as_millis() as i64
@@ -1292,82 +1341,35 @@ impl HostWindow {
             if state.locked {
                 let centre = state.centre;
 
-                let Some((dx, dy)) =
-                    locked_pointer_delta((ev.x, ev.y), centre, state.ignore_next_warp)
-                else {
+                // Synthetic warp echo back to centre: consume and discard without generating deltas.
+                if state.ignore_next_warp && (ev.x, ev.y) == centre {
                     state.ignore_next_warp = false;
+                    state.last_pos = centre;
                     return;
-                };
-                let (cx, cy) = centre;
+                }
 
-                // Preserve the existing Android/AGDK motion path while the
-                // pointer is captured. The absolute position remains the
-                // capture centre, but Roblox still sees the same MotionEvent
-                // sequence it saw before pointer locking was introduced.
-                let input = self
-                    .input
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                // Compute true incremental delta from the previous reported position.
+                // This prevents cumulative delta duplication when multiple motion events
+                // arrive in a single batch before the XWarpPointer request finishes.
+                let dx = ev.x - state.last_pos.0;
+                let dy = ev.y - state.last_pos.1;
+                state.last_pos = (ev.x, ev.y);
 
-                let buttons = input.buttons;
-                let down_time = input.down_time_ms;
-                let now = input.clock.elapsed().as_millis() as i64;
-                drop(input);
-
-                let action =
-                    if buttons != 0 {
-                        ACTION_MOVE
-                    } else {
-                        ACTION_HOVER_MOVE
-                    };
-
-                deliver_mouse(
-                    handle,
-                    action,
-                    cx as f32,
-                    cy as f32,
-                    buttons,
-                    0,
-                    now,
-                    down_time,
-                );
-
-                // The relative delta is still delivered through Roblox's
-                // NativeInputInterface path for camera rotation.
                 if dx != 0 || dy != 0 {
+                    state.needs_warp = true;
                     drop(state);
 
+                    // Deliver relative delta to Roblox's NativeInputInterface for camera look.
+                    // Note: deliver_mouse (AGDK touch) is deliberately NOT called here,
+                    // matching Wayland backend (see wayland.rs:3839); sending stationary touch events
+                    // at (cx, cy) interferes with Roblox's camera rotation and floods event queues.
                     super::input::pass_mouse_move_delta(
-                        cx as f32,
-                        cy as f32,
+                        centre.0 as f32,
+                        centre.1 as f32,
                         dx as f32,
                         dy as f32,
                     );
-
-                    let mut state = self
-                        .pointer_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-
-                    state.ignore_next_warp = true;
-                    drop(state);
-
-                    unsafe {
-                        (self.xlib.warp_pointer)(
-                            self.display,
-                            0,
-                            self.window,
-                            0,
-                            0,
-                            0,
-                            0,
-                            cx,
-                            cy,
-                        );
-                        (self.xlib.flush)(self.display);
-                    }
                 }
-
                 return;
             }
         }
@@ -1414,14 +1416,30 @@ impl HostWindow {
         let meta = android_meta_state(ev.state);
         let now = self.now_ms();
 
-        if down && keysym == 0xff1b && self.escape_pointer_lock() {
-            return;
+        let evdev = ev.detail as i32 - 8;
+        let (down_time, is_repeat) = {
+            let mut state = self.input.lock().unwrap_or_else(|e| e.into_inner());
+            if down {
+                if let Some(&orig_down) = state.key_down_times.get(&evdev) {
+                    (orig_down, true)
+                } else {
+                    state.key_down_times.insert(evdev, now);
+                    (now, false)
+                }
+            } else {
+                let orig_down = state.key_down_times.remove(&evdev).unwrap_or(now);
+                (orig_down, false)
+            }
+        };
+
+        if down && !is_repeat && keysym == 0xff1b {
+            self.toggle_pointer_lock_suppression();
         }
 
         // XK_F11. Like the Wayland game window, this backend is not the GTK
         // launcher and therefore cannot inherit its `win.fullscreen` action.
         if keysym == 0xffc8 {
-            if down {
+            if down && !is_repeat {
                 self.set_fullscreen(!self.fullscreen.load(Ordering::Relaxed));
             }
             return;
@@ -1431,7 +1449,7 @@ impl HostWindow {
             // `text=` is a length unless `CORDIAL_TRACE_TEXT_SHOW_PASSWORDS=1`:
             // one character at a time is still a password, printed slowly.
             eprintln!(
-                "[cordial] key {} keysym={keysym:#x} text={} keycode={:?} focus={:?}",
+                "[cordial] key {} (repeat={is_repeat}) keysym={keysym:#x} text={} keycode={:?} focus={:?}",
                 if down { "down" } else { "up" },
                 super::input::redacted(
                     std::str::from_utf8(&text[..n.max(0) as usize]).unwrap_or("")
@@ -1441,23 +1459,22 @@ impl HostWindow {
             );
         }
 
-        // Real per-key downTime tracking (one slot per held key) is not
-        // implemented; both fields use the current time on every call. That
-        // is a simplification, not a faithful `downTime`, and is called out in
-        // the report — it does not block a key reaching the engine, only the
-        // precision of one timing field most UI code does not consult.
-        // Keys the Android keycode table covers. A keysym with no mapping — the
-        // shifted symbols, `@` among them — used to `return` here, which also
-        // skipped the text path below and silently dropped the character. Text
-        // does not need an Android keycode: `@` is a character whether or not
-        // AKEYCODE has a name for it, and an email address is unusable without
-        // it. So this is now a branch rather than an exit.
+        // Real per-key downTime tracking (one slot per held key) is handled
+        // via state.key_down_times above.
+        //
+        // Only non-repeat presses are delivered to Roblox's game input.
+        // Auto-repeats from the X server reset hold actions (e.g. ProximityPrompt)
+        // because Roblox interprets duplicate press events as new InputBegan triggers.
+        // Note that text entry below still receives repeat events so holding keys in
+        // textboxes (like Backspace) works as expected.
         if let Some(keycode) = keysym_to_android(keysym) {
-            deliver_key(handle, down, keycode, ev.detail as i32, meta, 0, unicode, now, now);
-            // The evdev code, not the Android keycode. X11 keycodes are evdev
-            // offset by 8 -- XKB reserves the low 8 for historical reasons every
-            // consumer has to undo. See `pass_key_event`.
-            pass_key_event(down, ev.detail as i32 - 8, meta);
+            if !is_repeat {
+                deliver_key(handle, down, keycode, ev.detail as i32, meta, 0, unicode, now, down_time);
+                // The evdev code, not the Android keycode. X11 keycodes are evdev
+                // offset by 8 -- XKB reserves the low 8 for historical reasons every
+                // consumer has to undo. See `pass_key_event`.
+                pass_key_event(down, evdev, meta);
+            }
         } else {
             super::trace(format_args!("unmapped X11 keysym {keysym:#x}"));
         }
@@ -1565,8 +1582,15 @@ impl HostWindow {
                     let ev = unsafe { &*(buf.as_ptr() as *const XInputEvent) };
                     self.dispatch_motion(handle, ev);
                 }
-                KEY_PRESS | KEY_RELEASE => {
-                    self.dispatch_key(handle, &mut buf, event_type == KEY_PRESS);
+                KEY_RELEASE => {
+                    let ev = unsafe { &*(buf.as_ptr() as *const XInputEvent) };
+                    if self.is_synthetic_key_repeat(ev) {
+                        continue;
+                    }
+                    self.dispatch_key(handle, &mut buf, false);
+                }
+                KEY_PRESS => {
+                    self.dispatch_key(handle, &mut buf, true);
                 }
                 FOCUS_OUT => {
                     self.release_pointer_lock();
@@ -1577,6 +1601,7 @@ impl HostWindow {
                         .unwrap_or_else(|e| e.into_inner());
 
                     state.buttons = 0;
+                    state.key_down_times.clear();
                 }
                 EXPOSE => {
                     // SAFETY: `event_type == EXPOSE` means `XNextEvent` just
@@ -1601,6 +1626,38 @@ impl HostWindow {
         }
 
         self.sync_pointer_lock();
+
+        // Recentring: if the locked pointer moved away from centre during this drain,
+        // warp it back to centre ONCE per frame rather than on every single sub-pixel packet.
+        // This avoids flooding the X11 connection socket with hundreds of warp roundtrips per second.
+        {
+            let mut state = self
+                .pointer_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            if state.locked && state.needs_warp {
+                state.needs_warp = false;
+                state.ignore_next_warp = true;
+                let (cx, cy) = state.centre;
+                drop(state);
+
+                unsafe {
+                    (self.xlib.warp_pointer)(
+                        self.display,
+                        0,
+                        self.window,
+                        0,
+                        0,
+                        0,
+                        0,
+                        cx,
+                        cy,
+                    );
+                    (self.xlib.flush)(self.display);
+                }
+            }
+        }
     }
 
     /// The window changed size. Update what the engine is told about it.

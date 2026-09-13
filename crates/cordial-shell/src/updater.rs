@@ -296,8 +296,12 @@ pub fn header_button(
                         let last = last.clone();
                         let installing = installing.clone();
                         installing.set(true);
-                        on_worker(
-                            || {
+                        // Silent means no window, not nothing at all: the
+                        // button turns into the bar for the length of it.
+                        crate::download_progress::show_on_button(&button, None);
+                        let header = button.clone();
+                        on_worker_reporting(
+                            |report: &dyn Fn(cordial_update::provider::Progress)| {
                                 let cancel = cordial_update::provider::Cancel::new();
                                 cordial_update::provider::obtain_and_install(
                                     None,
@@ -306,11 +310,12 @@ pub fn header_button(
                                         cordial_shell::profile::all_pinned_versions(),
                                     )),
                                     &cancel,
-                                    &mut |_| {},
+                                    &mut |p| report(p),
                                 )
                                 .map(|(got, _)| got.version.name)
                                 .map_err(|e| e.to_string())
                             },
+                            move |step| crate::download_progress::show_on_button(&header, Some(&step)),
                             move |outcome| {
                                 installing.set(false);
                                 match outcome {
@@ -329,9 +334,15 @@ pub fn header_button(
                                         }
                                         dress(&button, &last.borrow(), automatic);
                                     }
-                                    Err(why) => println!(
-                                        "[update] a background update did not install: {why}"
-                                    ),
+                                    Err(why) => {
+                                        println!(
+                                            "[update] a background update did not install: {why}"
+                                        );
+                                        // The bar has to give the icon back
+                                        // on this path too, or it sits there
+                                        // pulsing for a download that ended.
+                                        dress(&button, &last.borrow(), automatic);
+                                    }
                                 }
                             },
                         );
@@ -1136,6 +1147,9 @@ pub fn present(
             let cancel = std::sync::Arc::new(cordial_update::provider::Cancel::new());
             status_line.set_visible(false);
             meter.start();
+            // And the header button, which outlives this window: close it
+            // mid-download and the bar in the header bar is what is left.
+            crate::download_progress::show_on_button(&button_for_badge, None);
             action_for_click.set_label("Cancel");
             action_for_click.remove_css_class("suggested-action");
             // **The handler has to outlive this block**, because whoever
@@ -1196,7 +1210,13 @@ pub fn present(
                         .map(|(got, _)| got.version.name)
                         .map_err(|e| e.to_string())
                 }},
-                move |step| stepping.step(&step),
+                {
+                    let header = button_for_badge.clone();
+                    move |step| {
+                        crate::download_progress::show_on_button(&header, Some(&step));
+                        stepping.step(&step);
+                    }
+                },
                 move |outcome| {
                     // Whatever happened, this attempt is over and the next
                     // press -- from this window or a future background check
@@ -1243,6 +1263,7 @@ pub fn present(
                         // its builds -- advice for somebody who could not
                         // download, shown to somebody who chose not to.
                         finishing.stopped();
+                        dress(&done_button, &done_last.borrow(), automatic);
                         button.set_label(DOWNLOAD);
                         button.add_css_class("suggested-action");
                         line.set_visible(true);
@@ -1252,6 +1273,7 @@ pub fn present(
                         // down and a machine having no network look identical
                         // from in here and only one is the user's to fix.
                         finishing.failed(&format!("{why}\n\n{STORES}"));
+                        dress(&done_button, &done_last.borrow(), automatic);
                         button.set_label(DOWNLOAD);
                         button.add_css_class("suggested-action");
                         line.set_visible(true);

@@ -234,9 +234,95 @@ impl Meter {
     }
 }
 
+/// Marks a header-button bar that has no denominator yet, so its tick callback
+/// knows to pulse. A class rather than a field because the bar is the only state
+/// there is: it lives as the button's child and goes when the icon comes back.
+const PULSING: &str = "cordial-pulsing";
+
+/// The header bar's update button, while a download runs.
+///
+/// **The button becomes the bar.** The meter above only exists inside the
+/// Roblox Build window, and that window can be closed part-way through a 229 MB
+/// fetch -- or never opened at all, when automatic updates download in the
+/// background -- which left nothing on screen saying a download was happening.
+/// The button is the one control that is always there and already means "the
+/// Roblox build".
+///
+/// Stateless on purpose: the bar is the button's child, so whoever finishes the
+/// download puts the icon back with `set_icon_name`, GTK replaces the child, and
+/// the pulse callback goes with the widget it was attached to. There is no
+/// second piece of state to forget to clear.
+pub fn show_on_button(button: &gtk::Button, step: Option<&Step>) {
+    let bar = match button.child().and_downcast::<gtk::ProgressBar>() {
+        Some(bar) => bar,
+        None => {
+            let bar = gtk::ProgressBar::new();
+            bar.set_valign(gtk::Align::Center);
+            bar.set_width_request(40);
+            bar.add_css_class(PULSING);
+            let last = std::cell::Cell::new(0i64);
+            bar.add_tick_callback(move |bar, clock| {
+                let now = clock.frame_time();
+                if bar.has_css_class(PULSING) && now - last.get() > 80_000 {
+                    last.set(now);
+                    bar.pulse();
+                }
+                glib::ControlFlow::Continue
+            });
+            button.set_child(Some(&bar));
+            bar
+        }
+    };
+    let tooltip = match step {
+        None => {
+            bar.add_css_class(PULSING);
+            "Starting the Roblox download…".to_string()
+        }
+        Some(Step::Asking { .. }) => {
+            bar.add_css_class(PULSING);
+            "Looking for the latest build…".to_string()
+        }
+        Some(Step::Fetching { done, total, .. }) => {
+            if let Some(total) = total.filter(|t| *t > 0) {
+                bar.remove_css_class(PULSING);
+                bar.set_fraction((*done as f64 / total as f64).clamp(0.0, 1.0));
+            } else {
+                bar.add_css_class(PULSING);
+            }
+            button_tooltip(*done, *total)
+        }
+        Some(Step::Verifying { .. }) => {
+            bar.remove_css_class(PULSING);
+            bar.set_fraction(1.0);
+            "Checking it was signed by Roblox…".to_string()
+        }
+    };
+    button.set_tooltip_text(Some(&tooltip));
+}
+
+/// What hovering the button says mid-transfer. The same rule as the meter: a
+/// percentage only against a length the server declared.
+fn button_tooltip(done: u64, total: Option<u64>) -> String {
+    match total {
+        Some(total) if total > 0 => format!(
+            "Downloading Roblox: {:.0}% of {}",
+            (done as f64 / total as f64).clamp(0.0, 1.0) * 100.0,
+            bytes(total)
+        ),
+        _ => format!("Downloading Roblox: {} so far", bytes(done)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_button_gives_a_percentage_only_against_a_declared_length() {
+        assert_eq!(button_tooltip(114_500_000, Some(229_000_000)), "Downloading Roblox: 50% of 229 MB");
+        assert_eq!(button_tooltip(12_000_000, None), "Downloading Roblox: 12 MB so far");
+        assert_eq!(button_tooltip(12_000_000, Some(0)), "Downloading Roblox: 12 MB so far");
+    }
 
     #[test]
     fn sizes_read_the_way_a_download_is_usually_quoted() {

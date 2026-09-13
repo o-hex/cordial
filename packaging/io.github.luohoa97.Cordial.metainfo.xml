@@ -78,6 +78,25 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.14.1" date="2026-09-13">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.14.1</url>
+      <description>
+        <p>
+          Closing the game window no longer ends on the crash page. The client
+          was segfaulting on the way out, and now exits cleanly.
+        </p>
+        <p>
+          Cordial keeps the current Roblox build and the two before it, and
+          Settings has a Version page for going back to one. Roblox refuses old
+          clients eventually, so a pinned build will stop working one day.
+        </p>
+        <p>
+          A resize glitch and the TaskScheduler crash on a second launch are
+          reported and not yet reproduced. Both are described in the release
+          notes.
+        </p>
+      </description>
+    </release>
     <release version="0.14.0" date="2026-09-13">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.14.0</url>
       <description>

@@ -122,7 +122,11 @@ be stated rather than dressed up.
 
 ## 5. Symbol resolution for `libm`/`libz` should not be gated on a checked-in TSV
 
-**Intermediate, and it has already broken a release once.**
+**Done, 2026-09-13.** `symtab::build` reads the engine's imports out of the ELF
+and resolves the union of those and the stub table; the acceptance test below
+was run with its control. See
+[ADR-034](../adr/ADR-034-symbol-resolution-asks-the-library.md). The rest of
+this section is kept because it states the problem better than the fix does.
 
 `docs/analysis/undefined-symbols.tsv` is a snapshot of what one build of
 `libroblox.so` imported, and the stub table is generated from it. When Roblox

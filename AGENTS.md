@@ -165,8 +165,18 @@ cut -f2 docs/analysis/undefined-symbols.tsv | sort -u > /tmp/old.txt
 comm -23 /tmp/new.txt /tmp/old.txt
 ```
 
-Data symbols fail the `DT_NEEDED` walk at load time rather than at first use, so
-one missing name stops the whole client.
+**That file used to be the gate, and is not any more.** `symtab::build` reads
+the engine's own imports out of the ELF and resolves the union of those and the
+stub table, so a new build importing an ordinary libc or libm function -- which
+is what `hypotf` and `getpwuid_r` were -- now resolves from the host and says
+so in the log. Regenerating the TSV is housekeeping that keeps each stub named,
+not a release blocker. [ADR-034](docs/adr/ADR-034-symbol-resolution-asks-the-library.md).
+
+What still stops the client is a symbol *nothing* can answer -- an Android API
+with no host equivalent and no implementation here. That is deliberate: it
+fails by name rather than being handed a silent zero. Data symbols fail the
+`DT_NEEDED` walk at load time rather than at first use, so one missing name
+stops the whole client.
 
 ## Never make a stub lie
 

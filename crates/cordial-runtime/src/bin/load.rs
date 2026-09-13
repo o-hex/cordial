@@ -1677,7 +1677,23 @@ fn main() -> ExitCode {
     // of this log should see the choice before its consequence.
     cordial_runtime::bionic::announce_audio_backend();
 
-    let table = symtab::build(opt.host_libc);
+    // Ask the engine what it imports rather than trusting the checked-in list.
+    // `docs/analysis/undefined-symbols.tsv` still generates the stubs, but it is
+    // no longer the gate: a Roblox update that adds an ordinary libc import used
+    // to stop the client loading until somebody regenerated that file, which
+    // happened for `hypotf` and again for `getpwuid_r`. Issue #15.
+    let (imports, unreadable) =
+        cordial_runtime::elf::undefined_symbols_in_dir(std::path::Path::new(&opt.lib_dir));
+    for (path, why) in &unreadable {
+        println!("  warning: could not read imports from {path}: {why}");
+    }
+    println!(
+        "engine imports: {} symbols across {}",
+        imports.len(),
+        opt.lib_dir
+    );
+
+    let table = symtab::build(opt.host_libc, &imports);
     let totals = table.totals();
 
     println!(
@@ -1696,6 +1712,47 @@ fn main() -> ExitCode {
     }
     for missing in &table.missing_host_libs {
         println!("  warning: host {missing} unavailable; its symbols are stubbed");
+    }
+
+    // Both of these are empty on a build whose imports the checked-in list
+    // already covers, so anything printed here is news.
+    for (symbol, library) in &table.beyond_stub_table {
+        println!(
+            "  note: {symbol} is not in docs/analysis/undefined-symbols.tsv; \
+             resolved from the host under {library}"
+        );
+    }
+    if !table.unprovidable.is_empty() {
+        let strong = table
+            .unprovidable
+            .iter()
+            .filter(|u| u.binding == cordial_runtime::elf::Binding::Strong)
+            .count();
+        let n = table.unprovidable.len();
+        println!(
+            "  {n} {} the engine imports cannot be answered by Cordial, the host, or a stub:",
+            if n == 1 { "symbol" } else { "symbols" }
+        );
+        for u in &table.unprovidable {
+            let weak = if u.binding == cordial_runtime::elf::Binding::Weak {
+                " (weak, so resolved to zero)"
+            } else {
+                ""
+            };
+            println!("    {}{weak} -- {}", u.symbol, u.why);
+        }
+        match strong {
+            0 => println!("  all of them are weak, so the load proceeds without them"),
+            1 => println!(
+                "  the load will fail on it. This is a Roblox build needing something \
+                 Cordial does not have; see .github/ISSUE_TEMPLATE/roblox_update.yml"
+            ),
+            n => println!(
+                "  the load will fail on the first of the {n} that are not weak. This is a \
+                 Roblox build needing something Cordial does not have; \
+                 see .github/ISSUE_TEMPLATE/roblox_update.yml"
+            ),
+        }
     }
 
     if opt.verbose {

@@ -18,9 +18,10 @@
 //! `bionic::pthread`'s `once` for the ABI comparison that has to be done, per
 //! symbol and measured, before adding a sixth.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_char, c_int, c_void, CString};
 
+use crate::elf::Binding;
 use crate::stubs::SYMBOLS;
 
 /// Symbol prefix -> the Android library that provides it. These have no host
@@ -67,6 +68,28 @@ const ANDROID_PREFIXES: &[(&str, &str)] = &[
 /// did before `native/aaudio.cpp` existed, the guest never asks for any audio
 /// library by any name.
 pub const AAUDIO_LIBRARY_NAME: &str = "libaaudio.so";
+
+/// libdl's surface, which the bionic linker answers itself.
+///
+/// **These must never be resolved from the host, and the danger is specific.**
+/// glibc exports every one of them, so a host lookup succeeds and hands the
+/// guest *our* loader -- at which point the engine's `dlopen("libvulkan.so")`
+/// asks glibc for a library only the bionic linker knows about, and gets
+/// nothing, with no error that points anywhere near the cause.
+///
+/// `build.rs` skips the same names when it generates the stub table, so they
+/// have never been in `SYMBOLS`. The list is repeated here rather than shared
+/// because a build script cannot import from the crate it builds; if one
+/// changes, change both.
+const LINKER_PROVIDED: &[&str] = &[
+    "dlopen",
+    "dlsym",
+    "dlclose",
+    "dlerror",
+    "dladdr",
+    "dl_iterate_phdr",
+    "dlvsym",
+];
 
 /// In `libroblox.so`'s `DT_NEEDED` but contributing no undefined symbols — they
 /// are consulted via `dlsym` at runtime, if at all. They still have to exist for
@@ -116,11 +139,28 @@ impl Stats {
     }
 }
 
+/// An import the engine has and nothing here can answer.
+pub struct Unprovidable {
+    pub symbol: String,
+    /// Weak imports are resolved to zero by the linker and do not stop a load.
+    pub binding: Binding,
+    /// What sort of thing it looked like, for the reader of the log.
+    pub why: String,
+}
+
 pub struct SymbolTable {
     pub libraries: BTreeMap<&'static str, Vec<Entry>>,
     pub stats: BTreeMap<&'static str, Stats>,
     /// Host libraries that could not be opened; their symbols fell back to stubs.
     pub missing_host_libs: Vec<&'static str>,
+    /// Imports found in the engine that the generated stub table has never
+    /// heard of, and which the host answered anyway. Empty on a build the
+    /// checked-in symbol list is current for; non-empty is the interesting case
+    /// and worth printing.
+    pub beyond_stub_table: Vec<(String, &'static str)>,
+    /// Imports nothing can answer. A strong one here means the load is about
+    /// to fail, and this is the only place that says which symbol and why.
+    pub unprovidable: Vec<Unprovidable>,
 }
 
 impl SymbolTable {
@@ -165,11 +205,63 @@ fn classify(symbol: &str) -> Class {
     Class::Generic
 }
 
+/// The soname a symbol is registered under when nothing more specific applies.
+fn fallback_library(class: &Class) -> &'static str {
+    match class {
+        Class::Android(lib) | Class::Khronos(lib) => lib,
+        Class::Generic => "libc.so",
+    }
+}
+
+/// Where a symbol resolves from, before any stub is considered.
+///
+/// `None` means nothing on this machine can answer it. For a symbol in the
+/// generated table that is what the stub is for; for one discovered in the
+/// library and absent from the table there is no stub, and `build` records it
+/// as unprovidable instead of inventing one.
+fn resolve(
+    symbol: &str,
+    class: &Class,
+    overrides: &BTreeMap<&'static str, *mut c_void>,
+    host_libs: &[HostLib],
+    libc: Option<&HostLib>,
+) -> Option<(&'static str, *mut c_void, Source)> {
+    // Cordial's own implementations win over everything. They exist because
+    // neither the host nor a stub is correct for these; see `bionic`.
+    if let Some(&addr) = overrides.get(symbol) {
+        return Some((fallback_library(class), addr, Source::Cordial));
+    }
+    match class {
+        // No host has these, so there is nothing to try.
+        Class::Android(_) => None,
+        // Always register under the Khronos soname even when the host answers,
+        // so the bucketing stays honest either way.
+        Class::Khronos(lib) => lookup(host_libs, symbol).map(|(_, addr)| (*lib, addr, Source::Host)),
+        Class::Generic => match lookup(host_libs, symbol) {
+            Some((provides, addr)) => Some((provides, addr, Source::Host)),
+            None => libc
+                .and_then(|l| l.lookup(symbol))
+                .map(|addr| ("libc.so", addr, Source::Host)),
+        },
+    }
+}
+
 /// Build the full table.
 ///
 /// `host_libc` resolves libc symbols from the host as well. It is ABI-unsafe and
 /// exists to see how far execution gets, not to be correct.
-pub fn build(host_libc: bool) -> SymbolTable {
+///
+/// `imports` is what the engine's own ELF says it needs, read by `crate::elf`.
+/// **It is the answer to issue #15.** The generated stub table is only as
+/// current as `docs/analysis/undefined-symbols.tsv`, and twice a Roblox update
+/// has added an ordinary libc import the host had all along -- `hypotf`, then
+/// `getpwuid_r` -- and stopped the client loading until somebody hand-edited
+/// that file. Anything in `imports` and not in `SYMBOLS` is resolved here from
+/// the host on the same rules as everything else. What the host cannot answer
+/// is *not* given a stub: there is no generated one to give it, and inventing a
+/// silent zero is how the next `hypotf` becomes a mystery rather than an error.
+/// It goes in `unprovidable`, the load fails on it, and the log names it.
+pub fn build(host_libc: bool, imports: &crate::elf::Imports) -> SymbolTable {
     // (host soname, Android soname it stands in for)
     //
     // libstdc++ and libgcc_s are here for one symbol: `__gxx_personality_v0`,
@@ -208,38 +300,14 @@ pub fn build(host_libc: bool) -> SymbolTable {
         libraries: BTreeMap::new(),
         stats: BTreeMap::new(),
         missing_host_libs,
+        beyond_stub_table: Vec::new(),
+        unprovidable: Vec::new(),
     };
 
     for (symbol, stub) in SYMBOLS.iter() {
-        let stub_addr = *stub as *mut c_void;
         let class = classify(symbol);
-
-        // Cordial's own implementations win over everything. They exist because
-        // neither the host nor a stub is correct for these; see `bionic`.
-        let (library, address, source) = if let Some(&addr) = overrides.get(symbol) {
-            let lib = match class {
-                Class::Android(lib) | Class::Khronos(lib) => lib,
-                Class::Generic => "libc.so",
-            };
-            (lib, addr, Source::Cordial)
-        } else {
-            match class {
-                Class::Android(lib) => (lib, stub_addr, Source::Stub),
-
-                Class::Khronos(lib) => match lookup(&host_libs, symbol) {
-                    Some((_, addr)) => (lib, addr, Source::Host),
-                    None => (lib, stub_addr, Source::Stub),
-                },
-
-                Class::Generic => match lookup(&host_libs, symbol) {
-                    Some((provides, addr)) => (provides, addr, Source::Host),
-                    None => match libc.as_ref().and_then(|l| l.lookup(symbol)) {
-                        Some(addr) => ("libc.so", addr, Source::Host),
-                        None => ("libc.so", stub_addr, Source::Stub),
-                    },
-                },
-            }
-        };
+        let (library, address, source) = resolve(symbol, &class, &overrides, &host_libs, libc.as_ref())
+            .unwrap_or((fallback_library(&class), *stub as *mut c_void, Source::Stub));
 
         table.libraries.entry(library).or_default().push(Entry {
             symbol,
@@ -247,6 +315,48 @@ pub fn build(host_libc: bool) -> SymbolTable {
             source,
         });
         table.stats.entry(library).or_default().record(source);
+    }
+
+    // Everything the engine imports that the generated table has never heard
+    // of. On a build the checked-in list is current for this loop does nothing;
+    // after a Roblox update it is the difference between the client starting
+    // and `cannot locate symbol` before any window appears. See `build`'s
+    // header and issue #15.
+    let known: BTreeSet<&str> = SYMBOLS.iter().map(|(s, _)| *s).collect();
+    for (symbol, binding) in imports {
+        let name = symbol.as_str();
+        if known.contains(name) || LINKER_PROVIDED.contains(&name) {
+            continue;
+        }
+        let class = classify(name);
+        match resolve(name, &class, &overrides, &host_libs, libc.as_ref()) {
+            Some((library, address, source)) => {
+                // The table outlives every caller -- it is handed to the linker
+                // at startup and never rebuilt -- and the linker copies these
+                // names into `std::string` keys of its own anyway. Leaking is
+                // the honest way to say that, and it is bounded by how many
+                // imports a Roblox update adds, which has been one at a time.
+                let leaked: &'static str = Box::leak(symbol.clone().into_boxed_str());
+                table.libraries.entry(library).or_default().push(Entry {
+                    symbol: leaked,
+                    address,
+                    source,
+                });
+                table.stats.entry(library).or_default().record(source);
+                table.beyond_stub_table.push((symbol.clone(), library));
+            }
+            None => table.unprovidable.push(Unprovidable {
+                symbol: symbol.clone(),
+                binding: *binding,
+                why: match class {
+                    Class::Android(lib) => {
+                        format!("an Android API belonging to {lib}, which needs implementing here")
+                    }
+                    Class::Khronos(_) => "no GLES or EGL on this host defines it".to_string(),
+                    Class::Generic => "no host library defines it".to_string(),
+                },
+            }),
+        }
     }
 
     for name in EMPTY_LIBRARIES {
@@ -463,6 +573,101 @@ mod tests {
         assert!(matches!(classify("pthread_create"), Class::Generic));
     }
 
+    /// Issue #15's acceptance test, in miniature: a symbol the host provides
+    /// that `docs/analysis/undefined-symbols.tsv` has never mentioned. `hypotl`
+    /// is the long-double sibling of the `hypotf` that actually stopped a
+    /// client loading in 2.734.0.917, and is not in the file -- checked, not
+    /// assumed, by the assertion below.
+    #[test]
+    fn a_host_symbol_absent_from_the_stub_table_still_resolves() {
+        assert!(
+            !SYMBOLS.iter().any(|(s, _)| *s == "hypotl"),
+            "hypotl has been added to the stub table; this test needs a symbol that has not"
+        );
+
+        let mut imports = crate::elf::Imports::new();
+        imports.insert("hypotl".to_string(), Binding::Strong);
+        let table = build(false, &imports);
+
+        assert!(
+            table.unprovidable.is_empty(),
+            "libm has hypotl: {:?}",
+            table.unprovidable.iter().map(|u| &u.symbol).collect::<Vec<_>>()
+        );
+        let entry = table
+            .libraries
+            .get("libm.so")
+            .expect("libm.so registered")
+            .iter()
+            .find(|e| e.symbol == "hypotl")
+            .expect("hypotl resolved into libm.so");
+        assert_eq!(entry.source, Source::Host);
+        assert_eq!(
+            table.beyond_stub_table,
+            vec![("hypotl".to_string(), "libm.so")]
+        );
+    }
+
+    /// The other half of the same issue, and the half that must stay loud: a
+    /// symbol nothing can answer is reported, not quietly given a zero.
+    #[test]
+    fn a_symbol_nothing_provides_is_reported_rather_than_stubbed() {
+        let name = "cordial_no_such_symbol_anywhere";
+        let mut imports = crate::elf::Imports::new();
+        imports.insert(name.to_string(), Binding::Strong);
+        let table = build(false, &imports);
+
+        assert!(table.beyond_stub_table.is_empty());
+        let reported = table
+            .unprovidable
+            .iter()
+            .find(|u| u.symbol == name)
+            .expect("reported as unprovidable");
+        assert_eq!(reported.binding, Binding::Strong);
+        assert!(
+            !table
+                .libraries
+                .values()
+                .flatten()
+                .any(|e| e.symbol == name),
+            "it must not be registered at all -- an unregistered symbol is what makes \
+             the linker fail by name, which is the whole point"
+        );
+    }
+
+    /// glibc exports `dlopen`, so the host lookup for it *succeeds*. Taking it
+    /// would hand the guest our loader, and its `dlopen("libvulkan.so")` would
+    /// then ask glibc for a library only the bionic linker knows about.
+    #[test]
+    fn libdl_is_never_taken_from_the_host() {
+        let mut imports = crate::elf::Imports::new();
+        for name in LINKER_PROVIDED {
+            imports.insert(name.to_string(), Binding::Strong);
+        }
+        let table = build(true, &imports);
+
+        assert!(table.beyond_stub_table.is_empty(), "{:?}", table.beyond_stub_table);
+        assert!(table.unprovidable.is_empty(), "nor reported as a gap: the linker has them");
+        for name in LINKER_PROVIDED {
+            assert!(
+                !table.libraries.values().flatten().any(|e| e.symbol == *name),
+                "{name} was registered from the host"
+            );
+        }
+    }
+
+    /// A weak import nothing provides is still reported, but marked -- the
+    /// eight in `libroblox.so` go unresolved on every healthy launch, and a
+    /// message saying the load is about to fail would be wrong every time.
+    #[test]
+    fn a_weak_gap_is_recorded_as_weak() {
+        let mut imports = crate::elf::Imports::new();
+        imports.insert("cordial_no_such_weak_hook".to_string(), Binding::Weak);
+        let table = build(false, &imports);
+        assert_eq!(table.unprovidable.len(), 1);
+        assert_eq!(table.unprovidable[0].binding, Binding::Weak);
+    }
+
     /// `pthread_once` and thread-specific data must resolve without
     /// `--host-libc`, which is the whole point of implementing them: as stubs
     /// they returned a success the caller could not survive, and the run died
@@ -470,7 +675,7 @@ mod tests {
     /// bare `--lib-dir` configuration.
     #[test]
     fn thread_local_storage_resolves_without_host_libc() {
-        let table = build(false);
+        let table = build(false, &Default::default());
         let libc = table.libraries.get("libc.so").expect("libc.so registered");
         for symbol in [
             "pthread_once",

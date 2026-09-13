@@ -762,6 +762,11 @@ Four real gaps, ranked. The first two are the same failure this project hit on
 
 ### U1. A new libm symbol is a manual code change. It should not be.
 
+**Fixed, 2026-09-13 --- see [ADR-034](docs/adr/ADR-034-symbol-resolution-asks-the-library.md).**
+`symtab::build` now takes the engine's own imports, read out of the ELF, and
+resolves the union of those and `SYMBOLS`. The diagnosis below was right and is
+kept for it.
+
 **This is the highest-value finding of the comparison.** `hypotf` stopped the
 client loading entirely, and the fix was a hand-edited row in a TSV.
 

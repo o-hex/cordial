@@ -253,11 +253,7 @@ mod tests {
         // code. 1 << 8 is "exited with 1".
         let status = ExitStatus::from_raw(1 << 8);
         assert!(is_crash(&status, ""));
-        assert!(
-            describe(&status).contains("exit code 1"),
-            "{}",
-            describe(&status)
-        );
+        assert!(describe(&status).contains("exit code 1"), "{}", describe(&status));
     }
 
     #[test]

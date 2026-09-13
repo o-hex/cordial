@@ -73,35 +73,6 @@ pub struct Build {
     pub lib_dir: PathBuf,
 }
 
-/// Replace the engine Cordial extracted into its own cache.
-///
-/// This is deliberately narrower than a generic "clear cache" action.  A
-/// Roblox profile holds its cookie store and app data below XDG data, not the
-/// XDG cache which holds this extracted ELF object. Removing the engine before
-/// a launch (or after a detected startup failure) asks the next launch to
-/// extract a fresh copy without signing the profile out. An engine beside a
-/// user-selected APK or in a directory selected in Settings is not ours to
-/// remove.
-pub fn replace_cached_engine(configured: &RobloxInstall, build: &Build) -> Result<Build, String> {
-    let cache = engine_cache();
-    if configured.lib_dir.is_some() || build.lib_dir != cache {
-        return Err(format!(
-            "{} is not Cordial's extracted-engine cache",
-            build.lib_dir.display()
-        ));
-    }
-
-    let library = cache.join(LIBRARY);
-    if !library.is_file() {
-        return Err(format!("No {LIBRARY} in {}", cache.display()));
-    }
-    std::fs::remove_file(&library).map_err(|e| format!("{}: {e}", library.display()))?;
-    locate(configured).map_err(|e| match e {
-        NotFound::NoBuild => "No Roblox build is available to re-extract the engine".to_string(),
-        NotFound::Unusable(message) => message,
-    })
-}
-
 
 /// Why a launch cannot proceed, split by what the user can do about it.
 #[derive(Debug)]
@@ -721,33 +692,6 @@ mod tests {
             got, b"the new engine, which is longer",
             "the cache must follow the APK it was extracted from"
         );
-    }
-
-    #[test]
-    fn replacing_the_cached_engine_leaves_data_outside_the_cache_alone() {
-        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(APK_OVERRIDE);
-        let dir = scratch("replace-cache-only");
-        let cache_home = dir.join("cache");
-        let previous = std::env::var_os("XDG_CACHE_HOME");
-        std::env::set_var("XDG_CACHE_HOME", &cache_home);
-
-        let apk = dir.join("base.apk");
-        std::fs::write(&apk, apk_holding(b"the engine")).unwrap();
-        let install = RobloxInstall { apk: Some(apk), lib_dir: None };
-        let build = locate(&install).unwrap();
-        let profile_data = dir.join("data/cordial/profiles/default/cookies");
-        std::fs::create_dir_all(profile_data.parent().unwrap()).unwrap();
-        std::fs::write(&profile_data, b"session stays here").unwrap();
-
-        let repaired = replace_cached_engine(&install, &build).unwrap();
-
-        match previous {
-            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
-        }
-        assert!(repaired.lib_dir.join(LIBRARY).is_file());
-        assert_eq!(std::fs::read(profile_data).unwrap(), b"session stays here");
     }
 
     #[test]

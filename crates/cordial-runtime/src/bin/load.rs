@@ -101,8 +101,8 @@ env:
                                      CORDIAL_MONITOR
   CORDIAL_FULLSCREEN=1               cover the chosen monitor and ask the
                                      window manager for fullscreen
-  CORDIAL_NO_COMPOSITOR_BYPASS=1     keep the Xorg compositor in fullscreen;
-                                     by default Cordial advertises direct scanout
+  CORDIAL_COMPOSITOR_BYPASS=1        X11: set _NET_WM_BYPASS_COMPOSITOR
+                                     while fullscreen (off by default)
   CORDIAL_RESOLUTION=<w>x<h>         render resolution (default 1280x720);
                                      CORDIAL_FULLSCREEN overrides it
   CORDIAL_DPI_SCALE=<f>              UI density Roblox lays out against.
@@ -3804,62 +3804,6 @@ fn main() -> ExitCode {
                                                 }
                                             }
                                             println!("  activity lifecycle: {fired}/9 fired");
-                                        }
-
-                                        // Wait for bootstrapTheApp to deliver
-                                        // settings before calling
-                                        // nativeGameGlobalInit. The engine calls
-                                        // bootstrapTheApp asynchronously — it can
-                                        // land before or after this thread
-                                        // continues — and nativeGameGlobalInit
-                                        // spawns the engine's own "Main" thread,
-                                        // which races through StartLuaAppDM and
-                                        // tries to init TaskScheduler. If
-                                        // bootstrapTheApp has not yet marked
-                                        // flags loaded when that thread wins,
-                                        // the engine aborts:
-                                        // "Can't initialize the TaskScheduler
-                                        // before flags have been loaded".
-                                        //
-                                        // The fix is to observe BOOTSTRAP_RAN —
-                                        // already set by run_bootstrap() on the
-                                        // engine's own thread — before handing
-                                        // control to nativeGameGlobalInit. A
-                                        // timeout prevents an indefinite hang
-                                        // when bootstrap never fires (which is
-                                        // what CORDIAL_LATE_SETTINGS=1 does by
-                                        // design, so the wait is skipped there).
-                                        //
-                                        // `CORDIAL_WAIT_BOOTSTRAP_MS=off`
-                                        // restores the old behaviour as a
-                                        // control. The default is 2000 ms, which
-                                        // is far longer than any observed
-                                        // bootstrap on this machine and short
-                                        // enough that a hang is noticed quickly.
-                                        let wait_ms = std::env::var("CORDIAL_WAIT_BOOTSTRAP_MS")
-                                            .ok()
-                                            .map_or(Some(2000u64), |v| {
-                                                if v == "off" { None } else { v.parse().ok() }
-                                            });
-                                        if let Some(limit_ms) = wait_ms {
-                                            if !globals_early
-                                                && std::env::var_os("CORDIAL_LATE_SETTINGS").is_none()
-                                                && !BOOTSTRAP_RAN.load(std::sync::atomic::Ordering::SeqCst)
-                                            {
-                                                let step = std::time::Duration::from_millis(5);
-                                                let deadline = std::time::Instant::now()
-                                                    + std::time::Duration::from_millis(limit_ms);
-                                                while !BOOTSTRAP_RAN.load(std::sync::atomic::Ordering::SeqCst)
-                                                    && std::time::Instant::now() < deadline
-                                                {
-                                                    std::thread::sleep(step);
-                                                }
-                                                if BOOTSTRAP_RAN.load(std::sync::atomic::Ordering::SeqCst) {
-                                                    println!("  bootstrap wait: delivered before globals");
-                                                } else {
-                                                    println!("  bootstrap wait: timed out after {limit_ms} ms; proceeding");
-                                                }
-                                            }
                                         }
 
                                         // Globals before the app bridge:

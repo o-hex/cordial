@@ -705,11 +705,11 @@ fn asked_to_stop() -> Option<&'static str> {
 
 /// Ask the pump to stop, from anywhere.
 ///
-/// **Backend-agnostic on purpose.** `window_closed` is the Wayland backend's
-/// own observation and answers `false` on X11 by design (see
-/// `android::mod`'s dispatcher), so hanging close-on-leave off it would make
-/// the setting silently do nothing on the diagnostic backend. This flag is the
-/// pump's own and works wherever the pump runs.
+/// **Backend-agnostic on purpose.** `window_closed` is each backend's
+/// observation of the user closing the window -- GTK's toplevel going away on
+/// Wayland, `WM_DELETE_WINDOW` on X11 -- and `CORDIAL_NO_CLOSE_EXIT` gates it.
+/// Hanging close-on-leave off it would tie an unrelated setting to that
+/// control. This flag is the pump's own and works wherever the pump runs.
 ///
 /// Sets a flag rather than exiting. `process::exit` from a caller's thread
 /// would drop the engine's cookie jar and storage mid-write; every other way

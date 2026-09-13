@@ -134,6 +134,15 @@ pub fn keysym_to_android(keysym: c_ulong) -> Option<i32> {
     })
 }
 
+/// The character an X keysym names, for the text `XLookupString` cannot give.
+///
+/// Xlib's lookup only produces Latin-1, so on a Cyrillic layout it returns no
+/// bytes and the letter never reached a TextBox. Two ranges are arithmetic
+/// (Unicode keysyms and Latin-1); everything else asks libxkbcommon, which
+/// shares X11's keysym numbering. It is `dlopen`ed rather than linked because
+/// the X11 backend is a diagnostic fallback that must not add a hard
+/// dependency. The table at the end covers only the Cyrillic block, for a host
+/// with no libxkbcommon, and a test checks it against the library.
 pub fn keysym_to_char(keysym: c_ulong) -> Option<char> {
     let k = keysym as u32;
     if (0x01000100..=0x0110ffff).contains(&k) {
@@ -168,11 +177,27 @@ pub fn keysym_to_char(keysym: c_ulong) -> Option<char> {
             return char::from_u32(cp);
         }
     }
+    cyrillic_keysym_to_char(k)
+}
+
+/// X11's Cyrillic keysyms, without libxkbcommon.
+///
+/// **The letters are in KOI8 order, not alphabetical order.** 0x6c3 is `ц`,
+/// not `в`. An earlier version of this table counted up from `а` and was wrong
+/// for 42 of the 64 letters, which no test noticed because the test host had
+/// libxkbcommon and never reached the table.
+fn cyrillic_keysym_to_char(k: u32) -> Option<char> {
+    const LOWER: [char; 32] = [
+        'ю', 'а', 'б', 'ц', 'д', 'е', 'ф', 'г', 'х', 'и', 'й', 'к', 'л', 'м', 'н', 'о',
+        'п', 'я', 'р', 'с', 'т', 'у', 'ж', 'в', 'ь', 'ы', 'з', 'ш', 'э', 'щ', 'ч', 'ъ',
+    ];
+    const UPPER: [char; 32] = [
+        'Ю', 'А', 'Б', 'Ц', 'Д', 'Е', 'Ф', 'Г', 'Х', 'И', 'Й', 'К', 'Л', 'М', 'Н', 'О',
+        'П', 'Я', 'Р', 'С', 'Т', 'У', 'Ж', 'В', 'Ь', 'Ы', 'З', 'Ш', 'Э', 'Щ', 'Ч', 'Ъ',
+    ];
     match k {
-        0x06c0 => Some('ю'),
-        0x06c1..=0x06df => char::from_u32(0x0430 + (k - 0x06c1)),
-        0x06e0 => Some('Ю'),
-        0x06e1..=0x06ff => char::from_u32(0x0410 + (k - 0x06e1)),
+        0x06c0..=0x06df => Some(LOWER[(k - 0x06c0) as usize]),
+        0x06e0..=0x06ff => Some(UPPER[(k - 0x06e0) as usize]),
         0x06a1 => Some('ђ'),
         0x06a2 => Some('ѓ'),
         0x06a3 => Some('ё'),
@@ -3315,5 +3340,34 @@ mod tests {
         assert_eq!(super::keysym_to_char(0x06e1), Some('А'));
         assert_eq!(super::keysym_to_char(0x0061), Some('a'));
         assert_eq!(super::keysym_to_char(0x01000430), Some('а'));
+    }
+
+    #[test]
+    fn the_cyrillic_fallback_table_agrees_with_libxkbcommon() {
+        // The table is only reached on a host without libxkbcommon, which is
+        // exactly the host a test run does not happen on -- so it is compared
+        // against the library directly, keysym by keysym, rather than trusted.
+        extern "C" {
+            fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
+            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        }
+        let to_utf32: unsafe extern "C" fn(u32) -> u32 = unsafe {
+            let lib = dlopen(c"libxkbcommon.so.0".as_ptr(), 2);
+            if lib.is_null() {
+                eprintln!("libxkbcommon.so.0 not present; nothing to compare against");
+                return;
+            }
+            let p = dlsym(lib, c"xkb_keysym_to_utf32".as_ptr());
+            assert!(!p.is_null());
+            std::mem::transmute(p)
+        };
+        let mut compared = 0;
+        for k in 0x06a1u32..=0x06ff {
+            let Some(ours) = super::cyrillic_keysym_to_char(k) else { continue };
+            let theirs = char::from_u32(unsafe { to_utf32(k) });
+            assert_eq!(Some(ours), theirs, "keysym {k:#x}");
+            compared += 1;
+        }
+        assert_eq!(compared, 94, "every entry in the table was compared");
     }
 }

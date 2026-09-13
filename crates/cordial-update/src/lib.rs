@@ -76,6 +76,7 @@ pub mod install;
 pub mod metered;
 pub mod provider;
 pub mod settings;
+pub mod store;
 pub mod url_policy;
 pub mod version;
 

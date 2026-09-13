@@ -1,6 +1,6 @@
 # ADR-033: Roblox builds live in a keyed store, and a profile names one
 
-**Status:** proposed
+**Status:** accepted, partly implemented (see the end)
 **Date:** 2026-09-13
 **Extends:** [ADR-015](ADR-015-fetching-the-roblox-build.md), [ADR-025](ADR-025-fetching-from-a-third-party-mirror.md)
 **Related:** [ADR-012](ADR-012-profiles-and-instances.md), [ADR-013](ADR-013-per-profile-configuration.md)
@@ -94,3 +94,44 @@ years earlier. Cheap to get right now, expensive to discover later.
 is simpler and matches ADR-013; a per-launch override would let somebody test an
 older build without disturbing a profile they play on. The second is cheap to
 add later and impossible to remove, so it is left out until somebody wants it.
+
+## As built, 2026-09-13
+
+`cordial_update::store` is the store. What the decision above left open, or got
+wrong, and what was settled while building it:
+
+**An entry is the engine and the archives, not the engine alone.** Assets come
+out of `base.apk` at runtime, so an entry holding an old `libroblox.so` beside
+whatever APK is newest is exactly the silent version mismatch
+`cordial_update::cache` exists to prevent. Entries keep `base.apk` and the split
+by hard link, which costs no disk. There is deliberately no copy fallback: an
+APK on another filesystem (Sober's, say) is not duplicated silently at 230 MB,
+and the entry is recorded as incomplete instead.
+
+**A pin refuses; it never falls back.** A profile pinned to a version the store
+lacks, or holds without its APK, does not launch, and says which. The paragraph
+above promising to fetch a missing pinned version is not built: there is no
+fetch-by-version, so a missing pin is refused.
+
+**The pin is `profiles/<name>/roblox-version`**, one line of text, checked
+against the same digits-and-dots whitelist as the directory name. Pruning
+protects every profile's pin, and a pin counts towards the bound of three, so
+pins displace unpinned builds first. Four profiles pinned to four versions
+keep four; a pin is never pruned to honour the bound.
+
+**The single-slot path is only a link when the version is known.** A build
+whose version was never recorded stays a real directory, as before. Anything
+writing to the slot has to detach the link first or it writes into a kept
+build; the updater, the shell's extraction and `just client` all do.
+
+**`.loaded-by` is written by `cordial-run` after `dlopen` succeeds**, and names
+the Cordial version. Nothing reads it yet.
+
+**The shell had never recorded a version for a Sober-sourced build.** It scanned
+`split_config.x86_64.apk` for the version string. Measured, that returns
+nothing and the extracted `libroblox.so` returns `2.738.0.1397` (INFERRED: the
+library is stored compressed in the archive). It scans the engine now.
+
+**Not built:** the picker. There is no way to set a pin except writing the file,
+the launcher does not show a pin, and the minimum-version warning above has
+nowhere to appear yet. Both open questions stand.

@@ -44,6 +44,10 @@
 //! cache root, which is what the swap below needs: a rename between them stays
 //! on one filesystem.
 //!
+//! Since ADR-033 that path is a symlink into `builds/<version>/` whenever the
+//! version is known, so anything that writes to it writes into a kept build.
+//! [`adopt`] detaches the link before extracting and keys the result after.
+//!
 //! ## Nothing replaces a working build until the replacement is complete
 //!
 //! The worst failure this feature can produce is somebody losing the client they
@@ -83,6 +87,7 @@ use crate::apk;
 use crate::cache;
 use crate::download::{self, Parts, Refusal as DownloadRefusal};
 use crate::engine;
+use crate::store;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -105,6 +110,56 @@ pub const SPLIT_APK: &str = "split_config.arm64_v8a.apk";
 /// [`build_dir`] so the move into place is a rename rather than a copy, and
 /// dot-prefixed so nothing looking for an APK finds a half-written one.
 const STAGING: &str = ".incoming";
+
+/// Where the engine is extracted to while it is being checked.
+///
+/// **Beside [`STAGING`] and not inside it.** It was inside for one revision and
+/// `swap_archives` deletes the whole of `STAGING` when it is done, which took
+/// the extracted engine with it and left the rename below failing with a bare
+/// "No such file or directory" -- five tests, all pointing at the destination
+/// path, none at the cause. Also under `build` rather than under the live
+/// engine directory, because that directory can now be a symlink into the
+/// store and extracting through it would put 115 MB inside the build the user
+/// is keeping.
+pub const INCOMING_ENGINE: &str = ".incoming-engine";
+
+/// Where a keyed store of Roblox builds is, and what must survive a prune.
+///
+/// Passed rather than computed, for the reason [`install_into`] names both of
+/// its directories rather than calling [`build_dir`] and [`engine_dir`]: a
+/// test that has to write into the cache somebody is launching from is a test
+/// nobody runs twice.
+///
+/// **`protect` is the caller's job because the caller is the only one who can
+/// know it.** Which versions are pinned lives in the profiles, under
+/// `$XDG_DATA_HOME`, and this crate has no business reading them --
+/// `cordial-shell` collects them and hands them over. A prune that took a
+/// pinned build would turn somebody's deliberate choice into a launch failure
+/// with nothing to explain it, so an empty `protect` from a caller that simply
+/// did not look is the failure mode worth being loud about; see
+/// `store::prune_in`.
+#[derive(Debug, Clone)]
+pub struct Store {
+    /// `~/.cache/cordial/builds` in production.
+    pub root: PathBuf,
+    /// How many entries to keep, current one included. Zero disables pruning.
+    pub keep: usize,
+    /// Versions no prune may take, whatever their age.
+    pub protect: Vec<String>,
+}
+
+impl Store {
+    /// The real store under the cache root, holding `protect` safe from a
+    /// prune.
+    ///
+    /// Owned rather than borrowed, which is the whole reason this is a struct
+    /// and not three parameters: every caller is a closure moved onto a worker
+    /// thread, and three borrowed arguments would each need a binding outside
+    /// the closure and a `move` that captured it. One owned value is a line.
+    pub fn live(protect: Vec<String>) -> Self {
+        Store { root: crate::store::root(), keep: crate::store::KEEP, protect }
+    }
+}
 
 /// `$XDG_CACHE_HOME/cordial`, or `~/.cache/cordial`.
 pub fn cache_root() -> PathBuf {
@@ -294,7 +349,7 @@ pub fn install(
     cancel: &crate::provider::Cancel,
     progress: Progress<'_>,
 ) -> Result<Installed, Failed> {
-    install_into(parts, &build_dir(), &engine_dir(), cancel, progress)
+    install_into(parts, &build_dir(), &engine_dir(), None, cancel, progress)
 }
 
 /// The whole sequence, with both directories named so it can be tested without
@@ -309,23 +364,28 @@ pub fn install_into(
     parts: &Parts,
     build: &Path,
     engine_into: &Path,
+    store: Option<&Store>,
     cancel: &crate::provider::Cancel,
     progress: Progress<'_>,
 ) -> Result<Installed, Failed> {
     let staging = build.join(STAGING);
-    let incoming = engine_into.join(STAGING);
-    let result = staged(parts, build, engine_into, &staging, &incoming, cancel, progress);
+    // See [`INCOMING_ENGINE`] for why this is where it is. Both directories are
+    // under one cache root either way, so the final move is still a rename.
+    let incoming = build.join(INCOMING_ENGINE);
+    let result = staged(parts, build, engine_into, &staging, &incoming, store, cancel, progress);
     let _ = std::fs::remove_dir_all(&staging);
     let _ = std::fs::remove_dir_all(&incoming);
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn staged(
     parts: &Parts,
     build: &Path,
     engine_into: &Path,
     staging: &Path,
     incoming: &Path,
+    store: Option<&Store>,
     cancel: &crate::provider::Cancel,
     progress: Progress<'_>,
 ) -> Result<Installed, Failed> {
@@ -345,7 +405,7 @@ fn staged(
         fetched.push((name, path));
     }
 
-    adopt(&fetched, build, engine_into, incoming, cancel, progress)
+    adopt(&fetched, build, engine_into, incoming, store, cancel, progress)
 }
 
 /// Take archives that are already on disk and make them the build in use.
@@ -395,11 +455,13 @@ pub fn ours_to_write(build: &Path) -> bool {
     !occupied
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn adopt(
     fetched: &[(&'static str, PathBuf)],
     build: &Path,
     engine_into: &Path,
     incoming: &Path,
+    store: Option<&Store>,
     cancel: &crate::provider::Cancel,
     progress: Progress<'_>,
 ) -> Result<Installed, Failed> {
@@ -460,9 +522,39 @@ pub fn adopt(
         return Err(Failed::Cancelled);
     }
 
-    // From here the previous build is being replaced. The stamp goes first: a
-    // process killed between the renames below leaves a cache that re-extracts,
-    // rather than the old engine claiming to belong to the new archives.
+    // From here the previous build is being replaced, so this is where the
+    // outgoing one is taken into the store -- after everything slow and
+    // failure-prone has already succeeded, and before anything writes over it.
+    //
+    // Two steps and both are needed. `adopt_current` turns a real directory
+    // holding a known version into a keyed entry and leaves a link, which is
+    // the one-time migration for every install predating the store and a no-op
+    // afterwards. `detach` then breaks that link, because everything below
+    // writes to `engine_into` and a write through a link lands *inside* the
+    // entry that was just preserved -- see `store::detach`, which carries the
+    // bug that taught this.
+    //
+    // A build whose version could not be read is not keyed, `adopt_current`
+    // says so by returning `None`, and `detach` leaves the real directory
+    // alone. That is exactly the behaviour there was before any of this, which
+    // is the right answer for a build nothing can name.
+    if let Some(store) = store {
+        match store::adopt_current(&store.root, engine_into) {
+            Ok(Some(kept)) => println!("[update] kept the previous build as {kept}"),
+            Ok(None) => {}
+            // Not fatal, and deliberately so: failing an install because the
+            // *old* build could not be filed away would trade a working update
+            // for a rollback nobody had asked for yet.
+            Err(e) => println!("[update] could not keep the previous build: {e}"),
+        }
+        if let Err(e) = store::detach(engine_into) {
+            return Err(Failed::Io { path: engine_into.display().to_string(), why: e.to_string() });
+        }
+    }
+
+    // The stamp goes first: a process killed between the renames below leaves a
+    // cache that re-extracts, rather than the old engine claiming to belong to
+    // the new archives.
     cache::clear_stamp(engine_into);
 
     std::fs::create_dir_all(build)
@@ -483,6 +575,13 @@ pub fn adopt(
     let base = build.join(BASE_APK);
     let carrier_live = build.join(carrier_name);
 
+    // Created here rather than relied upon. It used to exist by the time this
+    // ran only because the extraction staged *inside* it; now that staging is
+    // under `build`, nothing else has made it, and a first install would fail
+    // on the rename below with a bare "No such file or directory".
+    std::fs::create_dir_all(engine_into)
+        .map_err(|e| Failed::Io { path: engine_into.display().to_string(), why: e.to_string() })?;
+
     let engine_live = engine_into.join(engine::LIBRARY);
     std::fs::rename(&staged_engine, &engine_live)
         .map_err(|e| Failed::Io { path: engine_live.display().to_string(), why: e.to_string() })?;
@@ -497,6 +596,34 @@ pub fn adopt(
     }
     if let Some(version) = &version {
         let _ = cache::record_version(engine_into, version);
+    }
+
+    // And the new build becomes an entry, by the same route the old one took
+    // one step above: it is now a real directory with a version recorded in it,
+    // which is exactly what `adopt_current` keys. `engine_live` still resolves
+    // afterwards -- it is the same path, read through a link instead of
+    // directly -- so nothing downstream of here learns that the store exists.
+    if let Some(store) = store {
+        match store::adopt_current(&store.root, engine_into) {
+            Ok(Some(keyed)) => {
+                // The archives too, hard-linked, because an entry holding only
+                // the engine is half a build -- see `store::keep_archives`.
+                // After `swap_archives`, so these are the promoted files at
+                // their final names and not the staged copies.
+                let entry = store.root.join(&keyed);
+                for trouble in store::keep_archives(&entry, &[&base, &carrier_live]) {
+                    println!("[update] {keyed} is keyed without its archives: {trouble}");
+                }
+                if store.keep > 0 {
+                    let dropped = store::prune_in(&store.root, store.keep, &store.protect);
+                    if !dropped.is_empty() {
+                        println!("[update] removed older builds: {}", dropped.join(", "));
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => println!("[update] installed the build but could not key it: {e}"),
+        }
     }
 
     Ok(Installed { base, carrier: carrier_live, engine: engine_live, version })
@@ -668,6 +795,7 @@ mod tests {
             &build,
             &root.join("engine"),
             &root.join("engine").join(STAGING),
+            None,
             &crate::provider::Cancel::new(),
             &mut |_, _, _| {},
         )
@@ -724,6 +852,7 @@ mod tests {
             &build,
             &engine_into,
             &engine_into.join(STAGING),
+            None,
             &crate::provider::Cancel::new(),
             &mut |_, _, _| {},
         )
@@ -816,7 +945,7 @@ mod tests {
             Parts { base: source_for(&base), split: Some(source_for(&split)) };
 
         let installed =
-            install_into(&parts, &build, &engine_into, &no_cancel(), &mut silent()).expect("install");
+            install_into(&parts, &build, &engine_into, None, &no_cancel(), &mut silent()).expect("install");
 
         assert_eq!(installed.base, build.join(BASE_APK));
         assert_eq!(installed.carrier, build.join(SPLIT_APK));
@@ -834,6 +963,95 @@ mod tests {
         assert!(!engine_into.join(STAGING).exists());
     }
 
+    /// The store, end to end and with a control: install one build, install a
+    /// second, and check that the first is still there and still whole.
+    ///
+    /// This is the test the feature exists for. Everything else about the
+    /// store is unit-testable against directories somebody wrote by hand; only
+    /// this asserts that the real install path leaves a build behind rather
+    /// than over-writing it.
+    #[test]
+    fn a_second_install_keys_both_builds_and_leaves_the_first_intact() {
+        let dir = scratch("store-e2e");
+        let build = dir.join("build");
+        let engine_into = dir.join("lib");
+        let store_root = dir.join("builds");
+        let protect: Vec<String> = Vec::new();
+        let store = Store { root: store_root.clone(), keep: crate::store::KEEP, protect };
+
+        let install_one = |version: &str| {
+            let base = zip_of(&[("assets/content/fonts/x.json", b"{}")]);
+            let split = zip_of(&[(apk::LIBRARY_IN_APK, &engine_bytes(version))]);
+            let parts = Parts { base: source_for(&base), split: Some(source_for(&split)) };
+            install_into(&parts, &build, &engine_into, Some(&store), &no_cancel(), &mut silent())
+                .expect("install")
+        };
+
+        let first = install_one("2.734.0.917");
+        assert_eq!(first.version.as_deref(), Some("2.734.0.917"));
+        // The live path is a link into the store, and still reads as it always did.
+        assert!(std::fs::symlink_metadata(&engine_into).unwrap().file_type().is_symlink());
+        assert_eq!(
+            crate::store::current_in(&store_root, &engine_into).as_deref(),
+            Some("2.734.0.917")
+        );
+        assert!(engine_into.join(engine::LIBRARY).is_file());
+
+        let older_engine = store_root.join("2.734.0.917").join(engine::LIBRARY);
+        let kept_bytes = std::fs::read(&older_engine).expect("the first build's engine");
+
+        let second = install_one("2.738.0.1393");
+        assert_eq!(second.version.as_deref(), Some("2.738.0.1393"));
+        assert_eq!(
+            crate::store::current_in(&store_root, &engine_into).as_deref(),
+            Some("2.738.0.1393")
+        );
+
+        // **The control.** Without `detach`, the second install writes through
+        // the link and the first build's engine is the second build's engine.
+        assert_eq!(
+            std::fs::read(&older_engine).expect("the first build is still there"),
+            kept_bytes,
+            "the older entry was written through"
+        );
+
+        let listed = crate::store::list_in(&store_root);
+        let versions: Vec<&str> = listed.iter().map(|e| e.version.as_str()).collect();
+        assert_eq!(versions, vec!["2.738.0.1393", "2.734.0.917"]);
+        // Both hold their own archives, so either can be launched on its own.
+        assert!(listed.iter().all(|e| e.complete), "{listed:?}");
+        assert!(listed.iter().all(|e| e.base_apk().is_some()));
+        // Neither has been loaded by anything -- the record is written by
+        // whatever launches them, not by the install.
+        assert!(listed.iter().all(|e| e.loaded_by.is_none()));
+
+        assert!(!build.join(INCOMING_ENGINE).exists(), "the staged engine is cleared");
+    }
+
+    /// Pruning happens on install, and does not take a pinned build.
+    #[test]
+    fn installing_past_the_bound_drops_the_oldest_unpinned_build() {
+        let dir = scratch("store-prune");
+        let build = dir.join("build");
+        let engine_into = dir.join("lib");
+        let store_root = dir.join("builds");
+        let protect = vec!["2.730.0.1".to_string()];
+
+        for version in ["2.730.0.1", "2.734.0.917", "2.738.0.1393", "2.740.0.5"] {
+            let store = Store { root: store_root.clone(), keep: 2, protect: protect.clone() };
+            let base = zip_of(&[("assets/content/fonts/x.json", b"{}")]);
+            let split = zip_of(&[(apk::LIBRARY_IN_APK, &engine_bytes(version))]);
+            let parts = Parts { base: source_for(&base), split: Some(source_for(&split)) };
+            install_into(&parts, &build, &engine_into, Some(&store), &no_cancel(), &mut silent())
+                .expect("install");
+        }
+
+        let left: Vec<String> =
+            crate::store::list_in(&store_root).into_iter().map(|e| e.version).collect();
+        // Two by count, plus the pinned one that is older than either.
+        assert_eq!(left, vec!["2.740.0.5", "2.738.0.1393", "2.730.0.1"]);
+    }
+
     #[test]
     fn fetching_only_base_apk_is_refused_and_the_refusal_names_the_split() {
         // The mistake this module exists to make impossible. `base.apk` alone
@@ -841,7 +1059,7 @@ mod tests {
         let dir = scratch("halfway");
         let base = zip_of(&[("assets/content/fonts/x.json", b"{}")]);
         let parts = Parts { base: source_for(&base), split: None };
-        let e = install_into(&parts, &dir.join("build"), &dir.join("lib"), &no_cancel(), &mut silent())
+        let e = install_into(&parts, &dir.join("build"), &dir.join("lib"), None, &no_cancel(), &mut silent())
             .unwrap_err();
         assert!(matches!(e, Failed::NoEngine { .. }), "{e}");
         let shown = e.to_string();
@@ -860,7 +1078,7 @@ mod tests {
         ]);
         let parts = Parts { base: source_for(&one), split: None };
         let installed =
-            install_into(&parts, &dir.join("build"), &dir.join("lib"), &no_cancel(), &mut silent())
+            install_into(&parts, &dir.join("build"), &dir.join("lib"), None, &no_cancel(), &mut silent())
                 .unwrap();
         assert_eq!(installed.carrier, installed.base);
     }
@@ -879,6 +1097,7 @@ mod tests {
             &Parts { base: source_for(&base), split: Some(source_for(&split)) },
             &build,
             &engine_into,
+            None,
             &no_cancel(),
             &mut silent(),
         )
@@ -892,6 +1111,7 @@ mod tests {
             &Parts { base: source_for(&base), split: Some(lying) },
             &build,
             &engine_into,
+            None,
             &no_cancel(),
             &mut silent(),
         )
@@ -914,6 +1134,7 @@ mod tests {
             &Parts { base: source_for(&hostile), split: None },
             &build,
             &engine_into,
+            None,
             &no_cancel(),
             &mut silent(),
         )
@@ -935,6 +1156,7 @@ mod tests {
             &Parts { base: source_for(&base), split: Some(source_for(&split)) },
             &build,
             &dir.join("lib"),
+            None,
             &no_cancel(),
             &mut silent(),
         )
@@ -962,6 +1184,7 @@ mod tests {
             &Parts { base: source_for(&base), split: Some(source_for(&split)) },
             &dir.join("build"),
             &dir.join("lib"),
+            None,
             &no_cancel(),
             &mut |name, _, _| {
                 if seen.last().map(String::as_str) != Some(name) {
@@ -1039,6 +1262,7 @@ mod tests {
             &build,
             &engine_into,
             &engine_into.join(STAGING),
+            None,
             &cancel,
             &mut |_, _, _| {},
         )
@@ -1071,6 +1295,7 @@ mod tests {
             &build,
             &engine_into,
             &engine_into.join(STAGING),
+            None,
             &no_cancel(),
             &mut |_, _, _| {},
         )
@@ -1090,6 +1315,7 @@ mod tests {
             &build,
             &engine_into,
             &engine_into.join(STAGING),
+            None,
             &no_cancel(),
             &mut |_, _, _| {},
         )

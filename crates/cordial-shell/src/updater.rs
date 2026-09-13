@@ -302,6 +302,9 @@ pub fn header_button(
                                 cordial_update::provider::obtain_and_install(
                                     None,
                                     cordial_update::provider::Want::Newest,
+                                    Some(&cordial_update::install::Store::live(
+                                        cordial_shell::profile::all_pinned_versions(),
+                                    )),
                                     &cancel,
                                     &mut |_| {},
                                 )
@@ -1184,6 +1187,9 @@ pub fn present(
                     cordial_update::provider::obtain_and_install(
                         None,
                         cordial_update::provider::Want::Newest,
+                        Some(&cordial_update::install::Store::live(
+                            cordial_shell::profile::all_pinned_versions(),
+                        )),
                         &cancel,
                         &mut |p| report(p),
                     )

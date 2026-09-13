@@ -996,6 +996,20 @@ fn try_launch(
         Err(NotFound::Unusable(message)) => return Outcome::Failed(message),
     };
 
+    // A profile that names a Roblox version gets that one, whatever the current
+    // build is. Applied after `locate` rather than inside it, because `locate`
+    // answers "what build is on this machine" and has no business knowing about
+    // profiles -- and because a pin that cannot be honoured must refuse the
+    // launch rather than quietly hand back the build it was pinned away from.
+    let build = match profile::dir(&profile_name)
+        .map_err(NotFound::Unusable)
+        .and_then(|d| install::apply_pin(build, &d))
+    {
+        Ok(build) => build,
+        Err(NotFound::NoBuild) => return Outcome::NoBuild,
+        Err(NotFound::Unusable(message)) => return Outcome::Failed(message),
+    };
+
     // ADR-012's claim, taken before the process exists so that a refusal
     // costs nothing. A second window on one profile is two processes writing
     // one cookie store; the message names the profile because "already open"

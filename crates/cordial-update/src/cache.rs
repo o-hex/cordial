@@ -1,7 +1,8 @@
 //! Stamping the extracted engine with the APK it came from.
 //!
 //! `~/.cache/cordial/lib/x86_64` holds `libroblox.so`, pulled out of whichever
-//! APK the user has. **Presence alone used to be the whole test**, which meant a
+//! APK the user has. It is usually a symlink into the keyed store now
+//! ([`crate::store`], ADR-033), and the stamp travels with the entry. **Presence alone used to be the whole test**, which meant a
 //! new Roblox build left the *old* engine in place and Cordial ran it against
 //! the new APK's assets — a silent version mismatch, which is worse than the
 //! cold start the cache exists to avoid, because nothing about it presents as a
@@ -41,6 +42,14 @@ use std::time::UNIX_EPOCH;
 /// The stamp file, beside the engine it describes. Dot-prefixed so it is not
 /// mistaken for something the loader wants, and the same name `justfile` uses.
 pub const STAMP: &str = ".from";
+
+/// The Roblox version, beside the engine it describes.
+///
+/// Declared rather than spelled out at each use, because `cordial_update::store`
+/// keys a directory on the same fact and the two must not drift: a store entry
+/// named for one version with a `.version` file naming another is a build that
+/// lies about itself in whichever direction the reader happens to look.
+pub const VERSION: &str = ".version";
 
 /// What the cache should be stamped with for this APK, or `None` if the APK
 /// cannot be looked at.
@@ -104,7 +113,7 @@ pub fn clear_stamp(cache_dir: &Path) {
 /// without parsing Android's binary manifest, and guessing one would put a
 /// number in front of the user that nothing established.
 pub fn recorded_version(cache_dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(cache_dir.join(".version")).ok()?;
+    let text = std::fs::read_to_string(cache_dir.join(VERSION)).ok()?;
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
@@ -112,7 +121,7 @@ pub fn recorded_version(cache_dir: &Path) -> Option<String> {
 /// Record the version of a build Cordial fetched itself.
 pub fn record_version(cache_dir: &Path, version: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(cache_dir)?;
-    std::fs::write(cache_dir.join(".version"), version.trim())
+    std::fs::write(cache_dir.join(VERSION), version.trim())
 }
 
 #[cfg(test)]

@@ -1860,6 +1860,18 @@ fn main() -> ExitCode {
 
     let (code_base, code_size) = lib.code_region();
     println!("\nLOADED in {:.0?}", elapsed);
+
+    // **Here, and only here.** A build in the keyed store records which Cordial
+    // last got it as far as a successful `dlopen`, because Cordial's own shim
+    // is versioned too and an old Roblox build can import a symbol this one
+    // does not answer -- which fails right above this line, before any window
+    // appears. A version picker that offers a build nothing has ever loaded is
+    // offering that crash, so the record has to be written by the thing that
+    // did the loading and after it succeeded. Written anywhere earlier it would
+    // say the same thing about a build that crashes and one that does not.
+    if let Some(entry) = cordial_update::store::entry_at(std::path::Path::new(&opt.lib_dir)) {
+        let _ = cordial_update::store::record_loaded_by(&entry, env!("CARGO_PKG_VERSION"));
+    }
     println!("  base       {:#x}", lib.base());
     println!(
         "  code       {code_base:#x} + {code_size} bytes ({:.1} MB)",

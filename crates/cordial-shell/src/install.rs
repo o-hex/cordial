@@ -217,6 +217,48 @@ impl Origin {
     }
 }
 
+/// Swap in the build a profile has pinned, if it has pinned one.
+///
+/// **Both halves or neither.** A pin that moved only `lib_dir` would run an old
+/// engine against the current build's assets, which is the silent version
+/// mismatch `cordial_update::cache` exists to prevent and which presents as
+/// anything but a version problem. So an entry that does not hold its own
+/// `base.apk` is refused as a pin rather than half-applied -- that is what
+/// `store::Entry::complete` is, and every entry keyed before the archives were
+/// kept beside them is one.
+///
+/// **A missing entry is refused, not silently ignored.** Falling back to the
+/// current build would run the very version the user pinned away from, and say
+/// nothing. The message names the version and says what to do, because the two
+/// ways to get here -- a store pruned past it, or a profile copied to another
+/// machine -- both leave the user looking at a build they did not choose.
+///
+/// Roblox enforces a minimum client version server-side and will refuse an old
+/// build whenever it decides to. Nothing here can prevent that, and the
+/// settings page says so beside the picker rather than letting somebody
+/// conclude Cordial broke.
+pub fn apply_pin(build: Build, profile_dir: &Path) -> Result<Build, NotFound> {
+    let Some(version) = cordial_shell::profile::pinned_version(profile_dir) else {
+        return Ok(build);
+    };
+    let entries = cordial_update::store::list();
+    let Some(entry) = entries.iter().find(|e| e.version == version) else {
+        return Err(NotFound::Unusable(format!(
+            "This profile is pinned to Roblox {version}, and that build is not in Cordial's \
+             store. Open Settings and choose another version, or clear the pin to follow \
+             whichever build is current."
+        )));
+    };
+    let Some(apk) = entry.base_apk() else {
+        return Err(NotFound::Unusable(format!(
+            "This profile is pinned to Roblox {version}, and Cordial kept that build's engine \
+             without the APK it came from -- so its assets are gone and it cannot be run on its \
+             own. Clear the pin, or pin a build Cordial has downloaded since."
+        )));
+    };
+    Ok(Build { apk, lib_dir: entry.dir.clone() })
+}
+
 /// Find a usable build, extracting the engine from the APK if that is what it
 /// takes.
 ///
@@ -280,6 +322,24 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
         return Ok(Build { apk, lib_dir: cache });
     }
 
+    // **Before the extraction, and for the same reason `install::adopt` does
+    // it.** Once the cache path is a symlink into the keyed store, extracting
+    // "into the cache" writes *inside* whichever build is current -- so a Sober
+    // update, whose whole symptom is a stale cache, would overwrite the entry
+    // the user might want to go back to. `adopt_current` files the outgoing
+    // build away first; `detach` then leaves a real, empty directory to
+    // extract into. Both are no-ops on a build whose version was never known,
+    // which is exactly today's behaviour for an APK the user brought.
+    let store_root = cordial_update::store::root();
+    match cordial_update::store::adopt_current(&store_root, &cache) {
+        Ok(Some(kept)) => println!("  shell: kept the previous build as {kept}"),
+        Ok(None) => {}
+        Err(e) => println!("  shell: could not keep the previous build: {e}"),
+    }
+    if let Err(e) = cordial_update::store::detach(&cache) {
+        return Err(NotFound::Unusable(format!("{}: {e}", cache.display())));
+    }
+
     match extract_engine(&apk, &cache) {
         Ok(from) => {
             // Stamped only once the engine is on disk. A stamp written first
@@ -307,10 +367,21 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
             // on -- extracted their engine through this path instead, and could
             // not update through the interface at all.
             //
-            // Read from the engine that was just extracted rather than passed
-            // in, so it is the same string, from the same source, that
-            // `adopt` would have recorded.
-            match cordial_update::engine::version_of(&from) {
+            // **The extracted engine, not the archive `from` names.** This
+            // read `from` until 2026-09-13, and `from` is the *APK*:
+            // `extract_engine` returns the candidate it found the library in,
+            // not the library. Scanning the archive finds nothing -- measured
+            // on this host, `split_config.x86_64.apk` gives `None` where the
+            // engine out of it gives `2.738.0.1397`, and
+            // `engine::scan_the_real_build` keeps that as a guard. So the
+            // paragraph below, about a build that can never be updated, was
+            // describing a bug this code still had: every build that came from
+            // Sober or from a user's own APK went unrecorded, and the update
+            // check answered no for ever.
+            //
+            // It is also what the keyed store keys on, so an unrecorded version
+            // now means a build that cannot be kept or rolled back to either.
+            match cordial_update::engine::version_of(&cache.join(LIBRARY)) {
                 Some(version) => {
                     if let Err(e) = cordial_update::cache::record_version(&cache, &version) {
                         println!("  shell: extracted {LIBRARY} but could not record its version: {e}");
@@ -322,6 +393,42 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
                 None => println!("  shell: could not read a version out of the extracted {LIBRARY}"),
             }
             println!("  shell: extracted {LIBRARY} from {} into {}", from.display(), cache.display());
+
+            // And key what was just extracted, by the same route the outgoing
+            // build took above -- it is now a real directory with a version
+            // recorded in it, which is all `adopt_current` needs. `lib_dir`
+            // stays the same path either way; after this it reads through a
+            // link. Pruning protects every profile's pin, which is why it is
+            // asked for here rather than assumed empty.
+            match cordial_update::store::adopt_current(&store_root, &cache) {
+                Ok(Some(keyed)) => {
+                    // The archives too, so the entry is a build and not half of
+                    // one. These are the user's own files -- Sober's, usually
+                    // -- and hard-linking them costs no disk and takes nothing
+                    // away from whoever else is using them. A link cannot be
+                    // made across a filesystem boundary, and
+                    // `store::keep_archives` says so rather than copying 230 MB
+                    // onto somebody's launch without asking.
+                    let entry = store_root.join(&keyed);
+                    let mut archives: Vec<&Path> = vec![apk.as_path()];
+                    if from != apk {
+                        archives.push(from.as_path());
+                    }
+                    for trouble in cordial_update::store::keep_archives(&entry, &archives) {
+                        println!("  shell: {keyed} is kept without its archives: {trouble}");
+                    }
+                    let dropped = cordial_update::store::prune_in(
+                        &store_root,
+                        cordial_update::store::KEEP,
+                        &cordial_shell::profile::all_pinned_versions(),
+                    );
+                    if !dropped.is_empty() {
+                        println!("  shell: removed older builds: {}", dropped.join(", "));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => println!("  shell: extracted {LIBRARY} but could not key it: {e}"),
+            }
             Ok(Build { apk, lib_dir: cache })
         }
         Err(e) => Err(NotFound::Unusable(e)),

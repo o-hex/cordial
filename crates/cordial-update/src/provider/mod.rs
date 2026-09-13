@@ -484,6 +484,7 @@ pub(crate) fn obtain_from(
 pub fn obtain_and_install(
     preferred: Option<&str>,
     want: Want,
+    store: Option<&crate::install::Store>,
     cancel: &Cancel,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(Obtained, crate::install::Installed), Unreachable> {
@@ -559,7 +560,8 @@ pub fn obtain_and_install(
             &named,
             &crate::install::build_dir(),
             &crate::install::engine_dir(),
-            &crate::install::engine_dir().join(".incoming"),
+            &crate::install::build_dir().join(crate::install::INCOMING_ENGINE),
+            store,
             cancel,
             &mut |_, _, _| {},
         )

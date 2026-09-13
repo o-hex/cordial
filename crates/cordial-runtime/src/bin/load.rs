@@ -4497,6 +4497,12 @@ fn main() -> ExitCode {
                                                 // the engine issues the
                                                 // request and no one answers.
                                                 cordial_runtime::linking::arm(|name| lib.symbol(name));
+                                                // And voice's permission ask,
+                                                // which rides the same bus
+                                                // asynchronously. Unanswered,
+                                                // Roblox can never request the
+                                                // microphone.
+                                                cordial_runtime::permissions::arm(|name| lib.symbol(name));
                                                 install_webview_presenter();
 
                                                 // A dev-only trigger, in the same family as

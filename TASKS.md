@@ -273,6 +273,13 @@ session fixed seven of them that were registered as instance methods when the de
 declares them static. So the capture side has been worked; the device-wrapper
 layer above it has not.
 
+The microphone permission ask comes before any of that: the engine sends it
+over the message bus on `PermissionsProtocol`, not through
+`checkSelfPermission`, and nothing answered it. `crates/cordial-runtime/src/permissions.rs`
+now binds it and grants `MICROPHONE_ACCESS` alone. The request and response
+shapes are INFERRED from string tables and not yet seen working in a voice
+place; each request prints its permission names and the answer given.
+
 - **Touches:** `native/audio_classes.cpp`, a new device-wrapper module, the
   PipeWire capture path.
 - **Scope:** major, but the best-understood of the three. Its own PR.

@@ -108,7 +108,8 @@ set -e
 
 export DISPLAY="${DISPLAY:-:0}"
 export GDK_BACKEND=x11
-export CORDIAL_AUDIO=java
+export CORDIAL_AUDIO=aaudio
+export CORDIAL_AUDIO_HOST=pulse
 export PULSE_SERVER="${PULSE_SERVER:-127.0.0.1}"
 export CORDIAL_PLATFORM_NAME="${CORDIAL_PLATFORM_NAME:-Windows}"
 export CORDIAL_PRESENT_MODE=immediate

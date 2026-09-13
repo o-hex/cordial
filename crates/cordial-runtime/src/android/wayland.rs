@@ -5519,6 +5519,16 @@ impl WaylandWindow {
         // is exactly where a click on the header bar arrives, so the idle case
         // is the only one that waits.
         self.host.0.pump();
+        // The close button destroys the toplevel inside the `pump` just above,
+        // and the surface proxies below go with it. `looper::pump` only learns
+        // of the close from `window_closed` on its next turn, so without this
+        // the geometry sync marshalled onto a freed proxy first: SIGSEGV in
+        // `wl_argument_from_va_list` under `sync_canvas_geometry`, caught with
+        // gdb on a window closed in a nested sway. The launcher reported that
+        // as a crash every time somebody closed the game.
+        if self.host.0.wl_surface().is_none() {
+            return;
+        }
         self.sync_canvas_geometry();
         self.sync_ime_focus();
         self.sync_text_overlay();

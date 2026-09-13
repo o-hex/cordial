@@ -228,13 +228,13 @@ pub fn backend_close_window() {
 
 /// Whether the user has closed the engine's window, for the active backend.
 ///
-/// The X11 backend answers `false` unconditionally rather than growing a second
-/// implementation of this: ADR-011 makes X11 the diagnostic fallback, and a
-/// closed window there still ends the way it always has, on `--run`.
+/// The X11 backend observes the window manager's `WM_DELETE_WINDOW` message;
+/// Wayland observes GTK's toplevel disappearing. Both feed the same graceful
+/// lifecycle path in `looper::pump`.
 pub fn window_closed() -> bool {
     match backend() {
         Backend::Wayland => wayland::window_closed(),
-        Backend::X11 => false,
+        Backend::X11 => window::window_closed(),
     }
 }
 

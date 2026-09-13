@@ -730,7 +730,6 @@ fn build_performance_group(
     }
     group.add(&gamemode);
 
-
     // Order has to match ThrottleWhen::index/from_index.
     let throttle_model = gtk::StringList::new(&[
         "When the window is not visible",

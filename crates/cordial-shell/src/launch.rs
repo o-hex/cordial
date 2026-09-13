@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cordial_shell::profile::Claim;
@@ -109,6 +110,41 @@ const KEPT_LINES: usize = 200;
 /// the GTK main loop reads it, at a moment neither thread knows about.
 type Tail = Arc<Mutex<VecDeque<String>>>;
 
+/// The one startup signal the launcher can read without inspecting Roblox.
+///
+/// The runtime reports a cumulative `vkQueuePresentKHR` count every thirty
+/// seconds. A healthy idle client advances that count at about one frame per
+/// second; an engine that never produced its first frame reports `total=0`.
+/// Keeping that small, published fact here lets the shell warn about an empty
+/// window without guessing from CPU use or touching the engine's memory.
+#[derive(Default)]
+pub struct Health {
+    reported: AtomicBool,
+    total_presents: AtomicU64,
+}
+
+impl Health {
+    fn observe(&self, line: &str) {
+        let mut previous = None;
+        let mut total = None;
+        for word in line.split_whitespace() {
+            if word == "total" {
+                total = previous.and_then(|value: &str| value.parse::<u64>().ok());
+                break;
+            }
+            previous = Some(word);
+        }
+        let Some(total) = total else { return };
+        self.total_presents.store(total, Ordering::Release);
+        self.reported.store(true, Ordering::Release);
+    }
+
+    /// Whether a health report proves that no frame has ever been presented.
+    pub fn startup_empty(&self) -> bool {
+        self.reported.load(Ordering::Acquire) && self.total_presents.load(Ordering::Acquire) == 0
+    }
+}
+
 /// Lines that are never kept, replaced by a marker rather than dropped.
 ///
 /// **`[cookies]` and `[identity]` appear in ordinary runs**, carry a signed-in
@@ -140,6 +176,7 @@ pub struct Instance {
     /// immediately — an exit code on its own says nothing about what was run.
     pub command_line: String,
     tail: Tail,
+    health: Arc<Health>,
 }
 
 impl Instance {
@@ -170,6 +207,11 @@ impl Instance {
     pub fn recent_output(&self) -> String {
         let tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
         tail.iter().cloned().collect::<Vec<_>>().join("\n")
+    }
+
+    /// The runtime's published frame-health signal, not engine state.
+    pub fn health(&self) -> Arc<Health> {
+        self.health.clone()
     }
 }
 
@@ -226,10 +268,16 @@ fn already_stamped(line: &str) -> bool {
         && b[5] == b':'
 }
 
-fn pump(reader: impl std::io::Read + Send + 'static, tail: Tail, to_stderr: bool) {
+fn pump(
+    reader: impl std::io::Read + Send + 'static,
+    tail: Tail,
+    health: Arc<Health>,
+    to_stderr: bool,
+) {
     std::thread::spawn(move || {
         for line in BufReader::new(reader).lines() {
             let Ok(line) = line else { break };
+            health.observe(&line);
             // **A clock on every line the runtime prints.**
             //
             // `native/liblog.cpp` stamps the Android log, but Cordial's own
@@ -248,7 +296,11 @@ fn pump(reader: impl std::io::Read + Send + 'static, tail: Tail, to_stderr: bool
             // own output arrives pre-stamped and two clocks on one line is
             // worse than none. The check is the cheap one: a digit pair, a
             // colon, and the shape of a time.
-            let line = if already_stamped(&line) { line } else { format!("{} {line}", stamp()) };
+            let line = if already_stamped(&line) {
+                line
+            } else {
+                format!("{} {line}", stamp())
+            };
             if to_stderr {
                 let mut out = std::io::stderr().lock();
                 let _ = writeln!(out, "{line}");
@@ -394,7 +446,10 @@ pub fn spawn(
     // default has to match the shell's or the two disagree about what a fresh
     // install does.
     command.env("CORDIAL_THROTTLE", config.throttle.as_str());
-    command.env("CORDIAL_POINTER_ACCEL", config.pointer_acceleration.as_str());
+    command.env(
+        "CORDIAL_POINTER_ACCEL",
+        config.pointer_acceleration.as_str(),
+    );
 
     // The Graphics row, and **only when it is not Automatic**. That is not a
     // micro-optimisation: an absent variable is what tells the runtime the user
@@ -458,7 +513,10 @@ pub fn spawn(
     if !config.unpacked_plugins.is_empty() {
         let joined = config.unpacked_plugins.join(":");
         command.env("CORDIAL_UNPACKED_PLUGINS", &joined);
-        println!("shell: loading {} unpacked plugin(s)", config.unpacked_plugins.len());
+        println!(
+            "shell: loading {} unpacked plugin(s)",
+            config.unpacked_plugins.len()
+        );
     }
 
     // The Graphics optimisation row, and **only for the parameters the chosen
@@ -515,7 +573,10 @@ pub fn spawn(
                 // rather than left to MangoHUD's default so that what the
                 // switch turns on is a known overlay rather than whatever
                 // happens to be in a config file somewhere.
-                command.env("MANGOHUD_CONFIG", "fps,frametime,frame_timing=1,cpu_stats,gpu_stats");
+                command.env(
+                    "MANGOHUD_CONFIG",
+                    "fps,frametime,frame_timing=1,cpu_stats,gpu_stats",
+                );
                 println!("  shell: MangoHUD on, via {}", layer.display());
             }
             // Reported rather than silently dropped. A switch that is on in the
@@ -525,7 +586,8 @@ pub fn spawn(
             // MangoHUD tomorrow with the switch left where it was.
             None => println!(
                 "  shell: MangoHUD is switched on but its Vulkan layer is not installed; \
-                 the overlay will not appear. {}", mangohud_install_hint()
+                 the overlay will not appear. {}",
+                mangohud_install_hint()
             ),
         }
     }
@@ -541,20 +603,24 @@ pub fn spawn(
     claim.hand_to(&mut command);
 
     let command_line = describe(&loader, &build.lib_dir, &build.apk, &run, join_url);
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Could not start {}: {e}\n\n{command_line}", loader.display()))?;
+    let mut child = command.spawn().map_err(|e| {
+        format!(
+            "Could not start {}: {e}\n\n{command_line}",
+            loader.display()
+        )
+    })?;
 
     let tail: Tail = Arc::new(Mutex::new(VecDeque::with_capacity(KEPT_LINES)));
+    let health = Arc::new(Health::default());
     // Taken out of the `Child` so the pipes close when the reader threads see
     // EOF rather than being held open by a struct nobody is reading -- a child
     // whose stdout nothing drains blocks on a full pipe, which for a process
     // that narrates as much as this one would be a hang rather than a crash.
     if let Some(out) = child.stdout.take() {
-        pump(out, tail.clone(), false);
+        pump(out, tail.clone(), health.clone(), false);
     }
     if let Some(err) = child.stderr.take() {
-        pump(err, tail.clone(), true);
+        pump(err, tail.clone(), health.clone(), true);
     }
 
     // Dropped explicitly rather than left to fall off the end of the function,
@@ -563,7 +629,12 @@ pub fn spawn(
     // quitting the shell would be the thing that released it.
     drop(claim);
 
-    Ok(Instance { child, command_line, tail })
+    Ok(Instance {
+        child,
+        command_line,
+        tail,
+        health,
+    })
 }
 
 /// Whether this process is inside a Flatpak sandbox.
@@ -683,8 +754,16 @@ fn find_mangohud_layer_in(dirs: &[PathBuf]) -> Option<PathBuf> {
 /// It carries `--join-url` when there was one, because a launch that fails only
 /// with a link on it is exactly the launch somebody needs to be able to repeat
 /// in a terminal.
-fn describe(loader: &Path, lib_dir: &Path, apk: &Path, run: &str, join_url: Option<&str>) -> String {
-    let join = join_url.map(|u| format!(" --join-url {u}")).unwrap_or_default();
+fn describe(
+    loader: &Path,
+    lib_dir: &Path,
+    apk: &Path,
+    run: &str,
+    join_url: Option<&str>,
+) -> String {
+    let join = join_url
+        .map(|u| format!(" --join-url {u}"))
+        .unwrap_or_default();
     format!(
         "{} --lib-dir {} --apk {} --host-libc --game-activity --run {run}{join}",
         loader.display(),
@@ -708,7 +787,10 @@ mod tests {
         ] {
             let marker = redact(line).expect(line);
             assert!(marker.contains("left out"), "{marker}");
-            assert!(!marker.contains("roblox.com") && !marker.contains("/home/x"), "{marker}");
+            assert!(
+                !marker.contains("roblox.com") && !marker.contains("/home/x"),
+                "{marker}"
+            );
         }
         // And an ordinary line is untouched, or the page would show nothing
         // useful at all.
@@ -732,7 +814,9 @@ mod tests {
     #[test]
     fn a_vpn_required_profile_whose_check_fails_refuses_before_the_loader_is_looked_for() {
         let _env_guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        let _root_guard = crate::PROFILE_ROOT_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _root_guard = crate::PROFILE_ROOT_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join("cordial-launch-gate-test");
         let _ = std::fs::remove_dir_all(&root);
@@ -753,7 +837,10 @@ mod tests {
         )
         .unwrap();
 
-        let build = Build { apk: PathBuf::from("/nonexistent.apk"), lib_dir: PathBuf::from("/nonexistent") };
+        let build = Build {
+            apk: PathBuf::from("/nonexistent.apk"),
+            lib_dir: PathBuf::from("/nonexistent"),
+        };
         let result = spawn(&build, claim, Some(1), None);
 
         std::env::remove_var("CORDIAL_PROFILE_ROOT");
@@ -797,10 +884,16 @@ mod tests {
             "600",
             None,
         );
-        assert!(line.contains("--lib-dir /home/a/.cache/cordial/lib/x86_64"), "{line}");
+        assert!(
+            line.contains("--lib-dir /home/a/.cache/cordial/lib/x86_64"),
+            "{line}"
+        );
         assert!(line.contains("--apk /home/a/base.apk"), "{line}");
         assert!(line.contains("--run 600"), "{line}");
-        assert!(!line.contains("--join-url"), "no link means no argument at all: {line}");
+        assert!(
+            !line.contains("--join-url"),
+            "no link means no argument at all: {line}"
+        );
     }
 
     #[test]
@@ -816,7 +909,10 @@ mod tests {
             "0",
             Some("roblox-player://placeId=1818"),
         );
-        assert!(line.contains("--join-url roblox-player://placeId=1818"), "{line}");
+        assert!(
+            line.contains("--join-url roblox-player://placeId=1818"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -828,7 +924,25 @@ mod tests {
         // a client that outlives its window, which is what a day of timer
         // produced here for months. `cordial-run` reads zero as no timer and
         // ends on the window closing, on SIGTERM and on SIGINT instead.
-        assert_eq!(DEFAULT_RUN_SECONDS, 0, "the launcher must not impose a session length");
+        assert_eq!(
+            DEFAULT_RUN_SECONDS, 0,
+            "the launcher must not impose a session length"
+        );
+    }
+
+    #[test]
+    fn a_zero_total_health_report_marks_startup_as_empty() {
+        let health = Health::default();
+        assert!(!health.startup_empty());
+        health.observe("[cordial] health: 0 presents in 30s (0.0/s), 0 total -- nothing was drawn");
+        assert!(health.startup_empty());
+    }
+
+    #[test]
+    fn a_nonzero_total_health_report_is_not_an_afk_startup_failure() {
+        let health = Health::default();
+        health.observe("[cordial] health: 30 presents in 30s (1.0/s), 30 total");
+        assert!(!health.startup_empty());
     }
 
     #[test]
@@ -873,7 +987,11 @@ mod tests {
 
         std::fs::write(root.join("MangoHud.x86_64.json"), "{}").unwrap();
         let found = find_mangohud_layer_in(&[root.clone()]).expect("the layer is there now");
-        assert!(found.ends_with("MangoHud.x86_64.json"), "{}", found.display());
+        assert!(
+            found.ends_with("MangoHud.x86_64.json"),
+            "{}",
+            found.display()
+        );
 
         // A directory that does not exist is the ordinary case rather than an
         // error: most of the Vulkan loader's search path is absent on any given
@@ -935,7 +1053,11 @@ mod tests {
                 return;
             }
         };
-        println!("build: {} + {}", build.apk.display(), build.lib_dir.display());
+        println!(
+            "build: {} + {}",
+            build.apk.display(),
+            build.lib_dir.display()
+        );
 
         let claim = profile::acquire("e2e").expect("a fresh profile is free");
         let profile_dir = claim.profile_dir().to_path_buf();
@@ -959,7 +1081,11 @@ mod tests {
         // here and so no child watch — and `Instance::pid`'s doc explains why
         // the type no longer offers one to the launcher.
         assert!(
-            instance.child.try_wait().expect("waiting on the client works").is_none(),
+            instance
+                .child
+                .try_wait()
+                .expect("waiting on the client works")
+                .is_none(),
             "the client must still be up after 27 seconds"
         );
 

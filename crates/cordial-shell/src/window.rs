@@ -18,20 +18,20 @@ use libadwaita::glib;
 use libadwaita::gtk;
 use libadwaita::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
 use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
 use crate::chooser;
+use crate::crash;
 use crate::deep_link;
 use crate::install::{self, NotFound};
 use crate::instructions;
-use crate::root_warning;
 use crate::launch;
 use crate::profile_switcher;
 use crate::refresh_watch;
-use crate::crash;
+use crate::root_warning;
 use crate::settings;
 use crate::shell_config::ShellConfig;
 use crate::updater;
@@ -60,7 +60,10 @@ pub struct PendingJoin {
 
 impl PendingJoin {
     fn new() -> Self {
-        let banner = adw::Banner::builder().revealed(false).button_label("Discard").build();
+        let banner = adw::Banner::builder()
+            .revealed(false)
+            .button_label("Discard")
+            .build();
         let url: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         {
             // A queued join the user cannot get rid of is a trap: the next
@@ -233,8 +236,6 @@ fn starting_dialog(parent: &gtk::Window, profile: &str, joining: bool) -> gtk::W
     dialog
 }
 
-
-
 pub fn build(
     app: &adw::Application,
     config: Rc<RefCell<ShellConfig>>,
@@ -257,7 +258,9 @@ pub fn build(
         let config = config.clone();
         let join = join.clone();
         chooser::build(&source, move |id| {
-            let Some(window) = toasts.root().and_downcast::<gtk::Window>() else { return };
+            let Some(window) = toasts.root().and_downcast::<gtk::Window>() else {
+                return;
+            };
             match id {
                 chooser::ROBLOX => activate_roblox(&window, &toasts, &config, &join),
                 // Unreachable while there is one entry, and deliberately loud
@@ -295,7 +298,10 @@ pub fn build(
     column.append(&profile_row);
     column.append(&chooser_widget);
 
-    let clamp = adw::Clamp::builder().maximum_size(360).child(&column).build();
+    let clamp = adw::Clamp::builder()
+        .maximum_size(360)
+        .child(&column)
+        .build();
     clamp.set_margin_top(24);
     clamp.set_margin_bottom(24);
     clamp.set_margin_start(24);
@@ -337,15 +343,22 @@ pub fn build(
     // here is the same as one with nothing saved: windowed, at the built-in
     // default below.
     let initial_profile = config.borrow().profile.clone();
-    let initial_window =
-        profile::dir(&initial_profile).ok().map(|d| window_state::load(&d, window_state::Which::Launcher)).unwrap_or_default();
+    let initial_window = profile::dir(&initial_profile)
+        .ok()
+        .map(|d| window_state::load(&d, window_state::Which::Launcher))
+        .unwrap_or_default();
 
     // Kept as a pure function, the same reason `host_window.rs`'s own
     // `fit_within` is one, so the fallback is testable without a display.
     // [`DEFAULT_WIDTH`] carries why the built-in size is the size it is, and
     // why Settings rather than this window's own content is what decides it.
     let (initial_width, initial_height) = initial_size(&initial_window);
-    let host = HostWindow::new(&cordial_shell::host_window::title(), initial_width, initial_height, &toasts);
+    let host = HostWindow::new(
+        &cordial_shell::host_window::title(),
+        initial_width,
+        initial_height,
+        &toasts,
+    );
 
     // **The primary menu, rightmost, because that is where GNOME users look.**
     //
@@ -410,7 +423,6 @@ pub fn build(
     let update_button = updater::header_button(&window, config.clone());
     host.header().pack_end(&update_button);
 
-
     // An action rather than only a button handler, because the header bar is no
     // longer the only way in: a launch refused for a busy profile offers to
     // open settings, and that offer must land on the same window this button
@@ -434,8 +446,7 @@ pub fn build(
     // And again for `win.launch`, below. Same reason.
     let config_for_launch = config.clone();
 
-    let settings_action =
-        gtk::gio::SimpleAction::new("settings", Some(glib::VariantTy::STRING));
+    let settings_action = gtk::gio::SimpleAction::new("settings", Some(glib::VariantTy::STRING));
     let window_for_settings = window.clone();
     settings_action.connect_activate(move |_, page| {
         let settings = settings::build_preferences_window(
@@ -467,7 +478,10 @@ pub fn build(
         // compositor's to choose and there is already more room than this asks
         // for.
         if !window_for_settings.is_maximized() && !window_for_settings.is_fullscreen() {
-            let (w, h) = (window_for_settings.default_width(), window_for_settings.default_height());
+            let (w, h) = (
+                window_for_settings.default_width(),
+                window_for_settings.default_height(),
+            );
             if w < settings::CONTENT_WIDTH || h < settings::CONTENT_HEIGHT {
                 window_for_settings.set_default_size(w.max(DEFAULT_WIDTH), h.max(DEFAULT_HEIGHT));
             }
@@ -790,7 +804,10 @@ const DEFAULT_HEIGHT: i32 = 800;
 /// shape `host_window.rs`'s `fit_within` takes for the same reason: the
 /// fallback is worth pinning with a test that does not need a display.
 fn initial_size(state: &window_state::WindowState) -> (i32, i32) {
-    (state.width.unwrap_or(DEFAULT_WIDTH), state.height.unwrap_or(DEFAULT_HEIGHT))
+    (
+        state.width.unwrap_or(DEFAULT_WIDTH),
+        state.height.unwrap_or(DEFAULT_HEIGHT),
+    )
 }
 
 /// Save whether `window` is fullscreen right now, against whichever profile
@@ -876,7 +893,10 @@ fn persist_window_size(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) 
 /// Same shape as `CORDIAL_SHELL_RUN_SECONDS` above: an environment variable that
 /// nothing sets in normal use, doing something a person could do by hand.
 fn open_on_start(window: &adw::Window, update_button: &gtk::Button) {
-    let Some(want) = std::env::var("CORDIAL_SHELL_PRESENT").ok().filter(|s| !s.is_empty()) else {
+    let Some(want) = std::env::var("CORDIAL_SHELL_PRESENT")
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
         return;
     };
     let window = window.clone();
@@ -947,23 +967,72 @@ fn launch_now(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
 ) {
-    match try_launch(window, config, join) {
-        Outcome::Started => {}
-        Outcome::Failed(message) => alert(window, "Roblox could not start", &message),
-        Outcome::ProfileBusy(name, holder) => {
-            profile_busy(window, toasts, config, join, &name, holder)
+    let (roblox, profile_name) = {
+        let config = config.borrow();
+        (config.roblox.clone(), config.profile.clone())
+    };
+    let starting = starting_dialog(window, &profile_name, join.peek().is_some());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(prepare_launch(roblox, profile_name));
+    });
+
+    let window = window.clone();
+    let toasts = toasts.clone();
+    let config = config.clone();
+    let join = join.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(Ok(prepared)) => {
+            match try_launch_inner(
+                &window,
+                &config,
+                &join,
+                Some(prepared),
+                Some(starting.clone()),
+            ) {
+                Outcome::Started => {}
+                Outcome::Failed(message) => {
+                    starting.close();
+                    alert(&window, "Roblox could not start", &message)
+                }
+                Outcome::ProfileBusy(name, holder) => {
+                    starting.close();
+                    profile_busy(&window, &toasts, &config, &join, &name, holder)
+                }
+                Outcome::NoBuild => unreachable!("prepare_launch returned a build"),
+            }
+            glib::ControlFlow::Break
         }
-        Outcome::NoBuild => {
-            let window = window.clone();
-            let config = config.clone();
-            let join = join.clone();
-            instructions::present(&window.clone(), move || {
-                // Returning whether it worked is what lets the instructions
-                // window stay up while the user is still following them.
-                matches!(try_launch(&window, &config, &join), Outcome::Started)
-            });
+        Ok(Err(outcome)) => {
+            starting.close();
+            match outcome {
+                Outcome::Failed(message) => alert(&window, "Roblox could not start", &message),
+                Outcome::NoBuild => {
+                    let window = window.clone();
+                    let config = config.clone();
+                    let join = join.clone();
+                    instructions::present(&window.clone(), move || {
+                        matches!(try_launch(&window, &config, &join), Outcome::Started)
+                    });
+                }
+                Outcome::ProfileBusy(name, holder) => {
+                    profile_busy(&window, &toasts, &config, &join, &name, holder)
+                }
+                Outcome::Started => unreachable!("prepare_launch returned no build error"),
+            }
+            glib::ControlFlow::Break
         }
-    }
+        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            starting.close();
+            alert(
+                &window,
+                "Roblox could not start",
+                "The engine preparation worker stopped unexpectedly.",
+            );
+            glib::ControlFlow::Break
+        }
+    });
 }
 
 enum Outcome {
@@ -981,6 +1050,33 @@ enum Outcome {
     Failed(String),
 }
 
+type PreparedLaunch = (install::RobloxInstall, String, install::Build);
+
+fn prepare_launch(
+    roblox: install::RobloxInstall,
+    profile_name: String,
+) -> Result<PreparedLaunch, Outcome> {
+    let build = match install::locate(&roblox) {
+        Ok(build) => build,
+        Err(NotFound::NoBuild) => return Err(Outcome::NoBuild),
+        Err(NotFound::Unusable(message)) => return Err(Outcome::Failed(message)),
+    };
+    let build = match profile::dir(&profile_name)
+        .map_err(NotFound::Unusable)
+        .and_then(|d| install::apply_pin(build, &d))
+    {
+        Ok(build) => build,
+        Err(NotFound::NoBuild) => return Err(Outcome::NoBuild),
+        Err(NotFound::Unusable(message)) => return Err(Outcome::Failed(message)),
+    };
+    let build = if roblox.lib_dir.is_none() && build.lib_dir == install::engine_cache() {
+        install::replace_cached_engine(&roblox, &build).map_err(Outcome::Failed)?
+    } else {
+        build
+    };
+    Ok((roblox, profile_name, build))
+}
+
 /// No `ToastOverlay` any more: the "Starting Roblox" toast this used to raise
 /// is now the loading dialog, which says the same thing and stays up for as
 /// long as it is true.
@@ -989,29 +1085,28 @@ fn try_launch(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
 ) -> Outcome {
-    let (roblox, profile_name) = {
-        let config = config.borrow();
-        (config.roblox.clone(), config.profile.clone())
-    };
+    try_launch_inner(window, config, join, None, None)
+}
 
-    let build = match install::locate(&roblox) {
-        Ok(build) => build,
-        Err(NotFound::NoBuild) => return Outcome::NoBuild,
-        Err(NotFound::Unusable(message)) => return Outcome::Failed(message),
-    };
-
-    // A profile that names a Roblox version gets that one, whatever the current
-    // build is. Applied after `locate` rather than inside it, because `locate`
-    // answers "what build is on this machine" and has no business knowing about
-    // profiles -- and because a pin that cannot be honoured must refuse the
-    // launch rather than quietly hand back the build it was pinned away from.
-    let build = match profile::dir(&profile_name)
-        .map_err(NotFound::Unusable)
-        .and_then(|d| install::apply_pin(build, &d))
-    {
-        Ok(build) => build,
-        Err(NotFound::NoBuild) => return Outcome::NoBuild,
-        Err(NotFound::Unusable(message)) => return Outcome::Failed(message),
+fn try_launch_inner(
+    window: &gtk::Window,
+    config: &Rc<RefCell<ShellConfig>>,
+    join: &PendingJoin,
+    prepared: Option<PreparedLaunch>,
+    starting: Option<gtk::Window>,
+) -> Outcome {
+    let (roblox, profile_name, build) = match prepared {
+        Some(prepared) => prepared,
+        None => {
+            let (roblox, profile_name) = {
+                let config = config.borrow();
+                (config.roblox.clone(), config.profile.clone())
+            };
+            match prepare_launch(roblox, profile_name) {
+                Ok(prepared) => prepared,
+                Err(outcome) => return outcome,
+            }
+        }
     };
 
     // ADR-012's claim, taken before the process exists so that a refusal
@@ -1034,7 +1129,8 @@ fn try_launch(
     };
     join.clear();
 
-    let starting = starting_dialog(&window, &profile_name, url.is_some());
+    let starting =
+        starting.unwrap_or_else(|| starting_dialog(&window, &profile_name, url.is_some()));
 
     // **`SIGCHLD`, not a clock.** This was `timeout_add_local` at 500 ms for
     // the whole session -- two wakeups a second, forever, to ask a question
@@ -1098,55 +1194,168 @@ fn try_launch(
     // in the mechanism is sandbox-specific -- a `flatpak run` sandbox keeps
     // orphaned children alive perfectly well, measured the same day with a
     // marker process that outlived the sandbox's own main process.
-    let hold = window.application().map(|app| app.hold());
+    let hold = Rc::new(window.application().map(|app| app.hold()));
+    let url_saved = url.clone();
+    watch_client(
+        window.clone(),
+        starting,
+        dialog_closed,
+        hold,
+        instance,
+        build,
+        roblox,
+        profile_name,
+        url_saved,
+        false,
+    );
 
-    let window = window.clone();
+    Outcome::Started
+}
+
+fn watch_client(
+    window: gtk::Window,
+    starting: gtk::Window,
+    dialog_closed: Rc<Cell<bool>>,
+    hold: Rc<Option<libadwaita::gtk::gio::ApplicationHoldGuard>>,
+    instance: launch::Instance,
+    build: install::Build,
+    roblox: install::RobloxInstall,
+    profile_name: String,
+    url: Option<String>,
+    repaired_engine: bool,
+) {
+    // A health report with cumulative total=0 is the one safe startup-failure
+    // signal available outside the engine. AFK is different: once Roblox has
+    // drawn a frame, its idle throttle continues at roughly 1 frame/s. Keep
+    // this as a warning rather than an automatic kill so minimising a very
+    // slow first launch cannot destroy a session the user meant to keep.
+    let health = instance.health();
+    let finished = Rc::new(Cell::new(false));
+    let warned = Rc::new(Cell::new(false));
+    {
+        let window = window.clone();
+        let health = health.clone();
+        let finished = finished.clone();
+        let warned = warned.clone();
+        glib::timeout_add_local(Duration::from_millis(500), move || {
+            if finished.get() {
+                return glib::ControlFlow::Break;
+            }
+            if !warned.get() && health.startup_empty() {
+                warned.set(true);
+                startup_stalled(&window);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     let pid = glib::Pid(instance.pid() as i32);
     glib::child_watch_add_local(pid, move |_, wait_status| {
-        // Named rather than left to the closure's drop, because *when* it is
-        // released is the whole point: the application must not quit before
-        // the crash page below has been put on screen.
         let _released_once_this_client_is_gone = &hold;
-        if !dialog_closed.replace(true) {
-            starting.close();
-        }
-        // A closed launcher window must not pop a crash page on top of the
-        // desktop the user went back to. Under ADR-012 closing it while a
-        // client runs is the ordinary case -- and note that this now tests the
-        // *window*, not the process: the hold above means the launcher is
-        // still here, deliberately, holding the client's pipes open. The poll
-        // this replaces returned `Break` here; a child watch has no
-        // equivalent, and it does not need one -- the source removes itself
-        // once the child has exited, and until then the only thing this check
-        // costs is the branch.
-        if !window.is_visible() {
-            return;
-        }
-        // GLib hands back the raw `waitpid` status, which is exactly what
-        // `ExitStatusExt::from_raw` takes, so signal deaths keep their signal
-        // and `crash::is_crash` sees the same value `try_wait` used to give it.
+        finished.set(true);
         let status = std::process::ExitStatus::from_raw(wait_status);
-        // Narrated either way, and deliberately without the client's output in
-        // it: this line is how somebody reading a terminal learns which of the
-        // two paths was taken, and the output belongs on the page and nowhere
-        // else. `println!` here would be a second sink for text `launch.rs`
-        // took care to keep in memory.
-        if crash::is_crash(&status) {
+        // The child watch and the two pipe readers are independent sources.
+        // Give the readers a brief chance to record the final Xlib line before
+        // classifying status 1; otherwise the same normal display shutdown
+        // can race into the crash page with an apparently empty tail.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let output = instance.recent_output();
+        if crash::is_crash(&status, &output) {
+            if output.contains("Can't initialize the TaskScheduler before flags have been loaded")
+                && !repaired_engine
+            {
+                println!(
+                    "  shell: replacing the cached engine after TaskScheduler startup failure"
+                );
+                match install::replace_cached_engine(&roblox, &build) {
+                    Ok(repaired_build) => {
+                        let mut claim_opt = None;
+                        for _ in 0..10 {
+                            if let Ok(claim) = profile::acquire(&profile_name) {
+                                claim_opt = Some(claim);
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        if let Some(claim) = claim_opt {
+                            if let Ok(new_instance) = launch::spawn(
+                                &repaired_build,
+                                claim,
+                                run_seconds_override(),
+                                url.as_deref(),
+                            ) {
+                                watch_client(
+                                    window.clone(),
+                                    starting.clone(),
+                                    dialog_closed.clone(),
+                                    hold.clone(),
+                                    new_instance,
+                                    repaired_build,
+                                    roblox.clone(),
+                                    profile_name.clone(),
+                                    url.clone(),
+                                    true,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("  shell: could not replace the cached engine: {e}");
+                    }
+                }
+            }
+            if !dialog_closed.replace(true) {
+                starting.close();
+            }
+            if !window.is_visible() {
+                return;
+            }
             println!("  shell: the client {status}; showing the crash page");
-            crash::present(&window, &status, &instance.command_line, &instance.recent_output());
+            crash::present(&window, &status, &instance.command_line, &output);
         } else {
+            if !dialog_closed.replace(true) {
+                starting.close();
+            }
+            if !window.is_visible() {
+                return;
+            }
             println!("  shell: the client exited cleanly ({status}); no crash page");
         }
     });
+}
 
-    Outcome::Started
+/// Explain an empty client window without calling it a crash or killing it.
+///
+/// The only evidence here is Cordial's own present counter, published by the
+/// runtime. A cumulative zero distinguishes a client that never rendered from
+/// an AFK client whose idle throttle keeps presenting; it cannot tell whether
+/// a user deliberately minimised the window before the first frame, so the
+/// action remains theirs.
+fn startup_stalled(parent: &gtk::Window) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Roblox may be stuck starting")
+        .body(
+            concat!(
+                "The Roblox process is still running, but it has not drawn a frame yet. ",
+                "This is different from being AFK after startup. If you minimised it ",
+                "during launch, keep waiting; otherwise close this message and restart Roblox."
+            ),
+        )
+        .build();
+    dialog.add_response("wait", "Keep Waiting");
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("wait"));
+    dialog.present(Some(parent));
 }
 
 /// Shorten a session, for testing. `--run` is a hard timer in `cordial-run` and
 /// the launcher's own default is a day, which is unhelpful when what is being
 /// checked is that a launch happens at all.
 fn run_seconds_override() -> Option<u64> {
-    std::env::var("CORDIAL_SHELL_RUN_SECONDS").ok().and_then(|v| v.parse().ok())
+    std::env::var("CORDIAL_SHELL_RUN_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
 }
 
 /// The profile is already running, and here is what to do about it.
@@ -1217,24 +1426,24 @@ fn profile_busy(
     let join = join.clone();
     dialog.connect_response(None, move |_, response| {
         match response {
-        // The switcher is the combo row above the launch button; activating the
-        // window's action rather than building a second chooser here keeps one
-        // construction site.
-        "profile" => {
-            let _ = parent_window.activate_action("win.profile", None);
-        }
-        "stop" => {
-            if let Some(h) = ours.clone() {
-                close_then_launch(
-                    parent_window.clone(),
-                    toasts.clone(),
-                    config.clone(),
-                    join.clone(),
-                    h,
-                );
+            // The switcher is the combo row above the launch button; activating the
+            // window's action rather than building a second chooser here keeps one
+            // construction site.
+            "profile" => {
+                let _ = parent_window.activate_action("win.profile", None);
             }
-        }
-        _ => {}
+            "stop" => {
+                if let Some(h) = ours.clone() {
+                    close_then_launch(
+                        parent_window.clone(),
+                        toasts.clone(),
+                        config.clone(),
+                        join.clone(),
+                        h,
+                    );
+                }
+            }
+            _ => {}
         }
     });
     dialog.present(Some(parent));
@@ -1254,9 +1463,14 @@ fn busy_body(holder: Option<&profile::Holder>) -> String {
     // wants that can find it on ADR-012.
     match holder {
         Some(h) if h.is_cordial() => {
-            let started =
-                h.running_for_text().map(|t| format!(", up {t}")).unwrap_or_default();
-            format!("Another Cordial client has it open (process {}{started}).", h.pid)
+            let started = h
+                .running_for_text()
+                .map(|t| format!(", up {t}"))
+                .unwrap_or_default();
+            format!(
+                "Another Cordial client has it open (process {}{started}).",
+                h.pid
+            )
         }
         // Kept longer than the others, because this is the one case Cordial
         // will not act on and the user has to go and find the process itself.
@@ -1321,7 +1535,8 @@ fn close_then_launch(
             match now {
                 Escalation::KeepWaiting => {}
                 Escalation::Warn => {
-                    let diagnosis = stuck_diagnosis(started_cpu, holder.cpu_ticks(), holder.wchan().as_deref());
+                    let diagnosis =
+                        stuck_diagnosis(started_cpu, holder.cpu_ticks(), holder.wchan().as_deref());
                     println!(
                         "  shell: process {} still stopping after {}s: {diagnosis}",
                         holder.pid,
@@ -1472,9 +1687,7 @@ fn stuck_diagnosis(before: Option<u64>, after: Option<u64>, wchan: Option<&str>)
              than stuck."
                 .to_string()
         }
-        (Some(_), Some(_)) => {
-            "It has used no CPU time since being asked to close.".to_string()
-        }
+        (Some(_), Some(_)) => "It has used no CPU time since being asked to close.".to_string(),
         _ => "Its CPU use could not be read.".to_string(),
     };
     match wchan {
@@ -1494,7 +1707,10 @@ const STOP_POLL: Duration = Duration::from_millis(250);
 pub fn alert(parent: &gtk::Window, heading: &str, body: &str) {
     // In-window, for the reason `profile_busy` gives: a toplevel dialog gives
     // focus away when it closes.
-    let dialog = adw::AlertDialog::builder().heading(heading).body(body).build();
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(body)
+        .build();
     dialog.add_response("ok", "Close");
     dialog.present(Some(parent));
 }
@@ -1539,7 +1755,12 @@ mod tests {
 
     #[test]
     fn a_profile_with_a_saved_size_opens_at_that_size() {
-        let state = window_state::WindowState { fullscreen: false, maximised: false, width: Some(1024), height: Some(768) };
+        let state = window_state::WindowState {
+            fullscreen: false,
+            maximised: false,
+            width: Some(1024),
+            height: Some(768),
+        };
         assert_eq!(initial_size(&state), (1024, 768));
     }
 
@@ -1549,7 +1770,12 @@ mod tests {
         // both together, but a hand-edited file could carry just one -- and
         // the fallback per field is simpler and no worse than refusing the
         // whole saved size over half of it.
-        let state = window_state::WindowState { fullscreen: false, maximised: false, width: Some(1024), height: None };
+        let state = window_state::WindowState {
+            fullscreen: false,
+            maximised: false,
+            width: Some(1024),
+            height: None,
+        };
         assert_eq!(initial_size(&state), (1024, DEFAULT_HEIGHT));
     }
 
@@ -1563,7 +1789,10 @@ mod tests {
         let body = busy_body(Some(&holder("/app/bin/cordial-run --profile default")));
         assert!(body.contains("process 649889"), "{body}");
         assert!(body.contains("31 minutes"), "{body}");
-        assert!(!body.contains("close the window that already has it"), "{body}");
+        assert!(
+            !body.contains("close the window that already has it"),
+            "{body}"
+        );
     }
 
     #[test]
@@ -1629,7 +1858,10 @@ mod tests {
         // finish in well under STOP_WARN, and a dialog or toast popping up for
         // every routine "close it and launch" would train users to ignore it.
         assert_eq!(escalation_for(Duration::ZERO), Escalation::KeepWaiting);
-        assert_eq!(escalation_for(Duration::from_secs(9)), Escalation::KeepWaiting);
+        assert_eq!(
+            escalation_for(Duration::from_secs(9)),
+            Escalation::KeepWaiting
+        );
     }
 
     #[test]
@@ -1660,8 +1892,14 @@ mod tests {
         // and that is a property of the three constants, not of the function
         // reading them. Pinned directly so a future edit to one constant
         // cannot silently invert the sequence.
-        assert!(STOP_WARN < STOP_KILL, "warning must come before forcing a close");
-        assert!(STOP_KILL < STOP_GIVE_UP, "forcing a close must come before giving up on it");
+        assert!(
+            STOP_WARN < STOP_KILL,
+            "warning must come before forcing a close"
+        );
+        assert!(
+            STOP_KILL < STOP_GIVE_UP,
+            "forcing a close must come before giving up on it"
+        );
     }
 
     #[test]
@@ -1685,7 +1923,10 @@ mod tests {
         // both are claims about a number the caller does not actually have.
         let message = stuck_diagnosis(None, None, None);
         assert!(message.contains("could not be read"), "{message}");
-        assert!(!message.contains("doing something") && !message.contains("no CPU"), "{message}");
+        assert!(
+            !message.contains("doing something") && !message.contains("no CPU"),
+            "{message}"
+        );
     }
 
     #[test]

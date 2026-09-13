@@ -134,6 +134,79 @@ pub fn keysym_to_android(keysym: c_ulong) -> Option<i32> {
     })
 }
 
+pub fn keysym_to_char(keysym: c_ulong) -> Option<char> {
+    let k = keysym as u32;
+    if (0x01000100..=0x0110ffff).contains(&k) {
+        return char::from_u32(k - 0x01000000);
+    }
+    if (0x0020..=0x007e).contains(&k) || (0x00a0..=0x00ff).contains(&k) {
+        return char::from_u32(k);
+    }
+    static FN: std::sync::OnceLock<Option<unsafe extern "C" fn(u32) -> u32>> = std::sync::OnceLock::new();
+    let f = FN.get_or_init(|| {
+        extern "C" {
+            fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
+            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        }
+        unsafe {
+            let lib = dlopen(b"libxkbcommon.so.0\0".as_ptr() as *const std::ffi::c_char, 2);
+            if lib.is_null() {
+                None
+            } else {
+                let p = dlsym(lib, b"xkb_keysym_to_utf32\0".as_ptr() as *const std::ffi::c_char);
+                if p.is_null() {
+                    None
+                } else {
+                    Some(std::mem::transmute(p))
+                }
+            }
+        }
+    });
+    if let Some(to_utf32) = f {
+        let cp = unsafe { to_utf32(k) };
+        if cp != 0 {
+            return char::from_u32(cp);
+        }
+    }
+    match k {
+        0x06c0 => Some('ю'),
+        0x06c1..=0x06df => char::from_u32(0x0430 + (k - 0x06c1)),
+        0x06e0 => Some('Ю'),
+        0x06e1..=0x06ff => char::from_u32(0x0410 + (k - 0x06e1)),
+        0x06a1 => Some('ђ'),
+        0x06a2 => Some('ѓ'),
+        0x06a3 => Some('ё'),
+        0x06a4 => Some('є'),
+        0x06a5 => Some('ѕ'),
+        0x06a6 => Some('і'),
+        0x06a7 => Some('ї'),
+        0x06a8 => Some('ј'),
+        0x06a9 => Some('љ'),
+        0x06aa => Some('њ'),
+        0x06ab => Some('ћ'),
+        0x06ac => Some('ќ'),
+        0x06ad => Some('ґ'),
+        0x06ae => Some('ў'),
+        0x06af => Some('џ'),
+        0x06b1 => Some('Ђ'),
+        0x06b2 => Some('Ѓ'),
+        0x06b3 => Some('Ё'),
+        0x06b4 => Some('Є'),
+        0x06b5 => Some('Ѕ'),
+        0x06b6 => Some('І'),
+        0x06b7 => Some('Ї'),
+        0x06b8 => Some('Ј'),
+        0x06b9 => Some('Љ'),
+        0x06ba => Some('Њ'),
+        0x06bb => Some('Ћ'),
+        0x06bc => Some('Ќ'),
+        0x06bd => Some('Ґ'),
+        0x06be => Some('Ў'),
+        0x06bf => Some('Џ'),
+        _ => None,
+    }
+}
+
 /// Say that a native the input path wanted is not there — at the first drop,
 /// and then at each power of ten.
 ///
@@ -3225,5 +3298,22 @@ mod tests {
         assert!(!evdev_is_text_key(1), "escape");
         assert!(!evdev_is_text_key(28), "enter");
         assert!(!evdev_is_text_key(15), "tab");
+    }
+
+    #[test]
+    fn keysym_to_char_ukrainian() {
+        assert_eq!(super::keysym_to_char(0x06a4), Some('є'));
+        assert_eq!(super::keysym_to_char(0x06a6), Some('і'));
+        assert_eq!(super::keysym_to_char(0x06a7), Some('ї'));
+        assert_eq!(super::keysym_to_char(0x06ad), Some('ґ'));
+        assert_eq!(super::keysym_to_char(0x06b4), Some('Є'));
+        assert_eq!(super::keysym_to_char(0x06b6), Some('І'));
+        assert_eq!(super::keysym_to_char(0x06b7), Some('Ї'));
+        assert_eq!(super::keysym_to_char(0x06bd), Some('Ґ'));
+        assert_eq!(super::keysym_to_char(0x06c0), Some('ю'));
+        assert_eq!(super::keysym_to_char(0x06c1), Some('а'));
+        assert_eq!(super::keysym_to_char(0x06e1), Some('А'));
+        assert_eq!(super::keysym_to_char(0x0061), Some('a'));
+        assert_eq!(super::keysym_to_char(0x01000430), Some('а'));
     }
 }

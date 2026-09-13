@@ -15,7 +15,7 @@
 //! `xcb_window_t`/`Window` directly, whereas Wayland needs an `wl_egl_window`
 //! and a surface role — more moving parts for the same first frame.
 
-use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -38,8 +38,7 @@ pub const WINDOW_FORMAT_RGBA_8888: i32 = 1;
 /// changed size: the engine kept rendering at the size it was told at startup
 /// while X cleared the window to its background colour, which is the black
 /// flash on every resize.
-const INPUT_EVENT_MASK: c_long =
-    0x1 | 0x2 | 0x4 | 0x8 | 0x40 | 0x8000 | 0x20000 | 0x200000;
+const INPUT_EVENT_MASK: c_long = 0x1 | 0x2 | 0x4 | 0x8 | 0x40 | 0x8000 | 0x20000 | 0x200000;
 
 type Display = *mut c_void;
 type Window = c_ulong;
@@ -48,7 +47,15 @@ struct Xlib {
     open_display: unsafe extern "C" fn(*const c_char) -> Display,
     default_root_window: unsafe extern "C" fn(Display) -> Window,
     create_simple_window: unsafe extern "C" fn(
-        Display, Window, c_int, c_int, u32, u32, u32, c_ulong, c_ulong,
+        Display,
+        Window,
+        c_int,
+        c_int,
+        u32,
+        u32,
+        u32,
+        c_ulong,
+        c_ulong,
     ) -> Window,
     map_window: unsafe extern "C" fn(Display, Window) -> c_int,
     set_wm_normal_hints: unsafe extern "C" fn(Display, Window, *mut XSizeHints),
@@ -56,6 +63,17 @@ struct Xlib {
     set_wm_hints: unsafe extern "C" fn(Display, Window, *mut XWMHints) -> c_int,
     move_window: unsafe extern "C" fn(Display, Window, c_int, c_int) -> c_int,
     intern_atom: unsafe extern "C" fn(Display, *const c_char, c_int) -> c_ulong,
+    set_wm_protocols: unsafe extern "C" fn(Display, Window, *mut c_ulong, c_int) -> c_int,
+    change_property: unsafe extern "C" fn(
+        Display,
+        Window,
+        c_ulong,
+        c_ulong,
+        c_int,
+        c_int,
+        *const u8,
+        c_int,
+    ) -> c_int,
     send_event: unsafe extern "C" fn(Display, Window, c_int, c_long, *mut c_void) -> c_int,
     sync: unsafe extern "C" fn(Display, c_int) -> c_int,
     store_name: unsafe extern "C" fn(Display, Window, *const c_char) -> c_int,
@@ -68,17 +86,37 @@ struct Xlib {
     next_event: unsafe extern "C" fn(Display, *mut c_void) -> c_int,
 
     grab_pointer: unsafe extern "C" fn(
-        Display, Window, c_int, c_uint, c_int, c_int, Window, c_ulong, c_ulong,
+        Display,
+        Window,
+        c_int,
+        c_uint,
+        c_int,
+        c_int,
+        Window,
+        c_ulong,
+        c_ulong,
     ) -> c_int,
     ungrab_pointer: unsafe extern "C" fn(Display, c_ulong) -> c_int,
     warp_pointer: unsafe extern "C" fn(
-        Display, Window, Window, c_int, c_int, c_uint, c_uint, c_int, c_int,
+        Display,
+        Window,
+        Window,
+        c_int,
+        c_int,
+        c_uint,
+        c_uint,
+        c_int,
+        c_int,
     ) -> c_int,
     query_pointer: unsafe extern "C" fn(
-        Display, Window,
-        *mut Window, *mut Window,
-        *mut c_int, *mut c_int,
-        *mut c_int, *mut c_int,
+        Display,
+        Window,
+        *mut Window,
+        *mut Window,
+        *mut c_int,
+        *mut c_int,
+        *mut c_int,
+        *mut c_int,
         *mut c_uint,
     ) -> c_int,
 
@@ -92,7 +130,13 @@ struct Xlib {
     create_bitmap_from_data:
         unsafe extern "C" fn(Display, Window, *const c_char, c_uint, c_uint) -> c_ulong,
     create_pixmap_cursor: unsafe extern "C" fn(
-        Display, c_ulong, c_ulong, *mut XColor, *mut XColor, c_uint, c_uint,
+        Display,
+        c_ulong,
+        c_ulong,
+        *mut XColor,
+        *mut XColor,
+        c_uint,
+        c_uint,
     ) -> c_ulong,
     define_cursor: unsafe extern "C" fn(Display, Window, c_ulong) -> c_int,
     free_pixmap: unsafe extern "C" fn(Display, c_ulong) -> c_int,
@@ -149,6 +193,8 @@ impl Xlib {
             set_wm_hints: sym!("XSetWMHints"),
             move_window: sym!("XMoveWindow"),
             intern_atom: sym!("XInternAtom"),
+            set_wm_protocols: sym!("XSetWMProtocols"),
+            change_property: sym!("XChangeProperty"),
             send_event: sym!("XSendEvent"),
             sync: sym!("XSync"),
             connection_number: sym!("XConnectionNumber"),
@@ -177,6 +223,8 @@ pub struct HostWindow {
     /// ever calling into Xlib when there is nothing queued, which is what keeps
     /// it from blocking the render loop (see `pump_input_events`, below).
     conn_fd: c_int,
+    wm_protocols: c_ulong,
+    wm_delete_window: c_ulong,
     /// Dimensions the engine asked for via `ANativeWindow_setBuffersGeometry`,
     /// which override the window's own size in every query. Android reports the
     /// buffer geometry, not the surface geometry, and the engine sizes its
@@ -237,7 +285,7 @@ unsafe impl Send for HostWindow {}
 unsafe impl Sync for HostWindow {}
 
 static WINDOW: OnceLock<HostWindow> = OnceLock::new();
-
+static WINDOW_CLOSED: AtomicBool = AtomicBool::new(false);
 
 /// `XSizeHints`. Only the leading fields matter here, but the struct has to be
 /// the full size Xlib expects or `XSetWMNormalHints` reads past the end.
@@ -321,7 +369,14 @@ struct Placement {
 
 fn placement(win_w: c_int, win_h: c_int) -> Placement {
     let fullscreen = std::env::var_os("CORDIAL_FULLSCREEN").is_some();
-    let mut p = Placement { x: 0, y: 0, width: win_w, height: win_h, fullscreen, monitor: None };
+    let mut p = Placement {
+        x: 0,
+        y: 0,
+        width: win_w,
+        height: win_h,
+        fullscreen,
+        monitor: None,
+    };
 
     if let Ok(pos) = std::env::var("CORDIAL_WINDOW_POS") {
         let mut parts = pos.split(',').map(str::trim);
@@ -410,8 +465,7 @@ fn placement(win_w: c_int, win_h: c_int) -> Placement {
 
 /// The open display, so `window_origin` can query monitors on the same
 /// connection rather than opening a second one for a single call.
-static CURRENT_DISPLAY: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static CURRENT_DISPLAY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Open a window. Fails cleanly when there is no display, which is a normal
 /// condition rather than an error — the loader and asset paths do not need one.
@@ -437,8 +491,15 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
     // the one it was given".
     println!(
         "[android] window placement: {}x{} at {},{}{}",
-        place.width, place.height, place.x, place.y,
-        if place.fullscreen { " (fullscreen)" } else { "" }
+        place.width,
+        place.height,
+        place.x,
+        place.y,
+        if place.fullscreen {
+            " (fullscreen)"
+        } else {
+            ""
+        }
     );
     let (ox, oy) = (place.x, place.y);
     // Fullscreen resizes the surface as well as the window: the engine sizes
@@ -447,7 +508,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
     // corner of the screen.
     let (width, height) = (place.width as u32, place.height as u32);
 
-    let (window, conn_fd) = unsafe {
+    let (window, conn_fd, wm_protocols, wm_delete_window) = unsafe {
         let root = (xlib.default_root_window)(display);
         let w = (xlib.create_simple_window)(display, root, ox, oy, width, height, 0, 0, 0);
         // XStoreName sets WM_NAME, which is XA_STRING — Latin-1, not UTF-8.
@@ -476,10 +537,19 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             y: oy,
             width: width as c_int,
             height: height as c_int,
-            min_width: 0, min_height: 0, max_width: 0, max_height: 0,
-            width_inc: 0, height_inc: 0,
-            min_aspect_x: 0, min_aspect_y: 0, max_aspect_x: 0, max_aspect_y: 0,
-            base_width: 0, base_height: 0, win_gravity: 0,
+            min_width: 0,
+            min_height: 0,
+            max_width: 0,
+            max_height: 0,
+            width_inc: 0,
+            height_inc: 0,
+            min_aspect_x: 0,
+            min_aspect_y: 0,
+            max_aspect_x: 0,
+            max_aspect_y: 0,
+            base_width: 0,
+            base_height: 0,
+            win_gravity: 0,
         };
         (xlib.set_wm_normal_hints)(display, w, &mut hints);
 
@@ -488,10 +558,26 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             flags: (1 << 0) | (1 << 1),
             input: 1,
             initial_state: 1, // NormalState
-            icon_pixmap: 0, icon_window: 0, icon_x: 0, icon_y: 0,
-            icon_mask: 0, window_group: 0,
+            icon_pixmap: 0,
+            icon_window: 0,
+            icon_x: 0,
+            icon_y: 0,
+            icon_mask: 0,
+            window_group: 0,
         };
         (xlib.set_wm_hints)(display, w, &mut wm);
+
+        // Advertise `WM_DELETE_WINDOW` so the window manager asks us to close
+        // instead of killing the X11 client connection. Without this property
+        // Xlib handles the close as a fatal I/O error, bypassing the Android
+        // lifecycle teardown and leaving the engine's worker threads racing a
+        // destroyed display.
+        let wm_protocols = (xlib.intern_atom)(display, c"WM_PROTOCOLS".as_ptr(), 0);
+        let wm_delete_window = (xlib.intern_atom)(display, c"WM_DELETE_WINDOW".as_ptr(), 0);
+        let mut protocol = wm_delete_window;
+        if wm_protocols != 0 && wm_delete_window != 0 {
+            (xlib.set_wm_protocols)(display, w, &mut protocol, 1);
+        }
 
         // WM_CLASS, so the window is addressable by rule in a tiling or
         // scripted setup rather than only by title. It is also how a capture
@@ -529,7 +615,12 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             let pixmap = (xlib.create_bitmap_from_data)(display, w, blank.as_ptr(), 1, 1);
             if pixmap != 0 {
                 let mut black = XColor {
-                    pixel: 0, red: 0, green: 0, blue: 0, flags: 0, pad: 0,
+                    pixel: 0,
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                    flags: 0,
+                    pad: 0,
                 };
                 let cursor = (xlib.create_pixmap_cursor)(
                     display, pixmap, pixmap, &mut black, &mut black, 0, 0,
@@ -538,7 +629,9 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
                     (xlib.define_cursor)(display, w, cursor);
                     eprintln!("[cordial] host cursor hidden over the client window");
                 } else {
-                    eprintln!("[cordial] could not create a blank cursor; host pointer stays visible");
+                    eprintln!(
+                        "[cordial] could not create a blank cursor; host pointer stays visible"
+                    );
                 }
                 // The cursor holds its own reference to the pixmap contents, so
                 // the pixmap is freed now rather than leaked for the process.
@@ -563,6 +656,30 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             (xlib.intern_atom)(display, c.as_ptr(), 0)
         };
 
+        // Tell an Xorg compositor that fullscreen frames may be scanned out
+        // directly. This is only a hint: compositors that cannot honour it
+        // ignore it, while ones that can avoid an extra compositing copy and
+        // one frame of latency. It belongs on the X11 window rather than in
+        // Vulkan, because the decision is about the desktop compositor and
+        // not about Roblox's swapchain.
+        if place.fullscreen && std::env::var_os("CORDIAL_NO_COMPOSITOR_BYPASS").is_none() {
+            let bypass = atom("_NET_WM_BYPASS_COMPOSITOR");
+            let cardinal = atom("CARDINAL");
+            let value: c_ulong = 1;
+            if bypass != 0 && cardinal != 0 {
+                (xlib.change_property)(
+                    display,
+                    w,
+                    bypass,
+                    cardinal,
+                    32,
+                    0,
+                    (&value as *const c_ulong).cast(),
+                    1,
+                );
+            }
+        }
+
         // An XClientMessageEvent, laid out by hand. Xlib's XEvent union is
         // large and only the leading fields matter here.
         let mut msg = [0u8; 96];
@@ -580,7 +697,9 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
                 *(p.add(56 + i * 8) as *mut c_long) = *v;
             }
             (xlib.send_event)(
-                display, root, 0,
+                display,
+                root,
+                0,
                 SUBSTRUCTURE_REDIRECT | SUBSTRUCTURE_NOTIFY,
                 msg.as_mut_ptr() as *mut c_void,
             );
@@ -608,7 +727,12 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         (xlib.flush)(display);
         (xlib.sync)(display, 0);
 
-        (w, (xlib.connection_number)(display))
+        (
+            w,
+            (xlib.connection_number)(display),
+            wm_protocols,
+            wm_delete_window,
+        )
     };
 
     let host = HostWindow {
@@ -616,6 +740,8 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         display,
         window,
         conn_fd,
+        wm_protocols,
+        wm_delete_window,
         buffers: Mutex::new(Geometry {
             width: width as i32,
             height: height as i32,
@@ -752,7 +878,10 @@ impl HostWindow {
             *(p.add(32) as *mut Window) = self.window;
             *(p.add(40) as *mut c_ulong) = state;
             *(p.add(48) as *mut c_int) = 32;
-            for (i, v) in [if on { ADD } else { REMOVE }, fs as c_long, 0, 1, 0].iter().enumerate() {
+            for (i, v) in [if on { ADD } else { REMOVE }, fs as c_long, 0, 1, 0]
+                .iter()
+                .enumerate()
+            {
                 *(p.add(56 + i * 8) as *mut c_long) = *v;
             }
             (xlib.send_event)(
@@ -764,7 +893,41 @@ impl HostWindow {
             );
             (xlib.flush)(self.display);
         }
+        self.set_compositor_bypass(on);
         self.fullscreen.store(on, Ordering::Relaxed);
+    }
+
+    /// Keep the X11 compositor hint in step with fullscreen state.
+    ///
+    /// `_NET_WM_BYPASS_COMPOSITOR=1` is advisory and has no effect on a window
+    /// manager that does not support it. Setting it back to zero when leaving
+    /// fullscreen matters on compositors that cache the property across a
+    /// state transition; otherwise a later windowed resize could still be
+    /// treated as a direct-scanout candidate.
+    fn set_compositor_bypass(&self, on: bool) {
+        if std::env::var_os("CORDIAL_NO_COMPOSITOR_BYPASS").is_some() {
+            return;
+        }
+        unsafe {
+            let property =
+                (self.xlib.intern_atom)(self.display, c"_NET_WM_BYPASS_COMPOSITOR".as_ptr(), 0);
+            let cardinal = (self.xlib.intern_atom)(self.display, c"CARDINAL".as_ptr(), 0);
+            if property == 0 || cardinal == 0 {
+                return;
+            }
+            let value: c_ulong = if on { 1 } else { 0 };
+            (self.xlib.change_property)(
+                self.display,
+                self.window,
+                property,
+                cardinal,
+                32,
+                0,
+                (&value as *const c_ulong).cast(),
+                1,
+            );
+            (self.xlib.flush)(self.display);
+        }
     }
 
     /// Take or release the pointer to match what the engine and the mouse are
@@ -803,11 +966,7 @@ impl HostWindow {
     fn sync_pointer_lock(&self) {
         let engine_wants = super::input::engine_wants_pointer_lock() == Some(true);
 
-        let buttons = self
-            .input
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .buttons;
+        let buttons = self.input.lock().unwrap_or_else(|e| e.into_inner()).buttons;
 
         let no_drag_lock = std::env::var_os("CORDIAL_NO_DRAG_LOCK").is_some();
         let force = std::env::var_os("CORDIAL_FORCE_POINTER_LOCK").is_some();
@@ -817,10 +976,7 @@ impl HostWindow {
             return;
         }
 
-        let mut state = self
-            .pointer_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         let (want, suppressed) =
             pointer_lock_decision(engine_wants, buttons, no_drag_lock, force, state.suppressed);
@@ -843,8 +999,7 @@ impl HostWindow {
         }
 
         let centre = (width / 2, height / 2);
-        let root =
-            unsafe { (self.xlib.default_root_window)(self.display) };
+        let root = unsafe { (self.xlib.default_root_window)(self.display) };
 
         let mut root_return = 0;
         let mut child_return = 0;
@@ -868,8 +1023,11 @@ impl HostWindow {
             )
         };
 
-        let saved_root =
-            if queried != 0 { Some((root_x, root_y)) } else { None };
+        let saved_root = if queried != 0 {
+            Some((root_x, root_y))
+        } else {
+            None
+        };
 
         // X11 CurrentTime is 0.
         // owner_events = True
@@ -901,10 +1059,7 @@ impl HostWindow {
         }
 
         {
-            let mut state = self
-                .pointer_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut state = self.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
 
             state.locked = true;
             state.ignore_next_warp = true;
@@ -913,17 +1068,7 @@ impl HostWindow {
         }
 
         unsafe {
-            (self.xlib.warp_pointer)(
-                self.display,
-                0,
-                self.window,
-                0,
-                0,
-                0,
-                0,
-                centre.0,
-                centre.1,
-            );
+            (self.xlib.warp_pointer)(self.display, 0, self.window, 0, 0, 0, 0, centre.0, centre.1);
             (self.xlib.flush)(self.display);
         }
 
@@ -942,18 +1087,14 @@ impl HostWindow {
         if super::input::trace_mouse() {
             eprintln!(
                 "[cordial] X11 pointer lock acquired at ({}, {})",
-                centre.0,
-                centre.1
+                centre.0, centre.1
             );
         }
     }
 
     fn release_pointer_lock(&self) {
         let (was_locked, saved_root) = {
-            let mut state = self
-                .pointer_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut state = self.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
 
             let was_locked = state.locked;
             let saved_root = state.saved_root.take();
@@ -974,20 +1115,9 @@ impl HostWindow {
             (self.xlib.ungrab_pointer)(self.display, 0);
 
             if let Some((x, y)) = saved_root {
-                let root =
-                    (self.xlib.default_root_window)(self.display);
+                let root = (self.xlib.default_root_window)(self.display);
 
-                (self.xlib.warp_pointer)(
-                    self.display,
-                    root,
-                    root,
-                    0,
-                    0,
-                    0,
-                    0,
-                    x,
-                    y,
-                );
+                (self.xlib.warp_pointer)(self.display, root, root, 0, 0, 0, 0, x, y);
             }
 
             (self.xlib.flush)(self.display);
@@ -1033,6 +1163,11 @@ impl HostWindow {
 
 pub fn current() -> Option<&'static HostWindow> {
     WINDOW.get()
+}
+
+/// Whether the window manager delivered `WM_DELETE_WINDOW`.
+pub fn window_closed() -> bool {
+    WINDOW_CLOSED.load(Ordering::Acquire)
 }
 
 // ------------------------------------------------------------- input pump
@@ -1088,6 +1223,7 @@ const BUTTON_PRESS: c_int = 4;
 const BUTTON_RELEASE: c_int = 5;
 const EXPOSE: c_int = 12;
 const CONFIGURE_NOTIFY: c_int = 22;
+const CLIENT_MESSAGE: c_int = 33;
 
 /// `XConfigureEvent`. Another distinct layout: it carries the window's new
 /// geometry rather than a damaged rectangle.
@@ -1163,10 +1299,11 @@ fn android_meta_state(x11_state: c_uint) -> i32 {
 // why the keysym table in particular carries over unchanged: X11 keysyms and
 // XKB keysyms are the same numbering.
 use super::input::{
-    deliver_key, deliver_surface_redraw, deliver_mouse, edit_text_buffer, keysym_to_android,
-    pass_key_event, pass_mouse_button, pass_mouse_move, pass_text, report_keyboard_state, Caret,
-    Edit, ACTION_BUTTON_PRESS, ACTION_BUTTON_RELEASE, ACTION_DOWN, ACTION_HOVER_MOVE, ACTION_MOVE,
+    ACTION_BUTTON_PRESS, ACTION_BUTTON_RELEASE, ACTION_DOWN, ACTION_HOVER_MOVE, ACTION_MOVE,
     ACTION_UP, BUTTON_BACK, BUTTON_FORWARD, BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_TERTIARY,
+    Caret, Edit, deliver_key, deliver_mouse, deliver_surface_redraw, edit_text_buffer,
+    keysym_to_android, pass_key_event, pass_mouse_button, pass_mouse_move, pass_text,
+    report_keyboard_state,
 };
 
 /// X11 numbers buttons 1/2/3 as left/middle/right; Android's bit assignment
@@ -1266,12 +1403,30 @@ impl HostWindow {
             // click: ACTION_DOWN establishes the gesture, then
             // ACTION_BUTTON_PRESS names which button did it.
             deliver_mouse(handle, ACTION_DOWN, x, y, buttons, 0, now, down_time);
-            deliver_mouse(handle, ACTION_BUTTON_PRESS, x, y, buttons, android_button, now, down_time);
+            deliver_mouse(
+                handle,
+                ACTION_BUTTON_PRESS,
+                x,
+                y,
+                buttons,
+                android_button,
+                now,
+                down_time,
+            );
         } else {
             state.buttons &= !android_button;
             let (buttons, down_time) = (state.buttons, state.down_time_ms);
             drop(state);
-            deliver_mouse(handle, ACTION_BUTTON_RELEASE, x, y, buttons, android_button, now, down_time);
+            deliver_mouse(
+                handle,
+                ACTION_BUTTON_RELEASE,
+                x,
+                y,
+                buttons,
+                android_button,
+                now,
+                down_time,
+            );
             deliver_mouse(handle, ACTION_UP, x, y, buttons, 0, now, down_time);
         }
 
@@ -1284,10 +1439,7 @@ impl HostWindow {
 
     fn dispatch_motion(&self, handle: i64, ev: &XInputEvent) {
         {
-            let mut state = self
-                .pointer_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut state = self.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
 
             if state.locked {
                 let centre = state.centre;
@@ -1304,32 +1456,21 @@ impl HostWindow {
                 // pointer is captured. The absolute position remains the
                 // capture centre, but Roblox still sees the same MotionEvent
                 // sequence it saw before pointer locking was introduced.
-                let input = self
-                    .input
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let input = self.input.lock().unwrap_or_else(|e| e.into_inner());
 
                 let buttons = input.buttons;
                 let down_time = input.down_time_ms;
                 let now = input.clock.elapsed().as_millis() as i64;
                 drop(input);
 
-                let action =
-                    if buttons != 0 {
-                        ACTION_MOVE
-                    } else {
-                        ACTION_HOVER_MOVE
-                    };
+                let action = if buttons != 0 {
+                    ACTION_MOVE
+                } else {
+                    ACTION_HOVER_MOVE
+                };
 
                 deliver_mouse(
-                    handle,
-                    action,
-                    cx as f32,
-                    cy as f32,
-                    buttons,
-                    0,
-                    now,
-                    down_time,
+                    handle, action, cx as f32, cy as f32, buttons, 0, now, down_time,
                 );
 
                 // The relative delta is still delivered through Roblox's
@@ -1337,33 +1478,15 @@ impl HostWindow {
                 if dx != 0 || dy != 0 {
                     drop(state);
 
-                    super::input::pass_mouse_move_delta(
-                        cx as f32,
-                        cy as f32,
-                        dx as f32,
-                        dy as f32,
-                    );
+                    super::input::pass_mouse_move_delta(cx as f32, cy as f32, dx as f32, dy as f32);
 
-                    let mut state = self
-                        .pointer_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut state = self.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
 
                     state.ignore_next_warp = true;
                     drop(state);
 
                     unsafe {
-                        (self.xlib.warp_pointer)(
-                            self.display,
-                            0,
-                            self.window,
-                            0,
-                            0,
-                            0,
-                            0,
-                            cx,
-                            cy,
-                        );
+                        (self.xlib.warp_pointer)(self.display, 0, self.window, 0, 0, 0, 0, cx, cy);
                         (self.xlib.flush)(self.display);
                     }
                 }
@@ -1373,10 +1496,7 @@ impl HostWindow {
         }
 
         let (x, y) = (ev.x as f32, ev.y as f32);
-        let state = self
-            .input
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let state = self.input.lock().unwrap_or_else(|e| e.into_inner());
         let now = state.clock.elapsed().as_millis() as i64;
         let (buttons, down_time) = (state.buttons, state.down_time_ms);
         drop(state);
@@ -1384,7 +1504,11 @@ impl HostWindow {
         // started, hence ACTION_MOVE with the same down_time. No button held
         // makes it a hover, which is what a mouse (as opposed to touch) sends
         // when it moves without a button down.
-        let action = if buttons != 0 { ACTION_MOVE } else { ACTION_HOVER_MOVE };
+        let action = if buttons != 0 {
+            ACTION_MOVE
+        } else {
+            ACTION_HOVER_MOVE
+        };
         deliver_mouse(handle, action, x, y, buttons, 0, now, down_time);
         // And the path the interface reads. Both are driven: AGDK's contract is
         // real and the engine consumes it, it is simply not what hit-tests the
@@ -1410,7 +1534,15 @@ impl HostWindow {
             )
         };
         let ev = unsafe { &*(buf.as_ptr() as *const XInputEvent) };
-        let unicode = if n > 0 { text[0] as i32 } else { 0 };
+        let mut char_buf = [0u8; 4];
+        let decoded_char = super::input::keysym_to_char(keysym);
+        let unicode = if let Some(ch) = decoded_char {
+            ch as i32
+        } else if n > 0 {
+            text[0] as i32
+        } else {
+            0
+        };
         let meta = android_meta_state(ev.state);
         let now = self.now_ms();
 
@@ -1418,8 +1550,6 @@ impl HostWindow {
             return;
         }
 
-        // XK_F11. Like the Wayland game window, this backend is not the GTK
-        // launcher and therefore cannot inherit its `win.fullscreen` action.
         if keysym == 0xffc8 {
             if down {
                 self.set_fullscreen(!self.fullscreen.load(Ordering::Relaxed));
@@ -1428,14 +1558,17 @@ impl HostWindow {
         }
 
         if super::input::trace_text() {
-            // `text=` is a length unless `CORDIAL_TRACE_TEXT_SHOW_PASSWORDS=1`:
-            // one character at a time is still a password, printed slowly.
+            let trace_str = if let Some(ch) = decoded_char {
+                ch.encode_utf8(&mut char_buf)
+            } else if n > 0 {
+                std::str::from_utf8(&text[..n.max(0) as usize]).unwrap_or("")
+            } else {
+                ""
+            };
             eprintln!(
                 "[cordial] key {} keysym={keysym:#x} text={} keycode={:?} focus={:?}",
                 if down { "down" } else { "up" },
-                super::input::redacted(
-                    std::str::from_utf8(&text[..n.max(0) as usize]).unwrap_or("")
-                ),
+                super::input::redacted(trace_str),
                 keysym_to_android(keysym),
                 cordial_linker_sys::game_activity::focused_textbox(),
             );
@@ -1453,14 +1586,21 @@ impl HostWindow {
         // AKEYCODE has a name for it, and an email address is unusable without
         // it. So this is now a branch rather than an exit.
         if let Some(keycode) = keysym_to_android(keysym) {
-            deliver_key(handle, down, keycode, ev.detail as i32, meta, 0, unicode, now, now);
-            // The evdev code, not the Android keycode. X11 keycodes are evdev
-            // offset by 8 -- XKB reserves the low 8 for historical reasons every
-            // consumer has to undo. See `pass_key_event`.
-            pass_key_event(down, ev.detail as i32 - 8, meta);
+            deliver_key(
+                handle,
+                down,
+                keycode,
+                ev.detail as i32,
+                meta,
+                0,
+                unicode,
+                now,
+                now,
+            );
         } else {
             super::trace(format_args!("unmapped X11 keysym {keysym:#x}"));
         }
+        pass_key_event(down, ev.detail as i32 - 8, meta);
 
         // And the text path. Android text fields are edited by state, not by
         // keystrokes — delivering the key alone leaves the box empty, which is
@@ -1489,7 +1629,10 @@ impl HostWindow {
                 }
                 return;
             }
-            let typed = if n > 0 {
+            let mut insert_buf = [0u8; 4];
+            let typed = if let Some(ch) = decoded_char {
+                ch.encode_utf8(&mut insert_buf)
+            } else if n > 0 {
                 std::str::from_utf8(&text[..n as usize]).unwrap_or("")
             } else {
                 ""
@@ -1498,12 +1641,12 @@ impl HostWindow {
             // than committing them, and `XLookupString` reports nothing for
             // them anyway. Keysyms from keysymdef.h.
             let edit = match keysym {
-                0xff08 => Edit::Backspace,           // XK_BackSpace
-                0xffff => Edit::Delete,              // XK_Delete
-                0xff51 => Edit::Move(Caret::Left),   // XK_Left
-                0xff53 => Edit::Move(Caret::Right),  // XK_Right
-                0xff50 => Edit::Move(Caret::Home),   // XK_Home
-                0xff57 => Edit::Move(Caret::End),    // XK_End
+                0xff08 => Edit::Backspace,          // XK_BackSpace
+                0xffff => Edit::Delete,             // XK_Delete
+                0xff51 => Edit::Move(Caret::Left),  // XK_Left
+                0xff53 => Edit::Move(Caret::Right), // XK_Right
+                0xff50 => Edit::Move(Caret::Home),  // XK_Home
+                0xff57 => Edit::Move(Caret::End),   // XK_End
                 _ => Edit::Insert(typed),
             };
             if let Some((contents, caret)) = edit_text_buffer(edit) {
@@ -1531,7 +1674,11 @@ impl HostWindow {
             report_keyboard_state((gw, gh));
         }
 
-        let mut pfd = PollFd { fd: self.conn_fd, events: POLLIN, revents: 0 };
+        let mut pfd = PollFd {
+            fd: self.conn_fd,
+            events: POLLIN,
+            revents: 0,
+        };
         // SAFETY: `pfd` is a live array of length 1; a 0ms timeout makes this a
         // pure non-blocking check.
         let ready = unsafe { poll(&mut pfd as *mut PollFd as *mut c_void, 1, 0) };
@@ -1572,10 +1719,7 @@ impl HostWindow {
                 FOCUS_OUT => {
                     self.release_pointer_lock();
 
-                    let mut state = self
-                        .input
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut state = self.input.lock().unwrap_or_else(|e| e.into_inner());
 
                     state.buttons = 0;
                 }
@@ -1596,6 +1740,23 @@ impl HostWindow {
                     // the `XConfigureEvent` member of Xlib's union.
                     let ev = unsafe { &*(buf.as_ptr() as *const XConfigureEvent) };
                     self.dispatch_configure(handle, ev.width, ev.height);
+                }
+                CLIENT_MESSAGE => {
+                    // `WM_DELETE_WINDOW` is a ClientMessage whose
+                    // `message_type` is WM_PROTOCOLS and whose first data
+                    // word is the delete atom. Read the fixed XEvent offsets
+                    // unaligned, as in the event-construction code above.
+                    let message_type =
+                        unsafe { std::ptr::read_unaligned(buf.as_ptr().add(40) as *const c_ulong) };
+                    let protocol =
+                        unsafe { std::ptr::read_unaligned(buf.as_ptr().add(56) as *const c_long) };
+                    if message_type == self.wm_protocols
+                        && protocol as c_ulong == self.wm_delete_window
+                    {
+                        WINDOW_CLOSED.store(true, Ordering::Release);
+                        println!("[android] X11: window close requested; shutting the engine down");
+                        super::looper::request_quit();
+                    }
                 }
                 _ => {}
             }
@@ -1661,9 +1822,9 @@ impl HostWindow {
             g.format
         };
         super::config::set_screen(width, height);
-        if let Err(e) = cordial_linker_sys::game_activity::surface_resized(
-            handle, format, width, height,
-        ) {
+        if let Err(e) =
+            cordial_linker_sys::game_activity::surface_resized(handle, format, width, height)
+        {
             super::trace(format_args!("surface resize failed: {e}"));
         }
     }
@@ -1686,7 +1847,9 @@ pub fn pump_input_events(handle: i64) {
 /// than a separately allocated handle. `acquire`/`release` are then genuinely
 /// no-ops instead of pretending to refcount something with a single owner.
 fn handle() -> *mut c_void {
-    WINDOW.get().map_or(std::ptr::null_mut(), |w| w as *const HostWindow as *mut c_void)
+    WINDOW.get().map_or(std::ptr::null_mut(), |w| {
+        w as *const HostWindow as *mut c_void
+    })
 }
 
 fn as_window(p: *mut c_void) -> Option<&'static HostWindow> {
@@ -1799,7 +1962,8 @@ extern "C" fn egl_create_window_surface(
     _native_window: *mut c_void,
     attribs: *mut c_void,
 ) -> *mut c_void {
-    crate::android::glcount::CREATE_WINDOW_SURFACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::android::glcount::CREATE_WINDOW_SURFACE
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     extern "C" {
         fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     }
@@ -1886,7 +2050,10 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
         f!("ANativeWindow_getWidth", native_window_get_width),
         f!("ANativeWindow_getHeight", native_window_get_height),
         f!("ANativeWindow_getFormat", native_window_get_format),
-        f!("ANativeWindow_setBuffersGeometry", native_window_set_buffers_geometry),
+        f!(
+            "ANativeWindow_setBuffersGeometry",
+            native_window_set_buffers_geometry
+        ),
         f!("ANativeWindow_lock", native_window_lock),
         f!("ANativeWindow_unlockAndPost", native_window_unlock_and_post),
         f!("eglCreateWindowSurface", egl_create_window_surface),
@@ -1901,16 +2068,34 @@ mod tests {
     #[test]
     fn pointer_lock_is_wanted_for_any_of_its_three_independent_reasons() {
         // Nothing asking: no lock, and the latch has nothing to hold.
-        assert_eq!(pointer_lock_decision(false, 0, false, false, false), (false, false));
+        assert_eq!(
+            pointer_lock_decision(false, 0, false, false, false),
+            (false, false)
+        );
         // The engine's own request, alone.
-        assert_eq!(pointer_lock_decision(true, 0, false, false, false), (true, false));
+        assert_eq!(
+            pointer_lock_decision(true, 0, false, false, false),
+            (true, false)
+        );
         // A camera-button drag, alone -- and blocked by CORDIAL_NO_DRAG_LOCK.
-        assert_eq!(pointer_lock_decision(false, BUTTON_SECONDARY, false, false, false), (true, false));
-        assert_eq!(pointer_lock_decision(false, BUTTON_SECONDARY, true, false, false), (false, false));
+        assert_eq!(
+            pointer_lock_decision(false, BUTTON_SECONDARY, false, false, false),
+            (true, false)
+        );
+        assert_eq!(
+            pointer_lock_decision(false, BUTTON_SECONDARY, true, false, false),
+            (false, false)
+        );
         // The primary button is not a camera button and must not arm the lock.
-        assert_eq!(pointer_lock_decision(false, BUTTON_PRIMARY, false, false, false), (false, false));
+        assert_eq!(
+            pointer_lock_decision(false, BUTTON_PRIMARY, false, false, false),
+            (false, false)
+        );
         // The forced override, alone.
-        assert_eq!(pointer_lock_decision(false, 0, false, true, false), (true, false));
+        assert_eq!(
+            pointer_lock_decision(false, 0, false, true, false),
+            (true, false)
+        );
     }
 
     #[test]
@@ -1918,10 +2103,16 @@ mod tests {
         // Escape has just suppressed the lock, but the engine (or a held
         // camera button) is still asking for it the same pump: the latch
         // must hold, not be immediately overridden.
-        assert_eq!(pointer_lock_decision(true, 0, false, false, true), (false, true));
+        assert_eq!(
+            pointer_lock_decision(true, 0, false, false, true),
+            (false, true)
+        );
         // The ask has stopped -- the button was released, the engine let go
         // -- so the latch clears and a later ask can re-arm the lock.
-        assert_eq!(pointer_lock_decision(false, 0, false, false, true), (false, false));
+        assert_eq!(
+            pointer_lock_decision(false, 0, false, false, true),
+            (false, false)
+        );
     }
 
     #[test]
@@ -1932,11 +2123,20 @@ mod tests {
         assert_eq!(locked_pointer_delta((640, 360), (640, 360), true), None);
         // The same coincidence with the latch already spent (a previous
         // frame consumed the echo) is real motion, not another echo.
-        assert_eq!(locked_pointer_delta((640, 360), (640, 360), false), Some((0, 0)));
+        assert_eq!(
+            locked_pointer_delta((640, 360), (640, 360), false),
+            Some((0, 0))
+        );
         // Ordinary motion away from centre, latch armed or not, is never
         // swallowed -- only an exact match does that.
-        assert_eq!(locked_pointer_delta((645, 358), (640, 360), true), Some((5, -2)));
-        assert_eq!(locked_pointer_delta((645, 358), (640, 360), false), Some((5, -2)));
+        assert_eq!(
+            locked_pointer_delta((645, 358), (640, 360), true),
+            Some((5, -2))
+        );
+        assert_eq!(
+            locked_pointer_delta((645, 358), (640, 360), false),
+            Some((5, -2))
+        );
     }
 
     #[test]
@@ -1957,10 +2157,16 @@ mod tests {
         // happen — hence both assertions, not just the wheel one.
         for b in 4..=7 {
             assert!(x11_button_to_wheel(b).is_some(), "button {b} is the wheel");
-            assert!(x11_button_to_android(b).is_none(), "button {b} must not also be a click");
+            assert!(
+                x11_button_to_android(b).is_none(),
+                "button {b} must not also be a click"
+            );
         }
         for b in 1..=3 {
-            assert!(x11_button_to_wheel(b).is_none(), "button {b} is a click, not the wheel");
+            assert!(
+                x11_button_to_wheel(b).is_none(),
+                "button {b} is a click, not the wheel"
+            );
         }
         assert_eq!(x11_button_to_android(8), Some(BUTTON_BACK));
         assert_eq!(x11_button_to_android(9), Some(BUTTON_FORWARD));

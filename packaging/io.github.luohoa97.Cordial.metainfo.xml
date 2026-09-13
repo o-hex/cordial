@@ -78,6 +78,20 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.14.2" date="2026-09-13">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.14.2</url>
+      <description>
+        <p>
+          The Version page in Settings lists older Roblox builds the mirror has
+          and can download one. Each is checked against Roblox's signature, and
+          downloading one makes it that profile's build.
+        </p>
+        <p>
+          Roblox can now ask for the microphone. Voice chat still does not work;
+          the release notes say why.
+        </p>
+      </description>
+    </release>
     <release version="0.14.1" date="2026-09-13">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.14.1</url>
       <description>

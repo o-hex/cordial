@@ -118,6 +118,18 @@ pub(crate) fn major_and_build(version: &str) -> Option<(u64, u64)> {
     }
 }
 
+/// Whether two version strings name one build, whichever source wrote each.
+///
+/// For the Version page, which lists the mirror's `2.738.1397` beside the
+/// store's `2.738.0.1397` and must not offer to download a build it already
+/// keeps. Unreadable on either side is not a match.
+pub fn same_build(a: &str, b: &str) -> bool {
+    match (major_and_build(a), major_and_build(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Is `candidate` a newer build than `installed`?
 ///
 /// Both or nothing: an unknown installed version is not an old one, and a

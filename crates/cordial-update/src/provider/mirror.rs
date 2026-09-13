@@ -412,6 +412,45 @@ fn metadata(mirror: &Mirror, abi: &str) -> Result<Vec<u8>, Unreachable> {
     Ok(bytes)
 }
 
+/// Every version the mirror lists for x86-64, newest first.
+///
+/// For the Version page, which asks when it is shown and never at startup. The
+/// narrow filter only, for the reason `newest` gives: where a version listed
+/// only under the broad filter was checked, it had no x86-64 engine in it.
+pub fn offered() -> Result<Vec<Available>, Unreachable> {
+    let mirror = Mirror::configured()?;
+    let body = metadata(&mirror, ABI_EXACT)?;
+    let found = versions_in(&body);
+    if found.is_empty() {
+        return Err(Unreachable::Malformed {
+            url: mirror.metadata_url.clone(),
+            why: "the version list carries no versions Cordial can read".into(),
+        });
+    }
+    Ok(found)
+}
+
+/// The versions in a response, once each, ordered by version code.
+///
+/// A name with no code beside it is left out rather than listed with a zero:
+/// `code_before`'s adjacency check is what says a dotted number is a record's
+/// version and not something that happens to precede the tag. So is a name
+/// that is not digits and dots, because it becomes a directory name if it is
+/// downloaded.
+fn versions_in(d: &[u8]) -> Vec<Available> {
+    let mut out: Vec<Available> = Vec::new();
+    for m in markers(d) {
+        if out.iter().any(|a| a.name == m.name) || !crate::store::is_valid_version(&m.name) {
+            continue;
+        }
+        if let Some(code) = code_before(d, &m) {
+            out.push(Available { name: m.name.clone(), code });
+        }
+    }
+    out.sort_by(|a, b| b.code.cmp(&a.code));
+    out
+}
+
 /// The download URLs the response offers for exactly `version`.
 fn downloads_for(d: &[u8], version: &str) -> Vec<String> {
     let marks = markers(d);
@@ -795,6 +834,28 @@ mod tests {
         assert_eq!(code_before(&d, &m[0]), Some(2908));
     }
 
+    fn record(code: &str, name: &str) -> Vec<u8> {
+        let mut d = vec![0u8, 0x2a, code.len() as u8];
+        d.extend_from_slice(code.as_bytes());
+        d.push(0x32);
+        d.push(name.len() as u8);
+        d.extend_from_slice(name.as_bytes());
+        d.push(0x3a);
+        d
+    }
+
+    /// Listed once each and newest first, whatever order the records came in.
+    #[test]
+    fn the_version_list_is_deduplicated_and_ordered_by_code() {
+        let mut d = record("2908", "2.734.917");
+        d.extend(record("3101", "2.738.1397"));
+        d.extend(record("2908", "2.734.917"));
+        // A dotted number with no code beside it is not a version.
+        d.extend_from_slice(b"\x001.2.3\x3a");
+        let names: Vec<String> = versions_in(&d).into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["2.738.1397", "2.734.917"]);
+    }
+
     #[test]
     fn a_url_that_is_not_https_is_not_taken_from_a_record() {
         let mut r = b"XAPKJ".to_vec();
@@ -904,5 +965,19 @@ mod tests {
         let archives = classify(&[base.clone(), split.clone()]).expect("both halves are present");
         assert_eq!(archives.base, base);
         assert_eq!(archives.split, split);
+    }
+
+    /// Against the real mirror, so run by hand: `cargo test -p cordial-update
+    /// -- --ignored the_live_mirror_lists`. The fixtures above pin the parser to
+    /// a shape; this is the only check that the shape is still the one served.
+    #[test]
+    #[ignore = "network"]
+    fn the_live_mirror_lists_versions() {
+        let listed = offered().expect("the mirror answered with a version list");
+        for a in &listed {
+            println!("{} ({})", a.name, a.code);
+        }
+        assert!(!listed.is_empty());
+        assert!(listed.windows(2).all(|w| w[0].code > w[1].code), "newest first, no repeats");
     }
 }

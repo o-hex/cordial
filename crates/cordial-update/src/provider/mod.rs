@@ -420,43 +420,7 @@ pub(crate) fn obtain_from(
             Err(e) => return Err(e),
         };
 
-        // Every distinct file, and only once each: a monolithic APK is not
-        // hashed twice to satisfy the shape of the rule.
-        let mut certificate: Option<String> = None;
-        for file in archives.distinct() {
-            // Verification hashes a few hundred megabytes; a user who has asked
-            // to stop should not wait through it.
-            cancel.check()?;
-            progress(Progress::Verifying {
-                file: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
-            });
-            let signer = crate::apk_signature::verify_signed_by(file, trusted).map_err(|e| {
-                Unreachable::Refused {
-                    what: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                    why: e.to_string(),
-                }
-            })?;
-            // **The two halves must share a certificate.** Each being signed by
-            // some pinned key is not enough: two archives signed by different
-            // pinned keys would each pass on its own, and pairing them installs
-            // an engine from one release beside assets from another. Android's
-            // installer enforces the same rule for the same reason.
-            match &certificate {
-                None => certificate = Some(signer.certificate_sha256),
-                Some(first) if *first != signer.certificate_sha256 => {
-                    return Err(Unreachable::Refused {
-                        what: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                        why: "the two halves of this build were signed by different \
-                              certificates, so they are not two halves of one build"
-                            .into(),
-                    })
-                }
-                Some(_) => {}
-            }
-        }
-        let certificate = certificate.ok_or_else(|| Unreachable::NoSource {
-            why: "the source returned no archives at all".into(),
-        })?;
+        let certificate = verify_archives(&archives, cancel, trusted, progress)?;
 
         return Ok(Obtained {
             archives,
@@ -469,6 +433,178 @@ pub(crate) fn obtain_from(
     Err(Unreachable::NoSource {
         why: format!("no source had a Roblox build.\n  {}", absent.join("\n  ")),
     })
+}
+
+/// The signature check, on every distinct file a source returned, and the
+/// certificate they all share.
+///
+/// One function so that [`obtain_from`] and [`obtain_into_store_from`] run the
+/// identical check rather than two copies of it, which is how a copy ends up
+/// weaker than the original.
+fn verify_archives(
+    archives: &Archives,
+    cancel: &Cancel,
+    trusted: &[String],
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String, Unreachable> {
+    // Every distinct file, and only once each: a monolithic APK is not
+    // hashed twice to satisfy the shape of the rule.
+    let mut certificate: Option<String> = None;
+    for file in archives.distinct() {
+        // Verification hashes a few hundred megabytes; a user who has asked
+        // to stop should not wait through it.
+        cancel.check()?;
+        progress(Progress::Verifying {
+            file: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        });
+        let signer = crate::apk_signature::verify_signed_by(file, trusted).map_err(|e| {
+            Unreachable::Refused {
+                what: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                why: e.to_string(),
+            }
+        })?;
+        // **The two halves must share a certificate.** Each being signed by
+        // some pinned key is not enough: two archives signed by different
+        // pinned keys would each pass on its own, and pairing them installs
+        // an engine from one release beside assets from another. Android's
+        // installer enforces the same rule for the same reason.
+        match &certificate {
+            None => certificate = Some(signer.certificate_sha256),
+            Some(first) if *first != signer.certificate_sha256 => {
+                return Err(Unreachable::Refused {
+                    what: file.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                    why: "the two halves of this build were signed by different \
+                          certificates, so they are not two halves of one build"
+                        .into(),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    certificate.ok_or_else(|| Unreachable::NoSource {
+        why: "the source returned no archives at all".into(),
+    })
+}
+
+/// Refuse before any network activity when there is no room for a build.
+///
+/// Disk exhaustion is otherwise caught only as a write error a few hundred
+/// megabytes in, which wastes the transfer and reports itself as an IO failure
+/// rather than as "you do not have room". This machine reached 353 MB free
+/// during a day's work, so it is not a hypothetical.
+fn ensure_room(dir: &Path) -> Result<(), Unreachable> {
+    if let Some(free) = free_bytes(dir) {
+        // The largest archive the mirror is permitted to serve, plus the
+        // engine that comes out of it. Deliberately generous: refusing a fetch
+        // that would have fitted is worse than starting one that might not,
+        // because the second at least fails honestly.
+        const NEEDED: u64 = 700 * 1024 * 1024;
+        if free < NEEDED {
+            return Err(Unreachable::NoSource {
+                why: format!(
+                    "there is not enough room to install a build: about {} MB free where {} MB \
+                     is needed. Nothing was downloaded.",
+                    free / 1_048_576,
+                    NEEDED / 1_048_576
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// An advisory lock on `path`, refused at once rather than waited for: a
+/// second attempt should say so immediately rather than queue behind a 229 MB
+/// download the user cannot see. Released when the file is dropped.
+fn exclusive(path: &Path, busy: &str) -> Result<std::fs::File, Unreachable> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+    if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(Unreachable::NoSource { why: busy.into() });
+    }
+    Ok(lock)
+}
+
+/// The archives under the names a build directory and a store entry use.
+///
+/// A monolithic archive is one file and must be named once. Handing the same
+/// path in twice would have `adopt` copy it to both names and then look for the
+/// engine in whichever it found first, which works by accident and doubles the
+/// disk it takes.
+fn archive_names(archives: &Archives) -> Vec<(&'static str, PathBuf)> {
+    let mut named = vec![(crate::install::BASE_APK, archives.base.clone())];
+    if archives.split != archives.base {
+        named.push((crate::install::SPLIT_APK, archives.split.clone()));
+    }
+    named
+}
+
+/// **A cancel is named, not folded into `NoSource`.** It still has to come back
+/// as `Unreachable::Cancelled`, the one string `cordial-shell`'s buttons match
+/// on to show "stopped" rather than a red failure.
+fn from_install(e: crate::install::Failed) -> Unreachable {
+    match e {
+        crate::install::Failed::Cancelled => Unreachable::Cancelled,
+        other => Unreachable::NoSource { why: other.to_string() },
+    }
+}
+
+/// Download one named build from the mirror and keep it in the store, leaving
+/// the build in use alone.
+///
+/// The Version page's download ([ADR-033](../../../docs/adr/ADR-033-roblox-versions-are-a-keyed-store.md)).
+/// The same signature check as every other fetch, then
+/// [`crate::install::file_into_store`] rather than `adopt`, so nothing any
+/// profile launches today changes. Returns the version the engine reads as,
+/// which is the store's key and what a pin names -- four components, where the
+/// mirror's name for the same build has three.
+pub fn obtain_into_store(
+    version: &Available,
+    root: &Path,
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String, Unreachable> {
+    obtain_into_store_from(&mirror::ApkPure, version, root, &crate::apk_signature::pinned(), cancel, progress)
+}
+
+pub(crate) fn obtain_into_store_from(
+    source: &dyn Provider,
+    version: &Available,
+    root: &Path,
+    trusted: &[String],
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String, Unreachable> {
+    cancel.check()?;
+    std::fs::create_dir_all(root)
+        .map_err(|e| Unreachable::NoSource { why: format!("{}: {e}", root.display()) })?;
+    ensure_room(root)?;
+    // Its own lock rather than the install's: this writes only under `root`,
+    // and a download for the store should not stop an update from running.
+    let _lock = exclusive(
+        &root.join(".downloading"),
+        "another Cordial window is already downloading a Roblox build. Wait for it to finish.",
+    )?;
+
+    let staging = root.join(".fetching");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
+
+    let outcome = (|| {
+        let archives = source.fetch(version, cancel, &staging, progress)?;
+        verify_archives(&archives, cancel, trusted, progress)?;
+        crate::install::file_into_store(&archive_names(&archives), root, cancel).map_err(from_install)
+    })();
+
+    let _ = std::fs::remove_dir_all(&staging);
+    outcome
 }
 
 /// Obtain a build and make it the one Cordial launches.
@@ -488,56 +624,21 @@ pub fn obtain_and_install(
     cancel: &Cancel,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(Obtained, crate::install::Installed), Unreachable> {
-    // **Before any network activity.** Disk exhaustion is caught today only as
-    // a write error a few hundred megabytes in, which wastes the transfer and
-    // reports itself as an IO failure rather than as "you do not have room".
-    // This machine reached 353 MB free during a day's work, so it is not a
-    // hypothetical.
-    if let Some(free) = free_bytes(&crate::install::build_dir()) {
-        // The largest archive the mirror is permitted to serve, plus the
-        // engine that comes out of it. Deliberately generous: refusing a fetch
-        // that would have fitted is worse than starting one that might not,
-        // because the second at least fails honestly.
-        const NEEDED: u64 = 700 * 1024 * 1024;
-        if free < NEEDED {
-            return Err(Unreachable::NoSource {
-                why: format!(
-                    "there is not enough room to install a build: about {} MB free where {} MB \
-                     is needed. Nothing was downloaded.",
-                    free / 1_048_576,
-                    NEEDED / 1_048_576
-                ),
-            });
-        }
-    }
+    // **Before any network activity.**
+    ensure_room(&crate::install::build_dir())?;
 
     // **One install at a time.** ADR-012's lock covers a profile; nothing
     // covered the build directory, which every profile shares. Two clients --
     // or one client and a second window -- could reach here together, and the
     // loser would find its staging directory emptied, its archives renamed
     // underneath it, or the engine cache stamped for a build it did not
-    // install. Advisory, so it costs nothing when nobody contends.
-    let lock_path = crate::install::build_dir().join(".installing");
-    if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
-    // Non-blocking: a second attempt should say so immediately rather than
-    // queue behind a 229 MB download the user cannot see.
-    if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(Unreachable::NoSource {
-            why: "another Cordial is already installing a Roblox build. Only one install can \
-                  run at a time, because they share one build directory."
-                .into(),
-        });
-    }
-    // Held for the whole call; released when this returns, however it returns.
-    let _lock = lock;
+    // install. Held for the whole call; released when this returns, however it
+    // returns.
+    let _lock = exclusive(
+        &crate::install::build_dir().join(".installing"),
+        "another Cordial is already installing a Roblox build. Only one install can \
+         run at a time, because they share one build directory.",
+    )?;
 
     let staging = crate::install::build_dir().join(".fetching");
     let _ = std::fs::remove_dir_all(&staging);
@@ -546,15 +647,7 @@ pub fn obtain_and_install(
 
     let outcome = (|| {
         let obtained = obtain(preferred, want, cancel, &staging, progress)?;
-        let mut named: Vec<(&'static str, PathBuf)> =
-            vec![(crate::install::BASE_APK, obtained.archives.base.clone())];
-        // A monolithic archive is one file and must be named once. Handing the
-        // same path in twice would have `adopt` copy it to both names and then
-        // look for the engine in whichever it found first, which works by
-        // accident and doubles the disk it takes.
-        if obtained.archives.split != obtained.archives.base {
-            named.push((crate::install::SPLIT_APK, obtained.archives.split.clone()));
-        }
+        let named = archive_names(&obtained.archives);
 
         let installed = crate::install::adopt(
             &named,
@@ -565,16 +658,7 @@ pub fn obtain_and_install(
             cancel,
             &mut |_, _, _| {},
         )
-        .map_err(|e| match e {
-            // **Named, not folded into `NoSource`.** A cancel that reached
-            // `adopt` still has to come back as `Unreachable::Cancelled`, the
-            // one string `cordial-shell`'s button matches on to show "stopped"
-            // rather than a red failure. Before this, `adopt` had no way to
-            // hear about a cancel at all, so this arm was unreachable and the
-            // button's Stop label ran the install to completion regardless.
-            crate::install::Failed::Cancelled => Unreachable::Cancelled,
-            other => Unreachable::NoSource { why: other.to_string() },
-        })?;
+        .map_err(from_install)?;
         Ok((obtained, installed))
     })();
 
@@ -795,6 +879,31 @@ mod tests {
         // Nothing was adopted: the caller gets an error, not a half-install.
         assert!(!dir.join(".cordial-managed").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Version page's download goes through the same check, and a refusal
+    /// leaves the store with nothing in it -- not an entry, not a staging
+    /// directory. The control is `the_same_path_accepts_a_genuinely_signed_archive`,
+    /// since both paths call one `verify_archives`.
+    #[test]
+    fn a_hostile_provider_cannot_get_a_build_into_the_store_either() {
+        let root = std::env::temp_dir().join(format!("cordial-hostile-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let trusted =
+            vec!["44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477".to_string()];
+        let e = obtain_into_store_from(
+            &Hostile,
+            &Available { name: "9999.9.9".into(), code: 1 },
+            &root,
+            &trusted,
+            &Cancel::new(),
+            &mut |_| {},
+        )
+        .expect_err("an unsigned archive must never be kept");
+        assert!(matches!(e, Unreachable::Refused { .. }), "refused over its signature: {e}");
+        assert!(crate::store::list_in(&root).is_empty());
+        assert!(!root.join(".fetching").exists(), "staging is not left behind");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The control for the test above. **Without it, that test would pass even

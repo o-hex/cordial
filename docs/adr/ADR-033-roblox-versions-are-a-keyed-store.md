@@ -110,8 +110,9 @@ and the entry is recorded as incomplete instead.
 
 **A pin refuses; it never falls back.** A profile pinned to a version the store
 lacks, or holds without its APK, does not launch, and says which. The paragraph
-above promising to fetch a missing pinned version is not built: there is no
-fetch-by-version, so a missing pin is refused.
+above promising to fetch a missing pinned version is not built at launch: a
+missing pin is still refused there. Fetch-by-version exists only as the Version
+page's download, below, which the user starts.
 
 **The pin is `profiles/<name>/roblox-version`**, one line of text, checked
 against the same digits-and-dots whitelist as the directory name. Pruning
@@ -145,5 +146,24 @@ build and any pinned build cannot be removed. The launcher's profile row says
 the shell's early return for a current cache used to skip the store entirely,
 so an existing install would never have been migrated until the next update.
 
-Both open questions stand. The page offers only what the store holds, which is
-where the first one said to start.
+**Discovery goes to the network, but only from the Version page.** This
+settles the first open question, differently from where it said to start. The
+page asks APKPure for its x86-64 version list the first time it is shown, off
+the main thread, and never at startup, so the cost it warned about -- a new way
+to be slow or wrong -- is paid by a row on one page saying the list could not be
+had, not by the launcher. Versions the store already holds whole are not
+offered; the mirror's `2.738.1397` and the store's `2.738.0.1397` are compared
+as one build. A download goes through `provider::obtain_into_store`: the same
+signature check and shared-certificate rule as an update, then
+`install::file_into_store`, which files the build as a store entry and leaves
+the single-slot build and every pin alone. It takes its own lock and staging
+directory under the store root rather than the install's, so a download does
+not block an update.
+
+**A download pins itself to the profile whose page started it.** Pruning runs
+at launch as well as on install, and a freshly downloaded old build is the
+oldest unpinned entry, so without the pin it would be removed the next time
+anything launched. The page says so beside the list. The pin is written when
+the download finishes even if Settings has been closed by then.
+
+The rotation and per-launch questions stand.

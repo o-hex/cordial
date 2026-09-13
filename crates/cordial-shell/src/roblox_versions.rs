@@ -11,14 +11,18 @@
 //! version beside a Remove button, which put the same build in two places and
 //! the two things anybody does with it on different parts of the page.
 //!
-//! The page offers what the store holds and nothing else. Listing older versions
-//! from the mirror is ADR-033's open question and is deliberately not answered
-//! here: an index nobody publishes as an interface is a new way for Settings to
-//! be slow or wrong, and a list of what is on disk is honest and works offline.
+//! Below the kept builds, the versions the mirror lists for x86-64 that are not
+//! kept, each with a download. That list is asked for when this page is first
+//! shown and never at startup, so a slow or absent mirror costs a row saying so
+//! and not a slow Settings window. A download goes through the same signature
+//! check as an update and into the store beside the build in use, and becomes
+//! this profile's pin -- unpinned, it would be the oldest thing in the store and
+//! pruned on the next launch.
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use libadwaita as adw;
 use libadwaita::glib;
@@ -26,8 +30,11 @@ use libadwaita::gtk;
 use libadwaita::prelude::*;
 
 use cordial_shell::profile;
+use cordial_update::provider::{self, mirror, Available, Cancel};
 use cordial_update::store::{self, Entry};
+use cordial_update::Unreachable;
 
+use crate::download_progress::Meter;
 use crate::install;
 use crate::shell_config::ShellConfig;
 
@@ -81,10 +88,38 @@ fn subtitle(active: bool, detail: &str) -> String {
     }
 }
 
+/// The versions offered for download, minus every build the store already has
+/// whole. The two sources spell one build differently -- the mirror's
+/// `2.738.1397` is the store's `2.738.0.1397` -- so this compares builds, not
+/// strings. A build kept without its APK is still offered, because downloading
+/// it is how it becomes choosable.
+pub fn downloadable<'a>(offered: &'a [Available], kept: &[Entry]) -> Vec<&'a Available> {
+    offered
+        .iter()
+        .filter(|a| !kept.iter().any(|e| e.complete && cordial_update::version::same_build(&a.name, &e.version)))
+        .collect()
+}
+
+enum Offer {
+    NotAsked,
+    Asking,
+    Listed(Vec<Available>),
+    Failed(String),
+}
+
 struct View {
-    page: adw::PreferencesPage,
+    /// Weak, because `build_version_page` hands this page a strong reference to
+    /// the view. The other way round as well would be a cycle nothing breaks.
+    page: glib::WeakRef<adw::PreferencesPage>,
     config: Rc<RefCell<ShellConfig>>,
     groups: RefCell<Vec<adw::PreferencesGroup>>,
+    offer: RefCell<Offer>,
+    /// Kept across repopulating rather than rebuilt with the rest, because the
+    /// meter inside it is the only thing showing a download that is running.
+    downloads: adw::PreferencesGroup,
+    download_rows: gtk::ListBox,
+    meter: Rc<Meter>,
+    busy: RefCell<Option<(String, Arc<Cancel>)>>,
 }
 
 pub fn build_version_page(config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesPage {
@@ -95,9 +130,64 @@ pub fn build_version_page(config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesP
         // Checked on disk: `symbolic/actions/` in Adwaita.
         .icon_name("document-open-recent-symbolic")
         .build();
-    let view = Rc::new(View { page: page.clone(), config, groups: RefCell::new(Vec::new()) });
+
+    let downloads = adw::PreferencesGroup::builder()
+        .title("Available to download")
+        .description(
+            "Versions APKPure lists for x86-64. Each is checked against Roblox's signature before \
+             Cordial keeps it, and downloading one makes it this profile's build.",
+        )
+        .build();
+    let download_rows = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
+    download_rows.add_css_class("boxed-list");
+    downloads.add(&download_rows);
+    let meter = Meter::new();
+    meter.widget().set_margin_top(12);
+    downloads.add(meter.widget());
+
+    let view = Rc::new(View {
+        page: page.downgrade(),
+        config,
+        groups: RefCell::new(Vec::new()),
+        offer: RefCell::new(Offer::NotAsked),
+        downloads,
+        download_rows,
+        meter,
+        busy: RefCell::new(None),
+    });
     populate(&view);
+
+    // **The one strong reference to the view, and it has to exist.** Every
+    // handler on a row holds a `Weak`, so with nothing holding the view it was
+    // dropped as this function returned and `repopulate_soon` found nothing to
+    // repopulate. Held by a signal on the page, it lives exactly as long as the
+    // page does. The mirror is asked here, on first showing, rather than when
+    // Settings is built: most openings of Settings never visit this page.
+    let held = view.clone();
+    page.connect_map(move |_| ask(&held));
     page
+}
+
+/// Ask the mirror which versions exist, once, off the main thread.
+fn ask(view: &Rc<View>) {
+    if !matches!(*view.offer.borrow(), Offer::NotAsked) {
+        return;
+    }
+    *view.offer.borrow_mut() = Offer::Asking;
+    let weak = Rc::downgrade(view);
+    crate::updater::on_worker_reporting(
+        |_: &dyn Fn(())| mirror::offered().map_err(|e| e.to_string()),
+        |_| {},
+        move |outcome| {
+            if let Some(view) = weak.upgrade() {
+                *view.offer.borrow_mut() = match outcome {
+                    Ok(listed) => Offer::Listed(listed),
+                    Err(why) => Offer::Failed(why),
+                };
+                populate(&view);
+            }
+        },
+    );
 }
 
 /// Later, not now: every handler that changes the store runs inside a signal
@@ -131,8 +221,12 @@ fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
 /// this page whenever a launch or an update keys a build, and a list assembled
 /// once is wrong by the next one.
 fn populate(view: &Rc<View>) {
+    let Some(page) = view.page.upgrade() else { return };
     for group in view.groups.borrow_mut().drain(..) {
-        view.page.remove(&group);
+        page.remove(&group);
+    }
+    if view.downloads.parent().is_some() {
+        page.remove(&view.downloads);
     }
     let weak = Rc::downgrade(view);
 
@@ -251,11 +345,126 @@ fn populate(view: &Rc<View>) {
             .build();
         add_group(view, note);
     }
+
+    page.add(&view.downloads);
+    fill_downloads(view, &entries, &profile_dir);
 }
 
 fn add_group(view: &Rc<View>, group: adw::PreferencesGroup) {
-    view.page.add(&group);
+    if let Some(page) = view.page.upgrade() {
+        page.add(&group);
+    }
     view.groups.borrow_mut().push(group);
+}
+
+fn fill_downloads(view: &Rc<View>, entries: &[Entry], profile_dir: &Path) {
+    let rows = &view.download_rows;
+    while let Some(child) = rows.first_child() {
+        rows.remove(&child);
+    }
+    let weak = Rc::downgrade(view);
+
+    let offer = view.offer.borrow();
+    let listed = match &*offer {
+        Offer::NotAsked | Offer::Asking => {
+            let row = adw::ActionRow::builder().title("Asking APKPure which versions it has…").build();
+            let spinner = gtk::Spinner::new();
+            spinner.start();
+            row.add_suffix(&spinner);
+            rows.append(&row);
+            return;
+        }
+        Offer::Failed(why) => {
+            let row = adw::ActionRow::builder().title("Could not list versions to download").subtitle(why).build();
+            row.set_subtitle_lines(4);
+            let retry = icon_button("view-refresh-symbolic", "Ask again");
+            retry.connect_clicked(move |_| {
+                if let Some(view) = weak.upgrade() {
+                    *view.offer.borrow_mut() = Offer::NotAsked;
+                    ask(&view);
+                    repopulate_soon(&Rc::downgrade(&view));
+                }
+            });
+            row.add_suffix(&retry);
+            rows.append(&row);
+            return;
+        }
+        Offer::Listed(listed) => listed,
+    };
+
+    let offered = downloadable(listed, entries);
+    if offered.is_empty() {
+        let row = adw::ActionRow::builder().title("Every version APKPure lists is already kept").build();
+        rows.append(&row);
+        return;
+    }
+
+    let busy = view.busy.borrow();
+    for available in offered {
+        let row = adw::ActionRow::builder().title(format!("Roblox {}", available.name)).build();
+        match &*busy {
+            Some((name, cancel)) if *name == available.name => {
+                let stop = icon_button("process-stop-symbolic", "Stop the download");
+                let cancel = cancel.clone();
+                stop.connect_clicked(move |b| {
+                    cancel.stop();
+                    b.set_sensitive(false);
+                });
+                row.add_suffix(&stop);
+            }
+            other => {
+                let download = icon_button("folder-download-symbolic", "Download this build and use it");
+                // One at a time: they would share the store's staging directory,
+                // and the second is refused by its lock anyway.
+                download.set_sensitive(other.is_none());
+                let (available, profile_dir, weak) = (available.clone(), profile_dir.to_path_buf(), weak.clone());
+                download.connect_clicked(move |_| {
+                    if let Some(view) = weak.upgrade() {
+                        start_download(&view, available.clone(), profile_dir.clone());
+                    }
+                });
+                row.add_suffix(&download);
+            }
+        }
+        rows.append(&row);
+    }
+}
+
+fn start_download(view: &Rc<View>, version: Available, profile_dir: PathBuf) {
+    if view.busy.borrow().is_some() {
+        return;
+    }
+    let cancel = Arc::new(Cancel::new());
+    *view.busy.borrow_mut() = Some((version.name.clone(), cancel.clone()));
+    view.meter.start();
+    repopulate_soon(&Rc::downgrade(view));
+
+    let (meter, finished, weak) = (view.meter.clone(), view.meter.clone(), Rc::downgrade(view));
+    crate::updater::on_worker_reporting(
+        move |report: &dyn Fn(provider::Progress)| {
+            provider::obtain_into_store(&version, &store::root(), &cancel, &mut |p| report(p))
+        },
+        move |step| meter.step(&step),
+        move |outcome: Result<String, Unreachable>| {
+            // The pin is written whether or not the page is still open. A
+            // download that finishes after Settings closed is otherwise an
+            // unpinned old build, and the next launch prunes it.
+            match outcome {
+                Ok(version) => match profile::set_pinned_version(&profile_dir, Some(&version)) {
+                    Ok(()) => finished.finish(&version),
+                    Err(e) => finished.failed(&format!(
+                        "Roblox {version} was downloaded, but could not be made this profile's build: {e}"
+                    )),
+                },
+                Err(Unreachable::Cancelled) => finished.stopped(),
+                Err(e) => finished.failed(&e.to_string()),
+            }
+            if let Some(view) = weak.upgrade() {
+                *view.busy.borrow_mut() = None;
+                populate(&view);
+            }
+        },
+    );
 }
 
 fn show_status(status: &adw::ActionRow, title: &str, detail: &str) {
@@ -359,6 +568,21 @@ mod tests {
         assert!(removal_blocked("3.0", Some("3.0"), &pins).is_some());
         assert!(removal_blocked("2.0", Some("3.0"), &pins).is_some());
         assert_eq!(removal_blocked("1.0", Some("3.0"), &pins), None);
+    }
+
+    /// The mirror's three-component name against the store's four, for one
+    /// build. With a string comparison the kept build would be offered again.
+    #[test]
+    fn a_kept_build_is_not_offered_again_under_the_mirrors_spelling() {
+        let offered = vec![
+            Available { name: "2.738.1397".into(), code: 2 },
+            Available { name: "2.734.917".into(), code: 1 },
+            Available { name: "2.730.790".into(), code: 0 },
+        ];
+        let kept = vec![entry("2.738.0.1397", None, true), entry("2.734.0.917", None, false)];
+        let names: Vec<&str> = downloadable(&offered, &kept).iter().map(|a| a.name.as_str()).collect();
+        // 734 is kept without its APK, so downloading it is still useful.
+        assert_eq!(names, ["2.734.917", "2.730.790"]);
     }
 
     #[test]

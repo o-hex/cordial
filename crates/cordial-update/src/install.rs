@@ -629,6 +629,97 @@ pub fn adopt(
     Ok(Installed { base, carrier: carrier_live, engine: engine_live, version })
 }
 
+/// Keep a build in the store without making it the build in use.
+///
+/// The Version page's download. [`adopt`] is the wrong tool for it, because
+/// everything there replaces the live build, and somebody fetching an older
+/// Roblox to try it wants the one they launch every day left where it is. So
+/// nothing here writes outside `root`. The engine and the archives are gathered
+/// in a hidden directory and that directory is renamed to the version, so a
+/// download killed part way leaves a name `store::list_in` skips rather than an
+/// entry holding half a build.
+///
+/// `fetched` must already have passed the signature check; `provider` is the
+/// caller and does that first. An archive already under `root` -- the mirror's
+/// staging directory -- is moved, and anything else is copied, for `adopt`'s
+/// reason: a file outside Cordial's directories belongs to somebody else.
+///
+/// Returns the version read out of the engine, which is the store's key.
+pub fn file_into_store(
+    fetched: &[(&'static str, PathBuf)],
+    root: &Path,
+    cancel: &crate::provider::Cancel,
+) -> Result<String, Failed> {
+    for (_, path) in fetched {
+        apk::inspect(path, apk::Limits::default())?;
+    }
+    let mut carrier = None;
+    for (_, path) in fetched {
+        if apk::holds(path, apk::LIBRARY_IN_APK)? {
+            carrier = Some(path.clone());
+            break;
+        }
+    }
+    let Some(carrier) = carrier else {
+        return Err(Failed::NoEngine { fetched: fetched.iter().map(|(n, _)| n.to_string()).collect() });
+    };
+    if cancel.stopped() {
+        return Err(Failed::Cancelled);
+    }
+
+    let io = |path: &Path, e: std::io::Error| Failed::Io { path: path.display().to_string(), why: e.to_string() };
+    let land = |from: &Path, to: &Path| -> Result<(), Failed> {
+        if from.starts_with(root) {
+            std::fs::rename(from, to).map_err(|e| io(to, e))
+        } else {
+            std::fs::copy(from, to).map(|_| ()).map_err(|e| io(to, e))
+        }
+    };
+
+    let gathering = root.join(format!(".filing.{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&gathering);
+    std::fs::create_dir_all(&gathering).map_err(|e| io(&gathering, e))?;
+
+    let result = (|| -> Result<String, Failed> {
+        let engine = apk::extract(&carrier, apk::LIBRARY_IN_APK, &gathering)?;
+        let version = engine::version_of(&engine).filter(|v| store::is_valid_version(v)).ok_or_else(|| {
+            Failed::Io {
+                path: engine.display().to_string(),
+                why: "the engine carries no version Cordial can read, so it cannot be kept under one".into(),
+            }
+        })?;
+        if cancel.stopped() {
+            return Err(Failed::Cancelled);
+        }
+        let entry = store::entry_dir_in(root, &version).expect("checked by is_valid_version above");
+
+        // Already kept. The engine there is the same version, so only the
+        // archives an entry kept without them is missing are added.
+        if entry.join(engine::LIBRARY).is_file() {
+            for (name, path) in fetched {
+                let target = entry.join(name);
+                if !target.exists() {
+                    land(path, &target)?;
+                }
+            }
+            return Ok(version);
+        }
+
+        for (name, path) in fetched {
+            land(path, &gathering.join(name))?;
+        }
+        cache::record_version(&gathering, &version).map_err(|e| io(&gathering, e))?;
+        // A directory under the version's name with no engine in it is what a
+        // killed install leaves, and `list_in` already ignores it; it is in
+        // the way of the rename and holds nothing worth keeping.
+        let _ = std::fs::remove_dir_all(&entry);
+        std::fs::rename(&gathering, &entry).map_err(|e| io(&entry, e))?;
+        Ok(version)
+    })();
+    let _ = std::fs::remove_dir_all(&gathering);
+    result
+}
+
 /// Land every archive in `fetched` under `build`, as one unit: either all of
 /// them replace what was there, or none do.
 ///
@@ -961,6 +1052,41 @@ mod tests {
         assert!(build.join(SPLIT_APK).is_file());
         assert!(!build.join(STAGING).exists(), "staging is not left behind");
         assert!(!engine_into.join(STAGING).exists());
+    }
+
+    /// The Version page's download, with the build in use as the control: it
+    /// comes out byte for byte as it went in, and the new entry is whole.
+    #[test]
+    fn filing_a_build_keeps_it_beside_the_one_in_use_and_touches_nothing_else() {
+        let dir = scratch("file-into-store");
+        let root = dir.join("builds");
+        let staging = root.join(".fetching");
+        std::fs::create_dir_all(&staging).unwrap();
+        let in_use = root.join("2.738.0.1397");
+        std::fs::create_dir_all(&in_use).unwrap();
+        std::fs::write(in_use.join(engine::LIBRARY), b"the build in use").unwrap();
+
+        let base = staging.join("candidate-0.apk");
+        let engine = engine_bytes("2.730.0.790");
+        std::fs::write(
+            &base,
+            zip_of(&[("assets/x.json", b"{}" as &[u8]), (apk::LIBRARY_IN_APK, engine.as_slice())]),
+        )
+        .unwrap();
+
+        let version = file_into_store(&[(BASE_APK, base.clone())], &root, &no_cancel()).expect("filed");
+        assert_eq!(version, "2.730.0.790");
+        let entries = store::list_in(&root);
+        let names: Vec<&str> = entries.iter().map(|e| e.version.as_str()).collect();
+        assert_eq!(names, ["2.738.0.1397", "2.730.0.790"]);
+        assert!(entries[1].complete, "kept with its APK, so it can be chosen");
+        assert_eq!(std::fs::read(in_use.join(engine::LIBRARY)).unwrap(), b"the build in use");
+        assert!(!base.exists(), "moved out of staging rather than copied");
+        let stray = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(".filing"));
+        assert!(!stray, "the gathering directory is not left behind");
     }
 
     /// The store, end to end and with a control: install one build, install a

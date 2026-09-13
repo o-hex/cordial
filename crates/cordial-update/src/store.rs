@@ -456,9 +456,50 @@ pub fn prune_in(root: &Path, keep: usize, protect: &[String]) -> Vec<String> {
     removed
 }
 
+/// Remove one entry because somebody asked to, from the Version page.
+///
+/// Refuses the current entry and anything in `protect` for the same reason
+/// [`prune_in`] never takes them: the first leaves the slot a dangling link and
+/// nothing to launch, the second turns a profile's pin into a launch failure in
+/// a profile nobody touched. Removing an entry only drops its names for the
+/// archives, so an APK that was linked from Sober's directory stays there.
+pub fn remove_in(root: &Path, live: &Path, version: &str, protect: &[String]) -> Result<(), String> {
+    let Some(dir) = entry_dir_in(root, version) else {
+        return Err(format!("{version:?} is not a Roblox version"));
+    };
+    if current_in(root, live).as_deref() == Some(version) {
+        return Err(format!("Roblox {version} is the current build, and removing it would leave nothing to launch."));
+    }
+    if protect.iter().any(|p| p == version) {
+        return Err(format!("A profile is pinned to Roblox {version}. Clear that pin first."));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_refuses_the_current_build_and_a_pinned_one_and_takes_the_rest() {
+        let scratch = Scratch::new("remove");
+        let root = scratch.path().join(BUILDS);
+        for v in ["1.0", "2.0", "3.0"] {
+            std::fs::create_dir_all(root.join(v)).unwrap();
+            std::fs::write(root.join(v).join(crate::engine::LIBRARY), v).unwrap();
+        }
+        let live = scratch.path().join("lib").join("x86_64");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        point_current_at(&live, &root.join("3.0")).unwrap();
+        let pins = vec!["2.0".to_string()];
+
+        assert!(remove_in(&root, &live, "3.0", &pins).is_err(), "the current build");
+        assert!(remove_in(&root, &live, "2.0", &pins).is_err(), "a pinned build");
+        assert!(remove_in(&root, &live, "../lib", &pins).is_err(), "not a version");
+        remove_in(&root, &live, "1.0", &pins).unwrap();
+        let left: Vec<String> = list_in(&root).into_iter().map(|e| e.version).collect();
+        assert_eq!(left, ["3.0", "2.0"]);
+    }
 
     /// A scratch directory that deletes itself, so these tests need no
     /// dependency the workspace does not already have.

@@ -319,6 +319,16 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
             apk.display()
         );
     } else if cache.join(LIBRARY).is_file() {
+        // Keyed here as well, or an install that is already up to date never
+        // reaches the store: this branch is every launch after the first, and
+        // the extraction below -- the only other place that keys -- runs only
+        // when Roblox changes. A no-op once the cache is a link.
+        let split = apk.parent().map(|d| d.join(format!("split_config.{}.apk", cordial_update::apk::HOST_ABI)));
+        let mut archives: Vec<&Path> = vec![apk.as_path()];
+        if let Some(split) = split.as_deref().filter(|s| s.is_file()) {
+            archives.push(split);
+        }
+        key_into_store(&cordial_update::store::root(), &cache, &archives);
         return Ok(Build { apk, lib_dir: cache });
     }
 
@@ -400,38 +410,44 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
             // stays the same path either way; after this it reads through a
             // link. Pruning protects every profile's pin, which is why it is
             // asked for here rather than assumed empty.
-            match cordial_update::store::adopt_current(&store_root, &cache) {
-                Ok(Some(keyed)) => {
-                    // The archives too, so the entry is a build and not half of
-                    // one. These are the user's own files -- Sober's, usually
-                    // -- and hard-linking them costs no disk and takes nothing
-                    // away from whoever else is using them. A link cannot be
-                    // made across a filesystem boundary, and
-                    // `store::keep_archives` says so rather than copying 230 MB
-                    // onto somebody's launch without asking.
-                    let entry = store_root.join(&keyed);
-                    let mut archives: Vec<&Path> = vec![apk.as_path()];
-                    if from != apk {
-                        archives.push(from.as_path());
-                    }
-                    for trouble in cordial_update::store::keep_archives(&entry, &archives) {
-                        println!("  shell: {keyed} is kept without its archives: {trouble}");
-                    }
-                    let dropped = cordial_update::store::prune_in(
-                        &store_root,
-                        cordial_update::store::KEEP,
-                        &cordial_shell::profile::all_pinned_versions(),
-                    );
-                    if !dropped.is_empty() {
-                        println!("  shell: removed older builds: {}", dropped.join(", "));
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => println!("  shell: extracted {LIBRARY} but could not key it: {e}"),
+            let mut archives: Vec<&Path> = vec![apk.as_path()];
+            if from != apk {
+                archives.push(from.as_path());
             }
+            key_into_store(&store_root, &cache, &archives);
             Ok(Build { apk, lib_dir: cache })
         }
         Err(e) => Err(NotFound::Unusable(e)),
+    }
+}
+
+/// Move a cache with a recorded version into the keyed store (ADR-033), keep
+/// the archives it came from beside it, and prune.
+///
+/// The archives are the user's own files -- Sober's, usually -- and
+/// hard-linking them costs no disk and takes nothing away from whoever else is
+/// using them. A link cannot be made across a filesystem boundary, and
+/// `store::keep_archives` says so rather than copying 230 MB onto somebody's
+/// launch without asking. Pruning protects every profile's pin.
+fn key_into_store(store_root: &Path, cache: &Path, archives: &[&Path]) {
+    match cordial_update::store::adopt_current(store_root, cache) {
+        Ok(Some(keyed)) => {
+            println!("  shell: kept {} as Roblox {keyed}", cache.display());
+            let entry = store_root.join(&keyed);
+            for trouble in cordial_update::store::keep_archives(&entry, archives) {
+                println!("  shell: {keyed} is kept without its archives: {trouble}");
+            }
+            let dropped = cordial_update::store::prune_in(
+                store_root,
+                cordial_update::store::KEEP,
+                &cordial_shell::profile::all_pinned_versions(),
+            );
+            if !dropped.is_empty() {
+                println!("  shell: removed older builds: {}", dropped.join(", "));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => println!("  shell: could not key {} into the store: {e}", cache.display()),
     }
 }
 

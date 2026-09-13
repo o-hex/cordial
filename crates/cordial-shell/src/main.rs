@@ -27,6 +27,7 @@ mod instructions;
 mod launch;
 mod profile_switcher;
 mod refresh_watch;
+mod roblox_versions;
 mod root_warning;
 mod settings;
 mod shell_config;

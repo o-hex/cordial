@@ -232,7 +232,20 @@ impl Switcher {
         // lock, so asking whether a not-yet-created profile is free would create
         // it — a launcher conjuring an account out of drawing its own subtitle.
         let availability = offered().iter().any(|n| *n == name).then(|| availability(&name));
-        self.row.set_subtitle(&subtitle(&name, availability.as_ref()));
+        let pin = profile::dir(&name).ok().and_then(|d| profile::pinned_version(&d));
+        self.row.set_subtitle(&with_pin(subtitle(&name, availability.as_ref()), pin.as_deref()));
+    }
+}
+
+/// ADR-033 says a pinned profile "says so in the launcher", and this row is the
+/// launcher's only line about the profile. A pin is the one setting that stops
+/// Roblox updates reaching somebody, so it is shown even in the ordinary case
+/// that otherwise says nothing.
+fn with_pin(base: String, pin: Option<&str>) -> String {
+    match (pin, base.is_empty()) {
+        (None, _) => base,
+        (Some(v), true) => format!("Pinned to Roblox {v}"),
+        (Some(v), false) => format!("{base}. Pinned to Roblox {v}"),
     }
 }
 
@@ -249,6 +262,9 @@ impl Switcher {
 pub struct Chooser {
     pub group: adw::PreferencesGroup,
     pub row: adw::ComboRow,
+    /// Re-read what the row says. Settings can pin the profile shown here, and
+    /// nothing else would tell this row until the profile was switched.
+    pub refresh: Rc<dyn Fn()>,
 }
 
 pub fn build(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> Chooser {
@@ -305,7 +321,8 @@ pub fn build(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> Choo
     group.add(&row);
     let returned_row = row.clone();
 
-    Chooser { group, row: returned_row }
+    let refresh: Rc<dyn Fn()> = Rc::new(move || switcher.describe());
+    Chooser { group, row: returned_row, refresh }
 }
 
 /// How one profile is drawn inside the dropdown.
@@ -576,6 +593,16 @@ mod tests {
                 "{name} is offered by the list but refused by the create dialog"
             );
         }
+    }
+
+    #[test]
+    fn a_pin_is_said_even_where_the_row_would_otherwise_say_nothing() {
+        assert_eq!(with_pin(String::new(), None), "");
+        assert_eq!(with_pin(String::new(), Some("2.738.0.1397")), "Pinned to Roblox 2.738.0.1397");
+        assert_eq!(
+            with_pin("Opened in another window".into(), Some("2.738.0.1397")),
+            "Opened in another window. Pinned to Roblox 2.738.0.1397"
+        );
     }
 
     #[test]

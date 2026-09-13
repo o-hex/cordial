@@ -279,6 +279,7 @@ pub fn build(
     let switcher = profile_switcher::build(config.clone(), config_path.clone());
     let profile_row = switcher.group.clone();
     let profile_combo = switcher.row.clone();
+    let refresh_profile_row = switcher.refresh.clone();
 
     // Two controls, centred, and the empty space around them is the point.
     //
@@ -445,6 +446,9 @@ pub fn build(
         if let Some(name) = page.and_then(|p| p.str()).filter(|n| !n.is_empty()) {
             settings.set_visible_page_name(name);
         }
+        // The Version page can pin the profile the launcher row describes.
+        let refresh = refresh_profile_row.clone();
+        settings.connect_closed(move |_| refresh());
         // **Make room for it first, if this window has not got any.**
         //
         // Raising [`DEFAULT_WIDTH`] fixes the cramped dialog for a profile that
@@ -864,7 +868,7 @@ fn persist_window_size(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) 
 /// **`settings=<page>` opens Settings on a named page**, which is the same
 /// problem one level down: the window has five tabs and a photograph of it shows
 /// one. The names are the `name` each `AdwPreferencesPage` is built with —
-/// `roblox`, `updates`, `appearance`, `general`, `plugins` — and an unknown one
+/// `roblox`, `updates`, `version`, `general`, `plugins`, `report` — and an unknown one
 /// is libadwaita's warning to answer, not this function's, because a name that
 /// silently fell back to the first page would produce a screenshot captioned as
 /// something it is not.

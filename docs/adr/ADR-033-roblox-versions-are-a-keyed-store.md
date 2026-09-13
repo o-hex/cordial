@@ -132,6 +132,18 @@ the Cordial version. Nothing reads it yet.
 nothing and the extracted `libroblox.so` returns `2.738.0.1397` (INFERRED: the
 library is stored compressed in the archive). It scans the engine now.
 
-**Not built:** the picker. There is no way to set a pin except writing the file,
-the launcher does not show a pin, and the minimum-version warning above has
-nowhere to appear yet. Both open questions stand.
+**The picker is Settings → Version.** One row per build the store holds, plus
+"Follow the current build", each with a tick on the one the profile uses, a play
+button and a remove button. Clicking a row pins it; play pins it and launches.
+Play writes the pin rather than overriding one launch, so the question below
+about per-launch pins is still open. A build kept without its APK is listed and
+cannot be chosen. The minimum-version warning sits above the list. The current
+build and any pinned build cannot be removed. The launcher's profile row says
+"Pinned to Roblox X".
+
+**An up-to-date install is keyed on launch**, not only when Roblox changes:
+the shell's early return for a current cache used to skip the store entirely,
+so an existing install would never have been migrated until the next update.
+
+Both open questions stand. The page offers only what the store holds, which is
+where the first one said to start.

@@ -8,7 +8,7 @@
 //! graphics preference to be usable, without a terminal.
 //!
 //! `AdwPreferencesDialog` with several `AdwPreferencesPage`s — Roblox, Updates,
-//! General, Plugins, Report — each becomes its own tab/sidebar entry for free;
+//! Version, General, Plugins, FastFlags, Report — each becomes its own tab/sidebar entry for free;
 //! that is libadwaita's own page-switcher, not something built here. Appearance
 //! used to be its own page; its two groups live inside General now, and
 //! `build_preferences_window`'s own comment explains why.
@@ -2825,6 +2825,9 @@ pub fn build_preferences_window(
     window.add(&build_roblox_page(parent, config.clone(), config_path.clone()));
     // Second, next to the page about the build it is about.
     window.add(&crate::updater::build_update_page(config.clone(), config_path.clone()));
+    // Beside Updates, because the question it answers -- which build, and can I
+    // go back -- is the one somebody an update just broke arrives with.
+    window.add(&crate::roblox_versions::build_version_page(config.clone()));
     // **Five pages where there were seven**, reported as "why are there so many
     // tabs". Appearance held two groups and Get Plugins three; neither was a
     // destination, and a tab per group makes somebody hunt through seven pages

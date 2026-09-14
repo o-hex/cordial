@@ -101,6 +101,8 @@ env:
                                      CORDIAL_MONITOR
   CORDIAL_FULLSCREEN=1               cover the chosen monitor and ask the
                                      window manager for fullscreen
+  CORDIAL_COMPOSITOR_BYPASS=1        X11: set _NET_WM_BYPASS_COMPOSITOR
+                                     while fullscreen (off by default)
   CORDIAL_RESOLUTION=<w>x<h>         render resolution (default 1280x720);
                                      CORDIAL_FULLSCREEN overrides it
   CORDIAL_DPI_SCALE=<f>              UI density Roblox lays out against.

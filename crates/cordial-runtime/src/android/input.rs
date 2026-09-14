@@ -134,6 +134,61 @@ pub fn keysym_to_android(keysym: c_ulong) -> Option<i32> {
     })
 }
 
+/// The character an X keysym names, for the text `XLookupString` cannot give.
+///
+/// Xlib's lookup only produces Latin-1, so on a Cyrillic layout it returns no
+/// bytes and the letter never reached a TextBox. Two ranges are arithmetic
+/// (Unicode keysyms and Latin-1); everything else asks libxkbcommon, which
+/// shares X11's keysym numbering -- and therefore covers every layout X11 can
+/// name, not a list of scripts maintained here. It is `dlopen`ed rather than
+/// linked so this crate takes no build-time dependency; every binary that can
+/// start Cordial already links `libxkbcommon.so.0` through GTK, so in practice
+/// the lookup is always there.
+///
+/// **A hand-written Cyrillic table used to sit at the end of this file as a
+/// fallback, and it was wrong twice over.** It was unreachable -- the only host
+/// it claimed to serve is one with no libxkbcommon, which is not a host that
+/// got as far as running this code -- and it privileged one script, so that
+/// same imagined host would still have typed nothing in Greek, Hebrew or
+/// Arabic. Locale coverage belongs in the keysym library, not in a map kept
+/// up to date by hand.
+pub fn keysym_to_char(keysym: c_ulong) -> Option<char> {
+    let k = keysym as u32;
+    if (0x01000100..=0x0110ffff).contains(&k) {
+        return char::from_u32(k - 0x01000000);
+    }
+    if (0x0020..=0x007e).contains(&k) || (0x00a0..=0x00ff).contains(&k) {
+        return char::from_u32(k);
+    }
+    static FN: std::sync::OnceLock<Option<unsafe extern "C" fn(u32) -> u32>> = std::sync::OnceLock::new();
+    let f = FN.get_or_init(|| {
+        extern "C" {
+            fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
+            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        }
+        unsafe {
+            let lib = dlopen(b"libxkbcommon.so.0\0".as_ptr() as *const std::ffi::c_char, 2);
+            if lib.is_null() {
+                None
+            } else {
+                let p = dlsym(lib, b"xkb_keysym_to_utf32\0".as_ptr() as *const std::ffi::c_char);
+                if p.is_null() {
+                    None
+                } else {
+                    Some(std::mem::transmute(p))
+                }
+            }
+        }
+    });
+    if let Some(to_utf32) = f {
+        let cp = unsafe { to_utf32(k) };
+        if cp != 0 {
+            return char::from_u32(cp);
+        }
+    }
+    None
+}
+
 /// Say that a native the input path wanted is not there — at the first drop,
 /// and then at each power of ten.
 ///
@@ -3226,4 +3281,30 @@ mod tests {
         assert!(!evdev_is_text_key(28), "enter");
         assert!(!evdev_is_text_key(15), "tab");
     }
+
+    #[test]
+    fn keysym_to_char_is_not_limited_to_one_script() {
+        // The two arithmetic ranges, which this file resolves itself.
+        assert_eq!(super::keysym_to_char(0x0061), Some('a')); // Latin-1
+        assert_eq!(super::keysym_to_char(0x01000430), Some('а')); // Unicode keysym
+        // Cyrillic is what was reported broken, so it is pinned by value.
+        assert_eq!(super::keysym_to_char(0x06a4), Some('є'));
+        assert_eq!(super::keysym_to_char(0x06ad), Some('ґ'));
+        assert_eq!(super::keysym_to_char(0x06c1), Some('а'));
+        assert_eq!(super::keysym_to_char(0x06e1), Some('А'));
+        // The rest are the point of asking the library rather than shipping a
+        // table: a Cyrillic-only map answered `None` for every one of these,
+        // on exactly the host it claimed to serve. Asserted as "resolves at
+        // all" rather than by codepoint, so the test states the property that
+        // matters without turning into a second hand-maintained map.
+        for (keysym, script) in
+            [(0x07e1u64, "Greek"), (0x0ce0, "Hebrew"), (0x05c7, "Arabic"), (0x0aa1, "typographic")]
+        {
+            assert!(
+                super::keysym_to_char(keysym as std::ffi::c_ulong).is_some(),
+                "{script} keysym {keysym:#x} resolved to nothing"
+            );
+        }
+    }
+
 }

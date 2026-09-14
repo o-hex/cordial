@@ -240,6 +240,7 @@ cargo run --release --bin cordial-run -- \
 | `CORDIAL_RESOLUTION=<w>x<h>` | render resolution, default 1280x720 |
 | `CORDIAL_DPI_SCALE=<f>` | UI density Roblox lays out against; 1.0 is a low-density phone |
 | `CORDIAL_NO_POINTER_LOCK=1` | never capture the cursor at all |
+| `CORDIAL_COMPOSITOR_BYPASS=1` | X11 only: set `_NET_WM_BYPASS_COMPOSITOR` while fullscreen, a hint an Xorg compositor may use to unredirect the window; off by default and unmeasured |
 | `CORDIAL_PRESENT_MODE=<m>` | frame pacing: `mailbox` (default), `fifo`, `immediate`, `uncapped`, `off` — Settings has a row for this |
 | `CORDIAL_GAMEPAD_TYPE=<n>` | which controller brand Roblox draws glyphs for — see [`docs/controllers.md`](docs/controllers.md) |
 | `CORDIAL_ANDROID_TRACE=1` | log Android API calls |

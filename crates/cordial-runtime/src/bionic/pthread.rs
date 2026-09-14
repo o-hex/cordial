@@ -36,7 +36,7 @@
 //! that introduced this module recorded the overrun as one of three ABI
 //! divergences found, and the measurement above says there was no overrun to
 //! find. The wrapper stays for now: it is harmless either way, since it only
-//! ever writes the first 16 bytes of the caller's object, and taking it out
+//! ever writes the first 12 bytes of the caller's object, and taking it out
 //! changes what runs at every `pthread_cond_wait` in the engine — a behaviour
 //! change that wants its own measurement rather than a free ride on this one.
 //!
@@ -45,29 +45,36 @@
 //! condition variable can reach `wait` without `init` ever being called.
 
 use std::ffi::{c_int, c_uint, c_void};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Marks a wrapper whose backing object exists. Arbitrary, but distinctive in a
 /// memory dump and impossible to reach by zero-initialisation.
-const READY: u64 = 0xC0D1A1_C0FFEE;
+const READY: u32 = 0xC0D1_A1FF;
 
-const UNINIT: u64 = 0;
-const INITIALISING: u64 = 1;
+const UNINIT: u32 = 0;
+const INITIALISING: u32 = 1;
 
-/// An overlay on the first 32 bytes of bionic's 48-byte `pthread_cond_t`. The
-/// remaining 16 are never touched; only `state` and `real` are ours.
+/// An overlay on all 48 bytes of bionic's `pthread_cond_t`, which is
+/// `int32_t __private[12]` and so only promises four-byte alignment. Only the
+/// first 12 bytes -- `state` and the pointer split across `real_lo` and
+/// `real_hi` -- are ours; the reserved words are never touched. The fields are
+/// `u32` rather than `u64`/`usize` because reading an eight-byte atomic out of
+/// four-byte-aligned storage is undefined behaviour.
 #[repr(C)]
 struct BionicCond {
-    state: AtomicU64,
-    real: AtomicUsize,
-    _reserved: [u64; 2],
+    state: AtomicU32,
+    real_lo: AtomicU32,
+    real_hi: AtomicU32,
+    _reserved: [u32; 9],
 }
 
 /// bionic's `sem_t`: `unsigned int count; int __reserved[3];`
 #[repr(C)]
 struct BionicSem {
-    state: AtomicU64,
-    real: AtomicUsize,
+    state: AtomicU32,
+    real_lo: AtomicU32,
+    real_hi: AtomicU32,
+    _reserved: u32,
 }
 
 // glibc's implementations. These resolve to the host's libc at link time; our
@@ -106,10 +113,12 @@ unsafe fn free_backing(ptr: *mut c_void) {
 ///
 /// `init` is called exactly once, with the freshly allocated backing store.
 ///
-/// SAFETY: `state` and `real` must belong to the same live wrapper object.
+/// SAFETY: `state`, `real_lo` and `real_hi` must belong to the same live
+/// wrapper object.
 unsafe fn resolve(
-    state: &AtomicU64,
-    real: &AtomicUsize,
+    state: &AtomicU32,
+    real_lo: &AtomicU32,
+    real_hi: &AtomicU32,
     init: impl FnOnce(*mut c_void),
 ) -> *mut c_void {
     loop {
@@ -117,11 +126,17 @@ unsafe fn resolve(
             Ok(_) => {
                 let backing = alloc_backing();
                 init(backing);
-                real.store(backing as usize, Ordering::Release);
+                let address = backing as usize as u64;
+                real_lo.store(address as u32, Ordering::Relaxed);
+                real_hi.store((address >> 32) as u32, Ordering::Relaxed);
                 state.store(READY, Ordering::Release);
                 return backing;
             }
-            Err(READY) => return real.load(Ordering::Acquire) as *mut c_void,
+            Err(READY) => {
+                let address = (real_lo.load(Ordering::Relaxed) as u64)
+                    | ((real_hi.load(Ordering::Relaxed) as u64) << 32);
+                return address as usize as *mut c_void;
+            }
             Err(INITIALISING) => {
                 // Another thread is between allocation and publication. This
                 // window is a handful of instructions.
@@ -143,14 +158,14 @@ pub extern "C" fn cond_init(cond: *mut c_void, attr: *const c_void) -> c_int {
     if cond.is_null() {
         return libc_einval();
     }
-    // SAFETY: bionic's contract is a pointer to a 32-byte pthread_cond_t.
+    // SAFETY: bionic's contract is a pointer to a 48-byte pthread_cond_t.
     let c = unsafe { &mut *(cond as *mut BionicCond) };
     // An explicit init on an object we already wrapped replaces it, matching
     // glibc's "undefined behaviour, but do something sane" posture.
-    unsafe { destroy_backing(&c.state, &c.real, pthread_cond_destroy) };
+    unsafe { destroy_backing(&c.state, &c.real_lo, &c.real_hi, pthread_cond_destroy) };
     c.state.store(UNINIT, Ordering::Release);
     let backing = unsafe {
-        resolve(&c.state, &c.real, |p| {
+        resolve(&c.state, &c.real_lo, &c.real_hi, |p| {
             pthread_cond_init(p, attr);
         })
     };
@@ -167,20 +182,23 @@ pub extern "C" fn cond_destroy(cond: *mut c_void) -> c_int {
     }
     // SAFETY: as above.
     let c = unsafe { &mut *(cond as *mut BionicCond) };
-    unsafe { destroy_backing(&c.state, &c.real, pthread_cond_destroy) };
+    unsafe { destroy_backing(&c.state, &c.real_lo, &c.real_hi, pthread_cond_destroy) };
     0
 }
 
 /// Tear down and free a wrapper's backing object, if it has one.
 ///
-/// SAFETY: `state`/`real` must belong to the same live wrapper.
+/// SAFETY: `state`/`real_lo`/`real_hi` must belong to the same live wrapper.
 unsafe fn destroy_backing(
-    state: &AtomicU64,
-    real: &AtomicUsize,
+    state: &AtomicU32,
+    real_lo: &AtomicU32,
+    real_hi: &AtomicU32,
     destroy: unsafe extern "C" fn(*mut c_void) -> c_int,
 ) {
     if state.swap(UNINIT, Ordering::AcqRel) == READY {
-        let p = real.swap(0, Ordering::AcqRel) as *mut c_void;
+        let low = real_lo.swap(0, Ordering::AcqRel) as u64;
+        let high = real_hi.swap(0, Ordering::Acquire) as u64;
+        let p = (low | (high << 32)) as usize as *mut c_void;
         if !p.is_null() {
             destroy(p);
             free_backing(p);
@@ -194,10 +212,10 @@ macro_rules! cond_op {
             if cond.is_null() {
                 return libc_einval();
             }
-            // SAFETY: bionic's contract is a pointer to a 32-byte pthread_cond_t.
+            // SAFETY: bionic's contract is a pointer to a 48-byte pthread_cond_t.
             let c = unsafe { &mut *(cond as *mut BionicCond) };
             let backing = unsafe {
-                resolve(&c.state, &c.real, |p| {
+                resolve(&c.state, &c.real_lo, &c.real_hi, |p| {
                     pthread_cond_init(p, std::ptr::null());
                 })
             };
@@ -237,10 +255,10 @@ fn cond_backing(cond: *mut c_void) -> Option<*mut c_void> {
     if cond.is_null() {
         return None;
     }
-    // SAFETY: bionic's contract is a pointer to a 32-byte pthread_cond_t.
+    // SAFETY: bionic's contract is a pointer to a 48-byte pthread_cond_t.
     let c = unsafe { &mut *(cond as *mut BionicCond) };
     let backing = unsafe {
-        resolve(&c.state, &c.real, |p| {
+        resolve(&c.state, &c.real_lo, &c.real_hi, |p| {
             pthread_cond_init(p, std::ptr::null());
         })
     };
@@ -255,10 +273,10 @@ pub extern "C" fn semaphore_init(sem: *mut c_void, pshared: c_int, value: u32) -
     }
     // SAFETY: bionic's contract is a pointer to a 16-byte sem_t.
     let s = unsafe { &mut *(sem as *mut BionicSem) };
-    unsafe { destroy_backing(&s.state, &s.real, sem_destroy) };
+    unsafe { destroy_backing(&s.state, &s.real_lo, &s.real_hi, sem_destroy) };
     s.state.store(UNINIT, Ordering::Release);
     let backing = unsafe {
-        resolve(&s.state, &s.real, |p| {
+        resolve(&s.state, &s.real_lo, &s.real_hi, |p| {
             sem_init(p, pshared, value);
         })
     };
@@ -275,7 +293,7 @@ pub extern "C" fn semaphore_destroy(sem: *mut c_void) -> c_int {
     }
     // SAFETY: as above.
     let s = unsafe { &mut *(sem as *mut BionicSem) };
-    unsafe { destroy_backing(&s.state, &s.real, sem_destroy) };
+    unsafe { destroy_backing(&s.state, &s.real_lo, &s.real_hi, sem_destroy) };
     0
 }
 
@@ -291,7 +309,7 @@ macro_rules! sem_op {
             // so reaching here uninitialised means sem_init was skipped. Create
             // a zero-count semaphore rather than crashing.
             let backing = unsafe {
-                resolve(&s.state, &s.real, |p| {
+                resolve(&s.state, &s.real_lo, &s.real_hi, |p| {
                     sem_init(p, 0, 0);
                 })
             };
@@ -454,7 +472,7 @@ mod tests {
         // A wrapper is an overlay on storage the caller allocated to bionic's
         // size, so it must never be larger than bionic's type. `sem_t` is 16
         // and the overlay uses all of it; `pthread_cond_t` is 48 and the
-        // overlay uses the first 32.
+        // overlay spans all 48, of which it reads and writes the first 12.
         assert!(std::mem::size_of::<BionicCond>() <= 48);
         assert_eq!(std::mem::size_of::<BionicSem>(), 16);
     }
@@ -463,10 +481,12 @@ mod tests {
     fn statically_initialised_cond_works() {
         // bionic's PTHREAD_COND_INITIALIZER is all zeroes; signalling one that
         // was never explicitly initialised must still work.
-        // u64, not u8: the wrapper's first field is an AtomicU64, so byte
-        // storage is under-aligned and the cast is UB. Real conds come from the
-        // engine's own allocations and are always aligned.
-        let mut storage = [0u64; 4];
+        // u64 storage is more aligned than the bionic object requires. The
+        // wrapper itself uses only four-byte atomics because bionic condition
+        // variables are allowed to start at four-byte alignment. Six words, not
+        // four: the overlay is 48 bytes, and a reference to it over 32 bytes of
+        // storage is undefined behaviour even though only 12 are touched.
+        let mut storage = [0u64; 6];
         let cond = storage.as_mut_ptr() as *mut c_void;
         assert_eq!(cond_signal(cond), 0);
         assert_eq!(cond_broadcast(cond), 0);
@@ -475,7 +495,7 @@ mod tests {
 
     #[test]
     fn init_destroy_roundtrip_does_not_leak_state() {
-        let mut storage = [0u64; 4];
+        let mut storage = [0u64; 6];
         let cond = storage.as_mut_ptr() as *mut c_void;
         assert_eq!(cond_init(cond, std::ptr::null()), 0);
         assert_eq!(cond_destroy(cond), 0);
@@ -486,7 +506,7 @@ mod tests {
 
     #[test]
     fn once_runs_the_initialiser_exactly_once() {
-        static RUNS: AtomicU64 = AtomicU64::new(0);
+        static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         extern "C" fn init() {
             RUNS.fetch_add(1, Ordering::SeqCst);
         }

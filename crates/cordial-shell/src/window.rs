@@ -1126,14 +1126,22 @@ fn try_launch(
         // `ExitStatusExt::from_raw` takes, so signal deaths keep their signal
         // and `crash::is_crash` sees the same value `try_wait` used to give it.
         let status = std::process::ExitStatus::from_raw(wait_status);
+        // The child watch and the two pipe readers are independent sources, so
+        // the reaped status can arrive before the reader thread has recorded
+        // Xlib's last line. `is_crash` needs that line to tell a display
+        // shutdown from a real exit 1; a short grace here costs one 50 ms
+        // stall on the main loop per client exit. If it is still too short
+        // the result is main's behaviour, a crash page, not a missed crash.
+        std::thread::sleep(Duration::from_millis(50));
+        let output = instance.recent_output();
         // Narrated either way, and deliberately without the client's output in
         // it: this line is how somebody reading a terminal learns which of the
         // two paths was taken, and the output belongs on the page and nowhere
         // else. `println!` here would be a second sink for text `launch.rs`
         // took care to keep in memory.
-        if crash::is_crash(&status) {
+        if crash::is_crash(&status, &output) {
             println!("  shell: the client {status}; showing the crash page");
-            crash::present(&window, &status, &instance.command_line, &instance.recent_output());
+            crash::present(&window, &status, &instance.command_line, &output);
         } else {
             println!("  shell: the client exited cleanly ({status}); no crash page");
         }

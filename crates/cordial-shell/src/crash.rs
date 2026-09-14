@@ -61,9 +61,31 @@ use libadwaita::prelude::*;
 /// case this page most needs to catch: a `SIGSEGV` in the engine is the crash
 /// nobody currently gets told about.
 ///
-/// Kept as a function of the status alone, so it is testable without a process.
-pub fn is_crash(status: &std::process::ExitStatus) -> bool {
-    !status.success()
+/// An X11 connection loss is a shutdown caused by the display server, not an
+/// engine crash. Xlib has two messages for this depending on where the
+/// connection is noticed: `XIO: fatal IO error` or `X connection to :1 broken
+/// (explicit kill or server shutdown).` Both leave status 1. Treating every
+/// non-zero status as a crash made the launcher show an alarming page for that
+/// ordinary external teardown.
+pub fn is_crash(status: &std::process::ExitStatus, output: &str) -> bool {
+    if status.success() {
+        return false;
+    }
+
+    // A signal is never a clean X11 teardown. The display may print a
+    // connection-loss line while the process is already dying, but SIGSEGV,
+    // SIGABRT and friends still describe a real process failure.
+    if status.code().is_none() {
+        return true;
+    }
+
+    // The exact spacing in Xlib's `XIO` line varies between versions, while
+    // the connection-loss wording is stable. Keep this as a marker check
+    // rather than special-casing exit code 1: a loader failure also returns 1
+    // and must still reach the crash page.
+    let display_shutdown = (output.contains("XIO:") && output.contains("fatal IO error"))
+        || (output.contains("X connection to ") && output.contains(" broken"));
+    !display_shutdown
 }
 
 /// How the exit is described in one line, without making the user read it as a
@@ -222,7 +244,7 @@ mod tests {
     fn a_clean_exit_is_not_a_crash() {
         // The requirement that keeps this page out of the way of ordinary use:
         // closing Roblox, or `--run` expiring, must not raise an error window.
-        assert!(!is_crash(&ExitStatus::from_raw(0)));
+        assert!(!is_crash(&ExitStatus::from_raw(0), ""));
     }
 
     #[test]
@@ -230,7 +252,7 @@ mod tests {
         // `wait`-style encoding: the low byte is the signal, the next is the
         // code. 1 << 8 is "exited with 1".
         let status = ExitStatus::from_raw(1 << 8);
-        assert!(is_crash(&status));
+        assert!(is_crash(&status, ""));
         assert!(describe(&status).contains("exit code 1"), "{}", describe(&status));
     }
 
@@ -242,9 +264,36 @@ mod tests {
         // become under a careless `unwrap_or_default` -- would describe a crash
         // as a clean shutdown.
         let status = ExitStatus::from_raw(11); // SIGSEGV, no core flag
-        assert!(is_crash(&status));
+        assert!(is_crash(&status, ""));
         let line = describe(&status);
         assert!(!line.contains("exit code"), "{line}");
         assert!(line.contains("stopped by the system"), "{line}");
+    }
+
+    #[test]
+    fn an_x11_connection_loss_is_not_an_engine_crash() {
+        let status = ExitStatus::from_raw(1 << 8);
+        assert!(!is_crash(
+            &status,
+            "XIO:  fatal IO error 0 (Success) on X server \":1\""
+        ));
+    }
+
+    #[test]
+    fn an_x11_connection_break_is_not_an_engine_crash() {
+        let status = ExitStatus::from_raw(1 << 8);
+        assert!(!is_crash(
+            &status,
+            "X connection to :1 broken (explicit kill or server shutdown)."
+        ));
+    }
+
+    #[test]
+    fn a_signal_with_an_x11_line_is_still_a_crash() {
+        let status = ExitStatus::from_raw(libc::SIGSEGV);
+        assert!(is_crash(
+            &status,
+            "X connection to :1 broken (explicit kill or server shutdown)."
+        ));
     }
 }

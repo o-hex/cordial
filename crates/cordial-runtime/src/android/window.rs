@@ -56,6 +56,10 @@ struct Xlib {
     set_wm_hints: unsafe extern "C" fn(Display, Window, *mut XWMHints) -> c_int,
     move_window: unsafe extern "C" fn(Display, Window, c_int, c_int) -> c_int,
     intern_atom: unsafe extern "C" fn(Display, *const c_char, c_int) -> c_ulong,
+    set_wm_protocols: unsafe extern "C" fn(Display, Window, *mut c_ulong, c_int) -> c_int,
+    change_property: unsafe extern "C" fn(
+        Display, Window, c_ulong, c_ulong, c_int, c_int, *const u8, c_int,
+    ) -> c_int,
     send_event: unsafe extern "C" fn(Display, Window, c_int, c_long, *mut c_void) -> c_int,
     sync: unsafe extern "C" fn(Display, c_int) -> c_int,
     store_name: unsafe extern "C" fn(Display, Window, *const c_char) -> c_int,
@@ -149,6 +153,8 @@ impl Xlib {
             set_wm_hints: sym!("XSetWMHints"),
             move_window: sym!("XMoveWindow"),
             intern_atom: sym!("XInternAtom"),
+            set_wm_protocols: sym!("XSetWMProtocols"),
+            change_property: sym!("XChangeProperty"),
             send_event: sym!("XSendEvent"),
             sync: sym!("XSync"),
             connection_number: sym!("XConnectionNumber"),
@@ -177,6 +183,10 @@ pub struct HostWindow {
     /// ever calling into Xlib when there is nothing queued, which is what keeps
     /// it from blocking the render loop (see `pump_input_events`, below).
     conn_fd: c_int,
+    /// The two atoms a window manager's close request is spelled in, kept so
+    /// the event pump can recognise one without a round trip to the server.
+    wm_protocols: c_ulong,
+    wm_delete_window: c_ulong,
     /// Dimensions the engine asked for via `ANativeWindow_setBuffersGeometry`,
     /// which override the window's own size in every query. Android reports the
     /// buffer geometry, not the surface geometry, and the engine sizes its
@@ -237,6 +247,12 @@ unsafe impl Send for HostWindow {}
 unsafe impl Sync for HostWindow {}
 
 static WINDOW: OnceLock<HostWindow> = OnceLock::new();
+
+/// Set when the window manager delivers `WM_DELETE_WINDOW`, and only read by
+/// `looper::asked_to_stop` through `android::window_closed`. A flag rather
+/// than a call into the pump, so `CORDIAL_NO_CLOSE_EXIT` gates an X11 close
+/// exactly as it gates a Wayland one.
+static WINDOW_CLOSED: AtomicBool = AtomicBool::new(false);
 
 
 /// `XSizeHints`. Only the leading fields matter here, but the struct has to be
@@ -447,7 +463,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
     // corner of the screen.
     let (width, height) = (place.width as u32, place.height as u32);
 
-    let (window, conn_fd) = unsafe {
+    let (window, conn_fd, wm_protocols, wm_delete_window) = unsafe {
         let root = (xlib.default_root_window)(display);
         let w = (xlib.create_simple_window)(display, root, ox, oy, width, height, 0, 0, 0);
         // XStoreName sets WM_NAME, which is XA_STRING — Latin-1, not UTF-8.
@@ -492,6 +508,17 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             icon_mask: 0, window_group: 0,
         };
         (xlib.set_wm_hints)(display, w, &mut wm);
+
+        // Advertise `WM_DELETE_WINDOW`, so the window manager asks us to close
+        // rather than severing the connection. Without it a close button ends
+        // the client in Xlib's fatal I/O handler with status 1, skipping the
+        // lifecycle teardown every other way out goes through.
+        let wm_protocols = (xlib.intern_atom)(display, c"WM_PROTOCOLS".as_ptr(), 0);
+        let wm_delete_window = (xlib.intern_atom)(display, c"WM_DELETE_WINDOW".as_ptr(), 0);
+        if wm_protocols != 0 && wm_delete_window != 0 {
+            let mut protocol = wm_delete_window;
+            (xlib.set_wm_protocols)(display, w, &mut protocol, 1);
+        }
 
         // WM_CLASS, so the window is addressable by rule in a tiling or
         // scripted setup rather than only by title. It is also how a capture
@@ -587,6 +614,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         };
 
         if place.fullscreen {
+            set_compositor_bypass(&xlib, display, w, true);
             // Name the monitor outright. `_NET_WM_STATE_FULLSCREEN` alone
             // fullscreens onto whichever monitor the window manager believes
             // the window occupies, which is the thing that was wrong.
@@ -608,7 +636,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         (xlib.flush)(display);
         (xlib.sync)(display, 0);
 
-        (w, (xlib.connection_number)(display))
+        (w, (xlib.connection_number)(display), wm_protocols, wm_delete_window)
     };
 
     let host = HostWindow {
@@ -616,6 +644,8 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         display,
         window,
         conn_fd,
+        wm_protocols,
+        wm_delete_window,
         buffers: Mutex::new(Geometry {
             width: width as i32,
             height: height as i32,
@@ -763,6 +793,7 @@ impl HostWindow {
                 msg.as_mut_ptr() as *mut c_void,
             );
             (xlib.flush)(self.display);
+            set_compositor_bypass(xlib, self.display, self.window, on);
         }
         self.fullscreen.store(on, Ordering::Relaxed);
     }
@@ -1035,6 +1066,39 @@ pub fn current() -> Option<&'static HostWindow> {
     WINDOW.get()
 }
 
+/// Whether the window manager has asked this window to close.
+pub fn window_closed() -> bool {
+    WINDOW_CLOSED.load(Ordering::Acquire)
+}
+
+/// `_NET_WM_BYPASS_COMPOSITOR`, only when `CORDIAL_COMPOSITOR_BYPASS=1`.
+///
+/// Opt-in because nothing about it has been measured here: it is a hint an
+/// Xorg compositor may use to unredirect a fullscreen window, and whether that
+/// saves a copy or a frame of latency on any given desktop is unknown. Cleared
+/// again on leaving fullscreen, so a compositor that caches the property does
+/// not go on treating a windowed client as a scanout candidate.
+///
+/// SAFETY: `display` and `window` must be live handles from `xlib`.
+unsafe fn set_compositor_bypass(xlib: &Xlib, display: Display, window: Window, on: bool) {
+    static OPTED_IN: OnceLock<bool> = OnceLock::new();
+    if !*OPTED_IN.get_or_init(|| std::env::var("CORDIAL_COMPOSITOR_BYPASS").as_deref() == Ok("1")) {
+        return;
+    }
+    let property = (xlib.intern_atom)(display, c"_NET_WM_BYPASS_COMPOSITOR".as_ptr(), 0);
+    let cardinal = (xlib.intern_atom)(display, c"CARDINAL".as_ptr(), 0);
+    if property == 0 || cardinal == 0 {
+        return;
+    }
+    // Format 32 takes a C `long` per item, whatever the platform's width.
+    let value: c_ulong = on as c_ulong;
+    (xlib.change_property)(
+        display, window, property, cardinal, 32, 0, // PropModeReplace
+        (&value as *const c_ulong).cast(), 1,
+    );
+    (xlib.flush)(display);
+}
+
 // ------------------------------------------------------------- input pump
 //
 // Mouse and keyboard, delivered to the engine through the same AGDK
@@ -1088,6 +1152,7 @@ const BUTTON_PRESS: c_int = 4;
 const BUTTON_RELEASE: c_int = 5;
 const EXPOSE: c_int = 12;
 const CONFIGURE_NOTIFY: c_int = 22;
+const CLIENT_MESSAGE: c_int = 33;
 
 /// `XConfigureEvent`. Another distinct layout: it carries the window's new
 /// geometry rather than a damaged rectangle.
@@ -1410,7 +1475,17 @@ impl HostWindow {
             )
         };
         let ev = unsafe { &*(buf.as_ptr() as *const XInputEvent) };
-        let unicode = if n > 0 { text[0] as i32 } else { 0 };
+        let fallback = keysym_text_fallback(n, ev.state, keysym);
+        let mut fallback_buf = [0u8; 4];
+        let typed_text: &str = match fallback {
+            Some(ch) => ch.encode_utf8(&mut fallback_buf),
+            None => std::str::from_utf8(&text[..n.max(0) as usize]).unwrap_or(""),
+        };
+        let unicode = match fallback {
+            Some(ch) => ch as i32,
+            None if n > 0 => text[0] as i32,
+            None => 0,
+        };
         let meta = android_meta_state(ev.state);
         let now = self.now_ms();
 
@@ -1433,9 +1508,7 @@ impl HostWindow {
             eprintln!(
                 "[cordial] key {} keysym={keysym:#x} text={} keycode={:?} focus={:?}",
                 if down { "down" } else { "up" },
-                super::input::redacted(
-                    std::str::from_utf8(&text[..n.max(0) as usize]).unwrap_or("")
-                ),
+                super::input::redacted(typed_text),
                 keysym_to_android(keysym),
                 cordial_linker_sys::game_activity::focused_textbox(),
             );
@@ -1489,11 +1562,7 @@ impl HostWindow {
                 }
                 return;
             }
-            let typed = if n > 0 {
-                std::str::from_utf8(&text[..n as usize]).unwrap_or("")
-            } else {
-                ""
-            };
+            let typed = typed_text;
             // Editing keys, before text: an IME consumes these itself rather
             // than committing them, and `XLookupString` reports nothing for
             // them anyway. Keysyms from keysymdef.h.
@@ -1596,6 +1665,24 @@ impl HostWindow {
                     // the `XConfigureEvent` member of Xlib's union.
                     let ev = unsafe { &*(buf.as_ptr() as *const XConfigureEvent) };
                     self.dispatch_configure(handle, ev.width, ev.height);
+                }
+                CLIENT_MESSAGE => {
+                    // `WM_DELETE_WINDOW` arrives as a ClientMessage whose
+                    // `message_type` is WM_PROTOCOLS and whose first data word
+                    // is the delete atom -- the same offsets `open` writes by
+                    // hand. Read unaligned, since `buf` is a byte array.
+                    let message_type =
+                        unsafe { std::ptr::read_unaligned(buf.as_ptr().add(40) as *const c_ulong) };
+                    let protocol =
+                        unsafe { std::ptr::read_unaligned(buf.as_ptr().add(56) as *const c_ulong) };
+                    if message_type == self.wm_protocols && protocol == self.wm_delete_window {
+                        // Recorded, not acted on: the pump reads it and
+                        // `CORDIAL_NO_CLOSE_EXIT` decides whether it ends the
+                        // run, the same as a Wayland close.
+                        if !WINDOW_CLOSED.swap(true, Ordering::AcqRel) {
+                            println!("[android] X11: the window manager asked the window to close");
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1894,9 +1981,43 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
     ]
 }
 
+/// The character a key typed when `XLookupString` could not say, or `None`.
+///
+/// `XLookupString` only ever produces Latin-1, so on a Cyrillic layout it
+/// returns no bytes and the letter was lost. The keysym still names it, so it
+/// is used then -- and only then. It must not win over bytes Xlib did produce,
+/// and must not fire under Control or Alt: Ctrl+A's keysym is still `a`, and
+/// letting it through inserted the letter into a focused TextBox where Xlib had
+/// correctly reported a control character or nothing at all.
+fn keysym_text_fallback(lookup_len: c_int, x11_state: c_uint, keysym: c_ulong) -> Option<char> {
+    const CONTROL_MASK: c_uint = 1 << 2;
+    const MOD1_MASK: c_uint = 1 << 3;
+    if lookup_len > 0 || x11_state & (CONTROL_MASK | MOD1_MASK) != 0 {
+        return None;
+    }
+    super::input::keysym_to_char(keysym).filter(|c| !c.is_control())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_keysym_only_supplies_text_that_xlib_could_not() {
+        // Cyrillic_a on a Russian layout: no Latin-1 bytes, no modifiers.
+        assert_eq!(keysym_text_fallback(0, 0, 0x06c1), Some('а'));
+        // Shift is how capitals are typed and must not suppress them.
+        assert_eq!(keysym_text_fallback(0, 1, 0x06e1), Some('А'));
+        // Bytes from Xlib always win, including for a plain Latin letter.
+        assert_eq!(keysym_text_fallback(1, 0, 0x0061), None);
+        // Ctrl+A / Ctrl+C and Alt+letter: the keysym is the letter, but no
+        // letter was typed.
+        assert_eq!(keysym_text_fallback(0, 1 << 2, 0x0061), None);
+        assert_eq!(keysym_text_fallback(0, 1 << 2, 0x0063), None);
+        assert_eq!(keysym_text_fallback(0, 1 << 3, 0x06c1), None);
+        // An editing key has no character to offer.
+        assert_eq!(keysym_text_fallback(0, 0, 0xff08), None);
+    }
 
     #[test]
     fn pointer_lock_is_wanted_for_any_of_its_three_independent_reasons() {

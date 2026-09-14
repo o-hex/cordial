@@ -173,10 +173,8 @@ fn system_scheme(portal: Option<u32>) -> libadwaita::ColorScheme {
 /// which boxes the value one variant deeper; either shape is unwrapped by
 /// following `v` down until something that is not a variant comes out.
 ///
-/// Through `gio` rather than `zbus`. `zbus` is a dependency of `cordial-runtime`
-/// and not of this crate, and the shell is already holding a GDBus connection
-/// through GTK — adding an async runtime to this crate to ask one question the
-/// toolkit can already ask would be the larger change.
+/// Through `gio`: the shell already holds a GDBus connection through GTK, so
+/// this portal query reuses it. The shared secret backend uses `zbus` separately.
 fn portal_colour_scheme() -> Option<u32> {
     use libadwaita::gtk::gio;
     use libadwaita::gtk::glib::prelude::*;

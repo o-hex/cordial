@@ -1,8 +1,25 @@
 use super::*;
+use cordial_shell::secrets::Store;
 use std::num::NonZeroU64;
+use transport::SessionCookie;
 
 fn account(id: u64) -> AccountId {
     AccountId(NonZeroU64::new(id).unwrap())
+}
+
+fn matching_file_profile(
+    root: &Path,
+    account: AccountId,
+    authenticate: impl FnMut(&SessionCookie) -> Option<AccountId>,
+) -> Option<ProfileMatch> {
+    profile::matching_profile_with(
+        profile::ProfileQuery {
+            root,
+            account,
+            store: Store::File,
+        },
+        authenticate,
+    )
 }
 
 #[test]
@@ -54,7 +71,7 @@ fn exact_saved_account_is_selected_instead_of_last_used_profile() {
     save_profile(root.path(), "browser", 34);
     let (endpoint, server) = authenticated_server("SESSION-34", Some(34));
     // When identifying the browser's account.
-    let selected = profile::matching_profile_with(root.path(), account(34), |cookie| {
+    let selected = matching_file_profile(root.path(), account(34), |cookie| {
         transport::authenticated_at(cookie, &endpoint)
     });
     // Then only its profile is returned.
@@ -77,7 +94,7 @@ fn stale_saved_session_cannot_match_newer_identity() {
     let (endpoint, server) = authenticated_server("SESSION-A", Some(12));
     // When the saved session is checked over HTTP, then its authenticated account
     // rather than the newer identity metadata controls automatic launch.
-    let selected = profile::matching_profile_with(root.path(), account(34), |cookie| {
+    let selected = matching_file_profile(root.path(), account(34), |cookie| {
         transport::authenticated_at(cookie, &endpoint)
     });
     assert!(selected.is_none());
@@ -91,9 +108,7 @@ fn duplicate_saved_accounts_require_manual_choice() {
     save_profile(root.path(), "first", 34);
     save_profile(root.path(), "second", 34);
     // When matching, then neither directory wins by ordering.
-    assert!(
-        profile::matching_profile_with(root.path(), account(34), |_| Some(account(34))).is_none()
-    );
+    assert!(matching_file_profile(root.path(), account(34), |_| Some(account(34))).is_none());
 }
 
 #[test]
@@ -109,9 +124,7 @@ fn missing_session_or_unknown_identity_schema_cannot_match() {
     )
     .unwrap();
     // When matching, then stale or unreadable state cannot select a profile.
-    assert!(
-        profile::matching_profile_with(root.path(), account(34), |_| Some(account(34))).is_none()
-    );
+    assert!(matching_file_profile(root.path(), account(34), |_| Some(account(34))).is_none());
 }
 
 #[test]
@@ -121,7 +134,7 @@ fn session_changed_during_validation_cannot_launch_from_stale_result() {
     save_profile(root.path(), "browser", 34);
     let cookies = root.path().join("browser/cookies");
     // When the original session authenticates but is replaced before selection.
-    let selected = profile::matching_profile_with(root.path(), account(34), |_| {
+    let selected = matching_file_profile(root.path(), account(34), |_| {
         std::fs::write(
             &cookies,
             "# cordial cookie store v1 -- a live Roblox session. Treat it as a password.\n\
@@ -140,7 +153,7 @@ fn matched_profile_snapshot_rejects_identity_byte_changes_after_lookup() {
     let root = tempfile::tempdir().unwrap();
     save_profile(root.path(), "browser", 34);
     let dir = root.path().join("browser");
-    let matched = profile::snapshot_for_test("browser", &dir).unwrap();
+    let matched = profile::snapshot_for_test("browser", &dir, Store::File).unwrap();
 
     // When equivalent identity data is rewritten with different bytes.
     std::fs::write(dir.join("identity"), r#"{ "schema": 1, "userId": 34 }"#).unwrap();
@@ -155,7 +168,7 @@ fn matched_profile_snapshot_rejects_cookie_byte_changes_after_lookup() {
     let root = tempfile::tempdir().unwrap();
     save_profile(root.path(), "browser", 34);
     let dir = root.path().join("browser");
-    let matched = profile::snapshot_for_test("browser", &dir).unwrap();
+    let matched = profile::snapshot_for_test("browser", &dir, Store::File).unwrap();
 
     // When the cookie store changes after lookup, even without changing its session.
     let cookies = std::fs::read(dir.join("cookies")).unwrap();
@@ -174,7 +187,7 @@ fn failed_saved_session_validation_requires_manual_choice() {
     save_profile(root.path(), "browser", 34);
     let (endpoint, server) = authenticated_server("SESSION-34", None);
     // When matching through the authenticated-user endpoint.
-    let selected = profile::matching_profile_with(root.path(), account(34), |cookie| {
+    let selected = matching_file_profile(root.path(), account(34), |cookie| {
         transport::authenticated_at(cookie, &endpoint)
     });
     // Then transport failure cannot authorise automatic launch.

@@ -490,6 +490,18 @@ fn build_roblox_page(
         )
         .build();
 
+    let sign_in_storage = adw::ActionRow::builder()
+        .title("Saved sign-in")
+        .subtitle(match std::env::var("CORDIAL_SECRET_STORE").as_deref() {
+            Ok("file") => "Profile file, by request. Browser Play routing reads the same file.",
+            Ok("keyring") => "Desktop Secret Service only. A locked or unavailable keyring is left signed out.",
+            Ok("auto") | Err(_) => "Desktop Secret Service when available, otherwise a private profile file. Browser Play routing uses the selected backend.",
+            Ok(_) => "Profile file, because the configured secret backend is not recognised.",
+        })
+        .build();
+    sign_in_storage.set_subtitle_lines(3);
+    data_group.add(&sign_in_storage);
+
     let profile_name = config.borrow().profile.clone();
     let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
     let bytes = profile_dir.as_ref().map(|d| cordial_shell::profile::engine_data_bytes(d)).unwrap_or(0);

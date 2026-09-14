@@ -359,6 +359,7 @@ dependencies = [
  "tempfile",
  "ureq",
  "webkit6",
+ "zbus",
  "zip",
 ]
 

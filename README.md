@@ -279,8 +279,8 @@ sign-ups are currently closed. Install the release `.pkg.tar.zst` instead.
 **Can two accounts run at once?** Yes — two profiles, two instances, side by
 side, each about 1.5 GB. [`docs/status.md`](docs/status.md).
 
-**Can browser Play choose the matching account?** With `CORDIAL_SECRET_STORE=file`,
-yes — see [browser account routing](docs/browser-account-routing.md).
+**Can browser Play choose the matching account?** Yes, through whichever saved
+sign-in backend Cordial selected — see [browser account routing](docs/browser-account-routing.md).
 
 **How do I change FastFlags or the graphics backend?**
 [`docs/fastflags.md`](docs/fastflags.md).

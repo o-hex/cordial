@@ -8,6 +8,7 @@ use std::rc::Rc;
 use crate::browser_account::{self, LaunchTicket, ProfileMatch};
 use crate::deep_link;
 use crate::shell_config::ShellConfig;
+use cordial_shell::secrets::Store;
 
 /// A desktop join held until the browser account resolves or the user launches.
 ///
@@ -88,14 +89,17 @@ impl PendingJoin {
         *self.profile_match.borrow_mut() = Some(profile_match);
     }
 
-    pub(super) fn matched_profile_is_current(
+    pub(super) fn matched_store_if_current(
         &self,
         name: &str,
         profile_dir: &std::path::Path,
-    ) -> bool {
+    ) -> Result<Option<Store>, ()> {
         match self.profile_match.borrow().as_ref() {
-            Some(profile_match) => profile_match.still_matches(name, profile_dir),
-            None => true,
+            Some(profile_match) if profile_match.still_matches(name, profile_dir) => {
+                Ok(Some(profile_match.store()))
+            }
+            Some(_) => Err(()),
+            None => Ok(None),
         }
     }
 
@@ -147,10 +151,7 @@ impl Shell {
         url: String,
         lookup: impl FnOnce(LaunchTicket) -> Option<ResolvedProfile> + Send + 'static,
     ) -> Option<glib::JoinHandle<()>> {
-        // Reading files while the runtime uses a keyring could match a stale
-        // pre-migration identity. This adapter is for the explicit file backend.
-        let enabled = std::env::var("CORDIAL_SECRET_STORE").as_deref() == Ok("file")
-            && std::env::var("CORDIAL_BROWSER_ACCOUNT_ROUTING").as_deref() != Ok("0");
+        let enabled = std::env::var("CORDIAL_BROWSER_ACCOUNT_ROUTING").as_deref() != Ok("0");
         let ticket = enabled.then(|| LaunchTicket::parse(&url)).flatten();
         match ticket {
             None => {

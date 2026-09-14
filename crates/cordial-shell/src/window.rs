@@ -1027,18 +1027,30 @@ fn try_launch_tracked(
 
     // Account routing authenticated exact identity and cookie bytes before the
     // old client released this lock. Bind that evidence to the lock now: if the
-    // files changed in between, the name no longer identifies the session that
-    // was authenticated. Returning drops the claim before manual recovery.
-    if !join.matched_profile_is_current(&profile_name, claim.profile_dir()) {
-        join.clear_profile_match();
-        return Outcome::ProfileChanged;
-    }
+    // saved values changed in between, the name no longer identifies the
+    // session that was authenticated. Returning drops the claim before manual
+    // recovery.
+    let secret_store = match join.matched_store_if_current(&profile_name, claim.profile_dir()) {
+        Ok(store) => store,
+        Err(()) => {
+            join.clear_profile_match();
+            return Outcome::ProfileChanged;
+        }
+    };
 
     // Read rather than taken: everything above this can still refuse, and a
     // busy profile that also cost the user their link would be two failures for
     // one press. It is cleared below, once there is a process holding it.
     let url = join.peek();
-    let instance = match launch::spawn(&build, claim, run_seconds_override(), url.as_deref()) {
+    let instance = match launch::spawn(
+        &build,
+        claim,
+        launch::LaunchRequest {
+            run_seconds: run_seconds_override(),
+            join_url: url.as_deref(),
+            secret_store,
+        },
+    ) {
         Ok(instance) => instance,
         Err(message) => return Outcome::Failed(message),
     };

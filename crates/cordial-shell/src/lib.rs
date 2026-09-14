@@ -37,6 +37,7 @@ pub mod profile;
 // `crates/cordial-runtime/src/bin/load.rs`'s `wire_refresh_rate` for what
 // that still needs and does not yet have.
 pub mod refresh_watch;
+pub mod secrets;
 // `webview_policy` needs nothing beyond `gtk4::glib::Uri`, so it is always
 // compiled and always under test -- see its own header on why it is the part
 // that has to be right. `webview` needs `webkitgtk6.0-devel`, which is the

@@ -205,12 +205,9 @@ pub struct WindowRequest {
     /// A validated `.ROBLOSECURITY` value to seed this window's cookie jar
     /// with before the first load, or `None` to open signed out.
     ///
-    /// Deliberately not something this module fetches for itself. ADR-012
-    /// keeps a Roblox session in the desktop secret service, and the module
-    /// that already knows how to ask it — `crate::cookies` plus
-    /// `crate::secrets`, both in `cordial-runtime` — is not one this crate can
-    /// depend on without a cycle (`cordial-runtime` depends on this crate for
-    /// `host_window`). `cordial_runtime::webview::extract_roblosecurity` does
+    /// Deliberately not something this module fetches for itself. The runtime
+    /// owns the live cookie jar; the shared secret backend only knows its saved
+    /// form. `cordial_runtime::webview::extract_roblosecurity` does
     /// the validation (RFC 6265 `cookie-octet`, a length bound) that has to
     /// happen before a value reaches a `Set-Cookie` header; this field only
     /// carries the already-checked result.

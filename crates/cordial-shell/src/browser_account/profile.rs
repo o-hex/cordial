@@ -1,9 +1,9 @@
 use super::transport::{AccountId, SessionCookie};
-use std::io::Read;
+use cordial_shell::secrets::{self, Kind, SnapshotRequest, Store};
 use std::path::Path;
 
-const MAX_IDENTITY_BYTES: u64 = 16 * 1024;
-const MAX_COOKIE_BYTES: u64 = 1024 * 1024;
+const MAX_IDENTITY_BYTES: usize = 16 * 1024;
+const MAX_COOKIE_BYTES: usize = 1024 * 1024;
 
 #[derive(serde::Deserialize)]
 struct SavedIdentity {
@@ -12,13 +12,14 @@ struct SavedIdentity {
     user_id: AccountId,
 }
 
-/// Exact profile files that established an automatic account match.
+/// Exact saved values that established an automatic account match.
 ///
 /// Deliberately carries opaque bytes rather than parsed credentials. The
 /// launcher compares them after acquiring the profile lock and never exposes,
 /// formats or logs them.
 pub(crate) struct ProfileMatch {
     name: String,
+    store: Store,
     identity: Vec<u8>,
     cookies: Vec<u8>,
 }
@@ -28,21 +29,42 @@ impl ProfileMatch {
         &self.name
     }
 
+    pub(crate) const fn store(&self) -> Store {
+        self.store
+    }
+
     pub(crate) fn still_matches(&self, name: &str, profile_dir: &Path) -> bool {
         self.name == name
-            && read_limited(&profile_dir.join("identity"), MAX_IDENTITY_BYTES).as_deref()
+            && secrets::snapshot(SnapshotRequest {
+                store: self.store,
+                profile_dir,
+                kind: Kind::Identity,
+                max_bytes: MAX_IDENTITY_BYTES,
+            })
+            .as_deref()
                 == Some(self.identity.as_slice())
-            && read_limited(&profile_dir.join("cookies"), MAX_COOKIE_BYTES).as_deref()
+            && secrets::snapshot(SnapshotRequest {
+                store: self.store,
+                profile_dir,
+                kind: Kind::Cookies,
+                max_bytes: MAX_COOKIE_BYTES,
+            })
+            .as_deref()
                 == Some(self.cookies.as_slice())
     }
 }
 
+pub(super) struct ProfileQuery<'a> {
+    pub(super) root: &'a Path,
+    pub(super) account: AccountId,
+    pub(super) store: Store,
+}
+
 pub(super) fn matching_profile_with(
-    root: &Path,
-    account: AccountId,
+    query: ProfileQuery<'_>,
     mut authenticate: impl FnMut(&SessionCookie) -> Option<AccountId>,
 ) -> Option<ProfileMatch> {
-    let mut matches = std::fs::read_dir(root).ok()?.filter_map(|entry| {
+    let mut matches = std::fs::read_dir(query.root).ok()?.filter_map(|entry| {
         let entry = entry.ok()?;
         if !entry.file_type().ok()?.is_dir() {
             return None;
@@ -51,25 +73,50 @@ pub(super) fn matching_profile_with(
         if !cordial_shell::profile::is_valid_name(&name) {
             return None;
         }
-        let identity_path = entry.path().join("identity");
-        let cookie_path = entry.path().join("cookies");
-        let identity_before = read_limited(&identity_path, MAX_IDENTITY_BYTES)?;
+        let profile_dir = entry.path();
+        let identity_before = secrets::snapshot(SnapshotRequest {
+            store: query.store,
+            profile_dir: &profile_dir,
+            kind: Kind::Identity,
+            max_bytes: MAX_IDENTITY_BYTES,
+        })?;
         let identity: SavedIdentity = serde_json::from_slice(&identity_before).ok()?;
-        if identity.schema != 1 || identity.user_id != account {
+        if identity.schema != 1 || identity.user_id != query.account {
             return None;
         }
-        let cookies_before = read_limited(&cookie_path, MAX_COOKIE_BYTES)?;
+        let cookies_before = secrets::snapshot(SnapshotRequest {
+            store: query.store,
+            profile_dir: &profile_dir,
+            kind: Kind::Cookies,
+            max_bytes: MAX_COOKIE_BYTES,
+        })?;
         let session = session_from_store(&cookies_before)?;
-        if authenticate(&session) != Some(account) {
+        if authenticate(&session) != Some(query.account) {
             return None;
         }
-        // The client reads these files after routing. A periodic cookie flush or
-        // identity save during the HTTP check makes that future read a different
-        // session, so fail closed instead of launching from the stale decision.
-        (read_limited(&identity_path, MAX_IDENTITY_BYTES)?.as_slice() == identity_before
-            && read_limited(&cookie_path, MAX_COOKIE_BYTES)?.as_slice() == cookies_before)
+        // The client reads these values after routing. A periodic cookie flush
+        // or identity save during the HTTP check makes that future read a
+        // different session, so fail closed instead of launching from the stale
+        // decision.
+        (secrets::snapshot(SnapshotRequest {
+            store: query.store,
+            profile_dir: &profile_dir,
+            kind: Kind::Identity,
+            max_bytes: MAX_IDENTITY_BYTES,
+        })?
+        .as_slice()
+            == identity_before
+            && secrets::snapshot(SnapshotRequest {
+                store: query.store,
+                profile_dir: &profile_dir,
+                kind: Kind::Cookies,
+                max_bytes: MAX_COOKIE_BYTES,
+            })?
+            .as_slice()
+                == cookies_before)
             .then_some(ProfileMatch {
                 name,
+                store: query.store,
                 identity: identity_before,
                 cookies: cookies_before,
             })
@@ -79,22 +126,27 @@ pub(super) fn matching_profile_with(
 }
 
 #[cfg(test)]
-pub(crate) fn snapshot_for_test(name: &str, profile_dir: &Path) -> Option<ProfileMatch> {
+pub(crate) fn snapshot_for_test(
+    name: &str,
+    profile_dir: &Path,
+    store: Store,
+) -> Option<ProfileMatch> {
     Some(ProfileMatch {
         name: name.to_string(),
-        identity: read_limited(&profile_dir.join("identity"), MAX_IDENTITY_BYTES)?,
-        cookies: read_limited(&profile_dir.join("cookies"), MAX_COOKIE_BYTES)?,
+        store,
+        identity: secrets::snapshot(SnapshotRequest {
+            store,
+            profile_dir,
+            kind: Kind::Identity,
+            max_bytes: MAX_IDENTITY_BYTES,
+        })?,
+        cookies: secrets::snapshot(SnapshotRequest {
+            store,
+            profile_dir,
+            kind: Kind::Cookies,
+            max_bytes: MAX_COOKIE_BYTES,
+        })?,
     })
-}
-
-fn read_limited(path: &Path, limit: u64) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() <= usize::try_from(limit).ok()?).then_some(bytes)
 }
 
 fn session_from_store(bytes: &[u8]) -> Option<SessionCookie> {

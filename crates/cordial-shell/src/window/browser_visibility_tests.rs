@@ -2,7 +2,7 @@ use super::*;
 use std::cell::Cell;
 
 #[test]
-#[ignore = "requires a GTK display; run alone with CORDIAL_SECRET_STORE=file"]
+#[ignore = "requires a GTK display; run alone"]
 fn matching_browser_account_never_maps_profile_picker() {
     // Given an unopened launcher and a matching account.
     let (shell, launches, _root) = super::tests::fallback_shell();
@@ -31,7 +31,7 @@ fn matching_browser_account_never_maps_profile_picker() {
 }
 
 #[test]
-#[ignore = "requires a GTK display; run alone with CORDIAL_SECRET_STORE=file"]
+#[ignore = "requires a GTK display; run alone"]
 fn unmatched_browser_account_reveals_manual_picker() {
     // Given an unopened launcher with no matching saved account.
     let (shell, launches, _root) = super::tests::fallback_shell();

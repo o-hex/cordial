@@ -2,7 +2,7 @@ use super::*;
 use std::cell::Cell;
 
 #[test]
-#[ignore = "requires a GTK display; run alone with CORDIAL_SECRET_STORE=file"]
+#[ignore = "requires a GTK display; run alone"]
 fn browser_account_launches_matching_profile_through_window_action() {
     // Given the actual shell widgets with a recording player-launch boundary.
     adw::init().unwrap();
@@ -71,7 +71,7 @@ fn browser_account_launches_matching_profile_through_window_action() {
 }
 
 #[test]
-#[ignore = "requires a GTK display; run alone with CORDIAL_SECRET_STORE=file"]
+#[ignore = "requires a GTK display; run alone"]
 fn matched_profile_is_shown_when_automatic_launch_waits_for_retry() {
     // Given two real profiles and the actual launcher profile row showing the last-used one.
     adw::init().unwrap();
@@ -153,7 +153,7 @@ fn matched_profile_is_shown_when_automatic_launch_waits_for_retry() {
 }
 
 #[test]
-#[ignore = "requires a GTK display; run alone with CORDIAL_SECRET_STORE=file"]
+#[ignore = "requires a GTK display; run alone"]
 fn unmatched_account_keeps_ticketless_join_for_manual_launch() {
     // Given the shell with no matching account returned by its lookup.
     let (shell, launches, _root) = fallback_shell();
@@ -177,7 +177,7 @@ fn unmatched_account_keeps_ticketless_join_for_manual_launch() {
 }
 
 #[test]
-#[ignore = "requires a GTK display; run alone with CORDIAL_SECRET_STORE=file"]
+#[ignore = "requires a GTK display; run alone"]
 fn discarded_request_cannot_launch_after_account_lookup_finishes() {
     // Given a queued lookup that would find a matching account.
     let (shell, launches, _root) = fallback_shell();
@@ -198,7 +198,7 @@ fn discarded_request_cannot_launch_after_account_lookup_finishes() {
 }
 
 #[test]
-#[ignore = "requires a GTK display; run alone with CORDIAL_SECRET_STORE=file"]
+#[ignore = "requires a GTK display; run alone"]
 fn newer_identical_join_invalidates_previous_account_lookup() {
     // Given an older lookup for the same place as the next request.
     let (shell, launches, _root) = fallback_shell();

@@ -140,7 +140,8 @@ Roblox's OAuth 2.0 grants API scopes to third-party applications through the
 creator dashboard. It does not issue a play session, and there is no supported
 mechanism for a client to authenticate on a user's behalf. Account switching is
 therefore not an authentication feature at all: each profile logs in normally and
-keeps its own session in its own directory. Nothing about this design needs
+keeps its own session under its profile's storage key. The configured secret
+backend stores that session in the keyring or in the profile directory. Nothing about this design needs
 Roblox to grant anything, which is also why it cannot be withdrawn.
 
 ## On credentials — originally, why they do not go in a keyring
@@ -290,7 +291,8 @@ runs on one computer. The API reached is identical; only the client differs.
 constraint, and it is the owner's: *users cannot play Roblox if they have not
 unlocked their keyring*. Losing the stored session must degrade to "sign in
 again" and never to "the client will not start", and never to a dialog standing
-between somebody and the game. So `crates/cordial-runtime/src/secrets.rs`:
+between somebody and the game. So `crates/cordial-shell/src/secrets.rs`, shared
+with the runtime through its existing `secrets` module:
 
 - reads the default collection's `Locked` property and **never calls `Unlock`**.
   A locked collection is "not available", not an error and not a prompt. With

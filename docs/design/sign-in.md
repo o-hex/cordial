@@ -1112,7 +1112,9 @@ and whole-account access, and `0600` stops another Unix account and nothing
 else. A backup, a sync client, a container mount, a second application running
 as the same user, or somebody reading over a shoulder all get there.
 
-Both stores now go into the desktop Secret Service. Nothing above about the
+Both stores prefer the desktop Secret Service in the default `auto` mode,
+with file fallback when it is unavailable. Explicit `file` skips the keyring;
+explicit `keyring` refuses file fallback. Nothing above about the
 *format* changes: the same body that used to be the file's contents is the
 item's value, which is what makes the migration a move rather than a
 re-derivation.
@@ -1139,9 +1141,9 @@ the user — which is precisely what `0600` permits.
 
 `org.freedesktop.secrets` is the interface; `gnome-keyring-daemon` implements it
 on GNOME, KWallet and KeePassXC elsewhere, and libsecret is one client for it.
-`crates/cordial-runtime/src/secrets.rs` speaks the interface over `zbus`, which
-this crate already depends on and which `android::accessibility` already uses
-the same way for `org.a11y.atspi`.
+`crates/cordial-shell/src/secrets.rs` and its submodules speak the interface over
+`zbus`. The runtime reexports this shared backend through its existing `secrets`
+module, so account routing and the running client use the same storage format.
 
 An item is keyed by four attributes — `xdg:schema=org.cordial.Session`,
 `application=cordial`, `store=cookies|identity`, and `profile=<absolute profile
@@ -1150,13 +1152,13 @@ this repository runs under its own `XDG_DATA_HOME` and every one of those roots
 has a profile called `default`.
 
 The hard constraint is the owner's, and it governs the whole module: **a stored
-session is a convenience and never a prerequisite** — users cannot play Roblox
-if they have not unlocked their keyring. So the collection's `Locked` property
+session is a convenience and never a prerequisite** — a locked keyring must not
+prevent a launch. So the collection's `Locked` property
 is read and `Unlock` is **never** called; every call is bounded by a timeout on
 a thread of its own, because `zbus`'s blocking API has none and a save runs on
-the looper thread; and missing, locked, dismissed and unusable all resolve to
-the same thing, which is nothing saved, one line in the log, and a client on the
-landing page.
+the looper thread. A missing or locked service selects announced file fallback
+in `auto` mode, or no saved session in explicit `keyring` mode. An unreadable
+stored session leaves the client on the landing page rather than failing launch.
 
 ### 10.3 Measured, 2026-08-02, on a scratch profile with a fabricated token
 

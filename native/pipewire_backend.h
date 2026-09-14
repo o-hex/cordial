@@ -7,6 +7,7 @@
 // tree was configured with pipewire-devel present — see the top of
 // `pipewire_backend.cpp` for how that split is enforced.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -395,6 +396,20 @@ private:
     struct Impl;
     Impl* impl_;
 };
+
+/// Roblox's voice mute, set through `AppRtcDeviceWrapper.wrapSetCommunicationMute`
+/// and honoured by `AAudioStream_read`, which zeroes what it hands back while
+/// it is set.
+///
+/// A statement about content, not about the stream, so it does not bend the
+/// rule below: a muted capture stream is still an open one, exactly as on
+/// Android, where `AudioManager.setMicrophoneMute` silences the samples and
+/// leaves the recording running. What it must not be is ignored -- a mute
+/// button that keeps sending the room is the worst answer available.
+inline std::atomic<bool>& voice_muted() {
+    static std::atomic<bool> muted{false};
+    return muted;
+}
 
 /// One capture stream, backed by one `pw_stream` in the input direction.
 ///

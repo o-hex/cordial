@@ -1137,6 +1137,12 @@ static aaudio_result_t AAudioStream_read(AAudioStream* stream, void* buffer, int
         }
     }
 
+    // After the trace, so the trace still says whether the microphone itself
+    // is delivering sound while Roblox has it muted.
+    if (cordial::audio::voice_muted().load(std::memory_order_relaxed)) {
+        std::memset(dst, 0, static_cast<size_t>(frames) * bpf);
+    }
+
     return static_cast<aaudio_result_t>(frames);
 }
 

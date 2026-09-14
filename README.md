@@ -282,6 +282,9 @@ side, each about 1.5 GB. [`docs/status.md`](docs/status.md).
 **How do I change FastFlags or the graphics backend?**
 [`docs/fastflags.md`](docs/fastflags.md).
 
+**Can I hide the game title bar without fullscreen?** Yes — choose Hidden in
+the [title-bar settings](docs/title-bar.md).
+
 **My controller shows the wrong button icons.** A known, unsolved mapping
 problem — every button still works. [`docs/controllers.md`](docs/controllers.md).
 

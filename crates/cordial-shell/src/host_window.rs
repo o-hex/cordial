@@ -581,7 +581,7 @@ impl HostWindow {
         // libadwaita default nearer 47px, which read as "the x in the title bar
         // looks off and the titlebar looks short". That is now opt-in through
         // the Appearance page rather than the only option.
-        let compact = matches!(std::env::var("CORDIAL_TITLE_BAR").as_deref(), Ok("compact"));
+        let compact = crate::title_bar::TitleBar::from_env() == crate::title_bar::TitleBar::Compact;
         // The see-through state is a class rather than the default, and that
         // distinction is the whole lesson of 5a295e3. A permanently transparent
         // toplevel shows the desktop whenever the engine is not painting, which
@@ -670,9 +670,11 @@ impl HostWindow {
     }
 
     pub fn new(title: &str, width: i32, height: i32, content: &impl IsA<gtk::Widget>) -> Self {
+        let title_bar = crate::title_bar::TitleBar::from_env();
         let header = adw::HeaderBar::new();
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
+        toolbar.set_reveal_top_bars(title_bar.revealed(false));
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(content));
         let text_layer = gtk::Fixed::new();
@@ -758,9 +760,10 @@ impl HostWindow {
         // up past the end of the monitor. On a dual-head desktop that reads as
         // the window bleeding onto the second screen, which is how this was
         // first reported.
+        let chrome_height = if title_bar.revealed(false) { header_height_hint() } else { 0 };
         let (w, h) = match smallest_monitor() {
-            Some(monitor) => fit_within((width, height + header_height_hint()), monitor),
-            None => (width, height + header_height_hint()),
+            Some(monitor) => fit_within((width, height + chrome_height), monitor),
+            None => (width, height + chrome_height),
         };
 
         let window = adw::Window::builder()
@@ -770,7 +773,8 @@ impl HostWindow {
             .content(&toolbar)
             .build();
 
-        // Hide the header bar while fullscreen, and put it back afterwards.
+        // Hide the header bar while fullscreen. Restore it afterwards only
+        // when the saved preference has not hidden windowed chrome too.
         //
         // GTK does not do this for you and is right not to: it cannot know
         // whether a given toolbar is chrome the user wants gone or part of the
@@ -786,7 +790,7 @@ impl HostWindow {
         {
             let toolbar_for_fs = toolbar.clone();
             window.connect_fullscreened_notify(move |w| {
-                toolbar_for_fs.set_reveal_top_bars(!w.is_fullscreen());
+                toolbar_for_fs.set_reveal_top_bars(title_bar.revealed(w.is_fullscreen()));
             });
         }
 

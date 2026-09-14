@@ -29,6 +29,7 @@ pub mod json_highlight;
 pub mod network;
 pub mod plugin_preferences;
 pub mod profile;
+pub mod title_bar;
 // Not pulled in by `host_window` or `network` -- registered here on its own
 // so `cordial-runtime` can reach it as `cordial_shell::refresh_watch`, which
 // `refresh_watch.rs`'s own header names as the one thing left to do before

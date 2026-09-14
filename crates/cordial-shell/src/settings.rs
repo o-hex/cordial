@@ -212,17 +212,13 @@ fn add_appearance_groups(page: &adw::PreferencesPage, config: Rc<RefCell<ShellCo
 
     // ---- the game window's chrome ------------------------------------------
     //
-    // Two named sizes, not a pixel value. A free number gives chrome that
-    // matches nothing else on the desktop and, under about 30px, clips the
-    // window controls -- which is the "the x in the title bar looks off" that
-    // put this row here in the first place. Somebody who wants the pixels back
-    // properly wants fullscreen, which F11 gives and which persists per profile.
+    // Named choices avoid clipped controls from arbitrary pixel heights.
+    // Hidden removes chrome without asking the compositor for fullscreen.
     let window_group = adw::PreferencesGroup::builder().title("Game window").build();
     // Order has to match TitleBar::index/from_index.
-    let bar_model = gtk::StringList::new(&["Default", "Compact"]);
+    let bar_model = gtk::StringList::new(crate::shell_config::TitleBar::LABELS);
     let bar_row = adw::ComboRow::builder()
         .title("Title bar")
-        .subtitle("Default matches every other window on your desktop.")
         .model(&bar_model)
         .selected(config_for_bar.borrow().title_bar.index())
         .build();
@@ -243,7 +239,7 @@ fn add_appearance_groups(page: &adw::PreferencesPage, config: Rc<RefCell<ShellCo
     // Says when it applies, because it does not apply to a window already open
     // and a setting that appears to do nothing is worse than one that explains
     // itself.
-    bar_row.set_subtitle("Default matches every other window on your desktop. Applies to the next launch.");
+    bar_row.set_subtitle("Hidden removes the title bar without fullscreen. Applies to the next launch.");
     window_group.add(&bar_row);
     page.add(&window_group);
 

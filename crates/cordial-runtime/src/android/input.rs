@@ -3283,28 +3283,52 @@ mod tests {
     }
 
     #[test]
-    fn keysym_to_char_is_not_limited_to_one_script() {
-        // The two arithmetic ranges, which this file resolves itself.
-        assert_eq!(super::keysym_to_char(0x0061), Some('a')); // Latin-1
-        assert_eq!(super::keysym_to_char(0x01000430), Some('а')); // Unicode keysym
-        // Cyrillic is what was reported broken, so it is pinned by value.
-        assert_eq!(super::keysym_to_char(0x06a4), Some('є'));
-        assert_eq!(super::keysym_to_char(0x06ad), Some('ґ'));
-        assert_eq!(super::keysym_to_char(0x06c1), Some('а'));
-        assert_eq!(super::keysym_to_char(0x06e1), Some('А'));
-        // The rest are the point of asking the library rather than shipping a
-        // table: a Cyrillic-only map answered `None` for every one of these,
-        // on exactly the host it claimed to serve. Asserted as "resolves at
-        // all" rather than by codepoint, so the test states the property that
-        // matters without turning into a second hand-maintained map.
-        for (keysym, script) in
-            [(0x07e1u64, "Greek"), (0x0ce0, "Hebrew"), (0x05c7, "Arabic"), (0x0aa1, "typographic")]
-        {
-            assert!(
-                super::keysym_to_char(keysym as std::ffi::c_ulong).is_some(),
-                "{script} keysym {keysym:#x} resolved to nothing"
-            );
+    fn keysym_to_char_agrees_with_libxkbcommon_everywhere() {
+        // Not a list of scripts. Naming Greek, Hebrew and Arabic would still be
+        // a hand-maintained set -- just a longer one than the Cyrillic table it
+        // replaced -- and it would pass while some script nobody thought of
+        // stayed broken. The contract is the whole keysym space: whatever the
+        // library can name, this function returns, with nothing special-cased
+        // on the way. Reintroduce a per-script branch and this fails.
+        extern "C" {
+            fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
+            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
         }
+        let to_utf32: unsafe extern "C" fn(u32) -> u32 = unsafe {
+            let lib = dlopen(c"libxkbcommon.so.0".as_ptr(), 2);
+            if lib.is_null() {
+                // GTK links it into every binary that can start Cordial, so
+                // this is a test-environment gap rather than a pass.
+                eprintln!("libxkbcommon.so.0 not present; nothing to compare against");
+                return;
+            }
+            let p = dlsym(lib, c"xkb_keysym_to_utf32".as_ptr());
+            assert!(!p.is_null());
+            std::mem::transmute(p)
+        };
+
+        // The legacy keysym block, which is every national layout X11 ships,
+        // and the Unicode-keysym range. This file resolves parts of both
+        // arithmetically before the library is consulted, so comparing them
+        // also catches that arithmetic drifting.
+        let mut resolved = 0usize;
+        for k in (0x0020u32..=0x20ff).chain(0x01000100..=0x0100faff) {
+            // Zero is how the library says "this keysym names no character",
+            // not U+0000. Comparing it as `Some('\0')` is what made the first
+            // version of this test fail on `0x7f` (DEL) while the function was
+            // behaving correctly -- the bug was here, not in `keysym_to_char`.
+            let theirs = match unsafe { to_utf32(k) } {
+                0 => None,
+                cp => char::from_u32(cp),
+            };
+            let ours = super::keysym_to_char(k as std::ffi::c_ulong);
+            assert_eq!(ours, theirs, "keysym {k:#x} disagrees with libxkbcommon");
+            if theirs.is_some() {
+                resolved += 1;
+            }
+        }
+        // Guards against the loop silently comparing nothing at all.
+        assert!(resolved > 1000, "only {resolved} keysyms resolved; the comparison did not run");
     }
 
 }

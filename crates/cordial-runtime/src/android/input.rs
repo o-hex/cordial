@@ -139,10 +139,19 @@ pub fn keysym_to_android(keysym: c_ulong) -> Option<i32> {
 /// Xlib's lookup only produces Latin-1, so on a Cyrillic layout it returns no
 /// bytes and the letter never reached a TextBox. Two ranges are arithmetic
 /// (Unicode keysyms and Latin-1); everything else asks libxkbcommon, which
-/// shares X11's keysym numbering. It is `dlopen`ed rather than linked because
-/// the X11 backend is a diagnostic fallback that must not add a hard
-/// dependency. The table at the end covers only the Cyrillic block, for a host
-/// with no libxkbcommon, and a test checks it against the library.
+/// shares X11's keysym numbering -- and therefore covers every layout X11 can
+/// name, not a list of scripts maintained here. It is `dlopen`ed rather than
+/// linked so this crate takes no build-time dependency; every binary that can
+/// start Cordial already links `libxkbcommon.so.0` through GTK, so in practice
+/// the lookup is always there.
+///
+/// **A hand-written Cyrillic table used to sit at the end of this file as a
+/// fallback, and it was wrong twice over.** It was unreachable -- the only host
+/// it claimed to serve is one with no libxkbcommon, which is not a host that
+/// got as far as running this code -- and it privileged one script, so that
+/// same imagined host would still have typed nothing in Greek, Hebrew or
+/// Arabic. Locale coverage belongs in the keysym library, not in a map kept
+/// up to date by hand.
 pub fn keysym_to_char(keysym: c_ulong) -> Option<char> {
     let k = keysym as u32;
     if (0x01000100..=0x0110ffff).contains(&k) {
@@ -177,59 +186,7 @@ pub fn keysym_to_char(keysym: c_ulong) -> Option<char> {
             return char::from_u32(cp);
         }
     }
-    cyrillic_keysym_to_char(k)
-}
-
-/// X11's Cyrillic keysyms, without libxkbcommon.
-///
-/// **The letters are in KOI8 order, not alphabetical order.** 0x6c3 is `ц`,
-/// not `в`. An earlier version of this table counted up from `а` and was wrong
-/// for 42 of the 64 letters, which no test noticed because the test host had
-/// libxkbcommon and never reached the table.
-fn cyrillic_keysym_to_char(k: u32) -> Option<char> {
-    const LOWER: [char; 32] = [
-        'ю', 'а', 'б', 'ц', 'д', 'е', 'ф', 'г', 'х', 'и', 'й', 'к', 'л', 'м', 'н', 'о',
-        'п', 'я', 'р', 'с', 'т', 'у', 'ж', 'в', 'ь', 'ы', 'з', 'ш', 'э', 'щ', 'ч', 'ъ',
-    ];
-    const UPPER: [char; 32] = [
-        'Ю', 'А', 'Б', 'Ц', 'Д', 'Е', 'Ф', 'Г', 'Х', 'И', 'Й', 'К', 'Л', 'М', 'Н', 'О',
-        'П', 'Я', 'Р', 'С', 'Т', 'У', 'Ж', 'В', 'Ь', 'Ы', 'З', 'Ш', 'Э', 'Щ', 'Ч', 'Ъ',
-    ];
-    match k {
-        0x06c0..=0x06df => Some(LOWER[(k - 0x06c0) as usize]),
-        0x06e0..=0x06ff => Some(UPPER[(k - 0x06e0) as usize]),
-        0x06a1 => Some('ђ'),
-        0x06a2 => Some('ѓ'),
-        0x06a3 => Some('ё'),
-        0x06a4 => Some('є'),
-        0x06a5 => Some('ѕ'),
-        0x06a6 => Some('і'),
-        0x06a7 => Some('ї'),
-        0x06a8 => Some('ј'),
-        0x06a9 => Some('љ'),
-        0x06aa => Some('њ'),
-        0x06ab => Some('ћ'),
-        0x06ac => Some('ќ'),
-        0x06ad => Some('ґ'),
-        0x06ae => Some('ў'),
-        0x06af => Some('џ'),
-        0x06b1 => Some('Ђ'),
-        0x06b2 => Some('Ѓ'),
-        0x06b3 => Some('Ё'),
-        0x06b4 => Some('Є'),
-        0x06b5 => Some('Ѕ'),
-        0x06b6 => Some('І'),
-        0x06b7 => Some('Ї'),
-        0x06b8 => Some('Ј'),
-        0x06b9 => Some('Љ'),
-        0x06ba => Some('Њ'),
-        0x06bb => Some('Ћ'),
-        0x06bc => Some('Ќ'),
-        0x06bd => Some('Ґ'),
-        0x06be => Some('Ў'),
-        0x06bf => Some('Џ'),
-        _ => None,
-    }
+    None
 }
 
 /// Say that a native the input path wanted is not there — at the first drop,
@@ -3326,48 +3283,28 @@ mod tests {
     }
 
     #[test]
-    fn keysym_to_char_ukrainian() {
+    fn keysym_to_char_is_not_limited_to_one_script() {
+        // The two arithmetic ranges, which this file resolves itself.
+        assert_eq!(super::keysym_to_char(0x0061), Some('a')); // Latin-1
+        assert_eq!(super::keysym_to_char(0x01000430), Some('а')); // Unicode keysym
+        // Cyrillic is what was reported broken, so it is pinned by value.
         assert_eq!(super::keysym_to_char(0x06a4), Some('є'));
-        assert_eq!(super::keysym_to_char(0x06a6), Some('і'));
-        assert_eq!(super::keysym_to_char(0x06a7), Some('ї'));
         assert_eq!(super::keysym_to_char(0x06ad), Some('ґ'));
-        assert_eq!(super::keysym_to_char(0x06b4), Some('Є'));
-        assert_eq!(super::keysym_to_char(0x06b6), Some('І'));
-        assert_eq!(super::keysym_to_char(0x06b7), Some('Ї'));
-        assert_eq!(super::keysym_to_char(0x06bd), Some('Ґ'));
-        assert_eq!(super::keysym_to_char(0x06c0), Some('ю'));
         assert_eq!(super::keysym_to_char(0x06c1), Some('а'));
         assert_eq!(super::keysym_to_char(0x06e1), Some('А'));
-        assert_eq!(super::keysym_to_char(0x0061), Some('a'));
-        assert_eq!(super::keysym_to_char(0x01000430), Some('а'));
+        // The rest are the point of asking the library rather than shipping a
+        // table: a Cyrillic-only map answered `None` for every one of these,
+        // on exactly the host it claimed to serve. Asserted as "resolves at
+        // all" rather than by codepoint, so the test states the property that
+        // matters without turning into a second hand-maintained map.
+        for (keysym, script) in
+            [(0x07e1u64, "Greek"), (0x0ce0, "Hebrew"), (0x05c7, "Arabic"), (0x0aa1, "typographic")]
+        {
+            assert!(
+                super::keysym_to_char(keysym as std::ffi::c_ulong).is_some(),
+                "{script} keysym {keysym:#x} resolved to nothing"
+            );
+        }
     }
 
-    #[test]
-    fn the_cyrillic_fallback_table_agrees_with_libxkbcommon() {
-        // The table is only reached on a host without libxkbcommon, which is
-        // exactly the host a test run does not happen on -- so it is compared
-        // against the library directly, keysym by keysym, rather than trusted.
-        extern "C" {
-            fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
-            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
-        }
-        let to_utf32: unsafe extern "C" fn(u32) -> u32 = unsafe {
-            let lib = dlopen(c"libxkbcommon.so.0".as_ptr(), 2);
-            if lib.is_null() {
-                eprintln!("libxkbcommon.so.0 not present; nothing to compare against");
-                return;
-            }
-            let p = dlsym(lib, c"xkb_keysym_to_utf32".as_ptr());
-            assert!(!p.is_null());
-            std::mem::transmute(p)
-        };
-        let mut compared = 0;
-        for k in 0x06a1u32..=0x06ff {
-            let Some(ours) = super::cyrillic_keysym_to_char(k) else { continue };
-            let theirs = char::from_u32(unsafe { to_utf32(k) });
-            assert_eq!(Some(ours), theirs, "keysym {k:#x}");
-            compared += 1;
-        }
-        assert_eq!(compared, 94, "every entry in the table was compared");
-    }
 }

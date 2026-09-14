@@ -108,9 +108,10 @@ env:
   CORDIAL_DPI_SCALE=<f>              UI density Roblox lays out against.
                                      1.0 is a low-density phone; try 1.5-2
   CORDIAL_PLATFORM_NAME=<name>       what Cordial answers when the engine asks
-                                     which platform it is on. Defaults to Linux,
-                                     one of the engine's own Enum.Platform
-                                     names; =Android is the control run. See
+                                     which platform it is on. Defaults to the
+                                     device profile's: Windows for pc-windows-11,
+                                     Android for android-tablet and roblox-app;
+                                     =Linux is the previous client. See
                                      docs/analysis/platform-identity.md
   CORDIAL_WHEEL_SCALE=<f>            scroll wheel detents per notch (default 1);
                                      negative inverts the direction

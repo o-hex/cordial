@@ -671,27 +671,27 @@ void trace_identity(const char* field) {
 
 /// What Cordial answers when the engine asks which platform it is running on.
 ///
-/// `Linux` is one of the engine's *own* platform names, not a word invented
-/// here: `Android`, `AndroidTV`, `Linux`, `MetaOS`, `SteamOS`, `Windows` and
-/// `XBoxOne` are the standalone platform tokens in libroblox.so's string table,
-/// and they are `Enum.Platform` values. So this is not passing Cordial off as
-/// something else — it is telling the truth in the vocabulary the engine
-/// already has, on a machine that genuinely is Linux.
+/// It follows the profile's device identity (`CORDIAL_DEVICE_PROFILE`, see
+/// `device_identity()` in `native/init_params.cpp`): `pc-windows-11`, the
+/// default, answers `Windows`; `android-tablet` and `roblox-app` answer
+/// `Android`. All of those are the engine's own `Enum.Platform` tokens from
+/// libroblox.so's string table.
 ///
-/// "Never make a stub lie" cuts both ways here. `Windows` would be a lie.
-/// `Android`, which is what Cordial answered until now, is *also* a lie: the
-/// host is a desktop Linux machine with a keyboard and a mouse and no
-/// touchscreen. The engine is already told the last of those through
-/// `PlatformParams.isTouchDevice`, and it does read that one — measured, twice
-/// per cold start — so answering `Android` here contradicted a value the engine
-/// had taken from us. (`isKeyboardDevice` and `isMouseDevice` sit beside it and
-/// are never read at all; see `native/init_params.cpp`'s header. Do not reach
-/// for those two.)
+/// **This used to answer `Linux` for every profile, and the reason given was
+/// that anything else would be a stub lying.** That argument was about this one
+/// string in isolation, and the identity it sat in had already stopped being
+/// the host: the default profile sends a Windows 11 PC User-Agent and
+/// `BuildInfo` model, so `Linux` was the one field contradicting the rest, and
+/// Cordial was the only host on this machine reporting it (mocktail's
+/// `pc-windows-11` answers `Windows`). The profile is the claim the user chose;
+/// every field of it should say the same thing.
 ///
-/// **What this is not.** It has not been established that this is what makes the
-/// client behave as a mobile one; see docs/analysis/platform-identity.md for
-/// what was measured and what was not. It is defensible as the truthful answer
-/// on its own, independently of what it fixes.
+/// **What this is not.** It is not established as the fix for Settings >
+/// Device Preferences lacking the theme selector: neither
+/// `CORDIAL_PLATFORM_NAME=Android` nor `=Windows` brought it back on 2026-09-14,
+/// signed in, same page, override confirmed in the process environment. See
+/// docs/analysis/platform-identity.md for what was measured about the platform
+/// name and what was not.
 ///
 /// It is also not settled whether `getPlatformName` means "the platform this
 /// client runs on" or "the platform this *user* is on", the console-gamertag
@@ -702,13 +702,15 @@ void trace_identity(const char* field) {
 /// `Enum.Platform` until someone has printed `UserInputService:GetPlatform()`
 /// inside a running experience.
 ///
-/// `CORDIAL_PLATFORM_NAME=<name>` overrides it, which is also the control: a
-/// run with `CORDIAL_PLATFORM_NAME=Android` is the pre-change client in the same
-/// session and the same binary, differing in exactly this string.
+/// `CORDIAL_PLATFORM_NAME=<name>` still overrides it, which is also the control:
+/// `CORDIAL_PLATFORM_NAME=Linux` is the previous client in the same session and
+/// the same binary, differing in exactly this string.
+const char* device_platform_name();  // native/init_params.cpp
+
 const char* platform_name() {
     static const std::string v = [] {
         const char* e = getenv("CORDIAL_PLATFORM_NAME");
-        return (e && *e) ? std::string(e) : std::string("Linux");
+        return (e && *e) ? std::string(e) : std::string(device_platform_name());
     }();
     return v.c_str();
 }

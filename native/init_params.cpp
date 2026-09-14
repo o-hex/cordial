@@ -254,6 +254,23 @@ static const char* device_identity_label() {
     return "roblox-app";
 }
 
+/// The `getPlatformName()` answer that goes with the device identity.
+///
+/// Exposed for `android_classes.cpp` so the platform name cannot disagree with
+/// the rest of the identity. It used to answer `"Linux"` whatever this file
+/// said, so the default `pc-windows-11` profile sent a Windows 11 PC User-Agent
+/// and `BuildInfo` model beside a Linux platform name -- the only one of the
+/// three hosts on this machine to report Linux, while mocktail's matching
+/// profile reports Windows.
+const char* device_platform_name() {
+    switch (device_identity()) {
+        case DeviceIdentity::PcWindows11:   return "Windows";
+        case DeviceIdentity::AndroidTablet: return "Android";
+        case DeviceIdentity::RobloxApp:     break;
+    }
+    return "Android";
+}
+
 /// Device-identity strings for surfaces that need brand/model/build fields
 /// without inventing a second `device_identity()` switch.
 ///
@@ -1762,11 +1779,16 @@ public:
         // rather than only against the source, and the User-Agent itself
         // never appears in Cordial's own logs or the engine's FLog output --
         // it goes out on the wire, not into anything grep can reach here.
+        // The platform name is printed with the rest because it is answered
+        // from `android_classes.cpp`, and a run is the only place the two can
+        // be seen to agree; `CORDIAL_PLATFORM_NAME` shows up here too.
+        const char* platform_name();  // native/android_classes.cpp
         std::string ua = build_user_agent();
-        fprintf(stderr, "[cordial] device identity: %s (isTablet=%s, User-Agent: %s)\n",
+        fprintf(stderr,
+                "[cordial] device identity: %s (isTablet=%s, platform=%s, User-Agent: %s)\n",
                 device_identity_label(),
                 device_identity() == DeviceIdentity::AndroidTablet ? "true" : "false",
-                ua.c_str());
+                platform_name(), ua.c_str());
         p->userAgent = S(ua.c_str());
         p->deviceParams = DeviceParams::Create(env, width, height);
         p->platformParams = PlatformParams::Create(env, assets, width, height);

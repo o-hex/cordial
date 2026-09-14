@@ -483,8 +483,10 @@ mod tests {
         // was never explicitly initialised must still work.
         // u64 storage is more aligned than the bionic object requires. The
         // wrapper itself uses only four-byte atomics because bionic condition
-        // variables are allowed to start at four-byte alignment.
-        let mut storage = [0u64; 4];
+        // variables are allowed to start at four-byte alignment. Six words, not
+        // four: the overlay is 48 bytes, and a reference to it over 32 bytes of
+        // storage is undefined behaviour even though only 12 are touched.
+        let mut storage = [0u64; 6];
         let cond = storage.as_mut_ptr() as *mut c_void;
         assert_eq!(cond_signal(cond), 0);
         assert_eq!(cond_broadcast(cond), 0);
@@ -493,7 +495,7 @@ mod tests {
 
     #[test]
     fn init_destroy_roundtrip_does_not_leak_state() {
-        let mut storage = [0u64; 4];
+        let mut storage = [0u64; 6];
         let cond = storage.as_mut_ptr() as *mut c_void;
         assert_eq!(cond_init(cond, std::ptr::null()), 0);
         assert_eq!(cond_destroy(cond), 0);

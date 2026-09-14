@@ -91,6 +91,13 @@ const SCHEMA: &str = "org.cordial.Session";
 /// What a stored body is, as far as the service is concerned.
 const CONTENT_TYPE: &str = "text/plain; charset=utf8";
 
+/// Keep Secret Service values to one ASCII line. The implementation used on
+/// this desktop truncates text values containing cookie-style separators
+/// (newline, tab and `=`), returning only the first comment line on read-back.
+/// Hex encoding makes the service carry the value opaquely while leaving the
+/// file backend and callers' formats unchanged.
+const ENCODED_PREFIX: &str = "cordial-secret-hex-v1:";
+
 /// How long the first question is allowed to take.
 ///
 /// Deliberately short and deliberately on the startup path: if the answer is
@@ -282,7 +289,7 @@ pub fn load(store: Store, dir: &Path, kind: Kind) -> Option<String> {
             if let Some(body) = adopt_file(dir, kind) {
                 return Some(body);
             }
-            match ask(Ask::Read(attributes(dir, kind)), CALL_TIMEOUT) {
+            match read_keyring(&attributes(dir, kind)) {
                 Ok(body) => body,
                 Err(why) => {
                     println!("  [secrets] {}: not read back ({why}); signed out", kind.name());
@@ -291,6 +298,50 @@ pub fn load(store: Store, dir: &Path, kind: Kind) -> Option<String> {
             }
         }
     }
+}
+
+fn read_keyring(attrs: &HashMap<String, String>) -> Answer {
+    match ask(Ask::Read(attrs.clone()), CALL_TIMEOUT)? {
+        Some(stored) if stored.starts_with(ENCODED_PREFIX) => decode_keyring(&stored)
+            .map(Some)
+            .ok_or_else(|| "the stored session has an invalid encoding".to_string()),
+        // Older releases wrote the body directly. Keep those values readable
+        // (identity is a single-line JSON value); cookie stores that were
+        // truncated by the service will simply parse as empty and be replaced
+        // after the next sign-in.
+        Some(stored) => Ok(Some(stored)),
+        None => Ok(None),
+    }
+}
+
+fn encode_keyring(body: &str) -> String {
+    let mut encoded = String::with_capacity(ENCODED_PREFIX.len() + body.len() * 2);
+    encoded.push_str(ENCODED_PREFIX);
+    for byte in body.as_bytes() {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_keyring(stored: &str) -> Option<String> {
+    let hex = stored.strip_prefix(ENCODED_PREFIX)?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let mut chars = hex.bytes();
+    while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
+        let nibble = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        };
+        bytes.push((nibble(hi)? << 4) | nibble(lo)?);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Write a body, or say plainly that it was not written.
@@ -307,7 +358,7 @@ pub fn save(store: Store, dir: &Path, kind: Kind, body: &str) -> std::io::Result
             Ask::Write {
                 attrs: attributes(dir, kind),
                 label: kind.label(dir),
-                body: body.to_string(),
+                body: encode_keyring(body),
             },
             CALL_TIMEOUT,
         ) {
@@ -462,7 +513,7 @@ fn adopt_file(dir: &Path, kind: Kind) -> Option<String> {
         Ask::Write {
             attrs: attributes(dir, kind),
             label: kind.label(dir),
-            body: body.clone(),
+            body: encode_keyring(&body),
         },
         CALL_TIMEOUT,
     );
@@ -477,7 +528,7 @@ fn adopt_file(dir: &Path, kind: Kind) -> Option<String> {
         return Some(body);
     }
 
-    match ask(Ask::Read(attributes(dir, kind)), CALL_TIMEOUT) {
+    match read_keyring(&attributes(dir, kind)) {
         Ok(Some(back)) if back == body => match shred(&path) {
             Ok(()) => {
                 println!(

@@ -836,6 +836,10 @@ pub struct ShellConfig {
     /// Turning it on is choosing to hand a credential to the engine in exchange
     /// for not typing a password. A reasonable trade to offer, and not one to
     /// make on somebody's behalf.
+    ///
+    /// This controls engine forwarding only. Browser account routing redeems
+    /// and removes the ticket separately; `CORDIAL_BROWSER_ACCOUNT_ROUTING=0`
+    /// disables that lookup. See ADR-035 for the credential-use decision.
     #[serde(default)]
     pub carry_launch_ticket: bool,
     pub mangohud: bool,

@@ -447,10 +447,8 @@ pub fn spawn(
     // are some: an empty variable and an absent one mean the same thing to
     // `manifest::unpacked_dirs`, and sending an empty one would put a
     // developer-mode marker in the environment of every ordinary launch.
-    // The browser's sign-in ticket, and only when asked for. Absent is the
-    // client's own default, so an off switch sends nothing rather than sending
-    // a "no" -- and a live credential does not move because a variable was set
-    // to the wrong string.
+    // Engine forwarding is opt-in. Automatic account routing consumes and
+    // removes the ticket earlier, independently of this switch (ADR-035).
     if config.carry_launch_ticket {
         command.env("CORDIAL_DEEPLINK_CARRY_TICKET", "1");
     }

@@ -24,7 +24,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::chooser;
-use crate::deep_link;
 use crate::install::{self, NotFound};
 use crate::instructions;
 use crate::root_warning;
@@ -39,100 +38,52 @@ use crate::window_state;
 use cordial_shell::host_window::HostWindow;
 use cordial_shell::profile;
 
-/// A `roblox-player://` link the desktop handed over, held until the user
-/// presses Roblox.
-///
-/// **Deliberately not a launch.** A link could start the client outright, and
-/// that is what a browser handler usually does; here it would skip the two
-/// decisions the launcher exists to take — which profile, and against which
-/// build — and it would do it in response to a click in another application.
-/// So the link opens the launcher, the launcher says a join is waiting, and the
-/// user presses Roblox as they otherwise would.
-///
-/// The banner is not decoration either. A link that vanished into a variable
-/// would be indistinguishable from a link that was dropped, and "it ignored my
-/// click" is the report that follows.
-#[derive(Clone)]
-pub struct PendingJoin {
-    url: Rc<RefCell<Option<String>>>,
-    banner: adw::Banner,
+mod browser_join;
+
+#[cfg(test)]
+#[path = "window/browser_lifecycle_tests.rs"]
+mod browser_lifecycle_tests;
+
+#[cfg(test)]
+use browser_join::banner_line;
+pub use browser_join::{PendingJoin, Shell};
+
+#[derive(Clone, Default)]
+struct LaunchLifecycle {
+    active_clients: Rc<Cell<usize>>,
 }
 
-impl PendingJoin {
-    fn new() -> Self {
-        let banner = adw::Banner::builder().revealed(false).button_label("Discard").build();
-        let url: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        {
-            // A queued join the user cannot get rid of is a trap: the next
-            // launch would carry a link they have changed their mind about, and
-            // the only way out would be closing the launcher.
-            let url = url.clone();
-            banner.connect_button_clicked(move |banner| {
-                *url.borrow_mut() = None;
-                banner.set_revealed(false);
-            });
-        }
-        PendingJoin { url, banner }
+impl LaunchLifecycle {
+    fn client_started(&self) {
+        self.active_clients.set(self.active_clients.get() + 1);
     }
 
-    /// Show a link as waiting. Replaces whatever was queued: two links means the
-    /// second click is the one the user is looking at.
-    pub fn queue(&self, url: String) {
-        self.banner.set_title(&banner_line(&url));
-        self.banner.set_revealed(true);
-        *self.url.borrow_mut() = Some(url);
-    }
-
-    /// What the next launch should carry, without consuming it: a launch that
-    /// fails must leave the link where it was, or a busy profile would cost the
-    /// user the link as well as the launch.
-    fn peek(&self) -> Option<String> {
-        self.url.borrow().clone()
-    }
-
-    fn clear(&self) {
-        *self.url.borrow_mut() = None;
-        self.banner.set_revealed(false);
-    }
-
-    fn banner(&self) -> &adw::Banner {
-        &self.banner
+    fn client_finished(&self) -> usize {
+        let remaining = self.active_clients.get() - 1;
+        self.active_clients.set(remaining);
+        remaining
     }
 }
 
-/// What the banner says about a waiting link.
-///
-/// Pure, and separate from the widget, for the reason `busy_body` is: a string
-/// that can only be inspected by building a window and photographing it is a
-/// string that drifts. It also has one genuine hazard in it — `AdwBanner`'s
-/// title is Pango markup and this text came from a browser, so an unescaped `&`
-/// in a query string is enough to make GTK drop the label, and anything sharper
-/// is worse than that.
-fn banner_line(url: &str) -> String {
-    let shown = glib::markup_escape_text(&deep_link::summarise(url));
-    format!("Roblox link waiting: {shown} — press Roblox to join")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitPresentation {
+    Keep,
+    Close,
+    Crash,
 }
 
-/// The running shell, for the handful of things that happen to it from outside.
-///
-/// `main.rs` holds one so that a second invocation carrying a link — which is
-/// what the desktop does when a browser opens `roblox-player://` while Cordial
-/// is up — reaches the window that already exists rather than starting another.
-pub struct Shell {
-    window: adw::Window,
-    join: PendingJoin,
-}
-
-impl Shell {
-    /// Bring the launcher forward and show the link as waiting.
-    pub fn queue_join(&self, url: String) {
-        self.join.queue(url);
-        self.window.present();
-    }
-
-    /// Bring the launcher forward, for a second invocation carrying nothing.
-    pub fn present(&self) {
-        self.window.present();
+const fn exit_presentation(
+    crashed: bool,
+    remaining_clients: usize,
+    picker_visible: bool,
+    lookup_pending: bool,
+) -> ExitPresentation {
+    if crashed {
+        ExitPresentation::Crash
+    } else if remaining_clients == 0 && !picker_visible && !lookup_pending {
+        ExitPresentation::Close
+    } else {
+        ExitPresentation::Keep
     }
 }
 
@@ -167,7 +118,11 @@ const EARLY_EXIT_CHECK: std::time::Duration = std::time::Duration::from_secs(3);
 /// it is customised by pointing at a file, never by shipping alternatives:
 /// Roblox's own icons are their assets, and AGENTS.md rules out vendoring any
 /// of them however small.
-fn starting_dialog(parent: &gtk::Window, profile: &str, joining: bool) -> gtk::Window {
+fn starting_dialog(parent: &gtk::Window, profile: &str, joining: bool) -> Option<gtk::Window> {
+    // Browser auto-launch has no launcher surface or progress animation.
+    if !parent.is_visible() {
+        return None;
+    }
     let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
     content.set_margin_top(28);
     content.set_margin_bottom(24);
@@ -230,7 +185,7 @@ fn starting_dialog(parent: &gtk::Window, profile: &str, joining: bool) -> gtk::W
     });
 
     dialog.present();
-    dialog
+    Some(dialog)
 }
 
 
@@ -251,15 +206,17 @@ pub fn build(
     // Empty and hidden until the desktop hands over a link, which on most runs
     // is never; `AdwBanner` takes no space while it is not revealed.
     let join = PendingJoin::new();
+    let lifecycle = LaunchLifecycle::default();
 
     let chooser_widget = {
         let toasts = toasts.clone();
         let config = config.clone();
         let join = join.clone();
+        let lifecycle = lifecycle.clone();
         chooser::build(&source, move |id| {
             let Some(window) = toasts.root().and_downcast::<gtk::Window>() else { return };
             match id {
-                chooser::ROBLOX => activate_roblox(&window, &toasts, &config, &join),
+                chooser::ROBLOX => activate_roblox(&window, &toasts, &config, &join, &lifecycle),
                 // Unreachable while there is one entry, and deliberately loud
                 // rather than ignored: the moment plugin-contributed entries
                 // exist, an id core does not know how to launch is a bug in the
@@ -437,6 +394,10 @@ pub fn build(
     let settings_action =
         gtk::gio::SimpleAction::new("settings", Some(glib::VariantTy::STRING));
     let window_for_settings = window.clone();
+    let browser_shell = Shell {
+        window: window.clone(), join: join.clone(), config: config.clone(),
+        config_path: config_path.clone(), refresh_profiles: refresh_profile_row.clone(),
+    };
     settings_action.connect_activate(move |_, page| {
         let settings = settings::build_preferences_window(
             &window_for_settings,
@@ -544,8 +505,15 @@ pub fn build(
         let toasts = toasts.clone();
         let config = config_for_launch;
         let join = join.clone();
+        let lifecycle = lifecycle.clone();
         launch_action.connect_activate(move |_, _| {
-            activate_roblox(&window.clone().upcast(), &toasts, &config, &join);
+            // Re-queueing the same value is deliberate: `PendingJoin` gives
+            // every queue entry a distinct `Rc`, and the account lookup uses
+            // that identity to reject a late result. Do it before root
+            // confirmation, build discovery or profile acquisition can return,
+            // while retaining the URL for a manual retry if any of them does.
+            join.invalidate_lookup(&config.borrow().profile);
+            activate_roblox(&window.clone().upcast(), &toasts, &config, &join, &lifecycle);
         });
     }
 
@@ -699,7 +667,11 @@ pub fn build(
     {
         let config = config_for_window_state.clone();
         let pending = pending_size_save.clone();
+        let join = join.clone();
         window.connect_close_request(move |w| {
+            // Closing a visible picker cancels its pending lookup. Visibility
+            // itself cannot be the cancellation signal: browser starts are hidden.
+            join.clear();
             if let Some(id) = pending.take() {
                 id.remove();
                 persist_window_size(&config, w);
@@ -717,13 +689,8 @@ pub fn build(
     // and neither is more obviously meant than the other.
     GtkWindowExt::set_focus(&window, Some(&chooser_widget));
 
-    window.present();
-    // After `present()`, not before: every other place this window is put into
-    // or out of fullscreen (`fullscreen_action` above, `HostWindow::set_fullscreen`)
-    // does it to an already-mapped window, and there is no precedent here for
-    // asking an unmapped one. See `window_state.rs`'s header for why doing this
-    // unconditionally is the right call for this window and must not be copied
-    // uncritically onto the engine's own.
+    // Construct without mapping: browser joins only need the picker on fallback.
+    // GTK remembers these state requests until an explicit presentation.
     // Before fullscreen, so that a window saved as both comes back as both and
     // leaving fullscreen drops it to maximised rather than to its floating
     // size -- which is what a user who maximised it and then fullscreened it
@@ -746,7 +713,7 @@ pub fn build(
     // belongs instead.
     refresh_watch::watch(&window, |_outputs| {});
 
-    Shell { window, join }
+    browser_shell
 }
 
 /// How long to wait after the last `notify::default-width`/`default-height`
@@ -921,6 +888,7 @@ fn activate_roblox(
     toasts: &adw::ToastOverlay,
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
+    lifecycle: &LaunchLifecycle,
 ) {
     // Root gets one warning before it costs an hour. See `root_warning`: no
     // session bus means no PipeWire, and the engine calls `abort()` at
@@ -928,42 +896,70 @@ fn activate_roblox(
     // crash, not as an audio problem. Not a refusal: on FreeBSD's linuxulator
     // there is no other user, so refusing would refuse the platform.
     if root_warning::running_as_root() {
+        window.present();
         let window = window.clone();
         let toasts = toasts.clone();
         let config = config.clone();
         let join = join.clone();
+        let lifecycle = lifecycle.clone();
         root_warning::confirm(&window.clone(), move || {
-            launch_now(&window, &toasts, &config, &join);
+            launch_now_tracked(&window, &toasts, &config, &join, &lifecycle);
         });
         return;
     }
-    launch_now(window, toasts, config, join);
+    launch_now_tracked(window, toasts, config, join, lifecycle);
 }
 
 /// The launch itself, once anything that had to be asked has been.
+fn launch_now_tracked(
+    window: &gtk::Window,
+    toasts: &adw::ToastOverlay,
+    config: &Rc<RefCell<ShellConfig>>,
+    join: &PendingJoin,
+    lifecycle: &LaunchLifecycle,
+) {
+    match try_launch_tracked(window, config, join, lifecycle) {
+        Outcome::Started => {}
+        Outcome::Failed(message) => {
+            window.present();
+            alert(window, "Roblox could not start", &message);
+        }
+        Outcome::ProfileBusy(name, holder) => {
+            window.present();
+            profile_busy(window, toasts, config, join, lifecycle, &name, holder)
+        }
+        Outcome::ProfileChanged => {
+            window.present();
+            join.banner().set_title(
+                "Roblox link waiting — the matched profile changed; choose a profile and press Roblox",
+            );
+        }
+        Outcome::NoBuild => {
+            window.present();
+            let window = window.clone();
+            let config = config.clone();
+            let join = join.clone();
+            let lifecycle = lifecycle.clone();
+            instructions::present(&window.clone(), move || {
+                // Returning whether it worked is what lets the instructions
+                // window stay up while the user is still following them.
+                matches!(
+                    try_launch_tracked(&window, &config, &join, &lifecycle),
+                    Outcome::Started
+                )
+            });
+        }
+    }
+}
+
+#[cfg(test)]
 fn launch_now(
     window: &gtk::Window,
     toasts: &adw::ToastOverlay,
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
 ) {
-    match try_launch(window, config, join) {
-        Outcome::Started => {}
-        Outcome::Failed(message) => alert(window, "Roblox could not start", &message),
-        Outcome::ProfileBusy(name, holder) => {
-            profile_busy(window, toasts, config, join, &name, holder)
-        }
-        Outcome::NoBuild => {
-            let window = window.clone();
-            let config = config.clone();
-            let join = join.clone();
-            instructions::present(&window.clone(), move || {
-                // Returning whether it worked is what lets the instructions
-                // window stay up while the user is still following them.
-                matches!(try_launch(&window, &config, &join), Outcome::Started)
-            });
-        }
-    }
+    launch_now_tracked(window, toasts, config, join, &LaunchLifecycle::default());
 }
 
 enum Outcome {
@@ -978,16 +974,21 @@ enum Outcome {
     /// and that was the misleading part — the holder frequently has no window,
     /// which is exactly what makes this hard to recover from unaided.
     ProfileBusy(String, Option<profile::Holder>),
+    /// Account routing matched one session, but that profile changed before its
+    /// lock could bind the decision to a launch. The ticketless join remains
+    /// queued for an explicit choice instead.
+    ProfileChanged,
     Failed(String),
 }
 
 /// No `ToastOverlay` any more: the "Starting Roblox" toast this used to raise
 /// is now the loading dialog, which says the same thing and stays up for as
 /// long as it is true.
-fn try_launch(
+fn try_launch_tracked(
     window: &gtk::Window,
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
+    lifecycle: &LaunchLifecycle,
 ) -> Outcome {
     let (roblox, profile_name) = {
         let config = config.borrow();
@@ -1024,6 +1025,15 @@ fn try_launch(
         Err(e) => return Outcome::Failed(e.to_string()),
     };
 
+    // Account routing authenticated exact identity and cookie bytes before the
+    // old client released this lock. Bind that evidence to the lock now: if the
+    // files changed in between, the name no longer identifies the session that
+    // was authenticated. Returning drops the claim before manual recovery.
+    if !join.matched_profile_is_current(&profile_name, claim.profile_dir()) {
+        join.clear_profile_match();
+        return Outcome::ProfileChanged;
+    }
+
     // Read rather than taken: everything above this can still refuse, and a
     // busy profile that also cost the user their link would be two failures for
     // one press. It is cleared below, once there is a process holding it.
@@ -1033,6 +1043,7 @@ fn try_launch(
         Err(message) => return Outcome::Failed(message),
     };
     join.clear();
+    lifecycle.client_started();
 
     let starting = starting_dialog(&window, &profile_name, url.is_some());
 
@@ -1060,9 +1071,8 @@ fn try_launch(
     // by source priority, and the shared `Cell` only has to make the close
     // idempotent. A `Cell` suffices for that because both callbacks run on the
     // GTK main context, on this thread, one at a time.
-    let dialog_closed = Rc::new(Cell::new(false));
-    {
-        let starting = starting.clone();
+    let dialog_closed = Rc::new(Cell::new(starting.is_none()));
+    if let Some(starting) = starting.clone() {
         let dialog_closed = dialog_closed.clone();
         glib::timeout_add_local_once(EARLY_EXIT_CHECK, move || {
             if !dialog_closed.replace(true) {
@@ -1101,6 +1111,8 @@ fn try_launch(
     let hold = window.application().map(|app| app.hold());
 
     let window = window.clone();
+    let join = join.clone();
+    let lifecycle = lifecycle.clone();
     let pid = glib::Pid(instance.pid() as i32);
     glib::child_watch_add_local(pid, move |_, wait_status| {
         // Named rather than left to the closure's drop, because *when* it is
@@ -1108,18 +1120,22 @@ fn try_launch(
         // the crash page below has been put on screen.
         let _released_once_this_client_is_gone = &hold;
         if !dialog_closed.replace(true) {
-            starting.close();
+            if let Some(starting) = &starting {
+                starting.close();
+            }
         }
+        let remaining_clients = lifecycle.client_finished();
         // A closed launcher window must not pop a crash page on top of the
         // desktop the user went back to. Under ADR-012 closing it while a
         // client runs is the ordinary case -- and note that this now tests the
-        // *window*, not the process: the hold above means the launcher is
-        // still here, deliberately, holding the client's pipes open. The poll
+        // application's ownership, not visibility: a browser-started launcher
+        // is hidden but has not been closed. The hold above keeps the process
+        // here, deliberately, holding the client's pipes open. The poll
         // this replaces returned `Break` here; a child watch has no
         // equivalent, and it does not need one -- the source removes itself
         // once the child has exited, and until then the only thing this check
         // costs is the branch.
-        if !window.is_visible() {
+        if window.application().is_none() {
             return;
         }
         // GLib hands back the raw `waitpid` status, which is exactly what
@@ -1139,11 +1155,38 @@ fn try_launch(
         // two paths was taken, and the output belongs on the page and nowhere
         // else. `println!` here would be a second sink for text `launch.rs`
         // took care to keep in memory.
-        if crash::is_crash(&status, &output) {
-            println!("  shell: the client {status}; showing the crash page");
-            crash::present(&window, &status, &instance.command_line, &output);
-        } else {
-            println!("  shell: the client exited cleanly ({status}); no crash page");
+        let presentation = exit_presentation(
+            crash::is_crash(&status, &output),
+            remaining_clients,
+            window.is_visible(),
+            join.peek().is_some(),
+        );
+        match presentation {
+            ExitPresentation::Crash => {
+                println!("  shell: the client {status}; showing the crash page");
+                window.present();
+                crash::present(&window, &status, &instance.command_line, &output);
+            }
+            ExitPresentation::Close => {
+                println!("  shell: the client exited cleanly ({status}); no crash page");
+                // A browser launch never mapped its picker, but the registered
+                // window still counts as an application window after this
+                // callback releases its hold. Close only the final clean
+                // client's hidden, idle launcher: another client still needs
+                // its pipe lifetime, while a queued lookup still needs
+                // somewhere to dispatch. `close()` is only a request and does
+                // not remove a never-mapped GTK window, measured by the
+                // lifecycle regression below, so quitting its application is
+                // the necessary second half. The callback still owns `hold`
+                // until both calls return, preserving ADR-031's pipe lifetime.
+                window.close();
+                if let Some(app) = window.application() {
+                    app.quit();
+                }
+            }
+            ExitPresentation::Keep => {
+                println!("  shell: the client exited cleanly ({status}); no crash page");
+            }
         }
     });
 
@@ -1186,6 +1229,7 @@ fn profile_busy(
     toasts: &adw::ToastOverlay,
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
+    lifecycle: &LaunchLifecycle,
     name: &str,
     holder: Option<profile::Holder>,
 ) {
@@ -1223,6 +1267,7 @@ fn profile_busy(
     let toasts = toasts.clone();
     let config = config.clone();
     let join = join.clone();
+    let lifecycle = lifecycle.clone();
     dialog.connect_response(None, move |_, response| {
         match response {
         // The switcher is the combo row above the launch button; activating the
@@ -1238,6 +1283,7 @@ fn profile_busy(
                     toasts.clone(),
                     config.clone(),
                     join.clone(),
+                    lifecycle.clone(),
                     h,
                 );
             }
@@ -1297,6 +1343,7 @@ fn close_then_launch(
     toasts: adw::ToastOverlay,
     config: Rc<RefCell<ShellConfig>>,
     join: PendingJoin,
+    lifecycle: LaunchLifecycle,
     holder: profile::Holder,
 ) {
     if let Err(message) = holder.ask_to_stop() {
@@ -1314,7 +1361,7 @@ fn close_then_launch(
 
     glib::timeout_add_local(STOP_POLL, move || {
         if holder.has_exited() {
-            activate_roblox(&window, &toasts, &config, &join);
+            activate_roblox(&window, &toasts, &config, &join, &lifecycle);
             return glib::ControlFlow::Break;
         }
         waited.set(waited.get() + STOP_POLL);

@@ -669,14 +669,14 @@ fn build_session_group(
     // **In Session rather than anywhere else**, because it is about what
     // happens when a launch arrives rather than about graphics or plugins.
     let ticket = adw::SwitchRow::builder()
-        .title("Sign in from browser launches")
+        .title("Forward browser sign-in tickets to the engine")
         // The row says what it does; the two reasons it is off by default are
         // behind the detail button, and both still have to be somewhere. It
         // moves a credential, which is why somebody might say no, and it is
         // unverified, which is why it might do nothing. A row that promised
         // the feature and silently failed would be the stub-that-lies shape in
         // an interface.
-        .subtitle("Clicking play on the website does not ask you to sign in again.")
+        .subtitle("For manual browser launches; engine support is unverified.")
         .active(config.borrow().carry_launch_ticket)
         .build();
     ticket.set_subtitle_lines(2);
@@ -684,7 +684,9 @@ fn build_session_group(
         "Roblox puts a one-time sign-in ticket in a play link, and this passes it \
          through to the engine.\n\nOff by default for two separate reasons: it moves a \
          credential, and it is not yet confirmed that this engine accepts one, so it \
-         may simply do nothing.",
+         may simply do nothing.\n\nAutomatic account matching uses the ticket separately \
+         and removes it before launch. Set CORDIAL_BROWSER_ACCOUNT_ROUTING=0 to disable \
+         automatic matching.",
     ));
     {
         let config = config.clone();

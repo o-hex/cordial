@@ -391,6 +391,12 @@ legal.
 authenticate or know anything about accounts — it selects a directory. Cordial
 never sees a password.
 
+**Extended by [ADR-035](ADR-035-browser-account-routing.md):** the manual
+switcher still selects a directory, but browser routing now redeems a launch
+ticket and compares account IDs to select an existing profile automatically.
+The directory-only description below records the earlier design; it no longer
+describes every selection path in the shell.
+
 > The rest of this point read "and never stores a session token itself; Roblox
 > does that, inside the profile." That is no longer true and was never true of
 > the engine: Cordial stores the session token, because nothing else does. See

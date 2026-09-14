@@ -321,7 +321,7 @@ pub fn build(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> Choo
     group.add(&row);
     let returned_row = row.clone();
 
-    let refresh: Rc<dyn Fn()> = Rc::new(move || switcher.describe());
+    let refresh: Rc<dyn Fn()> = Rc::new(move || switcher.refresh());
     Chooser { group, row: returned_row, refresh }
 }
 

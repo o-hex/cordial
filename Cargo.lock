@@ -353,8 +353,11 @@ dependencies = [
  "libadwaita",
  "libc",
  "minisign-verify",
+ "percent-encoding",
  "serde",
  "serde_json",
+ "tempfile",
+ "ureq",
  "webkit6",
  "zip",
 ]

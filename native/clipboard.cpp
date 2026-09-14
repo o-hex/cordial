@@ -289,13 +289,14 @@ public:
 /// why voice could not ask for the mic at all.
 ///
 /// The descriptor `run(Ljava/lang/String;Ljava/lang/String;)V` is read out of
-/// the dex `method_ids` table, not inferred. **Which of the two strings is the
-/// request and which the handler id is INFERRED**, and so is the argument order
-/// of `callResponseHandlerRaw`. Rather than guess the first, the payload is
-/// taken to be whichever argument is a JSON object, and the other is the id.
-/// The second is assumed to be `(id, response)`, the order the method's name
-/// reads in; if the engine logs `PermissionsProtocolCore: Invalid response
-/// received.` with a request line printed here beside it, suspect that first.
+/// the dex `method_ids` table, not inferred. The payload is taken to be
+/// whichever argument is a JSON object, and the other is the id -- in practice
+/// the method id, e.g. `"PermissionsProtocol.PermissionsRequest"`.
+/// `callResponseHandlerRaw` takes `(id, response)`. Both were measured in a
+/// voice place on 2026-09-13/14, not read off the names: the delivered
+/// `AUTHORIZED` answer produced no `PermissionsProtocolCore: Invalid response
+/// received.`, and the swapped order ended the run at the first answer (see
+/// the delivery block below).
 class MessageBusRequestHandlerAsyncRaw : public Object {
 public:
     int (*sink)(const char* request, char* out, size_t out_len) = nullptr;
@@ -328,6 +329,15 @@ public:
         if (!answered || !h->respond || !env) {
             return;
         }
+        // The order is (id, response), and that is measured, not read off the
+        // method's name: on 2026-09-14 the swapped order ended the run at the
+        // first answer with `RBXCRASH: UnhandledException (bad_function_call)`,
+        // the engine having looked up a handler by the JSON and called the empty
+        // one it got back. The id is the method id, e.g.
+        // "PermissionsProtocol.HasPermissions". Answering from another thread
+        // after run() returned killed the run the same way, so it stays inline.
+        fprintf(stderr, "[messagebus] async response to %s: id=\"%s\" response=%s\n", name,
+                id.c_str(), out);
         try {
             auto cls = env->GetClass("com/roblox/universalapp/messagebus/MessageBus");
             auto jid = std::make_shared<String>(id);

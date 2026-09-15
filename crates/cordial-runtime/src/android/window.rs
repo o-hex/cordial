@@ -219,6 +219,11 @@ struct PointerLockState {
     locked: bool,
     suppressed: bool,
     ignore_next_warp: bool,
+    /// Consecutive locked `MotionNotify` events discarded while waiting for
+    /// the confirmed echo of the last recentring warp. See
+    /// [`locked_pointer_delta`] for why a single check on the very next event
+    /// was not enough, and [`MAX_WARP_ECHO_WAIT`] for the bound.
+    warp_echo_wait: u8,
     centre: (i32, i32),
     saved_root: Option<(i32, i32)>,
 }
@@ -229,6 +234,7 @@ impl PointerLockState {
             locked: false,
             suppressed: false,
             ignore_next_warp: false,
+            warp_echo_wait: 0,
             centre: (0, 0),
             saved_root: None,
         }
@@ -700,10 +706,58 @@ fn pointer_lock_decision(
     (asked && !suppressed, suppressed)
 }
 
-/// The relative motion implied by one `MotionNotify` while the pointer is
-/// locked, or `None` if the event is the synthetic echo of this backend's own
-/// `XWarpPointer` call back to the centre and must be swallowed rather than
-/// reported as movement.
+/// Bound on how many consecutive locked `MotionNotify` events
+/// [`locked_pointer_delta`] discards while waiting for the confirmed echo of
+/// a recentring warp, before giving up and trusting the next one regardless.
+///
+/// It exists because `XWarpPointer` onto a pixel the pointer already
+/// occupies generates no `MotionNotify` at all -- X does not report a
+/// position that did not change -- so there is no unbounded wait that is
+/// safe: without this, that one coincidence would discard camera input for
+/// the rest of the lock. Four is arbitrary but generous: the steady-state
+/// case (nothing else moved the mouse in between) confirms on the very next
+/// event, so this bound is only ever exercised by the pathological case it
+/// guards against, not by ordinary play.
+const MAX_WARP_ECHO_WAIT: u8 = 4;
+
+/// What [`locked_pointer_delta`] decided about one locked `MotionNotify`.
+#[derive(Debug, PartialEq, Eq)]
+enum LockedMotion {
+    /// The confirmed echo of the recentring warp, or an event that
+    /// coincidentally lands exactly on `centre` -- either way its delta is
+    /// zero, so the two cases need not be told apart. Clears the wait latch.
+    Echo,
+    /// Not the echo, and still within [`MAX_WARP_ECHO_WAIT`] of the warp that
+    /// is being waited for, so discarded rather than trusted.
+    Waiting,
+    /// A real relative motion to report.
+    Real(i32, i32),
+}
+
+/// What one `MotionNotify` means while the pointer is locked, or whether it
+/// must be discarded instead of reported as camera movement.
+///
+/// Two different things get discarded here, and conflating them was the
+/// X11-180 bug in #41. One is the literal echo of this backend's own
+/// `XWarpPointer` call landing back on `centre`. The other is anything still
+/// arriving from *before* the lock was taken: the pointer is free-roaming
+/// right up to the instant a camera-drag button or the engine's own
+/// `SetMouseBehavior(LockCenter)` engages the lock, and X11 guarantees event
+/// ordering on one connection -- a `MotionNotify` generated before this
+/// backend's `XGrabPointer`+`XWarpPointer` request is necessarily delivered
+/// no later than that request's own echo, never after it. The version of
+/// this function that shipped only ever checked the *immediate* next event:
+/// if a stray in-flight motion sample arrived first, it was read as real
+/// motion relative to `centre` rather than discarded, and a pointer that
+/// happened to be sitting near a window edge -- exactly where a free cursor
+/// tends to be right when the user has just clicked something there -- at
+/// the instant the lock engaged reported that stale absolute position as a
+/// multi-hundred-pixel relative delta in one frame: a one-shot spin, worst
+/// at the edges, which is the shape #41 reports and the discriminator its
+/// reporter offered.
+///
+/// `waiting` is how many consecutive events this lock has already discarded
+/// looking for the echo; see [`MAX_WARP_ECHO_WAIT`] for why that is bounded.
 ///
 /// Separate from [`HostWindow::dispatch_motion`] for the same reason as
 /// [`pointer_lock_decision`] above: the centre-relative arithmetic and the
@@ -713,11 +767,15 @@ fn locked_pointer_delta(
     event_pos: (i32, i32),
     centre: (i32, i32),
     ignore_next_warp: bool,
-) -> Option<(i32, i32)> {
-    if ignore_next_warp && event_pos == centre {
-        return None;
+    waiting: u8,
+) -> LockedMotion {
+    if event_pos == centre {
+        return LockedMotion::Echo;
     }
-    Some((event_pos.0 - centre.0, event_pos.1 - centre.1))
+    if ignore_next_warp && waiting < MAX_WARP_ECHO_WAIT {
+        return LockedMotion::Waiting;
+    }
+    LockedMotion::Real(event_pos.0 - centre.0, event_pos.1 - centre.1)
 }
 
 impl HostWindow {
@@ -1357,11 +1415,41 @@ impl HostWindow {
             if state.locked {
                 let centre = state.centre;
 
-                let Some((dx, dy)) =
-                    locked_pointer_delta((ev.x, ev.y), centre, state.ignore_next_warp)
-                else {
-                    state.ignore_next_warp = false;
-                    return;
+                let (dx, dy) = match locked_pointer_delta(
+                    (ev.x, ev.y),
+                    centre,
+                    state.ignore_next_warp,
+                    state.warp_echo_wait,
+                ) {
+                    LockedMotion::Echo => {
+                        if super::input::trace_mouse() && state.warp_echo_wait > 0 {
+                            eprintln!(
+                                "[cordial] X11 pointer lock: warp echo confirmed at ({}, {}) after discarding {} stale event(s)",
+                                ev.x, ev.y, state.warp_echo_wait
+                            );
+                        }
+                        state.ignore_next_warp = false;
+                        state.warp_echo_wait = 0;
+                        return;
+                    }
+                    LockedMotion::Waiting => {
+                        state.warp_echo_wait += 1;
+                        if super::input::trace_mouse() {
+                            eprintln!(
+                                "[cordial] X11 pointer lock: discarding stale motion at ({}, {}), waiting for warp echo at ({}, {}) (wait={})",
+                                ev.x, ev.y, centre.0, centre.1, state.warp_echo_wait
+                            );
+                        }
+                        return;
+                    }
+                    LockedMotion::Real(dx, dy) => {
+                        // Either the ordinary case (no warp outstanding) or
+                        // `MAX_WARP_ECHO_WAIT` was reached, in which case the
+                        // wait is abandoned here rather than left stuck at
+                        // the bound forever.
+                        state.warp_echo_wait = 0;
+                        (dx, dy)
+                    }
                 };
                 let (cx, cy) = centre;
 
@@ -1401,6 +1489,13 @@ impl HostWindow {
                 // NativeInputInterface path for camera rotation.
                 if dx != 0 || dy != 0 {
                     drop(state);
+
+                    if super::input::trace_mouse() {
+                        eprintln!(
+                            "[cordial] X11 pointer lock: motion at ({}, {}) -> delta ({dx}, {dy}), re-warping to ({cx}, {cy})",
+                            ev.x, ev.y
+                        );
+                    }
 
                     super::input::pass_mouse_move_delta(
                         cx as f32,
@@ -1647,6 +1742,26 @@ impl HostWindow {
                         .unwrap_or_else(|e| e.into_inner());
 
                     state.buttons = 0;
+
+                    // Mouse buttons get corrected here, but nothing does the
+                    // same for the keyboard: this backend keeps no held-key
+                    // set at all (only `InputState.buttons`), and there is no
+                    // `FOCUS_IN` arm to reconcile one even if it did. A
+                    // KeyRelease for a key that is let go while this window
+                    // does not have focus is never delivered to it -- X only
+                    // sends key events to the focused client -- so the
+                    // engine's own idea of "is W still held" has no external
+                    // correction the way the button bitmask just got one.
+                    // `INFERRED`, not confirmed: this is a candidate mechanism
+                    // for #41's second fault (movement continuing for several
+                    // seconds after the pointer lock's warp/grab cycle), not
+                    // an established cause -- reproducing it needs a real
+                    // keyboard and a focus change mid-drag, which this
+                    // sandbox cannot generate (see AGENTS.md on synthesised
+                    // input) and the MCP's `cordial_key` cannot exercise
+                    // either, since it calls `input::pass_key_event` directly
+                    // (`devctl.rs`'s `Cmd::Key`) and never goes through this
+                    // X11 event path at all.
                 }
                 EXPOSE => {
                     // SAFETY: `event_type == EXPOSE` means `XNextEvent` just
@@ -2050,14 +2165,50 @@ mod tests {
         // The synthetic MotionNotify this backend's own XWarpPointer produces
         // lands exactly on the capture centre and must be dropped, or every
         // recentring warp would report itself as a fresh delta.
-        assert_eq!(locked_pointer_delta((640, 360), (640, 360), true), None);
+        assert_eq!(locked_pointer_delta((640, 360), (640, 360), true, 0), LockedMotion::Echo);
         // The same coincidence with the latch already spent (a previous
-        // frame consumed the echo) is real motion, not another echo.
-        assert_eq!(locked_pointer_delta((640, 360), (640, 360), false), Some((0, 0)));
-        // Ordinary motion away from centre, latch armed or not, is never
-        // swallowed -- only an exact match does that.
-        assert_eq!(locked_pointer_delta((645, 358), (640, 360), true), Some((5, -2)));
-        assert_eq!(locked_pointer_delta((645, 358), (640, 360), false), Some((5, -2)));
+        // frame consumed the echo) is still just a zero delta -- an `Echo`
+        // either way, since the two cases are indistinguishable and neither
+        // has anything to report.
+        assert_eq!(locked_pointer_delta((640, 360), (640, 360), false, 0), LockedMotion::Echo);
+        // Ordinary motion away from centre, with no warp outstanding, is
+        // never swallowed.
+        assert_eq!(locked_pointer_delta((645, 358), (640, 360), false, 0), LockedMotion::Real(5, -2));
+    }
+
+    #[test]
+    fn stale_pre_lock_motion_is_discarded_rather_than_read_as_a_spin() {
+        // #41: a motion event still in flight from before the lock engaged --
+        // the free cursor sitting near a window edge at the instant a camera
+        // drag or SetMouseBehavior(LockCenter) grabbed it -- must not be
+        // reported as a several-hundred-pixel delta just because it is not
+        // itself the echo. It is discarded, and the wait latch stays armed.
+        assert_eq!(locked_pointer_delta((1900, 40), (640, 360), true, 0), LockedMotion::Waiting);
+        // A second stale event before the echo arrives: still discarded.
+        assert_eq!(locked_pointer_delta((1850, 55), (640, 360), true, 1), LockedMotion::Waiting);
+        // The echo itself, whenever it turns up, is still recognised and
+        // clears the latch.
+        assert_eq!(locked_pointer_delta((640, 360), (640, 360), true, 2), LockedMotion::Echo);
+    }
+
+    #[test]
+    fn a_warp_with_no_echo_eventually_gives_up_waiting() {
+        // XWarpPointer onto a pixel the pointer already occupies produces no
+        // MotionNotify -- there is nothing to confirm the warp with -- so an
+        // unbounded wait would discard camera input for the rest of the
+        // lock. Once MAX_WARP_ECHO_WAIT is reached the next event is trusted
+        // even though the latch was never explicitly cleared.
+        for waiting in 0..MAX_WARP_ECHO_WAIT {
+            assert_eq!(
+                locked_pointer_delta((900, 200), (640, 360), true, waiting),
+                LockedMotion::Waiting,
+                "wait {waiting} should still be discarded"
+            );
+        }
+        assert_eq!(
+            locked_pointer_delta((900, 200), (640, 360), true, MAX_WARP_ECHO_WAIT),
+            LockedMotion::Real(260, -160)
+        );
     }
 
     #[test]

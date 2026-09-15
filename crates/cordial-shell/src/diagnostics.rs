@@ -214,6 +214,12 @@ pub fn report() -> String {
         // version and how it got here are separate questions a reader scans
         // for separately.
         ("Cordial", cordial_shell::version::full()),
+        // The identifier only. `version::NOTICE` carries the licence and the
+        // project URL together for somebody holding a bare binary, but the row
+        // above already names the version and the block is pasted into this
+        // project's own issue tracker, so repeating either here would cost
+        // scanning room to say nothing the reader lacks.
+        ("Licence", "GPL-3.0-or-later".into()),
         ("Install", install_method()),
         ("Roblox", roblox()),
         ("System", uname()),
@@ -237,8 +243,14 @@ mod tests {
     /// A report with four lines where five were expected reads as complete.
     #[test]
     fn every_field_is_present_and_says_something() {
+        // Named once and counted from, rather than a list and a separate
+        // literal that have to be remembered together: the literal was 6 when
+        // a seventh row was added, and the failure it produced said nothing
+        // about which row was new.
+        const LABELS: [&str; 7] =
+            ["Cordial", "Licence", "Install", "Roblox", "System", "Distro", "Session"];
         let text = report();
-        for label in ["Cordial", "Install", "Roblox", "System", "Distro", "Session"] {
+        for label in LABELS {
             let line = text
                 .lines()
                 .find(|l| l.starts_with(label))
@@ -246,7 +258,7 @@ mod tests {
             let value = line[label.len()..].trim();
             assert!(!value.is_empty(), "{label} has no value in:\n{text}");
         }
-        assert_eq!(text.lines().count(), 6, "unexpected line count:\n{text}");
+        assert_eq!(text.lines().count(), LABELS.len(), "unexpected line count:\n{text}");
     }
 
     /// **Nothing here may carry a home directory.**

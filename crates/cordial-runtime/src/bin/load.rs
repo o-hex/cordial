@@ -1501,6 +1501,11 @@ fn main() -> ExitCode {
                 eprintln!("error: {msg}\n");
             }
             eprint!("{USAGE}");
+            // Printed here rather than folded into `USAGE`, which is a `const`
+            // and cannot call anything. The string itself is compiled into this
+            // binary either way -- that is the point of it, so `strings` can
+            // answer what a stray `cordial-run` is and what licence it carries.
+            eprintln!("{}", cordial_shell::version::NOTICE);
             return ExitCode::from(2);
         }
     };

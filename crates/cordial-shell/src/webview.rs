@@ -572,7 +572,9 @@ pub fn open(parent: &(impl IsA<gtk4::Widget> + Clone), request: &WindowRequest) 
 /// for a global object holding an `executeRoblox` **function that takes a
 /// JSON string**, and calls it as
 ///
-///     window.__globalRobloxAndroidBridge__.executeRoblox(jsonString)
+/// ```text
+/// window.__globalRobloxAndroidBridge__.executeRoblox(jsonString)
+/// ```
 ///
 /// Two earlier attempts missed for different reasons and both are worth
 /// recording. The first shipped the message handler alone and nothing ever

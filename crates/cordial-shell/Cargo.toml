@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [lib]
 name = "cordial_shell"
 path = "src/lib.rs"

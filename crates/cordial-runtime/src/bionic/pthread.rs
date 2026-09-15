@@ -106,7 +106,9 @@ fn alloc_backing() -> *mut c_void {
 
 /// SAFETY: `ptr` must have come from `alloc_backing` and not been freed.
 unsafe fn free_backing(ptr: *mut c_void) {
-    drop(Box::from_raw(ptr as *mut [u8; BACKING_SIZE]));
+    // SAFETY: `ptr` came from `alloc_backing` and has not been freed, per
+    // this function's own contract, stated above.
+    drop(unsafe { Box::from_raw(ptr as *mut [u8; BACKING_SIZE]) });
 }
 
 /// Resolve the real object behind a wrapper, creating it on first use.
@@ -200,8 +202,14 @@ unsafe fn destroy_backing(
         let high = real_hi.swap(0, Ordering::Acquire) as u64;
         let p = (low | (high << 32)) as usize as *mut c_void;
         if !p.is_null() {
-            destroy(p);
-            free_backing(p);
+            // SAFETY: `p` was the backing object for this wrapper, and the
+            // `state.swap` above already claimed it -- no other caller can
+            // observe `READY` again for the same wrapper, so this is the one
+            // place that destroys and frees it.
+            unsafe {
+                destroy(p);
+                free_backing(p);
+            }
         }
     }
 }

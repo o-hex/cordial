@@ -49,7 +49,9 @@ unsafe fn s(p: *const c_char) -> String {
     if p.is_null() {
         "(null)".into()
     } else {
-        CStr::from_ptr(p).to_string_lossy().into_owned()
+        // SAFETY: non-null per the check above; NUL-termination is this
+        // function's own contract, stated above.
+        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
     }
 }
 

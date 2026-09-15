@@ -1143,18 +1143,22 @@ unsafe fn set_compositor_bypass(xlib: &Xlib, display: Display, window: Window, o
     if !*OPTED_IN.get_or_init(|| std::env::var("CORDIAL_COMPOSITOR_BYPASS").as_deref() == Ok("1")) {
         return;
     }
-    let property = (xlib.intern_atom)(display, c"_NET_WM_BYPASS_COMPOSITOR".as_ptr(), 0);
-    let cardinal = (xlib.intern_atom)(display, c"CARDINAL".as_ptr(), 0);
-    if property == 0 || cardinal == 0 {
-        return;
+    // SAFETY: `display` and `window` are live handles per this function's own
+    // contract, stated above; the rest are ordinary xlib calls on them.
+    unsafe {
+        let property = (xlib.intern_atom)(display, c"_NET_WM_BYPASS_COMPOSITOR".as_ptr(), 0);
+        let cardinal = (xlib.intern_atom)(display, c"CARDINAL".as_ptr(), 0);
+        if property == 0 || cardinal == 0 {
+            return;
+        }
+        // Format 32 takes a C `long` per item, whatever the platform's width.
+        let value: c_ulong = on as c_ulong;
+        (xlib.change_property)(
+            display, window, property, cardinal, 32, 0, // PropModeReplace
+            (&value as *const c_ulong).cast(), 1,
+        );
+        (xlib.flush)(display);
     }
-    // Format 32 takes a C `long` per item, whatever the platform's width.
-    let value: c_ulong = on as c_ulong;
-    (xlib.change_property)(
-        display, window, property, cardinal, 32, 0, // PropModeReplace
-        (&value as *const c_ulong).cast(), 1,
-    );
-    (xlib.flush)(display);
 }
 
 // ------------------------------------------------------------- input pump

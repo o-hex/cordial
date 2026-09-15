@@ -65,6 +65,15 @@
 //! than one that reports failure, because the user then debugs a Roblox build
 //! that is quietly six months old.
 
+// The one `unsafe` this crate ever had was `libc::flock` in
+// `provider::exclusive`, and it is gone -- `rustix::fs::flock` does the same
+// syscall safely. `forbid` rather than `deny` so a future contributor cannot
+// quietly reopen this with a local `#[allow(unsafe_code)]`; reopening it
+// takes removing this line, which is a change
+// [ADR-036](../../../docs/adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md)
+// asks be justified on its own.
+#![forbid(unsafe_code)]
+
 pub mod apk;
 pub mod apk_signature;
 pub mod cache;

@@ -16,6 +16,15 @@
 //! keeps the area behind the engine's canvas the desktop's actual background
 //! colour instead of a flash of white while a resize catches up.
 
+// This binary compiles its own copies of `audio_devices.rs` and
+// `root_warning.rs` (see the `mod` lines below) rather than depending on the
+// `cordial_shell` lib crate for them, so `[lints] workspace = true`'s
+// `unsafe_code = "deny"` applies to this crate root independently of the
+// `#![allow(unsafe_code)]` on `lib.rs` -- see that file's comment, and
+// [ADR-036](../../../docs/adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md),
+// for why cordial-shell carries the allow at all.
+#![allow(unsafe_code)]
+
 mod audio_devices;
 mod chooser;
 mod crash;

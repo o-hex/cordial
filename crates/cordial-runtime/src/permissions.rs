@@ -27,7 +27,7 @@
 //! `native/audio_classes.cpp` stands: no capture stream exists until Roblox
 //! actually starts recording.
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString, OsStr};
+use std::ffi::{c_char, c_int, c_void, CString, OsStr};
 
 extern "C" {
     fn cordial_messagebus_set_request_handler_async(
@@ -79,22 +79,18 @@ extern "C" fn on_rationale(request: *const c_char, out: *mut c_char, out_len: us
 }
 
 fn reply(method: &str, request: *const c_char, out: *mut c_char, out_len: usize) -> c_int {
-    if request.is_null() || out.is_null() || out_len == 0 {
+    // SAFETY: the bus hands over a NUL-terminated string it owns for the
+    // call, which is exactly `borrow_request`'s contract.
+    let Some(raw) = (unsafe { crate::ffi_util::borrow_request(request) }) else {
         return 0;
-    }
-    // SAFETY: the bus hands over a NUL-terminated string it owns for the call.
-    let raw = unsafe { CStr::from_ptr(request) }
-        .to_string_lossy()
-        .into_owned();
-    let body = answer(method, &raw);
+    };
+    let body = answer(method, &raw.to_string_lossy());
     let Ok(c) = CString::new(body) else { return 0 };
-    let bytes = c.as_bytes_with_nul();
-    if bytes.len() > out_len {
-        return 0;
+    if crate::ffi_util::write_response(c.as_bytes_with_nul(), out, out_len) {
+        1
+    } else {
+        0
     }
-    // SAFETY: length checked against the caller's buffer immediately above.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, out, bytes.len()) };
-    1
 }
 
 /// Build the response for one request without logging its contents.

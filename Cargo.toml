@@ -14,5 +14,33 @@ edition = "2021"
 license = "GPL-3.0-or-later"  # see LICENSE; third-party notices in THIRD-PARTY-NOTICES.md
 rust-version = "1.75"
 
+# ADR-036: the unsafe/safe boundary between the two ABI-edge crates and the
+# other three is a lint, not a habit anyone has to remember. Every member
+# crate opts in with `[lints]\nworkspace = true`; `cordial-runtime` and
+# `cordial-linker-sys` each override `unsafe_code` back to `allow` at their
+# own crate root, with a comment saying why.
+[workspace.lints.rust]
+unsafe_code = "deny"
+# Measured on 2026-09-16 by setting this to "deny" and building the whole
+# workspace before fixing anything: 16 real sites total (all in
+# cordial-runtime; cordial-linker-sys, cordial-shell, cordial-plugins and
+# cordial-update had none), not the hundreds a codebase with ~650 unsafe
+# sites might suggest -- most `unsafe fn` bodies here already wrapped their
+# raw operations in an inner `unsafe {}` out of habit. All 16 are fixed, so
+# this is "deny" rather than a ratchet. See ADR-036 for the measurement.
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# Measured with `cargo clippy --workspace --all-targets -- -A
+# clippy::not_unsafe_ptr_arg_deref -W clippy::undocumented_unsafe_blocks` on
+# 2026-09-16: 190 unsafe blocks across the workspace (174 cordial-runtime, 13
+# cordial-linker-sys, 3 cordial-shell) have no SAFETY comment. That is the gap
+# this ratchets down, not a target already met -- see ADR-036 and
+# `tools/unsafe-audit.py --clippy` for the up-to-date count. The
+# `-A clippy::not_unsafe_ptr_arg_deref` is load-bearing, not incidental: that
+# lint is deny-by-default and already fails on 50 pre-existing sites in
+# cordial-linker-sys, unrelated to unsafe documentation -- see ADR-036.
+undocumented_unsafe_blocks = "warn"
+
 [profile.release]
 debug = true      # the runtime is useless to debug without symbols

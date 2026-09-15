@@ -5,6 +5,11 @@
 //! nothing else. Symbol-table policy — what Cordial provides for each Android
 //! library — lives in `cordial-runtime`.
 
+// The other ABI-edge crate: everything here is a `extern "C"` call across
+// into `native/shim.cpp`, or a raw pointer handed back from it. See
+// [ADR-036](../../../docs/adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md).
+#![allow(unsafe_code)]
+
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
 mod ffi {

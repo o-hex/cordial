@@ -11,6 +11,15 @@
 //! profile rather than to the machine — see
 //! [ADR-013](../../../docs/adr/ADR-013-per-profile-configuration.md).
 
+// The one `unsafe` this crate ever had was `kill(-pid, SIGKILL)` in `host.rs`,
+// and it is gone -- `rustix::process::kill_process_group` now does the same
+// syscall safely. `forbid` rather than `deny` so a future contributor cannot
+// quietly reopen this with a local `#[allow(unsafe_code)]`; reopening it
+// takes removing this line, which is a change
+// [ADR-036](../../../docs/adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md)
+// asks be justified on its own.
+#![forbid(unsafe_code)]
+
 pub mod broker;
 pub mod capability;
 pub mod consent;

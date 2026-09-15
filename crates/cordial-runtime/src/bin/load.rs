@@ -4,6 +4,12 @@
 //! layout work against the real 116 MB object, and turns
 //! docs/framework-api-inventory.md into a prioritised list of what to implement.
 
+// Same boundary as `cordial_runtime`'s own crate root: this binary calls the
+// bionic linker directly, and the lint's `[lints] workspace = true` applies
+// per compilation unit, so the bin target needs its own allow. See
+// ADR-036.
+#![allow(unsafe_code)]
+
 use std::cell::Cell;
 use std::process::ExitCode;
 use std::rc::Rc;

@@ -1300,10 +1300,13 @@ unsafe extern "C" fn registry_global(
     interface: *const c_char,
     version: u32,
 ) {
-    let globals = &mut *(data as *mut Globals);
+    // SAFETY: `data` is the `*mut Globals` this listener was registered with
+    // in `add_listener`, and the callback is only ever invoked by the
+    // Wayland event loop on that same registry.
+    let globals = unsafe { &mut *(data as *mut Globals) };
     // SAFETY: `wl_registry.global`'s `interface` argument is a NUL-terminated
     // string per the protocol.
-    let iface = CStr::from_ptr(interface).to_string_lossy();
+    let iface = unsafe { CStr::from_ptr(interface) }.to_string_lossy();
     match iface.as_ref() {
         "wl_compositor" => globals.compositor = Some((name, version)),
         "wl_subcompositor" => globals.subcompositor = Some((name, version)),

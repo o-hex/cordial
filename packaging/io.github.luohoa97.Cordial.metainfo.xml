@@ -78,6 +78,23 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.16.0" date="2026-09-15">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.16.0</url>
+      <description>
+        <p>
+          Launching twice in a row works. The crash that killed every launch
+          after the first until you cleared the cache was a race between
+          Cordial's startup and the engine's, not a corrupt cache, and Cordial
+          now waits for the engine to be given its flags before going on.
+        </p>
+        <p>
+          The camera no longer throws you a half-turn on X11, Join in a game's
+          Servers list opens the server instead of doing nothing, and entering
+          fullscreen rebuilds the display chain once rather than once per
+          animation step.
+        </p>
+      </description>
+    </release>
     <release version="0.15.1" date="2026-09-15">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.15.1</url>
       <description>

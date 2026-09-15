@@ -92,8 +92,10 @@ for the launcher to tail that, which would also give users a log to attach to a
 bug report. Neither is done here, and neither should be claimed.
 
 **Deep links still do not reach a client that is already running.** The launcher
-is single-instance, so the *link* reaches the running launcher correctly; it is
-then held until the user presses the button, and pressing it starts a new client
+is single-instance, so the *link* reaches the running launcher correctly.
+[ADR-035](ADR-035-browser-account-routing.md) adds automatic matching through
+the configured secret backend; unmatched links and unavailable sessions still
+wait for the button. Either path starts a new client
 — which ADR-012's lock refuses if that profile is already open. Routing a join
 into a live engine needs an IPC into `cordial-run` that does not exist outside
 the development control surface (ADR-019). That is a separate decision and

@@ -490,6 +490,18 @@ fn build_roblox_page(
         )
         .build();
 
+    let sign_in_storage = adw::ActionRow::builder()
+        .title("Saved sign-in")
+        .subtitle(match std::env::var("CORDIAL_SECRET_STORE").as_deref() {
+            Ok("file") => "Profile file, by request. Browser Play routing reads the same file.",
+            Ok("keyring") => "Desktop Secret Service only. A locked or unavailable keyring is left signed out.",
+            Ok("auto") | Err(_) => "Desktop Secret Service when available, otherwise a private profile file. Browser Play routing uses the selected backend.",
+            Ok(_) => "Profile file, because the configured secret backend is not recognised.",
+        })
+        .build();
+    sign_in_storage.set_subtitle_lines(3);
+    data_group.add(&sign_in_storage);
+
     let profile_name = config.borrow().profile.clone();
     let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
     let bytes = profile_dir.as_ref().map(|d| cordial_shell::profile::engine_data_bytes(d)).unwrap_or(0);
@@ -669,14 +681,14 @@ fn build_session_group(
     // **In Session rather than anywhere else**, because it is about what
     // happens when a launch arrives rather than about graphics or plugins.
     let ticket = adw::SwitchRow::builder()
-        .title("Sign in from browser launches")
+        .title("Forward browser sign-in tickets to the engine")
         // The row says what it does; the two reasons it is off by default are
         // behind the detail button, and both still have to be somewhere. It
         // moves a credential, which is why somebody might say no, and it is
         // unverified, which is why it might do nothing. A row that promised
         // the feature and silently failed would be the stub-that-lies shape in
         // an interface.
-        .subtitle("Clicking play on the website does not ask you to sign in again.")
+        .subtitle("For manual browser launches; engine support is unverified.")
         .active(config.borrow().carry_launch_ticket)
         .build();
     ticket.set_subtitle_lines(2);
@@ -684,7 +696,9 @@ fn build_session_group(
         "Roblox puts a one-time sign-in ticket in a play link, and this passes it \
          through to the engine.\n\nOff by default for two separate reasons: it moves a \
          credential, and it is not yet confirmed that this engine accepts one, so it \
-         may simply do nothing.",
+         may simply do nothing.\n\nAutomatic account matching uses the ticket separately \
+         and removes it before launch. Set CORDIAL_BROWSER_ACCOUNT_ROUTING=0 to disable \
+         automatic matching.",
     ));
     {
         let config = config.clone();

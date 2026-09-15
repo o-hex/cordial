@@ -173,10 +173,8 @@ fn system_scheme(portal: Option<u32>) -> libadwaita::ColorScheme {
 /// which boxes the value one variant deeper; either shape is unwrapped by
 /// following `v` down until something that is not a variant comes out.
 ///
-/// Through `gio` rather than `zbus`. `zbus` is a dependency of `cordial-runtime`
-/// and not of this crate, and the shell is already holding a GDBus connection
-/// through GTK — adding an async runtime to this crate to ask one question the
-/// toolkit can already ask would be the larger change.
+/// Through `gio`: the shell already holds a GDBus connection through GTK, so
+/// this portal query reuses it. The shared secret backend uses `zbus` separately.
 fn portal_colour_scheme() -> Option<u32> {
     use libadwaita::gtk::gio;
     use libadwaita::gtk::glib::prelude::*;
@@ -836,6 +834,10 @@ pub struct ShellConfig {
     /// Turning it on is choosing to hand a credential to the engine in exchange
     /// for not typing a password. A reasonable trade to offer, and not one to
     /// make on somebody's behalf.
+    ///
+    /// This controls engine forwarding only. Browser account routing redeems
+    /// and removes the ticket separately; `CORDIAL_BROWSER_ACCOUNT_ROUTING=0`
+    /// disables that lookup. See ADR-035 for the credential-use decision.
     #[serde(default)]
     pub carry_launch_ticket: bool,
     pub mangohud: bool,

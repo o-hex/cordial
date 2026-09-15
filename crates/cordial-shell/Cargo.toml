@@ -67,6 +67,9 @@ cordial-linker-sys = { path = "../cordial-linker-sys" }
 cordial-update = { path = "../cordial-update" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+zbus = { version = "5.18.0", features = ["blocking"] }
+ureq = "3.3.0"
+percent-encoding = "2"
 # `v4_12`, and that number is measured rather than chosen. The pin said
 # `v4_20` while the comment beside it said 4.10, and the code needed neither:
 # lowering it to `v4_10` fails on exactly three call sites, two uses of
@@ -122,3 +125,6 @@ gdk4-wayland = "0.11"
 # because a key is a UI-entered value, not something `cordial-plugins` picks
 # a default for — see that crate's `sign` module for why no key ships.
 minisign-verify = "0.2.5"
+
+[dev-dependencies]
+tempfile = "3"

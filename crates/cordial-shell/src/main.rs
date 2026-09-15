@@ -20,6 +20,7 @@ mod audio_devices;
 mod chooser;
 mod crash;
 mod deep_link;
+mod browser_account;
 mod diagnostics;
 mod download_progress;
 mod install;
@@ -157,7 +158,12 @@ fn main() -> libadwaita::glib::ExitCode {
 
     {
         let shell = shell.clone();
-        app.connect_activate(move |app| start(app, &shell));
+        app.connect_activate(move |app| {
+            start(app, &shell);
+            if let Some(shell) = shell.borrow().as_ref() {
+                shell.present();
+            }
+        });
     }
     {
         // The path every desktop launch takes, local or remote: `Exec=` in the
@@ -207,28 +213,30 @@ fn main() -> libadwaita::glib::ExitCode {
 /// Check a link and hand it to the window, or say why not.
 ///
 /// Nothing about the string is trusted: it was produced by a browser acting on
-/// somebody's click. [`deep_link::accept`] is what decides, and the only thing
-/// that ever consumes the result is `Command::arg`.
+/// somebody's click. [`deep_link::accept`] validates the envelope before the
+/// window attempts account routing or holds it for a manual launch.
 fn queue(shell: &Rc<RefCell<Option<window::Shell>>>, raw: &str) {
     match deep_link::accept(raw) {
         Ok(url) => match shell.borrow().as_ref() {
             Some(shell) => {
-                // Printed as well as shown, because the banner shows the first
-                // sixty characters and this is the only place the whole of what
-                // arrived can be compared with what the browser sent.
-                println!("  shell: holding {url} until you press Roblox");
+                println!("  shell: received Roblox link");
                 shell.queue_join(url);
             }
             // `start` built the window immediately above, so this is
             // unreachable rather than merely unlikely — and said out loud,
             // because a link silently going nowhere is the failure this whole
             // path exists to avoid.
-            None => println!("  shell: no window to hand {url} to"),
+            None => println!("  shell: no window to receive Roblox link"),
         },
         // Reported rather than swallowed: somebody whose browser opens Cordial
         // and appears to do nothing has no other way to find out that the link
         // was refused, or why.
-        Err(why) => println!("  shell: ignoring {why}"),
+        Err(why) => {
+            println!("  shell: ignoring {why}");
+            if let Some(shell) = shell.borrow().as_ref() {
+                shell.present();
+            }
+        }
     }
 }
 

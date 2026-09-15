@@ -6,16 +6,14 @@
 //! reason a Play button on the website has anywhere to go on this machine. What
 //! arrives is a string produced by a browser acting on a click, so it is treated
 //! as hostile input rather than as an instruction: nothing here builds a path
-//! from it, nothing interpolates it into a shell string, and the only thing that
-//! ever consumes it is [`std::process::Command::arg`], which puts a byte string
-//! into the child's `argv` without a shell anywhere in the path.
+//! from it and nothing interpolates it into a shell string. Joins reach the
+//! child through [`std::process::Command::arg`]. The optional browser-account
+//! resolver extracts and consumes the authentication ticket before that handoff.
 //!
-//! **The checks are deliberately shallow.** The scheme and a length cap are the
-//! two things the shell can decide; what a valid Roblox launch payload looks
-//! like is the client's business, and a launcher that thought it knew would
-//! start rejecting links the day Roblox changed the format. Refusing early on
-//! the two things that are knowable, and passing the rest through untouched, is
-//! the split that does not go stale.
+//! Acceptance checks the scheme, length and printable bytes. Account routing
+//! recognises a narrower desktop grammar separately. Ticket stripping preserves
+//! recognised desktop fields; unknown field-like text inside `gameinfo` is
+//! removed with the ticket rather than forwarded as a possible credential suffix.
 //!
 //! **`cordial_runtime::deeplink` checks the same three things again**, and the
 //! duplication is deliberate rather than an oversight: `cordial-shell` does not
@@ -306,4 +304,3 @@ mod tests {
         assert_eq!(summarise("roblox://home"), "roblox:");
     }
 }
-

@@ -37,11 +37,11 @@ becomes structurally impossible rather than avoided by discipline.
 
 **The absences carry more design information than the presences.**
 
-* **No `AAudioStream_write`.** Only `_read`. Playback is therefore
-  callback-driven and nothing else: the engine installs a data callback and
-  expects to be asked for frames. Capture is a blocking read. Any
-  implementation that expects to be written to is answering a call this build
-  never makes.
+* **No `AAudioStream_write`.** Playback is therefore callback-driven and
+  nothing else: the engine installs a data callback and expects to be asked for
+  frames. `_read` being present does not make capture exclusively blocking;
+  `AAudioStreamBuilder_setDataCallback` serves both directions. Roblox
+  2.738.0.1397 was measured installing it on an input stream.
 * **No `setSampleRate` and no `setChannelCount`.** The engine does not request
   a format; it opens a stream, then reads back `getSampleRate`,
   `getChannelCount` and `getFormat` and adapts. That is easier for us than the
@@ -164,9 +164,10 @@ openStream requested: direction=INPUT  format=UNSPECIFIED bufferCapacity=0    da
 ```
 
 The first two are probes, closed immediately; 9216 is FMOD sizing itself from
-what the second one reported (nine bursts). The input stream is refused —
-AAudio capture is not implemented — and **playback carried on unaffected for
-the rest of the run**, so refusing capture costs capture and nothing else.
+what the second one reported (nine bursts). In this historical run the input
+stream was refused because AAudio capture was not implemented, and **playback
+carried on unaffected for the rest of the run**, so refusing capture cost
+capture and nothing else.
 
 The callback rate is the arithmetic it should be: 11 234 callbacks delivering
 11 503 616 frames over a four-minute run, 8 414 and 8 615 936 over three
@@ -235,11 +236,18 @@ see; for input it would be a node left in the graph with the desktop's
 microphone indicator still lit. The rule at the top of `native/audio_classes.cpp`
 does not admit that state, so an AAudio input pause is a stop.
 
-The reading is not callback-driven because the engine's own symbol set says it
-is not: `AAudioStream_read` is among the 25 and `AAudioStream_write` is not.
-An input stream that arrives carrying a data callback is refused with
-`AAUDIO_ERROR_UNIMPLEMENTED` and a line saying why, rather than opened and
-never fed.
+Both input delivery shapes are supported. A callback-less stream keeps the
+blocking `AAudioStream_read` path described below. A stream carrying a data
+callback starts a Cordial-owned consumer thread in `requestStart`; that thread
+pulls complete 480-frame S16 mono bursts from the same `CaptureStream` ring and
+invokes the callback away from PipeWire's realtime thread.
+
+Pause, stop and close cancel and join that consumer before returning. A
+callback returning `AAUDIO_CALLBACK_RESULT_STOP` changes the stream to STOPPED
+and destroys the capture stream itself. Stop or pause re-entered from inside the
+callback only requests cancellation — it cannot join itself — and close from
+inside the callback is refused with `AAUDIO_ERROR_INVALID_STATE`, matching
+AAudio's requirement that another thread close the stream.
 
 ### Checked from outside, not asserted
 
@@ -333,72 +341,35 @@ AAUDIO-PLAYBACK PASS
 identical to the digit on both runs, and identical to the format and burst the
 four signed-in runs above negotiated.
 
-### One thing is still not measured, and it is the one to measure next
+### Measured later: voice uses callback input
 
-**Nothing here shows what FMOD does with a capture stream that opens.** The
-earlier runs measured FMOD asking for one input stream and carrying on when it
-was refused. Whether it then calls `requestStart`, when, and whether it ever
-stops, is unmeasured. A signed-out client cannot answer it: a 45-second run to
-the Landing screen on 2026-08-22 logged no `openStream` of any direction and no
-`AudioDevice.init` either, because FMOD is not initialised until there is
-something to play. It takes a signed-in run into a place, and on the day this
-was written the only signed-in profile was held by a client that was in one for
-the whole session ([ADR-012](../adr/ADR-012-profiles-and-instances.md): one
-instance per profile, by `flock`).
+The unanswered question above was settled on 2026-09-14 with Roblox
+2.738.0.1397. Once permission delivery reached WebRTC audio initialisation, the
+engine opened an input stream with a data callback and called `requestStart`.
+The old bridge then failed explicitly with `refusing an input stream that
+installed a data callback`; this corrected the earlier inference that the
+presence of `AAudioStream_read` made capture exclusively blocking.
 
-So, precisely:
+After callback input was implemented, native lifecycle and ABI checks covered
+whole-burst delivery, callback STOP, pause/stop/restart, cancellation and the
+blocking-read path. A tester then confirmed audible microphone transmission
+to another player in a real voice-enabled game. The automated checks establish
+the bridge contract; the manual test establishes the end-to-end user outcome.
 
-* Opening the microphone without an explicit `requestStart` is structurally
-  impossible, and the registry table above is the check on that from outside
-  the process.
-* "FMOD cannot open it by accident" is a different claim from "FMOD does not
-  start it and leave it started", and only the first is established. The
-  second is **`INFERRED`**, on this: the input stream FMOD opens has
-  `bufferCapacity=0` and `dataCallback=no`, which is the same signature as the
-  two *output* probes in the same log — both of which were closed immediately
-  — and reading `getSampleRate`/`getChannelCount` off a probe needs no
-  `requestStart` at all.
-
-The next signed-in run answers it with no extra instrumentation, because every
-transition already prints. One grep does it:
-
-```bash
-grep -E "input stream opened|microphone opened|microphone closed|recording (paused|stopped)" run.log
-```
-
-A `microphone opened` with no `microphone closed` behind it, in a run where
-nobody spoke, is the failure this paragraph exists to look for, and it would
-mean the default has to go back.
-
-**The default was NOT flipped, and this section used to say it was.** The
-argument for flipping is recorded here because it is a good one and it may yet
-win: the exposure is created by implementing capture, not by defaulting to it,
-since anyone following `CORDIAL_AUDIO=aaudio` runs identical code; and an unset
-variable taking the common path is what gets the question answered soonest.
-
-It lost on one point. The two failures are not symmetric. "Voice chat never
-worked" is a feature gap someone reports; "Cordial is holding your microphone"
-is a reason someone uninstalls it, and it is the one a user *sees*, as a lit
-indicator, for a whole session. The default decides how many people meet an
-unmeasured failure first, and "everyone" is the wrong answer to that for want
-of a single run. So `parse_backend` returns `Backend::Java` for an unset
-variable, and the comment beside it names the grep that flips it.
+Opening the microphone without an explicit `requestStart` remains structurally
+impossible. Pause, stop, callback STOP and close destroy the capture stream;
+the native tests assert those teardown paths without relying on a live account.
 
 ## How it landed
 
 The plan was: behind `CORDIAL_AUDIO=aaudio`, off by default, measured against
 the Java path in one session, and only then made default in its own commit
-quoting the numbers. That is what happened up to the last step, with one
-substitution — the measurement is `pw-top`'s `ERR` column and a peak meter, not
-`getXRunCount`, for the reason two sections above. The last step has not
-happened: the commit that would flip the default is waiting on the microphone
-lifetime run, and until it lands every claim about "the default" in this file
-means Java.
+quoting the numbers. That happened, with one substitution — the measurement is
+`pw-top`'s `ERR` column and a peak meter, not `getXRunCount`, for the reason two
+sections above.
 
-**AAudio is not the default; Java still is** — see the section above, which
-this paragraph contradicted until it was corrected. What follows is the case
-for AAudio on its merits, which is unaffected by which one is default, and the
-honest summary of it is not that AAudio is better. On this machine it is not measurably better: zero `ERR` on both paths,
+**AAudio is the default; `CORDIAL_AUDIO=java` is the rollback.** The honest
+summary is not that AAudio is better. On this machine it is not measurably better: zero `ERR` on both paths,
 same rate, same clean teardown. What it is, is structurally different — no JNI
 hop, no `jbyteArray` copy, no `std::deque`, no mutex between the engine and
 PipeWire's callback, F32 end to end — and, since capture was implemented, the
@@ -406,8 +377,8 @@ only one of the two that can record at all. The Java path is
 `CORDIAL_AUDIO=java` and remains what a host with no PipeWire session gets,
 because `supportsAAudio()` answers false there regardless of this switch.
 
-**`CORDIAL_AUDIO` now exists**, with three values — `java` (the default, and
-what an unset variable means), `aaudio`, and `aaudio-refuse` — and it
+**`CORDIAL_AUDIO` now exists**, with three values — `aaudio` (the default, and
+what an unset variable means), `java`, and `aaudio-refuse` — and it
 announces which one it chose during startup, on the line beginning
 `I/Cordial-AAudio          audio backend:`. It was previously described in
 conversation as the intended design and then tried on a live run before

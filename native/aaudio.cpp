@@ -30,8 +30,8 @@
 // a place that loaded and played in silence. The "AAudio, then OpenSL ES,
 // then Java" chain does not exist on this build once the first link has been
 // claimed. That is why `supportsAAudio()` checks `pipewire_available()`
-// before saying yes, and why this whole path stays behind a switch that is
-// off by default.
+// before saying yes. `CORDIAL_AUDIO=java` remains the rollback when that check
+// is not enough for a particular host.
 //
 // **What the engine actually asks for is measured, not assumed.**
 // `docs/analysis/aaudio-contract.md` lists the 25 `AAudio*` names present in
@@ -83,19 +83,20 @@
 //   * Every failure path closes. A `requestStart` whose open fails stays
 //     STOPPED with nothing held, and `~Stream` closes again behind it.
 //
-// The shape is a *blocking read* rather than a callback, and that is measured
-// rather than chosen: `AAudioStream_read` is in the engine's 25 symbols and
-// `AAudioStream_write` is not, so the engine pulls capture on a thread of its
-// own. An input stream that arrives carrying a data callback is refused,
-// loudly, because feeding one would need a thread of ours with the microphone
-// tied to its lifetime rather than to `requestStart` — see AGENTS.md on stubs
-// that lie, and note that a stream opened for a callback nobody calls is
-// precisely a microphone held open for a recording that is not happening.
+// Capture supports both AAudio shapes. Blocking callers pull from
+// `CaptureStream` directly. Callback callers use a cancellable consumer thread
+// that pulls complete bursts from the same ring and invokes the engine away
+// from PipeWire's realtime thread. On 2026-09-14 Roblox 2.738.0.1397 was
+// measured requesting the latter after voice permission delivery completed;
+// treating `_read`'s presence as proof that input could only be blocking had
+// left that stream refused and voice without a microphone.
 
 #include "aaudio.h"
+#include "aaudio_input_callback.h"
 #include "pipewire_backend.h"
 
 #include <memory>
+#include <mutex>
 
 #include <pthread.h>
 
@@ -129,6 +130,7 @@ using aaudio_usage_t = int32_t;
 using aaudio_input_preset_t = int32_t;
 
 constexpr aaudio_result_t AAUDIO_OK = 0;
+constexpr aaudio_result_t AAUDIO_ERROR_DISCONNECTED = -899;
 constexpr aaudio_result_t AAUDIO_ERROR_ILLEGAL_ARGUMENT = -898;
 constexpr aaudio_result_t AAUDIO_ERROR_INVALID_STATE = -895;
 constexpr aaudio_result_t AAUDIO_ERROR_UNIMPLEMENTED = -890;
@@ -151,6 +153,7 @@ constexpr aaudio_stream_state_t AAUDIO_STREAM_STATE_STARTED = 4;
 constexpr aaudio_stream_state_t AAUDIO_STREAM_STATE_PAUSED = 6;
 constexpr aaudio_stream_state_t AAUDIO_STREAM_STATE_STOPPED = 10;
 constexpr aaudio_stream_state_t AAUDIO_STREAM_STATE_CLOSED = 12;
+constexpr aaudio_stream_state_t AAUDIO_STREAM_STATE_DISCONNECTED = 13;
 
 constexpr aaudio_data_callback_result_t AAUDIO_CALLBACK_RESULT_CONTINUE = 0;
 
@@ -219,10 +222,9 @@ Backend parse_backend(const char* value) {
     // and the reason to flip is that the question was asked and came back
     // zero, not that the log was empty.
     //
-    // Still unmeasured: a session with voice chat actually enabled. That is
-    // the one path where FMOD would have reason to call requestStart. If a
-    // lit microphone indicator is ever reported, that is where to look, and
-    // this branch is the one line to change back.
+    // A later voice-enabled run did call requestStart with a data callback.
+    // That exposed the callback-input gap fixed below; after the fix, a
+    // tester manually confirmed audible transmission in a live game.
     if (!value || value[0] == '\0') return Backend::AAudio;
     if (std::strcmp(value, "aaudio") == 0) return Backend::AAudio;
     if (std::strcmp(value, "aaudio-refuse") == 0) return Backend::AAudioRefuse;
@@ -246,14 +248,13 @@ Backend selected_backend() {
             std::getenv("CORDIAL_AUDIO") ? std::getenv("CORDIAL_AUDIO") : "unset",
             b == Backend::Java
                 ? "libaaudio.so is not registered and org.fmod.FMOD.supportsAAudio() reports "
-                  "false, so FMOD takes its Java AudioDevice path. This is the default, and "
-                  "it is held here until one signed-in run shows FMOD closing an input "
-                  "stream it opened; CORDIAL_AUDIO=aaudio opts in."
+                  "false, so FMOD takes its Java AudioDevice path. This is the explicit "
+                  "rollback; unset CORDIAL_AUDIO selects AAudio."
                 : b == Backend::AAudio
                       ? "libaaudio.so is registered and supportsAAudio() reports true; streams "
-                        "open against PipeWire. Playback is callback-driven, capture is a "
-                        "blocking read, and the microphone exists only between requestStart "
-                        "and the next stop, pause or close."
+                        "open against PipeWire. Playback and callback input are callback-driven; "
+                        "blocking input reads remain supported. The microphone exists only "
+                        "between requestStart and callback STOP, pause, stop or close."
                       : "CONTROL RUN: libaaudio.so is registered and supportsAAudio() reports "
                         "true, but every openStream is refused with AAUDIO_ERROR_UNAVAILABLE.");
         return b;
@@ -330,6 +331,23 @@ struct Stream {
     /// own destructor on every failure path in `openStream`.
     cordial::audio::CaptureStream capture;
 
+    /// Serialises capture open/close/is_open across the callback exit hook and
+    /// external lifecycle calls. It is never held while joining the callback
+    /// worker, so the worker remains free to finish its own close.
+    std::mutex capture_lifecycle;
+
+    /// Callback INPUT consumes `capture`'s ring away from PipeWire's realtime
+    /// thread. It is idle until `requestStart`, cancelled and joined by every
+    /// external pause/stop/close, and allowed to cancel itself without joining
+    /// when those calls are re-entered from the engine callback.
+    cordial::audio::InputCallbackDriver input_callback;
+
+    /// Serialises external input lifecycle calls. Callback-thread lifecycle
+    /// calls never take it: an external stop may hold it while joining that
+    /// thread, so taking it from the callback would recreate the wait cycle
+    /// this bridge exists to avoid.
+    std::mutex input_lifecycle;
+
     /// A partial frame left over from the previous `AAudioStream_read`.
     ///
     /// `CaptureStream::read` counts bytes, and this bridge owes the engine
@@ -349,8 +367,8 @@ struct Stream {
     aaudio_format_t format = AAUDIO_FORMAT_UNSPECIFIED;
     std::atomic<aaudio_stream_state_t> state{AAUDIO_STREAM_STATE_OPEN};
 
-    /// The thread PipeWire last ran the fill callback on, recorded so that a
-    /// `close` reaching this file from inside that callback can be refused
+    /// The thread that last ran an AAudio callback, recorded so that output
+    /// `close` reaching this file from inside its callback can be refused
     /// instead of deadlocking on the loop lock. AAudio's own documentation
     /// forbids it ("another thread should be used to stop and close the
     /// stream"), and a well-behaved FMOD will never do it — but a hang is a
@@ -361,10 +379,9 @@ struct Stream {
     /// counts what Cordial can honestly see, which is not what Android counts.
     std::atomic<int32_t> xruns{0};
 
-    // CORDIAL_TRACE_AUDIO=1 bookkeeping only. Touched from the fill callback
-    // and nowhere else, so plain members rather than atomics: AAudio's own
-    // contract is that the data callback is never entered from two threads at
-    // once, and PipeWire honours it here by running `process` on one loop.
+    // CORDIAL_TRACE_AUDIO=1 bookkeeping only. Output callbacks and each input
+    // delivery shape have one owner thread. Lifecycle joins callback input
+    // before resetting these fields, so plain members remain sufficient.
     uint64_t trace_cycles = 0;
     uint64_t trace_frames = 0;
     float trace_peak = 0.0f;
@@ -499,7 +516,8 @@ bool fill_from_engine(void* dst, uint32_t frames, void* user) {
 /// count are both equally happy with a river of zeroes. Capture has exactly
 /// the same hole and it is worse: a microphone that is muted at the source, or
 /// a stream linked to the wrong node, delivers frames forever and every one of
-/// them is zero. Runs on the engine's own reading thread, never on PipeWire's.
+/// them is zero. Runs on the blocking reader or callback-consumer thread,
+/// never on PipeWire's.
 float s16_peak(const int16_t* p, size_t samples) {
     int peak = 0;
     for (size_t i = 0; i < samples; ++i) {
@@ -525,6 +543,101 @@ void sleep_ns(int64_t ns) {
 bool on_callback_thread(Stream* s) {
     unsigned long t = s->callback_thread.load(std::memory_order_relaxed);
     return t != 0 && t == static_cast<unsigned long>(pthread_self());
+}
+
+bool input_capture_is_open(Stream* s) {
+    std::lock_guard<std::mutex> lifecycle(s->capture_lifecycle);
+    return s->capture.is_open();
+}
+
+bool open_input_capture(Stream* s) {
+    std::lock_guard<std::mutex> lifecycle(s->capture_lifecycle);
+    return s->capture.open(kCaptureRate, kCaptureChannels, std::string());
+}
+
+void close_input_capture(Stream* s) {
+    std::lock_guard<std::mutex> lifecycle(s->capture_lifecycle);
+    s->capture.close();
+}
+
+bool disconnect_failed_input(Stream* s) {
+    if (!s->capture.failed()) return false;
+
+    aaudio_stream_state_t expected = AAUDIO_STREAM_STATE_STARTED;
+    if (s->state.compare_exchange_strong(expected, AAUDIO_STREAM_STATE_DISCONNECTED,
+                                         std::memory_order_relaxed)) {
+        // This runs on the callback driver thread, where cancel is deliberately
+        // non-joining. The capture is gone before the engine receives error.
+        s->input_callback.cancel();
+        close_input_capture(s);
+        s->read_residue_len = 0;
+        std::fprintf(stderr,
+            "E/Cordial-AAudio          capture backend disconnected; microphone closed "
+            "and input stream moved to DISCONNECTED.\n");
+        if (s->error_callback) {
+            s->error_callback(reinterpret_cast<AAudioStream*>(s), s->error_user,
+                              AAUDIO_ERROR_DISCONNECTED);
+        }
+    }
+    return true;
+}
+
+void trace_capture_delivery(Stream* s, const void* data, uint32_t frames) {
+    if (!trace_audio_enabled() || frames == 0) return;
+    ++s->trace_cycles;
+    s->trace_frames += frames;
+    float peak = s16_peak(static_cast<const int16_t*>(data),
+                          static_cast<size_t>(frames) * kCaptureChannels);
+    if (peak > s->trace_peak) s->trace_peak = peak;
+    auto now = std::chrono::steady_clock::now();
+    if (now - s->trace_last >= std::chrono::seconds(1)) {
+        s->trace_last = now;
+        std::fprintf(stderr,
+            "D/Cordial-AAudio          capture trace: %llu delivery(s), %llu frame(s), peak "
+            "%.4f of full scale, %llu frame(s) dropped by the ring in total\n",
+            static_cast<unsigned long long>(s->trace_cycles),
+            static_cast<unsigned long long>(s->trace_frames), s->trace_peak,
+            static_cast<unsigned long long>(s->capture.dropped_bytes() /
+                                            kCaptureBytesPerFrame));
+        s->trace_peak = 0.0f;
+    }
+}
+
+uint32_t read_callback_capture(void* source, void* dst, uint32_t size) {
+    auto* s = static_cast<Stream*>(source);
+    if (disconnect_failed_input(s)) return 0;
+    return s->capture.read(dst, size);
+}
+
+bool deliver_input_callback(void* data, uint32_t frames, void* user) {
+    auto* s = static_cast<Stream*>(user);
+    s->callback_thread.store(static_cast<unsigned long>(pthread_self()),
+                             std::memory_order_relaxed);
+    trace_capture_delivery(s, data, frames);
+    if (cordial::audio::voice_muted().load(std::memory_order_relaxed)) {
+        std::memset(data, 0, static_cast<size_t>(frames) * kCaptureBytesPerFrame);
+    }
+
+    const aaudio_data_callback_result_t result = s->data_callback(
+        reinterpret_cast<AAudioStream*>(s), s->data_user, data,
+        static_cast<int32_t>(frames));
+    if (result != AAUDIO_CALLBACK_RESULT_CONTINUE) {
+        aaudio_stream_state_t expected = AAUDIO_STREAM_STATE_STARTED;
+        s->state.compare_exchange_strong(expected, AAUDIO_STREAM_STATE_STOPPED,
+                                         std::memory_order_relaxed);
+        return false;
+    }
+    return true;
+}
+
+void input_callback_exited(bool callback_stopped, void* user) {
+    auto* s = static_cast<Stream*>(user);
+    close_input_capture(s);
+    if (callback_stopped) {
+        std::fprintf(stderr,
+            "I/Cordial-AAudio          input data callback returned "
+            "AAUDIO_CALLBACK_RESULT_STOP; capture stream destroyed and recording stopped.\n");
+    }
 }
 
 /// `AAudioStreamBuilder_openStream` for `AAUDIO_DIRECTION_INPUT`.
@@ -558,29 +671,11 @@ aaudio_result_t open_input_stream(const Builder& b, AAudioStream** streamOut) {
         return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
     }
 
-    // A callback-driven *input* stream is a shape AAudio has and this bridge
-    // does not: it would need a thread of our own pulling `CaptureStream` and
-    // pushing into the engine, with the microphone's lifetime tied to that
-    // thread rather than to `requestStart`. The 2026-08-22 measurement has
-    // FMOD opening its input stream with `dataCallback=no`, so this is the
-    // branch that should never be taken — and if a later build takes it, an
-    // error here is a line in the log, where opening the stream and never
-    // invoking the callback would be a microphone held open for a recording
-    // nobody receives. That is the exact state the microphone rule exists to
-    // forbid, so it is not a close call.
-    if (b.data_callback) {
-        std::fprintf(stderr,
-            "E/Cordial-AAudio          refusing an input stream that installed a data "
-            "callback: this bridge implements capture as the blocking AAudioStream_read the "
-            "engine's own symbol set implies (there is no AAudioStream_write), and has no "
-            "thread to push frames from. Recording will not work this run; say so rather "
-            "than hold the microphone open for a callback that is never called.\n");
-        return AAUDIO_ERROR_UNIMPLEMENTED;
-    }
-
     auto* s = new (std::nothrow) Stream();
     if (!s) return AAUDIO_ERROR_NO_MEMORY;
     s->direction = AAUDIO_DIRECTION_INPUT;
+    s->data_callback = b.data_callback;
+    s->data_user = b.data_user;
     s->error_callback = b.error_callback;
     s->error_user = b.error_user;
     s->format = AAUDIO_FORMAT_PCM_I16;
@@ -588,11 +683,12 @@ aaudio_result_t open_input_stream(const Builder& b, AAudioStream** streamOut) {
 
     std::fprintf(stderr,
         "I/Cordial-AAudio          input stream opened: will report %u Hz, %u channel(s), "
-        "%s, %u frames per burst. **No microphone is open yet** — the capture stream is "
+        "%s, %u frames per burst, delivery=%s. **No microphone is open yet** — the capture stream is "
         "created by requestStart and destroyed by requestPause, requestStop and close, so "
         "an opened-but-unstarted stream is invisible to pw-cli and leaves the desktop's "
         "microphone indicator out.\n",
-        kCaptureRate, kCaptureChannels, format_name(s->format), kCaptureBurstFrames);
+        kCaptureRate, kCaptureChannels, format_name(s->format), kCaptureBurstFrames,
+        s->data_callback ? "callback" : "blocking read");
 
     *streamOut = reinterpret_cast<AAudioStream*>(s);
     return AAUDIO_OK;
@@ -734,7 +830,7 @@ static aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder* build
     //     bufferCapacity=0     dataCallback=no   errorCallback=no    -> closed at once
     //     bufferCapacity=0     dataCallback=yes  errorCallback=yes   -> closed at once
     //     bufferCapacity=9216  dataCallback=yes  errorCallback=yes   -> kept, and pulled
-    //     direction=INPUT      dataCallback=no   errorCallback=no    -> refused, below
+    //     direction=INPUT      dataCallback=no   errorCallback=no    -> then refused
     //
     // The first two are *probes*. With no `AAudioStreamBuilder_setSampleRate`
     // to ask with, the only way to learn what the device runs at is to open a
@@ -791,18 +887,28 @@ static aaudio_result_t AAudioStream_close(AAudioStream* stream) {
     if (!stream) return AAUDIO_ERROR_NULL;
     auto* s = reinterpret_cast<Stream*>(stream);
     if (s->direction == AAUDIO_DIRECTION_INPUT) {
-        // Unconditional, before anything else can fail. `CaptureStream::close`
-        // is idempotent and destroys the `pw_stream` rather than deactivating
-        // it, so a closed AAudio input stream is indistinguishable from one
-        // that never recorded. `~Stream` would do this too; doing it here as
-        // well means no future early return between this line and the delete
-        // can leave the microphone up.
-        s->capture.close();
-        s->state.store(AAUDIO_STREAM_STATE_CLOSED, std::memory_order_relaxed);
+        if (s->input_callback.is_callback_thread()) {
+            std::fprintf(stderr,
+                "E/Cordial-AAudio          AAudioStream_close called from inside the input "
+                "data callback; refusing (AAudio requires another thread for close) rather "
+                "than deleting the callback's stream underneath it.\n");
+            return AAUDIO_ERROR_INVALID_STATE;
+        }
+        {
+            std::lock_guard<std::mutex> lifecycle(s->input_lifecycle);
+            s->state.store(AAUDIO_STREAM_STATE_CLOSED, std::memory_order_relaxed);
+            s->input_callback.cancel();
+            // Close before joining: an engine callback is untrusted and may
+            // not return promptly, but it must not extend the microphone's
+            // lifetime after another thread asks to close the stream.
+            close_input_capture(s);
+            s->input_callback.join();
+        }
         std::fprintf(stderr,
             "I/Cordial-AAudio          input stream closed; %u capture stream(s) still "
             "open across Cordial (must be 0 unless something else is recording).\n",
             cordial::audio::active_capture_streams());
+        // The lifecycle guard must be gone before this destroys its mutex.
         delete s;
         return AAUDIO_OK;
     }
@@ -825,7 +931,7 @@ static aaudio_result_t AAudioStream_close(AAudioStream* stream) {
     return AAUDIO_OK;
 }
 
-// requestStart/Pause/Stop flip one relaxed atomic and touch nothing else.
+// Output requestStart/Pause/Stop flip one relaxed atomic and touch nothing else.
 //
 // They deliberately do *not* call `pw_stream_set_active`, which would need
 // PipeWire's loop lock — and AAudio documents that an error callback may stop
@@ -838,11 +944,25 @@ static aaudio_result_t AAudioStream_requestStart(AAudioStream* stream) {
     auto* s = reinterpret_cast<Stream*>(stream);
 
     if (s->direction == AAUDIO_DIRECTION_INPUT) {
+        if (s->input_callback.is_callback_thread()) {
+            return s->state.load(std::memory_order_relaxed) == AAUDIO_STREAM_STATE_STARTED
+                       ? AAUDIO_OK
+                       : AAUDIO_ERROR_INVALID_STATE;
+        }
+        std::lock_guard<std::mutex> lifecycle(s->input_lifecycle);
+        if (s->data_callback) {
+            // An external requestStart is also a restart barrier. Waiting for
+            // the old callback worker prevents its exit hook from closing the
+            // newly opened capture after a concurrent callback STOP.
+            s->input_callback.cancel();
+            s->input_callback.join();
+            close_input_capture(s);
+        }
         // **The only place in this file that opens a microphone**, and the
         // only place that may be. `requestStart` is AAudio's "I am recording
         // now"; everything earlier is preparation and must leave the capture
         // device alone.
-        if (s->capture.is_open()) {
+        if (input_capture_is_open(s)) {
             s->state.store(AAUDIO_STREAM_STATE_STARTED, std::memory_order_relaxed);
             return AAUDIO_OK;
         }
@@ -851,11 +971,11 @@ static aaudio_result_t AAudioStream_requestStart(AAudioStream* stream) {
         // makes for sinks — a resolved name is a snapshot of today's default,
         // an absent `PW_KEY_TARGET_OBJECT` is a standing instruction — and it
         // also spares the recording path a registry round trip.
-        if (!s->capture.open(kCaptureRate, kCaptureChannels, std::string())) {
+        if (!open_input_capture(s)) {
             // Stays STOPPED with nothing open. A stream that reported OK here
             // would have the engine reading zeroes out of a device it does
             // not hold, which is the "stub that lies" AGENTS.md is about.
-            s->capture.close();
+            close_input_capture(s);
             s->state.store(AAUDIO_STREAM_STATE_STOPPED, std::memory_order_relaxed);
             std::fprintf(stderr,
                 "E/Cordial-AAudio          requestStart could not open a capture stream; "
@@ -869,6 +989,17 @@ static aaudio_result_t AAudioStream_requestStart(AAudioStream* stream) {
         s->trace_peak = 0.0f;
         s->trace_last = std::chrono::steady_clock::now();
         s->state.store(AAUDIO_STREAM_STATE_STARTED, std::memory_order_relaxed);
+        if (s->data_callback &&
+            !s->input_callback.start(s, &read_callback_capture, kCaptureBytesPerFrame,
+                                     kCaptureBurstFrames, &deliver_input_callback,
+                                     &input_callback_exited, s)) {
+            s->state.store(AAUDIO_STREAM_STATE_STOPPED, std::memory_order_relaxed);
+            close_input_capture(s);
+            std::fprintf(stderr,
+                "E/Cordial-AAudio          requestStart could not start the input callback "
+                "consumer; staying stopped with no microphone open.\n");
+            return AAUDIO_ERROR_UNAVAILABLE;
+        }
         return AAUDIO_OK;
     }
 
@@ -891,16 +1022,26 @@ static aaudio_result_t AAudioStream_requestStart(AAudioStream* stream) {
 /// recording. So an input pause destroys the stream, the same as a stop, and
 /// a later `requestStart` opens a fresh one.
 static void stop_capture(Stream* s, aaudio_stream_state_t to) {
-    const bool was_open = s->capture.is_open();
-    s->capture.close();
-    s->read_residue_len = 0;
+    const bool was_started = s->state.load(std::memory_order_relaxed) ==
+                             AAUDIO_STREAM_STATE_STARTED;
     s->state.store(to, std::memory_order_relaxed);
-    if (was_open) {
+    if (s->data_callback) {
+        s->input_callback.cancel();
+    }
+    // A callback may call pause/stop and then never return. Closing before the
+    // self-join check makes that request's AAUDIO_OK mean the microphone is
+    // already gone rather than promising cleanup in the callback exit hook.
+    close_input_capture(s);
+    s->read_residue_len = 0;
+    if (was_started) {
         std::fprintf(stderr,
             "I/Cordial-AAudio          recording %s: capture stream destroyed, not "
             "deactivated. %u capture stream(s) still open across Cordial.\n",
             to == AAUDIO_STREAM_STATE_PAUSED ? "paused" : "stopped",
             cordial::audio::active_capture_streams());
+    }
+    if (s->data_callback && !s->input_callback.is_callback_thread()) {
+        s->input_callback.join();
     }
 }
 
@@ -908,6 +1049,11 @@ static aaudio_result_t AAudioStream_requestPause(AAudioStream* stream) {
     if (!stream) return AAUDIO_ERROR_NULL;
     auto* s = reinterpret_cast<Stream*>(stream);
     if (s->direction == AAUDIO_DIRECTION_INPUT) {
+        if (!s->input_callback.is_callback_thread()) {
+            std::lock_guard<std::mutex> lifecycle(s->input_lifecycle);
+            stop_capture(s, AAUDIO_STREAM_STATE_PAUSED);
+            return AAUDIO_OK;
+        }
         stop_capture(s, AAUDIO_STREAM_STATE_PAUSED);
         return AAUDIO_OK;
     }
@@ -920,6 +1066,11 @@ static aaudio_result_t AAudioStream_requestStop(AAudioStream* stream) {
     if (!stream) return AAUDIO_ERROR_NULL;
     auto* s = reinterpret_cast<Stream*>(stream);
     if (s->direction == AAUDIO_DIRECTION_INPUT) {
+        if (!s->input_callback.is_callback_thread()) {
+            std::lock_guard<std::mutex> lifecycle(s->input_lifecycle);
+            stop_capture(s, AAUDIO_STREAM_STATE_STOPPED);
+            return AAUDIO_OK;
+        }
         stop_capture(s, AAUDIO_STREAM_STATE_STOPPED);
         return AAUDIO_OK;
     }
@@ -1035,14 +1186,14 @@ static int32_t AAudioStream_getXRunCount(AAudioStream* stream) {
     return static_cast<int32_t>(count > INT32_MAX ? INT32_MAX : count);
 }
 
-/// The capture side, and the only way frames leave this bridge.
+/// Blocking capture. Callback capture leaves through `deliver_input_callback`.
 ///
 /// `AAudioStream_write` is not among the 25 names this build looks up and
-/// `_read` is, which is the measurement the whole shape rests on: playback is
-/// pushed to the engine by a callback, capture is pulled by the engine on a
-/// thread of its own. So there is nothing realtime here — this runs wherever
-/// FMOD's recording loop runs, and it is allowed to sleep, which is what makes
-/// a blocking read implementable over a ring that never blocks.
+/// `_read` is, but that does not exclude callback input — a claim corrected
+/// after Roblox 2.738.0.1397 installed one. This entry point remains for input
+/// streams without a callback and runs wherever FMOD's blocking recording loop
+/// runs. It may sleep, which is what makes a blocking read implementable over
+/// a ring that never blocks.
 ///
 /// The wait is a poll rather than a condition variable, and that is a
 /// deliberate trade. Signalling a condvar would mean adding a wakeup to
@@ -1068,12 +1219,14 @@ static aaudio_result_t AAudioStream_read(AAudioStream* stream, void* buffer, int
         return AAUDIO_ERROR_UNIMPLEMENTED;
     }
 
+    if (s->data_callback) return AAUDIO_ERROR_INVALID_STATE;
+
     if (numFrames < 0) return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
     if (numFrames == 0) return 0;
     // Not started, or started and then stopped: there is no microphone open,
     // and the engine must hear that rather than be handed a quiet room.
     if (s->state.load(std::memory_order_relaxed) != AAUDIO_STREAM_STATE_STARTED ||
-        !s->capture.is_open()) {
+        !input_capture_is_open(s)) {
         return AAUDIO_ERROR_INVALID_STATE;
     }
 
@@ -1118,24 +1271,7 @@ static aaudio_result_t AAudioStream_read(AAudioStream* stream, void* buffer, int
         s->read_residue_len = remainder;
     }
 
-    if (trace_audio_enabled() && frames > 0) {
-        ++s->trace_cycles;
-        s->trace_frames += frames;
-        float peak = s16_peak(reinterpret_cast<const int16_t*>(dst),
-                               static_cast<size_t>(frames) * kCaptureChannels);
-        if (peak > s->trace_peak) s->trace_peak = peak;
-        auto now = std::chrono::steady_clock::now();
-        if (now - s->trace_last >= std::chrono::seconds(1)) {
-            s->trace_last = now;
-            std::fprintf(stderr,
-                "D/Cordial-AAudio          capture trace: %llu read(s), %llu frame(s), peak "
-                "%.4f of full scale, %llu frame(s) dropped by the ring in total\n",
-                static_cast<unsigned long long>(s->trace_cycles),
-                static_cast<unsigned long long>(s->trace_frames), s->trace_peak,
-                static_cast<unsigned long long>(s->capture.dropped_bytes() / bpf));
-            s->trace_peak = 0.0f;
-        }
-    }
+    trace_capture_delivery(s, dst, frames);
 
     // After the trace, so the trace still says whether the microphone itself
     // is delivering sound while Roblox has it muted.

@@ -96,6 +96,15 @@
 //! unprivileged after loading privileged, and mocktail's own
 //! `IsPrivilegedBridgeAllowed` re-reads `webkit_web_view_get_uri` for exactly
 //! that reason. This file does the same, at the same point.
+//!
+//! **A popup is not exempt from any of this.** Until this file also answered
+//! WebKit's `create` signal (see [`install_popup_handling`]), a page that
+//! opened a second window with `window.open()` got one with no bridge, no
+//! navigation policy and no log line -- which is this module's own opening
+//! sentence, describing a gap in this file rather than in the engine. Every
+//! popup now gets the identical registration, policy check and origin
+//! re-check a top-level window does, via the same functions [`open`] itself
+//! calls.
 
 use adw::prelude::*;
 use gtk4::prelude::*;
@@ -136,6 +145,48 @@ enum BridgeHandler {
     RobloxWkHybrid,
 }
 
+impl BridgeHandler {
+    /// The registered handler name this variant answers for, so a rejection
+    /// log can say which of the two contracts a malformed message arrived
+    /// on without printing the message itself.
+    fn name(self) -> &'static str {
+        match self {
+            BridgeHandler::ExecuteRoblox => BRIDGE_EXECUTE_ROBLOX,
+            BridgeHandler::RobloxWkHybrid => BRIDGE_ROBLOX_WK_HYBRID,
+        }
+    }
+}
+
+/// A one-word JS type name for `value`, for the rejection log below -- never
+/// the value itself, which may be whatever the page and the engine are
+/// mid-conversation about. `object` covers the case a page posted an object
+/// with no `command` string property, which reads identically to an
+/// `is_object()` failure in the log unless something distinguishes them; this
+/// does not distinguish that further because doing so would mean walking the
+/// object's own properties, and this function's whole job is to say what
+/// arrived without looking at what it says.
+fn describe_value_shape(value: &webkit6::javascriptcore::Value) -> &'static str {
+    if value.is_undefined() {
+        "undefined"
+    } else if value.is_null() {
+        "null"
+    } else if value.is_boolean() {
+        "a boolean"
+    } else if value.is_number() {
+        "a number"
+    } else if value.is_string() {
+        "a string"
+    } else if value.is_array() {
+        "an array"
+    } else if value.is_function() {
+        "a function"
+    } else if value.is_object() {
+        "an object"
+    } else {
+        "an unrecognised JS value"
+    }
+}
+
 fn forward_script_message(
     view: &webkit6::WebView,
     value: &webkit6::javascriptcore::Value,
@@ -157,8 +208,20 @@ fn forward_script_message(
             .and_then(|bytes| std::str::from_utf8(bytes.as_ref()).ok().map(str::to_owned)),
         _ => None,
     };
+    // Named by handler and shaped by JS type, rather than a bare "malformed":
+    // this is the one place that distinguishes "a message arrived on this
+    // handler but was not the shape expected" from the silence a page
+    // opening a *second* window produces instead (see
+    // `install_popup_handling`'s doc) -- two failure modes that otherwise
+    // both read as "pressing the button did nothing". The type name is
+    // logged, never the value -- a JS type says nothing about what the page
+    // and the engine were mid-conversation about.
     let Some(command) = command.filter(|command| !command.is_empty()) else {
-        eprintln!("[webview] rejected a malformed bridge command");
+        eprintln!(
+            "[webview] rejected a malformed {} bridge command (arrived as {})",
+            handler.name(),
+            describe_value_shape(value),
+        );
         return;
     };
 
@@ -243,7 +306,7 @@ pub struct WindowRequest {
 /// loudly matters more here than elsewhere: silence is the failure mode this
 /// whole module exists to end, and "the window did not open" must never again be
 /// indistinguishable from "nobody was listening".
-pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<adw::Dialog> {
+pub fn open(parent: &(impl IsA<gtk4::Widget> + Clone), request: &WindowRequest) -> Option<adw::Dialog> {
     let policy = webview_policy::evaluate(&request.url);
     if !policy.allowed {
         eprintln!(
@@ -292,118 +355,14 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
     // starts unprivileged and is somehow later on a Roblox host still may not
     // get it retroactively without this being checked again at the point of
     // use, which is exactly what happens below.
+    //
+    // Done through [`register_bridge`] rather than inline, because a page
+    // that opens a second window from inside this one -- `window.open()`, or
+    // a `target="_blank"` link -- needs the identical registration on that
+    // window too. See [`install_popup_handling`]'s doc for the gap that used
+    // to leave a popup with none of this at all.
     let user_content = webkit6::UserContentManager::new();
-    for handler in [BRIDGE_EXECUTE_ROBLOX, BRIDGE_ROBLOX_WK_HYBRID] {
-        if !user_content.register_script_message_handler(handler, None) {
-            eprintln!("[webview] could not register the {handler} bridge handler");
-        }
-    }
-
-    // **The global the page actually looks for is `__globalRobloxAndroidBridge__`.**
-    //
-    // `register_script_message_handler` above exposes the handler as
-    // `window.webkit.messageHandlers.executeRoblox.postMessage(...)`, which is
-    // WebKitGTK's only shape. The page never touches that directly. It looks
-    // for a global object holding an `executeRoblox` **function that takes a
-    // JSON string**, and calls it as
-    //
-    //     window.__globalRobloxAndroidBridge__.executeRoblox(jsonString)
-    //
-    // Two earlier attempts missed for different reasons and both are worth
-    // recording. The first shipped the message handler alone and nothing ever
-    // called it, which read as a bridge failing to deliver when in fact the
-    // page had concluded it was not inside an app and used an ordinary link --
-    // reported as "pressing Join opens the game's detail page instead of
-    // joining". The second guessed the Android `addJavascriptInterface` shape,
-    // `window.executeRoblox.someMethod(args)`, and was wrong in both the name
-    // and the calling convention: it is one function taking a string, not an
-    // object with methods.
-    //
-    // The shape is adapted from mocktail (`src/webview/webview_helper_policy.cc`,
-    // Apache-2.0), which is the third implementation this project has learned
-    // the platform's own vocabulary from rather than inferring it. Guessing at
-    // a JS calling convention is exactly as unreliable as guessing at a JNI
-    // descriptor, and this file now has two instances of each.
-    //
-    // `writable: false, configurable: false` so a page-defined object can never
-    // replace the native bridge, and the whole thing is a no-op when the
-    // handler is absent rather than installing a global that silently swallows
-    // calls. Policy is still re-checked against the live uri on every message,
-    // because this necessarily runs in the page's own world.
-    //
-    // **Never log the payload** -- it carries whatever the page and the engine
-    // are mid-conversation about.
-    // The early return below (`if (!handler) return;`) never retries, which
-    // looks like a race waiting to happen: if `window.webkit.messageHandlers`
-    // were not populated when a document-start script runs, the bridge would
-    // silently never install.
-    //
-    // **It cannot happen, and the reason is structural rather than lucky.**
-    // `WebKitWebView`'s `user-content-manager` property is construct-only, so
-    // a manager cannot be attached after the view exists -- handlers and
-    // scripts are necessarily registered before there is any document to run
-    // them in. Checked in `WebKit-6.0.gir`; this file's own ordering
-    // (handlers, then script, then `WebView::builder()`, then `load_uri`)
-    // satisfies it regardless.
-    //
-    // Recorded because it is an appealing theory that costs a day: it explains
-    // an intermittent symptom neatly and is wrong.
-    let shim = format!(
-        r#"(() => {{
-  "use strict";
-  const handlers = window.webkit && window.webkit.messageHandlers;
-  const handler = handlers && handlers.{a};
-  if (!handler) {{ return; }}
-  const bridge = {{}};
-  Object.defineProperty(bridge, "{a}", {{
-    value: (query) => handler.postMessage(JSON.parse(query)),
-    enumerable: true, writable: false, configurable: false
-  }});
-  try {{
-    Object.defineProperty(window, "__globalRobloxAndroidBridge__", {{
-      value: bridge, enumerable: true, writable: false, configurable: false
-    }});
-  }} catch (_) {{ /* a page may not replace the native bridge */ }}
-}})();"#,
-        a = BRIDGE_EXECUTE_ROBLOX,
-    );
-    // **`TopFrame` is load-bearing, not a leftover.** It pairs with the origin
-    // check in `forward_script_message`, and changing one without the other
-    // opens a hole. Written down because the pairing is invisible from either
-    // end and the obvious "fix" for a bridge-in-an-iframe bug is to flip this
-    // constant.
-    //
-    // Measured on this machine with `cargo run -p cordial-shell --example
-    // frame_scope_probe`, against a page with one same-origin `srcdoc` child:
-    //
-    //     TopFrame   -> ["top"]
-    //     AllFrames  -> ["top", "nested"]
-    //
-    // So a nested frame does receive the script under `AllFrames`, and it can
-    // reach `window.webkit.messageHandlers` -- the handler is registered per
-    // script *world*, not per frame. `AllFrames` is in fact WebKitGTK's
-    // documented default; this is a deliberate narrowing away from it.
-    //
-    // The narrowing is what makes the policy check correct. Messages arrive
-    // through `script-message-received`, which does not say which frame sent
-    // them, and `forward_script_message` therefore evaluates
-    // `webview_policy::evaluate(view.uri())` -- **the top-level document's
-    // address**. With `TopFrame` that is the sender's address by construction.
-    // With `AllFrames` it would not be: any nested frame, including a
-    // third-party one embedded in a roblox.com page, could post a bridge
-    // command and have it judged against roblox.com rather than against
-    // itself.
-    //
-    // So if the Join control ever does turn out to live in an iframe, the fix
-    // is **not** one constant. It is `AllFrames` plus per-frame origin
-    // attribution, and this API does not obviously offer the latter.
-    user_content.add_script(&webkit6::UserScript::new(
-        &shim,
-        webkit6::UserContentInjectedFrames::TopFrame,
-        webkit6::UserScriptInjectionTime::Start,
-        &[],
-        &[],
-    ));
+    register_bridge(&user_content);
 
     // With no User-Agent set, WebKitGTK sends its own, and roblox.com reads
     // that as an ordinary desktop browser rather than the app it is -- and
@@ -448,47 +407,27 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
     // reported rather than silently dropped: a page that believes its
     // command was delivered when nothing on this end received it is exactly
     // the lie that rule exists to rule out.
-    {
-        let bridge_view = view.clone();
-        user_content.connect_script_message_received(Some(BRIDGE_EXECUTE_ROBLOX), move |_manager, value| {
-            forward_script_message(&bridge_view, value, BridgeHandler::ExecuteRoblox);
-        });
-    }
-    {
-        let bridge_view = view.clone();
-        user_content.connect_script_message_received(Some(BRIDGE_ROBLOX_WK_HYBRID), move |_manager, value| {
-            forward_script_message(&bridge_view, value, BridgeHandler::RobloxWkHybrid);
-        });
-    }
+    wire_bridge_messages(&user_content, &view);
 
     // The policy is applied again on every navigation, not just the first. A
     // page that is allowed to load may redirect, and the address that matters
     // for the bridge is wherever it ended up rather than where it started.
-    view.connect_decide_policy(|_, decision, kind| {
-        if kind != webkit6::PolicyDecisionType::NavigationAction {
-            return false;
-        }
-        let Some(nav) = decision.downcast_ref::<webkit6::NavigationPolicyDecision>() else {
-            return false;
-        };
-        let uri = nav
-            .navigation_action()
-            .and_then(|mut a| a.request())
-            .and_then(|r| r.uri())
-            .map(|u| u.to_string())
-            .unwrap_or_default();
-        let verdict = webview_policy::evaluate(&uri);
-        if verdict.allowed {
-            decision.use_();
-        } else {
-            eprintln!(
-                "[webview] blocked navigation to scheme {} host {}",
-                verdict.scheme, verdict.host
-            );
-            decision.ignore();
-        }
-        true
-    });
+    install_navigation_policy(&view);
+
+    // **A page opening a second window got none of the above at all, until
+    // now.** `window.open()` and a `target="_blank"` link both fire WebKit's
+    // `create` signal, and an unanswered `create` returns nothing by
+    // WebKitGTK's own default -- no view, no error, nothing reaching this
+    // process to log. See [`install_popup_handling`]'s doc for why this was
+    // never exercised: the only window this module used to build was the one
+    // `openWindow` itself asked for, and nothing inside that page had ever
+    // been observed to open a second one.
+    // `Clone::clone(parent)`, not `parent.clone()` -- `parent` is already a
+    // reference, and `&T` is unconditionally `Clone` in its own right (a
+    // trivial pointer copy), so `.clone()` on it resolves to *that* impl
+    // before ever considering `T`'s. The explicit trait form pins `Self = T`
+    // from the argument type instead, giving the owned widget `upcast` needs.
+    install_popup_handling(&view, Clone::clone(parent).upcast(), request.user_agent.clone());
 
     // Whether this WebKitGTK build has WebAuthn at all, asked of a live page,
     // once per process. A Roblox account with a passkey enrolled cannot finish
@@ -622,6 +561,384 @@ pub fn open(parent: &impl IsA<gtk4::Widget>, request: &WindowRequest) -> Option<
     Some(dialog)
 }
 
+/// The script every view this module builds needs, so `window.__globalRobloxAndroidBridge__`
+/// is present in a popup exactly as it is in [`open`]'s own top-level window.
+///
+/// **The global the page actually looks for is `__globalRobloxAndroidBridge__`.**
+///
+/// `register_script_message_handler` (in [`register_bridge`]) exposes the handler as
+/// `window.webkit.messageHandlers.executeRoblox.postMessage(...)`, which is
+/// WebKitGTK's only shape. The page never touches that directly. It looks
+/// for a global object holding an `executeRoblox` **function that takes a
+/// JSON string**, and calls it as
+///
+///     window.__globalRobloxAndroidBridge__.executeRoblox(jsonString)
+///
+/// Two earlier attempts missed for different reasons and both are worth
+/// recording. The first shipped the message handler alone and nothing ever
+/// called it, which read as a bridge failing to deliver when in fact the
+/// page had concluded it was not inside an app and used an ordinary link --
+/// reported as "pressing Join opens the game's detail page instead of
+/// joining". The second guessed the Android `addJavascriptInterface` shape,
+/// `window.executeRoblox.someMethod(args)`, and was wrong in both the name
+/// and the calling convention: it is one function taking a string, not an
+/// object with methods.
+///
+/// The shape is adapted from mocktail (`src/webview/webview_helper_policy.cc`,
+/// Apache-2.0), which is the third implementation this project has learned
+/// the platform's own vocabulary from rather than inferring it. Guessing at
+/// a JS calling convention is exactly as unreliable as guessing at a JNI
+/// descriptor, and this file now has two instances of each.
+///
+/// `writable: false, configurable: false` so a page-defined object can never
+/// replace the native bridge, and the whole thing is a no-op when the
+/// handler is absent rather than installing a global that silently swallows
+/// calls. Policy is still re-checked against the live uri on every message,
+/// because this necessarily runs in the page's own world.
+///
+/// **Never log the payload** -- it carries whatever the page and the engine
+/// are mid-conversation about.
+/// The early return below (`if (!handler) return;`) never retries, which
+/// looks like a race waiting to happen: if `window.webkit.messageHandlers`
+/// were not populated when a document-start script runs, the bridge would
+/// silently never install.
+///
+/// **It cannot happen, and the reason is structural rather than lucky.**
+/// `WebKitWebView`'s `user-content-manager` property is construct-only, so
+/// a manager cannot be attached after the view exists -- handlers and
+/// scripts are necessarily registered before there is any document to run
+/// them in. Checked in `WebKit-6.0.gir`; this file's own ordering
+/// (handlers, then script, then `WebView::builder()`, then `load_uri`)
+/// satisfies it regardless.
+///
+/// Recorded because it is an appealing theory that costs a day: it explains
+/// an intermittent symptom neatly and is wrong.
+fn bridge_shim() -> String {
+    format!(
+        r#"(() => {{
+  "use strict";
+  const handlers = window.webkit && window.webkit.messageHandlers;
+  const handler = handlers && handlers.{a};
+  if (!handler) {{ return; }}
+  const bridge = {{}};
+  Object.defineProperty(bridge, "{a}", {{
+    value: (query) => handler.postMessage(JSON.parse(query)),
+    enumerable: true, writable: false, configurable: false
+  }});
+  try {{
+    Object.defineProperty(window, "__globalRobloxAndroidBridge__", {{
+      value: bridge, enumerable: true, writable: false, configurable: false
+    }});
+  }} catch (_) {{ /* a page may not replace the native bridge */ }}
+}})();"#,
+        a = BRIDGE_EXECUTE_ROBLOX,
+    )
+}
+
+/// Register the two bridge handler names and inject [`bridge_shim`] into
+/// `user_content`. Shared between [`open`]'s own top-level view and
+/// [`create_popup_view`], because a popup with no bridge handlers registered
+/// is a popup a Roblox sign-in or payment flow cannot talk to -- the same
+/// silent gap this whole module exists to end, one level down.
+fn register_bridge(user_content: &webkit6::UserContentManager) {
+    for handler in [BRIDGE_EXECUTE_ROBLOX, BRIDGE_ROBLOX_WK_HYBRID] {
+        if !user_content.register_script_message_handler(handler, None) {
+            eprintln!("[webview] could not register the {handler} bridge handler");
+        }
+    }
+
+    // **`TopFrame` is load-bearing, not a leftover.** It pairs with the origin
+    // check in `forward_script_message`, and changing one without the other
+    // opens a hole. Written down because the pairing is invisible from either
+    // end and the obvious "fix" for a bridge-in-an-iframe bug is to flip this
+    // constant.
+    //
+    // Measured on this machine with `cargo run -p cordial-shell --example
+    // frame_scope_probe`, against a page with one same-origin `srcdoc` child:
+    //
+    //     TopFrame   -> ["top"]
+    //     AllFrames  -> ["top", "nested"]
+    //
+    // So a nested frame does receive the script under `AllFrames`, and it can
+    // reach `window.webkit.messageHandlers` -- the handler is registered per
+    // script *world*, not per frame. `AllFrames` is in fact WebKitGTK's
+    // documented default; this is a deliberate narrowing away from it.
+    //
+    // The narrowing is what makes the policy check correct. Messages arrive
+    // through `script-message-received`, which does not say which frame sent
+    // them, and `forward_script_message` therefore evaluates
+    // `webview_policy::evaluate(view.uri())` -- **the top-level document's
+    // address**. With `TopFrame` that is the sender's address by construction.
+    // With `AllFrames` it would not be: any nested frame, including a
+    // third-party one embedded in a roblox.com page, could post a bridge
+    // command and have it judged against roblox.com rather than against
+    // itself.
+    //
+    // So if the Join control ever does turn out to live in an iframe, the fix
+    // is **not** one constant. It is `AllFrames` plus per-frame origin
+    // attribution, and this API does not obviously offer the latter.
+    //
+    // **That hypothesis is now the less likely of the two live in this file.**
+    // Checked directly against mocktail's own `CreateSurface`
+    // (`third_party/mocktail-webview/mocktail_webview_helper.cc`), a working
+    // reference implementation of this exact button: it also injects its
+    // bridge shim with `WEBKIT_USER_CONTENT_INJECT_TOP_FRAME`, not
+    // `ALL_FRAMES`. A reference that solves this problem and still narrows to
+    // the top frame is evidence the Join control is not hiding in an iframe --
+    // see [`install_popup_handling`] for the gap that same reference
+    // implementation *does* answer and this file, until now, did not.
+    user_content.add_script(&webkit6::UserScript::new(
+        &bridge_shim(),
+        webkit6::UserContentInjectedFrames::TopFrame,
+        webkit6::UserScriptInjectionTime::Start,
+        &[],
+        &[],
+    ));
+}
+
+/// Wire `script-message-received` on `user_content` to [`forward_script_message`]
+/// for both handler names, reporting bridge messages that arrive on `view`.
+/// Split out from [`register_bridge`] because this half needs `view` itself
+/// (to know which page a message came from), which does not exist yet when
+/// `register_bridge` has to run -- `user-content-manager` is a construct-only
+/// property, so the manager and its handlers must be finished before
+/// `WebView::builder().build()`, and this half can only run after it.
+fn wire_bridge_messages(user_content: &webkit6::UserContentManager, view: &webkit6::WebView) {
+    {
+        let bridge_view = view.clone();
+        user_content.connect_script_message_received(Some(BRIDGE_EXECUTE_ROBLOX), move |_manager, value| {
+            forward_script_message(&bridge_view, value, BridgeHandler::ExecuteRoblox);
+        });
+    }
+    {
+        let bridge_view = view.clone();
+        user_content.connect_script_message_received(Some(BRIDGE_ROBLOX_WK_HYBRID), move |_manager, value| {
+            forward_script_message(&bridge_view, value, BridgeHandler::RobloxWkHybrid);
+        });
+    }
+}
+
+/// Approve or refuse a navigation, or a request to open a new window, against
+/// [`webview_policy::evaluate`]. Wired onto every view this module builds --
+/// [`open`]'s own top-level view and every popup [`create_popup_view`] makes
+/// in answer to WebKit's `create` signal -- because a page that redirects
+/// itself, or opens `window.open()` at an address the policy would have
+/// refused as a first load, must be judged exactly as strictly the second
+/// time.
+///
+/// **`NewWindowAction` used to go unanswered here.** `INFERRED`: WebKitGTK's
+/// own documentation for `WebKitWebView::decide-policy` describes an
+/// unhandled decision as defaulting to `webkit_policy_decision_use()`, which
+/// would mean a blocked-scheme popup was already reaching `create` regardless
+/// of what this function did with it -- but nothing in this session ran a
+/// build to confirm that default rather than reading it off webkitgtk.org, so
+/// treat it as documented rather than measured here. What the checked-in
+/// change to this function does not depend on that either way:
+/// [`install_popup_handling`] refuses inside `create` itself regardless, and
+/// checking the type here too, with its own log line, is the same
+/// belt-and-braces this file already applies to bridge messages -- re-checked
+/// at the point of use rather than trusted from an earlier decision, because
+/// "the window did not open" must never again be indistinguishable from
+/// "nobody was listening".
+fn install_navigation_policy(view: &webkit6::WebView) {
+    view.connect_decide_policy(|_, decision, kind| {
+        if kind != webkit6::PolicyDecisionType::NavigationAction
+            && kind != webkit6::PolicyDecisionType::NewWindowAction
+        {
+            return false;
+        }
+        let Some(nav) = decision.downcast_ref::<webkit6::NavigationPolicyDecision>() else {
+            return false;
+        };
+        let uri = nav
+            .navigation_action()
+            .and_then(|mut a| a.request())
+            .and_then(|r| r.uri())
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let verdict = webview_policy::evaluate(&uri);
+        if verdict.allowed {
+            decision.use_();
+        } else {
+            let what = if kind == webkit6::PolicyDecisionType::NewWindowAction {
+                "opening a new window"
+            } else {
+                "navigation"
+            };
+            eprintln!(
+                "[webview] blocked {what} to scheme {} host {}",
+                verdict.scheme, verdict.host
+            );
+            decision.ignore();
+        }
+        true
+    });
+}
+
+/// Answer WebKit's `create` signal on `view`, fired when a page inside it
+/// calls `window.open()` or follows a `target="_blank"` link.
+///
+/// **Nothing answered this before, and that is a real gap rather than a
+/// theory.** This module's own opening line says what an unanswered Android
+/// expectation looks like: "no window, no error, no log line". An unanswered
+/// `create` is WebKitGTK's own equivalent -- the default return is nothing,
+/// so a page that opens a window this way gets exactly that: no view is
+/// built, nothing is logged, and the click that triggered it is
+/// indistinguishable from one that did nothing at all. That is a plausible
+/// account of issue #40 ("pressing Join in the Servers list does nothing")
+/// distinct from the iframe hypothesis [`register_bridge`] records and
+/// weighs against: it does not require the Join control to be in a nested
+/// frame at all, only that whatever it does to join a server opens a second
+/// window rather than calling the existing bridge.
+///
+/// **Still not established which of the two this is, or whether it is
+/// either.** Nothing in this session ran a signed-in client to watch which
+/// signal actually fires when Join is pressed (AGENTS.md's rule on test
+/// accounts). What is established is that this path was entirely unhandled,
+/// which on its own is a bug worth fixing regardless of whether it explains
+/// that issue: a `broken_feature` exactly as this module's doc describes one.
+///
+/// Modelled on mocktail's `OnCreatePopup`/`CreateSurface`
+/// (`third_party/mocktail-webview/mocktail_webview_helper.cc`, Apache-2.0),
+/// which wires `create`, `ready-to-show` and `close` together and reuses its
+/// own view-construction function for a popup rather than building one with
+/// less on it than a top-level window gets -- the same reuse
+/// [`create_popup_view`] does here via [`register_bridge`],
+/// [`wire_bridge_messages`] and [`install_navigation_policy`].
+///
+/// `chrome_parent` is the widget [`open`] itself presents its dialog
+/// against, threaded through so a popup presents alongside it. `AdwDialog`
+/// has no transient-for requirement of its own -- libadwaita already stacks
+/// multiple dialogs presented against the same parent correctly, which is
+/// simpler than mocktail's own `gtk_window_set_transient_for` bookkeeping and
+/// needs none of it because Cordial's dialogs were never separate
+/// `GtkWindow`s to begin with (see this module's own doc on why).
+fn install_popup_handling(view: &webkit6::WebView, chrome_parent: gtk4::Widget, user_agent: Option<String>) {
+    view.connect_create(move |parent_view, action| {
+        let uri = action
+            .request()
+            .and_then(|r| r.uri())
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let verdict = webview_policy::evaluate(&uri);
+        eprintln!(
+            "[webview] the page asked to open a new window (host {}, scheme {}); {}",
+            verdict.host,
+            verdict.scheme,
+            if verdict.allowed { "creating one" } else { "refusing" },
+        );
+        if !verdict.allowed {
+            return None;
+        }
+        Some(create_popup_view(parent_view, chrome_parent.clone(), user_agent.clone()).upcast())
+    });
+}
+
+/// Build the WebKitWebView, dialog chrome and bridge for one popup a page
+/// opened with `window.open()`, and present it once WebKit says it is ready.
+///
+/// `related_view` rather than a fresh `NetworkSession` -- unlike [`open`]'s
+/// own ephemeral session, a popup must share the parent's cookie jar to be
+/// usable for anything Roblox would open one for (a sign-in step, a payment
+/// confirmation). mocktail's `CreateSurface` sets a new view up the same way:
+/// `related-view` when a related view exists, `network-session` only when it
+/// does not, never both, and asserts afterwards that the result carries the
+/// same `NetworkSession` as the app's one shared view in either case -- which
+/// is this crate's evidence that `related-view` inherits the session rather
+/// than a WebKitGTK API guarantee read off documentation. This crate's own
+/// `open()` creates a fresh ephemeral session specifically because Cordial
+/// only ever has one web window in flight at a time (see
+/// `cordial_runtime::webview::report_window_closed`'s doc); a popup is that
+/// same window's child, not a second unrelated one, so it inherits rather
+/// than repeating that choice.
+///
+/// The user agent is still applied explicitly, to the view's own live
+/// `Settings` fetched after construction, rather than assumed to be
+/// inherited through `related-view` -- mocktail's `CreateSurface` re-applies
+/// its settings to every view it builds regardless of relation, which reads
+/// as the same caution rather than an oversight, and nothing here has
+/// measured whether WebKitGTK actually would inherit them if left unset.
+///
+/// Not presented immediately: WebKit hands this view back from `create`
+/// before it has navigated anywhere or been given a size, and presenting an
+/// empty, zero-sized dialog would be worse than the wait. `ready-to-show` is
+/// WebKit's own signal that it is safe to, the same point mocktail's
+/// `OnReadyToShow` waits for before its equivalent of `present`.
+fn create_popup_view(
+    parent_view: &webkit6::WebView,
+    chrome_parent: gtk4::Widget,
+    user_agent: Option<String>,
+) -> webkit6::WebView {
+    let user_content = webkit6::UserContentManager::new();
+    register_bridge(&user_content);
+
+    // No `.settings(&settings)` construct property here, unlike [`open`]'s own
+    // view -- mocktail's `CreateSurface` never passes one at construction
+    // either, for a related or an unrelated view; it applies its equivalent
+    // (`ConfigureWebView`) to `webkit_web_view_get_settings()` afterwards in
+    // both cases. Matched here rather than risk an untested interaction
+    // between `related-view` and a `settings` construct property this crate
+    // never had reason to try before.
+    let view = webkit6::WebView::builder()
+        .related_view(parent_view)
+        .user_content_manager(&user_content)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    if let (Some(ua), Some(settings)) = (&user_agent, view.settings()) {
+        settings.set_user_agent(Some(ua));
+    }
+
+    wire_bridge_messages(&user_content, &view);
+    install_navigation_policy(&view);
+    install_popup_handling(&view, chrome_parent.clone(), user_agent);
+
+    let header = adw::HeaderBar::new();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&view));
+
+    let dialog = adw::Dialog::new();
+    dialog.set_child(Some(&toolbar));
+    dialog.set_content_width(900);
+    dialog.set_content_height(700);
+
+    {
+        let dialog = dialog.clone();
+        let shown_view = view.clone();
+        view.connect_ready_to_show(move |_| {
+            let host =
+                webview_policy::evaluate(&shown_view.uri().map(|u| u.to_string()).unwrap_or_default())
+                    .host;
+            header.set_title_widget(Some(&adw::WindowTitle::new(&host, "")));
+            dialog.set_title(&host);
+            dialog.present(Some(&chrome_parent));
+        });
+    }
+    // The counterpart to `create`: a page calling `window.close()` on itself.
+    // Closing the dialog rather than leaving an unresponsive window up with
+    // nothing left in it to show anything.
+    {
+        let dialog = dialog.clone();
+        // `AdwDialog::close` returns whether it accepted the request, which
+        // `connect_close`'s own signature has no room for -- WebKit's `close`
+        // signal wants a plain reaction, not a verdict.
+        view.connect_close(move |_| {
+            let _ = dialog.close();
+        });
+    }
+
+    // **Untested: whether this leaks a closed popup.** `dialog` holds `view`
+    // (through `toolbar`), and `view`'s own signal connections above hold
+    // `dialog` back -- a reference cycle, if GTK's own teardown of a closed
+    // dialog does not break it by dropping the content widget (and with it
+    // the signal closures) before the cycle matters. This crate could not
+    // build to check, so it is written down rather than assumed away; a weak
+    // reference via `glib::clone!` would be the fix if a live run ever shows
+    // popup dialogs surviving their own closure.
+    view
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +974,25 @@ mod tests {
     fn the_bridge_handler_names_match_mocktails() {
         assert_eq!(BRIDGE_EXECUTE_ROBLOX, "executeRoblox");
         assert_eq!(BRIDGE_ROBLOX_WK_HYBRID, "RobloxWKHybrid");
+    }
+
+    /// `forward_script_message`'s malformed-command log names a handler by
+    /// this, so a typo here would make the log lie about which contract a
+    /// bad message arrived on -- pinned the same way the constants above are.
+    #[test]
+    fn bridge_handler_name_matches_its_registered_handler() {
+        assert_eq!(BridgeHandler::ExecuteRoblox.name(), BRIDGE_EXECUTE_ROBLOX);
+        assert_eq!(BridgeHandler::RobloxWkHybrid.name(), BRIDGE_ROBLOX_WK_HYBRID);
+    }
+
+    /// Pure-function coverage for the one part of [`register_bridge`] that
+    /// does not need a live display: the shim text itself still installs the
+    /// global the page actually calls, under the handler name WebKitGTK's
+    /// `postMessage` is registered against.
+    #[test]
+    fn the_bridge_shim_installs_the_android_bridge_global() {
+        let shim = bridge_shim();
+        assert!(shim.contains("__globalRobloxAndroidBridge__"));
+        assert!(shim.contains(BRIDGE_EXECUTE_ROBLOX));
     }
 }

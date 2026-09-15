@@ -268,7 +268,75 @@ pub fn apply_pin(build: Build, profile_dir: &Path) -> Result<Build, NotFound> {
 /// an install — which is a worse trade than a progress bar and a better one
 /// than the two states and a worker thread that a progress bar costs. If that
 /// stops being true, this is the place to move.
+/// Establish that Roblox signed this archive, at most once per build.
+///
+/// **The check belongs here because this is the only place every launch passes
+/// through.** `cordial-update` verifies what it downloads, but the launcher
+/// reaches a build four other ways -- `CORDIAL_APK`, the APK chosen in
+/// Settings, an engine directory beside it, or Sober's package directory -- and
+/// none of those went through the downloader. Nothing in this crate called
+/// [`cordial_update::apk_signature`] at all, so a substituted archive launched
+/// exactly like a genuine one and was then keyed into the same store the
+/// Version page lists. Reported by @kanqz; issue #51.
+///
+/// **Recorded rather than repeated**, because verifying digests the whole
+/// archive and `cordial_update::cache`'s own header argues against paying that
+/// on every launch. The first launch after this lands verifies once, the same
+/// one-off cost an unstamped cache already pays to re-extract; every launch
+/// after reads a fingerprint.
+///
+/// A refusal names which of the two failures happened, because
+/// [`cordial_update::apk_signature::Refusal`] distinguishes "somebody changed
+/// this file" from "this is intact and is not Roblox's", and collapsing them
+/// into one shrug is what that type exists to prevent.
+fn verified_once(apk: &Path, cache: &Path) -> Result<(), NotFound> {
+    let pinned = cordial_update::apk_signature::pinned();
+    if let Some(known) = cordial_update::cache::recorded_signer(cache) {
+        if pinned.iter().any(|p| p.eq_ignore_ascii_case(&known)) {
+            return Ok(());
+        }
+    }
+    match cordial_update::apk_signature::verify_signed_by(apk, &pinned) {
+        Ok(signer) => {
+            // Not fatal if it cannot be written: the cost is verifying again
+            // next launch, which is slow rather than wrong. The same shape as
+            // the version and stamp writes below.
+            if let Err(e) = cordial_update::cache::record_signer(cache, &signer.certificate_sha256) {
+                println!("  shell: verified {} but could not record it: {e}", apk.display());
+            }
+            Ok(())
+        }
+        Err(e) => Err(NotFound::Unusable(format!(
+            "Cordial will not run {}: {e}.\n\nThis is the archive Cordial was pointed at, not \
+             one it downloaded. Clear the APK in Settings to let Cordial find or fetch a build \
+             it can check.",
+            apk.display()
+        ))),
+    }
+}
+
 pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
+    locate_with(configured, verified_once)
+}
+
+/// [`locate`], with the signature check injected.
+///
+/// **The seam exists so the extraction tests remain testable.** They drive real
+/// behaviour worth keeping -- that a new Roblox build at the same path
+/// re-extracts, and that an unchanged one does not -- against archives built by
+/// `apk_holding`, which are plain zips. Gating `locate` unconditionally would
+/// make every one of them unrunnable, and the way out is not to fabricate a
+/// signed archive: `cordial_update::apk_signature`'s own tests explain that one
+/// signed by an invented key exercises the parser and proves nothing about
+/// whether Roblox's real build is accepted.
+///
+/// So tests inject a verifier that accepts, and a separate test drives the real
+/// entry point above to prove an unsigned archive is refused. The same shape as
+/// `browser_account::profile::matching_profile_with`, for the same reason.
+fn locate_with(
+    configured: &RobloxInstall,
+    verify: impl FnOnce(&Path, &Path) -> Result<(), NotFound>,
+) -> Result<Build, NotFound> {
     let Some((apk, _)) = effective_apk(configured) else {
         return Err(NotFound::NoBuild);
     };
@@ -278,6 +346,9 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
             apk.display()
         )));
     }
+    // Before any of the four paths below returns a `Build`, so that none of
+    // them can hand the loader an archive nobody established the origin of.
+    verify(&apk, &engine_cache())?;
 
     // An explicit --lib-dir wins and is not second-guessed: someone who set it
     // has a reason, and quietly extracting over the top of it would hide a
@@ -675,13 +746,13 @@ mod tests {
         std::fs::write(&apk, apk_holding(b"the old engine")).unwrap();
         let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
 
-        let first = locate(&install).unwrap();
+        let first = locate_with(&install, |_, _| Ok(())).unwrap();
         assert_eq!(std::fs::read(first.lib_dir.join(LIBRARY)).unwrap(), b"the old engine");
 
         // A new Roblox build lands at the same path, which is exactly what
         // Sober updating does.
         std::fs::write(&apk, apk_holding(b"the new engine, which is longer")).unwrap();
-        let second = locate(&install).unwrap();
+        let second = locate_with(&install, |_, _| Ok(())).unwrap();
         let got = std::fs::read(second.lib_dir.join(LIBRARY)).unwrap();
 
         match previous {
@@ -710,11 +781,11 @@ mod tests {
         std::fs::write(&apk, apk_holding(b"the engine")).unwrap();
         let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
 
-        let build = locate(&install).unwrap();
+        let build = locate_with(&install, |_, _| Ok(())).unwrap();
         // Something no extraction would ever produce, so its survival is proof
         // the second call did not extract.
         std::fs::write(build.lib_dir.join(LIBRARY), b"left alone").unwrap();
-        let again = locate(&install).unwrap();
+        let again = locate_with(&install, |_, _| Ok(())).unwrap();
         let got = std::fs::read(again.lib_dir.join(LIBRARY)).unwrap();
 
         match previous {
@@ -730,6 +801,41 @@ mod tests {
         std::fs::write(dir.join("base.apk"), b"not really a zip").unwrap();
         let err = extract_engine(&dir.join("base.apk"), &dir.join("cache")).unwrap_err();
         assert!(err.contains("split_config"), "{err}");
+    }
+
+    /// **The regression guard for issue #51**, reported by @kanqz: a build the
+    /// launcher was merely pointed at used to reach the loader without anything
+    /// asking whose signature was on it.
+    ///
+    /// This drives the real entry point rather than the seam, so deleting the
+    /// check in `locate` fails here. It asserts a *refusal*, which is what
+    /// makes it writable at all -- `apk_holding` produces a plain zip with no
+    /// signing block, exactly the shape of a substituted APK, and no genuine
+    /// signed archive is needed to prove that one is turned away.
+    #[test]
+    fn an_unsigned_archive_is_refused_by_the_real_entry_point() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(APK_OVERRIDE);
+        let dir = scratch("unsigned");
+        let cache_home = dir.join("cache");
+        let previous = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", &cache_home);
+
+        let apk = dir.join("base.apk");
+        std::fs::write(&apk, apk_holding(b"an engine nobody signed")).unwrap();
+        let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
+        let refused = locate(&install);
+
+        match previous {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match refused {
+            Err(NotFound::Unusable(msg)) => {
+                assert!(msg.contains("no APK signing block"), "{msg}")
+            }
+            other => panic!("an unsigned archive must not reach the loader, got {other:?}"),
+        }
     }
 
 

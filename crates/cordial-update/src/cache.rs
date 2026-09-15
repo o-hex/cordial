@@ -51,6 +51,24 @@ pub const STAMP: &str = ".from";
 /// lies about itself in whichever direction the reader happens to look.
 pub const VERSION: &str = ".version";
 
+/// The signing certificate the APK was verified against, beside the engine it
+/// describes.
+///
+/// **Recorded once rather than checked on every launch, for the reason this
+/// module's own header gives about hashing.** Verifying an APK signature means
+/// digesting the whole archive, which is the same ~0.5 s cost per launch that
+/// `is_current` uses size and mtime to avoid. So the check happens where a
+/// build enters the store and its answer is written here, and a launch reads a
+/// fingerprint instead of re-doing the work.
+///
+/// Absent means "nobody checked", which is different from "checked and
+/// refused" — the second never gets this far. Issue #51 is why it exists: a
+/// build that came from Settings, `CORDIAL_APK` or Sober's directory reached
+/// the launcher without anything asking whose signature was on it, and the
+/// store then held it beside builds that had been checked with nothing telling
+/// the two apart.
+pub const SIGNER: &str = ".signer";
+
 /// What the cache should be stamped with for this APK, or `None` if the APK
 /// cannot be looked at.
 ///
@@ -122,6 +140,29 @@ pub fn recorded_version(cache_dir: &Path) -> Option<String> {
 pub fn record_version(cache_dir: &Path, version: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(cache_dir)?;
     std::fs::write(cache_dir.join(VERSION), version.trim())
+}
+
+/// The signing certificate this build was verified against, if anything ever
+/// verified it.
+///
+/// `None` means nobody checked, not that a check failed: a build that fails
+/// verification is refused rather than recorded, so this file never holds the
+/// fingerprint of something that was turned away.
+pub fn recorded_signer(cache_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(cache_dir.join(SIGNER)).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Record the certificate a build verified against, so the next launch can read
+/// the answer instead of digesting the archive again.
+///
+/// Lowercase hex, matching [`crate::apk_signature::Signer::certificate_sha256`]
+/// and the pinned list, so a reader comparing the two is comparing like with
+/// like rather than discovering a case difference at the worst moment.
+pub fn record_signer(cache_dir: &Path, fingerprint: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(cache_dir)?;
+    std::fs::write(cache_dir.join(SIGNER), fingerprint.trim().to_ascii_lowercase())
 }
 
 #[cfg(test)]

@@ -14,23 +14,27 @@
 //! the engine carries `PermissionsProtocol`, `PermissionsRequest`,
 //! `HasPermissions`, `SupportsPermissions`, `MICROPHONE_ACCESS`, `permissions`
 //! and `status`; the dex carries the same names plus `AUTHORIZED`, `DENIED`
-//! and `missingPermissions`. **How those keys are arranged in the request and
-//! the response is INFERRED** -- `{"permissions": [...]}` in, and
-//! `{"status": ..., "missingPermissions": [...]}` out. Every request prints the
-//! permission names it carried and the answer given, so a wrong guess shows up
-//! beside the engine's own `PermissionsProtocolCore: Invalid response
-//! received.` rather than as silence.
+//! and `missingPermissions`. Response schemas are cross-checked against
+//! mocktail's Apache-2.0 `src/runtime/roblox_permissions_bridge.cc`: discovery
+//! returns a permission list, authorisation returns status and missing names,
+//! and the two Android-dialog queries return hidden upsells. A status response
+//! to discovery cannot tell the engine that microphone access is supported.
+//! Protocol publication followed by async resolution reached voice setup in a
+//! controlled run, and the completed capture path was then confirmed manually
+//! to transmit audible microphone audio in a live game.
 //!
 //! Granting the permission does not open the microphone. The rule in
 //! `native/audio_classes.cpp` stands: no capture stream exists until Roblox
 //! actually starts recording.
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString, OsStr};
 
 extern "C" {
     fn cordial_messagebus_set_request_handler_async(
         set_fn: *mut c_void,
+        publish_fn: *mut c_void,
         respond_fn: *mut c_void,
+        dual_response: c_int,
         protocol: *const c_char,
         method: *const c_char,
         sink: extern "C" fn(*const c_char, *mut c_char, usize) -> c_int,
@@ -40,11 +44,14 @@ extern "C" {
 }
 
 const PROTOCOL: &str = "PermissionsProtocol";
+const DUAL_RESPONSE_ENV: &str = "CORDIAL_PERMISSIONS_DUAL_RESPONSE";
+const PUBLISH_RESPONSE_NATIVE: &str =
+    "Java_com_roblox_universalapp_messagebus_MessageBus_publishProtocolMethodResponseRaw";
 
-/// The only permission Cordial can truthfully grant. Anything else -- camera,
-/// contacts, local network -- has no implementation behind it, so saying yes
-/// would be a stub that lies.
+/// Microphone capture is implemented. LOCAL_NETWORK has no Android runtime
+/// permission to request; actual network access remains subject to host policy.
 const MICROPHONE: &str = "MICROPHONE_ACCESS";
+const SUPPORTED: [&str; 2] = [MICROPHONE, "LOCAL_NETWORK"];
 
 extern "C" fn on_request(request: *const c_char, out: *mut c_char, out_len: usize) -> c_int {
     reply("PermissionsRequest", request, out, out_len)
@@ -58,12 +65,27 @@ extern "C" fn on_supports(request: *const c_char, out: *mut c_char, out_len: usi
     reply("SupportsPermissions", request, out, out_len)
 }
 
+extern "C" fn on_upsell(request: *const c_char, out: *mut c_char, out_len: usize) -> c_int {
+    reply("ShouldShowPermissionUpsell", request, out, out_len)
+}
+
+extern "C" fn on_rationale(request: *const c_char, out: *mut c_char, out_len: usize) -> c_int {
+    reply(
+        "ShouldShowRequestPermissionRationale",
+        request,
+        out,
+        out_len,
+    )
+}
+
 fn reply(method: &str, request: *const c_char, out: *mut c_char, out_len: usize) -> c_int {
     if request.is_null() || out.is_null() || out_len == 0 {
         return 0;
     }
     // SAFETY: the bus hands over a NUL-terminated string it owns for the call.
-    let raw = unsafe { CStr::from_ptr(request) }.to_string_lossy().into_owned();
+    let raw = unsafe { CStr::from_ptr(request) }
+        .to_string_lossy()
+        .into_owned();
     let body = answer(method, &raw);
     let Ok(c) = CString::new(body) else { return 0 };
     let bytes = c.as_bytes_with_nul();
@@ -75,52 +97,110 @@ fn reply(method: &str, request: *const c_char, out: *mut c_char, out_len: usize)
     1
 }
 
-/// Build the response for one request, and say what was asked and answered.
-///
-/// Printing is safe here in a way it is not for `linking`: a permissions
-/// request carries permission names and nothing a user typed.
+/// Build the response for one request without logging its contents.
 fn answer(method: &str, raw: &str) -> String {
-    let value = serde_json::from_str::<serde_json::Value>(raw).unwrap_or(serde_json::Value::Null);
-    let asked: Vec<String> = value
-        .get("permissions")
-        .and_then(|p| p.as_array())
-        .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect())
-        .unwrap_or_default();
-    if asked.is_empty() {
-        let keys: Vec<&str> = value
-            .as_object()
-            .map(|o| o.keys().map(String::as_str).collect())
-            .unwrap_or_default();
-        println!("  permissions: {method} carried no permission list (keys {keys:?})");
-    }
-    let missing: Vec<&str> = asked.iter().map(String::as_str).filter(|p| *p != MICROPHONE).collect();
-    let status = if missing.is_empty() { "AUTHORIZED" } else { "DENIED" };
-    println!("  permissions: {method} {asked:?} -> {status}");
-    serde_json::json!({ "status": status, "missingPermissions": missing }).to_string()
+    let object = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw).ok();
+    let asked = object
+        .as_ref()
+        .and_then(|value| value.get("permissions"))
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok());
+    let response = match method {
+        "SupportsPermissions" => {
+            let permissions = if object.is_some() {
+                SUPPORTED.as_slice()
+            } else {
+                &[]
+            };
+            serde_json::json!({ "permissions": permissions })
+        }
+        "ShouldShowPermissionUpsell" | "ShouldShowRequestPermissionRationale" => {
+            // There is no Android permission dialog to show on this desktop.
+            let hidden = asked.unwrap_or_else(|| vec![MICROPHONE.to_owned()]);
+            serde_json::json!({ "upsellStatus": "HIDE", "hiddenUpsellPermissions": hidden })
+        }
+        "HasPermissions" | "PermissionsRequest" => {
+            let valid = asked.is_some();
+            let names = asked.unwrap_or_else(|| vec![MICROPHONE.to_owned()]);
+            let missing: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !valid || !SUPPORTED.contains(name))
+                .collect();
+            let status = if valid && missing.is_empty() {
+                "AUTHORIZED"
+            } else {
+                "DENIED"
+            };
+            serde_json::json!({ "status": status, "missingPermissions": missing })
+        }
+        _ => serde_json::json!({ "status": "DENIED", "missingPermissions": [MICROPHONE] }),
+    };
+    println!("  permissions: {method} answered");
+    response.to_string()
 }
 
-/// Bind the three methods. `symbol` resolves a name in the loaded engine.
+fn dual_response_enabled(value: Option<&OsStr>) -> bool {
+    value != Some(OsStr::new("0"))
+}
+
+/// Bind discovery, authorisation and dialog queries. `symbol` resolves a name
+/// in the loaded engine.
 ///
 /// Not fatal on failure, like `linking::arm`: a client without voice is still
 /// worth launching.
 pub fn arm(symbol: impl Fn(&str) -> Option<*mut c_void>) {
-    let set = symbol("Java_com_roblox_universalapp_messagebus_MessageBus_setRequestHandlerAsyncRaw");
-    let respond = symbol("Java_com_roblox_universalapp_messagebus_MessageBus_callResponseHandlerRaw");
+    let set =
+        symbol("Java_com_roblox_universalapp_messagebus_MessageBus_setRequestHandlerAsyncRaw");
+    let respond =
+        symbol("Java_com_roblox_universalapp_messagebus_MessageBus_callResponseHandlerRaw");
     let (Some(set), Some(respond)) = (set, respond) else {
         println!("  permissions: async request natives are not exported; the microphone cannot be granted");
         return;
     };
+    let configured = std::env::var_os(DUAL_RESPONSE_ENV);
+    let dual_response = dual_response_enabled(configured.as_deref());
+    let publish = if dual_response {
+        symbol(PUBLISH_RESPONSE_NATIVE)
+    } else {
+        None
+    };
+    if dual_response && publish.is_none() {
+        println!(
+            "  permissions: protocol+async delivery is enabled, but \
+             publishProtocolMethodResponseRaw is not exported; no permission handlers were bound"
+        );
+        return;
+    }
+    println!(
+        "  permissions: response delivery mode {}",
+        if dual_response {
+            "protocol+async"
+        } else {
+            "async"
+        }
+    );
     let protocol = CString::new(PROTOCOL).expect("literal");
-    let methods: [(&str, extern "C" fn(*const c_char, *mut c_char, usize) -> c_int); 3] =
-        [("PermissionsRequest", on_request), ("HasPermissions", on_has), ("SupportsPermissions", on_supports)];
+    let methods: [(
+        &str,
+        extern "C" fn(*const c_char, *mut c_char, usize) -> c_int,
+    ); 5] = [
+        ("PermissionsRequest", on_request),
+        ("HasPermissions", on_has),
+        ("SupportsPermissions", on_supports),
+        ("ShouldShowPermissionUpsell", on_upsell),
+        ("ShouldShowRequestPermissionRationale", on_rationale),
+    ];
     for (method, sink) in methods {
         let m = CString::new(method).expect("literal");
         let mut err = vec![0u8; 512];
-        // SAFETY: both strings outlive the call; `err` is only written into.
+        // SAFETY: resolved native pointers use the declared ABI; strings outlive
+        // the call, and `err` is writable for the supplied length.
         let rc = unsafe {
             cordial_messagebus_set_request_handler_async(
                 set,
+                publish.unwrap_or(std::ptr::null_mut()),
                 respond,
+                c_int::from(dual_response),
                 protocol.as_ptr(),
                 m.as_ptr(),
                 sink,
@@ -132,7 +212,10 @@ pub fn arm(symbol: impl Fn(&str) -> Option<*mut c_void>) {
             println!("  permissions: {PROTOCOL}.{method} handler bound");
         } else {
             let msg = String::from_utf8_lossy(&err);
-            println!("  permissions: could not bind {PROTOCOL}.{method}: {}", msg.trim_end_matches('\0'));
+            println!(
+                "  permissions: could not bind {PROTOCOL}.{method}: {}",
+                msg.trim_end_matches('\0')
+            );
         }
     }
 }
@@ -154,15 +237,20 @@ mod tests {
 
     #[test]
     fn the_microphone_is_granted() {
-        let (s, missing) = status(&answer("PermissionsRequest", r#"{"permissions":["MICROPHONE_ACCESS"]}"#));
+        let (s, missing) = status(&answer(
+            "PermissionsRequest",
+            r#"{"permissions":["MICROPHONE_ACCESS"]}"#,
+        ));
         assert_eq!(s, "AUTHORIZED");
         assert!(missing.is_empty());
     }
 
     #[test]
     fn a_permission_with_nothing_behind_it_is_not_granted() {
-        let (s, missing) =
-            status(&answer("PermissionsRequest", r#"{"permissions":["MICROPHONE_ACCESS","CAMERA_ACCESS"]}"#));
+        let (s, missing) = status(&answer(
+            "PermissionsRequest",
+            r#"{"permissions":["MICROPHONE_ACCESS","CAMERA_ACCESS"]}"#,
+        ));
         assert_eq!(s, "DENIED");
         assert_eq!(missing, vec!["CAMERA_ACCESS"]);
     }
@@ -170,6 +258,59 @@ mod tests {
     #[test]
     fn a_malformed_request_still_gets_a_well_formed_answer() {
         let (s, _) = status(&answer("HasPermissions", "not json"));
-        assert_eq!(s, "AUTHORIZED");
+        assert_eq!(s, "DENIED");
+    }
+
+    #[test]
+    fn supported_permissions_are_a_list_when_discovery_is_requested() {
+        // Given a support query with no permissions array.
+        let request = "{}";
+        // When the engine asks what the host supports.
+        let response: serde_json::Value =
+            serde_json::from_str(&answer("SupportsPermissions", request)).unwrap();
+        // Then it receives the discovery schema, not an authorisation result.
+        assert_eq!(
+            response,
+            serde_json::json!({"permissions": ["MICROPHONE_ACCESS", "LOCAL_NETWORK"]})
+        );
+    }
+
+    #[test]
+    fn network_and_microphone_are_granted_when_requested_together() {
+        // Given the voice permission bundle.
+        let request = r#"{"permissions":["MICROPHONE_ACCESS","LOCAL_NETWORK"]}"#;
+        // When the host checks the bundle.
+        let result = status(&answer("HasPermissions", request));
+        // Then neither permission remains missing.
+        assert_eq!(result, ("AUTHORIZED".to_owned(), vec![]));
+    }
+
+    #[test]
+    fn android_dialogs_are_hidden_when_upsell_or_rationale_is_requested() {
+        for method in [
+            "ShouldShowPermissionUpsell",
+            "ShouldShowRequestPermissionRationale",
+        ] {
+            // Given a permission for which this desktop has no Android dialog.
+            let request = r#"{"permissions":["CAMERA_ACCESS"]}"#;
+            // When the engine asks whether to show one.
+            let response: serde_json::Value =
+                serde_json::from_str(&answer(method, request)).unwrap();
+            // Then hiding the dialog does not claim to grant the permission.
+            assert_eq!(
+                response,
+                serde_json::json!({"upsellStatus":"HIDE", "hiddenUpsellPermissions":["CAMERA_ACCESS"]})
+            );
+        }
+    }
+
+    #[test]
+    fn dual_response_defaults_on_and_zero_is_the_rollback() {
+        // Given the default, rollback, and explicit enabled values.
+        let values = [None, Some(OsStr::new("0")), Some(OsStr::new("1"))];
+        // When each value is parsed at the permission boundary.
+        let enabled = values.map(dual_response_enabled);
+        // Then dual delivery is on unless the rollback explicitly disables it.
+        assert_eq!(enabled, [true, false, true]);
     }
 }

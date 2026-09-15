@@ -167,14 +167,15 @@ endif()
 # onLogLine/onJoin: neither event exists, see the header of liblog.cpp.
 #
 # `aaudio.cpp` is here rather than beside the JNI shim because it belongs with
-# `pipewire_backend.cpp`, and it needs no PipeWire headers of its own — it
-# speaks only `pipewire_backend.h`, which deliberately carries no PipeWire
-# types. So the AAudio bridge compiles identically on a tree with no
+# `pipewire_backend.cpp`, and it needs no PipeWire headers of its own — its two
+# local headers deliberately carry no PipeWire types. So the AAudio bridge
+# compiles identically on a tree with no
 # pipewire-devel, and honestly refuses every stream there, exactly as
 # `slCreateEngine` does.
 add_library(cordial_liblog STATIC
   liblog.cpp system_paths.cpp netdb_compat.cpp opensles.cpp pipewire_backend.cpp
-  pulse_backend.cpp alsa_backend.cpp oss_backend.cpp aaudio.cpp thread_trace.cpp)
+  pulse_backend.cpp alsa_backend.cpp oss_backend.cpp aaudio.cpp
+  aaudio_input_callback.cpp thread_trace.cpp)
 # Compiled unconditionally, like every other file here: without the headers it
 # is its own honest "unavailable" arm, so the selector gets a truthful answer
 # rather than a link error. Only the define is conditional.
@@ -249,6 +250,22 @@ if(PIPEWIRE_FOUND)
     COMMENT "Running pipewire_backend fill_pcm checks (no PipeWire session needed)")
   add_dependencies(cordial_liblog cordial_pipewire_backend_test)
 endif()
+
+add_executable(cordial_aaudio_input_callback_test EXCLUDE_FROM_ALL
+  aaudio_input_callback.cpp aaudio_input_callback_test.cpp)
+target_compile_options(cordial_aaudio_input_callback_test PRIVATE -UNDEBUG)
+add_custom_command(TARGET cordial_aaudio_input_callback_test POST_BUILD
+  COMMAND cordial_aaudio_input_callback_test
+  COMMENT "Running AAudio input callback lifecycle checks")
+add_dependencies(cordial_liblog cordial_aaudio_input_callback_test)
+
+add_executable(cordial_aaudio_input_test EXCLUDE_FROM_ALL
+  aaudio.cpp aaudio_input_callback.cpp aaudio_input_test.cpp)
+target_compile_options(cordial_aaudio_input_test PRIVATE -UNDEBUG)
+add_custom_command(TARGET cordial_aaudio_input_test POST_BUILD
+  COMMAND cordial_aaudio_input_test
+  COMMENT "Running AAudio callback and blocking input ABI checks")
+add_dependencies(cordial_liblog cordial_aaudio_input_test)
 
 add_library(cordial_linker_shim STATIC shim.cpp)
 target_link_libraries(cordial_linker_shim PUBLIC linker)
@@ -338,7 +355,17 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libjnivm
 # (see its own header comment), so the Java audio surface builds identically
 # either way and reports an honestly empty device list on a tree that has no
 # backend behind it.
-add_library(cordial_jni_shim STATIC jni_shim.cpp android_classes.cpp game_activity.cpp init_params.cpp accessibility.cpp cookies.cpp audio_classes.cpp deeplink.cpp clipboard.cpp local_storage.cpp legacy_stdio.cpp platform_classes.cpp battery.cpp unanswered_classes.cpp)
+add_library(cordial_jni_shim STATIC jni_shim.cpp android_classes.cpp game_activity.cpp init_params.cpp accessibility.cpp cookies.cpp audio_classes.cpp deeplink.cpp clipboard.cpp permissions_transport.cpp local_storage.cpp legacy_stdio.cpp platform_classes.cpp battery.cpp unanswered_classes.cpp)
 target_link_libraries(cordial_jni_shim PUBLIC jnivm)
+
+add_executable(cordial_permissions_transport_test EXCLUDE_FROM_ALL
+  permissions_transport.cpp permissions_transport_test.cpp)
+target_compile_options(cordial_permissions_transport_test PRIVATE -UNDEBUG)
+target_include_directories(cordial_permissions_transport_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libjnivm/include)
+add_custom_command(TARGET cordial_permissions_transport_test POST_BUILD
+  COMMAND cordial_permissions_transport_test
+  COMMENT "Running PermissionsProtocol response transport checks")
+add_dependencies(cordial_jni_shim cordial_permissions_transport_test)
 
 install(TARGETS cordial_jni_shim jnivm logger ARCHIVE DESTINATION lib)

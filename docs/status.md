@@ -57,6 +57,7 @@ what changed release by release.
 | Launching from the shell | ✅ finds a build, or explains how to get one |
 | Choosing a profile | ✅ a chooser above the Launch button; creates one, and shows a profile another window holds as unavailable |
 | Audio | ✅ sound in an experience, reported from real play; the OpenSL ES bridge into PipeWire was measured with a control before that |
+| Voice chat | ✅ dual permission delivery reaches WebRTC audio initialisation; callback capture passed native lifecycle and ABI checks, and a tester confirmed audible transmission in a real game |
 | Web views (Marketplace, Profile, Communities…) | 🟡 they render in a real signed-in WebKitGTK window, with correct canvas stacking; both observed JavaScript bridge formats now reach the runtime, but more pages still need interactive coverage |
 | **Asset overlays** (custom textures, sounds, fonts) | ✅ drop a file mirroring the APK's `assets/` tree into `~/.config/cordial/overlay` and it is served instead; nothing is modified, remove the file and the original returns |
 | Fullscreen | ✅ F11 acts on the gameplay window, hides the compact themed header bar and persists per profile |

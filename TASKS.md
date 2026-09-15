@@ -265,7 +265,19 @@ PC-client feature; the mobile engine this project loads does not have it. There
 is no shim, capability or amount of platform work that adds it, because there is
 no engine code on the other side to call. **Closed, not deferred.**
 
-### Voice chat — the nearest of the three
+### Voice chat — implemented, broader testing remains
+
+Dual protocol/async permission delivery now unlocks voice initialisation, and
+AAudio supports the callback-driven microphone input Roblox requests. A tester
+confirmed audible transmission on Roblox 2.738.0.1397 in the combined local
+build. Other devices and distributions remain unverified. See
+[the controlled experiment](docs/analysis/voice-dual-response.md).
+
+<details>
+<summary>Superseded investigation notes, before the 2026-09-14 fix</summary>
+
+The following records earlier observations and hypotheses, not the current
+blockers or next steps.
 
 `AppRtcDeviceWrapper` used to be registered with `isValid()` answering
 **false** and nothing else. It now answers true and implements the device
@@ -326,9 +338,7 @@ voice settings responses is intercepting the engine's own HTTPS: curl reads
 and trusts the extracted `assets/ssl/cacert.pem`, so a local proxy whose CA is
 appended to that file should see them. That has not been tried.
 
-- **Touches:** `native/audio_classes.cpp`, a new device-wrapper module, the
-  PipeWire capture path.
-- **Scope:** major, but the best-understood of the three. Its own PR.
+</details>
 
 ### Gamepad and extended input
 

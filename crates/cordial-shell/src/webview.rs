@@ -752,7 +752,7 @@ fn install_navigation_policy(view: &webkit6::WebView) {
         };
         let uri = nav
             .navigation_action()
-            .and_then(|mut a| a.request())
+            .and_then(|a| a.request())
             .and_then(|r| r.uri())
             .map(|u| u.to_string())
             .unwrap_or_default();
@@ -885,7 +885,14 @@ fn create_popup_view(
         .hexpand(true)
         .vexpand(true)
         .build();
-    if let (Some(ua), Some(settings)) = (&user_agent, view.settings()) {
+    // Fully qualified, because `settings()` is ambiguous on a `WebView`: GTK's
+    // `WidgetExt` offers one returning `gtk::Settings` and WebKit's `WebViewExt`
+    // offers this one returning `Option<webkit6::Settings>`. Left bare it fails
+    // to compile with E0034, and the `Some(..)` pattern below only makes sense
+    // for the WebKit one.
+    if let (Some(ua), Some(settings)) =
+        (&user_agent, webkit6::prelude::WebViewExt::settings(&view))
+    {
         settings.set_user_agent(Some(ua));
     }
 

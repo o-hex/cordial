@@ -534,6 +534,8 @@ impl HostWindow {
     /// is added on top of that, so the engine gets the resolution it asked for
     /// rather than that minus a titlebar.
     pub fn with_canvas(title: &str, width: i32, height: i32) -> Self {
+        let title_bar = crate::title_bar::TitleBar::from_env();
+        let chrome_height = if title_bar.revealed(false) { header_height_hint() } else { 0 };
         // A `GtkDrawingArea` with no draw function paints nothing at all, so
         // what shows through is the themed window background — which is
         // exactly what ADR-011 asks for behind the canvas ("the desktop's own
@@ -557,7 +559,29 @@ impl HostWindow {
         // exists at all, and any future arrangement that stops punching the
         // hole. What it must not do is imply the line below is load-bearing.
         canvas.set_cursor_from_name(canvas_cursor());
-        let host = Self::new(title, width, height, &canvas);
+        let host = Self::new(title, width, height + chrome_height, &canvas);
+        host.toolbar.set_reveal_top_bars(title_bar.revealed(false));
+
+        // Hide the header bar while fullscreen. Restore it afterwards only
+        // when the saved preference has not hidden windowed chrome too.
+        //
+        // GTK does not do this for you and is right not to: it cannot know
+        // whether a given toolbar is chrome the user wants gone or part of the
+        // application. For a game it is chrome. Without this, fullscreening
+        // leaves the title bar sitting across the top of the picture, which is
+        // what "fullscreen still shows the titlebar" means and is not a
+        // compositor problem — the window really is fullscreen, the bar is
+        // simply still inside it.
+        //
+        // `set_reveal_top_bars` rather than hiding the header directly, because
+        // ToolbarView owns the space it occupies: hiding the child leaves the
+        // gap it was sitting in.
+        {
+            let toolbar_for_fs = host.toolbar.clone();
+            host.window.connect_fullscreened_notify(move |w| {
+                toolbar_for_fs.set_reveal_top_bars(title_bar.revealed(w.is_fullscreen()));
+            });
+        }
         host.window.add_css_class("cordial-engine-host");
         // **The window itself is not transparent, and must not be.**
         //
@@ -581,7 +605,7 @@ impl HostWindow {
         // libadwaita default nearer 47px, which read as "the x in the title bar
         // looks off and the titlebar looks short". That is now opt-in through
         // the Appearance page rather than the only option.
-        let compact = matches!(std::env::var("CORDIAL_TITLE_BAR").as_deref(), Ok("compact"));
+        let compact = title_bar == crate::title_bar::TitleBar::Compact;
         // The see-through state is a class rather than the default, and that
         // distinction is the whole lesson of 5a295e3. A permanently transparent
         // toplevel shows the desktop whenever the engine is not painting, which
@@ -759,8 +783,8 @@ impl HostWindow {
         // the window bleeding onto the second screen, which is how this was
         // first reported.
         let (w, h) = match smallest_monitor() {
-            Some(monitor) => fit_within((width, height + header_height_hint()), monitor),
-            None => (width, height + header_height_hint()),
+            Some(monitor) => fit_within((width, height), monitor),
+            None => (width, height),
         };
 
         let window = adw::Window::builder()
@@ -769,26 +793,6 @@ impl HostWindow {
             .default_height(h)
             .content(&toolbar)
             .build();
-
-        // Hide the header bar while fullscreen, and put it back afterwards.
-        //
-        // GTK does not do this for you and is right not to: it cannot know
-        // whether a given toolbar is chrome the user wants gone or part of the
-        // application. For a game it is chrome. Without this, fullscreening
-        // leaves the title bar sitting across the top of the picture, which is
-        // what "fullscreen still shows the titlebar" means and is not a
-        // compositor problem — the window really is fullscreen, the bar is
-        // simply still inside it.
-        //
-        // `set_reveal_top_bars` rather than hiding the header directly, because
-        // ToolbarView owns the space it occupies: hiding the child leaves the
-        // gap it was sitting in.
-        {
-            let toolbar_for_fs = toolbar.clone();
-            window.connect_fullscreened_notify(move |w| {
-                toolbar_for_fs.set_reveal_top_bars(!w.is_fullscreen());
-            });
-        }
 
         HostWindow {
             window,

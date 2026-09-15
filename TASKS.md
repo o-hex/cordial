@@ -260,10 +260,30 @@ x86-64 Android build, `2.730.0.790`:
 
 ### VR is not available and this is not a Cordial limitation
 
-The Android build contains no VR surface of any kind. Roblox's VR support is a
-PC-client feature; the mobile engine this project loads does not have it. There
-is no shim, capability or amount of platform work that adds it, because there is
-no engine code on the other side to call. **Closed, not deferred.**
+**The reasoning above is incomplete, though the verdict holds.** A dex
+class-count of zero only shows Roblox's own Java code has no VR surface — it
+says nothing about what the engine asks the *platform* for, and Cordial
+supplies that platform, not Roblox's dex (see issue #35, `DeviceUtils`, for a
+case where the engine asked for a class no dex declared). The binary does have
+VR code compiled in: flag-shaped strings (`IsVRAppBuild`, `ExposeOpenXrAPI1`,
+`DebugEnableVREmulator` and more) and `[FLog::VRService]` format strings for
+per-eye camera CFrames are present in `libroblox.so`.
+
+What actually settles it: [docs/analysis/vr-reachability.md](docs/analysis/vr-reachability.md)
+turned on every VR-related FastFlag findable in `docs/traces/` (and the
+binary-string names besides, under both `F`/`DF` prefixes), verified the
+override reached the engine (`nativeInitClientSettings -> 0`, settings
+document grew by exactly the injected bytes), and compared against an
+otherwise-identical control run. Across three instruments — the dumped Java
+class surface, the `Constructed Unresolved symbol` / stub-call log, and the
+engine's own log stream with `FLogVRService`/`DFLogVRService` turned on — the
+two runs are indistinguishable. No new class or method is requested, no
+unresolved symbol appears, no VRService line is ever printed, and a
+`CORDIAL_TRACE_PATHS=1` capture shows no attempt to `dlopen` a VR runtime
+library. The flags do nothing observable, which is a different and stronger
+finding than "no VR classes in the dex" — reached at the account-router/menu
+shell, not inside a joined place, which that document names as the one gap
+still open. **Closed, not deferred**, on the evidence now in hand.
 
 ### Voice chat — implemented, broader testing remains
 

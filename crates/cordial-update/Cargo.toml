@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 # The same client `cordial-runtime::client_settings` already uses for Roblox's
 # settings CDN, so this adds an edge to an already-resolved dependency rather
@@ -37,7 +40,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # `cordial-plugins` and `cordial-runtime` already pin.
 zbus = { version = "5.18.0", features = ["blocking"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
-libc = "0.2"
+# `flock(2)` for `provider::exclusive`, safely -- see ADR-036. Already in the
+# tree at this version via async-io/zbus, so this is a direct user of a crate
+# that is present rather than a second copy.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
 # Only so one test can pin that the version constant in `deno.rs` and the

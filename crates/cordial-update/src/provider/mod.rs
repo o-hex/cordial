@@ -516,6 +516,14 @@ fn ensure_room(dir: &Path) -> Result<(), Unreachable> {
 /// An advisory lock on `path`, refused at once rather than waited for: a
 /// second attempt should say so immediately rather than queue behind a 229 MB
 /// download the user cannot see. Released when the file is dropped.
+///
+/// `rustix::fs::flock` rather than the raw `libc::flock` this used to call
+/// directly: same `flock(2)`, but rustix turns the `-1`-on-failure C
+/// convention into an `Err`, so there is no unsafe block and no raw fd to
+/// mismanage. `std::fs::File::try_lock` would do this with no extra
+/// dependency at all, but it only stabilised in Rust 1.89 and this workspace
+/// pins `rust-version = "1.75"` for the Flatpak runtime — see
+/// [ADR-036](../../../docs/adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md).
 fn exclusive(path: &Path, busy: &str) -> Result<std::fs::File, Unreachable> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -526,9 +534,8 @@ fn exclusive(path: &Path, busy: &str) -> Result<std::fs::File, Unreachable> {
         .write(true)
         .open(path)
         .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
-    if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(Unreachable::NoSource { why: busy.into() });
-    }
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(|_| Unreachable::NoSource { why: busy.into() })?;
     Ok(lock)
 }
 

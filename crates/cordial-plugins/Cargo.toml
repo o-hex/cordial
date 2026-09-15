@@ -4,8 +4,14 @@ version.workspace = true
 edition = "2021"
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
-libc = "0.2"
+# `kill(2)` on a process group for `Plugin::kill`, safely -- see ADR-036.
+# Already in the tree at this version via async-io/zbus, so this is a direct
+# user of a crate that is present rather than a second copy.
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 minisign-verify = "0.2.5"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

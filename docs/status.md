@@ -46,7 +46,7 @@ what changed release by release.
 | Mouse: navigation, buttons, field focus | ✅ |
 | Mouse: turning the camera | ✅ right-drag, and the delta is the compositor's *unaccelerated* one — using the accelerated pair made sensitivity depend on your desktop mouse settings and made the camera speed up through a fast sweep |
 | Scroll wheel | ✅ |
-| Frame rate | ✅ a flat 60 on MAILBOX, where FIFO gave a variable 35–50 |
+| Frame rate | 🟡 **the records disagree and neither has been re-measured.** This row read "a flat 60 on MAILBOX, where FIFO gave a variable 35–50"; `crates/cordial-runtime/src/android/vulkan.rs` instead records FIFO tracking the output exactly — 60.0 on a 59.88 Hz panel, 49.4 on a 49.96 Hz one — with Sober exceeding both. A later uncapped arm under the MAILBOX default read 34.6–47.2 (`docs/analysis/flag-init.md` §49), the same range this row attributed to FIFO. Whether a flat 60 is a display lock or the engine's own pacing is open |
 | Feral GameMode | ✅ registered while the client runs |
 | Typing into text fields | ✅ a GTK overlay draws focused Android fields live, including caret movement and Wayland IME preedit |
 | Pointer capture in first person | ✅ the cursor stays in the window, reported from real play |
@@ -68,8 +68,26 @@ what changed release by release.
 
 Frame rate measured with pointer motion driven for the whole run, because
 presents drop to exactly 1/s when nothing is happening and every earlier figure
-in this repository was that idle throttle integrated: a flat 60.0 on MAILBOX
-against a variable 35–50 on FIFO, four runs of 120 s.
+in this repository was that idle throttle integrated. That run, on 2026-08-02,
+read a flat 60.0 on MAILBOX against a variable 35–50 on FIFO across four runs
+of 120 s.
+
+**Do not quote those two numbers as settled, because they contradict the other
+record of the same thing.** `vulkan.rs` says FIFO tracks the output exactly,
+60.0 on the 59.88 Hz panel and 49.4 on the 49.96 Hz one, and that Sober clears
+both on the same machine and APK. A 35–50 FIFO sits below both refresh rates
+and was noted as unexplained at the time; the same 35–47 band later turned up
+as the *uncapped* arm in `docs/analysis/flag-init.md` §49, which is what a
+scheduler-paced rate would look like rather than a vsync-locked one. A flat 60
+is also the one thing MAILBOX is supposed not to produce.
+
+What would settle it, and neither costs much: take the same input-driven count
+under `CORDIAL_PRESENT_MODE=fifo` and then `=mailbox`, on each output in turn.
+If MAILBOX follows the panel — near 60 on the 59.88 Hz one and near 50 on the
+49.96 Hz one — the ceiling is the display and the present mode is not escaping
+it. If it stays near 60 on the 49.96 Hz output, the ceiling is the engine's own
+pacing and the display is irrelevant. `refresh.rs` notes Cordial has never told
+the engine the real refresh rate, so that is the third arm worth running.
 
 **What is left is polish and broader live coverage.** Focused text fields now
 have a desktop overlay, and web views forward both bridge formats observed in

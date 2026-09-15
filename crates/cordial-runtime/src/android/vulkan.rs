@@ -679,6 +679,18 @@ pub fn last_extent() -> (u32, u32) {
 /// Counted rather than printed per call for the reason `input::
 /// report_unregistered` gives: one line would be indistinguishable from a
 /// transient at a resize, and one per frame would bury the run.
+///
+/// **Checked against issue #35's Steam Deck SIGSEGV, and ruled out as this
+/// file's doing.** The reporter's log has `vkAcquireNextImageKHR` returning
+/// `VK_SUBOPTIMAL_KHR` immediately before the crash, but `VK_SUBOPTIMAL_KHR`
+/// is a success code — the image is still usable — and this function's own
+/// logic above confirms it: the return value from `vkQueuePresentKHR` is
+/// read only to decide what to print, never to change `rc`, which the caller
+/// returns to the engine exactly as the driver gave it. `vkAcquireNextImageKHR`
+/// itself is not interposed anywhere in this file at all (there is no
+/// `vk_acquire_next_image_khr` here), so that call reaches the host driver
+/// completely unmodified. Neither fact leaves room for this file to be
+/// turning a benign resize signal into the crash.
 fn report_present_result(rc: i32) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SUBOPTIMAL: AtomicU64 = AtomicU64::new(0);
@@ -1078,6 +1090,36 @@ static HOST_CREATE_SWAPCHAIN: std::sync::atomic::AtomicUsize =
 /// matter which path produced it. The alternative reliably grows a route that
 /// forgets, and a capture against a stale swapchain handle is a driver crash
 /// rather than a wrong picture.
+///
+/// **Checked against issue #39's SIGSEGV on the first swapchain recreation of
+/// a fullscreen-exit transition, and not confirmed as this file's doing.**
+/// This function and [`vk_create_swapchain_inner`] change exactly two scalar
+/// fields of the caller's `VkSwapchainCreateInfoKHR` — `presentMode` and,
+/// rarely, `minImageCount` — and forward `oldSwapchain` unexamined; the actual
+/// handling of an outgoing swapchain's in-flight images is a matter between
+/// the engine and the host driver that never passes through Rust code at all,
+/// because neither `vkAcquireNextImageKHR` nor `vkDestroySwapchainKHR` is
+/// interposed anywhere in this file. There is consequently no lever here to
+/// have mishandled a stale image or a torn-down swapchain.
+///
+/// `tools/sober-corpus`'s issue #2180 (`Crashes after SceneManager first
+/// resize when using Vulkan`) is independent evidence for a wider version of
+/// the same fault shape: Roblox's Android-targeted Vulkan renderer, run on
+/// Sober rather than Cordial, has repeatedly SIGSEGV'd immediately after a
+/// framebuffer resize on ordinary desktop Linux GPU drivers (NVIDIA 535
+/// through 550, Pascal through Ampere), with no Cordial-equivalent code
+/// involved at all — Sober's own maintainers concluded it is the engine's
+/// renderer disagreeing with the host driver, not anything in the launcher,
+/// and the confirmed workaround every reporter in that thread used is forcing
+/// the OpenGL/GLES path instead of Vulkan. Cordial already ships the same
+/// switch: `CORDIAL_GRAPHICS=gles` withholds the virtual Vulkan library
+/// entirely, so the engine falls through to its own GLES3 renderer and none
+/// of this file's code ever runs. Confirmed still working on this build,
+/// 2026-09-15: `CORDIAL_GRAPHICS=gles` reached the Landing page cleanly,
+/// logging `[graphics] backend: GLES3 — Vulkan is being withheld
+/// deliberately`. That makes it a real mitigation to offer a reporter of #35
+/// or #39 today, not a fix for whatever is actually wrong with Roblox's
+/// Vulkan renderer here.
 extern "C" fn vk_create_swapchain_khr(
     device: *mut c_void,
     create_info: *const VkSwapchainCreateInfoKHR,

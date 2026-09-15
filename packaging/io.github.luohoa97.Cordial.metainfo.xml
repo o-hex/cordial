@@ -78,6 +78,22 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.15.1" date="2026-09-15">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.15.1</url>
+      <description>
+        <p>
+          A Roblox build Cordial was merely pointed at — through the Settings
+          picker, CORDIAL_APK, or Sober's package directory — is now checked
+          against Roblox's signing certificate before it is used, the way a
+          build Cordial downloaded itself always was.
+        </p>
+        <p>
+          The apt, dnf and pacman repositories now publish from a tagged
+          release rather than from every commit to main, and every binary
+          carries its version, its licence and the project URL.
+        </p>
+      </description>
+    </release>
     <release version="0.15.0" date="2026-09-15">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.15.0</url>
       <description>

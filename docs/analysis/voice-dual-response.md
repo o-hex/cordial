@@ -54,3 +54,29 @@ After the callback fix, a tester confirmed audible microphone transmission
 to another player in a real voice-enabled game. This establishes the end-to-end
 user outcome that the native harness and the permission on/off/on control cannot
 establish independently.
+
+## Confirmed again on the shipped build, 2026-09-15
+
+Repeated on the merged code rather than the combined development build, in the
+same place 14236925335, joined by `--join-url
+roblox://experiences/start?placeId=<id>` and connected through that game's own
+Connect control. The maintainer confirmed voice working. Line 456 of the run:
+
+    I/Cordial-Audio  WebRtcAudioManager.init reports success: WebRtcAudioTrack
+    implements the downlink and WebRtcAudioRecord implements the uplink, so a
+    voice session can both send and receive.
+
+`refusing an input stream that installed a data callback` — the blocker this
+change was written against — did not recur, and the run answered every Android
+call it made (`stubs called: 2 distinct of 650`, both ZSTD tracing).
+
+**Grep for `WebRtcAudioManager`, not for the voice channels.** Setting
+`FLogVoiceChatLogs=7` and `FLogVoiceChatControlPlaneTracingLogs=7` in the
+profile's `flags.json` produced nothing: the string `VoiceChat` does not appear
+once in 522 lines of a session where voice demonstrably worked. Searching for
+the vocabulary in issue #47 — `voice_service_init`, `VoiceChatInternal`,
+`ClientMuteUnmuteOperation` — returns empty on a *healthy* run and reads as a
+total failure of voice. That mistake was made here before the log was searched
+for the string this document already named. The positive marker is emitted by
+Cordial's own `Cordial-Audio` layer, and a run that only reaches Home does not
+contain it, so its presence is attributable to the join and the connect.

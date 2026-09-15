@@ -3339,7 +3339,32 @@ unsafe extern "C" fn touch_down(
     // reason: Cordial's devices sit on the seat GDK also has devices on, so a
     // finger on the header bar or the close button arrives here too.
     if !std::ptr::eq(surface, w.surface) {
+        // Worth a line under trace rather than nothing: issue #36 is a crash on
+        // the very first touch with no Roblox-side log at all, and "the
+        // contact was silently dropped as not ours" and "the contact reached
+        // the engine and something downstream faulted" are different bugs that
+        // otherwise look identical from outside.
+        if super::input::trace_touch() {
+            eprintln!(
+                "[cordial] wl_touch.down id={id} on {surface:p} -- not our surface ({:p}); dropped",
+                w.surface
+            );
+        }
         return;
+    }
+    // Printed before the call into `android::input`, not after: if the fault
+    // is inside `onTouchEventNative` -- i.e. inside `libroblox.so` itself, on
+    // the far side of `game_activity.cpp` -- the process never returns to
+    // print anything that logs its result. This line is the one thing
+    // guaranteed to reach the log before that happens, which is what #36
+    // needs: nobody who has hit it has a touchscreen-free way to reproduce it
+    // here, so the trace has to carry the whole story on the first try.
+    if super::input::trace_touch() {
+        eprintln!(
+            "[cordial] wl_touch.down id={id} x={} y={}",
+            fixed_to_f32(x),
+            fixed_to_f32(y)
+        );
     }
     let (cw, ch, _) = w.geometry();
     super::input::touch_down(
@@ -3354,6 +3379,12 @@ unsafe extern "C" fn touch_down(
 
 unsafe extern "C" fn touch_up(_data: *mut c_void, _touch: *mut c_void, _serial: u32, _time: u32, id: i32) {
     let Some(w) = current() else { return };
+    // See `touch_down` for why this is logged before dispatch rather than
+    // after: a fault inside the engine's own handling of the event leaves
+    // nothing else to print it.
+    if super::input::trace_touch() {
+        eprintln!("[cordial] wl_touch.up id={id}");
+    }
     let (cw, ch, _) = w.geometry();
     super::input::touch_up(w.active_handle.load(Ordering::Relaxed), id as i64, (cw, ch), w.now_ms());
 }
@@ -3367,6 +3398,15 @@ unsafe extern "C" fn touch_motion(
     y: i32,
 ) {
     let Some(w) = current() else { return };
+    // See `touch_down` for why this is logged before dispatch rather than
+    // after.
+    if super::input::trace_touch() {
+        eprintln!(
+            "[cordial] wl_touch.motion id={id} x={} y={}",
+            fixed_to_f32(x),
+            fixed_to_f32(y)
+        );
+    }
     let (cw, ch, _) = w.geometry();
     super::input::touch_motion(
         w.active_handle.load(Ordering::Relaxed),
@@ -3394,6 +3434,11 @@ unsafe extern "C" fn touch_frame(_data: *mut c_void, _touch: *mut c_void) {}
 /// gesture -- and every contact is void.
 unsafe extern "C" fn touch_cancel(_data: *mut c_void, _touch: *mut c_void) {
     let Some(w) = current() else { return };
+    // See `touch_down` for why this is logged before dispatch rather than
+    // after.
+    if super::input::trace_touch() {
+        eprintln!("[cordial] wl_touch.cancel");
+    }
     let (cw, ch, _) = w.geometry();
     super::input::touch_cancel(w.active_handle.load(Ordering::Relaxed), (cw, ch), w.now_ms());
 }
@@ -4519,11 +4564,21 @@ fn reconcile_keyboard_focus() {
         return;
     }
     if let Some(w) = current() {
-        // The same two-way comparison `keyboard_enter` makes, for the same
+        // The same three-way comparison `keyboard_enter` makes, for the same
         // reason. Two places deciding "is this our surface" by different rules
-        // is how one of them ends up wrong.
+        // is how one of them ends up wrong -- which this one was: until now it
+        // checked `parent_surface` and GDK's live surface but not `w.surface`,
+        // the canvas, which is exactly the surface #31 established Hyprland
+        // names on a refocus. `keyboard_enter` picked that up when the window
+        // already existed; this function only runs for the narrower case of an
+        // `enter` that arrived before the window did, and it was still
+        // comparing by the pre-#31 rule. Not the reported bug -- a window that
+        // exists in time for `keyboard_enter` never reaches this path -- and
+        // not reproduced, but there is no reason for the two checks to
+        // disagree about what "ours" means.
         let live = w.host.0.wl_surface();
         if entered == w.parent_surface as usize
+            || entered == w.surface as usize
             || live.is_some_and(|s| entered == s as usize)
         {
             KEYBOARD_FOCUSED.store(true, Ordering::Release);

@@ -6,6 +6,20 @@ change made inside them can be committed locally, but the submodule pointer woul
 then name a commit nobody else can fetch, and a fresh clone would fail. So
 changes to the loader live here as patches until somebody decides to fork.
 
+**What is at stake is the instrument, not the behaviour.** 0002, 0003 and 0004
+are gated on environment variables that default off, and 0001 only tightens a
+mapping, so a release built from a fresh checkout behaves the same whether or
+not any of them is applied. What a lost working tree destroys is the ability to
+reproduce a measurement. That nearly happened: 132 lines of edits to the three
+files `crates/cordial-linker-sys/build.rs` compiles sat uncommitted for an
+unknown length of time before anything captured them.
+
+A second copy of those same 132 lines used to live at `third_party/patches/`,
+as one undifferentiated blob with a README describing only the two traces in it
+and not the mapping change or the constructor split it also carried. It has been
+removed: its content is exactly these four patches, checked line for line before
+it went.
+
 **These are not applied automatically.** Applying them is a build-system change
 nobody has made yet, and a patch that silently applies is worse than one that
 does not: `crates/cordial-linker-sys/build.rs` did not watch the loader sources

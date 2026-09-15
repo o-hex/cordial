@@ -78,6 +78,22 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.15.0" date="2026-09-15">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.15.0</url>
+      <description>
+        <p>
+          Voice chat reaches the network: the permission answer is delivered
+          both ways the engine expects, and the microphone is captured through
+          callbacks. Audible speech was confirmed before the last round of
+          hardening, not on these exact bytes, so treat it as new.
+        </p>
+        <p>
+          Clicking Play in a browser now launches the saved profile for that
+          browser account without showing the picker, and the game window's
+          title bar can be hidden for tiling window managers.
+        </p>
+      </description>
+    </release>
     <release version="0.14.2" date="2026-09-13">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.14.2</url>
       <description>

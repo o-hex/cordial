@@ -73,15 +73,24 @@ mod tests {
     }
 
     #[test]
-    fn hidden_chrome_stays_hidden_after_leaving_fullscreen() {
+    fn each_mode_controls_windowed_chrome() {
+        // Given each named preference.
+        for (choice, expected) in [
+            (TitleBar::Default, true),
+            (TitleBar::Compact, true),
+            (TitleBar::Hidden, false),
+        ] {
+            // When requesting its windowed presentation, then only Hidden removes chrome.
+            assert_eq!(choice.revealed(false), expected);
+        }
+    }
+
+    #[test]
+    fn fullscreen_hides_chrome_in_every_mode() {
         // Given each named preference.
         for choice in [TitleBar::Default, TitleBar::Compact, TitleBar::Hidden] {
-            // When requesting the fullscreen and windowed presentations.
-            let fullscreen = choice.revealed(true);
-            let windowed = choice.revealed(false);
-            // Then fullscreen always hides chrome, and Hidden also hides it tiled.
-            assert!(!fullscreen);
-            assert_eq!(windowed, choice != TitleBar::Hidden);
+            // When requesting its fullscreen presentation, then no mode reveals chrome.
+            assert!(!choice.revealed(true));
         }
     }
 

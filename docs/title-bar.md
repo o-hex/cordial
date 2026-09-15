@@ -3,6 +3,9 @@
 Settings → Appearance → Game window → Title bar offers **Default**, **Compact**
 and **Hidden**. The choice applies to the next game window you open.
 
+This setting applies only to Wayland game windows. The X11 runtime uses an
+unrelated native window and is unaffected.
+
 Hidden removes the title bar without requesting fullscreen, so a tiled window
 keeps its tile. Entering and leaving fullscreen does not restore a hidden bar.
 Default remains the default for new installations.

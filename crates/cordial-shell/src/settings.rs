@@ -240,6 +240,9 @@ fn add_appearance_groups(page: &adw::PreferencesPage, config: Rc<RefCell<ShellCo
     // and a setting that appears to do nothing is worse than one that explains
     // itself.
     bar_row.set_subtitle("Hidden removes the title bar without fullscreen. Applies to the next launch.");
+    bar_row.add_suffix(&detail(
+        "Hidden also removes the window controls. Use your desktop's window shortcuts to move or close the game.",
+    ));
     window_group.add(&bar_row);
     page.add(&window_group);
 

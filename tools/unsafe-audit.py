@@ -23,7 +23,9 @@ in an ordinary comment is excluded (comment-only lines are skipped for the
 unsafe count, though not for the SAFETY count, since a SAFETY comment is
 itself a comment).
 
-Pass --clippy for the number that actually gates a PR: it runs
+Pass --clippy for the accurate number -- nothing gates on it, because this
+repository runs no clippy job in CI at all, so it is a number to watch rather
+than one that will fail a build. It runs
 `cargo clippy -W clippy::undocumented_unsafe_blocks` in the given
 `CARGO_TARGET_DIR` and counts the real warnings, per crate. That needs a full
 build, so it is not the default and is not fast.
@@ -103,7 +105,7 @@ def grep_report(names: list[str]) -> int:
     print(f"{'total':<{width}}{total_sites:>14}{total_comments:>18}{total_gap:>6}")
     print()
     print("Heuristic textual count -- see this file's docstring for what it")
-    print("does and does not match. Use --clippy for the number that gates a PR.")
+    print("does and does not match. Use --clippy for the accurate count.")
     return 0
 
 

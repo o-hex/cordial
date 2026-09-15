@@ -33,6 +33,10 @@ pub mod cookies;
 pub mod deeplink;
 pub mod devctl;
 pub mod elf;
+// Not `pub`: its two functions are the raw-pointer half of this crate's
+// message-bus entry points, and nothing outside the crate should be reaching
+// for them. See ADR-036.
+mod ffi_util;
 pub mod flags;
 pub mod graphics;
 pub mod headless;

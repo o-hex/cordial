@@ -98,11 +98,26 @@ jobs:
     # `workflow_run` above). workflow_dispatch and workflow_call are always
     # eligible because something asked for this directly -- a human in the
     # first case, a future single publish-everything workflow in the second.
+    # **A tag, not every push to main.** This used to publish from any
+    # successful "Native packages" run, and since that workflow runs on every
+    # push to main, the apt repository tracked main rather than releases --
+    # every commit reached `apt upgrade` without a release being cut or notes
+    # being written. `workflow_run` carries no `ref_type`, so the tag is read
+    # off `head_branch`, which holds the tag name for a tag push and the branch
+    # name otherwise.
+    #
+    # The dispatch and call arms stay, and are load-bearing rather than
+    # decorative: release.yml has a `paths` filter, and a tag pointing at a
+    # commit already on main pushes no new commits, so it can produce no run to
+    # publish from at all. That is what left v0.11.0 tagged twice with no
+    # build, and with publishing now tag-only it would mean a release that
+    # never reaches apt. `workflow_dispatch` with a `run_id` is the way out.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'workflow_call' ||
       (github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.conclusion == 'success')
+       github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -120,13 +135,31 @@ jobs:
             run_id="${{ github.event.workflow_run.id }}"
           else
             # workflow_dispatch with no run_id given: the most recent
-            # successful push build, which is the same thing a fresh push
-            # would have picked.
-            run_id=$(gh run list --workflow=release.yml --branch=main \
-                        --status=success --event=push --limit=1 \
-                        --json databaseId --jq '.[0].databaseId')
+            # successful build **of a tag**, which is what this workflow now
+            # publishes.
+            #
+            # This took the newest main build until publishing became
+            # tag-only. That was right while every main push published and is
+            # wrong now: it would let one press of "Run workflow" put a main
+            # build into the repository the gate above exists to keep out.
+            #
+            # `gh run list` has no tag filter, but a tag-triggered run carries
+            # the tag in headBranch, so the list is filtered on that. The limit
+            # is large because main pushes outnumber tags and the last tag can
+            # sit well down the list; when it does not reach, pass run_id.
+            #
+            # The null check is not padding. jq aborts the whole expression on
+            # `null | startswith`, so a single run with no headBranch would turn
+            # this hatch into an error at the moment somebody is reaching for it
+            # because something else already went wrong. Measured against a list
+            # containing a null: unguarded dies with "startswith() requires
+            # string inputs", guarded returns the tag run.
+            run_id=$(gh run list --workflow=release.yml \
+                        --status=success --event=push --limit=100 \
+                        --json databaseId,headBranch \
+                        --jq '[.[] | select(.headBranch != null and (.headBranch | startswith("v")))] | .[0].databaseId')
             if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
-              echo "::error::no successful push run of release.yml found to build from" >&2
+              echo "::error::no successful tag run of release.yml found to build from; pass run_id" >&2
               exit 1
             fi
           fi

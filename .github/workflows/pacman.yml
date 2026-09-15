@@ -67,11 +67,15 @@ concurrency:
 
 jobs:
   build:
+    # A tag, not every push to main -- see apt.yml's comment on this same
+    # condition for why, and for why the dispatch arm is the escape hatch
+    # rather than decoration.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'workflow_call' ||
       (github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.conclusion == 'success')
+       github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     timeout-minutes: 20
@@ -95,11 +99,15 @@ jobs:
           elif [ "${{ github.event_name }}" = "workflow_run" ]; then
             run_id="${{ github.event.workflow_run.id }}"
           else
-            run_id=$(gh run list --workflow=release.yml --branch=main \
-                        --status=success --event=push --limit=1 \
-                        --json databaseId --jq '.[0].databaseId')
+            # The most recent successful build of a tag, matching what this
+            # workflow now publishes. See apt.yml for why this is no longer the
+            # newest main build, and why the limit is large.
+            run_id=$(gh run list --workflow=release.yml \
+                        --status=success --event=push --limit=100 \
+                        --json databaseId,headBranch \
+                        --jq '[.[] | select(.headBranch != null and (.headBranch | startswith("v")))] | .[0].databaseId')
             if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
-              echo "::error::no successful push run of release.yml found to build from" >&2
+              echo "::error::no successful tag run of release.yml found to build from; pass run_id" >&2
               exit 1
             fi
           fi

@@ -496,6 +496,69 @@ struct BootstrapPlan {
 static BOOTSTRAP: std::sync::OnceLock<BootstrapPlan> = std::sync::OnceLock::new();
 static BOOTSTRAP_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set once `run_bootstrap` has finished its attempt at `nativeInitClientSettings`
+/// -- delivered, refused, or found not exported. See `wait_for_settings_delivery`
+/// for why this exists: nothing previously stopped this file's own thread from
+/// racing the engine's bootstrap thread into the engine's other natives before
+/// the engine had its flags.
+static SETTINGS_DELIVERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Block until `run_bootstrap` has delivered client settings, or given up
+/// trying, so this file's own native calls -- `nativeSetDeviceInfo`, the
+/// storage manager, `nativeSetBaseDataDirectories` and the rest -- cannot run
+/// ahead of the engine having its flags.
+///
+/// **Why this exists.** `bootstrapTheApp` runs on the engine's own thread,
+/// spawned sometime during `GameActivity.initializeNativeCode`, concurrently
+/// with this function continuing on the thread that called `initialize()`.
+/// Nothing previously ordered the two, and GitHub issues #44, #28 and the X11
+/// arm of #38 are that race: reproduced here by launching twice against a
+/// fresh `XDG_DATA_HOME` with `CORDIAL_X11=1` -- the second launch, reading its
+/// client-settings document back from a warm on-disk cache instead of
+/// fetching it, reaches `nativeSetBaseDataDirectories` and the engine aborts
+/// with "Can't initialize the TaskScheduler before flags have been loaded"
+/// before `run_bootstrap`'s own call to `nativeInitClientSettings` has
+/// returned -- no `nativeInitClientSettings -> N` line ever appears in that
+/// log. The identical cache on Wayland, and a freshly-fetched document on
+/// either backend, did not reproduce it in repeated runs; running the X11
+/// case under gdb (which slows the process enough to change the race) also
+/// did not. That is what points at timing rather than the document's content:
+/// a cache read finishes fast enough that this thread's own native calls can
+/// get ahead of the engine thread's, where a slower network fetch gives the
+/// engine thread time to finish first. Sober's own log, quoted earlier in
+/// this file, has `nativeInitClientSettings` preceding `RbxStorage::init` by
+/// about 100 ms with nothing racing it -- this function's storage manager and
+/// app-info calls are exactly the Cordial-side equivalent of that gap, and
+/// they were never waiting for it.
+///
+/// Bounded rather than infinite: a build that never installs `bootstrapTheApp`
+/// (`CORDIAL_NO_BOOTSTRAP`, `CORDIAL_LATE_SETTINGS`, or a `libroblox.so` that
+/// never calls it back) must not hang here forever, and `bootstrap_installed`
+/// is `false` in exactly those cases -- the explicit fallback call site
+/// further down does the delivery itself when `bootstrapTheApp` never ran.
+fn wait_for_settings_delivery(bootstrap_installed: bool) {
+    if !bootstrap_installed {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(5);
+    while !SETTINGS_DELIVERED.load(std::sync::atomic::Ordering::SeqCst) {
+        if start.elapsed() > timeout {
+            // Printed rather than silently falling through: a launch that
+            // proceeds without ever having waited successfully is exactly
+            // the state this function exists to prevent, and AGENTS.md's
+            // rule about a stub that lies applies just as much to a wait
+            // that gives up without saying so.
+            println!(
+                "  bootstrapTheApp: still no client settings after {timeout:?}; \
+                 continuing without having waited for them"
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// Deliver settings and flags, from inside the engine's own bootstrap call.
 ///
 /// Prints rather than returning a result because there is nobody to return one
@@ -709,6 +772,10 @@ extern "C" fn run_bootstrap() {
              \x20   readelf --dyn-syms -W {} | grep -i initclientsettings",
             plan.library
         );
+        // Nothing is coming: this build cannot be given flags at all, so
+        // `wait_for_settings_delivery` must not sit out its full timeout on
+        // every single launch of it.
+        SETTINGS_DELIVERED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     if plan.settings_native != 0 {
         match linker::game_activity::init_client_settings(
@@ -720,6 +787,11 @@ extern "C" fn run_bootstrap() {
             Ok(code) => println!("    nativeInitClientSettings -> {code}"),
             Err(e) => println!("    nativeInitClientSettings failed: {e}"),
         }
+        // The delivery attempt is over, one way or the other -- this is the
+        // signal `wait_for_settings_delivery` blocks on. Set here, before the
+        // optional resettle experiment below, because that is unrelated extra
+        // work and nothing should wait on it.
+        SETTINGS_DELIVERED.store(true, std::sync::atomic::Ordering::SeqCst);
 
         // `CORDIAL_EXPERIMENT_RESETTLE_MS=30000` — re-call
         // `nativeInitClientSettings` that many milliseconds into the run, with
@@ -2458,7 +2530,13 @@ fn main() -> ExitCode {
                         // side, and §46 for why that ordering turned out not to
                         // be the thing that was missing.
                         let late = std::env::var_os("CORDIAL_LATE_SETTINGS").is_some();
-                        if std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_none() && !late {
+                        // Recorded rather than re-derived at the wait site below:
+                        // `wait_for_settings_delivery` needs to know whether
+                        // `run_bootstrap` will ever set `SETTINGS_DELIVERED` at
+                        // all, and the answer is exactly this condition.
+                        let bootstrap_installed =
+                            std::env::var_os("CORDIAL_NO_BOOTSTRAP").is_none() && !late;
+                        if bootstrap_installed {
                             const FLAG_NAMES: &str = include_str!("../native-flag-names.txt");
                             // Read once, ahead of the struct literal, because
                             // both `settings` and `settings_source` below come
@@ -2544,6 +2622,21 @@ fn main() -> ExitCode {
                                         let (width, height, format) = w.geometry();
                                         cordial_runtime::android::config::set_screen(width, height);
                                         println!("  window {width}x{height}");
+
+                                        // Everything from here on calls into
+                                        // the engine on the assumption it
+                                        // already has its flags -- Sober's own
+                                        // log has `nativeInitClientSettings`
+                                        // preceding all of it by about 100 ms.
+                                        // `bootstrapTheApp` runs on the
+                                        // engine's own thread, concurrently
+                                        // with this one, and nothing ordered
+                                        // the two before this line existed.
+                                        // See `wait_for_settings_delivery` for
+                                        // the race this closes: issues #44,
+                                        // #28 and the X11 arm of #38.
+                                        wait_for_settings_delivery(bootstrap_installed);
+
                                         // And the framework layer, which had no
                                         // way to be told at all: the C++ setter
                                         // behind this was never `extern "C"`, so

@@ -1,6 +1,6 @@
 # ADR-035: Match browser joins to saved accounts
 
-Status: proposed
+**Status:** Accepted, 2026-09-15
 
 ## Context
 
@@ -38,6 +38,10 @@ not tell us whether the server consumed it. Preserve recognised desktop launch
 fields; unknown field-like text within `gameinfo` is removed with the ticket
 rather than forwarded as a possible credential suffix.
 
+Unrecognised link shapes still follow the existing manual path: the original
+URL can reach `--join-url` and remain visible in `/proc/<pid>/cmdline`. Ticket
+removal on the parsed path does not close that pre-existing fallback exposure.
+
 This extends ADR-012's directory-only switcher decision: the manual switcher
 still selects directories, but the shell now also knows account IDs to route a
 browser join. It does not collect passwords or replace an existing profile's
@@ -48,7 +52,7 @@ It also changes the earlier default of dropping browser credentials unless
 the ticket to the engine on the manual path. Automatic matching instead sends
 the ticket to Roblox's authentication endpoint and discards the resulting
 session. This distinction is deliberate, but it is still credential use: file
-storage is not evidence that a user previously opted into it. The proposed
+storage is not evidence that a user previously opted into it. The accepted
 default treats a browser Play request as a request to select that browser
 account. `CORDIAL_BROWSER_ACCOUNT_ROUTING=0` restores the prior manual behaviour.
 

@@ -35,6 +35,7 @@ mod download_progress;
 mod install;
 mod instructions;
 mod launch;
+mod multi_instance_warning;
 mod profile_switcher;
 mod refresh_watch;
 mod roblox_versions;

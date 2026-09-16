@@ -213,6 +213,50 @@ pub fn acquire(name: &str) -> Result<Claim, Error> {
     Ok(Claim { file, dir })
 }
 
+/// Whether `name`'s profile is currently held by a live process, without
+/// taking or disturbing the lock.
+///
+/// **A `.lock` file's existence proves nothing.** `flock` is released when the
+/// last descriptor onto it closes, but nothing ever deletes the file itself,
+/// so every profile that has ever been launched keeps one for good — checked
+/// on this machine with `fuser` before writing this function, and every
+/// profile directory had a `.lock` with no holder. A caller that treated the
+/// file's presence as "running" would warn on every single launch, including
+/// the very first one against a profile nobody else is touching.
+///
+/// So this asks the kernel the same question [`acquire`] does: take the same
+/// non-blocking `LOCK_EX_NB`, and see whether it succeeds. It costs nothing
+/// and disturbs nothing either way. If it succeeds, nobody held the lock —
+/// `file` drops at the end of this function, which releases it the instant
+/// the answer is known, the same way a holder's own exit would. If it fails,
+/// something really does hold it; a non-blocking `flock` never blocks or
+/// otherwise touches whatever already has the lock, so probing a live holder
+/// this way is exactly as inert as not probing it.
+///
+/// `false` for a profile that has never been launched at all — there is no
+/// `.lock` file to open, and nothing to be running.
+pub fn is_held(name: &str) -> bool {
+    let Ok(dir) = dir(name) else { return false };
+    let Ok(file) = File::open(dir.join(".lock")) else { return false };
+    // SAFETY: `file` is open for the duration of this call. Read-only access
+    // is enough — `flock` locks the open file description, not a particular
+    // access mode.
+    unsafe { flock(file.as_raw_fd(), LOCK_EX_NB) != 0 }
+}
+
+/// Whether launching `exclude` would put a second live instance on the
+/// machine — some *other* profile already has a live holder.
+///
+/// This is deliberately blind to `exclude` itself: a second launch on the
+/// same profile is same-profile contention, which [`acquire`]'s own `flock`
+/// already refuses with a message naming the holder, and that path must not
+/// change. What it cannot see is two different profiles running at once,
+/// which is multi-instancing and is a Roblox account risk rather than a
+/// storage-corruption one — see `multi_instance_warning.rs`.
+pub fn other_profile_is_running(exclude: &str) -> bool {
+    list().iter().filter(|name| name.as_str() != exclude).any(|name| is_held(name))
+}
+
 /// The claim a *client* holds on the profile it runs — inherited if a launcher
 /// handed one down, taken here if nobody did.
 ///
@@ -1182,6 +1226,84 @@ mod tests {
         // And it is a real lock, not a wrapper around fd 1.
         assert!(matches!(acquire("default"), Err(Error::Busy(..))));
         drop(claim);
+    }
+
+    #[test]
+    fn a_stale_lock_file_with_no_holder_is_not_held() {
+        // The case that makes file-existence the wrong instrument: every
+        // profile keeps its `.lock` after the process that made it exits, so
+        // a bare file here has to read as "not held" or every launch on this
+        // machine would warn. `fuser` on a real profile directory agrees:
+        // no holder, same file.
+        let (_root, _g) = scratch("stale-is-held");
+        let dir = dir("default").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".lock"), b"").unwrap();
+        assert!(!is_held("default"), "a lock file with nothing holding it must not read as running");
+    }
+
+    #[test]
+    fn a_profile_never_launched_is_not_held() {
+        let (_root, _g) = scratch("never-launched-is-held");
+        assert!(!is_held("nobody-has-run-this"));
+    }
+
+    #[test]
+    fn a_live_holder_is_detected_without_disturbing_it() {
+        // The other half: a real holder must be seen, and the probe that sees
+        // it must not take its lock away. `sleep` stands in for `cordial-run`
+        // for the same reason it does throughout this file — the mechanism
+        // under test is the descriptor and the flock, not the engine.
+        let (_root, _g) = scratch("live-is-held");
+        let claim = acquire("default").unwrap();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("10");
+        claim.hand_to(&mut command);
+        let mut child = command.spawn().expect("sleep is on PATH");
+        drop(claim);
+
+        assert!(is_held("default"), "a live holder must be detected");
+        // Not disturbed: the child still holds the profile, so an ordinary
+        // acquire is still refused after the probe.
+        assert!(matches!(acquire("default"), Err(Error::Busy(..))));
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // And once the holder is actually gone, the same probe reports free —
+        // proving this reads the kernel's live state rather than a cached
+        // guess made the first time it was asked.
+        let mut freed = false;
+        for _ in 0..50 {
+            if !is_held("default") {
+                freed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(freed, "the lock must read as free once its holder has exited");
+    }
+
+    #[test]
+    fn other_profile_is_running_ignores_the_profile_being_launched() {
+        // The whole point of the distinction in the module doc comment:
+        // launching "default" again while "default" is already running is
+        // same-profile contention, which `acquire` already refuses, and must
+        // not also trip the multi-instance warning. Launching a different
+        // profile while "default" runs is the case the warning exists for.
+        let (_root, _g) = scratch("other-running");
+        let claim = acquire("default").unwrap();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("10");
+        claim.hand_to(&mut command);
+        let mut child = command.spawn().expect("sleep is on PATH");
+        drop(claim);
+
+        assert!(!other_profile_is_running("default"), "a profile must not be 'other' to itself");
+        assert!(other_profile_is_running("alt"), "a different, live profile must be seen");
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

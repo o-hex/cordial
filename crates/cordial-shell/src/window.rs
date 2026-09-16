@@ -26,6 +26,7 @@ use std::time::Duration;
 use crate::chooser;
 use crate::install::{self, NotFound};
 use crate::instructions;
+use crate::multi_instance_warning;
 use crate::root_warning;
 use crate::launch;
 use crate::profile_switcher;
@@ -907,6 +908,31 @@ fn activate_roblox(
         });
         return;
     }
+
+    // Multi-instancing gets one warning, then is remembered — see
+    // `multi_instance_warning`'s module comment for why this one is
+    // remembered and root's above is not. Detection is deliberately blind to
+    // *this* profile already running: that is same-profile contention, which
+    // `profile::acquire` below refuses on its own with a message naming the
+    // holder, and this warning is only about a launch that would put two
+    // different profiles up at once.
+    let target_profile = config.borrow().profile.clone();
+    if !config.borrow().multi_instance_warning_seen
+        && profile::other_profile_is_running(&target_profile)
+    {
+        window.present();
+        let window = window.clone();
+        let toasts = toasts.clone();
+        let config = config.clone();
+        let config_for_dialog = config.clone();
+        let join = join.clone();
+        let lifecycle = lifecycle.clone();
+        multi_instance_warning::confirm(&window.clone(), &config_for_dialog, move || {
+            launch_now_tracked(&window, &toasts, &config, &join, &lifecycle);
+        });
+        return;
+    }
+
     launch_now_tracked(window, toasts, config, join, lifecycle);
 }
 

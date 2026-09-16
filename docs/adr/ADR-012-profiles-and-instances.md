@@ -140,7 +140,8 @@ Roblox's OAuth 2.0 grants API scopes to third-party applications through the
 creator dashboard. It does not issue a play session, and there is no supported
 mechanism for a client to authenticate on a user's behalf. Account switching is
 therefore not an authentication feature at all: each profile logs in normally and
-keeps its own session in its own directory. Nothing about this design needs
+keeps its own session under its profile's storage key. The configured secret
+backend stores that session in the keyring or in the profile directory. Nothing about this design needs
 Roblox to grant anything, which is also why it cannot be withdrawn.
 
 ## On credentials — originally, why they do not go in a keyring
@@ -290,7 +291,8 @@ runs on one computer. The API reached is identical; only the client differs.
 constraint, and it is the owner's: *users cannot play Roblox if they have not
 unlocked their keyring*. Losing the stored session must degrade to "sign in
 again" and never to "the client will not start", and never to a dialog standing
-between somebody and the game. So `crates/cordial-runtime/src/secrets.rs`:
+between somebody and the game. So `crates/cordial-shell/src/secrets.rs`, shared
+with the runtime through its existing `secrets` module:
 
 - reads the default collection's `Locked` property and **never calls `Unlock`**.
   A locked collection is "not available", not an error and not a prompt. With
@@ -390,6 +392,12 @@ legal.
 **Accepted:** the account switcher is a profile switcher. It does not
 authenticate or know anything about accounts — it selects a directory. Cordial
 never sees a password.
+
+**Extended by [ADR-035](ADR-035-browser-account-routing.md):** the manual
+switcher still selects a directory, but browser routing now redeems a launch
+ticket and compares account IDs to select an existing profile automatically.
+The directory-only description below records the earlier design; it no longer
+describes every selection path in the shell.
 
 > The rest of this point read "and never stores a session token itself; Roblox
 > does that, inside the profile." That is no longer true and was never true of

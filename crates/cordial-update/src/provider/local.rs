@@ -26,9 +26,19 @@
 //! It also does not trust the file for being local. Being on the disk already
 //! is a statement about convenience and not about provenance -- the path is
 //! under `$HOME` and anything running as the user could have written it -- so
-//! the archive goes through exactly the same [`crate::apk_signature`] check as
-//! one off a mirror. A local file that fails that check is refused with the
-//! same words.
+//! an archive obtained *through this provider* goes through exactly the same
+//! [`crate::apk_signature`] check as one off a mirror, in
+//! [`crate::provider::obtain_from`]. A local file that fails that check is
+//! refused with the same words.
+//!
+//! **That is true of this provider and was not true of the path the launcher
+//! actually uses**, which is the correction this paragraph carries rather than
+//! the claim it used to make. `cordial_shell::install::locate` finds a build
+//! from the environment, the APK chosen in Settings, or Sober's directory and
+//! returns it without asking this crate to verify anything -- nothing in
+//! `cordial-shell` calls [`crate::apk_signature`] at all. A comment stating a
+//! security property the launch path does not have is worse than no comment,
+//! so it is scoped here to what it covers. See issue #51.
 //!
 //! ## Where it looks
 //!

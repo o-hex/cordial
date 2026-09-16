@@ -679,6 +679,18 @@ pub fn last_extent() -> (u32, u32) {
 /// Counted rather than printed per call for the reason `input::
 /// report_unregistered` gives: one line would be indistinguishable from a
 /// transient at a resize, and one per frame would bury the run.
+///
+/// **Checked against issue #35's Steam Deck SIGSEGV, and ruled out as this
+/// file's doing.** The reporter's log has `vkAcquireNextImageKHR` returning
+/// `VK_SUBOPTIMAL_KHR` immediately before the crash, but `VK_SUBOPTIMAL_KHR`
+/// is a success code — the image is still usable — and this function's own
+/// logic above confirms it: the return value from `vkQueuePresentKHR` is
+/// read only to decide what to print, never to change `rc`, which the caller
+/// returns to the engine exactly as the driver gave it. `vkAcquireNextImageKHR`
+/// itself is not interposed anywhere in this file at all (there is no
+/// `vk_acquire_next_image_khr` here), so that call reaches the host driver
+/// completely unmodified. Neither fact leaves room for this file to be
+/// turning a benign resize signal into the crash.
 fn report_present_result(rc: i32) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SUBOPTIMAL: AtomicU64 = AtomicU64::new(0);
@@ -1078,6 +1090,36 @@ static HOST_CREATE_SWAPCHAIN: std::sync::atomic::AtomicUsize =
 /// matter which path produced it. The alternative reliably grows a route that
 /// forgets, and a capture against a stale swapchain handle is a driver crash
 /// rather than a wrong picture.
+///
+/// **Checked against issue #39's SIGSEGV on the first swapchain recreation of
+/// a fullscreen-exit transition, and not confirmed as this file's doing.**
+/// This function and [`vk_create_swapchain_inner`] change exactly two scalar
+/// fields of the caller's `VkSwapchainCreateInfoKHR` — `presentMode` and,
+/// rarely, `minImageCount` — and forward `oldSwapchain` unexamined; the actual
+/// handling of an outgoing swapchain's in-flight images is a matter between
+/// the engine and the host driver that never passes through Rust code at all,
+/// because neither `vkAcquireNextImageKHR` nor `vkDestroySwapchainKHR` is
+/// interposed anywhere in this file. There is consequently no lever here to
+/// have mishandled a stale image or a torn-down swapchain.
+///
+/// `tools/sober-corpus`'s issue #2180 (`Crashes after SceneManager first
+/// resize when using Vulkan`) is independent evidence for a wider version of
+/// the same fault shape: Roblox's Android-targeted Vulkan renderer, run on
+/// Sober rather than Cordial, has repeatedly SIGSEGV'd immediately after a
+/// framebuffer resize on ordinary desktop Linux GPU drivers (NVIDIA 535
+/// through 550, Pascal through Ampere), with no Cordial-equivalent code
+/// involved at all — Sober's own maintainers concluded it is the engine's
+/// renderer disagreeing with the host driver, not anything in the launcher,
+/// and the confirmed workaround every reporter in that thread used is forcing
+/// the OpenGL/GLES path instead of Vulkan. Cordial already ships the same
+/// switch: `CORDIAL_GRAPHICS=gles` withholds the virtual Vulkan library
+/// entirely, so the engine falls through to its own GLES3 renderer and none
+/// of this file's code ever runs. Confirmed still working on this build,
+/// 2026-09-15: `CORDIAL_GRAPHICS=gles` reached the Landing page cleanly,
+/// logging `[graphics] backend: GLES3 — Vulkan is being withheld
+/// deliberately`. That makes it a real mitigation to offer a reporter of #35
+/// or #39 today, not a fix for whatever is actually wrong with Roblox's
+/// Vulkan renderer here.
 extern "C" fn vk_create_swapchain_khr(
     device: *mut c_void,
     create_info: *const VkSwapchainCreateInfoKHR,
@@ -1239,6 +1281,64 @@ static HOST_GET_SURFACE_CAPS: std::sync::atomic::AtomicUsize = std::sync::atomic
 /// is attached to it.
 const VK_WHOLE_SIZE_UNDEFINED_EXTENT: u32 = 0xFFFF_FFFF;
 
+/// How long a raw extent must stop changing before
+/// [`settle_resize_extent`] hands it to the engine.
+///
+/// [Issue #39](https://github.com/luohoa97/cordial/issues/39) logged a
+/// fullscreen transition as nine extent steps in well under half a second —
+/// two consecutive steps were 48 ms apart — with a swapchain rebuilt at each
+/// one, because this file handed the engine whatever `geometry()` returned on
+/// every call. 120 ms is comfortably longer than the 48 ms gap actually
+/// observed between animation steps, so a single Mutter resize collapses to
+/// one settled extent, while still being far short of the time a user holds a
+/// window at a size they chose by dragging.
+const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// State for [`settle_resize_extent`]: the extent last handed to the engine,
+/// the most recent raw extent observed, and when that raw extent was first
+/// seen.
+#[derive(Clone, Copy)]
+struct ResizeSettleState {
+    committed: (u32, u32),
+    pending: (u32, u32),
+    pending_since: std::time::Instant,
+}
+
+/// The debounce state behind [`vk_get_physical_device_surface_capabilities_khr`].
+/// `None` until the first call, so the very first extent this process ever
+/// reports needs no settling.
+static RESIZE_SETTLE_STATE: std::sync::Mutex<Option<ResizeSettleState>> = std::sync::Mutex::new(None);
+
+/// Collapse a storm of raw extents into one commit per settled size.
+///
+/// A pure step over `(previous state, raw extent, now)` -> `(reported extent,
+/// next state)`, so the coalescing behaviour that fixes issue #39 can be
+/// tested without a Wayland compositor animating a resize. The caller owns
+/// the actual mutable state ([`RESIZE_SETTLE_STATE`]); this function only
+/// decides what to do with it.
+///
+/// While `raw` keeps changing from one call to the next, `pending` chases it
+/// and `committed` — what gets reported — stays put, because every change
+/// resets the settle clock. Once `raw` stops moving for [`RESIZE_SETTLE`],
+/// `committed` jumps straight to it. The engine sees exactly one extent change
+/// per settled resize instead of one per animation frame, and never sees an
+/// extent Cordial's window did not end up at.
+fn settle_resize_extent(
+    state: Option<ResizeSettleState>,
+    raw: (u32, u32),
+    now: std::time::Instant,
+) -> ((u32, u32), ResizeSettleState) {
+    let mut state = state.unwrap_or(ResizeSettleState { committed: raw, pending: raw, pending_since: now });
+    if raw != state.pending {
+        state.pending = raw;
+        state.pending_since = now;
+    }
+    if state.pending != state.committed && now.duration_since(state.pending_since) >= RESIZE_SETTLE {
+        state.committed = state.pending;
+    }
+    (state.committed, state)
+}
+
 /// `vkGetPhysicalDeviceSurfaceCapabilitiesKHR`, patched on the Wayland backend
 /// only.
 ///
@@ -1315,14 +1415,26 @@ extern "C" fn vk_get_physical_device_surface_capabilities_khr(
             // could itself hand back an out-of-range extent would just move
             // this bug rather than fix it.
             let clamp = |v: i32, lo: u32, hi: u32| (v.max(0) as u32).clamp(lo, hi);
-            caps.current_extent.width =
-                clamp(width, caps.min_image_extent.width, caps.max_image_extent.width);
-            caps.current_extent.height =
-                clamp(height, caps.min_image_extent.height, caps.max_image_extent.height);
+            let raw = (
+                clamp(width, caps.min_image_extent.width, caps.max_image_extent.width),
+                clamp(height, caps.min_image_extent.height, caps.max_image_extent.height),
+            );
+            // Settled, not raw -- see `settle_resize_extent`. Reporting every
+            // intermediate size of an animated resize is issue #39: a
+            // fullscreen transition produced nine extents in well under half a
+            // second and the engine rebuilt its swapchain at each one.
+            let settled = {
+                let mut guard = RESIZE_SETTLE_STATE.lock().unwrap();
+                let (reported, next) = settle_resize_extent(*guard, raw, std::time::Instant::now());
+                *guard = Some(next);
+                reported
+            };
+            caps.current_extent.width = settled.0;
+            caps.current_extent.height = settled.1;
             crate::android::trace(format_args!(
                 "wayland: vkGetPhysicalDeviceSurfaceCapabilitiesKHR currentExtent was undefined \
-                 (0xFFFFFFFF), reporting the window's own {}x{}",
-                caps.current_extent.width, caps.current_extent.height,
+                 (0xFFFFFFFF), reporting the window's own {}x{} (raw {}x{})",
+                caps.current_extent.width, caps.current_extent.height, raw.0, raw.1,
             ));
             // And once per *change*, unconditionally. The engine asks this
             // several times a second, so a per-call line is unreadable and a
@@ -1723,5 +1835,70 @@ mod tests {
         // so this name must keep it. A key that lost the prefix would be sent
         // to the engine as though it were a FastFlag.
         assert!(PRESENT_MODE_KEY.starts_with("Cordial"));
+    }
+
+    /// Issue #39's storm, replayed against the pure step function: nine
+    /// extents 48 ms apart, the closest gap actually logged. Every
+    /// intermediate one must be swallowed and only the last reported.
+    #[test]
+    fn a_storm_of_extents_48ms_apart_settles_to_only_the_last_one() {
+        let steps: [(u32, u32); 9] = [
+            (1920, 1034),
+            (1920, 1049),
+            (1920, 1057),
+            (1920, 1061),
+            (1920, 1069),
+            (1920, 1076),
+            (1920, 1078),
+            (1920, 1079),
+            (1920, 1080),
+        ];
+        let start = std::time::Instant::now();
+        let mut state = None;
+        let mut reports = Vec::new();
+        for (i, &extent) in steps.iter().enumerate() {
+            let now = start + std::time::Duration::from_millis(48 * i as u64);
+            let (reported, next) = settle_resize_extent(state, extent, now);
+            state = Some(next);
+            reports.push(reported);
+        }
+        // None of the nine calls made during the storm ever reports anything
+        // but the size the window started at -- the storm never stops moving
+        // for a whole `RESIZE_SETTLE`, so nothing commits mid-animation.
+        assert!(reports.iter().all(|&r| r == steps[0]));
+
+        // Only once the extent stops changing for `RESIZE_SETTLE` does the
+        // final size get reported -- one commit, not nine.
+        let settle_time = start
+            + std::time::Duration::from_millis(48 * (steps.len() as u64 - 1))
+            + RESIZE_SETTLE;
+        let (reported, _) = settle_resize_extent(state, *steps.last().unwrap(), settle_time);
+        assert_eq!(reported, *steps.last().unwrap());
+    }
+
+    /// The very first extent a process ever reports needs no settling --
+    /// there is nothing to debounce against yet, and the engine's first
+    /// swapchain must be built at the window's real starting size.
+    #[test]
+    fn the_first_extent_reports_immediately() {
+        let (reported, _) = settle_resize_extent(None, (1280, 720), std::time::Instant::now());
+        assert_eq!(reported, (1280, 720));
+    }
+
+    /// A deliberate resize the user holds for longer than `RESIZE_SETTLE`
+    /// (dragging a window edge, say) must still be reported once it stops --
+    /// this is a debounce, not a permanent lock to the first size seen.
+    #[test]
+    fn a_resize_that_holds_past_the_settle_window_is_reported() {
+        let start = std::time::Instant::now();
+        let (_, state) = settle_resize_extent(None, (1280, 720), start);
+        let (_, state) =
+            settle_resize_extent(Some(state), (1600, 900), start + std::time::Duration::from_millis(10));
+        let (reported, _) = settle_resize_extent(
+            Some(state),
+            (1600, 900),
+            start + std::time::Duration::from_millis(10) + RESIZE_SETTLE,
+        );
+        assert_eq!(reported, (1600, 900));
     }
 }

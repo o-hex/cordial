@@ -357,17 +357,21 @@ impl Plugin {
     /// own tests, with every `kill()` call reached, still left one such
     /// process behind -- 21 seconds old and already reparented -- the same
     /// shape as the sandboxed stragglers this whole guard exists to stop.
-    /// Signalling the *group* (the negative pid) reaches every process
-    /// `--new-session` put in it, however many times bwrap forked.
+    /// Signalling the *group* reaches every process `--new-session` put in it,
+    /// however many times bwrap forked.
     ///
-    /// SAFETY: `kill(2)` with a negative pid is process-group signalling, not
-    /// a memory operation. The only failures are ESRCH (the group is already
-    /// gone) and EPERM, and both are fine to ignore: either way there is
-    /// nothing left running that this call could still reach.
+    /// `rustix::process::kill_process_group` takes the plain (positive) pid
+    /// and negates it internally before calling `kill(2)` -- the previous
+    /// version of this method did that negation itself in an unsafe block.
+    /// The only failures are ESRCH (the group is already gone) and EPERM, and
+    /// both are fine to ignore: either way there is nothing left running that
+    /// this call could still reach, so the result is dropped rather than
+    /// reported. If `child.id()` somehow will not fit a `Pid` the group is
+    /// left unsignalled and `child.kill()` below still reaps the one pid we
+    /// definitely have.
     pub fn kill(&mut self) {
-        let pid = self.child.id() as libc::pid_t;
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+        if let Some(pid) = rustix::process::Pid::from_raw(self.child.id() as i32) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
         let _ = self.child.kill();
         let _ = self.child.wait();

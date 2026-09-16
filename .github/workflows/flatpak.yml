@@ -336,6 +336,8 @@ jobs:
         run: |
           set -euo pipefail
           ref="${GITHUB_REF_NAME:-main}"
+          # Pull-request refs such as 49/merge must not become directories.
+          ref="${ref//\//-}"
           out="Cordial-${ref}.flatpak"
           flatpak build-bundle repo "$out" "$APP_ID" master \
             --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo

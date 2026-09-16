@@ -152,6 +152,9 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
                 cordial_update::provider::obtain_and_install(
                     None,
                     cordial_update::provider::Want::Any,
+                    Some(&cordial_update::install::Store::live(
+                        cordial_shell::profile::all_pinned_versions(),
+                    )),
                     &cancel,
                     &mut |p| report(p),
                 )

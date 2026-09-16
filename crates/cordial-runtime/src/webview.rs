@@ -67,7 +67,7 @@
 //! exists, the same distinction clipboard's own `arm` draws against
 //! `looper::pump`.
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
 
@@ -575,13 +575,13 @@ static SIGNAL_JAVASCRIPT_CALLBACK_NATIVE: OnceLock<usize> = OnceLock::new();
 /// applied here). That module needs no `webkitgtk6.0-devel` and is always
 /// compiled, so this call does not need the `webview` feature either.
 extern "C" fn on_open_window(json: *const c_char) {
-    if json.is_null() {
+    // SAFETY: the C side passes a NUL-terminated string that outlives the
+    // call, which is exactly `borrow_request`'s contract.
+    let Some(request) = (unsafe { crate::ffi_util::borrow_request(json) }) else {
         println!("[webview] openWindow published with a null payload");
         return;
-    }
-    // SAFETY: the C side passes a NUL-terminated string that outlives the
-    // call.
-    let bytes = unsafe { CStr::from_ptr(json) }.to_bytes();
+    };
+    let bytes = request.to_bytes();
     let Ok(json) = std::str::from_utf8(bytes) else {
         println!("[webview] openWindow message arrived: {} bytes, not valid UTF-8", bytes.len());
         return;

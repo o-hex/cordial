@@ -390,3 +390,34 @@ mod tests {
         assert_eq!(installed_version(&dir), None);
     }
 }
+
+#[cfg(test)]
+mod scan_the_real_build {
+    /// **Scanning the APK does not find the version; scanning the engine
+    /// does.** Measured on this host, 2026-09-13, against the build Sober had:
+    /// `split_config.x86_64.apk` gave `None` and the 118,732,400-byte
+    /// `libroblox.so` extracted from it gave `Some("2.738.0.1397")`.
+    ///
+    /// That is not a curiosity. `cordial-shell`'s `install::extract_engine`
+    /// returns the *archive* it took the engine out of, and its caller used to
+    /// scan that -- so every user whose build came from Sober or from an APK
+    /// they chose themselves had no recorded version at all, and
+    /// `Checked::installed` reading `None` makes "is there an update" answer no
+    /// for ever. The comment at that call site claimed it had fixed exactly
+    /// that, and had not.
+    ///
+    /// Kept as a guard against somebody simplifying the two scans back into
+    /// one. Ignored because it needs a Roblox build, which this repository may
+    /// not hold; `CORDIAL_TEST_APK` and `CORDIAL_TEST_LIB` name one.
+    #[test]
+    #[ignore = "needs a Roblox build; set CORDIAL_TEST_APK and CORDIAL_TEST_LIB"]
+    fn the_version_is_in_the_engine_and_not_in_the_archive_around_it() {
+        let apk = std::env::var("CORDIAL_TEST_APK").expect("CORDIAL_TEST_APK");
+        let lib = std::env::var("CORDIAL_TEST_LIB").expect("CORDIAL_TEST_LIB");
+        let from_apk = super::version_of(std::path::Path::new(&apk));
+        let from_lib = super::version_of(std::path::Path::new(&lib));
+        println!("apk: {from_apk:?}\nlib: {from_lib:?}");
+        assert!(from_lib.is_some(), "the engine carries a version");
+        assert_ne!(from_apk, from_lib, "and reading it off the archive does not find it");
+    }
+}

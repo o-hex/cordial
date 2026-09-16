@@ -836,7 +836,9 @@ pub unsafe extern "C" fn cordial_overlay_resolve(
     if path.is_null() || out.is_null() || out_len == 0 {
         return 0;
     }
-    let Some(name) = cstr(path) else { return 0 };
+    // SAFETY: `path` is non-null per the check above, and the function's own
+    // contract requires it be NUL-terminated.
+    let Some(name) = (unsafe { cstr(path) }) else { return 0 };
     let Some(resolved) = resolve_asset_path(&name, for_write != 0) else {
         return 0;
     };
@@ -844,8 +846,14 @@ pub unsafe extern "C" fn cordial_overlay_resolve(
     if bytes.len() + 1 > out_len {
         return 0;
     }
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
-    *out.add(bytes.len()) = 0;
+    // SAFETY: `out` is non-null with at least `out_len` writable bytes per
+    // the function's own contract, and `bytes.len() + 1 <= out_len` is
+    // checked immediately above, so both the copy and the NUL write land
+    // inside that buffer.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
+        *out.add(bytes.len()) = 0;
+    }
     1
 }
 
@@ -1219,7 +1227,9 @@ fn write_atomically(out: &Path, bytes: &[u8]) -> Result<(), String> {
 
 /// SAFETY: `p` is null or a NUL-terminated C string, per the API contract.
 unsafe fn cstr(p: *const c_char) -> Option<String> {
-    (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
+    // SAFETY: non-null per the check below; NUL-termination is this
+    // function's own contract, stated above.
+    (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
 }
 
 // ------------------------------------------------------------------- the API

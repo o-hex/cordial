@@ -165,8 +165,18 @@ cut -f2 docs/analysis/undefined-symbols.tsv | sort -u > /tmp/old.txt
 comm -23 /tmp/new.txt /tmp/old.txt
 ```
 
-Data symbols fail the `DT_NEEDED` walk at load time rather than at first use, so
-one missing name stops the whole client.
+**That file used to be the gate, and is not any more.** `symtab::build` reads
+the engine's own imports out of the ELF and resolves the union of those and the
+stub table, so a new build importing an ordinary libc or libm function -- which
+is what `hypotf` and `getpwuid_r` were -- now resolves from the host and says
+so in the log. Regenerating the TSV is housekeeping that keeps each stub named,
+not a release blocker. [ADR-034](docs/adr/ADR-034-symbol-resolution-asks-the-library.md).
+
+What still stops the client is a symbol *nothing* can answer -- an Android API
+with no host equivalent and no implementation here. That is deliberate: it
+fails by name rather than being handed a silent zero. Data symbols fail the
+`DT_NEEDED` walk at load time rather than at first use, so one missing name
+stops the whole client.
 
 ## Never make a stub lie
 
@@ -225,8 +235,14 @@ and matching it is not optional.
 - **Comments explain *why*, anchored in the failure that motivated the code.**
   Not what the line does. The good ones name the bug that would otherwise recur.
 - British-ish prose. No emoji in code or comments. No bullet-list comment blocks.
-- **Commit messages say what you measured**, not only what you changed. They are
-  long here on purpose.
+- **Commit messages are short. A subject line and a few lines of body.** Say
+  what changed, what you measured, and what is still unverified -- then stop.
+  **They used to be long here on purpose and that was wrong.** The reasoning,
+  the control, the alternatives considered and the history belong in an ADR,
+  where somebody about to contradict the decision will actually find them. A
+  git log nobody scrolls is not a decision record; `docs/adr/` is. If a change
+  needs more than a few lines to justify, that is the signal to write the ADR
+  and link it from the commit, not to write the ADR *in* the commit.
 - **Do not paste the conversation into them.** A commit that quotes what
   somebody typed in chat -- "reported as \"its stuck on starting up\"" -- turns
   a private exchange into a permanent public record, and it reads as though the
@@ -291,10 +307,35 @@ Where the user-facing writing lives, and who it is for:
 | `docs/analysis/`, `docs/NEXT.md` | Somebody continuing an investigation |
 | Release notes in `docs/releases/` | Somebody who just installed it and hit something |
 
+**The README has a length ceiling, and it is the one document here that
+does.** It is read by somebody deciding whether to install Cordial and then
+installing it, and nobody in that state reads twelve hundred lines. It reached
+1,250 on 2026-09-13 and the feedback was "the readme is waay too long. it
+should just be a short description, how to install, faq, etc." -- which is the
+correct table of contents. Everything else has somewhere better to live: a
+changelog belongs in `CHANGELOG.md`, an investigation in `docs/analysis/`, a
+feature's fine print in its own page under `docs/`. **When you add to the
+README, say what changed in one or two lines and link out.** If the thing you
+want to explain needs a paragraph, it needs a file.
+
+**The same failure has a second half: this project's writing reads as
+generated, and readers notice.** The complaint on the same day was not that AI
+wrote the code -- it was that the README and the release notes look like nobody
+read them before shipping. Length is most of that tell. Exhaustiveness is not
+thoroughness in a document whose reader is deciding whether to bother.
+
 **Release notes say what is broken.** Every set here does, about a third of the
 way down, because somebody installing a client that freezes on a signed-in
 profile deserves to know before they meet it rather than after. A release note
 that only lists what was added is an advertisement.
+
+**And a release note is not a report to the maintainer.** It is addressed to
+somebody who just installed this version, so it says what they can now do and
+what will still bite them. Prose about what was fixed, how it was diagnosed and
+what the commit did is the changelog's job and the commit message's job -- put
+it there. That distinction was reported from outside on 2026-09-13, of a
+release whose notes read as an account of the work rather than as anything a
+user could act on.
 
 ## Build and test
 

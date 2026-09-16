@@ -21,6 +21,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use cordial_shell::profile::Claim;
+use cordial_shell::secrets::Store;
 
 use crate::install::Build;
 use crate::shell_config;
@@ -140,6 +141,13 @@ pub struct Instance {
     /// immediately — an exit code on its own says nothing about what was run.
     pub command_line: String,
     tail: Tail,
+}
+
+/// Per-launch values that may be absent for an ordinary button launch.
+pub struct LaunchRequest<'a> {
+    pub run_seconds: Option<u64>,
+    pub join_url: Option<&'a str>,
+    pub secret_store: Option<Store>,
 }
 
 impl Instance {
@@ -276,8 +284,7 @@ fn pump(reader: impl std::io::Read + Send + 'static, tail: Tail, to_stderr: bool
 pub fn spawn(
     build: &Build,
     claim: Claim,
-    run_seconds: Option<u64>,
-    join_url: Option<&str>,
+    request: LaunchRequest<'_>,
 ) -> Result<Instance, String> {
     // Before anything is spawned at all, not merely before the join happens.
     // `cordial-run` gates this too — see `network::ensure_launchable`'s own
@@ -291,7 +298,7 @@ pub fn spawn(
     }
 
     let loader = loader_path()?;
-    let run = run_seconds.unwrap_or(DEFAULT_RUN_SECONDS).to_string();
+    let run = request.run_seconds.unwrap_or(DEFAULT_RUN_SECONDS).to_string();
 
     let mut command = Command::new(&loader);
     command
@@ -345,9 +352,10 @@ pub fn spawn(
     // scheme and the length were checked in `deep_link`; the rest is carried
     // untouched, because a launcher that rewrote the payload would be changing
     // which game it was asked to join.
-    if let Some(url) = join_url {
+    if let Some(url) = request.join_url {
         command.arg("--join-url").arg(url);
     }
+    pin_secret_store(&mut command, request.secret_store);
 
     // This used to set `CORDIAL_WAYLAND=1`, because `cordial-run` defaulted to
     // X11 and took Wayland only on that variable. It no longer does:
@@ -447,10 +455,8 @@ pub fn spawn(
     // are some: an empty variable and an absent one mean the same thing to
     // `manifest::unpacked_dirs`, and sending an empty one would put a
     // developer-mode marker in the environment of every ordinary launch.
-    // The browser's sign-in ticket, and only when asked for. Absent is the
-    // client's own default, so an off switch sends nothing rather than sending
-    // a "no" -- and a live credential does not move because a variable was set
-    // to the wrong string.
+    // Engine forwarding is opt-in. Automatic account routing consumes and
+    // removes the ticket earlier, independently of this switch (ADR-035).
     if config.carry_launch_ticket {
         command.env("CORDIAL_DEEPLINK_CARRY_TICKET", "1");
     }
@@ -540,7 +546,7 @@ pub fn spawn(
 
     claim.hand_to(&mut command);
 
-    let command_line = describe(&loader, &build.lib_dir, &build.apk, &run, join_url);
+    let command_line = describe(&loader, &build.lib_dir, &build.apk, &run, request.join_url);
     let mut child = command
         .spawn()
         .map_err(|e| format!("Could not start {}: {e}\n\n{command_line}", loader.display()))?;
@@ -564,6 +570,12 @@ pub fn spawn(
     drop(claim);
 
     Ok(Instance { child, command_line, tail })
+}
+
+fn pin_secret_store(command: &mut Command, store: Option<Store>) {
+    if let Some(store) = store {
+        command.env("CORDIAL_SECRET_STORE", store.setting_value());
+    }
 }
 
 /// Whether this process is inside a Flatpak sandbox.
@@ -754,7 +766,11 @@ mod tests {
         .unwrap();
 
         let build = Build { apk: PathBuf::from("/nonexistent.apk"), lib_dir: PathBuf::from("/nonexistent") };
-        let result = spawn(&build, claim, Some(1), None);
+        let result = spawn(
+            &build,
+            claim,
+            LaunchRequest { run_seconds: Some(1), join_url: None, secret_store: None },
+        );
 
         std::env::remove_var("CORDIAL_PROFILE_ROOT");
         let _ = std::fs::remove_dir_all(&root);
@@ -817,6 +833,25 @@ mod tests {
             Some("roblox-player://placeId=1818"),
         );
         assert!(line.contains("--join-url roblox-player://placeId=1818"), "{line}");
+    }
+
+    #[test]
+    fn routed_launch_pins_the_backend_selected_during_lookup() {
+        // Given commands for auto selections that resolved differently.
+        for (store, expected) in [(Store::Keyring, "keyring"), (Store::File, "file")] {
+            let mut command = Command::new("cordial-run");
+
+            // When routing pins the selected store for the child.
+            pin_secret_store(&mut command, Some(store));
+
+            // Then a fresh runtime cannot make a different automatic choice.
+            let value = command
+                .get_envs()
+                .find(|(name, _)| *name == "CORDIAL_SECRET_STORE")
+                .and_then(|(_, value)| value)
+                .and_then(|value| value.to_str());
+            assert_eq!(value, Some(expected));
+        }
     }
 
     #[test]
@@ -939,7 +974,12 @@ mod tests {
 
         let claim = profile::acquire("e2e").expect("a fresh profile is free");
         let profile_dir = claim.profile_dir().to_path_buf();
-        let mut instance = spawn(&build, claim, Some(40), None).expect("the client starts");
+        let mut instance = spawn(
+            &build,
+            claim,
+            LaunchRequest { run_seconds: Some(40), join_url: None, secret_store: None },
+        )
+        .expect("the client starts");
 
         // The lock has to have moved to the child. Checked while it is running,
         // because that is the only moment the answer can be wrong.

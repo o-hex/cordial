@@ -21,6 +21,108 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## Open: the AppImage's base moved and its closure is now computed, measured 2026-09-13
+
+The previous entry here described two independent defects and a next step of
+"check WebKitGTK builds on Ubuntu 24.04 and stop if it fails". Both defects
+are now fixed and all four measurements the previous entry asked for have
+been taken, against `Cordial-0.13.2-47-g6ff10ca-x86_64.AppImage` (86MB).
+
+**WebKitGTK builds on Ubuntu 24.04.** `libwebkitgtk-6.0-dev` 2.52.6 is on
+`noble-updates/universe`; the workspace, including the `webview` feature,
+built clean in the container in 2m55s. That was the mandatory precondition
+and it held, so the base move went ahead. See ADR-032 for why 24.04 rather
+than the usual answer of 22.04, and why the `gtk4` Cargo feature had to come
+down from `v4_20` to `v4_12` first to make any Ubuntu base usable at all.
+
+**The second defect -- thirteen libraries dropped by linuxdeploy's own
+excludelist -- had no actual fix in `build-appimage.sh` before this pass**,
+only a measurement against the Fedora build recorded in this file's previous
+version. Building on Ubuntu without one produced an AppImage that failed
+outright on plain `ubuntu:24.04`: `cordial-shell: error while loading shared
+libraries: libharfbuzz.so.0: cannot open shared object file`, because
+linuxdeploy printed `Skipping deployment of blacklisted library
+.../libharfbuzz.so.0` while bundling it -- an assumption true of a stock
+desktop and false of the minimal container this AppImage is meant to run on.
+
+**The fix walks the closure instead of trusting that assumption.**
+`build-appimage.sh` now reads every bundled ELF's `DT_NEEDED` entries with
+`patchelf --print-needed`, and copies in from the build host anything missing
+from the AppDir that is not on an explicit never-bundle list, to a fixed
+point. Measured: thirteen libraries completed in one pass (`libharfbuzz.so.0`
+and its own dependants -- `libfreetype`, `libfontconfig`, `libX11`,
+`libwayland-client`, and others down that chain); a second pass completed
+zero.
+
+**The first version of that fix would have shipped a worse bug than the one
+it closed.** It filled the closure for `libc.so.6` and `ld-linux-x86-64.so.2`
+too -- both are genuinely `DT_NEEDED` by `cordial-shell`/`cordial-run` and
+were genuinely missing from the AppDir. But `cordial-shell` carries `RUNPATH
+$ORIGIN/../lib` (`readelf -d`, checked before shipping), so a bundled
+`libc.so.6` in `usr/lib` would be found by the dynamic linker ahead of the
+host's, while the *interpreter* stays the host's regardless -- fixed at link
+time in `PT_INTERP`, loaded by the kernel before RUNPATH exists to consult.
+A mismatched loader/libc pair is exactly the failure class the bundled-loader
+prototype below was rejected for, arrived at by a different door. Caught with
+`readelf -d` inside the container before any host test, not after. The
+never-bundle list now excludes the whole glibc/loader/compiler-runtime family
+(`libc`, `libm`, `libdl`, `libpthread`, `librt`, `libresolv`, `libutil`,
+`libnsl`, `libanl`, `libcrypt`, `ld-linux-x86-64.so.2`, `libstdc++`,
+`libgcc_s`) alongside the graphics stack (`libEGL.so.1 libGLX.so.0 libGL.so.1
+libOpenGL.so.0 libGLdispatch.so.0 libgbm.so.1 libdrm.so.2 libGLESv2.so.2`) --
+all of them present on any host with a working dynamic linker at all, which
+the glibc-symbol floor below already relies on regardless.
+
+**All four measurements**, against the corrected artefact:
+
+1. The glibc-floor gate over the whole AppDir: 149 ELF files checked (136
+   before the closure fix added thirteen), every one `within GLIBC_2.39`,
+   `check-glibc-floor.sh` exit 0.
+2. `ubuntu:24.04` (glibc 2.39, exactly the floor): `--appimage-extract-and-run
+   --diagnostics` printed `Cordial   0.13.2 (6ff10ca)`, exit 0.
+3. `fedora:44` (glibc 2.43): same banner, exit 0.
+4. `debian:12-slim` (glibc 2.36, below the floor), the control: refused to
+   start -- `version 'GLIBC_2.39' not found` against `libc.so.6`, repeated per
+   bundled library needing it, exit 1. The plain version-mismatch message the
+   floor claim predicts, not a confusing one.
+
+**A bundled-loader prototype worked earlier and was abandoned**, for a
+different reason than the near-miss above. It printed `Cordial 0.13.2
+(323afa2)` on `debian:12-slim` (glibc 2.36). It is still the wrong answer
+because WebKitGTK execs its helper processes (`WebKitWebProcess`,
+`WebKitNetworkProcess`, `WebKitGPUProcess`) by absolute path, each carrying
+its own `PT_INTERP` -- a loader shim at the AppRun boundary only ever
+intercepts the first process, leaving those broken while every top-level
+smoke test passes. That failure shape is worse than the bug it fixes.
+
+**The web view's mount-namespace bind was re-measured with a real display,
+and it is a fix and a new open question, not a fix and a close.** Ubuntu's
+`libwebkitgtk-6.0.so` bakes in a single directory for both the helper
+processes and the injected bundle, `/usr/lib/x86_64-linux-gnu/webkitgtk-6.0`,
+where Fedora's split the two. With only the old Fedora-path binds, launching
+a `WebKitWebView` out of the extracted AppImage on this host's own live
+Wayland session, WebKitGTK/bwrap/xdg-dbus-proxy stripped from its search
+path, failed exactly as the mismatch predicts: `Failed to spawn child
+process ".../WebKitNetworkProcess" (No such file or directory)`. `AppRun` now
+binds the merged path too; re-measured the same way, `WebKitNetworkProcess`
+starts. The `WebProcess` it hands off to then aborts on its own, `Could not
+create default EGL display: EGL_BAD_PARAMETER`, for a reason not yet
+established -- reproduced with WebKitGTK's own sandbox disabled and with
+software rendering forced, so it is neither AppRun's mount namespace nor GPU
+acceleration specifically. This dev host has no real
+`/usr/lib/x86_64-linux-gnu` (Fedora keeps the split layout), so even that
+repro stands on the directory faked into existence with an extra bwrap layer
+purely for the test, and that scaffolding has not been ruled out either. See
+ADR-032 for the full account.
+
+**NixOS is a separate thing and was misdiagnosed in public.** An AppImage fails
+there because there is no FHS -- no `/lib64/ld-linux-x86-64.so.2` for the
+interpreter to land on -- regardless of how new the host glibc is. The fix is
+the user's: `programs.appimage.enable = true` with binfmt. That belongs in the
+install documentation and is not written down yet. `flake.nix` now builds
+Cordial for them, and **has never been built**; it needs
+`nix run "github:luohoa97/cordial?submodules=1"`.
+
 ## Open: the gamepad-ordinal probe ran; the pre-login shell is not a readout of `gamepadType`, 2026-08-30
 
 `android/gamepad.rs`'s module comment proposes settling `RBX::GamepadType`'s

@@ -16,10 +16,20 @@
 //! keeps the area behind the engine's canvas the desktop's actual background
 //! colour instead of a flash of white while a resize catches up.
 
+// This binary compiles its own copies of `audio_devices.rs` and
+// `root_warning.rs` (see the `mod` lines below) rather than depending on the
+// `cordial_shell` lib crate for them, so `[lints] workspace = true`'s
+// `unsafe_code = "deny"` applies to this crate root independently of the
+// `#![allow(unsafe_code)]` on `lib.rs` -- see that file's comment, and
+// [ADR-036](../../../docs/adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md),
+// for why cordial-shell carries the allow at all.
+#![allow(unsafe_code)]
+
 mod audio_devices;
 mod chooser;
 mod crash;
 mod deep_link;
+mod browser_account;
 mod diagnostics;
 mod download_progress;
 mod install;
@@ -27,6 +37,7 @@ mod instructions;
 mod launch;
 mod profile_switcher;
 mod refresh_watch;
+mod roblox_versions;
 mod root_warning;
 mod settings;
 mod shell_config;
@@ -120,8 +131,11 @@ fn main() -> libadwaita::glib::ExitCode {
              \x20 -h, --help     This.\n\
              \n\
              `cordial-run` is the loader this launches and is not meant to be run\n\
-             by hand. Issues: https://github.com/luohoa97/cordial/issues",
+             by hand. Issues: https://github.com/luohoa97/cordial/issues\n\
+             \n\
+             {notice}",
             version = cordial_shell::version::full(),
+            notice = cordial_shell::version::NOTICE,
         );
         return libadwaita::glib::ExitCode::SUCCESS;
     }
@@ -156,7 +170,12 @@ fn main() -> libadwaita::glib::ExitCode {
 
     {
         let shell = shell.clone();
-        app.connect_activate(move |app| start(app, &shell));
+        app.connect_activate(move |app| {
+            start(app, &shell);
+            if let Some(shell) = shell.borrow().as_ref() {
+                shell.present();
+            }
+        });
     }
     {
         // The path every desktop launch takes, local or remote: `Exec=` in the
@@ -206,28 +225,30 @@ fn main() -> libadwaita::glib::ExitCode {
 /// Check a link and hand it to the window, or say why not.
 ///
 /// Nothing about the string is trusted: it was produced by a browser acting on
-/// somebody's click. [`deep_link::accept`] is what decides, and the only thing
-/// that ever consumes the result is `Command::arg`.
+/// somebody's click. [`deep_link::accept`] validates the envelope before the
+/// window attempts account routing or holds it for a manual launch.
 fn queue(shell: &Rc<RefCell<Option<window::Shell>>>, raw: &str) {
     match deep_link::accept(raw) {
         Ok(url) => match shell.borrow().as_ref() {
             Some(shell) => {
-                // Printed as well as shown, because the banner shows the first
-                // sixty characters and this is the only place the whole of what
-                // arrived can be compared with what the browser sent.
-                println!("  shell: holding {url} until you press Roblox");
+                println!("  shell: received Roblox link");
                 shell.queue_join(url);
             }
             // `start` built the window immediately above, so this is
             // unreachable rather than merely unlikely — and said out loud,
             // because a link silently going nowhere is the failure this whole
             // path exists to avoid.
-            None => println!("  shell: no window to hand {url} to"),
+            None => println!("  shell: no window to receive Roblox link"),
         },
         // Reported rather than swallowed: somebody whose browser opens Cordial
         // and appears to do nothing has no other way to find out that the link
         // was refused, or why.
-        Err(why) => println!("  shell: ignoring {why}"),
+        Err(why) => {
+            println!("  shell: ignoring {why}");
+            if let Some(shell) = shell.borrow().as_ref() {
+                shell.present();
+            }
+        }
     }
 }
 

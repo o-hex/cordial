@@ -13,3 +13,6 @@ contact_links:
   - name: Security issue
     url: https://github.com/luohoa97/cordial/security/advisories/new
     about: Report privately rather than in a public issue.
+  - name: Licence questions
+    url: https://github.com/luohoa97/cordial/blob/main/CONTRIBUTING.md#the-licence-is-settled
+    about: Cordial is GPL-3.0-or-later and that is settled — relicensing requests are closed with a link to this, not argued. A third-party notice that is wrong or missing IS a bug and does belong in an issue.

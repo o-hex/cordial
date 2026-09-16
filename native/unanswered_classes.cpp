@@ -25,6 +25,10 @@
 // because the engine proceeds on an answer that is not true and fails
 // somewhere with no relationship to the cause.
 //
+// (`AppRtcDeviceWrapper` is the exception now: it is fully hooked, because a
+// voice place appeared to stall against its old "not valid" answer (INFERRED). Its own comment has
+// the reasoning.)
+//
 // So the rule applied here is: hook a method only where Cordial has a truthful
 // answer today. Everything else is left unhooked on purpose. An unhooked
 // method on a *registered* class surfaces through libjnivm's own unresolved
@@ -34,12 +38,15 @@
 
 #include <jnivm.h>
 
+#include "pipewire_backend.h"
+
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -160,34 +167,81 @@ public:
 
 /// `com.roblox.audio.AppRtcDeviceWrapper`
 ///
-/// WebRTC's Android audio-device wrapper, used for voice chat routing. Cordial
-/// has no Android audio routing at all: audio goes out through FMOD to
-/// `native/opensles.cpp` and PipeWire, and there is no `AudioManager`, no
-/// communication mode and no selectable device behind any of this.
+/// Roblox's voice audio-routing wrapper: which output voice plays through, the
+/// communication mode around a call, and the call's microphone mute.
 ///
-/// `isValid()` is hooked and returns **false**, which is not a stub failing
-/// safe by accident -- it is the honest answer. The dex declares it alongside
-/// `getSelectedAudioDeviceAsInt`, `getSelectedAudioDeviceName`,
-/// `wrapStartCommunication`, `wrapStopCommunication` and
-/// `wrapSetCommunicationMute`, which is the shape of a wrapper that expects to
-/// be asked whether it works before being driven. Answering false is the
-/// pattern `native/opensles.cpp` already uses when it reports
-/// `SL_RESULT_FEATURE_UNSUPPORTED` rather than handing back a dead engine
-/// object.
+/// **`isValid()` used to answer false, and that was the wrong honest answer.**
+/// It was written when Cordial had no capture path, on the reasoning that a
+/// wrapper with nothing behind it should say so. There is a path now -- the
+/// engine records voice through `AAudioStream_read` over PipeWire, and plays
+/// it through the same output as everything else -- and a mic button that did
+/// nothing and logged nothing in a voice place, with the microphone permission
+/// granted, is consistent with the engine giving up on a wrapper that says it
+/// is unusable. That link is `INFERRED`; nothing on this side has been seen
+/// being called yet, which is why every method now says so on stderr.
 ///
-/// The five driving methods are deliberately **not** hooked. Nothing has been
-/// observed calling them, and a `wrapStartCommunication` that silently does
-/// nothing would tell the engine communication started when no audio path
-/// exists. If something does call one, it surfaces as unresolved, which is
-/// where a gap belongs.
+/// What each answer means on a desktop, where routing belongs to the desktop:
+/// there is one device, the default one, and no communication mode to enter,
+/// so start and stop change nothing and say that. The mute is the one method
+/// with a real effect, and it is implemented rather than recorded -- see
+/// `audio::voice_muted`.
+///
+/// Prototypes are the dex's: `<init>(J)V`, `isValid()Z`,
+/// `getSelectedAudioDeviceAsInt()I`, `getSelectedAudioDeviceName()String`,
+/// `wrapStartCommunication()V`, `wrapStopCommunication()V`,
+/// `wrapSetCommunicationMute(Z)V`, all instance methods. The device answer is
+/// `SPEAKER_PHONE`, the name Android's own log gives as the default device in
+/// `docs/traces/waydroid-roblox-startup.log.gz`; that it is ordinal 0 is
+/// recalled from the public AppRTC device enum and is `INFERRED`.
 class AppRtcDeviceWrapper : public Object {
 public:
-    jboolean isValid(ENV*) { return JNI_FALSE; }
+    jboolean isValid(ENV*) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            std::fprintf(stderr,
+                "I/Cordial-Voice          AppRtcDeviceWrapper.isValid: yes. Voice uses the "
+                "desktop's default input and output; there is no device to route.\n");
+        }
+        return JNI_TRUE;
+    }
+
+    jint getSelectedAudioDeviceAsInt(ENV*) {
+        std::fprintf(stderr, "I/Cordial-Voice          AppRtcDeviceWrapper.getSelectedAudioDeviceAsInt -> 0 (SPEAKER_PHONE)\n");
+        return 0;
+    }
+
+    std::shared_ptr<String> getSelectedAudioDeviceName(ENV*) {
+        std::fprintf(stderr, "I/Cordial-Voice          AppRtcDeviceWrapper.getSelectedAudioDeviceName -> SPEAKER_PHONE\n");
+        return std::make_shared<String>("SPEAKER_PHONE");
+    }
+
+    void wrapStartCommunication(ENV*) {
+        std::fprintf(stderr,
+            "I/Cordial-Voice          AppRtcDeviceWrapper.wrapStartCommunication: a voice call "
+            "started. Nothing to switch on a desktop; the microphone opens when Roblox starts "
+            "recording.\n");
+    }
+
+    void wrapStopCommunication(ENV*) {
+        std::fprintf(stderr, "I/Cordial-Voice          AppRtcDeviceWrapper.wrapStopCommunication: the voice call ended.\n");
+        audio::voice_muted().store(false);
+    }
+
+    void wrapSetCommunicationMute(ENV*, jboolean mute) {
+        audio::voice_muted().store(mute != JNI_FALSE);
+        std::fprintf(stderr, "I/Cordial-Voice          AppRtcDeviceWrapper.wrapSetCommunicationMute(%s): "
+            "microphone samples are %s.\n", mute ? "true" : "false", mute ? "now silenced" : "passed through");
+    }
 
     static void Register(ENV* env) {
         env->GetClass<AppRtcDeviceWrapper>("com/roblox/audio/AppRtcDeviceWrapper");
         auto c = env->GetClass("com/roblox/audio/AppRtcDeviceWrapper");
         c->HookInstanceFunction(env, "isValid", &AppRtcDeviceWrapper::isValid);
+        c->HookInstanceFunction(env, "getSelectedAudioDeviceAsInt", &AppRtcDeviceWrapper::getSelectedAudioDeviceAsInt);
+        c->HookInstanceFunction(env, "getSelectedAudioDeviceName", &AppRtcDeviceWrapper::getSelectedAudioDeviceName);
+        c->HookInstanceFunction(env, "wrapStartCommunication", &AppRtcDeviceWrapper::wrapStartCommunication);
+        c->HookInstanceFunction(env, "wrapStopCommunication", &AppRtcDeviceWrapper::wrapStopCommunication);
+        c->HookInstanceFunction(env, "wrapSetCommunicationMute", &AppRtcDeviceWrapper::wrapSetCommunicationMute);
     }
 };
 

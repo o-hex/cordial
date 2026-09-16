@@ -29,6 +29,31 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// a committed one.
 pub const GIT_SHA: Option<&str> = option_env!("CORDIAL_GIT_SHA");
 
+/// What this is, under what licence, and where it came from.
+///
+/// Compiled into every binary that links this crate -- `cordial-run` included,
+/// since `cordial-runtime` depends on this one -- so that `strings` answers the
+/// question for a build that arrived without its repository. An AUR source
+/// package, a vendored tarball and a fork's own release all reach somebody that
+/// way, and the licence Cordial is under is not a thing they should have to go
+/// looking for.
+///
+/// GPL-3.0-or-later asks a modified version to carry its notices forward. A
+/// notice that is already in the binary is more likely to survive that than one
+/// somebody has to remember to copy across.
+///
+/// **This is a notice and deliberately not a watermark.** Nothing reads it
+/// back, nothing checks whether it is still there, and stripping it breaks
+/// nothing -- AGENTS.md rules out client-side integrity marks, and anything
+/// that behaved differently when this string was missing would be one. It is
+/// here to be read, including by somebody who has forked this and is deciding
+/// what they owe.
+pub const NOTICE: &str = concat!(
+    "Cordial ",
+    env!("CARGO_PKG_VERSION"),
+    " — GPL-3.0-or-later — https://github.com/luohoa97/cordial"
+);
+
 /// Version and provenance together, for a title bar or a bug report.
 ///
 /// `0.11.0 (0fdbb44a1)` with a git, `0.11.0` without. Never a third shape: the
@@ -60,6 +85,23 @@ mod tests {
                 "{VERSION} has a non-numeric component, so it is not orderable"
             );
         }
+    }
+
+    /// **The notice names this build, its licence and where it came from.**
+    ///
+    /// Asserted by content rather than against a copy of the string, because a
+    /// test that repeats the literal only proves the literal was not edited by
+    /// accident. What matters is that somebody holding the binary can answer
+    /// all three questions from it, and that the version in it is this build's
+    /// rather than one frozen when the constant was written.
+    #[test]
+    fn the_notice_carries_the_version_the_licence_and_the_project() {
+        assert!(NOTICE.contains(VERSION), "{NOTICE} does not name this build");
+        assert!(NOTICE.contains("GPL-3.0-or-later"), "{NOTICE} does not state the licence");
+        assert!(
+            NOTICE.contains("https://github.com/luohoa97/cordial"),
+            "{NOTICE} does not say where this came from"
+        );
     }
 
     /// The commit never leaks into the version half of the display string.

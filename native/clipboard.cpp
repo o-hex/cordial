@@ -76,6 +76,8 @@
 #include <vector>
 #include <unordered_map>
 
+#include "permissions_transport.h"
+
 namespace cordial {
 
 using jnivm::Class;
@@ -279,6 +281,104 @@ public:
     }
 };
 
+/// `com.roblox.universalapp.messagebus.RequestHandlerAsyncRaw`
+///
+/// The asynchronous request half. Where `RequestHandlerRaw.run` returns its
+/// answer, this `run` returns nothing, and the answer goes back later through
+/// the static native `MessageBus.callResponseHandlerRaw(String, String)`.
+/// `PermissionsProtocol` is the first user: the engine asks it whether it may
+/// use the microphone and, with no handler bound, never hears back -- which is
+/// why voice could not ask for the mic at all.
+///
+/// The descriptor `run(Ljava/lang/String;Ljava/lang/String;)V` is read out of
+/// the dex `method_ids` table, not inferred. The payload is taken to be
+/// whichever argument is a JSON object, and the other is the opaque correlation
+/// id. Protocol and method come from handler registration and stay separate;
+/// they must not be reconstructed from that id. `callResponseHandlerRaw` takes
+/// `(id, response)`. Both were measured in a
+/// voice place on 2026-09-13/14, not read off the names: the delivered
+/// `AUTHORIZED` answer produced no `PermissionsProtocolCore: Invalid response
+/// received.`, and the swapped order ended the run at the first answer (see
+/// the delivery block below).
+class MessageBusRequestHandlerAsyncRaw : public Object {
+public:
+    int (*sink)(const char* request, char* out, size_t out_len) = nullptr;
+    permissions::PublishProtocolMethodResponseRaw publish = nullptr;
+    permissions::CallResponseHandlerRaw respond = nullptr;
+    bool dual_response = false;
+    std::string protocol;
+    std::string method;
+
+    static bool looks_like_object(const std::string& s) {
+        for (char c : s) {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
+            return c == '{';
+        }
+        return false;
+    }
+
+    static void run(ENV* env, Object* self, std::shared_ptr<String> a, std::shared_ptr<String> b) {
+        auto* h = dynamic_cast<MessageBusRequestHandlerAsyncRaw*>(self);
+        const std::string sa = a ? static_cast<const std::string&>(*a) : std::string();
+        const std::string sb = b ? static_cast<const std::string&>(*b) : std::string();
+        const bool first_is_payload = looks_like_object(sa) || !looks_like_object(sb);
+        const std::string& payload = first_is_payload ? sa : sb;
+        const std::string& id = first_is_payload ? sb : sa;
+        const char* protocol = (h && !h->protocol.empty()) ? h->protocol.c_str() : "(unknown)";
+        const char* method = (h && !h->method.empty()) ? h->method.c_str() : "(unknown)";
+
+        char out[1024] = {0};
+        const bool answered = h && h->sink && h->sink(payload.c_str(), out, sizeof out) != 0;
+        fprintf(stderr, "[messagebus] async request %s.%s: %s\n", protocol, method,
+                answered ? "answering" : "no answer");
+        if (!answered || !h->respond || !env) {
+            return;
+        }
+        // The order is (id, response), and that is measured, not read off the
+        // method's name: on 2026-09-14 the swapped order ended the run at the
+        // first answer with `RBXCRASH: UnhandledException (bad_function_call)`,
+        // the engine having looked up a handler by the JSON and called the empty
+        // one it got back. Answering from another thread after run() returned
+        // killed the run the same way, so it stays inline.
+        try {
+            auto cls = env->GetClass("com/roblox/universalapp/messagebus/MessageBus");
+            auto jprotocol = std::make_shared<String>(h->protocol);
+            auto jmethod = std::make_shared<String>(h->method);
+            auto jid = std::make_shared<String>(id);
+            auto jresp = std::make_shared<String>(std::string(out));
+            auto jtelemetry = std::make_shared<String>(std::string("{}"));
+            const bool dual = permissions::uses_dual_response(h->dual_response, protocol);
+            fprintf(stderr, "[messagebus] async response %s.%s: transport=%s\n", protocol,
+                    method, dual ? "protocol+async" : "async");
+            permissions::deliver_response({
+                env->GetJNIEnv(),
+                (jobject)to_jni(env, cls),
+                (jstring)to_jni(env, jprotocol),
+                (jstring)to_jni(env, jmethod),
+                (jstring)to_jni(env, jresp),
+                (jstring)to_jni(env, jtelemetry),
+                (jstring)to_jni(env, jid),
+                h->publish,
+                h->respond,
+                protocol,
+                h->dual_response,
+            });
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[messagebus] async response %s.%s failed: %s\n", protocol,
+                    method, e.what());
+        } catch (...) {
+            fprintf(stderr, "[messagebus] async response %s.%s failed\n", protocol, method);
+        }
+    }
+
+    static void Register(ENV* env) {
+        const char* name = "com/roblox/universalapp/messagebus/RequestHandlerAsyncRaw";
+        env->GetClass<MessageBusRequestHandlerAsyncRaw>(name);
+        auto c = env->GetClass(name);
+        c->HookInstanceFunction(env, "run", &MessageBusRequestHandlerAsyncRaw::run);
+    }
+};
+
 /// Handlers stay alive for the life of the process.
 ///
 /// The bus holds the engine's own reference, but nothing here would keep the
@@ -287,6 +387,11 @@ public:
 /// the same fix.
 static std::vector<std::shared_ptr<MessageBusRequestHandlerRaw>>& request_handlers() {
     static std::vector<std::shared_ptr<MessageBusRequestHandlerRaw>> held;
+    return held;
+}
+
+static std::vector<std::shared_ptr<MessageBusRequestHandlerAsyncRaw>>& async_request_handlers() {
+    static std::vector<std::shared_ptr<MessageBusRequestHandlerAsyncRaw>> held;
     return held;
 }
 
@@ -302,6 +407,7 @@ void register_clipboard_classes(jnivm::ENV* env) {
     MessageBusRawCallback::Register(env);
     MessageBusConnection::Register(env);
     MessageBusRequestHandlerRaw::Register(env);
+    MessageBusRequestHandlerAsyncRaw::Register(env);
 }
 
 } // namespace cordial
@@ -418,6 +524,59 @@ extern "C" int cordial_messagebus_set_request_handler(
                                    (jstring)cordial::to_jni(env, jproto),
                                    (jstring)cordial::to_jni(env, jmethod),
                                    (jobject)cordial::to_jni(env, handler));
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// Bind an asynchronous request handler, e.g. `PermissionsProtocol` /
+/// `PermissionsRequest`.
+///
+/// `set_fn` is `setRequestHandlerAsyncRaw`, `publish_fn` is
+/// `publishProtocolMethodResponseRaw`, and `respond_fn` is
+/// `callResponseHandlerRaw`. All are exported natives on `MessageBus` and take
+/// the class as their receiver, like `cordial_messagebus_set_request_handler`.
+/// The publish prototype is `(JNIEnv*, jobject, protocol, method, response,
+/// code, telemetry)`, matching Mocktail's public PermissionsProtocol bridge.
+/// "Did not throw" is again the whole of the evidence until a request arrives.
+extern "C" int cordial_messagebus_set_request_handler_async(
+    void* set_fn, void* publish_fn, void* respond_fn, int dual_response,
+    const char* protocol, const char* method,
+    int (*sink)(const char*, char*, size_t), char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jstring, jstring, jobject);
+    auto* env = cordial::process_env();
+    if (!set_fn || !respond_fn || !env || !protocol || !method) {
+        snprintf(err, err_len, "no JavaVM, or setRequestHandlerAsyncRaw/callResponseHandlerRaw is not exported");
+        return -1;
+    }
+    if (cordial::permissions::uses_dual_response(dual_response != 0, protocol) && !publish_fn) {
+        snprintf(err, err_len, "publishProtocolMethodResponseRaw is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/universalapp/messagebus/MessageBus");
+        auto handler = std::make_shared<cordial::MessageBusRequestHandlerAsyncRaw>();
+        handler->sink = sink;
+        handler->publish = reinterpret_cast<cordial::permissions::PublishProtocolMethodResponseRaw>(
+            publish_fn);
+        handler->respond =
+            reinterpret_cast<cordial::permissions::CallResponseHandlerRaw>(respond_fn);
+        handler->dual_response = dual_response != 0;
+        handler->protocol = protocol;
+        handler->method = method;
+        auto jproto = std::make_shared<cordial::String>(std::string(protocol));
+        auto jmethod = std::make_shared<cordial::String>(std::string(method));
+        cordial::async_request_handlers().push_back(handler);
+        reinterpret_cast<Call>(set_fn)(env->GetJNIEnv(),
+                                       (jobject)cordial::to_jni(env, cls),
+                                       (jstring)cordial::to_jni(env, jproto),
+                                       (jstring)cordial::to_jni(env, jmethod),
+                                       (jobject)cordial::to_jni(env, handler));
         return 0;
     } catch (const std::exception& e) {
         snprintf(err, err_len, "%s", e.what());

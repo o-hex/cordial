@@ -418,6 +418,47 @@ fn opaque_bounds(
     Some((dx.round() as i32, dy.round() as i32, window_w, window_h))
 }
 
+/// How far in from each edge the window's own corners are rounded.
+///
+/// libadwaita's `$window_radius`. It is a constant here because GTK exposes no
+/// way to read a CSS corner radius back, and it does not need to be exact --
+/// **the error is only safe in one direction.** Insetting further than the real
+/// radius costs a few pixels of blending the compositor would otherwise have
+/// skipped. Insetting less leaves black corners, which is the whole bug. If a
+/// theme ever rounds a window harder than this, raise it.
+const WINDOW_CORNER_RADIUS: i32 = 12;
+
+/// The opaque region's rectangles, with the rounded corners left out of it.
+///
+/// **A single rectangle over a rounded window paints its corners black, and
+/// that is what this exists to stop.** An opaque region is a promise to the
+/// compositor that it need not blend those pixels. GTK draws nothing outside
+/// the corner radius, so the buffer there is transparent black -- and a
+/// compositor told to skip the blend shows it as what it literally is, opaque
+/// black, in four little squares where the rounding should be. Reported as
+/// black leaking through the corners where the title bar is not sharp.
+///
+/// Two overlapping bands rather than a real rounded rectangle: one inset
+/// horizontally, one inset vertically. Their union is everything except the
+/// corner squares, which is all the compositor needs to be told, and it costs
+/// two rectangles instead of a per-row approximation of an arc.
+///
+/// A window too small to inset claims nothing rather than claiming a
+/// degenerate band -- the same choice [`opaque_bounds`] makes for a window
+/// with no size, and for the same reason.
+fn corner_safe_rects(x: i32, y: i32, w: i32, h: i32, radius: i32) -> Vec<(i32, i32, i32, i32)> {
+    if radius <= 0 {
+        return vec![(x, y, w, h)];
+    }
+    if w <= radius * 2 || h <= radius * 2 {
+        return Vec::new();
+    }
+    vec![
+        (x + radius, y, w - radius * 2, h),
+        (x, y + radius, w, h - radius * 2),
+    ]
+}
+
 /// [`vertical_placement_tests`] covers the arithmetic, not a live box.
 fn vertical_placement(
     y_alignment: i32,
@@ -493,6 +534,8 @@ impl HostWindow {
     /// is added on top of that, so the engine gets the resolution it asked for
     /// rather than that minus a titlebar.
     pub fn with_canvas(title: &str, width: i32, height: i32) -> Self {
+        let title_bar = crate::title_bar::TitleBar::from_env();
+        let chrome_height = if title_bar.revealed(false) { header_height_hint() } else { 0 };
         // A `GtkDrawingArea` with no draw function paints nothing at all, so
         // what shows through is the themed window background — which is
         // exactly what ADR-011 asks for behind the canvas ("the desktop's own
@@ -516,7 +559,29 @@ impl HostWindow {
         // exists at all, and any future arrangement that stops punching the
         // hole. What it must not do is imply the line below is load-bearing.
         canvas.set_cursor_from_name(canvas_cursor());
-        let host = Self::new(title, width, height, &canvas);
+        let host = Self::new(title, width, height + chrome_height, &canvas);
+        host.toolbar.set_reveal_top_bars(title_bar.revealed(false));
+
+        // Hide the header bar while fullscreen. Restore it afterwards only
+        // when the saved preference has not hidden windowed chrome too.
+        //
+        // GTK does not do this for you and is right not to: it cannot know
+        // whether a given toolbar is chrome the user wants gone or part of the
+        // application. For a game it is chrome. Without this, fullscreening
+        // leaves the title bar sitting across the top of the picture, which is
+        // what "fullscreen still shows the titlebar" means and is not a
+        // compositor problem — the window really is fullscreen, the bar is
+        // simply still inside it.
+        //
+        // `set_reveal_top_bars` rather than hiding the header directly, because
+        // ToolbarView owns the space it occupies: hiding the child leaves the
+        // gap it was sitting in.
+        {
+            let toolbar_for_fs = host.toolbar.clone();
+            host.window.connect_fullscreened_notify(move |w| {
+                toolbar_for_fs.set_reveal_top_bars(title_bar.revealed(w.is_fullscreen()));
+            });
+        }
         host.window.add_css_class("cordial-engine-host");
         // **The window itself is not transparent, and must not be.**
         //
@@ -540,7 +605,7 @@ impl HostWindow {
         // libadwaita default nearer 47px, which read as "the x in the title bar
         // looks off and the titlebar looks short". That is now opt-in through
         // the Appearance page rather than the only option.
-        let compact = matches!(std::env::var("CORDIAL_TITLE_BAR").as_deref(), Ok("compact"));
+        let compact = title_bar == crate::title_bar::TitleBar::Compact;
         // The see-through state is a class rather than the default, and that
         // distinction is the whole lesson of 5a295e3. A permanently transparent
         // toplevel shows the desktop whenever the engine is not painting, which
@@ -581,9 +646,30 @@ impl HostWindow {
         );
         if compact {
             sheet.push_str(
+                // The close button's right margin is one pixel short of its
+                // other three, and that asymmetry is deliberate. Reported as
+                // the x sitting too far left, with the gap to the right edge
+                // visibly larger than the gap above and below it -- which it
+                // was, by exactly one pixel. The two gaps are computed
+                // differently: the horizontal one is a sum of paddings
+                // (`windowhandle` insets its `GtkCenterBox` child equally on
+                // both sides, and the button's own margin adds to that), while
+                // the vertical one is whatever centring leaves over once the
+                // bar's height is settled by something else entirely -- the
+                // title label, not this sheet, which is also why the
+                // `min-height` below does not bind. Measured with
+                // `examples/compact_bar_offsets.rs`: 8/8/9 before, 8/8/8
+                // after, against the unmodified sheet in the same session.
+                //
+                // A pixel off one margin is the smallest change that squares
+                // them. Equalising them properly would mean driving the bar's
+                // height from this sheet rather than the label's, which is the
+                // aggressive compaction 3d67e59 already tried and got reverted
+                // for.
                 " .cordial-engine-host headerbar { min-height: 30px; padding: 0 6px; } \
                  .cordial-engine-host headerbar windowcontrols button { \
-                     min-width: 24px; min-height: 24px; padding: 0; margin: 2px; \
+                     min-width: 24px; min-height: 24px; padding: 0; \
+                     margin: 2px 1px 2px 2px; \
                  }",
             );
         }
@@ -697,8 +783,8 @@ impl HostWindow {
         // the window bleeding onto the second screen, which is how this was
         // first reported.
         let (w, h) = match smallest_monitor() {
-            Some(monitor) => fit_within((width, height + header_height_hint()), monitor),
-            None => (width, height + header_height_hint()),
+            Some(monitor) => fit_within((width, height), monitor),
+            None => (width, height),
         };
 
         let window = adw::Window::builder()
@@ -707,26 +793,6 @@ impl HostWindow {
             .default_height(h)
             .content(&toolbar)
             .build();
-
-        // Hide the header bar while fullscreen, and put it back afterwards.
-        //
-        // GTK does not do this for you and is right not to: it cannot know
-        // whether a given toolbar is chrome the user wants gone or part of the
-        // application. For a game it is chrome. Without this, fullscreening
-        // leaves the title bar sitting across the top of the picture, which is
-        // what "fullscreen still shows the titlebar" means and is not a
-        // compositor problem — the window really is fullscreen, the bar is
-        // simply still inside it.
-        //
-        // `set_reveal_top_bars` rather than hiding the header directly, because
-        // ToolbarView owns the space it occupies: hiding the child leaves the
-        // gap it was sitting in.
-        {
-            let toolbar_for_fs = toolbar.clone();
-            window.connect_fullscreened_notify(move |w| {
-                toolbar_for_fs.set_reveal_top_bars(!w.is_fullscreen());
-            });
-        }
 
         HostWindow {
             window,
@@ -1243,8 +1309,23 @@ impl HostWindow {
             eprintln!("[shell] window size is back ({ww}x{wh}); opaque region rebuilt");
         }
 
+        // The corners are left out; see `corner_safe_rects`.
+        let rects = corner_safe_rects(ox, oy, ow, oh, WINDOW_CORNER_RADIUS);
+        let Some((fx, fy, fw, fh)) = rects.first().copied() else {
+            #[allow(deprecated)]
+            surface.set_opaque_region(None);
+            return;
+        };
         let opaque =
-            gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(ox, oy, ow, oh));
+            gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(fx, fy, fw, fh));
+        for (rx, ry, rw, rh) in rects.iter().skip(1) {
+            if opaque
+                .union_rectangle(&gtk::cairo::RectangleInt::new(*rx, *ry, *rw, *rh))
+                .is_err()
+            {
+                return;
+            }
+        }
         if opaque.subtract_rectangle(&gtk::cairo::RectangleInt::new(x, y, w, h)).is_err() {
             return;
         }
@@ -1662,6 +1743,41 @@ mod tests {
             Some((20, 20, 1596, 871)),
             "the shadow must not be inside the opaque region"
         );
+    }
+
+    /// The corner squares must be outside the opaque region, or the compositor
+    /// skips blending pixels GTK left transparent and they come out black.
+    #[test]
+    fn the_rounded_corners_are_left_out_of_the_opaque_region() {
+        let rects = corner_safe_rects(20, 20, 1596, 871, 12);
+        assert_eq!(
+            rects,
+            vec![(32, 20, 1572, 871), (20, 32, 1596, 847)],
+            "two bands, each inset by the radius on one axis"
+        );
+
+        // Every corner pixel of the window falls outside both bands, and a
+        // pixel just inside the radius on both axes falls within one.
+        let inside = |px: i32, py: i32| {
+            rects
+                .iter()
+                .any(|(x, y, w, h)| px >= *x && px < x + w && py >= *y && py < y + h)
+        };
+        for (px, py) in [(20, 20), (1615, 20), (20, 890), (1615, 890)] {
+            assert!(!inside(px, py), "corner ({px},{py}) must not be claimed opaque");
+        }
+        assert!(inside(32, 32), "the first pixel inside the radius is opaque");
+        assert!(inside(800, 20), "the top edge between the corners is opaque");
+        assert!(inside(20, 400), "the left edge between the corners is opaque");
+    }
+
+    /// A window narrower or shorter than two radii claims nothing, rather than
+    /// a band of negative width -- the same answer an unsized window gets.
+    #[test]
+    fn a_window_too_small_to_inset_claims_nothing() {
+        assert!(corner_safe_rects(0, 0, 24, 400, 12).is_empty());
+        assert!(corner_safe_rects(0, 0, 400, 24, 12).is_empty());
+        assert_eq!(corner_safe_rects(0, 0, 400, 400, 0), vec![(0, 0, 400, 400)]);
     }
 
     #[test]

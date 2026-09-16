@@ -5,11 +5,12 @@
 //! user to find -- it is not in the window title, not in Settings, and the only
 //! place it was written down was a dotfile in a cache directory. The
 //! distribution and the package format matter because Cordial ships in five and
-//! they fail differently: a `.deb` on Ubuntu 24.04 cannot start at all (GTK
-//! 4.20 against the LTS's 4.14), the AppImage's web view needs WebKitGTK on the
-//! host while the Flatpak carries its own, and one glibc symbol made the `.rpm`
-//! uninstallable on everything but rawhide. None of those is diagnosable from
-//! "it doesn't work on Linux".
+//! they fail differently: a `.deb` could not start on Ubuntu 24.04 at all
+//! until the GTK feature floor came down from 4.20 to 4.12, which the LTS's
+//! 4.14.5 clears (ADR-032), the AppImage's web view needs WebKitGTK on the
+//! host while the Flatpak carries its own, and one glibc symbol made the
+//! `.rpm` uninstallable on everything but rawhide. None of those is
+//! diagnosable from "it doesn't work on Linux".
 //!
 //! ## What it deliberately does not carry
 //!
@@ -213,6 +214,12 @@ pub fn report() -> String {
         // version and how it got here are separate questions a reader scans
         // for separately.
         ("Cordial", cordial_shell::version::full()),
+        // The identifier only. `version::NOTICE` carries the licence and the
+        // project URL together for somebody holding a bare binary, but the row
+        // above already names the version and the block is pasted into this
+        // project's own issue tracker, so repeating either here would cost
+        // scanning room to say nothing the reader lacks.
+        ("Licence", "GPL-3.0-or-later".into()),
         ("Install", install_method()),
         ("Roblox", roblox()),
         ("System", uname()),
@@ -236,8 +243,14 @@ mod tests {
     /// A report with four lines where five were expected reads as complete.
     #[test]
     fn every_field_is_present_and_says_something() {
+        // Named once and counted from, rather than a list and a separate
+        // literal that have to be remembered together: the literal was 6 when
+        // a seventh row was added, and the failure it produced said nothing
+        // about which row was new.
+        const LABELS: [&str; 7] =
+            ["Cordial", "Licence", "Install", "Roblox", "System", "Distro", "Session"];
         let text = report();
-        for label in ["Cordial", "Install", "Roblox", "System", "Distro", "Session"] {
+        for label in LABELS {
             let line = text
                 .lines()
                 .find(|l| l.starts_with(label))
@@ -245,7 +258,7 @@ mod tests {
             let value = line[label.len()..].trim();
             assert!(!value.is_empty(), "{label} has no value in:\n{text}");
         }
-        assert_eq!(text.lines().count(), 6, "unexpected line count:\n{text}");
+        assert_eq!(text.lines().count(), LABELS.len(), "unexpected line count:\n{text}");
     }
 
     /// **Nothing here may carry a home directory.**

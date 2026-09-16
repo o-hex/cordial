@@ -21,8 +21,8 @@ and nothing loads without it. The MIT text is kept beside it at
 third_party/mcpelauncher-linker/LICENSE.
 
 Local changes are not committed into the submodule, which belongs to somebody
-else and has nowhere to push. They live as patches in third_party/patches/ with
-a README saying what each one is for.
+else and has nowhere to push. They live as patches in patches/ with a README
+saying what each one is for.
 -------------------------------------------------------------------------------
 libjnivm
 Copyright (c) 2019 ChristopherHX

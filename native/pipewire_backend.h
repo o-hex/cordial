@@ -7,6 +7,7 @@
 // tree was configured with pipewire-devel present — see the top of
 // `pipewire_backend.cpp` for how that split is enforced.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -396,6 +397,20 @@ private:
     Impl* impl_;
 };
 
+/// Roblox's voice mute, set through `AppRtcDeviceWrapper.wrapSetCommunicationMute`
+/// and honoured by `AAudioStream_read`, which zeroes what it hands back while
+/// it is set.
+///
+/// A statement about content, not about the stream, so it does not bend the
+/// rule below: a muted capture stream is still an open one, exactly as on
+/// Android, where `AudioManager.setMicrophoneMute` silences the samples and
+/// leaves the recording running. What it must not be is ignored -- a mute
+/// button that keeps sending the room is the worst answer available.
+inline std::atomic<bool>& voice_muted() {
+    static std::atomic<bool> muted{false};
+    return muted;
+}
+
 /// One capture stream, backed by one `pw_stream` in the input direction.
 ///
 /// The lifetime rule is the point of this class and is not negotiable: an
@@ -408,10 +423,10 @@ private:
 /// indistinguishable is to actually not be there.
 ///
 /// That is why the read side is a ring buffer owned by this object rather
-/// than a borrowed-pointer arrangement like `PlaybackStream`'s: the caller
-/// (`android.media.AudioRecord.read`) polls on its own thread whenever it
-/// likes, including not at all, and none of that may keep the stream alive a
-/// moment longer than the engine asked for.
+/// than a borrowed-pointer arrangement like `PlaybackStream`'s: blocking
+/// Android readers and AAudio's callback-consumer thread both pull on their
+/// own schedule, including not at all, and none of that may keep the stream
+/// alive a moment longer than the engine asked for.
 class CaptureStream {
 public:
     CaptureStream();
@@ -426,8 +441,8 @@ public:
     ///
     /// **This is the only function in Cordial that opens the microphone.**
     /// Every caller of it must be on a path the engine explicitly asked to
-    /// record on; see `audio_classes.cpp`, where the only call sites are
-    /// `AudioRecord.startRecording` and `WebRtcAudioRecord.startRecording`.
+    /// record on: `AudioRecord.startRecording`, `WebRtcAudioRecord.startRecording`,
+    /// OpenSL's recorder transition, or `AAudioStream_requestStart`.
     bool open(uint32_t rate_hz, uint32_t channels, const std::string& target_node_name);
 
     /// Destroys the underlying `pw_stream` and drops every buffered sample.
@@ -436,6 +451,11 @@ public:
     void close();
 
     bool is_open() const;
+
+    /// True after PipeWire reports that this capture stream entered its error
+    /// state. Cleared by the next successful `open`, so AAudio can translate
+    /// a live backend failure into its DISCONNECTED state and error callback.
+    bool failed() const;
 
     /// Copies up to `size` bytes of captured interleaved S16 PCM into `dst`,
     /// returning how many bytes were written. Returns 0 rather than blocking

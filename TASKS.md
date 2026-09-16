@@ -260,22 +260,105 @@ x86-64 Android build, `2.730.0.790`:
 
 ### VR is not available and this is not a Cordial limitation
 
-The Android build contains no VR surface of any kind. Roblox's VR support is a
-PC-client feature; the mobile engine this project loads does not have it. There
-is no shim, capability or amount of platform work that adds it, because there is
-no engine code on the other side to call. **Closed, not deferred.**
+**The reasoning above is incomplete, though the verdict holds.** A dex
+class-count of zero only shows Roblox's own Java code has no VR surface — it
+says nothing about what the engine asks the *platform* for, and Cordial
+supplies that platform, not Roblox's dex (see issue #35, `DeviceUtils`, for a
+case where the engine asked for a class no dex declared). The binary does have
+VR code compiled in: flag-shaped strings (`IsVRAppBuild`, `ExposeOpenXrAPI1`,
+`DebugEnableVREmulator` and more) and `[FLog::VRService]` format strings for
+per-eye camera CFrames are present in `libroblox.so`.
 
-### Voice chat — the nearest of the three
+What actually settles it: [docs/analysis/vr-reachability.md](docs/analysis/vr-reachability.md)
+turned on every VR-related FastFlag findable in `docs/traces/` (and the
+binary-string names besides, under both `F`/`DF` prefixes), verified the
+override reached the engine (`nativeInitClientSettings -> 0`, settings
+document grew by exactly the injected bytes), and compared against an
+otherwise-identical control run. Across three instruments — the dumped Java
+class surface, the `Constructed Unresolved symbol` / stub-call log, and the
+engine's own log stream with `FLogVRService`/`DFLogVRService` turned on — the
+two runs are indistinguishable. No new class or method is requested, no
+unresolved symbol appears, no VRService line is ever printed, and a
+`CORDIAL_TRACE_PATHS=1` capture shows no attempt to `dlopen` a VR runtime
+library. The flags do nothing observable, which is a different and stronger
+finding than "no VR classes in the dex" — reached at the account-router/menu
+shell, not inside a joined place, which that document names as the one gap
+still open. **Closed, not deferred**, on the evidence now in hand.
 
-`AppRtcDeviceWrapper` is the real voice path and Cordial implements none of it.
-The WebRTC audio classes in `native/audio_classes.cpp` are hooked and this
-session fixed seven of them that were registered as instance methods when the dex
-declares them static. So the capture side has been worked; the device-wrapper
-layer above it has not.
+### Voice chat — implemented, broader testing remains
 
-- **Touches:** `native/audio_classes.cpp`, a new device-wrapper module, the
-  PipeWire capture path.
-- **Scope:** major, but the best-understood of the three. Its own PR.
+Dual protocol/async permission delivery now unlocks voice initialisation, and
+AAudio supports the callback-driven microphone input Roblox requests. A tester
+confirmed audible transmission on Roblox 2.738.0.1397 in the combined local
+build. Other devices and distributions remain unverified. See
+[the controlled experiment](docs/analysis/voice-dual-response.md).
+
+<details>
+<summary>Superseded investigation notes, before the 2026-09-14 fix</summary>
+
+The following records earlier observations and hypotheses, not the current
+blockers or next steps.
+
+`AppRtcDeviceWrapper` used to be registered with `isValid()` answering
+**false** and nothing else. It now answers true and implements the device
+getters, start/stop communication and the call mute
+(`native/unanswered_classes.cpp`), with the mute zeroing samples in
+`AAudioStream_read`. **The engine has never called any of it**: every method
+logs as `I/Cordial-Voice`, and three runs in a voice place printed none. It is
+kept because the contract comes from the dex and the Android capture, not
+because it fixed anything.
+
+Voice does not join under Cordial. In place 14236925335 with
+`FLogVoiceChatLogs=7`, under `roblox-app`, `android-tablet` and the default
+`pc-windows-11` (runs on 2026-09-13 logged the constructor under all three), the engine
+logs `voice_service_init`, `IsVoiceEnabledForUserIdAsync ... true`,
+`VoiceChatInternal ctor`, a muted publish pause and
+`onServiceProvider - UseNewJoinFlow = 0`, then no further voice line.
+
+**The Sober comparison this paragraph rested on measured nothing.** Sober on
+the same account, place and build logged no `VoiceChatLogs` line at all while
+voice joined and toggled, and that was read as "a working join logs the same
+silence". A second Sober run on 2026-09-14 shows why: with both families in
+its `fflags`, it wrote `DFLog*` lines (`VoiceChatRequestTrace`,
+`HttpTraceError`) and no `FLog*` voice line, so the `FLog` channels were never
+on in Sober. Whether a working join logs `ClientJoinOperation Constructed`,
+`asyncInitRTCThreadsAndAudioDevice` or `ClientPublishOperation` is untested;
+none of the three has appeared in any Cordial run. What the comparison does
+show is where the two split: Sober was already in voice when the game loaded,
+since the mic button it toggled only exists after a join, while Cordial's top
+bar still offers the join-voice button. The fault is the automatic join at
+load, not the button. The only line the toggles
+produced in Sober was a re-enumeration of the audio devices,
+`[FLog::Audio] InputDevice 0: ... 48000/2/4`, once per toggle. Cordial's
+Neighbors runs log that line only before the join, never after it, and report
+`48000/1/4`: Cordial's AAudio input answers mono (`kCaptureChannels` in
+`native/aaudio.cpp`) where Sober answers stereo. Whether the channel count
+matters is untested. `DFLogHttpTraceLight`, the channel that prints URLs, stops
+0.76 s after launch when Roblox's settings fetch replaces DF overrides;
+`DFLogHttpTrace` carries on for the whole run but prints no URLs, so in-game
+voice HTTP is still not visible.
+
+The microphone permission ask comes before any of that: the engine sends it
+over the message bus on `PermissionsProtocol`, not through
+`checkSelfPermission`, and nothing answered it. `crates/cordial-runtime/src/permissions.rs`
+now binds it and grants `MICROPHONE_ACCESS` alone. In Neighbors a voice click
+sends `PermissionsRequest`, the `AUTHORIZED` answer is delivered inline with
+(id, response) order and no `PermissionsProtocolCore: Invalid response
+received.`, and then nothing follows: no AAudio input stream, no `dlsym`, no
+voice log line, no UDP socket. The reverse order ends the run with
+`bad_function_call`, and answering from another thread after `run()` returns
+kills it, so both of those are measured rather than inferred.
+
+The bursts of `status:429` on `voice.roblox.com/v1/settings` (33 at once) and
+`/v1/user-voice-connection-state` (43 in ten seconds) came from runs with
+repeated clicking; a single click in a clean run produced neither, so they
+look like a consequence rather than the cause. The one route left to the
+voice settings responses is intercepting the engine's own HTTPS: curl reads
+`HTTPS_PROXY` through the host `getenv` (`crates/cordial-shell/src/network.rs`)
+and trusts the extracted `assets/ssl/cacert.pem`, so a local proxy whose CA is
+appended to that file should see them. That has not been tried.
+
+</details>
 
 ### Gamepad and extended input
 
@@ -731,7 +814,8 @@ that Cordial implements none of, with the implication that mocktail does.
 The class is real — `libroblox.so` exports
 `Java_com_roblox_audio_AppRtcDeviceWrapper_nativeAudioDeviceChanged` — but it is
 unimplemented in *both* projects. Voice chat is dead on both for the same reason,
-and it is a shared gap rather than a comparative one.
+and it is a shared gap rather than a comparative one. (Cordial has since
+implemented it, and voice still does not join; see the voice section above.)
 
 ### One feature they have that Cordial cannot have
 
@@ -761,6 +845,11 @@ Four real gaps, ranked. The first two are the same failure this project hit on
 2026-08-18 when Roblox shipped 2.734.0.917 and the client stopped loading.
 
 ### U1. A new libm symbol is a manual code change. It should not be.
+
+**Fixed, 2026-09-13 --- see [ADR-034](docs/adr/ADR-034-symbol-resolution-asks-the-library.md).**
+`symtab::build` now takes the engine's own imports, read out of the ELF, and
+resolves the union of those and `SYMBOLS`. The diagnosis below was right and is
+kept for it.
 
 **This is the highest-value finding of the comparison.** `hypotf` stopped the
 client loading entirely, and the fix was a hand-edited row in a TSV.

@@ -114,6 +114,28 @@ in-process injection, which is a different primitive.
 Also out: client-side integrity flags or watermarks, and
 obfuscation-as-security.
 
+## The licence is settled
+
+Cordial is GPL-3.0-or-later and stays that way. Requests to relicense — to MIT,
+to Apache-2.0, to dual-licence, to carve out an exception for one downstream —
+are declined, and the issue is closed with a link to this section rather than
+argued out.
+
+That is a rule, not a verdict on whoever asked. The argument has no new form
+left: it has been had, the answer has not moved, and each fresh round costs an
+evening that would otherwise go on the client. A maintainer closing one of these
+is following what is written here, and is not obliged to relitigate it in the
+thread.
+
+Two nearby things are **not** covered by this and are genuinely welcome, because
+they are different questions rather than the same one wearing a hat:
+
+- Whether a third-party component's obligations are actually being met.
+  [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) has to be accurate, and a
+  gap there is a bug worth an issue.
+- Whether some specific dependency you want to add is compatible with
+  GPL-3.0-or-later in the first place. Ask before you write the code, not after.
+
 ## No Roblox code, ever
 
 Cordial ships no Roblox code, APK, asset or decompiled material, and never will.

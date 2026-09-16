@@ -1,7 +1,11 @@
 # Which platform Cordial tells Roblox it is on
 
-**What changed:** `NativeUserJavaInterface.getPlatformName()` answered `"Android"`
-and now answers `"Linux"`, overridable with `CORDIAL_PLATFORM_NAME=<name>`.
+**What changed:** `NativeUserJavaInterface.getPlatformName()` answered `"Android"`,
+then `"Linux"`, and since 2026-09-14 follows the profile's device identity:
+`pc-windows-11` (the default) answers `"Windows"`, `android-tablet` and
+`roblox-app` answer `"Android"`. `CORDIAL_PLATFORM_NAME=<name>` still overrides
+it. §1 records why `Linux` was chosen and why that was reversed; the rest of
+this file measured `Linux` against `Android` and still stands as a measurement.
 
 **What is established:** the engine asks for that string, four times per cold
 start, once inside each app-bridge call. `Linux` is one of the engine's own
@@ -27,6 +31,21 @@ input work — was two-thirds wrong. Only `isTouchDevice` is read.
 ---
 
 ## 1. Why `Linux` rather than `Windows`, and why not `Android`
+
+**Reversed on 2026-09-14; the reasoning below is kept as the record.** It
+judged this one string in isolation. By then the default device profile,
+`pc-windows-11`, already sent the engine a Windows 11 PC User-Agent and
+`BuildInfo` model, so `Linux` was the one field contradicting the identity
+around it, and Cordial was the only host on this machine reporting it
+(mocktail's `pc-windows-11` answers `Windows`). The profile is a claim the user
+chose, and every field of it should make the same claim, so the platform name
+now follows it (`device_platform_name()` in `native/init_params.cpp`).
+
+What prompted the look was Settings > Device Preferences having no theme
+selector under Cordial while Sober and mocktail show one. The platform name is
+**not** that gate: with the override confirmed in the process environment,
+signed in, neither `Android` nor `Windows` brought the selector back. What does
+gate it is still unknown.
 
 `Android`, `AndroidTV`, `Linux`, `MetaOS`, `SteamOS`, `Windows` and `XBoxOne` are
 standalone tokens in libroblox.so's string table, in the region that holds

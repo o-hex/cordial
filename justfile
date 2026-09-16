@@ -315,7 +315,10 @@ client *args:
         want="$(stat -c '%s %Y %n' "$apk" 2>/dev/null)"
         if [ -f "$cache/libroblox.so" ] && [ "$(cat "$stamp" 2>/dev/null)" != "$want" ]; then
             echo "the APK changed since libroblox.so was extracted; re-extracting"
-            rm -f "$cache/libroblox.so"
+            # Since ADR-033 the cache is usually a symlink into a kept build, and
+            # deleting through it would overwrite that build with this one.
+            # Unlink it instead; the shell keys the new extraction next launch.
+            if [ -L "$cache" ]; then rm -f "$cache"; else rm -f "$cache/libroblox.so"; fi
         fi
         if [ ! -f "$cache/libroblox.so" ]; then
             mkdir -p "$cache"

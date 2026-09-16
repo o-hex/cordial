@@ -8,7 +8,7 @@
 //! graphics preference to be usable, without a terminal.
 //!
 //! `AdwPreferencesDialog` with several `AdwPreferencesPage`s — Roblox, Updates,
-//! General, Plugins, Report — each becomes its own tab/sidebar entry for free;
+//! Version, General, Plugins, FastFlags, Report — each becomes its own tab/sidebar entry for free;
 //! that is libadwaita's own page-switcher, not something built here. Appearance
 //! used to be its own page; its two groups live inside General now, and
 //! `build_preferences_window`'s own comment explains why.
@@ -212,17 +212,13 @@ fn add_appearance_groups(page: &adw::PreferencesPage, config: Rc<RefCell<ShellCo
 
     // ---- the game window's chrome ------------------------------------------
     //
-    // Two named sizes, not a pixel value. A free number gives chrome that
-    // matches nothing else on the desktop and, under about 30px, clips the
-    // window controls -- which is the "the x in the title bar looks off" that
-    // put this row here in the first place. Somebody who wants the pixels back
-    // properly wants fullscreen, which F11 gives and which persists per profile.
+    // Named choices avoid clipped controls from arbitrary pixel heights.
+    // Hidden removes chrome without asking the compositor for fullscreen.
     let window_group = adw::PreferencesGroup::builder().title("Game window").build();
     // Order has to match TitleBar::index/from_index.
-    let bar_model = gtk::StringList::new(&["Default", "Compact"]);
+    let bar_model = gtk::StringList::new(crate::shell_config::TitleBar::LABELS);
     let bar_row = adw::ComboRow::builder()
         .title("Title bar")
-        .subtitle("Default matches every other window on your desktop.")
         .model(&bar_model)
         .selected(config_for_bar.borrow().title_bar.index())
         .build();
@@ -243,7 +239,10 @@ fn add_appearance_groups(page: &adw::PreferencesPage, config: Rc<RefCell<ShellCo
     // Says when it applies, because it does not apply to a window already open
     // and a setting that appears to do nothing is worse than one that explains
     // itself.
-    bar_row.set_subtitle("Default matches every other window on your desktop. Applies to the next launch.");
+    bar_row.set_subtitle("Hidden removes the title bar without fullscreen. Applies to the next launch.");
+    bar_row.add_suffix(&detail(
+        "Hidden also removes the window controls. Use your desktop's window shortcuts to move or close the game.",
+    ));
     window_group.add(&bar_row);
     page.add(&window_group);
 
@@ -490,6 +489,18 @@ fn build_roblox_page(
         )
         .build();
 
+    let sign_in_storage = adw::ActionRow::builder()
+        .title("Saved sign-in")
+        .subtitle(match std::env::var("CORDIAL_SECRET_STORE").as_deref() {
+            Ok("file") => "Profile file, by request. Browser Play routing reads the same file.",
+            Ok("keyring") => "Desktop Secret Service only. A locked or unavailable keyring is left signed out.",
+            Ok("auto") | Err(_) => "Desktop Secret Service when available, otherwise a private profile file. Browser Play routing uses the selected backend.",
+            Ok(_) => "Profile file, because the configured secret backend is not recognised.",
+        })
+        .build();
+    sign_in_storage.set_subtitle_lines(3);
+    data_group.add(&sign_in_storage);
+
     let profile_name = config.borrow().profile.clone();
     let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
     let bytes = profile_dir.as_ref().map(|d| cordial_shell::profile::engine_data_bytes(d)).unwrap_or(0);
@@ -669,14 +680,14 @@ fn build_session_group(
     // **In Session rather than anywhere else**, because it is about what
     // happens when a launch arrives rather than about graphics or plugins.
     let ticket = adw::SwitchRow::builder()
-        .title("Sign in from browser launches")
+        .title("Forward browser sign-in tickets to the engine")
         // The row says what it does; the two reasons it is off by default are
         // behind the detail button, and both still have to be somewhere. It
         // moves a credential, which is why somebody might say no, and it is
         // unverified, which is why it might do nothing. A row that promised
         // the feature and silently failed would be the stub-that-lies shape in
         // an interface.
-        .subtitle("Clicking play on the website does not ask you to sign in again.")
+        .subtitle("For manual browser launches; engine support is unverified.")
         .active(config.borrow().carry_launch_ticket)
         .build();
     ticket.set_subtitle_lines(2);
@@ -684,7 +695,9 @@ fn build_session_group(
         "Roblox puts a one-time sign-in ticket in a play link, and this passes it \
          through to the engine.\n\nOff by default for two separate reasons: it moves a \
          credential, and it is not yet confirmed that this engine accepts one, so it \
-         may simply do nothing.",
+         may simply do nothing.\n\nAutomatic account matching uses the ticket separately \
+         and removes it before launch. Set CORDIAL_BROWSER_ACCOUNT_ROUTING=0 to disable \
+         automatic matching.",
     ));
     {
         let config = config.clone();
@@ -2825,6 +2838,9 @@ pub fn build_preferences_window(
     window.add(&build_roblox_page(parent, config.clone(), config_path.clone()));
     // Second, next to the page about the build it is about.
     window.add(&crate::updater::build_update_page(config.clone(), config_path.clone()));
+    // Beside Updates, because the question it answers -- which build, and can I
+    // go back -- is the one somebody an update just broke arrives with.
+    window.add(&crate::roblox_versions::build_version_page(config.clone()));
     // **Five pages where there were seven**, reported as "why are there so many
     // tabs". Appearance held two groups and Get Plugins three; neither was a
     // destination, and a tab per group makes somebody hunt through seven pages

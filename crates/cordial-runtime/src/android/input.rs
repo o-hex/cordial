@@ -134,6 +134,61 @@ pub fn keysym_to_android(keysym: c_ulong) -> Option<i32> {
     })
 }
 
+/// The character an X keysym names, for the text `XLookupString` cannot give.
+///
+/// Xlib's lookup only produces Latin-1, so on a Cyrillic layout it returns no
+/// bytes and the letter never reached a TextBox. Two ranges are arithmetic
+/// (Unicode keysyms and Latin-1); everything else asks libxkbcommon, which
+/// shares X11's keysym numbering -- and therefore covers every layout X11 can
+/// name, not a list of scripts maintained here. It is `dlopen`ed rather than
+/// linked so this crate takes no build-time dependency; every binary that can
+/// start Cordial already links `libxkbcommon.so.0` through GTK, so in practice
+/// the lookup is always there.
+///
+/// **A hand-written Cyrillic table used to sit at the end of this file as a
+/// fallback, and it was wrong twice over.** It was unreachable -- the only host
+/// it claimed to serve is one with no libxkbcommon, which is not a host that
+/// got as far as running this code -- and it privileged one script, so that
+/// same imagined host would still have typed nothing in Greek, Hebrew or
+/// Arabic. Locale coverage belongs in the keysym library, not in a map kept
+/// up to date by hand.
+pub fn keysym_to_char(keysym: c_ulong) -> Option<char> {
+    let k = keysym as u32;
+    if (0x01000100..=0x0110ffff).contains(&k) {
+        return char::from_u32(k - 0x01000000);
+    }
+    if (0x0020..=0x007e).contains(&k) || (0x00a0..=0x00ff).contains(&k) {
+        return char::from_u32(k);
+    }
+    static FN: std::sync::OnceLock<Option<unsafe extern "C" fn(u32) -> u32>> = std::sync::OnceLock::new();
+    let f = FN.get_or_init(|| {
+        extern "C" {
+            fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
+            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        }
+        unsafe {
+            let lib = dlopen(b"libxkbcommon.so.0\0".as_ptr() as *const std::ffi::c_char, 2);
+            if lib.is_null() {
+                None
+            } else {
+                let p = dlsym(lib, b"xkb_keysym_to_utf32\0".as_ptr() as *const std::ffi::c_char);
+                if p.is_null() {
+                    None
+                } else {
+                    Some(std::mem::transmute(p))
+                }
+            }
+        }
+    });
+    if let Some(to_utf32) = f {
+        let cp = unsafe { to_utf32(k) };
+        if cp != 0 {
+            return char::from_u32(cp);
+        }
+    }
+    None
+}
+
 /// Say that a native the input path wanted is not there — at the first drop,
 /// and then at each power of ten.
 ///
@@ -3226,4 +3281,54 @@ mod tests {
         assert!(!evdev_is_text_key(28), "enter");
         assert!(!evdev_is_text_key(15), "tab");
     }
+
+    #[test]
+    fn keysym_to_char_agrees_with_libxkbcommon_everywhere() {
+        // Not a list of scripts. Naming Greek, Hebrew and Arabic would still be
+        // a hand-maintained set -- just a longer one than the Cyrillic table it
+        // replaced -- and it would pass while some script nobody thought of
+        // stayed broken. The contract is the whole keysym space: whatever the
+        // library can name, this function returns, with nothing special-cased
+        // on the way. Reintroduce a per-script branch and this fails.
+        extern "C" {
+            fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
+            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        }
+        let to_utf32: unsafe extern "C" fn(u32) -> u32 = unsafe {
+            let lib = dlopen(c"libxkbcommon.so.0".as_ptr(), 2);
+            if lib.is_null() {
+                // GTK links it into every binary that can start Cordial, so
+                // this is a test-environment gap rather than a pass.
+                eprintln!("libxkbcommon.so.0 not present; nothing to compare against");
+                return;
+            }
+            let p = dlsym(lib, c"xkb_keysym_to_utf32".as_ptr());
+            assert!(!p.is_null());
+            std::mem::transmute(p)
+        };
+
+        // The legacy keysym block, which is every national layout X11 ships,
+        // and the Unicode-keysym range. This file resolves parts of both
+        // arithmetically before the library is consulted, so comparing them
+        // also catches that arithmetic drifting.
+        let mut resolved = 0usize;
+        for k in (0x0020u32..=0x20ff).chain(0x01000100..=0x0100faff) {
+            // Zero is how the library says "this keysym names no character",
+            // not U+0000. Comparing it as `Some('\0')` is what made the first
+            // version of this test fail on `0x7f` (DEL) while the function was
+            // behaving correctly -- the bug was here, not in `keysym_to_char`.
+            let theirs = match unsafe { to_utf32(k) } {
+                0 => None,
+                cp => char::from_u32(cp),
+            };
+            let ours = super::keysym_to_char(k as std::ffi::c_ulong);
+            assert_eq!(ours, theirs, "keysym {k:#x} disagrees with libxkbcommon");
+            if theirs.is_some() {
+                resolved += 1;
+            }
+        }
+        // Guards against the loop silently comparing nothing at all.
+        assert!(resolved > 1000, "only {resolved} keysyms resolved; the comparison did not run");
+    }
+
 }

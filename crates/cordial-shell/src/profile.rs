@@ -682,6 +682,71 @@ pub fn clear_engine_data(profile_dir: &Path) -> Result<u64, String> {
     Ok(freed)
 }
 
+/// The Roblox version this profile is pinned to, if it names one.
+///
+/// A plain file holding a version string, beside `flags.json` and
+/// `plugin-grants.json` -- per-profile configuration, which is what
+/// [ADR-013](../../../docs/adr/ADR-013-per-profile-configuration.md) says this
+/// is. Text rather than JSON because it is one scalar and a document with one
+/// key in it is a format to keep compatible for no gain;
+/// `cordial_update::cache` writes its `.version` the same way, for the same
+/// reason.
+pub const PIN: &str = "roblox-version";
+
+/// Which Roblox build this profile insists on, or `None` to follow whichever is
+/// current.
+///
+/// **`None` is the ordinary state and the one almost everybody wants.** A
+/// profile that follows the current build gets updates without being asked,
+/// which is what happens today and what should keep happening; a pin is a
+/// deliberate act by somebody a Roblox update broke.
+pub fn pinned_version(profile_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(profile_dir.join(PIN)).ok()?;
+    let trimmed = text.trim().to_string();
+    // Validated on the way out, not only on the way in. This file is in the
+    // user's own data directory and can be edited by hand, and a version read
+    // from it is joined onto a path -- so it gets the same check a version
+    // scanned out of a binary gets, at the point of use.
+    (cordial_update::store::is_valid_version(&trimmed)).then_some(trimmed)
+}
+
+/// Pin this profile to a version, or clear the pin with `None`.
+pub fn set_pinned_version(profile_dir: &Path, version: Option<&str>) -> Result<(), String> {
+    let path = profile_dir.join(PIN);
+    match version {
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        },
+        Some(version) => {
+            if !cordial_update::store::is_valid_version(version) {
+                return Err(format!("{version:?} is not a Roblox version"));
+            }
+            std::fs::create_dir_all(profile_dir).map_err(|e| format!("{}: {e}", path.display()))?;
+            std::fs::write(&path, version).map_err(|e| format!("{}: {e}", path.display()))
+        }
+    }
+}
+
+/// Every version any profile has pinned.
+///
+/// What the store must not prune. Collected across all profiles rather than
+/// just the one being launched, because a prune triggered by an update in one
+/// profile would otherwise take the build another profile is pinned to, and
+/// the symptom -- a launch that fails on a missing directory, in a profile
+/// nobody had touched -- gives no hint of the cause.
+pub fn all_pinned_versions() -> Vec<String> {
+    let mut pinned: Vec<String> = list()
+        .iter()
+        .filter_map(|name| dir(name).ok())
+        .filter_map(|d| pinned_version(&d))
+        .collect();
+    pinned.sort();
+    pinned.dedup();
+    pinned
+}
+
 /// A size for a sentence.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [(&str, u64); 3] = [("GB", 1_000_000_000), ("MB", 1_000_000), ("kB", 1_000)];

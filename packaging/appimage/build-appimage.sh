@@ -46,14 +46,20 @@
 # installed cordial rpm rather than from the cargo build below, because the
 # machine it was measured on has no webkitgtk6.0-devel and cannot compile the
 # webview feature; and the probe was a WebKitWebView, not cordial-shell's own
-# sign-in view. Still unexercised: any machine that is not this one, and any
-# distro that is not Fedora. Say which of those states a report is about.
+# sign-in view. That whole measurement was taken against a Fedora-built
+# libwebkitgtk-6.0.so, which is no longer what this script bundles -- see the
+# note beside the layout section below and in AppRun for what changed and
+# what is now unverified because of it.
 #
-# Built inside registry.fedoraproject.org/fedora:44 -- the one environment
-# this repository has proven builds gtk4 4.22/libadwaita 1.9 correctly
-# (test.yml exists because Fedora 43 and Ubuntu 24.04 are both older and fail
-# three *-sys build scripts). The AppImage bundles what that container has so
-# the result runs on hosts with much older, or no, GTK4 at all.
+# **Built inside ubuntu:24.04, not Fedora, since ADR-032.** The base moved
+# because the declared glibc floor is 2.39 and Fedora 44 is 2.43: eighteen
+# bundled libraries came out needing a glibc no host older than Fedora 44
+# had, which is what made v0.13.2's AppImage fail almost everywhere. Fedora
+# was the base in the first place only because gtk4 was pinned at the `v4_20`
+# Cargo feature; the code needs 4.12, and Ubuntu 24.04 carries 4.14.5 and
+# libadwaita 1.5.0 -- see ADR-032 for why 22.04 (GTK 4.6) does not clear that
+# bar either. The rest of this comment describes a Fedora 44 build and is
+# kept for its reasoning, not as a description of what runs today.
 #
 # Usage:
 #     packaging/appimage/build-appimage.sh [--outdir DIR]
@@ -282,8 +288,23 @@ echo "==> bundling shared libraries with linuxdeploy"
 # the part actually needed here; GSettings schemas and the WebKitGTK helper
 # binaries, which that walk cannot see because neither is a DT_NEEDED entry,
 # are handled by hand below instead.
-webkit_libexec=$(rpm -ql webkitgtk6.0 2>/dev/null | grep -m1 '/libexec/webkitgtk-6.0$' || true)
-webkit_bundle=$(rpm -ql webkitgtk6.0 2>/dev/null | grep -m1 '/webkitgtk-6.0/injected-bundle$' || true)
+# `rpm -ql` was the only lookup this needed while the base was Fedora 44. It
+# is not the base any more (ADR-032), and there is no rpm command in an
+# Ubuntu container to fall back to -- so this asks whichever package manager
+# is actually present. On Ubuntu 24.04 `libwebkitgtk-6.0-4` owns one
+# directory for both purposes, `/usr/lib/x86_64-linux-gnu/webkitgtk-6.0`, with
+# `injected-bundle` nested inside it; the two greps below still separate them
+# because the `find -maxdepth 1` calls further down rely on that separation
+# to avoid installing the bundle's .so as if it were a helper executable.
+webkit_pkg_files() {
+    if command -v rpm >/dev/null 2>&1 && rpm -q webkitgtk6.0 >/dev/null 2>&1; then
+        rpm -ql webkitgtk6.0
+    elif command -v dpkg-query >/dev/null 2>&1 && dpkg-query -L libwebkitgtk-6.0-4 >/dev/null 2>&1; then
+        dpkg-query -L libwebkitgtk-6.0-4
+    fi
+}
+webkit_libexec=$(webkit_pkg_files | grep -E '/(libexec|lib64|lib/x86_64-linux-gnu)/webkitgtk-6.0$' | head -1)
+webkit_bundle=$(webkit_pkg_files | grep -m1 '/webkitgtk-6.0/injected-bundle$' || true)
 deploy_args=(--executable "$appdir/usr/bin/cordial-shell" --executable "$appdir/usr/bin/cordial-run")
 if [ -n "$webkit_libexec" ] && [ -d "$webkit_libexec" ]; then
     # Every helper binary passed as its own --executable, not just copied,
@@ -370,6 +391,21 @@ echo "==> laying out what WebKitGTK reaches by absolute path"
 # anyway, measured 2026-08-27, left MiniBrowser spawning the *host's*
 # WebKitWebProcess. AppRun carries the full measurement and the byte offsets
 # of each baked-in path.
+#
+# **That measurement was of a Fedora-built libwebkitgtk-6.0.so, and this
+# script no longer bundles one.** Since ADR-032, `webkit_libexec` above
+# resolves to `/usr/lib/x86_64-linux-gnu/webkitgtk-6.0` -- confirmed with
+# `grep -abo` against Ubuntu 24.04's own library, 2026-09-13 -- which is a
+# single directory serving both the helper processes and the injected
+# bundle, not Fedora's split `/usr/libexec/webkitgtk-6.0` plus
+# `/usr/lib64/webkitgtk-6.0`. AppRun now binds that merged path too, added
+# and re-measured with a live Wayland display the same day: with only the
+# Fedora binds, MiniBrowser out of the extracted AppImage failed outright
+# with WebKitNetworkProcess not found; with the merged bind added, that
+# spawn succeeds. It does not add up to a verified web view yet -- the
+# WebProcess that spawns next aborts on its own, `Could not create default
+# EGL display: EGL_BAD_PARAMETER`, for a reason not yet established. See
+# AppRun for the full measurement and what has and has not been ruled out.
 install -d "$appdir/usr/libexec/webkitgtk-6.0"
 find "$webkit_libexec" -maxdepth 1 -type f -executable -exec \
     install -m755 {} "$appdir/usr/libexec/webkitgtk-6.0/" \;
@@ -387,11 +423,92 @@ done
 # beside the libexec directory in some layouts; copied best-effort rather
 # than gated on, since an absent one is a narrower loss (likely the GPU
 # process sandbox) than an absent helper binary is.
-webkit_share=$(rpm -ql webkitgtk6.0 2>/dev/null | grep -m1 '/share/webkitgtk-6.0$' || true)
+webkit_share=$(webkit_pkg_files | grep -m1 '/share/webkitgtk-6.0$' || true)
 if [ -n "$webkit_share" ] && [ -d "$webkit_share" ]; then
     install -d "$appdir/usr/share/webkitgtk-6.0"
     cp -a "$webkit_share/." "$appdir/usr/share/webkitgtk-6.0/"
 fi
+
+echo "==> completing the dependency closure linuxdeploy's excludelist dropped"
+# linuxdeploy carries its own fixed list of libraries it assumes every host
+# already has, and does not copy them regardless of what --executable or
+# --library named -- see its own `excludelist`. That assumption is a
+# reasonable one for a stock desktop and a wrong one for a minimal container,
+# which is exactly what an AppImage's own premise ("runs on a host that
+# installed nothing else for it") should not lean on. Measured here on
+# 2026-09-13: linuxdeploy printed "Skipping deployment of blacklisted library
+# .../libharfbuzz.so.0" while bundling this AppDir, and the resulting image
+# then failed outright on a bare `ubuntu:24.04` container with
+# `cordial-shell: error while loading shared libraries: libharfbuzz.so.0:
+# cannot open shared object file` -- the exact host this AppImage claims to
+# support, refusing it for a library the bundler decided was not its job.
+#
+# The fix computes the closure itself rather than trusting linuxdeploy's list
+# or hardcoding names: read each bundled ELF's own `DT_NEEDED` entries with
+# `patchelf --print-needed` (works on a stripped binary; that is section-
+# header debug info, not this), skip anything already sitting in the AppDir
+# and anything on the never-bundle list below, and copy the rest in from the
+# build container by way of `ldconfig -p`. Copying can introduce a library
+# that itself needs a further one linuxdeploy also skipped, so this runs to a
+# fixed point rather than once.
+#
+# Two families are left to the host on purpose, and the first pass of this
+# fix copied one of them in before that was noticed -- worth recording so it
+# is not tried again. `cordial-shell`/`cordial-run` carry `RUNPATH
+# $ORIGIN/../lib` (`readelf -d`, this pass), and copying `libc.so.6` and
+# `ld-linux-x86-64.so.2` into that directory put them ahead of the host's own
+# in the dynamic linker's search order for `DT_NEEDED` resolution -- while the
+# *interpreter* stays the host's regardless, fixed at link time in
+# `PT_INTERP`, which the kernel loads by absolute path before RUNPATH exists
+# to consult. Loading a foreign libc against the host's ld.so is the same
+# mismatched-pair failure the bundled-loader prototype was rejected for
+# elsewhere in this file, reached by RUNPATH instead of by rewriting
+# `PT_INTERP` on purpose. `libstdc++.so.6`, `libgcc_s.so.1` and the rest of
+# glibc's own component libraries carry the same ABI coupling to whichever
+# libc actually loads and are excluded for the same reason. None of them
+# needs bundling regardless: unlike `libharfbuzz`, they are present on any
+# glibc host by construction, which is the entire justification the
+# `objdump`-based glibc-symbol floor above relies on already.
+#
+# The second is the graphics stack: nothing renders without a matching driver
+# underneath, and bundling a driver-adjacent library ties the AppImage to
+# whatever GPU stack happened to be in the build container.
+never_bundle_libs="libEGL.so.1 libGLX.so.0 libGL.so.1 libOpenGL.so.0 libGLdispatch.so.0 libgbm.so.1 libdrm.so.2 libGLESv2.so.2 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 libresolv.so.2 libutil.so.1 libnsl.so.1 libanl.so.1 libcrypt.so.1 ld-linux-x86-64.so.2 libstdc++.so.6 libgcc_s.so.1"
+is_never_bundled() {
+    local name="$1" g
+    for g in $never_bundle_libs; do
+        [ "$name" = "$g" ] && return 0
+    done
+    return 1
+}
+
+pass=0
+added=1
+while [ "$added" -gt 0 ]; do
+    pass=$((pass + 1))
+    added=0
+    while IFS= read -r -d '' elf; do
+        while IFS= read -r needed; do
+            [ -z "$needed" ] && continue
+            is_never_bundled "$needed" && continue
+            [ -e "$appdir/usr/lib/$needed" ] && continue
+            src=$(ldconfig -p 2>/dev/null | awk -v n="$needed" '$1 == n { print $NF; exit }')
+            if [ -z "$src" ] || [ ! -e "$src" ]; then
+                echo "error: $elf needs $needed, which is neither bundled nor on this build host" >&2
+                echo "  linuxdeploy's excludelist dropped it, assuming a host has it -- this one" >&2
+                echo "  does not, so the AppImage would fail the same way on a real one" >&2
+                exit 1
+            fi
+            cp -L "$src" "$appdir/usr/lib/$needed"
+            chmod 644 "$appdir/usr/lib/$needed"
+            patchelf --set-rpath '$ORIGIN' "$appdir/usr/lib/$needed"
+            echo "  completed closure: $needed (needed by ${elf#"$appdir"/}, dropped by linuxdeploy's excludelist)"
+            added=$((added + 1))
+        done < <(patchelf --print-needed "$elf" 2>/dev/null || true)
+    done < <(find "$appdir/usr/bin" "$appdir/usr/lib" "$appdir/usr/libexec" \
+        -type f \( -executable -o -name '*.so*' \) -print0 2>/dev/null)
+    echo "  pass $pass: completed $added"
+done
 
 echo "==> compiling GSettings schemas into the AppDir"
 # Looked up by GIO through GSETTINGS_SCHEMA_DIR at runtime (see AppRun), not
@@ -409,6 +526,59 @@ else
     echo "warning: $schemas_src not found; the AppImage ships no compiled GSettings schemas" >&2
 fi
 
+echo "==> checking every bundled ELF against the glibc floor"
+# **This is the check that already existed and was pointed at the wrong
+# files, and v0.13.2 shipped broken because of it.**
+#
+# `check-glibc-floor.sh` was written after one `log10f@GLIBC_2.43` made
+# v0.10.0's rpm uninstallable, and its own header predicted this exact
+# outcome: "The AppImage had it too, and that one bundles no libc at all, so
+# the format whose whole purpose is running anywhere would have run on Fedora
+# 44 and nothing else." The release workflow then ran it over
+# `target/release/cordial-run` and `target/release/cordial-shell` and nothing
+# else -- so Cordial's own two binaries were held at GLIBC_2.39, and the
+# hundred-odd libraries linuxdeploy copies out of this Fedora 44 container
+# were never looked at.
+#
+# Measured on the shipped v0.13.2 AppImage on 2026-09-13: both Cordial
+# binaries at GLIBC_2.39, and eighteen bundled libraries at GLIBC_2.43 --
+# among them libgtk-4.so.1, libglib-2.0.so.0 and libwebkitgtk-6.0.so.4, which
+# is to say the ones nothing can start without. On any host older than Fedora
+# 44 the loader refuses them all before `main` and the user sees a wall of
+# "version `GLIBC_2.43' not found", one line per library. It reads like
+# missing dependencies. Every dependency is present; they are simply built
+# against a libc the host has not got, and an AppImage cannot bundle the libc
+# that would satisfy them.
+#
+# So the gate runs over the whole AppDir, here rather than only in CI, because
+# this script is also run by hand and a check that only fires in a workflow is
+# a check somebody can ship around.
+mapfile -t appdir_elves < <(
+    find "$appdir" -type f \( -name '*.so' -o -name '*.so.*' -o -perm -u+x \) -print0 \
+        | xargs -0 -r file --mime-type -- \
+        | awk -F': ' '$2 ~ /application\/x-(sharedlib|executable|pie-executable)/ {print $1}'
+)
+if [ "${#appdir_elves[@]}" -eq 0 ]; then
+    echo "check-glibc-floor: found no ELF files in $appdir, which cannot be right" >&2
+    exit 2
+fi
+echo "    ${#appdir_elves[@]} ELF files to check"
+if ! "$repo/packaging/check-glibc-floor.sh" "${appdir_elves[@]}"; then
+    cat >&2 <<'FLOOREOF'
+
+The AppImage was not written.
+
+One or more bundled libraries need a newer glibc than the floor, which means
+this image would fail to start on every host older than the container it was
+built in -- the failure mode v0.13.2 shipped with. The libraries named above
+came out of this build container, so the fix is not in Cordial's own code:
+either build the image on a base whose glibc is at or below the floor, or
+bundle the loader and libc alongside them and exec through it. Do not raise
+CORDIAL_GLIBC_FLOOR to make this pass; that silently drops distributions.
+FLOOREOF
+    exit 1
+fi
+
 echo "==> appimagetool"
 outfile="$outdir/Cordial-${CORDIAL_DESCRIBE}-x86_64.AppImage"
 mkdir -p "$outdir"
@@ -421,19 +591,18 @@ echo
 echo "The shell starts and draws: launched on Fedora 44 (Bluefin, GNOME,"
 echo "Wayland) on 2026-08-27, first-run window titled with CORDIAL_DESCRIBE,"
 echo "profile row and Roblox button, as a wl_surface with the right app id."
+echo "That run was against a Fedora-built AppImage, before ADR-032 moved the"
+echo "base to ubuntu:24.04; not yet repeated against this one."
 echo
-echo "The web view now travels. WebKitGTK 2.52 ignores WEBKIT_EXEC_PATH and"
-echo "reaches its three helper processes, its injected bundle, bwrap and"
-echo "xdg-dbus-proxy through absolute paths baked into libwebkitgtk-6.0.so;"
-echo "all five are bundled here and AppRun binds them over those paths in a"
-echo "mount namespace of its own. Measured 2026-09-02 on a host standing in"
-echo "for one with no WebKitGTK, no bwrap and no xdg-dbus-proxy: both helpers"
-echo "ran out of the image, the sandbox engaged, a page finished loading --"
-echo "and the same image with CORDIAL_APPIMAGE_NO_WRAP=1 gave the reported"
-echo "spawn error verbatim. Not yet measured through cordial-shell's own"
-echo "sign-in view, or on any distribution other than Fedora."
-echo
-echo "If bwrap or unprivileged overlayfs is unavailable, AppRun says so on"
-echo "stderr and carries on unwrapped; the web view then needs the host to"
-echo "have WebKitGTK 6.0 at Fedora's /usr/libexec path, which Debian, Ubuntu"
-echo "and Arch do not use."
+echo "The web view's mount-namespace trick (AppRun binding WebKitGTK's helper"
+echo "processes, injected bundle, bwrap and xdg-dbus-proxy over the absolute"
+echo "paths baked into libwebkitgtk-6.0.so) was measured 2026-09-02 against a"
+echo "Fedora-built copy of that library, whose baked-in path was"
+echo "/usr/libexec/webkitgtk-6.0. Ubuntu 24.04's build of the same library"
+echo "bakes in /usr/lib/x86_64-linux-gnu/webkitgtk-6.0 instead, and AppRun now"
+echo "binds that path too, re-measured 2026-09-13 with a live Wayland display:"
+echo "WebKitNetworkProcess, which failed to spawn at all with only the Fedora"
+echo "binds, now starts. The WebProcess it hands off to aborts on its own"
+echo "straight after, \"Could not create default EGL display: EGL_BAD_PARAMETER\","
+echo "for a reason not yet established. Treat the web view as UNVERIFIED on"
+echo "this AppImage -- the spawn-path defect is fixed, the EGL one is not."

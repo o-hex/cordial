@@ -25,7 +25,7 @@
 //! direction uses. `deeplink.cpp` handles links coming *in*; this is the way
 //! out.
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CString};
 
 extern "C" {
     fn cordial_messagebus_set_request_handler(
@@ -53,23 +53,20 @@ const URL_KEY: &str = "url";
 /// GTK thread and must not take it -- blocking the engine's thread on a GTK
 /// round trip is how the pump gets stalled.
 extern "C" fn on_open_url(request: *const c_char, out: *mut c_char, out_len: usize) -> c_int {
-    if request.is_null() || out.is_null() || out_len == 0 {
-        return 0;
-    }
     // SAFETY: the bus hands over a NUL-terminated string it owns for the
-    // duration of the call.
-    let raw = unsafe { CStr::from_ptr(request) }.to_string_lossy().into_owned();
-    let opened = open_from_request(&raw);
+    // duration of the call, which is exactly `borrow_request`'s contract.
+    let Some(raw) = (unsafe { crate::ffi_util::borrow_request(request) }) else {
+        return 0;
+    };
+    let opened = open_from_request(&raw.to_string_lossy());
 
     let body = if opened { "{\"success\":true}" } else { "{\"success\":false}" };
     let Ok(c) = CString::new(body) else { return 0 };
-    let bytes = c.as_bytes_with_nul();
-    if bytes.len() > out_len {
-        return 0;
+    if crate::ffi_util::write_response(c.as_bytes_with_nul(), out, out_len) {
+        1
+    } else {
+        0
     }
-    // SAFETY: length checked against the caller's buffer immediately above.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, out, bytes.len()) };
-    1
 }
 
 /// Parse the request and open the URL, returning whether it actually opened.

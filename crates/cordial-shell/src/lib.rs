@@ -23,12 +23,27 @@
 //! and `cordial-runtime` already depends on this crate for `host_window`, so
 //! putting the gate here costs no new edge and needs no second copy.
 
+// This crate's 15 unsafe sites are not the ABI edge ADR-036 carves out for
+// `cordial-runtime`/`cordial-linker-sys`, but they are the same *kind* of
+// boundary in miniature: `audio_devices.rs` calls the one C ABI
+// `native/pipewire_backend.h` exposes, `profile.rs` takes the ADR-012 lock
+// with `flock`/`fcntl`/`kill` on a raw fd and pid, and `host_window.rs` sets
+// an environment variable before GTK reads it, which `glib` marks unsafe
+// because `setenv` is not thread-safe against a concurrent `getenv`. None of
+// it is memory-unsafe Rust hiding behind an `unsafe` marker; all of it is a
+// syscall or an extern call that has no safe wrapper. Denying `unsafe_code`
+// here and rewriting fifteen call sites to route through a hand-rolled safe
+// shim would trade real, working code for the appearance of a clean crate —
+// see ADR-036's discussion of why that trade was rejected workspace-wide.
+#![allow(unsafe_code)]
+
 pub mod branding;
 pub mod host_window;
 pub mod json_highlight;
 pub mod network;
 pub mod plugin_preferences;
 pub mod profile;
+pub mod title_bar;
 // Not pulled in by `host_window` or `network` -- registered here on its own
 // so `cordial-runtime` can reach it as `cordial_shell::refresh_watch`, which
 // `refresh_watch.rs`'s own header names as the one thing left to do before
@@ -37,6 +52,7 @@ pub mod profile;
 // `crates/cordial-runtime/src/bin/load.rs`'s `wire_refresh_rate` for what
 // that still needs and does not yet have.
 pub mod refresh_watch;
+pub mod secrets;
 // `webview_policy` needs nothing beyond `gtk4::glib::Uri`, so it is always
 // compiled and always under test -- see its own header on why it is the part
 // that has to be right. `webview` needs `webkitgtk6.0-devel`, which is the

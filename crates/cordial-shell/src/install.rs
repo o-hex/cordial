@@ -217,6 +217,48 @@ impl Origin {
     }
 }
 
+/// Swap in the build a profile has pinned, if it has pinned one.
+///
+/// **Both halves or neither.** A pin that moved only `lib_dir` would run an old
+/// engine against the current build's assets, which is the silent version
+/// mismatch `cordial_update::cache` exists to prevent and which presents as
+/// anything but a version problem. So an entry that does not hold its own
+/// `base.apk` is refused as a pin rather than half-applied -- that is what
+/// `store::Entry::complete` is, and every entry keyed before the archives were
+/// kept beside them is one.
+///
+/// **A missing entry is refused, not silently ignored.** Falling back to the
+/// current build would run the very version the user pinned away from, and say
+/// nothing. The message names the version and says what to do, because the two
+/// ways to get here -- a store pruned past it, or a profile copied to another
+/// machine -- both leave the user looking at a build they did not choose.
+///
+/// Roblox enforces a minimum client version server-side and will refuse an old
+/// build whenever it decides to. Nothing here can prevent that, and the
+/// settings page says so beside the picker rather than letting somebody
+/// conclude Cordial broke.
+pub fn apply_pin(build: Build, profile_dir: &Path) -> Result<Build, NotFound> {
+    let Some(version) = cordial_shell::profile::pinned_version(profile_dir) else {
+        return Ok(build);
+    };
+    let entries = cordial_update::store::list();
+    let Some(entry) = entries.iter().find(|e| e.version == version) else {
+        return Err(NotFound::Unusable(format!(
+            "This profile is pinned to Roblox {version}, and that build is not in Cordial's \
+             store. Open Settings and choose another version, or clear the pin to follow \
+             whichever build is current."
+        )));
+    };
+    let Some(apk) = entry.base_apk() else {
+        return Err(NotFound::Unusable(format!(
+            "This profile is pinned to Roblox {version}, and Cordial kept that build's engine \
+             without the APK it came from -- so its assets are gone and it cannot be run on its \
+             own. Clear the pin, or pin a build Cordial has downloaded since."
+        )));
+    };
+    Ok(Build { apk, lib_dir: entry.dir.clone() })
+}
+
 /// Find a usable build, extracting the engine from the APK if that is what it
 /// takes.
 ///
@@ -226,7 +268,75 @@ impl Origin {
 /// an install — which is a worse trade than a progress bar and a better one
 /// than the two states and a worker thread that a progress bar costs. If that
 /// stops being true, this is the place to move.
+/// Establish that Roblox signed this archive, at most once per build.
+///
+/// **The check belongs here because this is the only place every launch passes
+/// through.** `cordial-update` verifies what it downloads, but the launcher
+/// reaches a build four other ways -- `CORDIAL_APK`, the APK chosen in
+/// Settings, an engine directory beside it, or Sober's package directory -- and
+/// none of those went through the downloader. Nothing in this crate called
+/// [`cordial_update::apk_signature`] at all, so a substituted archive launched
+/// exactly like a genuine one and was then keyed into the same store the
+/// Version page lists. Reported by @kanqz; issue #51.
+///
+/// **Recorded rather than repeated**, because verifying digests the whole
+/// archive and `cordial_update::cache`'s own header argues against paying that
+/// on every launch. The first launch after this lands verifies once, the same
+/// one-off cost an unstamped cache already pays to re-extract; every launch
+/// after reads a fingerprint.
+///
+/// A refusal names which of the two failures happened, because
+/// [`cordial_update::apk_signature::Refusal`] distinguishes "somebody changed
+/// this file" from "this is intact and is not Roblox's", and collapsing them
+/// into one shrug is what that type exists to prevent.
+fn verified_once(apk: &Path, cache: &Path) -> Result<(), NotFound> {
+    let pinned = cordial_update::apk_signature::pinned();
+    if let Some(known) = cordial_update::cache::recorded_signer(cache) {
+        if pinned.iter().any(|p| p.eq_ignore_ascii_case(&known)) {
+            return Ok(());
+        }
+    }
+    match cordial_update::apk_signature::verify_signed_by(apk, &pinned) {
+        Ok(signer) => {
+            // Not fatal if it cannot be written: the cost is verifying again
+            // next launch, which is slow rather than wrong. The same shape as
+            // the version and stamp writes below.
+            if let Err(e) = cordial_update::cache::record_signer(cache, &signer.certificate_sha256) {
+                println!("  shell: verified {} but could not record it: {e}", apk.display());
+            }
+            Ok(())
+        }
+        Err(e) => Err(NotFound::Unusable(format!(
+            "Cordial will not run {}: {e}.\n\nThis is the archive Cordial was pointed at, not \
+             one it downloaded. Clear the APK in Settings to let Cordial find or fetch a build \
+             it can check.",
+            apk.display()
+        ))),
+    }
+}
+
 pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
+    locate_with(configured, verified_once)
+}
+
+/// [`locate`], with the signature check injected.
+///
+/// **The seam exists so the extraction tests remain testable.** They drive real
+/// behaviour worth keeping -- that a new Roblox build at the same path
+/// re-extracts, and that an unchanged one does not -- against archives built by
+/// `apk_holding`, which are plain zips. Gating `locate` unconditionally would
+/// make every one of them unrunnable, and the way out is not to fabricate a
+/// signed archive: `cordial_update::apk_signature`'s own tests explain that one
+/// signed by an invented key exercises the parser and proves nothing about
+/// whether Roblox's real build is accepted.
+///
+/// So tests inject a verifier that accepts, and a separate test drives the real
+/// entry point above to prove an unsigned archive is refused. The same shape as
+/// `browser_account::profile::matching_profile_with`, for the same reason.
+fn locate_with(
+    configured: &RobloxInstall,
+    verify: impl FnOnce(&Path, &Path) -> Result<(), NotFound>,
+) -> Result<Build, NotFound> {
     let Some((apk, _)) = effective_apk(configured) else {
         return Err(NotFound::NoBuild);
     };
@@ -236,6 +346,9 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
             apk.display()
         )));
     }
+    // Before any of the four paths below returns a `Build`, so that none of
+    // them can hand the loader an archive nobody established the origin of.
+    verify(&apk, &engine_cache())?;
 
     // An explicit --lib-dir wins and is not second-guessed: someone who set it
     // has a reason, and quietly extracting over the top of it would hide a
@@ -277,7 +390,35 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
             apk.display()
         );
     } else if cache.join(LIBRARY).is_file() {
+        // Keyed here as well, or an install that is already up to date never
+        // reaches the store: this branch is every launch after the first, and
+        // the extraction below -- the only other place that keys -- runs only
+        // when Roblox changes. A no-op once the cache is a link.
+        let split = apk.parent().map(|d| d.join(format!("split_config.{}.apk", cordial_update::apk::HOST_ABI)));
+        let mut archives: Vec<&Path> = vec![apk.as_path()];
+        if let Some(split) = split.as_deref().filter(|s| s.is_file()) {
+            archives.push(split);
+        }
+        key_into_store(&cordial_update::store::root(), &cache, &archives);
         return Ok(Build { apk, lib_dir: cache });
+    }
+
+    // **Before the extraction, and for the same reason `install::adopt` does
+    // it.** Once the cache path is a symlink into the keyed store, extracting
+    // "into the cache" writes *inside* whichever build is current -- so a Sober
+    // update, whose whole symptom is a stale cache, would overwrite the entry
+    // the user might want to go back to. `adopt_current` files the outgoing
+    // build away first; `detach` then leaves a real, empty directory to
+    // extract into. Both are no-ops on a build whose version was never known,
+    // which is exactly today's behaviour for an APK the user brought.
+    let store_root = cordial_update::store::root();
+    match cordial_update::store::adopt_current(&store_root, &cache) {
+        Ok(Some(kept)) => println!("  shell: kept the previous build as {kept}"),
+        Ok(None) => {}
+        Err(e) => println!("  shell: could not keep the previous build: {e}"),
+    }
+    if let Err(e) = cordial_update::store::detach(&cache) {
+        return Err(NotFound::Unusable(format!("{}: {e}", cache.display())));
     }
 
     match extract_engine(&apk, &cache) {
@@ -307,10 +448,21 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
             // on -- extracted their engine through this path instead, and could
             // not update through the interface at all.
             //
-            // Read from the engine that was just extracted rather than passed
-            // in, so it is the same string, from the same source, that
-            // `adopt` would have recorded.
-            match cordial_update::engine::version_of(&from) {
+            // **The extracted engine, not the archive `from` names.** This
+            // read `from` until 2026-09-13, and `from` is the *APK*:
+            // `extract_engine` returns the candidate it found the library in,
+            // not the library. Scanning the archive finds nothing -- measured
+            // on this host, `split_config.x86_64.apk` gives `None` where the
+            // engine out of it gives `2.738.0.1397`, and
+            // `engine::scan_the_real_build` keeps that as a guard. So the
+            // paragraph below, about a build that can never be updated, was
+            // describing a bug this code still had: every build that came from
+            // Sober or from a user's own APK went unrecorded, and the update
+            // check answered no for ever.
+            //
+            // It is also what the keyed store keys on, so an unrecorded version
+            // now means a build that cannot be kept or rolled back to either.
+            match cordial_update::engine::version_of(&cache.join(LIBRARY)) {
                 Some(version) => {
                     if let Err(e) = cordial_update::cache::record_version(&cache, &version) {
                         println!("  shell: extracted {LIBRARY} but could not record its version: {e}");
@@ -322,9 +474,51 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
                 None => println!("  shell: could not read a version out of the extracted {LIBRARY}"),
             }
             println!("  shell: extracted {LIBRARY} from {} into {}", from.display(), cache.display());
+
+            // And key what was just extracted, by the same route the outgoing
+            // build took above -- it is now a real directory with a version
+            // recorded in it, which is all `adopt_current` needs. `lib_dir`
+            // stays the same path either way; after this it reads through a
+            // link. Pruning protects every profile's pin, which is why it is
+            // asked for here rather than assumed empty.
+            let mut archives: Vec<&Path> = vec![apk.as_path()];
+            if from != apk {
+                archives.push(from.as_path());
+            }
+            key_into_store(&store_root, &cache, &archives);
             Ok(Build { apk, lib_dir: cache })
         }
         Err(e) => Err(NotFound::Unusable(e)),
+    }
+}
+
+/// Move a cache with a recorded version into the keyed store (ADR-033), keep
+/// the archives it came from beside it, and prune.
+///
+/// The archives are the user's own files -- Sober's, usually -- and
+/// hard-linking them costs no disk and takes nothing away from whoever else is
+/// using them. A link cannot be made across a filesystem boundary, and
+/// `store::keep_archives` says so rather than copying 230 MB onto somebody's
+/// launch without asking. Pruning protects every profile's pin.
+fn key_into_store(store_root: &Path, cache: &Path, archives: &[&Path]) {
+    match cordial_update::store::adopt_current(store_root, cache) {
+        Ok(Some(keyed)) => {
+            println!("  shell: kept {} as Roblox {keyed}", cache.display());
+            let entry = store_root.join(&keyed);
+            for trouble in cordial_update::store::keep_archives(&entry, archives) {
+                println!("  shell: {keyed} is kept without its archives: {trouble}");
+            }
+            let dropped = cordial_update::store::prune_in(
+                store_root,
+                cordial_update::store::KEEP,
+                &cordial_shell::profile::all_pinned_versions(),
+            );
+            if !dropped.is_empty() {
+                println!("  shell: removed older builds: {}", dropped.join(", "));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => println!("  shell: could not key {} into the store: {e}", cache.display()),
     }
 }
 
@@ -552,13 +746,13 @@ mod tests {
         std::fs::write(&apk, apk_holding(b"the old engine")).unwrap();
         let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
 
-        let first = locate(&install).unwrap();
+        let first = locate_with(&install, |_, _| Ok(())).unwrap();
         assert_eq!(std::fs::read(first.lib_dir.join(LIBRARY)).unwrap(), b"the old engine");
 
         // A new Roblox build lands at the same path, which is exactly what
         // Sober updating does.
         std::fs::write(&apk, apk_holding(b"the new engine, which is longer")).unwrap();
-        let second = locate(&install).unwrap();
+        let second = locate_with(&install, |_, _| Ok(())).unwrap();
         let got = std::fs::read(second.lib_dir.join(LIBRARY)).unwrap();
 
         match previous {
@@ -587,11 +781,11 @@ mod tests {
         std::fs::write(&apk, apk_holding(b"the engine")).unwrap();
         let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
 
-        let build = locate(&install).unwrap();
+        let build = locate_with(&install, |_, _| Ok(())).unwrap();
         // Something no extraction would ever produce, so its survival is proof
         // the second call did not extract.
         std::fs::write(build.lib_dir.join(LIBRARY), b"left alone").unwrap();
-        let again = locate(&install).unwrap();
+        let again = locate_with(&install, |_, _| Ok(())).unwrap();
         let got = std::fs::read(again.lib_dir.join(LIBRARY)).unwrap();
 
         match previous {
@@ -607,6 +801,41 @@ mod tests {
         std::fs::write(dir.join("base.apk"), b"not really a zip").unwrap();
         let err = extract_engine(&dir.join("base.apk"), &dir.join("cache")).unwrap_err();
         assert!(err.contains("split_config"), "{err}");
+    }
+
+    /// **The regression guard for issue #51**, reported by @kanqz: a build the
+    /// launcher was merely pointed at used to reach the loader without anything
+    /// asking whose signature was on it.
+    ///
+    /// This drives the real entry point rather than the seam, so deleting the
+    /// check in `locate` fails here. It asserts a *refusal*, which is what
+    /// makes it writable at all -- `apk_holding` produces a plain zip with no
+    /// signing block, exactly the shape of a substituted APK, and no genuine
+    /// signed archive is needed to prove that one is turned away.
+    #[test]
+    fn an_unsigned_archive_is_refused_by_the_real_entry_point() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(APK_OVERRIDE);
+        let dir = scratch("unsigned");
+        let cache_home = dir.join("cache");
+        let previous = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", &cache_home);
+
+        let apk = dir.join("base.apk");
+        std::fs::write(&apk, apk_holding(b"an engine nobody signed")).unwrap();
+        let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
+        let refused = locate(&install);
+
+        match previous {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match refused {
+            Err(NotFound::Unusable(msg)) => {
+                assert!(msg.contains("no APK signing block"), "{msg}")
+            }
+            other => panic!("an unsigned archive must not reach the loader, got {other:?}"),
+        }
     }
 
 

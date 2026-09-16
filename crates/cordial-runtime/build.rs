@@ -4,6 +4,16 @@
 //! bootstrap enumeration (see docs/framework-api-inventory.md §6). Each symbol
 //! needs its *own* address so a stub hit identifies which symbol was called —
 //! hence generated code rather than one shared stub.
+//!
+//! **This file is no longer what decides whether a symbol resolves.** It used
+//! to be: `symtab::build` iterated exactly the array generated here, so a name
+//! absent from the TSV was never classified, never registered, and the load
+//! failed at `DT_NEEDED`. `hypotf` and then `getpwuid_r` each stopped the
+//! client that way, and each was an ordinary C function the host had all
+//! along. `symtab::build` now reads the engine's imports from the ELF and
+//! resolves the union; what this generates is the stub set, and the individual
+//! addresses that let a hit name its symbol. See
+//! `docs/adr/ADR-034-symbol-resolution-asks-the-library.md`.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;

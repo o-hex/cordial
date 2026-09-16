@@ -1148,6 +1148,7 @@ uint32_t active_capture_streams() { return g_open_capture_streams.load(); }
 struct CaptureStream::Impl {
     pw_stream* stream = nullptr;
     uint32_t bytes_per_frame = 0;
+    std::atomic<bool> failed{false};
 
     mutable std::mutex mutex;
     // A plain byte queue rather than a borrowed-pointer list like the
@@ -1161,8 +1162,10 @@ struct CaptureStream::Impl {
 
     static void on_process(void* data) { static_cast<Impl*>(data)->process(); }
 
-    static void on_state_changed(void*, pw_stream_state, pw_stream_state state, const char* error) {
+    static void on_state_changed(void* data, pw_stream_state, pw_stream_state state,
+                                 const char* error) {
         if (state == PW_STREAM_STATE_ERROR) {
+            static_cast<Impl*>(data)->failed.store(true, std::memory_order_release);
             std::fprintf(stderr,
                 "E/Cordial-OpenSLES         PipeWire capture stream entered the error state "
                 "(%s); recording will deliver no samples.\n", error ? error : "no reason given");
@@ -1213,6 +1216,7 @@ CaptureStream::~CaptureStream() {
 
 bool CaptureStream::open(uint32_t rate_hz, uint32_t channels, const std::string& target_node_name) {
     if (impl_->stream) return true;
+    impl_->failed.store(false, std::memory_order_release);
 
     // Cordial has three independent owners of a `CaptureStream`:
     // `AudioRecord` and `WebRtcAudioRecord` in `audio_classes.cpp`, and
@@ -1374,6 +1378,10 @@ void CaptureStream::close() {
 }
 
 bool CaptureStream::is_open() const { return impl_ && impl_->stream != nullptr; }
+
+bool CaptureStream::failed() const {
+    return impl_ && impl_->failed.load(std::memory_order_acquire);
+}
 
 uint32_t CaptureStream::read(void* dst, uint32_t size) {
     if (!impl_ || !dst || size == 0) return 0;
@@ -1655,6 +1663,7 @@ CaptureStream::~CaptureStream() {}
 bool CaptureStream::open(uint32_t, uint32_t, const std::string&) { return false; }
 void CaptureStream::close() {}
 bool CaptureStream::is_open() const { return false; }
+bool CaptureStream::failed() const { return false; }
 uint32_t CaptureStream::read(void*, uint32_t) { return 0; }
 uint64_t CaptureStream::dropped_bytes() const { return 0; }
 

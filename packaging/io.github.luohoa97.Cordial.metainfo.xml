@@ -36,7 +36,7 @@
       yourself.
     </p>
     <p>
-      It is early. Signing in, loading an experience and playing it with keyboard
+      It is experimental. Signing in, loading an experience and playing it with keyboard
       and mouse all work, text fields draw what you type, and sound plays. Voice
       chat does not, and on roughly one launch in three a signed-in client
       reaches the home screen and freezes; reopening usually works. Install it
@@ -78,6 +78,112 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.16.0" date="2026-09-15">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.16.0</url>
+      <description>
+        <p>
+          Launching twice in a row works. The crash that killed every launch
+          after the first until you cleared the cache was a race between
+          Cordial's startup and the engine's, not a corrupt cache, and Cordial
+          now waits for the engine to be given its flags before going on.
+        </p>
+        <p>
+          The camera no longer throws you a half-turn on X11, Join in a game's
+          Servers list opens the server instead of doing nothing, and entering
+          fullscreen rebuilds the display chain once rather than once per
+          animation step.
+        </p>
+      </description>
+    </release>
+    <release version="0.15.1" date="2026-09-15">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.15.1</url>
+      <description>
+        <p>
+          A Roblox build Cordial was merely pointed at — through the Settings
+          picker, CORDIAL_APK, or Sober's package directory — is now checked
+          against Roblox's signing certificate before it is used, the way a
+          build Cordial downloaded itself always was.
+        </p>
+        <p>
+          The apt, dnf and pacman repositories now publish from a tagged
+          release rather than from every commit to main, and every binary
+          carries its version, its licence and the project URL.
+        </p>
+      </description>
+    </release>
+    <release version="0.15.0" date="2026-09-15">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.15.0</url>
+      <description>
+        <p>
+          Voice chat reaches the network: the permission answer is delivered
+          both ways the engine expects, and the microphone is captured through
+          callbacks. Audible speech was confirmed before the last round of
+          hardening, not on these exact bytes, so treat it as new.
+        </p>
+        <p>
+          Clicking Play in a browser now launches the saved profile for that
+          browser account without showing the picker, and the game window's
+          title bar can be hidden for tiling window managers.
+        </p>
+      </description>
+    </release>
+    <release version="0.14.2" date="2026-09-13">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.14.2</url>
+      <description>
+        <p>
+          The Version page in Settings lists older Roblox builds the mirror has
+          and can download one. Each is checked against Roblox's signature, and
+          downloading one makes it that profile's build.
+        </p>
+        <p>
+          Roblox can now ask for the microphone. Voice chat still does not work;
+          the release notes say why.
+        </p>
+      </description>
+    </release>
+    <release version="0.14.1" date="2026-09-13">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.14.1</url>
+      <description>
+        <p>
+          Closing the game window no longer ends on the crash page. The client
+          was segfaulting on the way out, and now exits cleanly.
+        </p>
+        <p>
+          Cordial keeps the current Roblox build and the two before it, and
+          Settings has a Version page for going back to one. Roblox refuses old
+          clients eventually, so a pinned build will stop working one day.
+        </p>
+        <p>
+          A resize glitch and the TaskScheduler crash on a second launch are
+          reported and not yet reproduced. Both are described in the release
+          notes.
+        </p>
+      </description>
+    </release>
+    <release version="0.14.0" date="2026-09-13">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.14.0</url>
+      <description>
+        <p>
+          The AppImage runs on something other than the machine that built it.
+          It was built on Fedora 44 and eighteen of its bundled libraries came
+          out stamped for a glibc four minor versions above the floor Cordial
+          claims, so the one format whose whole promise is portability ran on
+          the one distribution that did not need it. The build base is now
+          Ubuntu 24.04, and none of the 149 bundled libraries is above the
+          floor.
+        </p>
+        <p>
+          Cordial also no longer fails to start on the newest Roblox build,
+          which began importing a C library function the generated symbol table
+          did not carry.
+        </p>
+        <p>
+          The web view still does not work inside the AppImage, and the window
+          still does not appear at all on Wayland compositors other than
+          Mutter. Both are described in the release notes.
+        </p>
+      </description>
+    </release>
     <release version="0.13.2" date="2026-09-03">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.13.2</url>
       <description>

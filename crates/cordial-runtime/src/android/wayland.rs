@@ -1245,6 +1245,13 @@ struct PolledTextBoxInfo {
     /// Which focused box this is about. A new generation resets everything;
     /// handles are reused, generations are not.
     generation: u32,
+    /// `textbox_property_generation()` as of the last ask. A change here
+    /// means `onLuaTextBoxPropertyChangedCallback` fired since — the box
+    /// restyled or resized without losing focus, so `generation` alone would
+    /// not catch it — and is treated the same as a new box for the purpose
+    /// of skipping the rate limit below, without touching `generation`
+    /// itself, which is `android::input`'s signal to reseed the edit buffer.
+    property_generation: u32,
     /// When the engine was last asked, so the rate limit has something to
     /// measure against.
     asked: std::time::Instant,
@@ -2424,19 +2431,24 @@ impl WaylandWindow {
         }
         let mut state = self.polled_textbox_info.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
+        let property_generation = cordial_linker_sys::game_activity::textbox_property_generation();
         match state.as_ref() {
-            // Same box, asked recently enough: reuse whatever the last poll
-            // established rather than asking again.
-            Some(p) if p.generation == generation => {
+            // Same box, no property change since, asked recently enough:
+            // reuse whatever the last poll established rather than asking
+            // again.
+            Some(p) if p.generation == generation && p.property_generation == property_generation => {
                 if now.duration_since(p.asked) < POLL_INTERVAL {
                     return p.usable;
                 }
             }
-            // A different box, or the first one. Nothing carries over --
+            // A different box, the first one, or the same box with a property
+            // change pending. Nothing carries over in the first two cases --
             // reusing another box's numbers is the thing `android_classes.cpp`
-            // refuses by design.
+            // refuses by design -- and the third deliberately forces the ask
+            // below rather than waiting out the rest of the interval, which
+            // is the whole reason `property_generation` is tracked at all.
             _ => {
-                *state = Some(PolledTextBoxInfo { generation, asked: now, usable: None });
+                *state = Some(PolledTextBoxInfo { generation, property_generation, asked: now, usable: None });
             }
         }
         let carried = state.as_ref().and_then(|p| p.usable);
@@ -2459,7 +2471,7 @@ impl WaylandWindow {
                 carried
             }
         };
-        *state = Some(PolledTextBoxInfo { generation, asked: now, usable: answer });
+        *state = Some(PolledTextBoxInfo { generation, property_generation, asked: now, usable: answer });
         answer
     }
 

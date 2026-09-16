@@ -202,6 +202,17 @@ bool g_textbox_last_built_known = false;
 /// editing" from "new box, reseed the buffer" without comparing handles — a
 /// handle can be reused after a box is destroyed.
 std::atomic<unsigned> g_textbox_generation{0};
+/// Bumped by `onLuaTextBoxPropertyChangedCallback`, and *not* the same
+/// counter as `g_textbox_generation` above. That one means "a different box
+/// has focus, reseed the edit buffer"; a restyle or resize of the box that is
+/// still focused is not a focus change, and folding the two together would
+/// make `android::input`'s reseed logic treat every property change as a new
+/// box to type into, discarding whatever the user had queued. This counter
+/// exists only so `WaylandWindow::polled_textbox_info`
+/// (crates/cordial-runtime/src/android/wayland.rs) can tell "the geometry
+/// this box last reported may be stale" from "nothing has happened", and skip
+/// its own poll interval when it has.
+std::atomic<unsigned> g_textbox_property_generation{0};
 
 /// Every slot, named where a name has been earned and numbered where it has
 /// not. `textColor` is printed in hex because that is the form in which it
@@ -295,6 +306,23 @@ extern "C" long long cordial_textbox_handle() {
 
 extern "C" unsigned cordial_textbox_generation() {
     return g_textbox_generation.load(std::memory_order_acquire);
+}
+
+extern "C" unsigned cordial_textbox_property_generation() {
+    return g_textbox_property_generation.load(std::memory_order_acquire);
+}
+
+/// Called from `onLuaTextBoxPropertyChangedCallback` below. Bumps the
+/// counter and nothing else: whatever thread this arrives on (see that
+/// callback's own comment) gets no GTK call, no re-read of the box's
+/// geometry, and no lock beyond the atomic itself. The actual re-read
+/// happens on Cordial's own pump, the next time it looks.
+extern "C" void cordial_textbox_property_changed() {
+    if (getenv("CORDIAL_TRACE_TEXT")) {
+        fprintf(stderr, "[cordial] textbox property changed, generation now %u\n",
+                g_textbox_property_generation.load(std::memory_order_relaxed) + 1);
+    }
+    g_textbox_property_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 /// How many times the engine has said a place finished loading, and which one.
@@ -831,12 +859,41 @@ public:
     //     Constructed Unresolved symbol ... `onLuaTextBoxChangedCallback`, `(Ljava/lang/String;)V`
     //     Constructed Unresolved symbol ... `onLuaTextBoxPropertyChangedCallback`, `()V`
     //
-    // Nothing on a desktop needs to react to either — there is no IME view to
-    // reposition — so these are no-ops. They exist because *resolving* is the
-    // point: an unresolved call is a different thing from a call that did
-    // nothing, and only the second one is safe.
+    // docs/NEXT.md §"Why the text is invisible while you type" explains what
+    // each is *for*: Android draws the box's own text with a real
+    // `EditText`-equivalent widget rather than letting the engine paint it,
+    // and both callbacks exist to keep that widget in sync — one with the
+    // text, one with everything else (`NativeTextBoxInfo`'s geometry and
+    // style fields). Cordial is now that widget too (`host_window.rs`'s text
+    // overlay), which is why the property callback stopped being a pure
+    // no-op: a box that resizes or restyles mid-edit previously only refreshed
+    // on `WaylandWindow::polled_textbox_info`'s 100ms poll.
+    //
+    // `onLuaTextBoxChangedCallback(String)` stays a no-op deliberately.
+    // Writing engine-pushed text into a GTK `TextBuffer` the user may be
+    // actively typing into needs to guard against the widget's own
+    // `connect_editor_changed` echoing it straight back as a keystroke, decide
+    // whose edit wins when the two disagree, and preserve the caret and
+    // selection through the write — none of which exists yet. See
+    // `host_window.rs`'s note on `connect_editor_changed` for why a careless
+    // write there is worse than the stale text this leaves in place.
     static void onLuaTextBoxChangedCallback(ENV*, Class*, std::shared_ptr<String>) {}
-    static void onLuaTextBoxPropertyChangedCallback(ENV*, Class*) {}
+    // Does not arrive on Cordial's GTK main loop, or even on the engine's
+    // main thread -- confirmed 2026-09-16 by logging `gettid()` and the
+    // calling thread's `pthread_getname_np` name under `CORDIAL_TRACE_TEXT=1`
+    // while cycling fullscreen with a Create Account username field focused
+    // (a resize is what the box's own responsive layout reacts to). Both
+    // firings printed the same tid, named `RBX Worker A` -- one of the
+    // engine's own job-system pool threads, not `Main` and not anything
+    // Cordial spawns. That is exactly why this only bumps an atomic rather
+    // than re-reading geometry or touching GTK here:
+    // `cordial_textbox_property_changed` does no engine work and takes no
+    // lock beyond the counter itself, and the actual re-read happens later,
+    // on Cordial's own pump, which is the only thread anything here may
+    // safely call into GTK from.
+    static void onLuaTextBoxPropertyChangedCallback(ENV*, Class*) {
+        cordial_textbox_property_changed();
+    }
     static void listenToMotionEvents(ENV*, Class*, std::shared_ptr<String>) {}
     static void screenOrientationChanged(ENV*, Class*, jint) {}
 

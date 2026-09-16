@@ -76,6 +76,64 @@ without an account can settle any of it, and no automated agent should try.
 separate IP. Enforcement is automated, runs in waves, and associates accounts
 sharing an address. The risk is collateral rather than causal.
 
+- **Does VR work inside a joined place?** This is the one VR question left, and
+  it is here because it needs a signed-in client in an experience. Everything
+  reachable signed out has been measured — see below.
+
+## VR: five routes measured, all negative, one gap left (2026-09-16)
+
+Worth reading before anyone spends a week on it. `docs/analysis/vr-reachability.md`
+is the full record; this is the shape of it.
+
+The engine has VR compiled in — `VRService` reflection with getters and setters,
+per-eye camera log strings, an exported input surface — but **nothing constructs
+a VR device**, and that is the whole wall. Measured and negative: served VR
+FastFlags; a real OpenXR runtime present and discoverable; the unpublished
+binary-string names (`DebugEnableVREmulator`, `IsVRAppBuild` and friends) through
+`flags.json` under `FFlag`/`DFFlag`/`SFFlag`/bare; the `nativeInitClientSettings`
+overrides channel; and calling the exported VR natives directly, where
+`enableVRVirtualInput(true)` returns cleanly and the getter still reads false.
+
+The fourth is the one to trust, because it carried its own positive control:
+argument two of `nativeInitClientSettings` is the overrides document, and pushing
+`{"DFLogHttpTraceLight":"7"}` through it moved the engine's own trace count from
+0 to 47 in the same session. The same channel, same shape, did nothing for VR.
+
+The only demonstrated way to construct a device is writing a byte at a hardcoded
+per-build address, which [ADR-001](adr/ADR-001-in-process-hooking.md) and
+[ADR-003](adr/ADR-003-plugin-isolation.md) make *absent, not disabled*. It would
+also break on every Roblox update.
+
+What does work and is reusable: Cordial's OpenXR path was proven end to end
+against Monado's simulated headset — `XR_KHR_vulkan_enable2`, device creation
+through `xrCreateVulkanDeviceKHR`, stereo swapchains, a `STAGE` reference space
+for room-scale, real per-eye disparity in a captured frame, plus emulated hand
+tracking and scripted poses over Monado's `remote` driver. The integration cost
+is known rather than guessed: `libroblox.so` creates its own Vulkan device and
+`android/vulkan.rs` only interposes, so OpenXR owning creation means reversing
+that layer and filtering `vkEnumeratePhysicalDevices`, which is not intercepted
+at all today.
+
+## The release channel split, and why it does nothing yet
+
+Every push to main redeploys the GitHub Pages site, and that site carries the
+OSTree Flatpak repo — so an installed release used to drift with main on every
+`flatpak update`. That was the bug behind "releases keep updating to a new
+commit".
+
+There are now two refs. `master` keeps moving, as before. `stable` is written
+only by a commit that carries a `v*` tag. Both publish from the same
+main-triggered deploy, because the `github-pages` environment has a deployment
+branch policy naming `main` and nothing else — a tagged deploy is refused by the
+environment regardless of what the workflow says, and v0.6.0 is the run that
+showed it. Do not "fix" this by gating the deploy on tags.
+
+**`stable` does not exist until a tagged release runs through it**, and until
+then the published summary carries `master` only with no default-branch key —
+which is correct, because pointing a default at a missing ref would break every
+install rather than just new ones. Existing users stay on `master` until they
+migrate by hand; the command is in `docs/install.md`.
+
 ## Per-profile network egress (ADR-016), and what is still missing
 
 A profile's `network.json` can now say `"mode": "vpn-required"`, which refuses
@@ -944,6 +1002,39 @@ developer's session, and it does not currently work. That is why
 `wlr-virtual-keyboard`, the RemoteDesktop portal — all land on whatever has
 focus, which is the developer's session. This has hijacked a developer's cursor
 once already, mid-session.
+
+**`CORDIAL_TRACE_PATHS=1` does not trace `dlopen`.** It wraps nine filesystem
+calls — `stat`, `lstat`, `access`, `opendir`, `realpath`, `readlink`, `fopen`,
+`open`, `statvfs` — and nothing else. A VR investigation used its silence as
+proof the engine never tried to open a VR runtime library; it was never capable
+of showing that either way. Retracted in `docs/analysis/vr-reachability.md`.
+
+**A background task's reported exit code is not the build's exit code.** Three
+times in one day a task reported success while the captured `BUILD_EXIT` was
+101. Capture the exit status into the log and read it from there.
+
+**A subagent's pasted build output is not proof it built.** One reported success
+with real pasted output that was a cached replay from before it created a file
+it then forgot to declare; `cordial-runtime` did not compile at all. The check
+that works is `grep "Compiling <crate>"` in the log — a `Finished` line with no
+`Compiling` line above it is not a build.
+
+**One whole class of error, which is most of the above.** On 2026-09-16 seven
+conclusions were reached and retracted in a day, and every one was the same
+shape: *an instrument that could not distinguish two states, reported as a
+finding.* `grep -iE "quest"` matching `Request`. A grep run against `main` when
+the work was on another branch, read as "nothing there". `df` straight after
+`rm -rf` on btrfs with `discard=async`, which reclaims lazily. `grep -c` exiting
+1 on zero matches and killing an `&&` chain before its later steps ran. `head -4`
+on a Python traceback, cutting off the exception. **Before believing a negative,
+ask what that instrument prints when the answer is yes.**
+
+**Two test failures are not regressions.**
+`android::accessibility::tests::connecting_registers_a_root_object_a_real_at_spi_client_can_read`
+needs a real AT-SPI bus and fails in any container without one.
+`secrets::tests::a_plaintext_store_is_adopted_and_destroyed` waits five seconds
+on gnome-keyring and times out under parallel load; it passes alone in 0.09 s.
+Re-run before believing that one.
 
 ## Layout
 

@@ -12,7 +12,7 @@
 namespace cordial::audio {
 namespace {
 
-thread_local const InputCallbackDriver* g_current_driver = nullptr;
+alignas(64) thread_local const InputCallbackDriver* g_current_driver = nullptr;
 
 } // namespace
 

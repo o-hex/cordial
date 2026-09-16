@@ -1496,7 +1496,7 @@ impl HostWindow {
                         }
                         return;
                     }
-                    LockedMotion::Real(_) => {
+                    LockedMotion::Real(..) => {
                         // Either the ordinary case (no warp outstanding) or
                         // `MAX_WARP_ECHO_WAIT` was reached, in which case the
                         // wait is abandoned here rather than left stuck at

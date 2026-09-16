@@ -2,7 +2,10 @@
   <img src="https://raw.githubusercontent.com/luohoa97/cordial/main/packaging/banner.svg" alt="Cordial" width="460">
 </p>
 
-# Open-source Roblox for Linux — run it natively, extend it yourself
+# Cordial
+
+Runs Roblox's official Android x86-64 build natively on Linux, with no emulator,
+container or virtual machine. GPL-3.0-or-later.
 
 <p align="center">
   <a href="https://discord.gg/qJzU3Xfr9b">
@@ -11,27 +14,90 @@
   </a>
 </p>
 
-<p align="center">
-  <strong><a href="https://discord.gg/qJzU3Xfr9b">Come and talk to us on Discord</a></strong> for help getting
-  it running and what is being worked on. Bugs and feature requests go on
-  <a href="https://github.com/luohoa97/cordial/issues/new/choose">GitHub</a>, not in chat, so they don't get lost.
-</p>
+## Demo
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-doors.gif"
-       alt="Roblox DOORS running under Cordial on Linux: first-person corridor, candle in hand"
+       alt="Roblox DOORS running under Cordial on Linux"
        width="560">
 </p>
 
-<p align="center">
-  <em>Roblox <strong>DOORS</strong>, unmodified, on Cordial — Fedora, GNOME, no Android device involved.<br>
-  <a href="https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-doors.mp4">This clip at full size</a>,
-  and more in <a href="docs/media">docs/media</a> — including an hour of Rivals cut down to its eliminations.</em>
-</p>
+Roblox **DOORS**, unmodified, on Cordial.
+[Full size](https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-doors.mp4),
+more in [`docs/media`](docs/media).
 
-*A hobby project, not a commercial one. Please don't DMCA it.*
+## Why Cordial
 
-## Get it running
+I used Sober for a year, and it worked really well. Cordial started off as a weekend project because I was bored, and I believe a project like this is something people have the right to read, modify, and learn from.
+
+Credit to sober for making android Roblox runtimes possible
+
+## Status
+
+Experimental. Full table in [`docs/status.md`](docs/status.md).
+
+**Works:** loading an experience, sign-in, keyboard and mouse, camera, text
+entry with IME preedit, audio, voice chat, pointer capture, fullscreen, two
+accounts side by side, asset overlays.
+
+**Known broken**, with issue numbers:
+
+| | |
+|---|---|
+| No window at all on COSMIC, KWin, wlroots compositors | [#38](https://github.com/luohoa97/cordial/issues/38) |
+| Crash after second launch | [#44](https://github.com/luohoa97/cordial/issues/44) |
+| Fullscreen freezes; exiting it crashes | [#39](https://github.com/luohoa97/cordial/issues/39) |
+| Touchscreen input crashes immediately | [#36](https://github.com/luohoa97/cordial/issues/36) |
+| SIGSEGV on launch on some machines | [#35](https://github.com/luohoa97/cordial/issues/35) |
+| Join does nothing in a game's Servers list | [#40](https://github.com/luohoa97/cordial/issues/40) |
+| Client can hang on exit | [#52](https://github.com/luohoa97/cordial/issues/52) |
+| Pointer lock unconfirmed on Hyprland, cursor drifts | [#56](https://github.com/luohoa97/cordial/issues/56) |
+| Keyboard stops after another app takes focus | [#31](https://github.com/luohoa97/cordial/issues/31) |
+| Camera-sensitivity text box glitches the client | [#53](https://github.com/luohoa97/cordial/issues/53) |
+| X11 camera snaps 180 degrees | [#41](https://github.com/luohoa97/cordial/issues/41) |
+
+Controller buttons and sticks work; the brand of glyph Roblox draws may be
+wrong ([`docs/controllers.md`](docs/controllers.md)). No force feedback.
+
+Frame-rate numbers are not quoted here because the two measurements in this
+repo contradict each other; see [`docs/status.md`](docs/status.md).
+
+**Tested platforms.** Development happens on Fedora with GNOME and Mesa. There
+is no systematic test matrix — other compositors and GPU vendors are reported
+working or broken through issues, not verified here.
+
+<!-- TODO(neil): a supported-platforms table needs a real test pass first. Nothing in the repo supports one today. -->
+
+## How it works
+
+Cordial mmaps and relocates Roblox's unmodified `libroblox.so` with a ported
+AOSP bionic linker rather than the system one. Every symbol the engine imports
+resolves as **cordial** (an Android behaviour implemented here), **host**
+(forwarded to glibc), or **stub** — and a stub reports failure rather than
+faking success, so a gap stays visible instead of surfacing later as an
+unrelated bug. `libjnivm` stands in for Android's ART, and a framework layer
+answers the JNI calls the client makes into the platform. Symbol resolution
+reads the engine's own ELF imports rather than a checked-in list, so an
+ordinary libc import resolves from the host automatically
+([`docs/adr/ADR-034-symbol-resolution-asks-the-library.md`](docs/adr/ADR-034-symbol-resolution-asks-the-library.md)).
+Compatibility gaps are fixed at that framework layer, never by patching the
+binary ([`docs/adr/ADR-001-in-process-hooking.md`](docs/adr/ADR-001-in-process-hooking.md)).
+
+Diagram and data flow: [`docs/architecture.md`](docs/architecture.md).
+
+## Install
+
+x86-64 Linux, Wayland. X11 starts through Flatpak's fallback socket but is not
+developed further
+([`docs/adr/ADR-011-wayland-and-libadwaita.md`](docs/adr/ADR-011-wayland-and-libadwaita.md)).
+
+You also need Roblox's Android build. Cordial does not ship it. First run has a
+**Download Roblox** button that fetches it from APKPure and refuses anything
+not signed by Roblox's own certificate. If [Sober](https://sober.vinegarhq.org/)
+is installed, Cordial uses the APK already on disk without copying or modifying
+it. You can also point Cordial at your own APK in Settings.
+
+**Flatpak:**
 
 ```bash
 flatpak remote-add --if-not-exists cordial https://luohoa97.github.io/cordial/cordial.flatpakrepo
@@ -39,181 +105,41 @@ flatpak install cordial io.github.luohoa97.Cordial
 flatpak run io.github.luohoa97.Cordial
 ```
 
-Or take the AppImage from [the releases
-page](https://github.com/luohoa97/cordial/releases), which installs nothing and
-runs anywhere: `chmod +x Cordial-x86_64.AppImage && ./Cordial-x86_64.AppImage`.
-[Install](#install) compares the two and says what is less proven about the
-newer one.
+The remote is not signed: `flatpak install` proves the download matches the
+repository's checksums, not who built it
+([`docs/install.md`](docs/install.md#trust-and-what-not-signed-means)).
 
-**You also need Roblox's Android build, which Cordial does not ship and never
-will.** First run has one button — **Download Roblox** — and that is the whole
-procedure. Cordial fetches the build from APKPure, a third-party mirror, and
-**refuses to install anything that is not signed by Roblox's own signing
-certificate**, so a mirror that alters a byte is caught rather than trusted. It
-waits for your press before downloading, since this is a few hundred megabytes
-and somebody may be paying for it by the megabyte.
-
-You never have to press it if a build is already on the machine:
-
-- **Already have [Sober](https://sober.vinegarhq.org/)?** Then there is nothing
-  to press. Cordial finds the APK Sober downloaded and uses it where it lies —
-  no copy, no modification, and Sober keeps working.
-- **Supply your own APK** and point Cordial at it in Settings, or see
-  [What you need](docs/install.md#what-you-need). It gets the same signature check.
-
-Three things worth knowing before you type that, rather than after: **the
-remote is not signed**, so `flatpak install` proves the download matches the
-repository's checksums and nothing about who built it — the
-[full explanation](docs/install.md#trust-and-what-not-signed-means) is in
-`docs/install.md` and you should read it. **That command tracks releases, not
-every commit** — see [Flatpak vs AppImage](docs/install.md#flatpak-vs-appimage)
-if you installed before this line existed and want to move off `master`. And
-Cordial is experimental: sign-in, gameplay, mouse and keyboard, text entry and
-audio all work; the [status page](docs/status.md) says exactly what does not.
-
-Cordial loads Roblox's official Android x86-64 engine directly on Linux through a
-purpose-built runtime: the AOSP bionic linker, a bionic/glibc shim, a JNI VM in
-place of Android's, and a framework layer that answers the client's calls. No
-emulator, no container, no virtual machine. It talks to your GPU through Vulkan
-or GLES2 the way any native application does.
-
-**It is also, as far as we know, the first user-extensible Roblox client** — not
-in the sense of replacing files or setting flags, which other launchers already
-do, but in the sense that *you can write code that runs as part of the client*.
-Plugins are ordinary programs in their own processes with named capabilities
-rather than access, and Cordial's own default features are built as plugins too,
-so the API has to be good enough for them. Browser extensions only reach
-Roblox's **website**, launcher mods replace **assets**, and FastFlag managers
-change **settings Roblox already reads** — none load user-written code into the
-client itself; if one already does, we would genuinely like to know.
-
-What this is **not** is a way to modify Roblox itself. There is no script
-execution, no hooking, and no memory access — absent from the API rather than
-disabled. Plugins extend *Cordial*.
-
-## Get started
-
-- [Join the Discord 💬](https://discord.gg/qJzU3Xfr9b)
-- [Read the documentation 📖](docs)
-- [Start here — what works and what is blocking 🧭](docs/NEXT.md)
-- [Install it 🔽](#install)
-- [How it actually works 🔬](docs/findings.md)
-- [Why there is no script execution, ever 🔒](docs/adr/ADR-001-in-process-hooking.md)
-- [Report a bug or suggest a feature 🐛](https://github.com/luohoa97/cordial/issues/new/choose)
-- [Contribute 🛠️](CONTRIBUTING.md)
-
-**New here?** Read the warning below first, then
-[`docs/NEXT.md`](docs/NEXT.md) — it is written for someone picking the project
-up cold and says plainly what is broken and what has already been ruled out.
-
-## Reporting a problem
-
-[GitHub Issues](https://github.com/luohoa97/cordial/issues/new/choose) is
-where a bug, a broken Roblox feature, a failed update, a feature suggestion,
-or a finding goes — not Discord, which is faster for a quick question but does
-not get triaged and is not searchable later. Blank issues are off; pick the
-template that matches and it asks for the right things — see
-[`.github/SUPPORT.md`](.github/SUPPORT.md) for the full list. Security issues
-go through [a private advisory](https://github.com/luohoa97/cordial/security/advisories/new)
-instead of a public one; see [`SECURITY.md`](SECURITY.md).
-
-**Every template requires a Diagnostics block.** Get it from
-**Settings → Report a Problem**, which has a copy button, or from a terminal:
+There are two branches. `master` rebuilds on every commit. `stable` moves only
+on a tagged release — it is created by the first tagged build to run through
+the release workflow, so until then a plain `flatpak install` lands on
+`master`. Once `stable` exists:
 
 ```bash
-cordial --diagnostics                                   # .deb / .rpm / Arch
-flatpak run io.github.luohoa97.Cordial --diagnostics    # Flatpak
-./Cordial-*.AppImage --diagnostics                      # AppImage
+flatpak uninstall io.github.luohoa97.Cordial//master
+flatpak install cordial io.github.luohoa97.Cordial//stable
 ```
 
-It carries the Cordial and Roblox build, `uname -a`, your distribution and
-package format — the things a report here is usually missing. **It does not
-carry your account, any token, your profile name, or any path under your home
-directory**, though it does carry your machine's hostname, shown on screen
-before it is copied so you can edit it out.
-
-> ### ⚠️ Read this before using an account you care about
->
-> **This is NOT an official Roblox client**, and it is not endorsed or sponsored
-> by Roblox Corporation, which has not approved this project and has not been
-> asked to. Roblox does not support third-party clients and operates automated
-> systems that ban accounts for using them, up to permanent termination —
-> including false positives against innocent players, in waves, associating
-> accounts that share an IP address.
->
-> Cordial does not modify the Roblox client or exploit it — no script executor,
-> no hooking, no memory access to the Roblox process, absent from the API
-> rather than disabled ([ADR-001](docs/adr/ADR-001-in-process-hooking.md),
-> [ADR-003](docs/adr/ADR-003-plugin-isolation.md)) — but it necessarily presents
-> a synthesised Android environment, and a heuristic detector does not owe you
-> that distinction. Alternate accounts are not a shield.
->
-> **If your account matters to you, do not use it here.** If you use Cordial and
-> get banned, that is on you, and the maintainers cannot get it reversed. See
-> [CONTRIBUTING.md](CONTRIBUTING.md) for testing with a throwaway account on its
-> own IP.
-
-## Status: experimental, but playable
-
-The full feature table, what changed recently in this fork, and three of the
-harder bugs it took to get here — the content store, the keyboard, and running
-two accounts at once — are in [`docs/status.md`](docs/status.md). Read it
-before installing.
-
-## Install
-
-> Cordial is experimental. [`docs/status.md`](docs/status.md) says what works
-> today — read it before installing.
-
-**x86-64 Linux, Wayland.** X11 still starts via Flatpak's fallback socket but
-is not developed further ([ADR-011](docs/adr/ADR-011-wayland-and-libadwaita.md)).
-You also need Roblox's Android build, which the **Download Roblox** button on
-first run fetches for you — see [`docs/install.md`](docs/install.md) for the
-Sober and custom-APK routes.
-
-**Flatpak**, sandboxed and self-updating — pick this unless you have a reason
-not to. This tracks releases; see
-[`docs/install.md`](docs/install.md#flatpak-vs-appimage) to move off `master`
-if you installed before that was true:
-
-```bash
-flatpak remote-add --if-not-exists cordial \
-    https://luohoa97.github.io/cordial/cordial.flatpakrepo
-flatpak install cordial io.github.luohoa97.Cordial
-flatpak run io.github.luohoa97.Cordial
-```
-
-**AppImage**, one file, no install, updates manually — newer and less proven,
-see [`docs/install.md`](docs/install.md#appimage):
+**AppImage**, from the [releases page](https://github.com/luohoa97/cordial/releases).
+Newer and less proven than the Flatpak; its web-view path fix has been measured
+on a stand-in, not on a real machine without WebKitGTK, and not outside Fedora
+([`docs/install.md`](docs/install.md#appimage)):
 
 ```bash
 chmod +x Cordial-x86_64.AppImage && ./Cordial-x86_64.AppImage
 ```
 
-**APT** (Debian/Ubuntu):
+**Packages** from the releases page. All artefacts are cosign-signed. The
+apt/dnf/pacman *repositories* are not published — the build scripts refuse to
+produce an unsigned repository. AUR submission is blocked on account sign-ups
+being closed.
 
 ```bash
-sudo apt install ./cordial_*_amd64.deb   # from the releases page
+sudo apt install ./cordial_*_amd64.deb
+sudo dnf install ./cordial-*.x86_64.rpm
+sudo pacman -U cordial-*-x86_64.pkg.tar.zst
 ```
 
-**dnf** (Fedora 44 today, RHEL and derivatives):
-
-```bash
-sudo dnf install ./cordial-*.x86_64.rpm  # from the releases page
-```
-
-**pacman** (Arch and derivatives):
-
-```bash
-sudo pacman -U cordial-*-x86_64.pkg.tar.zst  # from the releases page
-```
-
-All four release artefacts are cosign-signed; the Flatpak/APT/dnf/pacman
-*repositories* are not, yet, and the AUR is blocked on account sign-ups being
-closed. Verifying a signature, repository status and key fingerprints:
-[`docs/install.md`](docs/install.md).
-
-**Building from source:**
+**From source:**
 
 ```bash
 git clone --recursive https://github.com/luohoa97/cordial
@@ -221,197 +147,88 @@ cd cordial
 cargo build --release
 ```
 
-Needs Clang (AOSP bionic uses C11 `_Atomic` in C++ headers; GCC rejects it)
-and GTK4 ≥ 4.10 / libadwaita ≥ 1.4 development packages. Full dependency
-list and the Flatpak build: [`docs/install.md`](docs/install.md#building-from-source).
+Needs Clang — AOSP bionic uses C11 `_Atomic` in C++ headers and GCC rejects it
+— plus GTK4 >= 4.10 and libadwaita >= 1.4 development packages. PipeWire and
+WebKitGTK-6.0 headers are optional and probed at build time; without them the
+binary is quietly less capable. The Nix flake has not been built successfully
+by anyone. Full list: [`docs/install.md`](docs/install.md#building-from-source).
 
-**Running a source build:**
+## Configuration
 
-```bash
-cargo run --release --bin cordial-run -- \
-  --lib-dir /path/to/lib/x86_64 --apk /path/to/base.apk \
-  --host-libc --game-activity --run 30
-```
-
-`--run` is how many seconds to stay up; `cordial-run --help` lists the rest.
-
-### Useful knobs
-
-| | |
-|---|---|
-| `CORDIAL_MONITOR=<n>` | open on the nth monitor instead of the primary one |
-| `CORDIAL_FULLSCREEN=1` | cover that monitor |
-| `CORDIAL_RESOLUTION=<w>x<h>` | render resolution, default 1280x720 |
-| `CORDIAL_DPI_SCALE=<f>` | UI density Roblox lays out against; 1.0 is a low-density phone |
-| `CORDIAL_NO_POINTER_LOCK=1` | never capture the cursor at all |
-| `CORDIAL_COMPOSITOR_BYPASS=1` | X11 only: set `_NET_WM_BYPASS_COMPOSITOR` while fullscreen, a hint an Xorg compositor may use to unredirect the window; off by default and unmeasured |
-| `CORDIAL_PRESENT_MODE=<m>` | frame pacing: `mailbox` (default), `fifo`, `immediate`, `uncapped`, `off` — Settings has a row for this |
-| `CORDIAL_GAMEPAD_TYPE=<n>` | which controller brand Roblox draws glyphs for — see [`docs/controllers.md`](docs/controllers.md) |
-| `CORDIAL_ANDROID_TRACE=1` | log Android API calls |
-| `CORDIAL_COUNT_GL=1` | report graphics calls on exit |
-
-FastFlag overrides live in
-`~/.local/share/cordial/profiles/<profile>/flags.json` — syntax, layering and
-gotchas are in [`docs/fastflags.md`](docs/fastflags.md).
-
-### When something goes wrong
-
-**Read the engine's own log first.** Roblox writes it to
-`<files>/appData/logs/*.log` and it names subsystems, stages, paths and
-exceptions in its own words — most questions are answered by the newest file
-there. To check whether input is reaching the engine, run with
-`CORDIAL_ANDROID_TRACE=1` and look for `onTouchEventNative(...) -> true`. If
-none of that explains it, [file an issue](#reporting-a-problem).
-
-## FAQ
-
-**Is this an official Roblox client?** No. Not affiliated with, endorsed by, or
-sponsored by Roblox Corporation. It runs Roblox's own Android build under a
-runtime this project wrote.
-
-**Will my account get banned?** Possibly — read the warning under
-[Reporting a problem](#reporting-a-problem). Use a throwaway account on its own
-IP if you are testing.
-
-**Why isn't Cordial on Flathub?** Flathub's generative-AI policy excludes it —
-Cordial's commit history is honest about being AI-assisted, and that puts it on
-the wrong side of the policy. Detail: [`docs/install.md`](docs/install.md).
-
-**Why isn't there an AUR package yet?** The PKGBUILDs are ready; AUR account
-sign-ups are currently closed. Install the release `.pkg.tar.zst` instead.
-
-**Can two accounts run at once?** Yes — two profiles, two instances, side by
-side, each about 1.5 GB. [`docs/status.md`](docs/status.md).
-
-**Can browser Play choose the matching account?** Yes, through whichever saved
-sign-in backend Cordial selected — see [browser account routing](docs/browser-account-routing.md).
-
-**How do I change FastFlags or the graphics backend?**
+**FastFlags** live in `~/.local/share/cordial/profiles/<profile>/flags.json`, or
+wherever `CORDIAL_FLAGS` points. Layering and syntax:
 [`docs/fastflags.md`](docs/fastflags.md).
 
-**Can I hide the game title bar without fullscreen?** Yes — choose Hidden in
-the [title-bar settings](docs/title-bar.md).
+**Mouse acceleration** is a Settings control — cursor only, or cursor and
+camera — stored in `$XDG_CONFIG_HOME/cordial/shell.json`.
 
-**My controller shows the wrong button icons.** A known, unsolved mapping
-problem — every button still works. [`docs/controllers.md`](docs/controllers.md).
+**Separate data roots** per instance come from `XDG_DATA_HOME`, which moves both
+the profile root and the client's data directory. `CORDIAL_PROFILE_ROOT` moves
+only the profile root and not the client.
 
-**Can I install a plugin someone sent me?** Yes, from a `.tar.zst` archive via
-**Settings → Get Plugins** — there is no plugin store yet.
-[`docs/plugins.md`](docs/plugins.md).
+**Plugins** install from a `.tar.zst` archive through **Settings → Get Plugins**
+and unpack to `~/.local/share/cordial/plugins/<id>/`. They run as separate
+processes on Deno with named capabilities, default-deny, granted per profile in
+`plugin-grants.json`. Three ship with Cordial and all are off until enabled.
+[`docs/plugins.md`](docs/plugins.md),
+[`docs/adr/ADR-007-host-resources-are-brokered.md`](docs/adr/ADR-007-host-resources-are-brokered.md).
 
-**Something's broken.** Read the engine's log first (see
-[When something goes wrong](#when-something-goes-wrong)), then
-[file an issue](#reporting-a-problem) with a Diagnostics block.
+Runtime knobs — monitor, resolution, DPI scale, frame pacing, pointer lock,
+controller glyphs — are environment variables listed in
+[`docs/install.md`](docs/install.md).
 
-## Plugins
+## What Cordial is not
 
-**Three ship with Cordial and you already have them.** Open Settings and go to
-Plugins; they are listed there whether or not you have ever installed anything.
+**Not affiliated with Roblox Corporation**, not endorsed by it, and not
+approved by it. Roblox does not support third-party clients and bans accounts
+for using them, in waves, including false positives. If your account matters to
+you, do not use it here.
 
-| | What it does | On by default |
-|---|---|---|
-| **FPS Flex** | Stops drawing being pinned to your display's refresh — the same lever as **Frame pacing** in Settings, not a second one. Off by default: uncapping presentation makes your GPU draw frames nobody asked for, which on a laptop is heat and battery. | No |
-| **Discord Presence** | Shows on your Discord profile what you are playing. Ships but is not yet wired to a running client — [`docs/rich-presence.md`](docs/rich-presence.md). | No |
-| **Flag Inspector** | Logs which FastFlags are in effect and where each came from. A diagnostic, not a feature. | No |
+**Does not ship Roblox's client.** You supply the Android build.
 
-Nothing runs until you enable it, and a plugin only gets the permissions you
-approve, per profile — approving something in a test profile does not approve
-it in the one you actually play on.
+**Not a cheat, exploit or mod injector.** There is no script execution, no
+hooking and no memory access into the Roblox process — absent from the API
+rather than disabled, so there is no primitive to re-enable in a fork
+([`docs/adr/ADR-001-in-process-hooking.md`](docs/adr/ADR-001-in-process-hooking.md),
+[`docs/adr/ADR-003-plugin-isolation.md`](docs/adr/ADR-003-plugin-isolation.md)).
+Requests for it are declined. Plugins extend Cordial, not Roblox.
 
-Plugins run on [Deno](https://deno.com)
-([ADR-008](docs/adr/ADR-008-plugins-are-typescript-on-deno.md)); Cordial offers
-to fetch a pinned copy if none is on `PATH`. Installing one you were sent, and
-writing your own: [`docs/plugins.md`](docs/plugins.md),
-[`plugins/README.md`](plugins/README.md); the capability model is
-[ADR-007](docs/adr/ADR-007-host-resources-are-brokered.md).
+Also permanently out of scope: client-side integrity flags, watermarks, and
+obfuscation-as-security.
 
-## Documentation
+## AI disclosure
 
-Start with [`docs/NEXT.md`](docs/NEXT.md) — written for someone picking the
-project up cold, and plain about what is broken. The full index of design
-notes, ADRs and analyses is [`docs/README.md`](docs/README.md);
-[`CHANGELOG.md`](CHANGELOG.md) and the
-[releases](https://github.com/luohoa97/cordial/releases) page have what
-changed between versions.
+Implementation leans heavily on Claude Code. Architecture decisions, including
+the ones that were reversed, are written down in [`docs/adr/`](docs/adr).
 
-## What this is built on, and who it is owed to
+## Contributing
 
-**Sober**, VinegarHQ's client, is the reason anyone believes a Roblox client
-can run natively on Linux, and Cordial owes it three specific debts: its
-[issue tracker](tools/sober-corpus/) is a research corpus read before
-investigating any user-facing bug ([ADR-017](docs/adr/ADR-017-sober-issue-corpus.md));
-watching it run corrected a claim made here about text input
-([`docs/analysis/sober-input-stack.md`](docs/analysis/sober-input-stack.md));
-and it was how everybody here got a Roblox build before Cordial could fetch
-its own. **Sober's code was never read** — it is not source-available, and
-what was used is a public issue tracker and the observable behaviour of a
-running program, the same class of evidence as watching any program work.
+[`CONTRIBUTING.md`](CONTRIBUTING.md). Bugs and feature requests go on
+[GitHub](https://github.com/luohoa97/cordial/issues/new/choose), not Discord —
+every template needs a Diagnostics block from **Settings → Report a Problem**
+or `cordial --diagnostics`. Security issues go through
+[a private advisory](https://github.com/luohoa97/cordial/security/advisories/new).
 
-**mocktail**, komaruworld's client, is Apache-2.0; where its ideas are adapted
-they are credited in [`NOTICE`](NOTICE) and named at the point of use — the web
-view's security rules are theirs. **AGDK `GameActivity`** is also Apache-2.0,
-which is why the activity, surface, input and IME contract could be read
-rather than guessed at.
-
-## Headline findings
-
-- Roblox ships a complete x86-64 Android build — `split_config.x86_64.apk`
-  carries 116 MB of x86-64 machine code (NDK r28c), so Cordial needs no CPU
-  architecture translation, only feature emulation.
-- The runtime surface is bounded: 13 Android libraries linked, 644 undefined
-  symbols, GLES2 + EGL mandatory with Vulkan `dlopen`ed as an optional upgrade.
-- Roblox's game surface is AGDK `GameActivity`, Apache-2.0, so it could be read
-  rather than inferred.
-
-Full analysis: [`docs/findings.md`](docs/findings.md).
-
-## Not in scope, permanently
-
-No in-process code execution against the Roblox process: no hooking, no memory
-patching, no injected script environment. Not "disabled by default" — absent from
-the API vocabulary, so there is no injection primitive in the binary to extract.
-Reasoning in [ADR-001](docs/adr/ADR-001-in-process-hooking.md).
-
-Also out: client-side integrity flags or watermarks, and obfuscation-as-security.
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=luohoa97%2Fcordial&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=luohoa97/cordial&type=date&theme=dark&legend=top-left&sealed_token=k2BpUmlDBarFv8DEaibONMzIVqR354Y0p6GxcrH9umRfO7ofVa2KNYn9t5BypPU7oGyVHGS8s0wnGiRbLNDvNDI2nYv9wRglmTifqAQZ0fBdsKEKT6d6K9S4QIFhx3VwlQzJOrjE0yCpaHWX23qzsM4zS7CE4ted0uz1KxgK4fW7eZLA-NRhPifkQPqL" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=luohoa97/cordial&type=date&legend=top-left&sealed_token=k2BpUmlDBarFv8DEaibONMzIVqR354Y0p6GxcrH9umRfO7ofVa2KNYn9t5BypPU7oGyVHGS8s0wnGiRbLNDvNDI2nYv9wRglmTifqAQZ0fBdsKEKT6d6K9S4QIFhx3VwlQzJOrjE0yCpaHWX23qzsM4zS7CE4ted0uz1KxgK4fW7eZLA-NRhPifkQPqL" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=luohoa97/cordial&type=date&legend=top-left&sealed_token=k2BpUmlDBarFv8DEaibONMzIVqR354Y0p6GxcrH9umRfO7ofVa2KNYn9t5BypPU7oGyVHGS8s0wnGiRbLNDvNDI2nYv9wRglmTifqAQZ0fBdsKEKT6d6K9S4QIFhx3VwlQzJOrjE0yCpaHWX23qzsM4zS7CE4ted0uz1KxgK4fW7eZLA-NRhPifkQPqL" />
- </picture>
-</a>
+Questions and help: [Discord](https://discord.gg/qJzU3Xfr9b).
 
 ## Licence
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).
 
-Third-party components keep their own licences and notices, reproduced in
-[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) and installed alongside the
-binary by the Flatpak:
+Third-party components keep their own licences, reproduced in
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md): `third_party/libbadcpu`
+(MIT, from Sober OSS), `third_party/mocktail-webview` (Apache-2.0, from
+mocktail), `mcpelauncher-linker` (MIT), AOSP bionic (Apache-2.0 and BSD),
+`libjnivm` (MIT).
 
-- [`third_party/libbadcpu`](third_party/libbadcpu) — MIT, vendored from
-  [Sober OSS](https://github.com/Z3ki/sober-oss)
-- [`third_party/mocktail-webview`](third_party/mocktail-webview) — Apache-2.0,
-  from [mocktail](https://github.com/komaruworld/mocktail)
-- `mcpelauncher-linker` — MIT, ChristopherHX and MCMrARM
-- AOSP bionic, carried within it — Apache-2.0 and BSD
-- `libjnivm` — MIT, ChristopherHX
+**Sober** is why anyone believes a Roblox client can run natively on Linux. Its
+public issue tracker is a research corpus here
+([`docs/adr/ADR-017-sober-issue-corpus.md`](docs/adr/ADR-017-sober-issue-corpus.md))
+and watching it run corrected a claim made here about text input. Sober's code
+was never read; it is not source-available.
 
-MIT and Apache-2.0 are satisfied while the combined work is offered under the
-GPL, as long as those notices ship with it.
-
-**mocktail deserves more than a line in a list.** Cordial's web-view policy is
-derived from its `webview_helper_policy.cc`, the permission bridge follows the
-discovery pattern in its `roblox_permissions_bridge.cc`, and the performance
-tables in Settings are adapted from its own. It also settled a long tail of
-things that would otherwise have been guessed at or read out of a stripped
-binary: the field order of Roblox's `NativeTextBoxInfo`, several thread-count
-and pipeline flag values, the platform identity string, and a number of
-behaviours confirmed by watching it run. Each of those is credited in the
-comment beside the code it settled, and `docs/analysis/flag-init.md` cites it
-throughout.
-
-Sober is the other reference, for how the same engine behaves on a desktop.
+**mocktail** is Apache-2.0 and settled more here than a line in a list conveys:
+the web-view policy is derived from it, the permission bridge follows its
+discovery pattern, the Settings performance tables are adapted from its own,
+and it established the field order of Roblox's `NativeTextBoxInfo` along with
+several flag values. Each is credited at the point of use.

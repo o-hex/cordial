@@ -98,6 +98,45 @@ Full text: `third_party/libjnivm/LICENSE`.
 
 ---
 
+## mocktail — Apache-2.0
+
+Both vendored and read, which is why this entry is longer than the others.
+
+**Vendored.** [`third_party/mocktail-webview/`](third_party/mocktail-webview)
+holds unmodified copies of mocktail's implementation of Roblox's web-view
+protocol, kept as the reference for Cordial's own web window. They are not
+compiled — nothing in the build reads that directory.
+
+```
+Copyright 2026 komaruworld
+
+Licensed under the Apache License, Version 2.0
+```
+
+Full text: `third_party/mocktail-webview/LICENSE`.
+
+**Derived and adapted.** Cordial's `crates/cordial-shell/src/webview_policy.rs`
+is derived from mocktail's `webview_helper_policy.cc`;
+`crates/cordial-runtime/src/permissions.rs` follows the discovery pattern in its
+`roblox_permissions_bridge.cc`; and the performance tables in
+`crates/cordial-shell/src/shell_config.rs` are adapted from its own. Those are
+adaptations of Apache-2.0 work and are named as such in each file.
+
+**Read, and the reason several things here are right rather than guessed.**
+The field order of Roblox's `NativeTextBoxInfo` — including which slot carries
+`textWrapped` and the `xAlign`/`yAlign` pair — came from mocktail's constructor
+rather than from a stripped binary. So did several thread-count and pipeline
+flag values, the platform identity string Cordial reports, and a number of
+engine behaviours confirmed by watching mocktail run against the same build.
+`docs/analysis/flag-init.md` cites it throughout.
+
+This project reads mocktail deliberately and says so. The line it holds is that
+ideas, call orders, field layouts and documented shapes may be taken with
+credit, and implementations may not be transcribed — see
+[CLAUDE.md](CLAUDE.md).
+
+---
+
 ## Android Game Development Kit — Apache-2.0
 
 Not vendored. AGDK's `GameActivity` source was **read** to get the

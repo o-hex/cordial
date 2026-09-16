@@ -394,10 +394,24 @@ binary by the Flatpak:
 
 - [`third_party/libbadcpu`](third_party/libbadcpu) — MIT, vendored from
   [Sober OSS](https://github.com/Z3ki/sober-oss)
+- [`third_party/mocktail-webview`](third_party/mocktail-webview) — Apache-2.0,
+  from [mocktail](https://github.com/komaruworld/mocktail)
 - `mcpelauncher-linker` — MIT, ChristopherHX and MCMrARM
 - AOSP bionic, carried within it — Apache-2.0 and BSD
 - `libjnivm` — MIT, ChristopherHX
 
 MIT and Apache-2.0 are satisfied while the combined work is offered under the
-GPL, provided those notices travel with it. That is a condition, not a
-courtesy.
+GPL, as long as those notices ship with it.
+
+**mocktail deserves more than a line in a list.** Cordial's web-view policy is
+derived from its `webview_helper_policy.cc`, the permission bridge follows the
+discovery pattern in its `roblox_permissions_bridge.cc`, and the performance
+tables in Settings are adapted from its own. It also settled a long tail of
+things that would otherwise have been guessed at or read out of a stripped
+binary: the field order of Roblox's `NativeTextBoxInfo`, several thread-count
+and pipeline flag values, the platform identity string, and a number of
+behaviours confirmed by watching it run. Each of those is credited in the
+comment beside the code it settled, and `docs/analysis/flag-init.md` cites it
+throughout.
+
+Sober is the other reference, for how the same engine behaves on a desktop.

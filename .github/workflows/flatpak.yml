@@ -39,6 +39,38 @@
 # then this builds and uploads an artifact and stops, which is deliberate: a
 # workflow that starts publishing a public remote the moment it lands is not a
 # thing to spring on anyone.
+#
+# Two branches live in that repository, not one:
+#
+#     master   every push to main, exactly as before -- the edge channel
+#     stable   only the commit that carries a v* release tag -- the release channel
+#
+# and a plain `flatpak install cordial io.github.luohoa97.Cordial`, with no
+# branch named, now lands on stable rather than master, because "Update the
+# repository summary" below sets xa.default-branch once stable exists. This
+# is why the bug report that started this ("an installed release keeps
+# following main") had a real fix: master was the only branch and the only
+# default there was ever going to be. Existing master-tracking installs are
+# untouched by any of this -- a remote's default branch only matters to an
+# install naming none -- and are told how to move onto stable in the README
+# and in packaging/cordial.flatpakrepo's own comment.
+#
+# The one part of this worth writing down at length: **GitHub Pages has no
+# incremental publish.** `deploy` below replaces the whole site on every run
+# with whatever `build` produced, and `build` hands flatpak-builder a
+# repository that starts empty -- there is nothing in this workflow that
+# would carry `stable` from one run to the next on its own. Left alone, the
+# very first ordinary push to main after a release would publish a site with
+# `master` and no `stable` at all, deleting the release channel out from under
+# everyone on it. "Carry the stable channel forward, or point it at this
+# release" is the step that stops that: before the summary is rewritten, it
+# pulls the currently-published `stable` ref back out of the live site (the
+# one this same job is about to replace) into the local repository, so an
+# ordinary push carries it forward unchanged and only a tagged commit moves
+# it. Verified against the real published repository on 2026-09-16 -- see
+# that step's own comment for what a repository with no `stable` yet does
+# instead, and see "Check whether this commit carries a release tag" for how
+# a push to main is told apart from a push that also carries a tag.
 
 name: Flatpak
 
@@ -121,6 +153,13 @@ permissions:
 env:
   APP_ID: io.github.luohoa97.Cordial
   MANIFEST: packaging/io.github.luohoa97.Cordial.yml
+  # Must name the same tree as Url in packaging/cordial.flatpakrepo -- see
+  # that file's own comment for why it is not derived from github.repository.
+  # "Carry the stable channel forward" below reads this exact repository back
+  # in mid-build, so a rename here with no matching rename there would make
+  # that step silently pull from the wrong tree, or from nothing, rather than
+  # fail loudly.
+  PAGES_REPO_URL: https://luohoa97.github.io/cordial/repo/
 
 jobs:
   build:
@@ -142,9 +181,47 @@ jobs:
       # third_party/mcpelauncher-linker as `git` sources by commit and skips
       # them out of the `dir` source, so a recursive checkout would only be
       # copied in and then thrown away.
+      #
+      # fetch-tags: true is for "Check whether this commit carries a release
+      # tag" below, and without it that step finds nothing regardless of
+      # whether the commit is tagged. actions/checkout@v4's own default is
+      # fetch-depth: 1 *and* fetch-tags: false -- confirmed by reading its
+      # action.yml -- so the shallow clone this job ran with before had no
+      # tag refs in it at all. Replaying its git commands locally against
+      # this repository's real v0.16.0 tag showed the difference directly:
+      # with the defaults, `git tag --points-at HEAD` on that commit finds
+      # nothing; adding fetch-tags finds `v0.16.0`, and the extra fetch is
+      # small -- tag refs only, no extra commit history -- so fetch-depth
+      # stays at its default of 1 rather than growing to 0.
       - uses: actions/checkout@v4
         with:
           submodules: false
+          fetch-tags: true
+
+      # A push to main can carry a release tag on the same commit: the release
+      # choreography here pushes main and the v* tag together
+      # (`git push origin main <tag>`), so by the time this job's checkout
+      # runs, both refs already exist server-side even though the *event*
+      # that started this run was the branch push, not the tag. Only main
+      # pushes reach `deploy` below -- a tag push's own ref is
+      # refs/tags/v..., which that job's condition never matches -- so this
+      # only needs to run, and only matters, here.
+      #
+      # `head -1` rather than trusting there is exactly one: two tags on the
+      # same commit is possible (a hotfix re-tagged, say) and this only needs
+      # one name to act on.
+      - name: Check whether this commit carries a release tag
+        if: github.ref == 'refs/heads/main'
+        id: release
+        run: |
+          set -euo pipefail
+          tag=$(git tag --points-at HEAD | grep '^v' | head -1 || true)
+          if [ -n "$tag" ]; then
+            echo "this commit carries $tag; stable will point at this build"
+          else
+            echo "no v* tag on this commit; stable is carried forward unchanged"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       # The runner ships with about 25 GB free and a lot of it is Android SDKs
       # and dotnet nobody here needs. The Flatpak build carries the runtime, the
@@ -306,6 +383,47 @@ jobs:
           ostree --repo=repo refs
           ostree --repo=repo refs --delete "runtime/$APP_ID.Debug/x86_64/master" || true
 
+      # See the header comment for why this exists at all: GitHub Pages
+      # replaces the whole site on every deploy, flatpak-builder only ever
+      # exports `master` into a repository that starts this run empty, and
+      # without this step `stable` would vanish from the published tree on
+      # the very next ordinary push to main.
+      #
+      # --no-gpg-verify on this remote is about the pull, not the republish.
+      # The objects it fetches were already built and signed by this same
+      # workflow on an earlier run; re-verifying them here buys nothing, and a
+      # signing-key rotation would otherwise fail this step on old objects it
+      # has no actual reason to distrust. The repository this job publishes is
+      # signed exactly as it already was, in the step below.
+      #
+      # The first run to ever reach this path -- before any tagged commit has
+      # gone through it -- has no `stable` ref on the live site to pull, and
+      # `ostree pull` fails with "No such branch ... in repository summary".
+      # Verified locally against a repository missing the ref. That failure
+      # is expected and left non-fatal: `stable` simply does not exist yet,
+      # "Update the repository summary" below only sets it as the default
+      # branch once it does, and the first tagged build to pass through this
+      # step is what creates it.
+      - name: Carry the stable channel forward, or point it at this release
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          stable_ref="app/$APP_ID/x86_64/stable"
+          master_ref="app/$APP_ID/x86_64/master"
+          ostree --repo=repo remote add --no-gpg-verify pages-live "$PAGES_REPO_URL"
+          had_stable=true
+          ostree --repo=repo pull pages-live "$stable_ref" || had_stable=false
+          if [ -n "${{ steps.release.outputs.tag }}" ]; then
+            echo "tagged build (${{ steps.release.outputs.tag }}): stable now points at this commit"
+            ostree --repo=repo refs --create="$stable_ref" "$master_ref" --force
+          elif [ "$had_stable" = "true" ]; then
+            echo "not tagged: carrying the existing stable ref forward unchanged"
+            ostree --repo=repo refs --create="$stable_ref" "pages-live:$stable_ref" --force
+          else
+            echo "not tagged and no stable ref published yet: nothing to carry forward"
+          fi
+          ostree --repo=repo remote delete pages-live
+
       - name: Update the repository summary and appstream branch
         run: |
           set -euo pipefail
@@ -314,11 +432,26 @@ jobs:
             args+=(--gpg-homedir="${{ steps.gpg.outputs.gpghome }}"
                    --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}")
           fi
-          # Without this the repository has objects and no summary, and
-          # `flatpak install` answers "No remote refs found" — which reads like
-          # a bad URL and is not one. Static deltas are deliberately not
-          # generated: they make installs much faster and the repository much
-          # bigger, and size is the binding constraint on Pages.
+          # A plain `flatpak install` with no branch named follows this,
+          # rather than defaulting to master -- verified locally against
+          # flatpak 1.18.0 / libostree 2026.2: `build-update-repo
+          # --default-branch=X` writes xa.default-branch into the summary,
+          # and `flatpak remote-info` and `flatpak install` against a test
+          # repository built the same way both resolved to X with no branch
+          # named. Guarded on the ref actually existing in this run's
+          # repository: the bootstrap case in the step above can leave none
+          # to point at, and setting a default branch that does not exist
+          # would break every install, not just new ones, rather than
+          # printing the "No such branch" this is meant to avoid.
+          if ostree --repo=repo rev-parse "app/$APP_ID/x86_64/stable" >/dev/null 2>&1; then
+            args+=(--default-branch=stable)
+          fi
+          # Without --prune and the summary rewrite the repository has objects
+          # and no summary, and `flatpak install` answers "No remote refs
+          # found" — which reads like a bad URL and is not one. Static deltas
+          # are deliberately not generated: they make installs much faster and
+          # the repository much bigger, and size is the binding constraint on
+          # Pages.
           flatpak build-update-repo "${args[@]}" repo
           ostree --repo=repo refs
 

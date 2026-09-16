@@ -55,6 +55,20 @@ Uninstall with `flatpak uninstall io.github.luohoa97.Cordial`, and
 `flatpak uninstall --delete-data io.github.luohoa97.Cordial` if you also want the
 profiles, the sign-in and the extracted Roblox build gone.
 
+That command installs the `stable` branch, which only moves on a tagged
+release. There is also `master`, which moves on every commit to main — the
+remote used to publish only that branch, so an install from before this
+paragraph existed is on it, and will keep tracking main until you move it:
+
+```bash
+flatpak uninstall io.github.luohoa97.Cordial//master
+flatpak install cordial io.github.luohoa97.Cordial//stable
+```
+
+(add `--user` to both if that is how you installed it). If you want main
+rather than releases, `flatpak install cordial io.github.luohoa97.Cordial//master`
+says so explicitly.
+
 **The AppImage is one file that runs on any distribution.** No remote to add,
 no package manager, nothing installed system-wide — download `Cordial-x86_64.AppImage`
 from [the releases page](https://github.com/luohoa97/cordial/releases), then:

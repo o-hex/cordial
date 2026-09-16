@@ -61,13 +61,15 @@ You never have to press it if a build is already on the machine:
 - **Supply your own APK** and point Cordial at it in Settings, or see
   [What you need](docs/install.md#what-you-need). It gets the same signature check.
 
-Two things worth knowing before you type that, rather than after: **the remote
-is not signed**, so `flatpak install` proves the download matches the
+Three things worth knowing before you type that, rather than after: **the
+remote is not signed**, so `flatpak install` proves the download matches the
 repository's checksums and nothing about who built it — the
 [full explanation](docs/install.md#trust-and-what-not-signed-means) is in
-`docs/install.md` and you should read it. And Cordial is experimental:
-sign-in, gameplay, mouse and keyboard, text entry and audio all work; the
-[status page](docs/status.md) says exactly what does not.
+`docs/install.md` and you should read it. **That command tracks releases, not
+every commit** — see [Flatpak vs AppImage](docs/install.md#flatpak-vs-appimage)
+if you installed before this line existed and want to move off `master`. And
+Cordial is experimental: sign-in, gameplay, mouse and keyboard, text entry and
+audio all work; the [status page](docs/status.md) says exactly what does not.
 
 Cordial loads Roblox's official Android x86-64 engine directly on Linux through a
 purpose-built runtime: the AOSP bionic linker, a bionic/glibc shim, a JNI VM in
@@ -170,7 +172,9 @@ first run fetches for you — see [`docs/install.md`](docs/install.md) for the
 Sober and custom-APK routes.
 
 **Flatpak**, sandboxed and self-updating — pick this unless you have a reason
-not to:
+not to. This tracks releases; see
+[`docs/install.md`](docs/install.md#flatpak-vs-appimage) to move off `master`
+if you installed before that was true:
 
 ```bash
 flatpak remote-add --if-not-exists cordial \

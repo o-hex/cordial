@@ -283,7 +283,60 @@ unresolved symbol appears, no VRService line is ever printed, and a
 library. The flags do nothing observable, which is a different and stronger
 finding than "no VR classes in the dex" — reached at the account-router/menu
 shell, not inside a joined place, which that document names as the one gap
-still open. **Closed, not deferred**, on the evidence now in hand.
+still open.
+
+**Reopened 2026-09-16, and the verdict above — "Closed, not deferred" — was
+wrong.** It closed on a run that the same sentence admits never reached a
+joined place, which is where VR initialisation would happen. A second gap went
+unrecorded and matters more: the machine carried no OpenXR runtime at all. No
+loader, no `/usr/share/openxr/1/`, `XR_RUNTIME_JSON` unset, verified on this
+host. `ExposeOpenXrAPI1` and `DebugEnableVREmulator` cannot produce an
+observable effect, in a joined place or anywhere else, when there is nothing
+for the engine to find, and "no `dlopen` of a VR runtime library" is what a
+machine with no VR runtime installed looks like either way. Three instruments
+agreed because none of them could distinguish the two cases -- the same shape
+as every other broken measurement this file records.
+
+Settling it from the other direction: a working implementation exists against
+this same x86-64 APK and this same engine, running the OpenXR integration
+host-side, outside `libroblox.so`, at roughly 15,500 lines. So the engine's VR
+path is reachable, and "zero OpenXR symbols imported by `libroblox.so`" never
+ruled it out. On this architecture Cordial supplies the platform, so a runtime
+integration lives in the host by construction and no imported symbol would ever
+appear in the engine. The symbol scan answered a question nobody needed asked.
+
+**That arm has since been run, and it went against the hypothesis.** Three
+runs to the Landing page, each with its own data root, repeated: flags off;
+140 VR flag overrides on with no OpenXR runtime; and the same 140 with Monado
+25.1.0 serving and `XR_RUNTIME_JSON` set. The dumped Java class surface is
+byte-identical across all three at 4584 lines, no `Constructed Unresolved
+symbol` appears in any arm, the stub tally is unchanged, and the normalised
+stderr streams of the two flag-on arms diff to zero lines -- reproduced across
+two independent runs of the Monado arm. A discoverable OpenXR runtime changes
+nothing, so the gap this section opened is now closed by measurement rather
+than by assumption.
+
+The platform-layer route is closed too, for a more basic reason than the
+experiment: **there is no VR-shaped question for Cordial to answer.** The one
+VR item anywhere in the observed JNI surface is
+`NativeGLJavaInterface.onVrSessionStateUpdate(I)V`, and it is outbound -- the
+engine notifying Java that a session exists, not a capability the engine
+consults. It appears in the 2026-08-06 `CORDIAL_JNI_TRACE` capture (the one
+that reached a joined place) only as a `jmethodID` cached during
+`JNI_OnLoad`'s blanket pass, never invoked. `PackageManager.hasSystemFeature`
+was deliberately never implemented here because nothing has ever been seen
+calling it, so there is no gate sitting unanswered. Issue #35's `DeviceUtils`
+precedent is real but does not transfer: supplying a class the engine asks for
+is not the same as inventing one it never asks about.
+
+What remains genuinely untested is a signed-in, joined place -- whether flags
+plus a runtime make `onVrSessionStateUpdate` actually fire inside an
+experience. That needs an account, which is a user decision, not an agent's.
+The only demonstrated way to construct a VR device is a raw byte written at a
+hardcoded per-build address, which [ADR-001](docs/adr/ADR-001-in-process-hooking.md)
+and [ADR-003](docs/adr/ADR-003-plugin-isolation.md) make absent rather than
+disabled, and which would break on every Roblox update besides. **Not closed,
+and not pursued: blocked on a route this project does not take.**
 
 ### Voice chat — implemented, broader testing remains
 

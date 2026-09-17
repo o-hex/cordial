@@ -79,10 +79,23 @@ capture. The app bridge starts the app **after** the surface exists.
 **Next step, and what it is not.** Re-issue the app-bridge start in Android's
 order on top of the skipped-AGDK state, after the surface is delivered, behind
 an env switch, and score arms on FROZEN / BLANK / STARTUP-HANG / GOOD rather
-than on presents. An unfinished prototype of that arm is in the scratchpad as
-`agdk-lua-start.diff` (env `CORDIAL_LUASTART_ARM`); it built and its screening
-batch did not run to completion, so **it has measured nothing** and the diff
-should be read as a starting point, not as a result.
+than on presents. **That next step was taken on 2026-09-18, and all three arms are refuted.**
+Six runs an arm, interleaved with controls, same profile and harness: arm A
+re-issued `ASMA.start` and `nativeAppBridgeV2StartApp` after surface delivery,
+arm B moved the existing calls after it instead of duplicating them, and arm C
+replayed a pause/resume cycle whose natives are logged as having fired 6/6.
+Every one of the eighteen runs was blank, on the same screenshot signature as
+the plain skipped-AGDK state (modal fraction 0.981), with one
+`initializeWithAppStarter` cycle and no `StartupController started` in any of
+them. Controls reached Home 6/6 in the same batches. So the app-bridge start
+is not what is missing: re-ordering or repeating it changes nothing. The diffs
+and the draft ADR are in the scratchpad (`freeze-fix.diff`,
+`ADR-draft-lua-app-start.md`); nothing was committed.
+
+`nativeAppBridgeV2StartGameWithParam` was assessed and not attempted. It takes
+a 24-field `StartGameParams` object (`placeId`, `userId`, `joinRequestType`,
+`accessCode` and more), and at Home there is no game being joined, so every
+field would be invented rather than observed.
 `nativeAppBridgeV2StartGameWithParam` was suggested as the call to try and is
 the wrong one to start with: it is a game-session call and it does not appear
 in the Home trace.

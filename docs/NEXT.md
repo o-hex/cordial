@@ -21,6 +21,81 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## Open: the startup freeze has a second failure on the other side of it, 2026-09-17
+
+Four things were measured on `4c9d1b5`, built with `just build toolbox`, all on
+the signed-in `CordialTest` profile with one client on the machine at a time.
+The survey is `tools/startup-freeze-survey.sh`; the copies that ran, the logs,
+the screenshots and the scorer are under the session scratchpad at
+`agdk-combo/` (`classify.py`, `flatness.py`, `divergence.md`).
+
+**The freeze does not need a nested compositor.** Ten launches an arm: signed
+in 7/10 frozen in nested sway and 4/10 on the host GNOME session, signed out
+0/10 and 0/10. `docs/analysis/startup-freeze-capture.md` is corrected in
+`32f3abc`; its 0/7 on the host was too few launches. Sign-in is the variable.
+
+**mocktail's default AGDK combination removes the freeze and replaces it with a
+blank window.** mocktail keeps `initializeNativeCode` and skips both the AGDK
+surface natives and the lifecycle natives; its two gates default to 0
+(`legacy_runtime.cc:2873`). Cordial can be put in that state today with
+`CORDIAL_SKIP_AGDK_SURFACE=1 CORDIAL_SKIP_AGDK_LIFECYCLE=1`. Fifteen runs an
+arm, interleaved:
+
+```text
+control                6/15 frozen   0/15 blank   9/15 reached Home
+surface+lifecycle off  0/15 frozen  15/15 blank   0/15 reached Home
+```
+
+Fisher one-tailed: frozen p = 0.0169, reached-Home p = 0.0007. The blank runs
+are not a partial render. The engine reaches `app ready: RootSwitchNavigator`
+and presents at 240/s, and the screenshot is one flat colour plus the FPS
+overlay, identically in all fifteen (modal fraction 0.981 +/- 0.0001 against
+0.517 on a healthy control). **The present-count verdict scores every one of
+them HEALTHY**, so any future arm needs a screenshot check as well.
+
+**What separates them is one cycle.** Every control run, frozen or good, runs
+`[FLog::SingleSurfaceApp] initializeWithAppStarter` a second time and then logs
+`StartupController started: stage`. No run with the AGDK natives skipped ever
+gets that second cycle, in 15 of 15. So something in the AGDK surface or
+lifecycle block is what starts the Lua app, and that same block is where the
+freeze happens. Dropping it is not a fix on its own.
+
+**Frozen runs stop at a known line.** 6/6 frozen controls end at `Forcing
+finalize experience coordinator` -> `Did not finalize due to state.` ->
+`StartupController started` -> `sync cookies from engine`, with
+`~UgcExperienceController()` absent. 9/9 good controls log the same abort and
+then continue through `~UgcExperienceController()` to a third init. This
+repeats the 2026-08-24 discriminator on today's build.
+
+**Real Android does not need any of it.** In
+`docs/traces/waydroid-roblox-startup.log.gz` around lines 1085-1140 the order
+at Home is `surfaceCreated`, "Start the lua app",
+`setTaskSchedulerBackgroundMode() enable:false context:ASMA.start`,
+`nativeAppBridgeV2StartApp:`, then `startLuaApp` / `returnToLuaApp` /
+`replaceDataModel` / `RenderView created`, then `StartupController finished
+starting: stage = 2`. No GameActivity native is called anywhere in the
+capture. The app bridge starts the app **after** the surface exists.
+
+**Next step, and what it is not.** Re-issue the app-bridge start in Android's
+order on top of the skipped-AGDK state, after the surface is delivered, behind
+an env switch, and score arms on FROZEN / BLANK / STARTUP-HANG / GOOD rather
+than on presents. An unfinished prototype of that arm is in the scratchpad as
+`agdk-lua-start.diff` (env `CORDIAL_LUASTART_ARM`); it built and its screening
+batch did not run to completion, so **it has measured nothing** and the diff
+should be read as a starting point, not as a result.
+`nativeAppBridgeV2StartGameWithParam` was suggested as the call to try and is
+the wrong one to start with: it is a game-session call and it does not appear
+in the Home trace.
+
+**Ruled out, and not to be re-run:** every single-group AGDK skip (state-only,
+focus-only, lifecycle-only, surface-only) is blank; the blocking-acknowledgement
+account is refuted at 0/15 against 0/15 (`native/game_activity.cpp`);
+`CORDIAL_SKIP_AGDK=1` dies on `Can't initialize the TaskScheduler before flags
+have been loaded`, and that path never calls `nativeInitClientSettings`,
+`nativePostClientSettingsLoadedInitialization3` or
+`nativeInitializeNativeFlags` at all, so the crash is that gap rather than a
+conflict between skipping AGDK and loading flags.
+
 ## Open: the AppImage's base moved and its closure is now computed, measured 2026-09-13
 
 The previous entry here described two independent defects and a next step of

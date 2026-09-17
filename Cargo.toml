@@ -42,7 +42,13 @@ unsafe_op_in_unsafe_fn = "deny"
 # cordial-linker-sys, unrelated to unsafe documentation -- see ADR-036.
 undocumented_unsafe_blocks = "warn"
 
+[profile.dev]
+debug = false
+strip = "symbols"
+incremental = false
+
 [profile.release]
 debug = false     # Disabled on Android/Termux to prevent excessive UFS 4.1 flash wear and write amplification (reduces build artifacts from ~11.5 GB to ~350 MB)
 strip = "symbols"
+
 

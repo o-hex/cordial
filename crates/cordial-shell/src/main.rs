@@ -89,7 +89,43 @@ const APP_ID: &str = "io.github.luohoa97.Cordial";
 
 use std::io::Write;
 
-fn run_cli_install(is_update: bool) -> bool {
+fn installed_roblox_version() -> Option<String> {
+    let engine_dir = cordial_update::install::engine_dir();
+    cordial_update::cache::recorded_version(&engine_dir)
+        .or_else(|| cordial_update::engine::version_of(&engine_dir.join(cordial_update::engine::LIBRARY)))
+}
+
+fn run_cli_install(is_update: bool, force: bool) -> bool {
+    let installed = installed_roblox_version();
+
+    if is_update && !force {
+        if let Some(ref current) = installed {
+            print!("Checking for updates... ");
+            let _ = std::io::stdout().flush();
+            match cordial_update::provider::newest_obtainable() {
+                Some(newest) => {
+                    if !cordial_update::version::is_newer(&newest, current) {
+                        println!("up to date.");
+                        println!("Roblox is already at the latest available version ({current}).");
+                        println!("Use 'cordial update --force' to force re-download.");
+                        return true;
+                    }
+                    println!("update available ({current} -> {newest}).");
+                }
+                None => {
+                    println!("provider unreachable.");
+                    eprintln!("Warning: could not query update provider. Proceeding with update attempt...");
+                }
+            }
+        }
+    } else if !is_update && !force {
+        if let Some(ref current) = installed {
+            println!("Roblox is already installed (version {current}).");
+            println!("Use 'cordial update' to check for updates or 'cordial install --force' to reinstall.");
+            return true;
+        }
+    }
+
     println!("Connecting to update provider (apkpure)...");
     let cancel = cordial_update::provider::Cancel::new();
     let want = if is_update {
@@ -158,15 +194,16 @@ fn main() -> std::process::ExitCode {
              Usage: cordial [COMMAND | ROBLOX-LINK] [OPTIONS]\n\
              \n\
              Commands:\n\
-               run [LINK]      Launch Roblox Player directly (default)\n\
-               install         Download, verify and install Roblox APK and engine\n\
-               update          Check for updates and install the newest Roblox build\n\
-               diagnostics     Print diagnostic information\n\
-               help, -h        Show this help message\n\
+               run [LINK]          Launch Roblox Player directly (default)\n\
+               install [--force]   Download, verify and install Roblox APK and engine\n\
+               update [--force]    Check for updates and install the newest Roblox build\n\
+               diagnostics         Print diagnostic information\n\
+               help, -h            Show this help message\n\
              \n\
              Options:\n\
-               --apk <PATH>    Override Roblox APK path\n\
-               --profile <NAME> Roblox profile to use (default: \"default\")\n\
+               --force, -f         Force re-download even if already up to date\n\
+               --apk <PATH>        Override Roblox APK path\n\
+               --profile <NAME>    Roblox profile to use (default: \"default\")\n\
              \n\
              `cordial-run` is the engine loader. Issues: https://github.com/luohoa97/cordial/issues\n\
              \n\
@@ -177,8 +214,10 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
+    let force = args.iter().any(|a| a == "--force" || a == "-f");
+
     if args.iter().any(|a| a == "install" || a == "--install") {
-        return if run_cli_install(false) {
+        return if run_cli_install(false, force) {
             std::process::ExitCode::SUCCESS
         } else {
             std::process::ExitCode::FAILURE
@@ -186,7 +225,7 @@ fn main() -> std::process::ExitCode {
     }
 
     if args.iter().any(|a| a == "update" || a == "--update") {
-        return if run_cli_install(true) {
+        return if run_cli_install(true, force) {
             std::process::ExitCode::SUCCESS
         } else {
             std::process::ExitCode::FAILURE
@@ -243,7 +282,7 @@ fn main() -> std::process::ExitCode {
                 || trimmed.eq_ignore_ascii_case("y")
                 || trimmed.eq_ignore_ascii_case("yes")
             {
-                if !run_cli_install(false) {
+                if !run_cli_install(false, false) {
                     return std::process::ExitCode::FAILURE;
                 }
                 match install::locate(&config.roblox) {

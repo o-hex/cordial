@@ -112,8 +112,8 @@ export CORDIAL_AUDIO=aaudio
 export CORDIAL_AUDIO_HOST=pulse
 export PULSE_SERVER="${PULSE_SERVER:-127.0.0.1}"
 export CORDIAL_PLATFORM_NAME="${CORDIAL_PLATFORM_NAME:-Windows}"
-export CORDIAL_PRESENT_MODE=immediate
-export CORDIAL_POLL_TIMEOUT=1
+export CORDIAL_PRESENT_MODE="${CORDIAL_PRESENT_MODE:-mailbox}"
+export CORDIAL_POLL_TIMEOUT="${CORDIAL_POLL_TIMEOUT:-1}"
 
 # Start PulseAudio daemon if not running
 if ! pulseaudio --check >/dev/null 2>&1; then

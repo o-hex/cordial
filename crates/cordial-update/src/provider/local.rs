@@ -52,7 +52,7 @@ use crate::Unreachable;
 use std::path::{Path, PathBuf};
 
 /// The engine, inside whichever archive carries it.
-const ENGINE: &str = "lib/x86_64/libroblox.so";
+const ENGINE: &str = crate::apk::LIBRARY_IN_APK;
 
 #[derive(Debug, Default)]
 pub struct OnThisMachine;
@@ -64,15 +64,15 @@ fn candidates() -> Vec<PathBuf> {
         out.push(PathBuf::from(explicit));
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let package = "sober/packages/x86_64/com.roblox.client";
+        let package = format!("sober/packages/{}/com.roblox.client", crate::apk::HOST_ABI);
         // Sober as a Flatpak, which is how VinegarHQ distributes it and how
         // this machine has it.
-        out.push(home.join(".var/app/org.vinegarhq.Sober/data").join(package));
+        out.push(home.join(".var/app/org.vinegarhq.Sober/data").join(&package));
         // Sober installed natively, which follows the XDG data directory.
         let data = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"));
-        out.push(data.join(package));
+        out.push(data.join(&package));
     }
     out
 }
@@ -83,14 +83,14 @@ fn candidates() -> Vec<PathBuf> {
 /// and the engine are both reachable, and one file carrying both satisfies that
 /// as well as two do.
 fn pair_in(dir: &Path) -> Option<super::Archives> {
-    let base = dir.join("base.apk");
-    let split = dir.join("split_config.x86_64.apk");
+    let base = dir.join(crate::install::BASE_APK);
+    let split = dir.join(crate::install::SPLIT_APK);
     if base.is_file() && split.is_file() {
         return Some(super::Archives { base, split });
     }
     // One file carrying everything. Only accepted if it actually holds the
     // engine, checked by opening it rather than by trusting the name.
-    for name in ["base.apk", "com.roblox.client.apk", "roblox.apk"] {
+    for name in [crate::install::BASE_APK, "com.roblox.client.apk", "roblox.apk"] {
         let one = dir.join(name);
         if one.is_file() && holds_engine(&one) {
             return Some(super::Archives { base: one.clone(), split: one });

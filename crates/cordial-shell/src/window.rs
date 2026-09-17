@@ -234,22 +234,13 @@ pub fn build(
     // why that was a browser convention borrowed into an application that is not
     // one.
     let switcher = profile_switcher::build(config.clone(), config_path.clone());
-    let profile_row = switcher.group.clone();
+    let _profile_row = switcher.group.clone();
     let profile_combo = switcher.row.clone();
     let refresh_profile_row = switcher.refresh.clone();
 
-    // Two controls, centred, and the empty space around them is the point.
-    //
-    // This was a stack of two `AdwPreferencesGroup`s pinned to the top of the
-    // window, which left the bottom two thirds blank and read as a form that had
-    // run out of fields. Nothing was added to fill it: the same two controls
-    // sitting in the middle of the window is a composition rather than a
-    // remainder, and the width clamp is tighter than the 480 the groups used
-    // because a boxed list and a pill button stretched to a launcher's full
-    // width look like a preferences page whatever is in them.
+    // Centred Roblox launch button (single player, no multi-accounting).
     let column = gtk::Box::new(gtk::Orientation::Vertical, 24);
     column.set_valign(gtk::Align::Center);
-    column.append(&profile_row);
     column.append(&chooser_widget);
 
     let clamp = adw::Clamp::builder().maximum_size(360).child(&column).build();
@@ -931,7 +922,7 @@ fn launch_now_tracked(
         Outcome::ProfileChanged => {
             window.present();
             join.banner().set_title(
-                "Roblox link waiting — the matched profile changed; choose a profile and press Roblox",
+                "Roblox link waiting — press Roblox to join",
             );
         }
         Outcome::NoBuild => {
@@ -1265,14 +1256,12 @@ fn profile_busy(
     // client. Reported as the dialog having three buttons, two of which appear
     // to do the same thing. They never did: this one only dismisses.
     dialog.add_response("cancel", "Cancel");
-    dialog.add_response("profile", "Choose a Profile");
     if ours.is_some() {
         dialog.add_response("stop", "Close It and Launch");
         dialog.set_response_appearance("stop", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("stop"));
     } else {
-        dialog.set_response_appearance("profile", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("profile"));
+        dialog.set_default_response(Some("cancel"));
     }
 
     let parent_window = parent.clone();
@@ -1282,12 +1271,6 @@ fn profile_busy(
     let lifecycle = lifecycle.clone();
     dialog.connect_response(None, move |_, response| {
         match response {
-        // The switcher is the combo row above the launch button; activating the
-        // window's action rather than building a second chooser here keeps one
-        // construction site.
-        "profile" => {
-            let _ = parent_window.activate_action("win.profile", None);
-        }
         "stop" => {
             if let Some(h) = ours.clone() {
                 close_then_launch(

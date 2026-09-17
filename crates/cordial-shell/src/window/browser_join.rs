@@ -206,9 +206,8 @@ impl Shell {
                             }
                         }
                         Some(_) | None => {
-                            println!("  shell: browser account routing needs a profile choice");
                             join.banner.set_title(
-                                "Roblox link waiting — choose a profile and press Roblox",
+                                "Roblox link waiting — press Roblox to join",
                             );
                             window.present();
                         }

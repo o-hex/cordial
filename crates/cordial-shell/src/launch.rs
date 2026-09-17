@@ -179,6 +179,11 @@ impl Instance {
         let tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
         tail.iter().cloned().collect::<Vec<_>>().join("\n")
     }
+
+    /// Wait for the client to exit.
+    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
 }
 
 /// Read one of the child's pipes to EOF: pass every line through to the

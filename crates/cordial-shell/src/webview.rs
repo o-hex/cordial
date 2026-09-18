@@ -109,6 +109,7 @@
 use adw::prelude::*;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use libadwaita::glib;
 use webkit6::prelude::*;
 
 use crate::webview_policy;
@@ -120,6 +121,99 @@ use crate::webview_policy;
 /// citing `kExecuteRobloxHandler`/`kRobloxWkHybridHandler`.
 const BRIDGE_EXECUTE_ROBLOX: &str = "executeRoblox";
 const BRIDGE_ROBLOX_WK_HYBRID: &str = "RobloxWKHybrid";
+
+/// A third handler name, ours alone -- never claimed to be part of Roblox's
+/// own contract. Registered and wired only when [`bridge_probe_enabled`], so
+/// [`bridge_shim`]'s probe instrumentation has somewhere to report what the
+/// page actually touches.
+const BRIDGE_PROBE: &str = "cordialBridgeProbe";
+
+/// `CORDIAL_WEBVIEW_BRIDGE_PROBE=1` -- instrument the page's own JS instead of
+/// guessing at its shape from outside.
+///
+/// Written for issue #40's open question after `CORDIAL_TRACE_BRIDGE`
+/// confirmed the Servers-list Join button posts to neither registered
+/// handler at all: something upstream of the bridge decides not to call it,
+/// and nothing so far said what. This does three things, all reporting
+/// through [`BRIDGE_PROBE`] rather than through
+/// `enable-write-console-messages-to-stdout`, because
+/// `CORDIAL_WEBVIEW_CONSOLE_LOG` was tried first and produced nothing at all
+/// on this build, even on page load -- which the postMessage channel is
+/// already proven to survive (`Load More`, scroll and close all round-trip
+/// through it in the same sessions):
+///
+/// 1. `window.onerror`/`unhandledrejection` listeners, so a thrown handler is
+///    visible instead of read as "the button did nothing".
+/// 2. `window.webkit.messageHandlers` wrapped in a `Proxy` whose `get`/`has`
+///    traps report every property name the page asks for -- including one
+///    that comes back `undefined`, which names a handler this file never
+///    registered exactly as precisely as one that did.
+/// 3. `window.__globalRobloxAndroidBridge__`'s own object wrapped the same
+///    way, so a probe for `.getVersion` or similar sibling method reports
+///    itself instead of silently returning `undefined`.
+///
+/// Off by default: this reports the page's own property accesses, which is
+/// exactly the kind of behavioural detail `CORDIAL_TRACE_BRIDGE`'s doc already
+/// argues should not be on unless asked for.
+fn bridge_probe_enabled() -> bool {
+    std::env::var_os("CORDIAL_WEBVIEW_BRIDGE_PROBE").is_some()
+}
+
+/// A fourth handler name, for [`hybrid_launch_enabled`]'s own status
+/// reporting -- independent of [`BRIDGE_PROBE`] because this ships on by
+/// default and must report even with every diagnostic switch off.
+const HYBRID_LAUNCH_LOG: &str = "cordialHybridLaunchLog";
+
+/// The escape hatch. On by default since issue #40/#34's fix (below); set
+/// this to turn it back off rather than the other way around, because the
+/// default is now the behaviour, not the diagnostic.
+const HYBRID_LAUNCH_DISABLE_VAR: &str = "CORDIAL_WEBVIEW_DISABLE_HYBRID_LAUNCH";
+
+/// The default behaviour for issue #40/#34: a game's Servers-list Join button
+/// did nothing, because it calls `Roblox.Hybrid.Game.launchGame(payloadJson,
+/// callback)` -- a real, page-defined contract with a structured payload
+/// (`placeId`, `instanceId`, `joinAttemptId`, `joinAttemptOrigin`,
+/// `browserTrackerId`, `requestType`) -- and nothing native ever received it,
+/// because `Roblox.Hybrid` is the *page's own* object; grepping this whole
+/// file confirms nothing here ever creates or seeds `window.Roblox` in any
+/// form, so there was no native layer underneath it for the call to reach.
+/// This installs one: [`bridge_shim`]'s injected script wraps `launchGame` in
+/// place, so a call still runs the page's own original implementation (its
+/// callback, its analytics, its promise resolution all unchanged) and
+/// *additionally* posts the same JSON payload through `executeRoblox` -- the
+/// bridge this file already owns and already wires end-to-end -- where
+/// `cordial_runtime::webview::forward_bridge_message` recognises the shape
+/// and hands it to `cordial_runtime::deeplink`'s live publish path instead of
+/// the engine's own `signalJavascriptCallback` (see that function's own doc
+/// for why: this payload does not match the "Hybrid Module" JSON-RPC shape
+/// that channel expects, so forwarding it there too would not do anything).
+///
+/// `StartGameParams` (`docs/analysis/app-bridge.md`) was **not** needed:
+/// `deeplink.rs`'s existing `Linking.detectURL` publish already carries a
+/// place id into a real join, and it needed only the instance and a few more
+/// query fields added to carry a specific server too. See
+/// `deeplink::publish_hybrid_game_launch` for what is carried and what is
+/// dropped.
+///
+/// Installed defensively, not assumed present at document-start: the website
+/// defines `Roblox`, and `Roblox.Hybrid`, and `Roblox.Hybrid.Game`, none of
+/// which exist yet when this shim runs. So this watches for each to appear
+/// (a `get`/`set` pair) and wraps `launchGame` the moment `Game` is real. If
+/// it never appears at all, nothing is wrapped and [`HYBRID_LAUNCH_LOG`]
+/// says so -- there is no second guess here, only the one call shape
+/// measured against a real, signed-in Join click.
+///
+/// Verified 5/5 on the diagnosed build (behind the switch this default
+/// replaces) and 3/3 again after the probes around it were trimmed, on two
+/// public games from the Servers list, each landing in the exact requested
+/// `instanceId` per the engine's own join log -- not just the right place.
+/// Play from home and Play from a game page were re-checked both times and
+/// are unaffected, because neither ever goes through a `WebView`. Private
+/// servers remain untested: none reachable from the test account without a
+/// purchase or subscription, both of which are out of scope here.
+fn hybrid_launch_enabled() -> bool {
+    std::env::var_os(HYBRID_LAUNCH_DISABLE_VAR).is_none()
+}
 
 /// Where a policy-approved bridge message goes once it has passed
 /// [`webview_policy::bridge_message_acceptable`] against the page's *current*
@@ -383,6 +477,9 @@ pub fn open(parent: &(impl IsA<gtk4::Widget> + Clone), request: &WindowRequest) 
     if let Some(ua) = &request.user_agent {
         settings.set_user_agent(Some(ua));
     }
+    if console_log_enabled() {
+        settings.set_enable_write_console_messages_to_stdout(true);
+    }
 
     let view = webkit6::WebView::builder()
         .network_session(&network_session)
@@ -413,6 +510,7 @@ pub fn open(parent: &(impl IsA<gtk4::Widget> + Clone), request: &WindowRequest) 
     // page that is allowed to load may redirect, and the address that matters
     // for the bridge is wherever it ended up rather than where it started.
     install_navigation_policy(&view);
+    install_nav_probe(&view);
 
     // **A page opening a second window got none of the above at all, until
     // now.** `window.open()` and a `target="_blank"` link both fire WebKit's
@@ -530,6 +628,100 @@ pub fn open(parent: &(impl IsA<gtk4::Widget> + Clone), request: &WindowRequest) 
                     },
                 );
             }
+
+            // **`CORDIAL_WEBVIEW_CLICK_PROBE=1`: fire a script-driven `.click()`
+            // on the Servers list's own Join control, for issue #40.**
+            //
+            // `CORDIAL_TRACE_BRIDGE` and `CORDIAL_WEBVIEW_BRIDGE_PROBE` together
+            // established, on a real signed-in click, that Join produces no
+            // bridge message, no probe of `window.webkit.messageHandlers` or
+            // `window.__globalRobloxAndroidBridge__` under any property name,
+            // and no thrown error -- the page's own handler, whatever it is,
+            // never touches any of the three things this file can see. That
+            // is consistent with either "the handler is bound to a touch event
+            // our synthetic pointer never sends" or "Join was never going to
+            // call this bridge at all". This distinguishes the first case from
+            // the second, one specific way: a real DOM `.click()` fires
+            // `click` listeners but not `touch*` ones, so if THIS produces a
+            // bridge message where a hardware-driven pointer click never did,
+            // the gap is event-binding, not the page's own intent.
+            //
+            // Scoped to a leaf node whose own text is exactly "Join" AND whose
+            // ancestry (within 6 levels) also carries "of N people max" --
+            // text that only appears on a server-row card. A bare `/join/i`
+            // search would also match the home page's own promotional "Join"
+            // button on an unrelated experience banner and a paid
+            // subscription's own "Join" control on a monetised page; both are
+            // web content this same code path renders, and clicking either
+            // for a diagnostic would be the exact unwanted side effect this
+            // scoping exists to rule out. Off by default, and only ever
+            // dispatches a `click`, never a purchase or a form submission.
+            // Runs on the WebView's own `load-changed == Finished`, which is
+            // the initial document load -- but the Servers list's own rows
+            // arrive later, from an async fetch the popup makes after that
+            // (measured directly: the popup shows its own "Loading" text at
+            // `Finished` time, and the rows are not there yet). A first
+            // version of this returned a Promise from an `async` IIFE meaning
+            // to have `evaluate_javascript` await it; measured directly, this
+            // WebKitGTK binding does not support that and reports "Unsupported
+            // result type" instead of waiting. So the wait is a plain
+            // Rust-side retry instead: five attempts, 1.5s apart, each a
+            // synchronous, fire-and-forget find-and-click. `attempts_left`
+            // only gates how many *more* ticks fire after one that found
+            // nothing; a click, once sent, is not retried.
+            if std::env::var_os("CORDIAL_WEBVIEW_CLICK_PROBE").is_some() {
+                const CLICK_PROBE: &str = r#"(() => {
+  const candidates = Array.from(document.querySelectorAll("*")).filter((el) => {
+    return el.children.length === 0 && (el.textContent || "").trim() === "Join";
+  });
+  for (const el of candidates) {
+    let node = el, onCard = false;
+    for (let i = 0; i < 6 && node; i++, node = node.parentElement) {
+      if (/of\s+\d+\s+people max/i.test(node.textContent || "")) { onCard = true; break; }
+    }
+    if (onCard) {
+      el.click();
+      return "clicked a server-row Join element";
+    }
+  }
+  return `no server-row Join element found yet (${candidates.length} bare "Join" text node(s) on the page)`;
+})()"#;
+                // Retries are scheduled from *inside* the completion callback,
+                // once this attempt's result is known -- scheduling them
+                // right after firing `evaluate_javascript` (which is
+                // fire-and-forget) would race its own async result and could
+                // schedule a follow-up attempt that clicks Join a second time
+                // after the first attempt already succeeded.
+                fn tick(v: webkit6::WebView, attempts_left: u32) {
+                    v.evaluate_javascript(CLICK_PROBE, None, None, gtk4::gio::Cancellable::NONE, {
+                        let v = v.clone();
+                        move |r| {
+                            let found = matches!(&r, Ok(value) if value.to_str().starts_with("clicked"));
+                            match &r {
+                                Ok(value) => eprintln!(
+                                    "[webview] click probe (CORDIAL_WEBVIEW_CLICK_PROBE=1): {}",
+                                    value.to_str()
+                                ),
+                                Err(e) => eprintln!("[webview] click probe could not run: {e}"),
+                            }
+                            if found || r.is_err() {
+                                return;
+                            }
+                            if attempts_left == 0 {
+                                eprintln!(
+                                    "[webview] click probe: giving up after 5 attempts over ~7.5s"
+                                );
+                                return;
+                            }
+                            glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(1500),
+                                move || tick(v, attempts_left - 1),
+                            );
+                        }
+                    });
+                }
+                tick(v.clone(), 4);
+            }
         });
     });
 
@@ -616,17 +808,351 @@ pub fn open(parent: &(impl IsA<gtk4::Widget> + Clone), request: &WindowRequest) 
 /// Recorded because it is an appealing theory that costs a day: it explains
 /// an intermittent symptom neatly and is wrong.
 fn bridge_shim() -> String {
-    format!(
-        r#"(() => {{
-  "use strict";
-  const handlers = window.webkit && window.webkit.messageHandlers;
-  const handler = handlers && handlers.{a};
-  if (!handler) {{ return; }}
-  const bridge = {{}};
-  Object.defineProperty(bridge, "{a}", {{
+    // Assembled and injected **before** `probe_prelude` below. The two used
+    // to fight over `window.Roblox` when both were on -- `BRIDGE_PROBE` once
+    // installed its own `get`/`set` pair on the same property -- but that
+    // wrapping is gone (it found the `Roblox.Hybrid.Game.launchGame` contract
+    // this file now implements directly, and keeping two independent
+    // watchers on one page object after the contract was known was a trap
+    // for the next person to touch this file, not a diagnostic worth
+    // shipping). `probe_prelude` no longer touches `window.Roblox` at all,
+    // so the ordering here is no longer load-bearing between the two; kept
+    // as the injection order regardless, since there is no reason to change
+    // it now that it does not matter.
+    let hybrid_launch_prelude = if hybrid_launch_enabled() {
+        format!(
+            r#"
+  const __cordialHybridLog = (text) => {{
+    try {{
+      const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.{log};
+      if (h) h.postMessage(text);
+    }} catch (_) {{ /* the fix must never be the reason the page breaks */ }}
+  }};
+  let __cordialHybridArmed = false;
+  const __cordialTryIntercept = (hybrid) => {{
+    try {{
+      if (!hybrid || typeof hybrid !== "object") {{ return false; }}
+      const game = hybrid.Game;
+      if (!game || typeof game.launchGame !== "function") {{ return false; }}
+      if (game.launchGame.__cordialIntercepted) {{ __cordialHybridArmed = true; return true; }}
+      const original = game.launchGame;
+      // Runs the page's own `launchGame` exactly as before -- its callback,
+      // its analytics, its own promise resolution -- and additionally posts
+      // the identical JSON payload through `executeRoblox`, the bridge this
+      // file already owns end-to-end. This is Cordial implementing the layer
+      // the page is already calling, not a patch to the page's own code: the
+      // original function is never removed, only wrapped.
+      const intercepted = function(payload, callback) {{
+        try {{
+          const bridge = window.__globalRobloxAndroidBridge__;
+          // **Measured, not assumed:** round 6's own capture logged this
+          // argument as a JSON-quoted string, which looked like proof it
+          // always arrives pre-stringified -- but that capture went through
+          // the diagnostic probe's own `__cordialDescribeArg`, which calls
+          // `JSON.stringify` on anything that is not *already* a string, so
+          // an object argument and a string argument were indistinguishable
+          // in that log. A live call here, checked with a direct `typeof`,
+          // arrived as a plain object, not a string. `executeRoblox` needs a
+          // string (its own implementation calls `JSON.parse` on it), so
+          // both shapes are handled rather than assuming either.
+          let json = null;
+          if (typeof payload === "string") {{
+            json = payload;
+          }} else if (payload && typeof payload === "object") {{
+            try {{ json = JSON.stringify(payload); }} catch (_) {{ json = null; }}
+          }}
+          if (bridge && typeof bridge.executeRoblox === "function" && json !== null) {{
+            bridge.executeRoblox(json);
+          }} else {{
+            __cordialHybridLog(
+              "launchGame called but the bridge was not callable (bridge=" + typeof bridge +
+              ", executeRoblox=" + (bridge && typeof bridge.executeRoblox) +
+              ", payload=" + typeof payload + ")"
+            );
+          }}
+        }} catch (e) {{
+          // Logged, not swallowed silently -- AGENTS.md's rule against a stub
+          // that lies applies here exactly: a call that looks like it
+          // reached the bridge but actually threw must not read the same as
+          // one that succeeded.
+          __cordialHybridLog("launchGame's own bridge post threw: " + String(e && e.message));
+        }}
+        return original.apply(this, arguments);
+      }};
+      intercepted.__cordialIntercepted = true;
+      game.launchGame = intercepted;
+      __cordialHybridArmed = true;
+      __cordialHybridLog("intercepted Roblox.Hybrid.Game.launchGame");
+      return true;
+    }} catch (e) {{
+      __cordialHybridLog("could not intercept Roblox.Hybrid.Game.launchGame: " + String(e && e.message));
+      return false;
+    }}
+  }};
+  // `Hybrid` on the `Roblox` object gets the identical present-or-watch
+  // treatment `Roblox` itself gets below, one level in: the website assigns
+  // `Roblox` as one object literal with `Hybrid` already inside it in every
+  // run measured so far, so the immediate check almost always succeeds --
+  // but "almost always" is exactly the case this defends against, not the
+  // common one.
+  //
+  // **Every backing store below is a closure-captured variable, never
+  // `this.<something>`.** Measured directly on 2026-09-18: a first version
+  // stored the watched value on `this` inside the getter (`this.
+  // __cordialRobloxValue`), and `bundleVerifier.js` -- the same script round
+  // 5 already found sensitive to exactly this kind of accessor -- calls the
+  // installed getter with a receiver that is not `window`, or with none at
+  // all, throwing `TypeError: undefined is not an object (evaluating
+  // 'this.__cordialRobloxValue')` from inside the getter every time it did.
+  // The diagnostic probe's own equivalent code never had this bug because it
+  // takes a different shape on write (it replaces the accessor with a plain
+  // data property immediately, so there is no getter left for anything to
+  // call oddly); this needs the accessor to persist so a *later* read still
+  // reports through it, so the fix is to stop depending on `this` at all.
+  const __cordialArmHybrid = (roblox) => {{
+    if (!roblox || typeof roblox !== "object") {{ return; }}
+    if (__cordialTryIntercept(roblox.Hybrid)) {{ return; }}
+    try {{
+      const hdesc = Object.getOwnPropertyDescriptor(roblox, "Hybrid");
+      if (!hdesc || hdesc.configurable) {{
+        let hybridValue = hdesc ? hdesc.value : undefined;
+        Object.defineProperty(roblox, "Hybrid", {{
+          configurable: true,
+          get() {{ return hybridValue; }},
+          set(v) {{ hybridValue = v; __cordialTryIntercept(v); }},
+        }});
+      }}
+    }} catch (e) {{
+      __cordialHybridLog("could not watch Roblox.Hybrid for later assignment: " + String(e && e.message));
+    }}
+  }};
+  try {{
+    const rdesc = Object.getOwnPropertyDescriptor(window, "Roblox");
+    if (rdesc && "value" in rdesc && rdesc.value) {{
+      __cordialArmHybrid(rdesc.value);
+    }} else if (!rdesc) {{
+      let robloxValue;
+      Object.defineProperty(window, "Roblox", {{
+        configurable: true,
+        get() {{ return robloxValue; }},
+        set(v) {{ robloxValue = v; __cordialArmHybrid(v); }},
+      }});
+    }} else {{
+      __cordialHybridLog("window.Roblox already has its own accessor; not watching it");
+    }}
+  }} catch (e) {{
+    __cordialHybridLog("could not watch window.Roblox: " + String(e && e.message));
+  }}
+  setTimeout(() => {{
+    if (!__cordialHybridArmed) {{
+      __cordialHybridLog("Roblox.Hybrid.Game.launchGame never appeared within 5s; not installed");
+    }}
+  }}, 5000);
+"#,
+            log = HYBRID_LAUNCH_LOG,
+        )
+    } else {
+        String::new()
+    };
+    // The probe adds a `post` helper and wraps `window.webkit.messageHandlers`
+    // itself, so it has to run before the plain lookup below, and both live in
+    // one script -- two separate `UserScript`s at the same injection point run
+    // in registration order, but keeping the read-then-wrap sequencing in one
+    // string is the only way to be sure the wrap happens first without relying
+    // on that ordering guarantee. See [`bridge_probe_enabled`]'s doc for why
+    // this exists and what it reports.
+    let probe_prelude = if bridge_probe_enabled() {
+        format!(
+            r#"
+  const __cordialProbePost = (kind, detail) => {{
+    try {{
+      const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.{probe};
+      if (h) h.postMessage(JSON.stringify({{kind, detail}}));
+    }} catch (_) {{ /* the probe must never be the thing that breaks the page */ }}
+  }};
+  window.addEventListener("error", (e) => {{
+    __cordialProbePost("window.onerror", {{
+      message: String(e.message), filename: String(e.filename),
+      lineno: e.lineno, colno: e.colno,
+      stack: (e.error && e.error.stack) ? String(e.error.stack) : null,
+    }});
+  }});
+  window.addEventListener("unhandledrejection", (e) => {{
+    __cordialProbePost("unhandledrejection", {{
+      reason: (e.reason && e.reason.stack) ? String(e.reason.stack) : String(e.reason),
+    }});
+  }});
+  // `window.webkit.messageHandlers` is WebKit's own readonly IDL attribute,
+  // not a plain data property -- reassigning it while "use strict" is active
+  // (the whole shim runs strict, from the IIFE's own top line) throws a
+  // TypeError, uncaught, right here, before a single line below this block
+  // ever runs. Measured directly on 2026-09-18: with no try/catch, the very
+  // first probe message on every popup was a same-origin-scrubbed
+  // `{{"message":"Script error.","filename":"","lineno":0,"colno":0}}` --
+  // the signature WebKit gives an exception thrown inside a UserScript's own
+  // isolated world -- and the shim's remaining lines, including the bridge
+  // install below, never executed at all. A follow-up Join click on that same
+  // popup then produced `free(): corrupted unsorted chunks` in Cordial's own
+  // log and the client stopped answering its devctl socket. Whether that
+  // second failure is this throw or WebKitGTK's own handling of a Proxy over
+  // a native host object is not established -- but an uncaught throw here is
+  // reason enough on its own to guard it, since it was silently disabling the
+  // bridge this switch exists to diagnose. `write` on the descriptor is
+  // checked first so the common case (a build where this rejects) never
+  // pays for a throw/catch at all.
+  if (window.webkit && window.webkit.messageHandlers) {{
+    const desc = Object.getOwnPropertyDescriptor(window.webkit, "messageHandlers");
+    const replaceable = !desc || desc.writable || typeof desc.set === "function";
+    if (replaceable) {{
+      try {{
+        window.webkit.messageHandlers = new Proxy(window.webkit.messageHandlers, {{
+          get(target, prop, receiver) {{
+            const value = Reflect.get(target, prop, receiver);
+            if (prop !== "{probe}") {{
+              __cordialProbePost("messageHandlers.get", {{ prop: String(prop), present: value !== undefined }});
+            }}
+            return value;
+          }},
+          has(target, prop) {{
+            __cordialProbePost("messageHandlers.has", {{ prop: String(prop) }});
+            return Reflect.has(target, prop);
+          }},
+        }});
+      }} catch (e) {{
+        __cordialProbePost("messageHandlers.wrap-failed", {{ message: String(e && e.message) }});
+      }}
+    }} else {{
+      __cordialProbePost("messageHandlers.wrap-skipped", {{ reason: "not configurable/writable on this build" }});
+    }}
+  }}
+  // Widened for issue #40 after `executeRoblox`/`RobloxWKHybrid` and
+  // `__globalRobloxAndroidBridge__` all came back silent on a real Join
+  // click: the analytics beacon Join fires
+  // (`evt=playGameClicked`/`gamePlayIntent`, then
+  // `privateServerJoin_Success`) proves the page believes it handed the join
+  // off *successfully*, which rules out a dropped call and points at a
+  // contract this file had never named at the time. That contract is now
+  // known and implemented directly by [`hybrid_launch_enabled`]
+  // (`Roblox.Hybrid.Game.launchGame`) -- found by watching `window.Roblox`
+  // itself here, one level deep, until the page's own call to it was
+  // visible. That `Roblox`/`Hybrid`/`Game`-specific wrapping is gone from
+  // this probe now that the contract it found is shipped as the fix: keeping
+  // two independent watchers on one page object, with the silent-conflict
+  // wart the two used to have (see [`bridge_shim`]'s own doc), would be a
+  // trap for the next person to read this file rather than a diagnostic
+  // worth keeping. What is still here is the generic candidate-name sweep
+  // below, which answers a different, still-open question -- whether the
+  // page ever reaches for some *other* native-sounding global this file has
+  // not yet named.
+  //
+  // Every name below is watched two ways: a name currently absent gets a
+  // logging accessor installed in its place (a read is reported instead of
+  // silently coming back `undefined`, which is the whole point -- a page
+  // probing for a name Cordial never registered would otherwise look
+  // identical to one not probing at all); a name already present gets
+  // wrapped in a `Proxy` the same guarded way `messageHandlers` is above,
+  // so reads of *its* properties are visible too.
+  {{
+    const CANDIDATES = [
+      "RobloxWKHybrid", "AndroidBridge", "JSBridge", "ReactNativeWebView",
+      "AndroidInterface", "NativeInterface", "WebViewJavascriptBridge",
+      "Bridge", "external",
+    ];
+    // **The getter below must carry a setter, and this is not optional.**
+    // Measured directly on 2026-09-18: a first version installed a bare
+    // `get()` with no `set()` on every currently-absent name, including
+    // `window.Roblox` below. `window.Roblox` is not a native candidate at
+    // all -- it is the page's *own* namespace object, initialised by its own
+    // bootstrap with something in the shape of `Roblox = Roblox || {{}}`. A
+    // getter with no setter makes that assignment a silent no-op in
+    // non-strict code (the property has no `[[Set]]`, so nothing is stored,
+    // and the getter goes on returning `undefined` forever after). Every
+    // later reference the page's own bootstrap makes to `Roblox.<anything>`
+    // then throws `TypeError: undefined is not an object`, and the page dies
+    // rendering a blank popup -- which round 4 first read as "the site
+    // serves a broken bundle under an Android UA" before noticing the same
+    // crash also now hit the default Windows identity, which round 3 had
+    // exercised repeatedly with no such failure. The break was never the
+    // page or the UA; it was this probe's own missing setter, installed one
+    // round earlier. Every name below gets a real setter now: it replaces
+    // the accessor with a plain, writable, configurable data property
+    // holding whatever the page assigned, so a legitimate write behaves
+    // exactly as it would with no probe installed at all, and is logged
+    // rather than silently allowed to look identical to one that was not.
+    for (const name of CANDIDATES) {{
+      try {{
+        const desc = Object.getOwnPropertyDescriptor(window, name);
+        if (!desc) {{
+          Object.defineProperty(window, name, {{
+            configurable: true,
+            get() {{
+              __cordialProbePost("global.read", {{ name, present: false }});
+              return undefined;
+            }},
+            set(v) {{
+              __cordialProbePost("global.write", {{ name, type: typeof v }});
+              Object.defineProperty(window, name, {{
+                value: v, writable: true, configurable: true, enumerable: true,
+              }});
+            }},
+          }});
+        }} else {{
+          __cordialProbePost("global.present", {{ name, type: typeof desc.value }});
+        }}
+      }} catch (e) {{
+        __cordialProbePost("global.probe-failed", {{ name, message: String(e && e.message) }});
+      }}
+    }}
+    // Free, per the switch's own doc: settles whether a user-agent gate
+    // could be why Join never reaches for any of the above, without needing
+    // to catch a read of it in the act.
+    __cordialProbePost("navigator.userAgent", {{ value: String(navigator.userAgent) }});
+  }}
+"#,
+            probe = BRIDGE_PROBE,
+        )
+    } else {
+        String::new()
+    };
+    let bridge_object = if bridge_probe_enabled() {
+        format!(
+            r#"const bridgeImpl = {{}};
+  Object.defineProperty(bridgeImpl, "{a}", {{
     value: (query) => handler.postMessage(JSON.parse(query)),
     enumerable: true, writable: false, configurable: false
   }});
+  const bridge = new Proxy(bridgeImpl, {{
+    get(target, prop, receiver) {{
+      const value = Reflect.get(target, prop, receiver);
+      __cordialProbePost("globalRobloxAndroidBridge.get", {{ prop: String(prop), present: value !== undefined }});
+      return value;
+    }},
+    has(target, prop) {{
+      __cordialProbePost("globalRobloxAndroidBridge.has", {{ prop: String(prop) }});
+      return Reflect.has(target, prop);
+    }},
+  }});"#,
+            a = BRIDGE_EXECUTE_ROBLOX,
+        )
+    } else {
+        format!(
+            r#"const bridge = {{}};
+  Object.defineProperty(bridge, "{a}", {{
+    value: (query) => handler.postMessage(JSON.parse(query)),
+    enumerable: true, writable: false, configurable: false
+  }});"#,
+            a = BRIDGE_EXECUTE_ROBLOX,
+        )
+    };
+    format!(
+        r#"(() => {{
+  "use strict";
+{hybrid_launch_prelude}
+{probe_prelude}
+  const handlers = window.webkit && window.webkit.messageHandlers;
+  const handler = handlers && handlers.{a};
+  if (!handler) {{ return; }}
+  {bridge_object}
   try {{
     Object.defineProperty(window, "__globalRobloxAndroidBridge__", {{
       value: bridge, enumerable: true, writable: false, configurable: false
@@ -635,6 +1161,19 @@ fn bridge_shim() -> String {
 }})();"#,
         a = BRIDGE_EXECUTE_ROBLOX,
     )
+}
+
+/// `CORDIAL_WEBVIEW_CONSOLE_LOG=1` -- ask WebKitGTK to write the page's own
+/// `console.log`/`warn`/`error` to Cordial's stdout
+/// (`enable-write-console-messages-to-stdout`).
+///
+/// Diagnostic only, for issue #40: if the Join button's own handler throws --
+/// a missing global, a rejected promise -- the page's own console is the
+/// fastest way to see that, faster than guessing at the bridge shape from
+/// outside. Off by default because a page's console output is exactly the
+/// kind of thing that can carry whatever the user was doing, unfiltered.
+fn console_log_enabled() -> bool {
+    std::env::var_os("CORDIAL_WEBVIEW_CONSOLE_LOG").is_some()
 }
 
 /// Register the two bridge handler names and inject [`bridge_shim`] into
@@ -647,6 +1186,19 @@ fn register_bridge(user_content: &webkit6::UserContentManager) {
         if !user_content.register_script_message_handler(handler, None) {
             eprintln!("[webview] could not register the {handler} bridge handler");
         }
+    }
+    // Registered only under the probe switch: a handler nothing ever asks for
+    // is harmless to leave registered, but there is no reason to hand a page
+    // an extra name to enumerate when [`bridge_probe_enabled`] is off.
+    if bridge_probe_enabled() && !user_content.register_script_message_handler(BRIDGE_PROBE, None) {
+        eprintln!("[webview] could not register the {BRIDGE_PROBE} diagnostic handler");
+    }
+    // Independent of `bridge_probe_enabled()` -- see [`hybrid_launch_enabled`]'s
+    // own doc for why the fix's own status reporting cannot depend on the
+    // diagnostic probe being on.
+    if hybrid_launch_enabled() && !user_content.register_script_message_handler(HYBRID_LAUNCH_LOG, None)
+    {
+        eprintln!("[webview] could not register the {HYBRID_LAUNCH_LOG} handler");
     }
 
     // **`TopFrame` is load-bearing, not a leftover.** It pairs with the origin
@@ -680,18 +1232,38 @@ fn register_bridge(user_content: &webkit6::UserContentManager) {
     // is **not** one constant. It is `AllFrames` plus per-frame origin
     // attribution, and this API does not obviously offer the latter.
     //
-    // **That hypothesis is now the less likely of the two live in this file.**
-    // Checked directly against mocktail's own `CreateSurface`
-    // (`third_party/mocktail-webview/mocktail_webview_helper.cc`), a working
-    // reference implementation of this exact button: it also injects its
-    // bridge shim with `WEBKIT_USER_CONTENT_INJECT_TOP_FRAME`, not
-    // `ALL_FRAMES`. A reference that solves this problem and still narrows to
-    // the top frame is evidence the Join control is not hiding in an iframe --
-    // see [`install_popup_handling`] for the gap that same reference
-    // implementation *does* answer and this file, until now, did not.
+    // **Ruled out, not just less likely.** `hybrid_launch_enabled`'s fix
+    // watches `window.Roblox.Hybrid.Game.launchGame` in the top-level
+    // document and it is that call the Join button reaches, directly, with
+    // no bridge post and no message handler involved at all -- confirmed on
+    // a real signed-in Join click, repeatedly. The Join control was never in
+    // an iframe; it calls a plain JS method on the page's own top-level
+    // object, which this `TopFrame` scoping was always going to see. Left in
+    // place because the security reasoning above (a nested frame must never
+    // be judged against the top document's address) holds regardless of this
+    // one button, and `CORDIAL_WEBVIEW_BRIDGE_ALL_FRAMES` remains available
+    // for the next `broken_feature` that does turn out to live in a frame.
+    // `CORDIAL_WEBVIEW_BRIDGE_ALL_FRAMES=1` -- diagnostic only, per the doc
+    // above: this widens injection to every frame with NO per-frame origin
+    // attribution added, so a message from an iframe would still be judged
+    // against the top-level address. That is not a fix to ship; it exists so
+    // issue #40/#34's "does Join live in an iframe" question can be answered
+    // by measurement rather than left as the less-favoured of two guesses.
+    // If this makes Join's bridge message appear, the real fix is `AllFrames`
+    // plus the origin attribution this API does not obviously offer -- not
+    // this switch left on.
+    let frames = if std::env::var_os("CORDIAL_WEBVIEW_BRIDGE_ALL_FRAMES").is_some() {
+        eprintln!(
+            "[webview] CORDIAL_WEBVIEW_BRIDGE_ALL_FRAMES=1: injecting the bridge shim into every \
+             frame, diagnostic-only -- see register_bridge's doc before treating this as a fix"
+        );
+        webkit6::UserContentInjectedFrames::AllFrames
+    } else {
+        webkit6::UserContentInjectedFrames::TopFrame
+    };
     user_content.add_script(&webkit6::UserScript::new(
         &bridge_shim(),
-        webkit6::UserContentInjectedFrames::TopFrame,
+        frames,
         webkit6::UserScriptInjectionTime::Start,
         &[],
         &[],
@@ -716,6 +1288,39 @@ fn wire_bridge_messages(user_content: &webkit6::UserContentManager, view: &webki
         let bridge_view = view.clone();
         user_content.connect_script_message_received(Some(BRIDGE_ROBLOX_WK_HYBRID), move |_manager, value| {
             forward_script_message(&bridge_view, value, BridgeHandler::RobloxWkHybrid);
+        });
+    }
+    // The probe's own channel. Printed directly and unconditionally once a
+    // message arrives -- [`bridge_probe_enabled`] is already the opt-in, the
+    // same way `CORDIAL_TRACE_BRIDGE` and `CORDIAL_WEBVIEW_CONSOLE_LOG` are
+    // their own gates, so there is no second flag to check here.
+    if bridge_probe_enabled() {
+        user_content.connect_script_message_received(Some(BRIDGE_PROBE), move |_manager, value| {
+            let text = value
+                .is_string()
+                .then(|| value.to_string_as_bytes())
+                .flatten()
+                .and_then(|bytes| std::str::from_utf8(bytes.as_ref()).ok().map(str::to_owned));
+            match text {
+                Some(text) => println!("[webview] bridge probe (CORDIAL_WEBVIEW_BRIDGE_PROBE=1): {text}"),
+                None => eprintln!("[webview] bridge probe message arrived in an unexpected shape"),
+            }
+        });
+    }
+    // The fix's own status channel -- install succeeded, or `Roblox.Hybrid.Game`
+    // never appeared at all. Independent of `bridge_probe_enabled()`, same
+    // reasoning as its registration above.
+    if hybrid_launch_enabled() {
+        user_content.connect_script_message_received(Some(HYBRID_LAUNCH_LOG), move |_manager, value| {
+            let text = value
+                .is_string()
+                .then(|| value.to_string_as_bytes())
+                .flatten()
+                .and_then(|bytes| std::str::from_utf8(bytes.as_ref()).ok().map(str::to_owned));
+            match text {
+                Some(text) => println!("[webview] hybrid launch: {text}"),
+                None => eprintln!("[webview] hybrid launch status message arrived in an unexpected shape"),
+            }
         });
     }
 }
@@ -744,6 +1349,29 @@ fn wire_bridge_messages(user_content: &webkit6::UserContentManager, view: &webki
 /// "nobody was listening".
 fn install_navigation_policy(view: &webkit6::WebView) {
     view.connect_decide_policy(|_, decision, kind| {
+        // `Response` decisions (whether to render a fetched response inline
+        // or hand it off, e.g. as a download) were never even logged before
+        // this branch -- the function fell straight through to `return
+        // false` below, which is why a join implemented as "navigate to a
+        // launcher URL and inspect what comes back" would have left no trace
+        // at all. Reported under [`nav_probe_enabled`] only; the decision
+        // itself (`false`, WebKitGTK's own documented default) is
+        // unchanged -- this is visibility, not a new policy.
+        if nav_probe_enabled() && kind == webkit6::PolicyDecisionType::Response {
+            if let Some(resp) = decision.downcast_ref::<webkit6::ResponsePolicyDecision>() {
+                let uri = resp
+                    .response()
+                    .and_then(|r| r.uri())
+                    .map(|u| u.to_string())
+                    .unwrap_or_default();
+                let status = resp.response().map(|r| r.status_code());
+                println!(
+                    "[webview] nav probe (CORDIAL_WEBVIEW_NAV_PROBE=1): decide-policy Response \
+                     uri={uri} status={status:?}"
+                );
+            }
+            return false;
+        }
         if kind != webkit6::PolicyDecisionType::NavigationAction
             && kind != webkit6::PolicyDecisionType::NewWindowAction
         {
@@ -760,6 +1388,21 @@ fn install_navigation_policy(view: &webkit6::WebView) {
             .unwrap_or_default();
         let verdict = webview_policy::evaluate(&uri);
         if verdict.allowed {
+            // The refused branch below has always logged unconditionally --
+            // AGENTS.md's rule that a refusal must never look like silence.
+            // An *allowed* navigation had no equivalent, so a join that
+            // navigates somewhere Cordial's own policy happily accepts (its
+            // own `roblox.com` origin, say, via a URL this file never
+            // thought to name) would still look exactly like nothing
+            // happened. Gated because most navigations are unremarkable and
+            // logging all of them unconditionally would just be noise on
+            // every ordinary page load.
+            if nav_probe_enabled() {
+                println!(
+                    "[webview] nav probe (CORDIAL_WEBVIEW_NAV_PROBE=1): decide-policy {kind:?} \
+                     ALLOWED uri={uri}"
+                );
+            }
             decision.use_();
         } else {
             let what = if kind == webkit6::PolicyDecisionType::NewWindowAction {
@@ -777,6 +1420,177 @@ fn install_navigation_policy(view: &webkit6::WebView) {
     });
 }
 
+/// `CORDIAL_WEBVIEW_NAV_PROBE=1` -- off by [`nav_probe_enabled`], its own
+/// gate the same shape as [`bridge_probe_enabled`]'s.
+///
+/// Written for issue #40 after `CORDIAL_WEBVIEW_BRIDGE_PROBE` established, on
+/// a real signed-in Join click, that the page reads no property on
+/// `window.webkit.messageHandlers` or `window.__globalRobloxAndroidBridge__`
+/// at all, and throws nothing. That rules out a bridge call under a
+/// misspelled or unregistered handler name; it does not say where the click
+/// goes instead. Two candidates remain, both invisible to the bridge probe by
+/// construction because neither touches the bridge:
+///
+/// - **A navigation**, whether `window.location`, a `target="_blank"` link, or
+///   a custom scheme such as `roblox://` or `roblox-player://` carrying the
+///   launcher's query. `crates/cordial-runtime/src/deeplink.rs` already
+///   refuses a deep link carrying `accessCode`, `linkCode`,
+///   `reservedServerAccessCode`, `gameId` or `jobId`
+///   (`docs/analysis/deep-links.md`) -- but that refusal is downstream of a
+///   scheme actually reaching Cordial's own handling. If WebKit's own
+///   `decide-policy` never fires for whatever scheme this is, or fires and
+///   is refused by [`webview_policy::evaluate`] (which knows nothing about a
+///   `roblox://`-shaped scheme and would refuse it exactly the way it
+///   refuses anything non-`https`), the refusal is either invisible or is
+///   the bug, and either way it explains total silence at the reporter's end
+///   -- a refusal this file already logs unconditionally, so this switch is
+///   what tells the two apart: no line at all (WebKit dropped it before
+///   `decide-policy`) versus a `blocked navigation` line that was there all
+///   along and nobody had a reason to grep for.
+/// - **A network request** -- a join or launcher API call whose response
+///   this file has never once inspected.
+///
+/// This does not change what Cordial *does* with any of the above, only what
+/// it prints: every `load-changed` transition with the view's current URI,
+/// and every subresource request's URI plus how it ended
+/// (`finished`/`failed`, and the response status where WebKit hands one
+/// back). [`install_navigation_policy`] carries the `decide-policy` half of
+/// this, gated the same way, because the two signals are two branches of one
+/// question and belong next to each other rather than duplicated here.
+fn nav_probe_enabled() -> bool {
+    std::env::var_os("CORDIAL_WEBVIEW_NAV_PROBE").is_some()
+}
+
+fn install_nav_probe(view: &webkit6::WebView) {
+    if !nav_probe_enabled() {
+        return;
+    }
+    // Confirms the premise [`install_scheme_probe`] relies on: that *this*
+    // view answers to the same `WebContext` the scheme handlers are
+    // registered on, so "no scheme request arrived" means the page never
+    // tried one rather than that this file registered a handler on a
+    // context nothing here actually uses. Compared by pointer identity
+    // (`ToGlibPtr`) rather than trusting a language-level `==`, since
+    // nothing in this file had previously checked whether `WebContext`
+    // implements that meaningfully.
+    match (view.web_context(), webkit6::WebContext::default()) {
+        (Some(a), Some(b)) => {
+            use glib::translate::ToGlibPtr;
+            let same = ToGlibPtr::<*mut webkit6::ffi::WebKitWebContext>::to_glib_none(&a).0
+                == ToGlibPtr::<*mut webkit6::ffi::WebKitWebContext>::to_glib_none(&b).0;
+            println!(
+                "[webview] nav probe (CORDIAL_WEBVIEW_NAV_PROBE=1): this view's WebContext is \
+                 {} the default one the scheme handlers are registered on",
+                if same { "the same as" } else { "DIFFERENT FROM" }
+            );
+        }
+        (view_ctx, default_ctx) => println!(
+            "[webview] nav probe (CORDIAL_WEBVIEW_NAV_PROBE=1): WebContext check inconclusive \
+             (view has one: {}, default exists: {})",
+            view_ctx.is_some(),
+            default_ctx.is_some()
+        ),
+    }
+    view.connect_load_changed(|v, event| {
+        let uri = v.uri().map(|u| u.to_string()).unwrap_or_default();
+        println!(
+            "[webview] nav probe (CORDIAL_WEBVIEW_NAV_PROBE=1): load-changed {event:?} uri={uri}"
+        );
+    });
+    // One subresource can fire many of these (a redirect chain, a retried
+    // fetch), so each request gets its own `uri` captured into its own
+    // `finished`/`failed` closures rather than re-reading `resource.uri()`
+    // later -- WebKit reuses the same `WebResource` object across a
+    // redirect and updates its `uri` property in place, which would report
+    // the *final* address for a request that actually started somewhere
+    // this file needed to see.
+    view.connect_resource_load_started(|_v, resource, request| {
+        let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+        println!(
+            "[webview] nav probe (CORDIAL_WEBVIEW_NAV_PROBE=1): resource-load-started uri={uri}"
+        );
+        resource.connect_finished({
+            let uri = uri.clone();
+            move |r| {
+                let status = r.response().map(|resp| resp.status_code());
+                println!(
+                    "[webview] nav probe (CORDIAL_WEBVIEW_NAV_PROBE=1): resource finished \
+                     uri={uri} status={status:?}"
+                );
+            }
+        });
+        resource.connect_failed(move |_r, err| {
+            println!(
+                "[webview] nav probe (CORDIAL_WEBVIEW_NAV_PROBE=1): resource FAILED uri={uri} \
+                 error={err}"
+            );
+        });
+    });
+    install_scheme_probe();
+}
+
+/// Register `roblox`/`roblox-player` as handled URI schemes on the process's
+/// **default** `WebContext` -- every `WebView` this module builds uses it,
+/// since none of them is constructed with a `web-context` of its own -- so a
+/// scheme WebKit would otherwise refuse before it ever reaches a signal this
+/// file can see instead arrives here, in full, as a
+/// `WebKitURISchemeRequest`.
+///
+/// Written for the coordinator's own reading of round 4: `navigator.userAgent`
+/// came back as the **desktop** string (`ROBLOX Windows App ... Desktop`),
+/// because `native/init_params.cpp`'s `device_identity()` defaults to
+/// `PcWindows11` and nothing in this session had set
+/// `CORDIAL_DEVICE_PROFILE`. The desktop roblox.com does not call a
+/// JavaScript bridge to join at all -- it hands off to the installed Roblox
+/// Player through a protocol-handler URL, historically `roblox-player://`
+/// carrying `placeLauncherUrl`, and reports success to its own analytics
+/// immediately, which is exactly the `privateServerJoin_Success` beacon round
+/// 3 measured with no bridge read anywhere near it. `decide-policy` on the
+/// main frame saw nothing because the attempt, if there is one, plausibly
+/// never becomes a main-frame `NavigationAction` at all -- a hidden iframe's
+/// `src`, or a scheme WebKit does not recognise being resolved before
+/// `create`/`decide-policy` ever fire for it. Registering the scheme
+/// ourselves is what makes either case arrive somewhere loggable regardless.
+///
+/// `finish_error` on every request, immediately: there is nothing to load --
+/// this scheme has no real content on Cordial, and the request exists only
+/// to be observed. Leaving it unfinished would leave whatever made the
+/// request (an iframe, most likely) waiting indefinitely.
+///
+/// One-time per process, not per-view: `register_uri_scheme` operates on the
+/// `WebContext`, which is shared, and registering the same scheme twice is
+/// at best redundant and at worst WebKitGTK's own guess at what "the second
+/// registration wins" means -- untested here, so avoided outright.
+fn install_scheme_probe() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(ctx) = webkit6::WebContext::default() else {
+            eprintln!(
+                "[webview] nav probe (CORDIAL_WEBVIEW_NAV_PROBE=1): no default WebContext, \
+                 cannot register roblox/roblox-player scheme handlers"
+            );
+            return;
+        };
+        for scheme in ["roblox", "roblox-player"] {
+            ctx.register_uri_scheme(scheme, |request| {
+                let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+                println!(
+                    "[webview] nav probe (CORDIAL_WEBVIEW_NAV_PROBE=1): scheme request uri={uri}"
+                );
+                let mut err = glib::Error::new(
+                    gtk4::gio::IOErrorEnum::Failed,
+                    "Cordial's nav probe observed this request; it is not actually handled",
+                );
+                request.finish_error(&mut err);
+            });
+        }
+        println!(
+            "[webview] nav probe (CORDIAL_WEBVIEW_NAV_PROBE=1): registered scheme handlers for \
+             roblox, roblox-player"
+        );
+    });
+}
+
 /// Answer WebKit's `create` signal on `view`, fired when a page inside it
 /// calls `window.open()` or follows a `target="_blank"` link.
 ///
@@ -786,19 +1600,16 @@ fn install_navigation_policy(view: &webkit6::WebView) {
 /// `create` is WebKitGTK's own equivalent -- the default return is nothing,
 /// so a page that opens a window this way gets exactly that: no view is
 /// built, nothing is logged, and the click that triggered it is
-/// indistinguishable from one that did nothing at all. That is a plausible
+/// indistinguishable from one that did nothing at all. That was a plausible
 /// account of issue #40 ("pressing Join in the Servers list does nothing")
-/// distinct from the iframe hypothesis [`register_bridge`] records and
-/// weighs against: it does not require the Join control to be in a nested
-/// frame at all, only that whatever it does to join a server opens a second
-/// window rather than calling the existing bridge.
-///
-/// **Still not established which of the two this is, or whether it is
-/// either.** Nothing in this session ran a signed-in client to watch which
-/// signal actually fires when Join is pressed (AGENTS.md's rule on test
-/// accounts). What is established is that this path was entirely unhandled,
-/// which on its own is a bug worth fixing regardless of whether it explains
-/// that issue: a `broken_feature` exactly as this module's doc describes one.
+/// once, weighed against the iframe hypothesis [`register_bridge`] records --
+/// **both are now ruled out.** `hybrid_launch_enabled`'s fix established
+/// what Join actually does: it calls `Roblox.Hybrid.Game.launchGame` as a
+/// plain method on the page's own top-level object, no second window and no
+/// nested frame involved. This `create`-signal gap is still worth having
+/// fixed -- a page opening a real popup (sign-in, a payment step) needs one
+/// with the same bridge and policy a top-level window gets, which is what
+/// this function is for -- it is simply no longer issue #40/#34's own cause.
 ///
 /// Modelled on mocktail's `OnCreatePopup`/`CreateSurface`
 /// (`third_party/mocktail-webview/mocktail_webview_helper.cc`, Apache-2.0),
@@ -892,14 +1703,18 @@ fn create_popup_view(
     // offers this one returning `Option<webkit6::Settings>`. Left bare it fails
     // to compile with E0034, and the `Some(..)` pattern below only makes sense
     // for the WebKit one.
-    if let (Some(ua), Some(settings)) =
-        (&user_agent, webkit6::prelude::WebViewExt::settings(&view))
-    {
-        settings.set_user_agent(Some(ua));
+    if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
+        if let Some(ua) = &user_agent {
+            settings.set_user_agent(Some(ua));
+        }
+        if console_log_enabled() {
+            settings.set_enable_write_console_messages_to_stdout(true);
+        }
     }
 
     wire_bridge_messages(&user_content, &view);
     install_navigation_policy(&view);
+    install_nav_probe(&view);
     install_popup_handling(&view, chrome_parent.clone(), user_agent);
 
     let header = adw::HeaderBar::new();

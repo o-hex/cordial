@@ -578,3 +578,73 @@ no dependencies, read-only:
 Both scripts are throwaway investigation aids in the session scratch directory,
 not added to the repository — this task was investigation-only and no code was
 modified, per the instructions it was given.
+
+---
+
+## 9. A second, JS-side bridge: `Roblox.Hybrid.Game.launchGame` (issue #40/#34)
+
+Everything above is the *native* app bridge, reached from Java/JNI once a game
+is already running inside the engine. There is a second, unrelated contract
+one layer up, in the web page roblox.com serves into Cordial's own in-app
+`WebView` for the Servers-list popup — found by watching `window.Roblox` from
+the page's own JavaScript rather than by reading the dex, because this
+contract is the page's, not the engine's.
+
+**The call.** A game's Servers list renders each server as a card with a
+"Join" button. Pressing it calls, verbatim:
+
+```text
+Roblox.Hybrid.Game.launchGame(payload, callback)
+```
+
+`payload` arrives as either a JSON string or a plain JS object — both were
+observed on real clicks, and the field is genuinely one or the other, not
+always pre-stringified as an early capture through a `JSON.stringify`-based
+logger appeared to show. Its fields, all observed on real signed-in clicks
+against two different games:
+
+```text
+{
+  "requestType": "RequestGameJob",
+  "placeId": "<numeric place id>",
+  "instanceId": "<UUID of one specific running server>",
+  "isPlayTogetherGame": false,
+  "browserTrackerId": "<numeric>",
+  "joinAttemptId": "<UUID>",
+  "joinAttemptOrigin": "publicServerListJoin"
+}
+```
+
+`callback` is a real JavaScript closure the page defines (observed as
+something in the shape of `function(){n.resolve(t)}`), never a plain
+serialisable value — confirming this is genuine page-side JS with its own
+promise/resolve machinery, not a native stub answering to a fixed shape.
+
+**Nothing native ever received this call**, on any build before issue
+#40/#34's fix: `Roblox.Hybrid` is the page's *own* namespace object,
+assigned by the page's own bootstrap, and grepping this whole codebase
+confirms nothing in Cordial ever created or seeded `window.Roblox` in any
+form. There was no native layer underneath the call for it to reach, which
+is the entire reason pressing Join did nothing.
+
+**`StartGameParams` (§2.2) was not needed for this, and was deliberately not
+built.** The fix (`crates/cordial-shell/src/webview.rs`,
+`crates/cordial-runtime/src/webview.rs`,
+`crates/cordial-runtime/src/deeplink.rs::publish_hybrid_game_launch`) wraps
+`launchGame` in the page's own JS, forwards the same payload through the
+`executeRoblox` bridge this project already had end-to-end, and republishes
+it as an extended `Linking.detectURL` message — the same publish
+`docs/analysis/deep-links.md` §6 already measured producing a real
+`Game.launch`. That path takes a `placeId` and a handful of named query
+fields; it does not take an AutoValue-built native struct, and building one
+would have meant guessing at a native calling convention this session had no
+call site for. `requestType` and `isPlayTogetherGame` are dropped on
+delivery: neither has a field anywhere in `StartGameParams`'s own list (§2.2)
+or in the engine's own link grammar for either to have gone into if a native
+struct had been built instead.
+
+Verified 8/8 across two rounds (5/5 with diagnostics attached, 3/3 again with
+them removed) on public servers from the Servers list, each landing in the
+exact `instanceId` requested per the engine's own join log. Private servers
+remain untested — none was reachable from the signed-in test account without
+a purchase.

@@ -38,7 +38,9 @@ Experimental. Full table in [`docs/status.md`](docs/status.md).
 
 **Works:** loading an experience, sign-in, keyboard and mouse, camera, text
 entry with IME preedit, audio, voice chat, pointer capture, fullscreen, two
-accounts side by side, asset overlays.
+accounts side by side, asset overlays, joining a public server from a game's
+Servers list ([#40](https://github.com/luohoa97/cordial/issues/40)). Private
+servers are untested — none was reachable without a purchase.
 
 **Known broken**, with issue numbers:
 
@@ -49,7 +51,6 @@ accounts side by side, asset overlays.
 | Fullscreen freezes; exiting it crashes | [#39](https://github.com/luohoa97/cordial/issues/39) |
 | Touchscreen input crashes immediately | [#36](https://github.com/luohoa97/cordial/issues/36) |
 | SIGSEGV on launch on some machines | [#35](https://github.com/luohoa97/cordial/issues/35) |
-| Join does nothing in a game's Servers list | [#40](https://github.com/luohoa97/cordial/issues/40) |
 | Client can hang on exit | [#52](https://github.com/luohoa97/cordial/issues/52) |
 | Pointer lock unconfirmed on Hyprland, cursor drifts | [#56](https://github.com/luohoa97/cordial/issues/56) |
 | Keyboard stops after another app takes focus | [#31](https://github.com/luohoa97/cordial/issues/31) |

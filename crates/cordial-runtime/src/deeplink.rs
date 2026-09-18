@@ -360,6 +360,21 @@ pub fn validate(raw: &str) -> Result<JoinUrl, String> {
 /// have to be enumerated from names nothing here has measured, and every kind
 /// worth refusing carries one of these or no `placeId` at all, so the parameters
 /// answer the question the request kind would have.
+///
+/// **This still guards exactly the case it always did, and is still right to.**
+/// [`translate`] only ever had a bare `placeId` to work with -- a browser
+/// click hands over a `roblox-player:` link, and the *only* thing this file
+/// could pull out of it was the place, never a specific server, so carrying
+/// one of these alone would have joined the wrong game silently. Issue #40's
+/// round 6 found a second, later path in ([`publish_hybrid_game_launch`])
+/// where the whole query the page actually sent — including a real
+/// `instanceId` naming one server — arrives intact, because it comes from
+/// intercepting a JS call rather than reparsing a launcher URL. That path
+/// carries the instance forward instead of refusing on it, precisely because
+/// nothing is lost there the way it would be here. The refusal below stays
+/// exactly as strict as it was for the path it was written for; it does not
+/// need to loosen for a different path to stop losing what this one always
+/// lost.
 const SERVER_SELECTING: [&str; 5] =
     ["accesscode", "linkcode", "reservedserveraccesscode", "gameid", "jobid"];
 
@@ -820,6 +835,132 @@ pub fn tick() {
             "[deeplink] the app shell is up and nothing asked to launch an experience — this \
              link did not reach an experience. Signing in is required before a join can proceed"
         ),
+    }
+}
+
+/// The loaded engine, kept for [`publish_hybrid_game_launch`] to reach --
+/// [`deliver`]'s own `lib` argument only lives as long as the cold-start call
+/// that has it, and a live join click arrives long after that call returns.
+/// Set once, from `load.rs`, at the same point `cordial_runtime::webview::arm`
+/// is -- both exist so something resolved once at startup can be reached from
+/// a webview bridge callback arbitrarily later, the same shape for the same
+/// reason.
+/// A `Mutex`, not a `OnceLock`, for the same reason [`ARMED`] above is one and
+/// not the other: `Library` wraps a bare `*mut c_void` and is `Send` but not
+/// `Sync` (`crates/cordial-linker-sys/src/lib.rs`), so a bare `OnceLock<Library>`
+/// static does not compile -- `Mutex`'s own synchronization does not need the
+/// contained type to be `Sync` in the first place.
+static LIVE_LIB: std::sync::Mutex<Option<linker::Library>> = std::sync::Mutex::new(None);
+
+/// Called once from `load.rs`, alongside `cordial_runtime::webview::arm`, so
+/// [`publish_hybrid_game_launch`] has an engine handle to publish through
+/// whenever a live join click arrives.
+pub fn arm_live(lib: linker::Library) {
+    *LIVE_LIB.lock().expect("no other thread panics holding this") = Some(lib);
+}
+
+/// Whether `s` is safe to format directly into a `roblox://` query value.
+///
+/// The same rule [`ticket_shaped`] applies to a ticket, applied here to every
+/// field a live launch payload supplies: alphanumerics and `-._~` only. Every
+/// field round 6 actually observed (a place id, a UUID-shaped instance and
+/// join-attempt id, a short alphabetic origin tag, a numeric tracker id) is
+/// exactly this shape; anything that is not gets dropped rather than
+/// formatted in unescaped, because nothing here is prepared to percent-encode
+/// a value a web page supplied into a URL Cordial then asks the engine to
+/// parse.
+fn url_value_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 256
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+}
+
+/// Deliver a live `Roblox.Hybrid.Game.launchGame` interception, carrying the
+/// whole payload the page supplied rather than the bare `placeId` [`translate`]
+/// is limited to.
+///
+/// **Why this does not go through [`translate`] or its `SERVER_SELECTING`
+/// refusal.** That refusal exists because a browser-clicked `roblox-player:`
+/// link only ever gave this file a bare place id to work with, so carrying a
+/// server-selecting parameter out of one *alone* would join the wrong game.
+/// This function starts from a different, richer input -- the page's own
+/// call, intercepted directly, in
+/// `crates/cordial-shell/src/webview.rs`'s `hybrid_launch_enabled` -- where
+/// nothing is lost: every field the payload carries is available here, so
+/// there is nothing left to silently drop the way the old path would have.
+///
+/// **What is carried, and what is not, and why.** `placeId` is required, and
+/// validated exactly as strictly as [`translate`]'s own (digits only,
+/// capped at 20, matching a 64-bit id). `instanceId` — the field naming a
+/// specific running server, per the coordinator's own read of
+/// `docs/analysis/deep-links.md`'s launcher grammar — is carried as
+/// `gameInstanceId` in the built link, which is the key name that grammar
+/// documents for this. `joinAttemptId` and `joinAttemptOrigin` are carried
+/// under their own names, both already confirmed present in a real
+/// `Game.launch` payload (`docs/analysis/deep-links.md` §6.1's own capture).
+/// `browserTrackerId` is carried too, on the same "try it and measure" basis
+/// the coordinator asked for -- nothing here has confirmed the engine's own
+/// pattern names it, only that the pattern's own comment says it "admits
+/// arbitrary `\w+=value` pairs". **`requestType` and `isPlayTogetherGame`
+/// are dropped outright**: neither has any counterpart anywhere in the
+/// engine's own link grammar or in `StartGameParams`'s field list
+/// (`docs/analysis/app-bridge.md`), so there is nowhere honest to put them.
+///
+/// Every field is also dropped, individually, if [`url_value_safe`] refuses
+/// it -- reported by name either way, so a link that behaves differently
+/// from the payload that produced it always says which field explains it,
+/// the same discipline [`translate`]'s own `dropped` list already keeps.
+pub fn publish_hybrid_game_launch(
+    place_id: &str,
+    instance_id: Option<&str>,
+    join_attempt_id: Option<&str>,
+    join_attempt_origin: Option<&str>,
+    browser_tracker_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(lib) = *LIVE_LIB.lock().expect("no other thread panics holding this") else {
+        return Err("no engine library armed yet for a live publish (arm_live was never called)"
+            .to_string());
+    };
+    if place_id.is_empty() || place_id.len() > 20 || !place_id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("placeId is not a number, and Cordial will not invent one".to_string());
+    }
+
+    let mut url = format!("roblox://experiences/start?placeId={place_id}");
+    let mut carried = vec!["placeId"];
+    let mut dropped = Vec::new();
+    for (name, value) in [
+        ("gameInstanceId", instance_id),
+        ("joinAttemptId", join_attempt_id),
+        ("joinAttemptOrigin", join_attempt_origin),
+        ("browserTrackerId", browser_tracker_id),
+    ] {
+        match value {
+            Some(v) if url_value_safe(v) => {
+                url.push('&');
+                url.push_str(name);
+                url.push('=');
+                url.push_str(v);
+                carried.push(name);
+            }
+            Some(_) => dropped.push(name),
+            None => {}
+        }
+    }
+
+    let joined = validate(&url)
+        .map_err(|e| format!("the built link is not one Cordial takes: {e}"))?;
+    println!("[deeplink] live hybrid launch: carrying {}", carried.join(", "));
+    if !dropped.is_empty() {
+        println!(
+            "[deeplink] live hybrid launch: dropping {} (not in the shape a URL query value \
+             may safely carry unescaped)",
+            dropped.join(", ")
+        );
+    }
+    if publish_url(lib, &joined, "live hybrid launch") {
+        Ok(())
+    } else {
+        Err("MessageBus.publishRaw is not exported by this build".to_string())
     }
 }
 

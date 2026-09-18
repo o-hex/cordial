@@ -3983,12 +3983,14 @@ through as one opaque string and never parses it. `isColdStartDeeplinkToGame()`
 goes false -> true across the same delivery. `CORDIAL_DEEPLINK_NO_PUBLISH=1` is
 the control: identical launch, publish suppressed, neither observable moves.
 
-**Two things are not done, and the first is the important one.**
+**One of the two things below is now done. See §2d for the full result.**
 
-*Whether it joins is unverified and cannot be verified without an account.*
-`Game.launch` is the app shell asking for an experience; every run here ends at
-`app ready: Landing`, because a signed-out client belongs there. Closing this
-needs §2 first, and then one signed-in launch with `--join-url`.
+*Whether it joins was unverified and could not be verified without an
+account.* **Now verified**, on a signed-out-launch-shaped question that
+turned out to need a signed-in Servers-list Join click rather than
+`--join-url` directly: §2d's fix carries a real join all the way through this
+same publish, and the engine's own join log confirms the specific server
+requested, not just the place, on 8/8 signed-in attempts.
 
 *`roblox-player://` links are translated, and the translation reaches the engine.*
 The engine's own pattern, the client setting `FStringGameLaunchLinkURL`, matches
@@ -4003,16 +4005,58 @@ app shell answers `Game.launch` naming the place, without it nothing does
 (`docs/analysis/deep-links.md` §6.1).
 
 The one-time `gameinfo` ticket is dropped — this engine is the Android client and
-has no such ticket in any link it accepts — and **whether a join survives that is
-still unverified**, for the same reason nothing else about joining is: it needs a
-signed-in account. A desktop link that names a *particular server*
-(`accessCode`, `linkCode`, `reservedServerAccessCode`, `gameId`, `jobId`) is
-refused rather than translated, because a link that joins the wrong server is
-worse than one that does not join.
+has no such ticket in any link it accepts. A desktop link that names a
+*particular server* (`accessCode`, `linkCode`, `reservedServerAccessCode`,
+`gameId`, `jobId`) is still refused rather than translated on this path,
+because a *browser-clicked* link only ever carries a bare `placeId` alongside
+those fields, and joining the wrong server is worse than not joining. §2d is
+the exception this refusal was always going to need eventually: a launcher
+payload arriving through the page's own hybrid layer carries the whole query
+already, not just a place, so the place-only concern this refusal exists for
+does not apply there — see `deeplink.rs`'s own `SERVER_SELECTING` doc.
 
 `CORDIAL_DEEPLINK_PROBE=1` prints the linking protocol's own message and field
 names, read out of the running engine — that is how they were established, and
 it is the cheap way to check whether a Roblox update renamed any of them.
+
+## 2d. Issue #40/#34: Join in the Servers list, default fix
+
+**The contract.** The Servers-list Join button calls
+`Roblox.Hybrid.Game.launchGame(payload, callback)` — a real, page-defined
+function, not a native stub. `payload` arrives as a string or a plain object
+(both are handled) and carries `requestType` (`"RequestGameJob"`), `placeId`,
+`instanceId` (the specific server's UUID), `joinAttemptId`, `joinAttemptOrigin`,
+`browserTrackerId`, and `isPlayTogetherGame`. `callback` is a real page
+closure, not serialisable — confirming this is genuine page JS with no native
+listener underneath it, which is the whole of why Join did nothing. See
+`docs/analysis/app-bridge.md` for the contract recorded in full, and why
+`StartGameParams` was not needed.
+
+**The fix, on by default.** `crates/cordial-shell/src/webview.rs` wraps
+`launchGame` in place once the page defines it, runs the page's own original
+implementation unchanged (its callback, its analytics, its own promise
+resolution), and additionally posts the same JSON payload through
+`executeRoblox`, the bridge this file already owns end-to-end.
+`crates/cordial-runtime/src/webview.rs` recognises the payload by its
+`requestType` and hands it to `deeplink::publish_hybrid_game_launch`, which
+extends the already-measured `Linking.detectURL` publish (§2c) with
+`gameInstanceId`, `joinAttemptId`, `joinAttemptOrigin` and `browserTrackerId`
+alongside `placeId`. `requestType` and `isPlayTogetherGame` are dropped: no
+field in the engine's link grammar or in `StartGameParams` answers to either.
+`CORDIAL_WEBVIEW_DISABLE_HYBRID_LAUNCH=1` turns the whole thing back off.
+
+**Verified 8/8 total**, across two rounds and two public games (Neighbors,
+Brookhaven), each time landing in the *exact* `instanceId` requested per the
+engine's own join log — not just the right place, which the brief was
+explicit is the pass/fail line. 5/5 on the build carrying the diagnostics
+this was found with; 3/3 again afterward, with every one of those diagnostics
+off, confirming the trimmed build is the same fix rather than one that
+happened to work while something else was still watching. Play from home and
+Play from a game page were re-checked both times and are unaffected, because
+neither ever opens a `WebView`.
+
+**Still untested: private servers.** None was reachable from the signed-in
+test account without a purchase or a subscription, both out of scope here.
 
 ## 3. Plugins: running, but with three methods
 

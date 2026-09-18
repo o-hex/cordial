@@ -4593,6 +4593,17 @@ fn main() -> ExitCode {
                                                 // clipboard's but after the
                                                 // same precondition holds.
                                                 cordial_runtime::webview::arm(|name| lib.symbol(name));
+                                                // Same shape, same moment,
+                                                // for a different later
+                                                // caller: `deeplink::
+                                                // publish_hybrid_game_launch`
+                                                // needs this exact `lib` to
+                                                // publish through whenever a
+                                                // live Join click arrives,
+                                                // which is arbitrarily later
+                                                // than this call returns --
+                                                // see `arm_live`'s own doc.
+                                                cordial_runtime::deeplink::arm_live(lib);
                                                 // Same precondition, same
                                                 // moment: the bus exists, so
                                                 // the outbound half of

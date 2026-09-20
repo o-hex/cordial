@@ -100,7 +100,7 @@ optdepends=(
   'sober: a Roblox build for Cordial to run (Cordial ships none)'
 )
 provides=("$_pkgname")
-conflicts=("$_pkgname")
+conflicts=("$_pkgname" 'cordial-bin')
 install="$pkgname.install"
 options=('!lto')
 source=(

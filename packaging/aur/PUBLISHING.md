@@ -1,6 +1,6 @@
 # Publishing to the AUR
 
-Two packages live under `packaging/aur/`, both complete and neither ever
+Three packages live under `packaging/aur/`, all complete and none ever
 published. That is the single cheapest piece of reach Cordial is leaving on the
 table: Arch users are a large share of the people who run Roblox on Linux at
 all, mocktail has three AUR packages, and Cordial has none — not because the
@@ -13,6 +13,10 @@ packaging is missing but because nobody has pushed it.
   built it successfully at least once. That is a real test of this exact file,
   not a stand-in for one; it is not the same as this file having been pushed
   to the AUR, which still needs the steps below.
+- **`cordial-bin/`** repackages the `.pkg.tar.zst` from the GitHub release,
+  unchanged, instead of compiling. It is what someone who searches for a
+  prebuilt install ends up with, and it conflicts with the other two because
+  all three install the same files by design.
 
 **This cannot be done for you by an agent, and the reason is worth stating
 rather than working around.** Publishing needs an AUR account and an SSH key
@@ -40,8 +44,8 @@ CONF
 The AUR wants a repository whose root *is* the package directory — `PKGBUILD`
 and `.SRCINFO` at the top level, not under `packaging/aur/<name>/`. So this is a
 separate checkout that the files are copied into, rather than a remote on this
-repository. Substitute `cordial-git` for `cordial` throughout for the other
-package; the steps are the same.
+repository. Substitute `cordial-git` or `cordial-bin` for `cordial` throughout
+for the other packages; the steps are the same.
 
 ```bash
 git clone ssh://aur@aur.archlinux.org/cordial.git /tmp/aur-cordial
@@ -63,10 +67,19 @@ For `cordial/PKGBUILD` specifically, bumping `pkgver` and regenerating
 Nothing else in it should change from one release to the next unless the
 dependency list or the build itself changed too.
 
+For `cordial-bin/PKGBUILD`, a new release bumps three things together:
+`pkgver`, the pinned asset URL (whose token `0.17.0.r0.g5412f88` is the
+`git describe` build id, so it changes on every release), and `sha256sums`,
+regenerated with `sha256sum` on the downloaded file. The package stays
+version-pinned on purpose — a dynamic "latest release" fetch would need a SKIP
+checksum, which violates the AUR trust model, and its declared pkgver could not
+be the artifact's real version, which silently breaks helper tools' upgrade
+checking.
+
 ## Check before pushing, on Arch
 
 ```bash
-cd packaging/aur/cordial       # or cordial-git
+cd packaging/aur/cordial       # or cordial-git / cordial-bin
 makepkg --printsrcinfo | diff -u .SRCINFO -   # must be empty
 makepkg -si                                    # it must actually build
 namcap PKGBUILD
@@ -77,7 +90,11 @@ compiler outright, needs `binutils` for CMake's archiver step, and compiles the
 "this backend is unavailable" arm of each audio backend when its headers are
 missing — so a package that builds without `libpipewire`, `libpulse` or
 `alsa-lib` present produces a client with no sound and no error, which nobody
-would attribute to packaging.
+would attribute to packaging. For `cordial-bin` the equivalent check is
+`sourcedir="$(mktemp -d)"; bsdtar -xf cordial.pkg.tar.zst -C "$sourcedir"`,
+then a quick `namcap "$sourcedir/cordial-*.pkg.tar.zst"` — the artifact, not
+the repack — since the repack is a straight copy of a package CI already
+shipped.
 
 ## What CI already does, and does not
 
@@ -88,10 +105,13 @@ builds — but CI cannot register an AUR account or hold the SSH key that pushin
 needs, so it stops there. Nothing here is published to the AUR until a
 maintainer runs the steps above by hand, and CI building green is not that.
 
-There is no `cordial-bin` package. A prebuilt-binary AUR package would need
-somewhere to host the binary CI already produces (the GitHub release itself
-would do), and is worth adding once `cordial` and `cordial-git` are both
-actually on the AUR and someone asks for it — not before, on the same
-reasoning `cordial` itself waited for releases to be frequent enough that it
-would not immediately be three hundred commits behind, which was the state the
-tags were in before v0.7.0.
+There is a `cordial-bin` package: it repackages the `.pkg.tar.zst` CI already
+attaches to the GitHub release, so the hosting question is already answered. It
+is deliberately not built by `release.yml` — it downloads the arch job's own
+output, and building it there would be circular. Like the other two, the actual
+push to the AUR stays a manual maintainer step: CI building green is not the
+same as the package being published, and an Arch user's `yay -S cordial-bin`
+won't resolve until that step happens. Its maintainer keeps pkgver, the pinned
+asset URL and the checksum in lockstep, because a bin package that resolves
+anything other than the exact version it declares would break the upgrade
+tracking every AUR helper relies on.

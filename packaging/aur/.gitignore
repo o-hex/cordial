@@ -1,0 +1,7 @@
+# Build outputs from running makepkg inside these directories: the staging
+# tree (pkg/), extracted sources (src/), and the built packages. Without this
+# a `git add -A` sweeps tens of MB of build products into history; the stale
+# cordial-pkgbuild repro shows precisely that failure mode.
+pkg/
+src/
+*.pkg.tar.zst

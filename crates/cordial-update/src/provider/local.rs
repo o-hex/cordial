@@ -52,7 +52,12 @@ use crate::Unreachable;
 use std::path::{Path, PathBuf};
 
 /// The engine, inside whichever archive carries it.
-const ENGINE: &str = "lib/x86_64/libroblox.so";
+///
+/// `crate::apk::LIBRARY_IN_APK` rather than a literal: this was hardcoded to
+/// `"lib/x86_64/libroblox.so"` until the aarch64 port, which meant this
+/// provider could never recognise a build on an aarch64 host even though
+/// `apk.rs` already had the right path for it.
+const ENGINE: &str = crate::apk::LIBRARY_IN_APK;
 
 #[derive(Debug, Default)]
 pub struct OnThisMachine;
@@ -64,15 +69,25 @@ fn candidates() -> Vec<PathBuf> {
         out.push(PathBuf::from(explicit));
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let package = "sober/packages/x86_64/com.roblox.client";
+        // Sober names this directory segment after the same Android ABI
+        // string `crate::apk::HOST_ABI` on x86_64: "x86_64". Not verified for
+        // aarch64 -- Sober is a project this codebase may observe running but
+        // not inspect (AGENTS.md) -- so this is INFERRED from the x86_64
+        // naming pattern rather than confirmed against a real Sober install on
+        // ARM. If Sober turns out to use a different segment there (say
+        // "arm64-v8a" or "aarch64"), this candidate path silently finds
+        // nothing and this provider falls through to CORDIAL_APK_DIR or the
+        // mirror, which is a safe failure mode but a slower one worth fixing
+        // once somebody can check.
+        let package = format!("sober/packages/{}/com.roblox.client", crate::apk::HOST_ABI);
         // Sober as a Flatpak, which is how VinegarHQ distributes it and how
         // this machine has it.
-        out.push(home.join(".var/app/org.vinegarhq.Sober/data").join(package));
+        out.push(home.join(".var/app/org.vinegarhq.Sober/data").join(&package));
         // Sober installed natively, which follows the XDG data directory.
         let data = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"));
-        out.push(data.join(package));
+        out.push(data.join(&package));
     }
     out
 }
@@ -84,7 +99,7 @@ fn candidates() -> Vec<PathBuf> {
 /// as well as two do.
 fn pair_in(dir: &Path) -> Option<super::Archives> {
     let base = dir.join("base.apk");
-    let split = dir.join("split_config.x86_64.apk");
+    let split = dir.join(crate::install::SPLIT_APK);
     if base.is_file() && split.is_file() {
         return Some(super::Archives { base, split });
     }

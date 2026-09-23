@@ -286,10 +286,25 @@ client *args:
     if [ "${x11:-0}" = 1 ]; then
         export CORDIAL_X11=1
     fi
+    # The Android ABI this build of Cordial can execute, spelled the way the
+    # APK's own `lib/` directory spells it -- the shell-script mirror of
+    # `cordial_update::apk::HOST_ABI`, which a `just` recipe has no way to
+    # borrow directly. Only this one spelling is needed here: the split
+    # archive below is found by globbing `split_config*.apk` rather than
+    # building its exact name, so this recipe never has to know that Play
+    # spells the same ABI with an underscore there instead of a hyphen (see
+    # `cordial_update::install::SPLIT_APK`'s own comment for that trap --
+    # `cordial-shell/src/install.rs` got it wrong once by rebuilding that
+    # filename from the hyphenated form instead of using that constant).
+    case "$(uname -m)" in
+        x86_64)  abi_dir=x86_64 ;;
+        aarch64) abi_dir=arm64-v8a ;;
+        *) echo "unsupported host architecture $(uname -m); Cordial runs only Roblox's own x86-64 or arm64-v8a Android build" >&2; exit 1 ;;
+    esac
     # Cordial ships no Roblox build. Sober downloads the same official Android
     # one this runtime loads, so checking there first means a debugging run needs
     # no arguments. The shell says all this properly to a user who has neither.
-    sober_apk="$HOME/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk"
+    sober_apk="$HOME/.var/app/org.vinegarhq.Sober/data/sober/packages/$abi_dir/com.roblox.client/base.apk"
     if [ -z "$apk" ] && [ -f "$sober_apk" ]; then
         apk="$sober_apk"
         echo "using the build Sober downloaded: $apk"
@@ -299,12 +314,12 @@ client *args:
         echo "usage: just client --apk /path/to/base.apk    (or run \`just dev\`, which explains how to get one)" >&2
         exit 1
     fi
-    [ -n "$lib" ] || lib="$(dirname "$apk")/lib/x86_64"
+    [ -n "$lib" ] || lib="$(dirname "$apk")/lib/$abi_dir"
     if [ ! -f "$lib/libroblox.so" ]; then
         # Nothing unpacked, so unpack it. On a split build the engine is in
         # split_config.<abi>.apk rather than base.apk, so try the APK given and
         # then its siblings instead of asserting which one holds it.
-        cache="${XDG_CACHE_HOME:-$HOME/.cache}/cordial/lib/x86_64"
+        cache="${XDG_CACHE_HOME:-$HOME/.cache}/cordial/lib/$abi_dir"
         # Re-extract when the APK it came from has changed. Presence alone was
         # the test until now, so installing a new Roblox build left the OLD
         # engine cached and Cordial ran it against the new APK's assets --
@@ -324,7 +339,7 @@ client *args:
             mkdir -p "$cache"
             for candidate in "$apk" "$(dirname "$apk")"/split_config*.apk; do
                 [ -f "$candidate" ] || continue
-                if unzip -o -j -q "$candidate" 'lib/x86_64/libroblox.so' -d "$cache" 2>/dev/null \
+                if unzip -o -j -q "$candidate" "lib/$abi_dir/libroblox.so" -d "$cache" 2>/dev/null \
                    && [ -f "$cache/libroblox.so" ]; then
                     printf '%s' "$want" > "$stamp"
                     echo "extracted libroblox.so from $(basename "$candidate") into $cache"

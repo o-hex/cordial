@@ -47,22 +47,43 @@ use std::path::{Path, PathBuf};
 /// agree, because two constants that must match eventually do not.
 pub const VERSION: &str = "2.9.6";
 
-/// The only build Cordial fetches. Cordial is x86-64 only -- the whole project
-/// exists to run an x86-64 Android library -- so there is no architecture to
-/// choose between.
+/// The build Cordial fetches, one per host architecture.
+///
+/// **This was a single unconditional constant until the aarch64 port**, with a
+/// comment claiming "Cordial is x86-64 only -- the whole project exists to run
+/// an x86-64 Android library". That stopped being true the moment
+/// `cordial_update::apk` grew an aarch64 `HOST_ABI` -- Deno itself ships a
+/// `linux-gnu` build for both, and there is no reason the plugin interpreter
+/// should be the one thing on an aarch64 build that has no download to reach
+/// for.
+#[cfg(target_arch = "x86_64")]
 const ASSET: &str = "deno-x86_64-unknown-linux-gnu.zip";
+#[cfg(target_arch = "aarch64")]
+const ASSET: &str = "deno-aarch64-unknown-linux-gnu.zip";
 
-/// `deno-x86_64-unknown-linux-gnu.zip.sha256sum` for [`VERSION`], read from
-/// Deno's own release and checked here on 2026-09-02:
+/// `{ASSET}.sha256sum` for [`VERSION`], read from Deno's own release.
+///
+/// Written down rather than fetched alongside the archive, because a checksum
+/// served from the same place as the file it describes proves only that the
+/// two agree.
+///
+/// x86_64 checked on 2026-09-02:
 ///
 /// ```text
 /// 394f07f4da2bebe6ce6f1e7ce0fa16429b29b08c35e3fac3fe25972676dff4b2  deno-x86_64-unknown-linux-gnu.zip
 /// ```
 ///
-/// Written down rather than fetched alongside the archive, because a checksum
-/// served from the same place as the file it describes proves only that the
-/// two agree.
+/// aarch64 checked on 2026-09-23, both against Deno's published
+/// `.sha256sum` file and against a `sha256sum` of the downloaded archive
+/// itself:
+///
+/// ```text
+/// 9a46afc6c392c7cd2ff71a31558935545b46408d0e87f7a86908c712721c046e  deno-aarch64-unknown-linux-gnu.zip
+/// ```
+#[cfg(target_arch = "x86_64")]
 const SHA256: &str = "sha256:394f07f4da2bebe6ce6f1e7ce0fa16429b29b08c35e3fac3fe25972676dff4b2";
+#[cfg(target_arch = "aarch64")]
+const SHA256: &str = "sha256:9a46afc6c392c7cd2ff71a31558935545b46408d0e87f7a86908c712721c046e";
 
 fn url() -> String {
     format!("https://github.com/denoland/deno/releases/download/v{VERSION}/{ASSET}")
@@ -156,13 +177,15 @@ mod tests {
     }
 
     /// The URL is built from the pinned version, over https, and names the
-    /// x86-64 Linux build. Checked because a typo here is a 404 a user meets.
+    /// The host's own Linux build. Checked because a typo here is a 404 a
+    /// user meets. `ASSET` rather than a literal, so this holds on both
+    /// x86-64 and aarch64.
     #[test]
     fn the_url_is_the_pinned_release_over_https() {
         let u = url();
         assert!(u.starts_with("https://"), "{u}");
         assert!(u.contains(&format!("/v{VERSION}/")), "{u}");
-        assert!(u.ends_with("deno-x86_64-unknown-linux-gnu.zip"), "{u}");
+        assert!(u.ends_with(ASSET), "{u}");
     }
 
     /// The pinned hash parses as a SHA-256. A malformed constant would

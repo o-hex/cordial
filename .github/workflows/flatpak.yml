@@ -415,7 +415,22 @@ jobs:
           ostree --repo=repo pull pages-live "$stable_ref" || had_stable=false
           if [ -n "${{ steps.release.outputs.tag }}" ]; then
             echo "tagged build (${{ steps.release.outputs.tag }}): stable now points at this commit"
-            ostree --repo=repo refs --create="$stable_ref" "$master_ref" --force
+            # A new commit, not a second name for master's. Every commit
+            # flatpak-builder exports carries ostree.ref-binding naming the
+            # one ref it was built for, and both `flatpak install` and
+            # `ostree pull` refuse a ref whose commit does not list it:
+            # "Commit has no requested ref ...stable in ref binding metadata
+            # (...master)". An alias made with `refs --create` broke every
+            # stable install from v0.17.0's tag, and then deleted stable
+            # outright on the next push, because the carry-forward pull
+            # below hit the same check. Reproduced and fixed against the
+            # live repository's master commit.
+            commit_args=(--no-update-summary --src-ref="$master_ref")
+            if [ "${{ steps.gpg.outputs.signing }}" = "true" ]; then
+              commit_args+=(--gpg-homedir="${{ steps.gpg.outputs.gpghome }}"
+                            --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}")
+            fi
+            flatpak build-commit-from "${commit_args[@]}" repo "$stable_ref"
           elif [ "$had_stable" = "true" ]; then
             echo "not tagged: carrying the existing stable ref forward unchanged"
             ostree --repo=repo refs --create="$stable_ref" "pages-live:$stable_ref" --force

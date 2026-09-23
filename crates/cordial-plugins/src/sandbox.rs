@@ -100,7 +100,12 @@ impl Sandbox {
 /// is the same check `launch.rs` uses for the MangoHud hint. `FLATPAK_ID` is not
 /// used: it is inherited by child processes, so a terminal launched from a
 /// Flatpak reports itself as one.
-fn in_flatpak() -> bool {
+///
+/// Public because `plugin_host.rs` (a different crate) needs it too, to pick
+/// which "Deno is missing" text is true: telling a Flatpak user to install
+/// their distribution's package is advice they cannot act on, since the
+/// sandbox has no route to the host's package manager.
+pub fn in_flatpak() -> bool {
     Path::new("/.flatpak-info").exists()
 }
 
@@ -201,11 +206,38 @@ pub fn managed_deno() -> Option<PathBuf> {
 /// distribution and is the one the user chose; Cordial's copy exists for hosts
 /// that have none -- every packaging format but Arch, since `dnf5 list deno`
 /// on Fedora and Debian's own source index both come back empty.
+///
+/// **A few well-known install locations are tried before falling back to
+/// Cordial's own copy.** A GUI launcher does not source `.bashrc`/`.zshrc`, so
+/// Homebrew's `eval "$(brew shellenv)"` and Deno's own install script's
+/// `export PATH=...` -- both written to those files -- never reach a client
+/// started from a desktop icon or `.desktop` file. Reported 2026-09-23: Deno
+/// at `/home/linuxbrew/.linuxbrew/bin/deno`, working from a terminal,
+/// invisible to a launched Cordial. Checking these unconditionally is
+/// harmless inside the Flatpak too -- the paths are outside the sandbox's
+/// view there and `is_file` just reports false, same as today.
 fn which_deno() -> Option<PathBuf> {
-    let on_path = std::env::var_os("PATH").and_then(|path| {
+    if let Some(on_path) = std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path).map(|d| d.join("deno")).find(|c| c.is_file())
-    });
-    on_path.or_else(managed_deno)
+    }) {
+        return Some(on_path);
+    }
+    if let Some(found) = common_deno_locations().into_iter().find(|c| c.is_file()) {
+        return Some(found);
+    }
+    managed_deno()
+}
+
+/// Well-known places `deno` ends up when it is not on `PATH`, checked in
+/// `which_deno` for the GUI-launch case described there.
+fn common_deno_locations() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("/home/linuxbrew/.linuxbrew/bin/deno")];
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".linuxbrew/bin/deno"));
+        candidates.push(home.join(".deno/bin/deno"));
+    }
+    candidates
 }
 
 fn have(binary: &str) -> bool {
@@ -404,6 +436,63 @@ pub fn command(sandbox: Sandbox, entry: &Path, reload: bool) -> Command {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The Linuxbrew fallback names a real path, not a guess.** Regression
+    /// test for the 2026-09-23 report: Deno at
+    /// `/home/linuxbrew/.linuxbrew/bin/deno`, working from a terminal,
+    /// invisible to a client launched without that shell's `PATH`. Runs
+    /// against whatever is actually at that path on the machine running the
+    /// suite and skips otherwise -- faking a Homebrew Cellar symlink would
+    /// prove nothing about whether `interpreter()` resolves the real one.
+    #[test]
+    fn a_linuxbrew_install_off_path_is_found_and_bound_by_prefix() {
+        let linuxbrew = std::path::Path::new("/home/linuxbrew/.linuxbrew/bin/deno");
+        if !linuxbrew.is_file() {
+            return; // Nothing to check on a host without Linuxbrew.
+        }
+        let original = std::env::var_os("PATH");
+        std::env::set_var("PATH", "");
+
+        assert!(
+            super::interpreter_present(),
+            "the Linuxbrew fallback must be found with PATH empty"
+        );
+        let (_real, binds) = super::interpreter().expect("interpreter() must resolve it too");
+        assert!(
+            binds.iter().any(|b| b == std::path::Path::new("/home/linuxbrew/.linuxbrew")),
+            "the Cellar-relative prefix must be bound, not just the binary: {binds:?}"
+        );
+
+        match original {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+
+    /// The `$HOME`-relative candidates must actually be under the caller's
+    /// `$HOME`, not a hardcoded one -- otherwise this "fix" only ever works
+    /// on the machine it was written on.
+    #[test]
+    fn common_locations_include_the_home_relative_installs() {
+        let original_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/tmp/cordial-sandbox-test-home");
+
+        let candidates = super::common_deno_locations();
+        assert!(candidates.contains(&std::path::PathBuf::from(
+            "/home/linuxbrew/.linuxbrew/bin/deno"
+        )));
+        assert!(candidates.contains(&std::path::PathBuf::from(
+            "/tmp/cordial-sandbox-test-home/.linuxbrew/bin/deno"
+        )));
+        assert!(candidates.contains(&std::path::PathBuf::from(
+            "/tmp/cordial-sandbox-test-home/.deno/bin/deno"
+        )));
+
+        match original_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
 
     /// **The interpreter check must not be skipped when `bwrap` exists.**
     ///

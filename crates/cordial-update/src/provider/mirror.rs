@@ -82,9 +82,11 @@
 //! ## Nothing downstream trusts this about architecture
 //!
 //! The ABI filter is a hint to the service and not a fact about what arrives.
-//! The archive is opened and `lib/x86_64/libroblox.so` is looked for directly,
-//! which is why the broad-filter retry is safe: widening it buys availability
-//! and cannot buy a wrong answer.
+//! The archive is opened and [`crate::apk::LIBRARY_IN_APK`] (the host's own
+//! library path -- `lib/x86_64/libroblox.so` on an x86-64 build,
+//! `lib/arm64-v8a/libroblox.so` on aarch64) is looked for directly, which is
+//! why the broad-filter retry is safe: widening it buys availability and
+//! cannot buy a wrong answer.
 
 use super::{Archives, Available, Progress, Provider};
 use crate::url_policy;
@@ -232,12 +234,53 @@ impl Mirror {
     }
 }
 
-/// What Cordial can run.
+/// The `x-abis` value that gets APKPure's **monolithic** bundle -- not "what
+/// Cordial can run" the way it reads, and not `crate::apk::HOST_ABI`.
+///
+/// **This was briefly made `apk::HOST_ABI` during the aarch64 port, and that
+/// was wrong.** The x86_64-only measurement in the module header above (and
+/// `docs/analysis/apk-mirrors.md`, "APKPure is not behind. Settled, and the
+/// narrow filter is why") recorded that asking with `x-abis: x86_64`
+/// specifically returns one 229 MB APK carrying `lib/{arm64-v8a,armeabi-v7a,
+/// x86_64}/libroblox.so` -- every ABI, in one file. That was read as "the
+/// narrow filter for the host's own ABI", which happened to be true only
+/// because the host was x86_64. Asked with `x-abis: arm64-v8a` instead
+/// (2.739.691, measured 2026-09-24), APKPure serves something else entirely:
+/// two XAPK bundles, `config.armeabi_v7a.apk` in one and `config.arm64_v8a.apk`
+/// in the other, neither a plain APK `held()` can look inside without XAPK
+/// support this module does not have. The literal string `"x86_64"` is what
+/// selects the monolithic response, not "the caller's own ABI" -- an artefact
+/// of whatever this mirror indexes its bundles by, not a fact about Android.
+///
+/// So this stays `"x86_64"` unconditionally, on every host architecture,
+/// which is also why x86_64's behaviour is unchanged by this constant existing
+/// at all. What makes the result correct for aarch64 is downstream:
+/// [`crate::apk::LIBRARY_IN_APK`] in `held()`/`classify()` looks for
+/// `lib/arm64-v8a/libroblox.so` inside whatever this filter returns, and the
+/// monolithic bundle has always carried it.
+///
+/// **The known gap, not hidden:** if APKPure ever again lists an ARM-only
+/// release with no x86_64 entry at all -- `docs/analysis/apk-mirrors.md`
+/// records that this already happened once, 2.735.1138 on 2026-08-26 -- an
+/// aarch64 host querying with `"x86_64"` will not see it as the newest
+/// version, for the same reason an x86_64 host does not chase an ARM-only
+/// release today: `newest()`'s own doc comment below explains why that
+/// asymmetry is deliberate on the x86_64 side. On aarch64 it is not deliberate,
+/// it is this constant's side effect, and it means an ARM-only Roblox release
+/// would be invisible to Cordial on ARM until a matching x86_64 build also
+/// ships. Fixing that for real needs XAPK support in `held()`/`classify()`
+/// (option (b) in the discussion that produced this comment) -- not attempted
+/// here, since it needs synthetic-XAPK tests of its own and this fix's job was
+/// to get aarch64 users the build that already exists, not every build that
+/// might.
 const ABI_EXACT: &str = "x86_64";
 /// Every ABI, for the retry. The filtered index is not reliably complete for
 /// older versions -- APKPure sometimes omits a bundle that does contain the
-/// x86-64 split -- so a download that cannot find its version in the narrow
-/// list asks again without one.
+/// matching split -- so a download that cannot find its version in the narrow
+/// list asks again without one. Left spelled out rather than built from
+/// `ABI_EXACT`: this list is APKPure's own vocabulary of Android ABI names, not
+/// Cordial's, and only ever needs `arm64-v8a` and `x86_64` added to as Android
+/// itself grows a new ABI.
 const ABI_BROAD: &str = "arm64-v8a,armeabi-v7a,armeabi,x86,x86_64";
 
 /// Metadata is small. Anything larger than this is not a version list, and
@@ -726,9 +769,10 @@ impl Provider for ApkPure {
             url: mirror.metadata_url.clone(),
             why: format!(
                 "the mirror served {} archive(s) for version {} and none of them carries \
-                 lib/x86_64/libroblox.so, so there is no engine in what arrived",
+                 {}, so there is no engine in what arrived",
                 landed.len(),
-                version.name
+                version.name,
+                crate::apk::LIBRARY_IN_APK
             ),
         })
     }
@@ -747,7 +791,7 @@ fn held(files: &[PathBuf]) -> (Option<PathBuf>, Option<PathBuf>) {
     for f in files {
         let Ok(file) = std::fs::File::open(f) else { continue };
         let Ok(mut zip) = zip::ZipArchive::new(std::io::BufReader::new(file)) else { continue };
-        if engine.is_none() && zip.by_name("lib/x86_64/libroblox.so").is_ok() {
+        if engine.is_none() && zip.by_name(crate::apk::LIBRARY_IN_APK).is_ok() {
             engine = Some(f.clone());
         }
         if assets.is_none() && (0..zip.len()).any(|i| {
@@ -915,7 +959,7 @@ mod tests {
         let one = dir.join("one.apk");
         std::fs::write(
             &one,
-            zip_of(&[("assets/x.json", b"{}" as &[u8]), ("lib/x86_64/libroblox.so", b"\x7fELF")]),
+            zip_of(&[("assets/x.json", b"{}" as &[u8]), (crate::apk::LIBRARY_IN_APK, b"\x7fELF")]),
         )
         .unwrap();
         let (engine, assets) = held(std::slice::from_ref(&one));
@@ -932,7 +976,7 @@ mod tests {
         let base = dir.join("base.apk");
         let split = dir.join("split.apk");
         std::fs::write(&base, zip_of(&[("assets/x.json", b"{}")])).unwrap();
-        std::fs::write(&split, zip_of(&[("lib/x86_64/libroblox.so", b"\x7fELF")])).unwrap();
+        std::fs::write(&split, zip_of(&[(crate::apk::LIBRARY_IN_APK, b"\x7fELF")])).unwrap();
 
         let (engine, assets) = held(std::slice::from_ref(&base));
         assert!(engine.is_none(), "the base half alone carries no engine");
@@ -961,7 +1005,7 @@ mod tests {
         let base = dir.join("base.apk");
         let split = dir.join("split.apk");
         std::fs::write(&base, zip_of(&[("assets/x.json", b"{}")])).unwrap();
-        std::fs::write(&split, zip_of(&[("lib/x86_64/libroblox.so", b"\x7fELF")])).unwrap();
+        std::fs::write(&split, zip_of(&[(crate::apk::LIBRARY_IN_APK, b"\x7fELF")])).unwrap();
         let archives = classify(&[base.clone(), split.clone()]).expect("both halves are present");
         assert_eq!(archives.base, base);
         assert_eq!(archives.split, split);

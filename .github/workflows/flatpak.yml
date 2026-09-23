@@ -705,10 +705,23 @@ jobs:
       # mismatched-mode destination is a real way for a local OSTree pull to
       # refuse, so this is not a formality).
       - name: Combine both architectures' repos into one
+        # **Failed here on the first real run, and this is the fix, not a
+        # guess: reproduced locally first.** `ostree pull-local SRC` with no
+        # explicit refs enumerates `SRC/refs/remotes` to decide what to pull,
+        # and `actions/upload-artifact`/`download-artifact` do not preserve
+        # empty directories -- `refs/remotes` and `refs/mirrors` are always
+        # empty in a repo `flatpak-builder` exports (nothing here ever adds a
+        # remote to it), so the round trip through the artifact silently drops
+        # them, and pull-local dies with "opendir(refs/remotes): No such file
+        # or directory". Verified against a real ostree repo on this host:
+        # removing those two directories reproduces the exact error, and
+        # recreating them before pull-local (`mkdir -p`, a no-op if they do
+        # exist) resolves it cleanly.
         run: |
           set -euo pipefail
           ostree --repo=merged init --mode=archive-z2
           for arch_dir in legs/flatpak-repo-*; do
+            mkdir -p "$arch_dir/refs/remotes" "$arch_dir/refs/mirrors"
             echo "==> pulling $arch_dir into the merged repo"
             ostree --repo=merged pull-local "$arch_dir"
           done

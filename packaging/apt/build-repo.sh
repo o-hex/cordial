@@ -55,15 +55,19 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(git -C "$here" rev-parse --show-toplevel)
 
-# Fixed rather than flags: this repository has one component and one
-# architecture today, and the brief that produced this script names
-# dists/stable/ specifically. Widen these into flags the day a second
-# architecture or a second suite (e.g. an unstable/nightly channel) is
-# actually wanted -- there is no reason to carry the option before there is
-# a caller for it.
+# SUITE and COMPONENT are still fixed rather than flags: this repository has
+# one suite and one component today, and the brief that produced this script
+# names dists/stable/ specifically. Widen these into flags the day a second
+# suite (e.g. an unstable/nightly channel) is actually wanted -- there is no
+# reason to carry the option before there is a caller for it.
+#
+# ARCH is no longer fixed. It used to be, on the same "widen it the day a
+# second one is wanted" reasoning -- that day is release.yml's `deb` job
+# gaining an aarch64 leg, so this script now reads each .deb's own
+# Architecture field instead of asserting one and refusing the rest. See the
+# per-architecture Packages generation below.
 SUITE=stable
 COMPONENT=main
-ARCH=amd64
 
 outdir="$repo/dist/apt-repo"
 allow_unsigned=0
@@ -135,12 +139,11 @@ outdir=$(cd "$outdir" && pwd)
 
 distdir="$outdir/dists/$SUITE"
 pooldir="$outdir/pool/$COMPONENT"
-binarydir="$distdir/$COMPONENT/binary-$ARCH"
 rm -rf "$distdir" # dists/ is regenerated wholesale each run; pool/ is not,
                    # so that re-running this against a superset of .debs
                    # (an old release's package alongside a new one, say)
                    # does not require every prior .deb to be passed again.
-mkdir -p "$pooldir" "$binarydir"
+mkdir -p "$pooldir"
 
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
@@ -190,8 +193,8 @@ for deb in "${debs[@]}"; do
         echo "error: $deb: could not read Package/Version from its control stanza" >&2
         exit 1
     fi
-    if [ "$arch" != "$ARCH" ]; then
-        echo "error: $deb: Architecture is '$arch', this repository only serves $ARCH" >&2
+    if [ -z "$arch" ]; then
+        echo "error: $deb: could not read Architecture from its control stanza" >&2
         exit 1
     fi
 
@@ -234,14 +237,21 @@ fi
 # work the loop above already did for this invocation's own packages.
 echo "==> reading control stanzas from the pool"
 packages_body=""
+declare -A archs_seen=()
 while IFS= read -r poolfile; do
     control=$(read_control "$poolfile")
     pkg=$(control_field Package "$control")
     ver=$(control_field Version "$control")
+    arch=$(control_field Architecture "$control")
     if [ -z "$pkg" ] || [ -z "$ver" ]; then
         echo "error: $poolfile: could not read Package/Version from its control stanza" >&2
         exit 1
     fi
+    if [ -z "$arch" ]; then
+        echo "error: $poolfile: could not read Architecture from its control stanza" >&2
+        exit 1
+    fi
+    archs_seen["$arch"]=1
     relpath=${poolfile#"$outdir/"}
 
     size=$(stat -c%s "$poolfile")
@@ -264,14 +274,47 @@ SHA256: $sha256"
 "
 done < <(find "$pooldir" -type f -name '*.deb' | sort)
 
+if [ "${#archs_seen[@]}" -eq 0 ]; then
+    echo "error: no .deb found under $pooldir after copying the arguments in" >&2
+    exit 1
+fi
+# Sorted so the arch list in Release and the order `find` above already
+# produced for iteration are both deterministic across runs -- bash's
+# associative-array key order otherwise depends on insertion, which here
+# means "whichever order the pool happened to be scanned in".
+mapfile -t archs < <(printf '%s\n' "${!archs_seen[@]}" | sort)
+echo "==> architectures present in the pool: ${archs[*]}"
+
+# One binary-$ARCH directory and one Packages file per architecture, the
+# standard multi-architecture apt layout -- Architecture: is part of a
+# Packages stanza's own identity, not the directory's, so a repository
+# serving both amd64 and arm64 needs both stanza sets kept apart rather than
+# interleaved in one file that every apt would then have to filter itself.
+# This script used to serve exactly one $ARCH, fixed by a variable rather
+# than discovered, from back when release.yml's `deb` job built only one.
+raw_packages="$workdir/all-packages"
 if [ "$have_apt_ftparchive" -eq 1 ]; then
-    echo "==> apt-ftparchive found; using it for Packages and Release"
-    ( cd "$outdir" && apt-ftparchive packages "pool/$COMPONENT" > "$binarydir/Packages" )
+    echo "==> apt-ftparchive found; using it for Packages"
+    ( cd "$outdir" && apt-ftparchive packages "pool/$COMPONENT" ) > "$raw_packages"
 else
     echo "==> apt-ftparchive not found; writing Packages by hand (see this script's header)"
-    printf '%s' "$packages_body" > "$binarydir/Packages"
+    printf '%s' "$packages_body" > "$raw_packages"
 fi
-gzip -9 -kf "$binarydir/Packages"
+
+for arch in "${archs[@]}"; do
+    binarydir="$distdir/$COMPONENT/binary-$arch"
+    mkdir -p "$binarydir"
+    # Paragraph mode (RS="") treats a Packages file as records separated by a
+    # blank line, which is exactly its own format -- both branches above
+    # write stanzas in that shape already. Matching "Architecture: $arch" as
+    # its own line inside the record, rather than a substring match against
+    # the whole record, is what keeps arm64 from also matching arm64-static
+    # or some future architecture whose name embeds this one.
+    awk -v want="$arch" 'BEGIN { RS=""; ORS="\n\n" }
+        $0 ~ ("(^|\n)Architecture: " want "(\n|$)") { print }' \
+        "$raw_packages" > "$binarydir/Packages"
+    gzip -9 -kf "$binarydir/Packages"
+done
 
 echo "==> writing $distdir/Release"
 release_date=$(date -u '+%a, %d %b %Y %H:%M:%S UTC')
@@ -281,7 +324,7 @@ release_date=$(date -u '+%a, %d %b %Y %H:%M:%S UTC')
     echo "Suite: $SUITE"
     echo "Codename: $SUITE"
     echo "Components: $COMPONENT"
-    echo "Architectures: $ARCH"
+    echo "Architectures: ${archs[*]}"
     echo "Date: $release_date"
     echo "Description: Cordial's own APT repository -- see docs/design/apt-repository.md"
     # MD5Sum and SHA256 only, not SHA1: apt has treated SHA1 as untrusted
@@ -290,14 +333,18 @@ release_date=$(date -u '+%a, %d %b %Y %H:%M:%S UTC')
     # that look at nothing else. SHA256 is what every apt from the last
     # decade actually checks against.
     echo "MD5Sum:"
-    for f in "Packages" "Packages.gz"; do
-        p="$distdir/$COMPONENT/binary-$ARCH/$f"
-        printf ' %s %16d %s\n' "$(md5sum "$p" | cut -d' ' -f1)" "$(stat -c%s "$p")" "$COMPONENT/binary-$ARCH/$f"
+    for arch in "${archs[@]}"; do
+        for f in "Packages" "Packages.gz"; do
+            p="$distdir/$COMPONENT/binary-$arch/$f"
+            printf ' %s %16d %s\n' "$(md5sum "$p" | cut -d' ' -f1)" "$(stat -c%s "$p")" "$COMPONENT/binary-$arch/$f"
+        done
     done
     echo "SHA256:"
-    for f in "Packages" "Packages.gz"; do
-        p="$distdir/$COMPONENT/binary-$ARCH/$f"
-        printf ' %s %16d %s\n' "$(sha256sum "$p" | cut -d' ' -f1)" "$(stat -c%s "$p")" "$COMPONENT/binary-$ARCH/$f"
+    for arch in "${archs[@]}"; do
+        for f in "Packages" "Packages.gz"; do
+            p="$distdir/$COMPONENT/binary-$arch/$f"
+            printf ' %s %16d %s\n' "$(sha256sum "$p" | cut -d' ' -f1)" "$(stat -c%s "$p")" "$COMPONENT/binary-$arch/$f"
+        done
     done
 } > "$distdir/Release"
 

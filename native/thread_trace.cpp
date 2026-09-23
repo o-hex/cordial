@@ -5,9 +5,18 @@
 // log before that line, bottoming out at `start_thread`/`__clone3` rather than
 // at `do_dlopen`. Nobody had asked who creates that thread or what it runs
 // first, because Cordial did not intercept `pthread_create` at all: it is
-// fixed-arity and the bionic/glibc layouts agree (`pthread.rs`'s own size
-// table), so forwarding it untouched has always been correct and remains the
-// default here.
+// fixed-arity and the bionic/glibc layouts agree on x86_64 (`pthread.rs`'s
+// own size table), so forwarding it untouched has always been correct there.
+//
+// **That stopped being true of `attr` on aarch64, where it is not.**
+// bionic's `pthread_attr_t` is 56 bytes there against glibc's 64 — measured
+// 2026-09-23, `pthread.rs`'s own doc comment — so an `attr` built by the
+// engine's own bionic-compiled code and forwarded straight to the host's
+// `pthread_create` would have glibc read 8 bytes past what the engine
+// allocated. `cordial_pthread_attr_real` below resolves `attr` to the real,
+// correctly-sized object behind `pthread.rs`'s own wrapper before it reaches
+// `::pthread_create`; on x86_64 that function does not exist and this file
+// changes nothing.
 //
 // This file adds a wrapper that, off, does exactly what an unwrapped
 // `pthread_create` does — one extra call and one `if`, no change to `attr` or
@@ -111,8 +120,18 @@ void* trampoline(void* raw) {
 
 } // namespace
 
+#if defined(__aarch64__)
+// Defined in crates/cordial-runtime/src/bionic/pthread.rs, aarch64 only —
+// see that file's own comment on `cordial_pthread_attr_real` for why this
+// call exists and what it would silently overrun without it.
+extern "C" const void* cordial_pthread_attr_real(const void* attr);
+#endif
+
 extern "C" int cordial_pthread_create(pthread_t* thread, const pthread_attr_t* attr,
                                        void* (*start_routine)(void*), void* arg) {
+#if defined(__aarch64__)
+    attr = reinterpret_cast<const pthread_attr_t*>(cordial_pthread_attr_real(attr));
+#endif
     if (!g_trace) {
         return ::pthread_create(thread, attr, start_routine, arg);
     }

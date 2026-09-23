@@ -9,25 +9,85 @@
 //! thread-specific data a stub is fatal.
 //!
 //! Sizes in bytes, measured rather than read off. One probe translation unit
-//! declaring `char sz_x[sizeof(x)];` per type, compiled twice and the symbol
-//! sizes read back with `nm -S`: once against this tree's
-//! `third_party/mcpelauncher-linker/bionic/libc/include` at
-//! `-target x86_64-linux-android -D__ANDROID_API__=33`, once against the host's
-//! glibc (2.43 when this was written).
+//! declaring `char sz_x[sizeof(x)];` per type, compiled once per libc and the
+//! symbol sizes read back with `nm -S`. The bionic columns are against this
+//! tree's `third_party/mcpelauncher-linker/bionic/libc/include` at
+//! `-D__ANDROID_API__=33` and the architecture's own `-target *-linux-android`
+//! triple; the glibc columns are against that architecture's own real glibc
+//! (2.43, both times this was written). The x86_64 pair was the original
+//! measurement; the aarch64 pair was added on 2026-09-23, compiled x86_64
+//! natively and aarch64 inside a Fedora 44 container under qemu emulation,
+//! since this host has no aarch64 glibc-devel of its own — cross-checked
+//! against `grep __SIZEOF_PTHREAD_MUTEX_T /usr/include/bits/pthreadtypes-arch.h`
+//! inside that container, which agrees with the `nm` reading exactly.
 //!
-//! | type                  | bionic | glibc | |
-//! |-----------------------|-------:|------:|-|
-//! | `pthread_mutex_t`     |     40 |    40 | passthrough |
-//! | `pthread_rwlock_t`    |     56 |    56 | passthrough |
-//! | `pthread_attr_t`      |     56 |    56 | passthrough — layouts differ, but Roblox only ever hands the struct back to us |
-//! | `pthread_once_t`      |      4 |     4 | forwarded |
-//! | `pthread_key_t`       |      4 |     4 | forwarded |
-//! | `pthread_cond_t`      |     48 |    48 | wrapped, on a size that was wrong — see below |
-//! | **`sem_t`**           | **16** |**32** | **wrapped** |
+//! | type                  | bionic (x86_64) | glibc (x86_64) | bionic (aarch64) | glibc (aarch64) | treatment |
+//! |-----------------------|----------------:|---------------:|------------------:|------------------:|-|
+//! | `pthread_mutex_t`     |              40 |             40 |                 40 |         **48** | passthrough on x86_64, **wrapped on aarch64** — see below |
+//! | `pthread_rwlock_t`    |              56 |             56 |                 56 |             56 | passthrough |
+//! | `pthread_attr_t`      |              56 |             56 |                 56 |         **64** | passthrough on x86_64, **wrapped on aarch64** — see below |
+//! | `pthread_once_t`      |               4 |              4 |                  4 |              4 | forwarded |
+//! | `pthread_key_t`       |               4 |              4 |                  4 |              4 | forwarded |
+//! | `pthread_cond_t`      |              48 |             48 |                 48 |             48 | wrapped, on a size that was wrong — see below |
+//! | **`sem_t`**           |          **16** |         **32** |             **16** |         **32** | **wrapped** |
 //!
-//! `sem_t` is a real mismatch: glibc's `sem_init` writes 32 bytes into a
-//! 16-byte object, so the 16 bytes after it belong to whatever was adjacent.
-//! The wrapper is what stops that.
+//! `sem_t` is a real mismatch on both architectures: glibc's `sem_init` writes
+//! 32 bytes into a 16-byte object, so the 16 bytes after it belong to whatever
+//! was adjacent. The wrapper is what stops that.
+//!
+//! **bionic's own sizes are identical across architectures**, and that is not
+//! a coincidence worth reading much into: every one of these types is declared
+//! in terms of `__LP64__` in
+//! `third_party/mcpelauncher-linker/bionic/libc/include/bits/pthread_types.h`,
+//! not the specific processor, and both `x86_64-android` and `aarch64-android`
+//! are LP64. What varies by architecture is glibc, and on x86_64 it happened
+//! to agree with bionic for `pthread_mutex_t` and `pthread_attr_t` — which is
+//! exactly what made the x86_64-only measurement look more reassuring than it
+//! was; nothing here had ever checked whether that agreement was structural or
+//! a coincidence of one architecture's glibc.
+//!
+//! **It was a coincidence. `pthread_mutex_t` and `pthread_attr_t` were a real
+//! size mismatch on aarch64, and this was found before either was wrapped.**
+//! glibc's aarch64 `pthread_mutex_t` is 48 bytes against bionic's 40; its
+//! `pthread_attr_t` is 64 against bionic's 56. Roblox's engine allocates
+//! these objects at bionic's size, because that is the only size it knows,
+//! so handing either straight to glibc's `pthread_mutex_init` /
+//! `pthread_mutex_lock` / … or `pthread_attr_init` / … meant the host libc
+//! read and wrote past the end of an object the engine allocated smaller —
+//! the same class of overrun `sem_t` already needed a wrapper for, just one
+//! that happened not to bite on x86_64. `pthread_mutex_t` is the engine's
+//! most heavily used pthread primitive, so this was never a corner case; it
+//! was whichever mutex got locked first.
+//!
+//! **Both are wrapped now**, `BionicMutex`/`BionicAttr` further down this
+//! file, aarch64 only — on x86_64 neither type is in [`overrides`] at all,
+//! and `pthread_mutex_*`/`pthread_attr_*` keep resolving straight from the
+//! host exactly as before this paragraph existed. The mutex wrapper has to
+//! handle a mutex that was never explicitly initialised: bionic spells
+//! `PTHREAD_MUTEX_INITIALIZER`, `_RECURSIVE_MUTEX_INITIALIZER_NP` and
+//! `_ERRORCHECK_MUTEX_INITIALIZER_NP` as three different raw words in the
+//! object's own memory, and each has to keep behaving as its declared type
+//! on the very first lock, having never passed through `pthread_mutex_init`
+//! — see `resolve_mutex`'s own comment for how that differs from
+//! `pthread_cond_t`'s and `sem_t`'s single-sentinel lazy init below. The attr
+//! wrapper also has to follow `attr` through to `pthread_create` (there is
+//! no POSIX static initialiser for an attr, so it has no equivalent
+//! complication) — `native/thread_trace.cpp`'s `cordial_pthread_create` calls
+//! back into this file, on aarch64 only, to resolve `attr` before forwarding
+//! it to the host's own `pthread_create`.
+//!
+//! **Run, not just typechecked, as of 2026-09-23**: `cargo test --release -p
+//! cordial-runtime --lib bionic::pthread::` inside the same emulated aarch64
+//! container the size measurement used, natively (the container is aarch64;
+//! nothing here is cross-compiled) -- 14 passed, 0 failed, covering a
+//! statically-initialised normal/recursive/errorcheck mutex each, a mutex
+//! locked and unlocked by eight threads at once, an attr's stack size read
+//! back through its own getter, and the same value read back on the far side
+//! of a real `pthread_create`/`pthread_getattr_np` round trip through
+//! `native/thread_trace.cpp`. **Still not run**: against real ARM64
+//! hardware, or against Roblox's own engine -- an emulated qemu-user
+//! container proves the ABI translation is right, not that the engine's
+//! actual lock usage pattern is.
 //!
 //! **The `pthread_cond_t` row used to read 32 against 48, and it was wrong.**
 //! 32 bytes is `pthread_barrier_t`, which is `int64_t __private[4]`;
@@ -45,6 +105,8 @@
 //! condition variable can reach `wait` without `init` ever being called.
 
 use std::ffi::{c_int, c_uint, c_void};
+#[cfg(target_arch = "aarch64")]
+use std::ffi::c_ulong;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Marks a wrapper whose backing object exists. Arbitrary, but distinctive in a
@@ -92,6 +154,44 @@ extern "C" {
     fn sem_post(sem: *mut c_void) -> c_int;
     fn sem_wait(sem: *mut c_void) -> c_int;
     fn sem_trywait(sem: *mut c_void) -> c_int;
+}
+
+// glibc's mutex/attr/sched implementations, needed only on aarch64 -- see the
+// module doc comment's table. Cfg'd out entirely on x86_64, where none of
+// this is linked or called: `overrides()` never registers
+// `pthread_mutex_*`/`pthread_attr_*`/`pthread_getattr_np` there, so the
+// host's own implementations keep resolving directly, unchanged from before
+// this fix.
+#[cfg(target_arch = "aarch64")]
+extern "C" {
+    fn pthread_mutex_init(mutex: *mut c_void, attr: *const c_void) -> c_int;
+    fn pthread_mutex_destroy(mutex: *mut c_void) -> c_int;
+    fn pthread_mutex_lock(mutex: *mut c_void) -> c_int;
+    fn pthread_mutex_trylock(mutex: *mut c_void) -> c_int;
+    fn pthread_mutex_unlock(mutex: *mut c_void) -> c_int;
+    fn pthread_mutex_timedlock(mutex: *mut c_void, abstime: *const c_void) -> c_int;
+
+    fn pthread_mutexattr_init(attr: *mut c_void) -> c_int;
+    fn pthread_mutexattr_destroy(attr: *mut c_void) -> c_int;
+    fn pthread_mutexattr_settype(attr: *mut c_void, kind: c_int) -> c_int;
+
+    fn pthread_attr_init(attr: *mut c_void) -> c_int;
+    fn pthread_attr_destroy(attr: *mut c_void) -> c_int;
+    fn pthread_attr_setstacksize(attr: *mut c_void, stacksize: usize) -> c_int;
+    fn pthread_attr_getstacksize(attr: *const c_void, stacksize: *mut usize) -> c_int;
+    fn pthread_attr_setdetachstate(attr: *mut c_void, state: c_int) -> c_int;
+    fn pthread_attr_getdetachstate(attr: *const c_void, state: *mut c_int) -> c_int;
+    fn pthread_attr_setguardsize(attr: *mut c_void, guardsize: usize) -> c_int;
+    fn pthread_attr_getguardsize(attr: *const c_void, guardsize: *mut usize) -> c_int;
+    fn pthread_attr_setschedparam(attr: *mut c_void, param: *const c_void) -> c_int;
+    fn pthread_attr_getschedparam(attr: *const c_void, param: *mut c_void) -> c_int;
+    fn pthread_attr_setstack(attr: *mut c_void, stackaddr: *mut c_void, stacksize: usize) -> c_int;
+    fn pthread_attr_getstack(
+        attr: *const c_void,
+        stackaddr: *mut *mut c_void,
+        stacksize: *mut usize,
+    ) -> c_int;
+    fn pthread_getattr_np(thread: c_ulong, attr: *mut c_void) -> c_int;
 }
 
 /// Size of the heap allocation standing in for a glibc object. Generous on
@@ -333,6 +433,449 @@ sem_op!(semaphore_post, sem_post);
 sem_op!(semaphore_wait, sem_wait);
 sem_op!(semaphore_trywait, sem_trywait);
 
+// ------------------------------------------------------------------- mutexes
+//
+// aarch64 only. glibc's `pthread_mutex_t` is 48 bytes there against bionic's
+// 40 (see the size table above); on x86_64 the two agree and this section
+// does not exist -- `pthread_mutex_*` is not in `overrides()` there, so the
+// host's own implementation keeps resolving directly, exactly as it always
+// has for this, the engine's hottest lock.
+
+/// An overlay on all 40 bytes of bionic's `pthread_mutex_t`
+/// (`third_party/mcpelauncher-linker/bionic/libc/include/bits/pthread_types.h`:
+/// `int32_t __private[10]` on LP64). Same shape as `BionicCond`/`BionicSem`
+/// above: `state` carries this file's own lazy-init protocol, `real_lo`/
+/// `real_hi` split the backing pointer across two 32-bit atomics because the
+/// object only promises four-byte alignment, and the rest is never touched.
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+struct BionicMutex {
+    state: AtomicU32,
+    real_lo: AtomicU32,
+    real_hi: AtomicU32,
+    _reserved: [u32; 7],
+}
+
+/// glibc's own mutex-type numbering. It happens to use the same small
+/// integers as bionic's `pthread_mutex.cpp` -- 0/1/2 -- but the two are
+/// otherwise unrelated enums; the agreement is not load-bearing anywhere else
+/// in this file, only convenient for this comment.
+#[cfg(target_arch = "aarch64")]
+const GLIBC_MUTEX_RECURSIVE: c_int = 1;
+#[cfg(target_arch = "aarch64")]
+const GLIBC_MUTEX_ERRORCHECK: c_int = 2;
+
+/// Which mutex type a bionic mutex's *untouched* `state` word asks for.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+enum StaticMutexKind {
+    Normal,
+    Recursive,
+    ErrorCheck,
+}
+
+/// bionic's three possible "nobody has called `pthread_mutex_init` yet"
+/// values for a mutex's `state` word, straight out of
+/// `third_party/mcpelauncher-linker/bionic/libc/bionic/pthread_mutex.cpp`'s
+/// `MUTEX_TYPE_SHIFT` (14): `PTHREAD_MUTEX_INITIALIZER`,
+/// `_RECURSIVE_MUTEX_INITIALIZER_NP` and `_ERRORCHECK_MUTEX_INITIALIZER_NP`
+/// spell `(type & 3) << 14` for type 0, 1 and 2 respectively. Nothing else
+/// can be sitting in this word before this file's own wrapper has touched
+/// it -- bionic's real mutex algorithm never runs against memory this shim
+/// intercepts, and there is no fourth static-initialiser macro to account
+/// for.
+#[cfg(target_arch = "aarch64")]
+fn static_mutex_kind(raw: u32) -> Option<StaticMutexKind> {
+    match raw {
+        0 => Some(StaticMutexKind::Normal),
+        0x4000 => Some(StaticMutexKind::Recursive),
+        0x8000 => Some(StaticMutexKind::ErrorCheck),
+        _ => None,
+    }
+}
+
+/// Resolve a mutex's backing object, creating it from bionic's own static
+/// pattern the first time it is touched with no explicit `pthread_mutex_init`
+/// -- see `static_mutex_kind`. Shaped like [`resolve`] but keyed off three
+/// possible "not yet created" values instead of one, because a bionic
+/// mutex's untouched state legitimately differs by declared type: an engine
+/// mutex declared `PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP` must behave as a
+/// recursive mutex on its very first lock, having never passed through
+/// `pthread_mutex_init`.
+///
+/// SAFETY: `m` must be a live `BionicMutex`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn resolve_mutex(m: &BionicMutex) -> *mut c_void {
+    loop {
+        let raw = m.state.load(Ordering::Acquire);
+        if raw == READY {
+            let low = m.real_lo.load(Ordering::Relaxed) as u64;
+            let high = m.real_hi.load(Ordering::Relaxed) as u64;
+            return (low | (high << 32)) as usize as *mut c_void;
+        }
+        if raw == INITIALISING {
+            // Another thread is between allocation and publication.
+            std::hint::spin_loop();
+            continue;
+        }
+        let Some(kind) = static_mutex_kind(raw) else {
+            // Not one of the three static patterns and not our own
+            // INITIALISING/READY markers -- either genuine corruption or a
+            // caller that hand-wrote a bit pattern this shim was never told
+            // about. Refuse rather than guess a type, the same posture
+            // `resolve`'s own catch-all takes for cond/sem.
+            return std::ptr::null_mut();
+        };
+        if m
+            .state
+            .compare_exchange(raw, INITIALISING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Lost a race with another thread also resolving this mutex for
+            // the first time; reobserve rather than assume who won.
+            continue;
+        }
+        let backing = alloc_backing();
+        // SAFETY: `backing` is BACKING_SIZE (128) bytes, comfortably larger
+        // than glibc's real `pthread_mutex_t` (48 on aarch64) and its
+        // `pthread_mutexattr_t` (a `long`-sized union on any LP64 host).
+        unsafe {
+            match kind {
+                StaticMutexKind::Normal => {
+                    pthread_mutex_init(backing, std::ptr::null());
+                }
+                StaticMutexKind::Recursive | StaticMutexKind::ErrorCheck => {
+                    let mut attr_storage = [0u8; BACKING_SIZE];
+                    let attr = attr_storage.as_mut_ptr() as *mut c_void;
+                    pthread_mutexattr_init(attr);
+                    let glibc_kind = if matches!(kind, StaticMutexKind::Recursive) {
+                        GLIBC_MUTEX_RECURSIVE
+                    } else {
+                        GLIBC_MUTEX_ERRORCHECK
+                    };
+                    pthread_mutexattr_settype(attr, glibc_kind);
+                    pthread_mutex_init(backing, attr);
+                    pthread_mutexattr_destroy(attr);
+                }
+            }
+        }
+        let address = backing as usize as u64;
+        m.real_lo.store(address as u32, Ordering::Relaxed);
+        m.real_hi.store((address >> 32) as u32, Ordering::Relaxed);
+        m.state.store(READY, Ordering::Release);
+        return backing;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn mutex_init(mutex: *mut c_void, attr: *const c_void) -> c_int {
+    if mutex.is_null() {
+        return libc_einval();
+    }
+    // SAFETY: bionic's contract is a pointer to a 40-byte pthread_mutex_t.
+    let m = unsafe { &mut *(mutex as *mut BionicMutex) };
+    // An explicit init on an object we already wrapped replaces it, matching
+    // `cond_init`'s posture on the same situation.
+    unsafe { destroy_backing(&m.state, &m.real_lo, &m.real_hi, pthread_mutex_destroy) };
+    m.state.store(UNINIT, Ordering::Release);
+    // `attr` is passed straight through here, unlike `resolve_mutex`'s
+    // static-pattern path: an explicitly supplied attr was built by the
+    // engine calling `pthread_mutexattr_init`/`_settype`, which this file
+    // does not intercept, because bionic's `pthread_mutexattr_t` and
+    // glibc's are both a single `long`-sized word on LP64 -- whichever libc's
+    // functions wrote it, wrote a self-consistent encoding that the *same*
+    // libc's `pthread_mutex_init` reads correctly. Since those attr
+    // functions are left unintercepted (ordinary passthrough, resolved from
+    // the host), `attr` already holds glibc's own encoding by the time it
+    // reaches here, not bionic's, and needs no translation.
+    let backing = unsafe {
+        resolve(&m.state, &m.real_lo, &m.real_hi, |p| {
+            pthread_mutex_init(p, attr);
+        })
+    };
+    if backing.is_null() {
+        libc_einval()
+    } else {
+        0
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn mutex_destroy(mutex: *mut c_void) -> c_int {
+    if mutex.is_null() {
+        return libc_einval();
+    }
+    // SAFETY: as above.
+    let m = unsafe { &mut *(mutex as *mut BionicMutex) };
+    unsafe { destroy_backing(&m.state, &m.real_lo, &m.real_hi, pthread_mutex_destroy) };
+    0
+}
+
+#[cfg(target_arch = "aarch64")]
+fn mutex_backing(mutex: *mut c_void) -> Option<*mut c_void> {
+    if mutex.is_null() {
+        return None;
+    }
+    // SAFETY: bionic's contract is a pointer to a 40-byte pthread_mutex_t.
+    let m = unsafe { &mut *(mutex as *mut BionicMutex) };
+    let backing = unsafe { resolve_mutex(m) };
+    (!backing.is_null()).then_some(backing)
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! mutex_op {
+    ($name:ident, $glibc:ident) => {
+        pub extern "C" fn $name(mutex: *mut c_void) -> c_int {
+            let Some(backing) = mutex_backing(mutex) else {
+                return libc_einval();
+            };
+            unsafe { $glibc(backing) }
+        }
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+mutex_op!(mutex_lock, pthread_mutex_lock);
+#[cfg(target_arch = "aarch64")]
+mutex_op!(mutex_trylock, pthread_mutex_trylock);
+#[cfg(target_arch = "aarch64")]
+mutex_op!(mutex_unlock, pthread_mutex_unlock);
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn mutex_timedlock(mutex: *mut c_void, abstime: *const c_void) -> c_int {
+    let Some(backing) = mutex_backing(mutex) else {
+        return libc_einval();
+    };
+    // SAFETY: `struct timespec` is identical between the two libcs, the same
+    // assumption `cond_timedwait` already makes above.
+    unsafe { pthread_mutex_timedlock(backing, abstime) }
+}
+
+// -------------------------------------------------------------- thread attrs
+//
+// aarch64 only -- 56 bytes in bionic against 64 in glibc; see the module doc
+// comment. Unlike a mutex there is no POSIX static initialiser for an attr
+// object, so this reuses [`resolve`]/[`destroy_backing`] exactly as `cond`
+// and `sem` do, with one addition: `pthread_getattr_np` fills in an attr
+// describing an *existing* thread rather than one the caller initialised, so
+// it gets its own path below rather than going through `attr_backing`.
+//
+// This also means `pthread_create` needs to translate whatever `attr` it is
+// given before handing it to the host's own `pthread_create` --
+// `cordial_pthread_attr_real` below is exported for exactly that, and
+// `native/thread_trace.cpp`'s `cordial_pthread_create` calls it on aarch64.
+// Missing that call site would leave every other fix in this file correct
+// and this one path -- thread creation with a non-default attr, which is
+// what a set stack size goes through -- still handing glibc a 56-byte object
+// it reads as its own 64-byte one.
+
+/// An overlay on all 56 bytes of bionic's `pthread_attr_t`.
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+struct BionicAttr {
+    state: AtomicU32,
+    real_lo: AtomicU32,
+    real_hi: AtomicU32,
+    _reserved: [u32; 11],
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_init(attr: *mut c_void) -> c_int {
+    if attr.is_null() {
+        return libc_einval();
+    }
+    // SAFETY: bionic's contract is a pointer to a 56-byte pthread_attr_t.
+    let a = unsafe { &mut *(attr as *mut BionicAttr) };
+    unsafe { destroy_backing(&a.state, &a.real_lo, &a.real_hi, pthread_attr_destroy) };
+    a.state.store(UNINIT, Ordering::Release);
+    let backing = unsafe {
+        resolve(&a.state, &a.real_lo, &a.real_hi, |p| {
+            pthread_attr_init(p);
+        })
+    };
+    if backing.is_null() {
+        libc_einval()
+    } else {
+        0
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_destroy(attr: *mut c_void) -> c_int {
+    if attr.is_null() {
+        return libc_einval();
+    }
+    // SAFETY: as above.
+    let a = unsafe { &mut *(attr as *mut BionicAttr) };
+    unsafe { destroy_backing(&a.state, &a.real_lo, &a.real_hi, pthread_attr_destroy) };
+    0
+}
+
+/// Resolve an attr's backing object, auto-initialising on first touch if a
+/// setter or getter is reached with no explicit `pthread_attr_init` --
+/// undefined behaviour under POSIX regardless of libc, so this is the same
+/// permissive fallback `cond`/`sem` already take rather than a third
+/// behaviour introduced just for this type.
+///
+/// SAFETY: `attr` must be a live, 56-byte `BionicAttr`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn attr_backing(attr: *const c_void) -> Option<*mut c_void> {
+    if attr.is_null() {
+        return None;
+    }
+    // SAFETY: caller's obligation, stated above.
+    let a = unsafe { &mut *(attr as *mut BionicAttr) };
+    let backing = unsafe {
+        resolve(&a.state, &a.real_lo, &a.real_hi, |p| {
+            pthread_attr_init(p);
+        })
+    };
+    (!backing.is_null()).then_some(backing)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_setstacksize(attr: *mut c_void, stacksize: usize) -> c_int {
+    let Some(backing) = (unsafe { attr_backing(attr) }) else {
+        return libc_einval();
+    };
+    unsafe { pthread_attr_setstacksize(backing, stacksize) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_getstacksize(attr: *const c_void, out: *mut usize) -> c_int {
+    let Some(backing) = (unsafe { attr_backing(attr) }) else {
+        return libc_einval();
+    };
+    unsafe { pthread_attr_getstacksize(backing, out) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_setdetachstate(attr: *mut c_void, state: c_int) -> c_int {
+    let Some(backing) = (unsafe { attr_backing(attr) }) else {
+        return libc_einval();
+    };
+    unsafe { pthread_attr_setdetachstate(backing, state) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_getdetachstate(attr: *const c_void, out: *mut c_int) -> c_int {
+    let Some(backing) = (unsafe { attr_backing(attr) }) else {
+        return libc_einval();
+    };
+    unsafe { pthread_attr_getdetachstate(backing, out) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_setguardsize(attr: *mut c_void, guardsize: usize) -> c_int {
+    let Some(backing) = (unsafe { attr_backing(attr) }) else {
+        return libc_einval();
+    };
+    unsafe { pthread_attr_setguardsize(backing, guardsize) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_getguardsize(attr: *const c_void, out: *mut usize) -> c_int {
+    let Some(backing) = (unsafe { attr_backing(attr) }) else {
+        return libc_einval();
+    };
+    unsafe { pthread_attr_getguardsize(backing, out) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_setschedparam(attr: *mut c_void, param: *const c_void) -> c_int {
+    let Some(backing) = (unsafe { attr_backing(attr) }) else {
+        return libc_einval();
+    };
+    // SAFETY: `struct sched_param` is `{ int sched_priority; }` in both
+    // libcs on Linux -- INFERRED from the POSIX-mandated field and confirmed
+    // against this tree's own vendored bionic header, not independently
+    // measured against glibc's the way the pthread types above were.
+    unsafe { pthread_attr_setschedparam(backing, param) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_getschedparam(attr: *const c_void, param: *mut c_void) -> c_int {
+    let Some(backing) = (unsafe { attr_backing(attr) }) else {
+        return libc_einval();
+    };
+    unsafe { pthread_attr_getschedparam(backing, param) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_setstack(attr: *mut c_void, stackaddr: *mut c_void, stacksize: usize) -> c_int {
+    let Some(backing) = (unsafe { attr_backing(attr) }) else {
+        return libc_einval();
+    };
+    unsafe { pthread_attr_setstack(backing, stackaddr, stacksize) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn attr_getstack(
+    attr: *const c_void,
+    stackaddr: *mut *mut c_void,
+    stacksize: *mut usize,
+) -> c_int {
+    let Some(backing) = (unsafe { attr_backing(attr) }) else {
+        return libc_einval();
+    };
+    unsafe { pthread_attr_getstack(backing, stackaddr, stacksize) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn getattr_np(thread: c_ulong, attr: *mut c_void) -> c_int {
+    if attr.is_null() {
+        return libc_einval();
+    }
+    // SAFETY: bionic's contract is a pointer to a 56-byte pthread_attr_t.
+    let a = unsafe { &mut *(attr as *mut BionicAttr) };
+    // Unlike every other attr function, this one *writes* the attr rather
+    // than reading one the caller built -- so any existing backing is
+    // replaced, the same posture `mutex_init`/`cond_init` take on an
+    // explicit re-init, rather than reused.
+    unsafe { destroy_backing(&a.state, &a.real_lo, &a.real_hi, pthread_attr_destroy) };
+    a.state.store(UNINIT, Ordering::Release);
+    let mut result: c_int = 0;
+    let backing = unsafe {
+        resolve(&a.state, &a.real_lo, &a.real_hi, |p| {
+            result = pthread_getattr_np(thread, p);
+        })
+    };
+    if backing.is_null() {
+        libc_einval()
+    } else {
+        result
+    }
+}
+
+/// Resolve a `pthread_attr_t*` handed to `pthread_create` to its real glibc
+/// backing object -- exported for `native/thread_trace.cpp`'s
+/// `cordial_pthread_create`, which otherwise forwards `attr` straight to the
+/// host's own `pthread_create`. Correct on x86_64, where bionic's and
+/// glibc's `pthread_attr_t` agree in size and this function does not even
+/// exist; wrong on aarch64, where that would hand glibc a 56-byte object it
+/// reads as its own 64-byte one -- the same overrun class `BionicMutex`
+/// exists to stop for the hottest lock, one call site later.
+///
+/// A null `attr` (by far the common case -- most `pthread_create` calls pass
+/// none) is returned unchanged rather than resolved into anything, matching
+/// glibc's own "use the default attributes" reading of null. A resolution
+/// failure also falls back to the original pointer rather than null: neither
+/// is right for the anomalous state that would cause it, and this at least
+/// reproduces the pre-fix behaviour rather than guaranteeing a crash on top
+/// of whatever corrupted the attr.
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub extern "C" fn cordial_pthread_attr_real(attr: *const c_void) -> *const c_void {
+    if attr.is_null() {
+        return attr;
+    }
+    // SAFETY: as `attr_backing` above.
+    match unsafe { attr_backing(attr) } {
+        Some(backing) => backing,
+        None => attr,
+    }
+}
+
 // ------------------------------------------------- once, and thread-local keys
 
 // glibc's. Renamed so the forwarding wrappers below can carry bionic's names.
@@ -448,7 +991,9 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
             ($name, $fn as *const () as *mut c_void)
         };
     }
-    vec![
+    // `mut` is only needed for the aarch64 extension below; unused on x86_64.
+    #[allow(unused_mut)]
+    let mut v = vec![
         f!("pthread_cond_init", cond_init),
         f!("pthread_cond_destroy", cond_destroy),
         f!("pthread_cond_wait", cond_wait),
@@ -468,7 +1013,34 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
         f!("pthread_key_delete", key_delete),
         f!("pthread_getspecific", getspecific),
         f!("pthread_setspecific", setspecific),
-    ]
+    ];
+    // `pthread_mutex_t` and `pthread_attr_t` need translating only on
+    // aarch64 -- see the module doc comment's table. On x86_64 the two libcs
+    // agree in size and these symbols are left to resolve straight from the
+    // host, exactly as before this fix.
+    #[cfg(target_arch = "aarch64")]
+    v.extend([
+        f!("pthread_mutex_init", mutex_init),
+        f!("pthread_mutex_destroy", mutex_destroy),
+        f!("pthread_mutex_lock", mutex_lock),
+        f!("pthread_mutex_trylock", mutex_trylock),
+        f!("pthread_mutex_unlock", mutex_unlock),
+        f!("pthread_mutex_timedlock", mutex_timedlock),
+        f!("pthread_attr_init", attr_init),
+        f!("pthread_attr_destroy", attr_destroy),
+        f!("pthread_attr_setstacksize", attr_setstacksize),
+        f!("pthread_attr_getstacksize", attr_getstacksize),
+        f!("pthread_attr_setdetachstate", attr_setdetachstate),
+        f!("pthread_attr_getdetachstate", attr_getdetachstate),
+        f!("pthread_attr_setguardsize", attr_setguardsize),
+        f!("pthread_attr_getguardsize", attr_getguardsize),
+        f!("pthread_attr_setschedparam", attr_setschedparam),
+        f!("pthread_attr_getschedparam", attr_getschedparam),
+        f!("pthread_attr_setstack", attr_setstack),
+        f!("pthread_attr_getstack", attr_getstack),
+        f!("pthread_getattr_np", getattr_np),
+    ]);
+    v
 }
 
 #[cfg(test)]
@@ -483,6 +1055,11 @@ mod tests {
         // overlay spans all 48, of which it reads and writes the first 12.
         assert!(std::mem::size_of::<BionicCond>() <= 48);
         assert_eq!(std::mem::size_of::<BionicSem>(), 16);
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(std::mem::size_of::<BionicMutex>(), 40);
+            assert_eq!(std::mem::size_of::<BionicAttr>(), 56);
+        }
     }
 
     #[test]
@@ -579,5 +1156,183 @@ mod tests {
         assert_eq!(semaphore_post(sem), 0);
         assert_eq!(semaphore_trywait(sem), 0);
         assert_eq!(semaphore_destroy(sem), 0);
+    }
+
+    // ---------------------------------------------------- aarch64-only: mutexes
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn statically_initialised_normal_mutex_locks_and_unlocks() {
+        // bionic's PTHREAD_MUTEX_INITIALIZER is all zeroes; locking one that
+        // was never explicitly initialised must still work, and must behave
+        // as a normal (non-recursive) mutex.
+        let mut storage = [0u64; 5]; // 40 bytes
+        let m = storage.as_mut_ptr() as *mut c_void;
+        assert_eq!(mutex_lock(m), 0);
+        assert_eq!(mutex_unlock(m), 0);
+        assert_eq!(mutex_destroy(m), 0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn statically_initialised_recursive_mutex_can_be_relocked_by_its_owner() {
+        // PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP's raw value:
+        // (PTHREAD_MUTEX_RECURSIVE & 3) << MUTEX_TYPE_SHIFT, i.e. 1 << 14 --
+        // see `static_mutex_kind`'s own comment for where these numbers come
+        // from. A mutex declared with this macro and never passed to
+        // `pthread_mutex_init` must still behave as recursive on its very
+        // first lock.
+        const RECURSIVE_INITIALIZER: u64 = 1 << 14;
+        let mut storage = [0u64; 5];
+        storage[0] = RECURSIVE_INITIALIZER;
+        let m = storage.as_mut_ptr() as *mut c_void;
+        assert_eq!(mutex_lock(m), 0);
+        assert_eq!(
+            mutex_trylock(m),
+            0,
+            "a recursive mutex must let its own owner lock it again"
+        );
+        assert_eq!(mutex_unlock(m), 0);
+        assert_eq!(mutex_unlock(m), 0);
+        assert_eq!(mutex_destroy(m), 0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn statically_initialised_errorcheck_mutex_refuses_a_self_relock() {
+        // PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP: (PTHREAD_MUTEX_ERRORCHECK
+        // & 3) << 14, i.e. 2 << 14. The opposite property from the recursive
+        // case above -- proof that the two static patterns are not being
+        // confused for one another.
+        const ERRORCHECK_INITIALIZER: u64 = 2 << 14;
+        let mut storage = [0u64; 5];
+        storage[0] = ERRORCHECK_INITIALIZER;
+        let m = storage.as_mut_ptr() as *mut c_void;
+        assert_eq!(mutex_lock(m), 0);
+        assert_ne!(
+            mutex_lock(m),
+            0,
+            "an errorcheck mutex must refuse a self-relock rather than deadlock or succeed"
+        );
+        assert_eq!(mutex_unlock(m), 0);
+        assert_eq!(mutex_destroy(m), 0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn mutex_lock_is_exclusive_under_contention() {
+        // If the lock were not truly exclusive -- the whole point of the
+        // wrapper existing -- concurrent threads racing on this
+        // load-then-store would lose increments and the final count would
+        // come out short.
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        const THREADS: usize = 8;
+        const ITERS: usize = 2000;
+
+        let mut storage = [0u64; 5];
+        let m = storage.as_mut_ptr() as *mut c_void;
+        assert_eq!(mutex_init(m, std::ptr::null()), 0);
+        let address = m as usize;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let mutex = address as *mut c_void;
+                    for _ in 0..ITERS {
+                        assert_eq!(mutex_lock(mutex), 0);
+                        let v = COUNTER.load(Ordering::Relaxed);
+                        COUNTER.store(v + 1, Ordering::Relaxed);
+                        assert_eq!(mutex_unlock(mutex), 0);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(COUNTER.load(Ordering::SeqCst), (THREADS * ITERS) as u32);
+        assert_eq!(mutex_destroy(m), 0);
+    }
+
+    // ------------------------------------------------------- aarch64-only: attrs
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn attr_setstacksize_round_trips_through_the_getter() {
+        let mut storage = [0u64; 7]; // 56 bytes
+        let attr = storage.as_mut_ptr() as *mut c_void;
+        assert_eq!(attr_init(attr), 0);
+        let requested: usize = 1 << 20;
+        assert_eq!(attr_setstacksize(attr, requested), 0);
+        let mut got: usize = 0;
+        assert_eq!(attr_getstacksize(attr, &mut got), 0);
+        assert_eq!(got, requested);
+        assert_eq!(attr_destroy(attr), 0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn attr_round_trips_a_set_stack_size_through_pthread_create() {
+        // Exercises the real path an engine call takes: this file's
+        // `attr_init`/`attr_setstacksize`, then `native/thread_trace.cpp`'s
+        // `cordial_pthread_create` (which calls back into
+        // `cordial_pthread_attr_real` on aarch64 before forwarding to the
+        // host's own `pthread_create`), then the new thread reading its own
+        // stack size back via `getattr_np`/`attr_getstacksize` -- the same
+        // two functions Roblox's engine would call, on the same object,
+        // through the same wrapper.
+        extern "C" {
+            fn cordial_pthread_create(
+                thread: *mut c_ulong,
+                attr: *const c_void,
+                start_routine: extern "C" fn(*mut c_void) -> *mut c_void,
+                arg: *mut c_void,
+            ) -> c_int;
+            fn pthread_join(thread: c_ulong, retval: *mut *mut c_void) -> c_int;
+            fn pthread_self() -> c_ulong;
+        }
+
+        static SEEN_STACK: AtomicU32 = AtomicU32::new(0);
+        // A whole page above PTHREAD_STACK_MIN on any Linux, and page-aligned
+        // so nothing rounds it before the read-back.
+        const REQUESTED_STACK: usize = 1 << 20;
+
+        extern "C" fn start(_: *mut c_void) -> *mut c_void {
+            let mut self_attr_storage = [0u64; 7];
+            let self_attr = self_attr_storage.as_mut_ptr() as *mut c_void;
+            // SAFETY: `pthread_self` takes no arguments and returns the
+            // calling thread's own handle.
+            let me = unsafe { pthread_self() };
+            assert_eq!(getattr_np(me, self_attr), 0);
+            let mut size: usize = 0;
+            assert_eq!(attr_getstacksize(self_attr, &mut size), 0);
+            SEEN_STACK.store(size as u32, Ordering::SeqCst);
+            assert_eq!(attr_destroy(self_attr), 0);
+            std::ptr::null_mut()
+        }
+
+        let mut attr_storage = [0u64; 7];
+        let attr = attr_storage.as_mut_ptr() as *mut c_void;
+        assert_eq!(attr_init(attr), 0);
+        assert_eq!(attr_setstacksize(attr, REQUESTED_STACK), 0);
+
+        let mut thread: c_ulong = 0;
+        // SAFETY: `attr` is a live, initialised BionicAttr; `start` matches
+        // the expected signature and returns null.
+        let rc = unsafe {
+            cordial_pthread_create(&mut thread, attr, start, std::ptr::null_mut())
+        };
+        assert_eq!(rc, 0, "pthread_create with a translated attr must succeed");
+        // SAFETY: `thread` came from the `cordial_pthread_create` call above.
+        assert_eq!(unsafe { pthread_join(thread, std::ptr::null_mut()) }, 0);
+
+        assert_eq!(
+            SEEN_STACK.load(Ordering::SeqCst) as usize,
+            REQUESTED_STACK,
+            "the new thread must see the stack size that was set on the attr \
+             it was created with, round-tripped through pthread_create and \
+             pthread_getattr_np"
+        );
+        assert_eq!(attr_destroy(attr), 0);
     }
 }

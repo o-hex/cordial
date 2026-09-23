@@ -703,7 +703,16 @@ fn crc_table() -> &'static [u32; 256] {
 }
 
 fn crc32(data: &[u8]) -> u32 {
-    crc32_continue(0xffff_ffff ^ 0xffff_ffff, data) // start from 0, see below
+    // `crc32_continue` takes the *previous finished* CRC and undoes the
+    // final XOR-out (`prev ^ 0xffff_ffff`) to recover the raw running
+    // register before folding more data in -- see below. For a first call
+    // that raw register must start at the standard 0xffff_ffff, which is
+    // `prev = 0`. This used to be spelled `0xffff_ffff ^ 0xffff_ffff`, which
+    // clippy's `eq_op` flagged as a likely typo; it was not one -- verified
+    // against the standard CRC-32/ISO-HDLC check value, `crc32(b"123456789")
+    // == 0xcbf4_3926` -- but the constant it reduces to is the honest way to
+    // write it.
+    crc32_continue(0, data)
 }
 
 /// PNG's CRC is over the type and the data together, so it has to be resumable.

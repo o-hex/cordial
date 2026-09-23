@@ -71,6 +71,70 @@ answer is "unsupported", not "write a JIT". Reopening this requires reopening Ta
 **No Quest/VR target.** The Quest build ships no x86 code, so supporting it would mandate
 exactly the translation path this decision exists to avoid. Linux desktop only.
 
+## Status, 2026-09-23
+
+The x86_64/aarch64 split this document called for in `apk.rs`/`install.rs` was real
+but incomplete: it stopped at the two constants and never reached the code that
+actually *fetches* a build. `crates/cordial-update/src/provider/mirror.rs` hardcoded
+`ABI_EXACT = "x86_64"` and searched archives for the literal path
+`lib/x86_64/libroblox.so` rather than `apk::LIBRARY_IN_APK`; `provider/local.rs` and
+`cordial-shell/src/install.rs` had the same hardcoding for the engine path, the split
+APK filename, and Sober's own package directory. An aarch64 build would have compiled
+clean and then found no build to run, silently, because the acquisition layer never
+asked for or recognised anything but x86_64. Fixed 2026-09-23; see the commits
+touching `provider/mirror.rs`, `provider/local.rs`, `cordial-shell/src/install.rs`,
+`crates/cordial-update/src/deno.rs` and `justfile`.
+
+One of those fixes was a genuine latent bug rather than a missing branch:
+`cordial-shell/src/install.rs` rebuilt the split APK's filename from `HOST_ABI`
+(`arm64-v8a`, hyphenated) instead of using `cordial_update::install::SPLIT_APK`
+(`arm64_v8a`, underscored, which is how Play actually spells it). That is invisible on
+x86_64, which has no hyphen to get wrong, and would have made this code path never find
+the split archive on a real aarch64 install.
+
+Packaging gates (`ExclusiveArch: x86_64` in `packaging/rpm/cordial.spec`,
+`Architecture: amd64` in `packaging/deb/control.in`, the AppImage's x86_64-linux-gnu
+WebKitGTK discovery) were the same shape of gap and are fixed in the same batch of
+commits, alongside aarch64 legs in `release.yml`/`flatpak.yml`/`test.yml`/`apt.yml`/
+`yum.yml` — the pacman/AUR arch job stays x86_64-only, since Arch Linux ships no
+aarch64 build at all (Arch Linux ARM is a separate project with its own repos).
+
+**Corrected once more, 2026-09-24: the mirror fix above was itself wrong in a way
+worth recording.** Making `ABI_EXACT` (`provider/mirror.rs`) equal to `apk::HOST_ABI`
+made an aarch64 build ask APKPure for `x-abis: arm64-v8a` specifically — and for that
+filter APKPure serves XAPK split bundles (`config.arm64_v8a.apk` nested inside a zip
+this reader cannot look inside), not the monolithic all-ABI APK that `x-abis: x86_64`
+returns and that this module's own header already measured. `ABI_EXACT` is now pinned
+to the literal `"x86_64"` unconditionally, on both architectures — it selects
+APKPure's bundle shape, not "the caller's own ABI" — with `apk::LIBRARY_IN_APK`
+downstream still doing the real, correct, per-architecture check inside whatever comes
+back. Known and documented gap: an ARM-only release newer than the current x86_64 one
+(this already happened once, 2.735.1138, `docs/analysis/apk-mirrors.md`) would not
+surface as "newest" on an aarch64 host. Real XAPK support in `held()`/`classify()`
+would close that properly; not attempted, since it needs its own synthetic-XAPK tests.
+
+**`pthread_mutex_t`/`pthread_attr_t` needed a real ABI shim, found by building, not by
+inspection.** `crates/cordial-runtime/src/bionic/pthread.rs`'s size table was only
+ever measured on x86_64, where bionic and glibc happen to agree on both types'
+sizes. On aarch64 they do not (glibc's `pthread_mutex_t` is 48 bytes against bionic's
+40; `pthread_attr_t` 64 against 56) — handing either straight to glibc, as the
+pre-existing x86_64-only passthrough did, would have overrun the engine's own
+allocation on the first mutex it locked. Both are now wrapped the same way `sem_t`
+already was, aarch64-only; x86_64 is untouched.
+
+**The page-size risk and ADR-001's re-verification are still open** — nothing here
+closes either, and qemu-user emulation (4K-page x86_64 emulating 4K-page aarch64)
+says nothing about real 16K-page hardware. What the "cheapest next step" paragraph
+below asked for is now half-done rather than not-done: a real, Roblox-signed
+arm64-v8a `libroblox.so` was fetched (via `cordial_update`'s own mirror path,
+signature verified, fingerprint matches this module's own documented one) and loaded
+under emulation — `cordial-run` got through the bionic linker, `JNI_OnLoad`, GameActivity
+native init, and the engine's own flag initialisation (139 flags, by name) before the
+smoke test's time bound ended, with no crash and no undefined symbol. The specific
+`readelf --dyn-syms`/`DT_TEXTREL`/`p_align` check this paragraph asks for was not
+run against that binary before it was deleted (per the disposable-profile instructions
+for that test) — still open, and still cheap: needs one more fetch, not a device.
+
 ## Implementation notes
 
 - Host ABI is fixed at **compile time**, not resolved at launch. `cordial_update::apk::

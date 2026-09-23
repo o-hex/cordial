@@ -599,7 +599,8 @@ fn call_globals(lib: &linker::Library, when: &str) {
         let short = name.rsplit('_').next().unwrap_or(name);
         match lib.symbol(name) {
             None => println!("  {name} not exported"),
-            Some(f) => match linker::game_activity::appbridge_call_bare(f) {
+            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            Some(f) => match unsafe { linker::game_activity::appbridge_call_bare(f) } {
                 Ok(()) => println!("  {short} ok ({when})"),
                 Err(e) => println!("  {short} failed ({when}): {e}"),
             },
@@ -650,10 +651,11 @@ extern "C" fn run_bootstrap() {
                     .unwrap_or_else(|| plan.settings.clone()),
                 _ => plan.settings.clone(),
             };
-            match linker::game_activity::preload_flag_overrides(
+            // SAFETY: `plan.preload_native as *mut std::ffi:...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            match unsafe { linker::game_activity::preload_flag_overrides(
                 plan.preload_native as *mut std::ffi::c_void,
                 &body,
-            ) {
+            ) } {
                 Ok(()) => println!(
                     "    nativePreloadFlagOverrides ok ({shape}, {} bytes)",
                     body.len()
@@ -703,7 +705,8 @@ extern "C" fn run_bootstrap() {
                     .ok()
                     .and_then(|v| v.parse::<i64>().ok())
                     .unwrap_or(when);
-                match linker::game_activity::init_client_settings_cached_compressed(
+                // SAFETY: `plan.cached_native as *mut std::ffi::...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                match unsafe { linker::game_activity::init_client_settings_cached_compressed(
                     plan.cached_native as *mut std::ffi::c_void,
                     &bytes,
                     a1,
@@ -711,7 +714,7 @@ extern "C" fn run_bootstrap() {
                     a3,
                     when,
                     flag,
-                ) {
+                ) } {
                     Ok(code) => println!(
                         "    nativeInitClientSettingsCachedCompressed ({} bytes, [{a1}|{a2}|{a3}], when {when}, flag {flag}) -> {code}",
                         bytes.len()
@@ -784,12 +787,13 @@ extern "C" fn run_bootstrap() {
         SETTINGS_DELIVERED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     if plan.settings_native != 0 {
-        match linker::game_activity::init_client_settings(
+        // SAFETY: `plan.settings_native as *mut std::ffi...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        match unsafe { linker::game_activity::init_client_settings(
             plan.settings_native as *mut std::ffi::c_void,
             &plan.settings,
             "",
             "",
-        ) {
+        ) } {
             Ok(code) => println!("    nativeInitClientSettings -> {code}"),
             Err(e) => println!("    nativeInitClientSettings failed: {e}"),
         }
@@ -842,12 +846,13 @@ extern "C" fn run_bootstrap() {
                      ({} bytes)",
                     settings.len()
                 );
-                match linker::game_activity::init_client_settings(
+                // SAFETY: `native as *mut std::ffi::c_void` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                match unsafe { linker::game_activity::init_client_settings(
                     native as *mut std::ffi::c_void,
                     &settings,
                     "",
                     "",
-                ) {
+                ) } {
                     Ok(code) => println!("  [experiment] second nativeInitClientSettings -> {code}"),
                     Err(e) => println!("  [experiment] second nativeInitClientSettings failed: {e}"),
                 }
@@ -886,9 +891,10 @@ extern "C" fn run_bootstrap() {
     // call site, which predates the early one and is what actually produces the
     // block, is untouched.
     if plan.post_native != 0 && std::env::var_os("CORDIAL_EARLY_POST").is_some() {
-        match linker::game_activity::post_client_settings_loaded(
+        // SAFETY: `plan.post_native as *mut std::ffi::c_...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        match unsafe { linker::game_activity::post_client_settings_loaded(
             plan.post_native as *mut std::ffi::c_void,
-        ) {
+        ) } {
             Ok(()) => println!("    postClientSettingsLoadedInitialization3 ok"),
             Err(e) => println!("    postClientSettingsLoadedInitialization3 failed: {e}"),
         }
@@ -901,10 +907,11 @@ extern "C" fn run_bootstrap() {
         println!("  nativeInitializeNativeFlags is not exported by this build; no flag names sent");
     }
     if plan.flags_native != 0 {
-        match linker::game_activity::init_flags(
+        // SAFETY: `plan.flags_native as *mut std::ffi::c...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        match unsafe { linker::game_activity::init_flags(
             plan.flags_native as *mut std::ffi::c_void,
             &plan.flag_names,
-        ) {
+        ) } {
             Ok(()) => println!("    flags initialised"),
             Err(e) => println!("    flag init failed: {e}"),
         }
@@ -1043,7 +1050,8 @@ fn wire_refresh_rate(lib: linker::Library) {
             if supported.is_empty() {
                 println!("  refresh: no plausible output to report yet");
             } else {
-                match linker::game_activity::pass_supported_refresh_rates(supported_native, &supported) {
+                // SAFETY: `supported_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                match unsafe { linker::game_activity::pass_supported_refresh_rates(supported_native, &supported) } {
                     Ok(()) => println!("  refresh: nativePassSupportedRefreshRates {supported:?}"),
                     Err(e) => println!("  refresh: nativePassSupportedRefreshRates failed: {e}"),
                 }
@@ -1059,7 +1067,8 @@ fn wire_refresh_rate(lib: linker::Library) {
             let current = cordial_runtime::refresh::current_for(&outputs);
             if cordial_runtime::refresh::worth_announcing(previous_current.get(), current) {
                 if let Some(hz) = current {
-                    match linker::game_activity::pass_current_refresh_rate(current_native, hz) {
+                    // SAFETY: `current_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                    match unsafe { linker::game_activity::pass_current_refresh_rate(current_native, hz) } {
                         Ok(()) => println!("  refresh: nativePassCurrentDisplayRefreshRate {hz}"),
                         Err(e) => println!("  refresh: nativePassCurrentDisplayRefreshRate failed: {e}"),
                     }
@@ -1126,11 +1135,12 @@ fn wire_battery_reporting(lib: linker::Library) {
         if changed {
             match cordial_runtime::battery::state_changed_args(&reading) {
                 Some((status, plugged)) => {
-                    match linker::game_activity::report_battery_state_changed(
+                    // SAFETY: `state_changed_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                    match unsafe { linker::game_activity::report_battery_state_changed(
                         state_changed_native,
                         status,
                         plugged,
-                    ) {
+                    ) } {
                         Ok(()) => {
                             println!("  battery: reportBatteryStateChanged({status}, {plugged})")
                         }
@@ -1163,7 +1173,8 @@ fn wire_battery_reporting(lib: linker::Library) {
                 temperature_c: b.and_then(|b| b.temperature_tenths_c).map(|t| t as f32 / 10.0),
                 plugged: reading.plugged,
             };
-            match linker::game_activity::report_battery_status(status_native, &fields) {
+            // SAFETY: `status_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            match unsafe { linker::game_activity::report_battery_status(status_native, &fields) } {
                 Ok(()) => println!("  battery: reportBatteryStatus {fields:?}"),
                 Err(e) => println!("  battery: reportBatteryStatus failed: {e}"),
             }
@@ -2058,7 +2069,8 @@ fn main() -> ExitCode {
         for (name, args) in dirs {
             match lib.symbol(name) {
                 None => println!("  {name} not exported (pre-ctors)"),
-                Some(f) => match linker::game_activity::call_static_strings(f, SETTINGS, args) {
+                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                Some(f) => match unsafe { linker::game_activity::call_static_strings(f, SETTINGS, args) } {
                     Ok(()) => println!(
                         "  {} ok (pre-ctors)",
                         name.rsplit('_').next().unwrap_or(name)
@@ -2090,7 +2102,8 @@ fn main() -> ExitCode {
             if let Some(f) = lib.symbol(
                 "Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings",
             ) {
-                match linker::game_activity::init_client_settings(f, &settings_json, "", "") {
+                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                match unsafe { linker::game_activity::init_client_settings(f, &settings_json, "", "") } {
                     Ok(code) => println!("  nativeInitClientSettings -> {code} (pre-ctors)"),
                     Err(e) => println!("  nativeInitClientSettings failed (pre-ctors): {e}"),
                 }
@@ -2100,7 +2113,8 @@ fn main() -> ExitCode {
             if let Some(f) = lib.symbol(
                 "Java_com_roblox_client_flags_FlagJniInterface_nativeInitializeNativeFlags",
             ) {
-                match linker::game_activity::init_flags(f, FLAG_NAMES) {
+                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                match unsafe { linker::game_activity::init_flags(f, FLAG_NAMES) } {
                     Ok(()) => println!("  flags initialised (pre-ctors)"),
                     Err(e) => println!("  flag init failed (pre-ctors): {e}"),
                 }
@@ -2137,7 +2151,8 @@ fn main() -> ExitCode {
             };
             println!("\nJavaVM at {vm:p}; calling JNI_OnLoad");
 
-            match linker::jni::call_on_load(p) {
+            // SAFETY: `p` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            match unsafe { linker::jni::call_on_load(p) } {
                 // JNI versions are 0x000M_000m; 0x00010006 is JNI_VERSION_1_6.
                 Ok(rc) => {
                     println!("JNI_OnLoad returned {rc:#x} = JNI {}.{}", rc >> 16, rc & 0xffff);
@@ -2221,13 +2236,16 @@ fn main() -> ExitCode {
                                     continue;
                                 };
                                 let r = match run {
-                                    1 => linker::game_activity::appbridge_init(
+                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                    1 => unsafe { linker::game_activity::appbridge_init(
                                         f, &apk_path, width, height,
-                                    ),
-                                    2 => linker::game_activity::appbridge_start_app(
+                                    ) },
+                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                    2 => unsafe { linker::game_activity::appbridge_start_app(
                                         f, &apk_path, width, height,
-                                    ),
-                                    _ => linker::game_activity::appbridge_call_bare(f),
+                                    ) },
+                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                    _ => unsafe { linker::game_activity::appbridge_call_bare(f) },
                                 };
                                 match r {
                                     Ok(()) => println!("  {name} ok"),
@@ -2343,9 +2361,10 @@ fn main() -> ExitCode {
                                 opt.client_settings.as_deref(),
                             )
                             .unwrap_or_default();
-                            match linker::game_activity::init_client_settings(
+                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                            match unsafe { linker::game_activity::init_client_settings(
                                 f, &settings, "", "",
-                            ) {
+                            ) } {
                                 Ok(code) => {
                                     println!("  early client settings ({} bytes) -> {code}", settings.len())
                                 }
@@ -2499,9 +2518,10 @@ fn main() -> ExitCode {
                                 );
                                 match lib.symbol(&sym) {
                                     None => println!("  {name} not exported (early)"),
-                                    Some(f) => match linker::game_activity::call_static_strings(
+                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                    Some(f) => match unsafe { linker::game_activity::call_static_strings(
                                         f, SETTINGS, args,
-                                    ) {
+                                    ) } {
                                         Ok(()) => println!("  {name} ok (early)"),
                                         Err(e) => println!("  {name} failed (early): {e}"),
                                     },
@@ -2612,7 +2632,8 @@ fn main() -> ExitCode {
                         linker::game_activity::set_ui_mode_night(if dark { 1 } else { 0 });
 
                         println!("\ncalling GameActivity.initializeNativeCode");
-                        match linker::game_activity::initialize(f, &files, &files, &files) {
+                        // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                        match unsafe { linker::game_activity::initialize(f, &files, &files, &files) } {
                             Ok(handle) => {
                                 println!("  native handle {handle:#x}");
 
@@ -2991,9 +3012,10 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetDeviceInfo",
                                         ) {
-                                            match linker::game_activity::set_device_info(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::set_device_info(
                                                 f, width, height,
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  device info set"),
                                                 Err(e) => println!("  nativeSetDeviceInfo failed: {e}"),
                                             }
@@ -3020,9 +3042,10 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_client_LocalStorageManager_initStorageManagerNativeV3",
                                         ) {
-                                            match linker::game_activity::init_storage_manager(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::init_storage_manager(
                                                 f, &files, &cache,
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  storage manager initialised"),
                                                 Err(e) => println!("  initStorageManagerNativeV3 failed: {e}"),
                                             }
@@ -3033,9 +3056,10 @@ fn main() -> ExitCode {
                                         for (name, cls, args) in dirs2 {
                                             match lib.symbol(name) {
                                                 None => println!("  {name} not exported"),
-                                                Some(f) => match linker::game_activity::call_static_strings(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::call_static_strings(
                                                     f, cls, args,
-                                                ) {
+                                                ) } {
                                                     Ok(()) => println!(
                                                         "  {} ok",
                                                         name.rsplit('_').next().unwrap_or(name)
@@ -3048,9 +3072,10 @@ fn main() -> ExitCode {
                                         for (name, args) in dirs {
                                             match lib.symbol(name) {
                                                 None => println!("  {name} not exported"),
-                                                Some(f) => match linker::game_activity::call_static_strings(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::call_static_strings(
                                                     f, SETTINGS, args,
-                                                ) {
+                                                ) } {
                                                     Ok(()) => println!(
                                                         "  {} ok",
                                                         name.rsplit('_').next().unwrap_or(name)
@@ -3097,11 +3122,12 @@ fn main() -> ExitCode {
                                                 None => println!(
                                                     "  webview: setWebviewUserAgent not exported by this build"
                                                 ),
-                                                Some(f) => match linker::game_activity::call_static_strings(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::call_static_strings(
                                                     f,
                                                     "com/roblox/engine/jni/NativeGLInterface",
                                                     &[ua.as_str()],
-                                                ) {
+                                                ) } {
                                                     Ok(()) => println!("  webview: setWebviewUserAgent ok"),
                                                     Err(e) => println!(
                                                         "  webview: setWebviewUserAgent failed: {e}"
@@ -3173,10 +3199,11 @@ fn main() -> ExitCode {
                                                 None => println!(
                                                     "  [cookies] updateOnSetCookieHandler not exported; cookie changes will not be noticed"
                                                 ),
-                                                Some(f) => match linker::game_activity::cookies_register_handler(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::cookies_register_handler(
                                                     f,
                                                     cordial_runtime::cookies::observe_host,
-                                                ) {
+                                                ) } {
                                                     Ok(()) => println!("  [cookies] OnSetCookieHandler registered"),
                                                     Err(e) => println!("  [cookies] updateOnSetCookieHandler failed: {e}"),
                                                 },
@@ -3190,12 +3217,16 @@ fn main() -> ExitCode {
                                         let steps: Vec<(&str, Box<dyn Fn(*mut std::ffi::c_void) -> Result<(), String>>)> = vec![
                                             (
                                                 "Java_com_roblox_client_JNIAAssetManagerSetup_initNative",
-                                                Box::new(linker::game_activity::asset_manager_init),
+                                                Box::new(|f| {
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    unsafe { linker::game_activity::asset_manager_init(f) }
+                                                }),
                                             ),
                                             (
                                                 "Java_com_roblox_client_LocalStorageManager_initStorageManagerNativeV3",
                                                 Box::new(move |f| {
-                                                    linker::game_activity::storage_init(f, &files, &cache)
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    unsafe { linker::game_activity::storage_init(f, &files, &cache) }
                                                 }),
                                             ),
                                         ];
@@ -3295,12 +3326,13 @@ fn main() -> ExitCode {
                                             // the `.apk`. Naming the archive here
                                             // made every path the engine built
                                             // from it a file inside a file.
-                                            match linker::game_activity::set_init_params(
+                                            // SAFETY: `p` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::set_init_params(
                                                 p,
                                                 &asset_folder(&opt.apk),
                                                 width,
                                                 height,
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  init params set"),
                                                 Err(e) => println!("  init params failed: {e}"),
                                             }
@@ -3421,9 +3453,10 @@ fn main() -> ExitCode {
                                                 // client_settings.rs.
                                                 _ => (settings.as_str(), "", ""),
                                             };
-                                            match linker::game_activity::init_client_settings(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::init_client_settings(
                                                 f, a, b, c,
-                                            ) {
+                                            ) } {
                                                 Ok(code) => println!(
                                                     "  nativeInitClientSettings -> {code}"
                                                 ),
@@ -3455,7 +3488,8 @@ fn main() -> ExitCode {
                                                 )
                                                 .filter(|_| !already)
                                             {
-                                                match linker::game_activity::post_client_settings_loaded(f) {
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                match unsafe { linker::game_activity::post_client_settings_loaded(f) } {
                                                     Ok(()) => println!(
                                                         "  postClientSettingsLoadedInitialization3 ok"
                                                     ),
@@ -3523,9 +3557,10 @@ fn main() -> ExitCode {
                                                 } else {
                                                     format!("FLog{name}")
                                                 };
-                                                match linker::game_activity::get_fint(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                match unsafe { linker::game_activity::get_fint(
                                                     f, &full, ABSENT,
-                                                ) {
+                                                ) } {
                                                     Ok(v) if v == ABSENT => {
                                                         println!("  flog probe: {full} = <not a registered flag>")
                                                     }
@@ -3574,7 +3609,8 @@ fn main() -> ExitCode {
                                                 "  flag names: {}",
                                                 settings.lines().filter(|l| !l.trim().is_empty()).count()
                                             );
-                                            match linker::game_activity::init_flags(f, &settings) {
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::init_flags(f, &settings) } {
                                                 Ok(()) => println!("  flags initialised"),
                                                 Err(e) => println!("  flag init failed: {e}"),
                                             }
@@ -3606,9 +3642,10 @@ fn main() -> ExitCode {
                                             if let Some(f) = lib.symbol(
                                                 "Java_com_roblox_client_startup_MainGameActivity_nativePreloadFlagOverrides",
                                             ) {
-                                                match linker::game_activity::preload_flag_overrides(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                match unsafe { linker::game_activity::preload_flag_overrides(
                                                     f, json,
-                                                ) {
+                                                ) } {
                                                     Ok(()) => println!(
                                                         "  flag overrides preloaded ({} bytes)",
                                                         json.len()
@@ -3638,7 +3675,8 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_readLocalFlags",
                                         ) {
-                                            match linker::game_activity::read_local_flags(f) {
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::read_local_flags(f) } {
                                                 Ok(()) => println!("  local flags read"),
                                                 Err(e) => println!("  readLocalFlags failed: {e}"),
                                             }
@@ -3690,7 +3728,8 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_client_startup_MainGameActivity_nativeRetryInit",
                                         ) {
-                                            match linker::game_activity::call_bare(f) {
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::call_bare(f) } {
                                                 Ok(()) => println!("  retryInit ok"),
                                                 Err(e) => println!("  retryInit failed: {e}"),
                                             }
@@ -3865,9 +3904,10 @@ fn main() -> ExitCode {
                                                 None => println!(
                                                     "  [sign-in] nativeIsLuaLoginEnabled not exported"
                                                 ),
-                                                Some(f) => match linker::game_activity::call_static_bare_bool(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::call_static_bare_bool(
                                                     f, SETTINGS,
-                                                ) {
+                                                ) } {
                                                     Ok(v) => println!(
                                                         "  [sign-in] nativeIsLuaLoginEnabled() -> {v}"
                                                     ),
@@ -3898,9 +3938,10 @@ fn main() -> ExitCode {
                                                 if let Some(f) =
                                                     lib.symbol(&format!("{PREFIX}{stage}"))
                                                 {
-                                                    match linker::game_activity::activity_lifecycle(
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    match unsafe { linker::game_activity::activity_lifecycle(
                                                         f, activity,
-                                                    ) {
+                                                    ) } {
                                                         Ok(()) => fired += 1,
                                                         Err(e) => {
                                                             println!("  {stage} failed: {e}")
@@ -3978,7 +4019,8 @@ fn main() -> ExitCode {
                                         {
                                             match lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3") {
                                                 None => println!("  pre-bridge post: not exported"),
-                                                Some(f) => match linker::game_activity::post_client_settings_loaded(f) {
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::post_client_settings_loaded(f) } {
                                                     Ok(()) => println!("  pre-bridge post: postClientSettingsLoadedInitialization3 ok"),
                                                     Err(e) => println!("  pre-bridge post failed: {e}"),
                                                 },
@@ -3998,9 +4040,10 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeV2InitWithParams",
                                         ) {
-                                            match linker::game_activity::appbridge_init(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::appbridge_init(
                                                 f, &apk_path, width, height,
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  app bridge initialised"),
                                                 Err(e) => println!("  app bridge init failed: {e}"),
                                             }
@@ -4066,7 +4109,8 @@ fn main() -> ExitCode {
                                             ) {
                                                 None => {}
                                                 Some(f) => {
-                                                    let n = cordial_runtime::cookies::restore(f);
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    let n = unsafe { cordial_runtime::cookies::restore(f) };
                                                     println!(
                                                         "  [cookies] restored {n} domain(s) from {}",
                                                         cordial_runtime::cookies::where_kept()
@@ -4084,7 +4128,10 @@ fn main() -> ExitCode {
                                                         if let Some(g) = lib.symbol(
                                                             "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeGetCookiesForDomain",
                                                         ) {
-                                                            cordial_runtime::cookies::probe(f, g, "restore");
+                                                            // SAFETY: `f`/`g` are natives resolved via symbol lookups against the loaded libroblox.so, which is never unloaded.
+                                                            unsafe {
+                                                                cordial_runtime::cookies::probe(f, g, "restore");
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -4123,7 +4170,8 @@ fn main() -> ExitCode {
                                                     "  [identity] nativeSetUserId not exported; the engine will not know who is signed in"
                                                 ),
                                                 Some(f) => {
-                                                    if cordial_runtime::identity::push_user_id(f) {
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    if unsafe { cordial_runtime::identity::push_user_id(f) } {
                                                         println!("  [identity] the engine has been told which user is signed in");
                                                     }
                                                 }
@@ -4192,7 +4240,8 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeStartLuaAppDM",
                                         ) {
-                                            match linker::game_activity::appbridge_call_bare(f) {
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::appbridge_call_bare(f) } {
                                                 Ok(()) => println!("  Lua app DataModel started"),
                                                 Err(e) => println!("  StartLuaAppDM failed: {e}"),
                                             }
@@ -4216,9 +4265,10 @@ fn main() -> ExitCode {
                                             println!("  startup recovery armed");
                                             let _ = cordial_runtime::android::looper::STARTUP_RECOVERY
                                                 .set(Box::new(move || {
-                                                    linker::game_activity::appbridge_call_bare(
+                                                    // SAFETY: `addr as *mut std::ffi::c_void` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    unsafe { linker::game_activity::appbridge_call_bare(
                                                         addr as *mut std::ffi::c_void,
-                                                    )
+                                                    ) }
                                                 }));
                                         }
                                         }
@@ -4233,12 +4283,13 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_setTaskSchedulerBackgroundMode",
                                         ) {
-                                            match linker::game_activity::call_static_bool_string(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::call_static_bool_string(
                                                 f,
                                                 "com/roblox/engine/jni/NativeGLInterface",
                                                 false,
                                                 "ASMA.start",
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  task scheduler foregrounded"),
                                                 Err(e) => {
                                                     println!("  setTaskSchedulerBackgroundMode failed: {e}")
@@ -4250,9 +4301,10 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeV2StartAppWithParams",
                                         ) {
-                                            match linker::game_activity::appbridge_start_app(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::appbridge_start_app(
                                                 f, &apk_path, width, height,
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  app started with surface"),
                                                 Err(e) => println!("  StartApp failed: {e}"),
                                             }
@@ -4282,9 +4334,10 @@ fn main() -> ExitCode {
                                             ] {
                                                 let which = if game { "game" } else { "app" };
                                                 match lib.symbol(native) {
-                                                    Some(f) => match linker::game_activity::appbridge_update_surface(
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    Some(f) => match unsafe { linker::game_activity::appbridge_update_surface(
                                                         f, &apk_path, width, height, game,
-                                                    ) {
+                                                    ) } {
                                                         Ok(()) => println!("  surface+platform params delivered ({which})"),
                                                         Err(e) => println!("  UpdateSurface {which} failed: {e}"),
                                                     },
@@ -4400,7 +4453,8 @@ fn main() -> ExitCode {
                                                                 opt.client_settings.as_deref(),
                                                             )
                                                             .unwrap_or_default();
-                                                            match linker::game_activity::init_client_settings(sf, &doc, "", "") {
+                                                            // SAFETY: `sf` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                            match unsafe { linker::game_activity::init_client_settings(sf, &doc, "", "") } {
                                                                 Ok(code) => println!("  late settings ({} bytes) -> {code}", doc.len()),
                                                                 Err(e) => println!("  late settings failed: {e}"),
                                                             }
@@ -4408,7 +4462,8 @@ fn main() -> ExitCode {
                                                     }
                                                     match lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3") {
                                                         None => println!("  late post: not exported"),
-                                                        Some(f) => match linker::game_activity::post_client_settings_loaded(f) {
+                                                        // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                        Some(f) => match unsafe { linker::game_activity::post_client_settings_loaded(f) } {
                                                             Ok(()) => println!("  late post: postClientSettingsLoadedInitialization3 ok (after {ms} ms)"),
                                                             Err(e) => println!("  late post failed: {e}"),
                                                         },
@@ -4437,7 +4492,8 @@ fn main() -> ExitCode {
                                                     if std::env::var("CORDIAL_LATE_RETRY").map_or(true, |v| v != "off") {
                                                         match lib.symbol("Java_com_roblox_client_startup_MainGameActivity_nativeRetryInit") {
                                                             None => println!("  late retry: not exported"),
-                                                            Some(f) => match linker::game_activity::appbridge_call_bare(f) {
+                                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                            Some(f) => match unsafe { linker::game_activity::appbridge_call_bare(f) } {
                                                                 Ok(()) => println!("  late retry: nativeRetryInit ok"),
                                                                 Err(e) => println!("  late retry failed: {e}"),
                                                             },
@@ -5355,6 +5411,8 @@ mod local_storage_secrets {
         if value.is_null() {
             return -1;
         }
+        // SAFETY: `value` points to `value_len` bytes the caller owns for the
+        // duration of this call, per this function's own contract above.
         let bytes = unsafe { std::slice::from_raw_parts(value as *const u8, value_len) };
         let Ok(value) = std::str::from_utf8(bytes) else {
             println!("  [local-storage] {key}: value is not UTF-8; refused rather than stored");
@@ -5365,6 +5423,8 @@ mod local_storage_secrets {
 
     #[no_mangle]
     pub extern "C" fn cordial_local_storage_delete(user_id: c_longlong, key: *const c_char) -> c_int {
+        // SAFETY: `key` is a NUL-terminated C string owned by the caller for
+        // the duration of this call, per `borrow_str`'s own contract.
         let Some(key) = (unsafe { borrow_str(key) }) else {
             return -1;
         };

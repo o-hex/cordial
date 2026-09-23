@@ -128,7 +128,8 @@ pub fn read_vocabulary(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) -> V
     for (label, getter) in STRING_GETTERS {
         let name = format!("Java_com_roblox_protocols_webview_WebViewProtocol_{getter}");
         match symbol(&name) {
-            Some(f) => match cordial_linker_sys::game_activity::call_static_ret_string(f, CLASS) {
+            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            Some(f) => match unsafe { cordial_linker_sys::game_activity::call_static_ret_string(f, CLASS) } {
                 Ok(v) => entries.push((*label, v)),
                 // A getter that is exported and then fails is a different fact
                 // from one that is absent, and conflating them would hide it.
@@ -681,7 +682,8 @@ pub fn arm(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) {
     match symbol(
         "Java_com_roblox_protocols_webview_WebViewProtocol_initializeAndroidWebViewProtocol",
     ) {
-        Some(f) => match cordial_linker_sys::game_activity::protocol_init(f, CLASS) {
+        // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        Some(f) => match unsafe { cordial_linker_sys::game_activity::protocol_init(f, CLASS) } {
             Ok(()) => println!("  webview: initializeAndroidWebViewProtocol ok"),
             Err(e) => println!("  webview: initializeAndroidWebViewProtocol failed: {e}"),
         },
@@ -741,12 +743,13 @@ pub fn arm(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) {
         println!("  webview: MessageBus.getMessageId is not exported; not subscribing");
         return;
     };
-    let bus_id = match cordial_linker_sys::game_activity::call_static_two_strings_ret_string(
+    // SAFETY: `get_message_id` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let bus_id = match unsafe { cordial_linker_sys::game_activity::call_static_two_strings_ret_string(
         get_message_id,
         BUS,
         &protocol,
         &open_window_id,
-    ) {
+    ) } {
         Ok(id) => id,
         Err(e) => {
             println!("  webview: getMessageId({protocol:?}, {open_window_id:?}) failed: {e}");
@@ -834,12 +837,13 @@ pub fn arm(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) {
         );
         return;
     };
-    let close_bus_id = match cordial_linker_sys::game_activity::call_static_two_strings_ret_string(
+    // SAFETY: `get_message_id` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let close_bus_id = match unsafe { cordial_linker_sys::game_activity::call_static_two_strings_ret_string(
         get_message_id,
         BUS,
         &protocol,
         &handle_close_id,
-    ) {
+    ) } {
         Ok(id) => id,
         Err(e) => {
             println!("  webview: getMessageId({protocol:?}, {handle_close_id:?}) failed: {e}");
@@ -900,7 +904,7 @@ pub fn report_window_closed() {
     // SAFETY: `publish_raw` was resolved under its own symbol name in `arm`
     // and never used for anything else; `call_static_strings` owns its own
     // buffers for the call.
-    match cordial_linker_sys::game_activity::call_static_strings(f, BUS, &[bus_id.as_str(), "{}"]) {
+    match unsafe { cordial_linker_sys::game_activity::call_static_strings(f, BUS, &[bus_id.as_str(), "{}"]) } {
         Ok(()) => println!("[webview] reported window closed on {bus_id}"),
         Err(e) => println!("[webview] reporting window closed on {bus_id} failed: {e}"),
     }
@@ -1028,7 +1032,7 @@ pub fn forward_bridge_message(message: &str) {
     // SAFETY: `native` was resolved under its own symbol name in `arm` and is
     // never used for anything else; `call_static_strings` owns the buffers it
     // passes for the duration of the call.
-    match cordial_linker_sys::game_activity::call_static_strings(f, CLASS, &[message]) {
+    match unsafe { cordial_linker_sys::game_activity::call_static_strings(f, CLASS, &[message]) } {
         Ok(()) => println!(
             "[webview] forwarded a bridge message to signalJavascriptCallback ({} bytes); \
              whether the engine acted on it is not established by this line",

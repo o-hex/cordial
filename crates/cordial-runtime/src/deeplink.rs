@@ -728,7 +728,8 @@ pub fn deliver(lib: linker::Library, url: &JoinUrl) -> Outcome {
     for (class, tag) in [(BASE_URL, "JNIBaseUrlProtocol"), (WEB_LOGIN, "JNIWebLoginProtocol")] {
         let sym = format!("Java_{}_init", class.replace('/', "_"));
         if let Some(f) = lib.symbol(&sym) {
-            match linker::game_activity::protocol_init(f, class) {
+            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            match unsafe { linker::game_activity::protocol_init(f, class) } {
                 Ok(()) => println!("[deeplink] {tag}.init ok"),
                 Err(e) => println!("[deeplink] {tag}.init failed: {e}"),
             }
@@ -743,7 +744,8 @@ pub fn deliver(lib: linker::Library, url: &JoinUrl) -> Outcome {
             continue;
         };
         any_surface = true;
-        match linker::game_activity::cold_start_protocol_launch(f, class, url.expose()) {
+        // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        match unsafe { linker::game_activity::cold_start_protocol_launch(f, class, url.expose()) } {
             Ok(true) => {
                 println!("[deeplink] {tag} took the link");
                 return Outcome::Claimed(tag);
@@ -1004,7 +1006,8 @@ fn publish_url(lib: linker::Library, url: &JoinUrl, phase: &str) -> bool {
         println!("[deeplink] ({phase}) not publishing (CORDIAL_DEEPLINK_NO_PUBLISH)");
         return true;
     }
-    match linker::game_activity::call_static_strings(publish, BUS, &[DETECT_URL, &payload]) {
+    // SAFETY: `publish` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    match unsafe { linker::game_activity::call_static_strings(publish, BUS, &[DETECT_URL, &payload]) } {
         Ok(()) => println!("[deeplink] ({phase}) published {DETECT_URL}"),
         Err(e) => {
             println!("[deeplink] ({phase}) publishing {DETECT_URL} failed: {e}");
@@ -1025,7 +1028,8 @@ fn publish_url(lib: linker::Library, url: &JoinUrl, phase: &str) -> bool {
 /// `MessageBus.getLastRaw(id)` — the last payload published on a message id,
 /// or `None` when there has never been one.
 fn read_last(f: *mut std::ffi::c_void, id: &str) -> Option<String> {
-    match linker::game_activity::call_static_string_ret_string(f, BUS, id) {
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    match unsafe { linker::game_activity::call_static_string_ret_string(f, BUS, id) } {
         Ok(v) if v.is_empty() => None,
         Ok(v) => Some(v),
         Err(e) => {
@@ -1061,7 +1065,8 @@ fn escape_json(s: &str) -> String {
 /// exactly where Cordial hands the URL over.
 fn cold_start_flag(lib: linker::Library) -> Option<bool> {
     let f = lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_isColdStartDeeplinkToGame")?;
-    linker::game_activity::call_static_bare_bool(f, "com/roblox/engine/jni/NativeGLInterface").ok()
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    unsafe { linker::game_activity::call_static_bare_bool(f, "com/roblox/engine/jni/NativeGLInterface") }.ok()
 }
 
 /// Read the linking protocol's own vocabulary out of the running engine.
@@ -1098,7 +1103,8 @@ fn probe(lib: linker::Library) {
     for name in GETTERS {
         match lib.symbol(&format!("{prefix}{name}")) {
             None => println!("[deeplink probe] {name}: not exported"),
-            Some(f) => match linker::game_activity::call_static_ret_string(f, LINKING) {
+            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            Some(f) => match unsafe { linker::game_activity::call_static_ret_string(f, LINKING) } {
                 Ok(v) => println!("[deeplink probe] {name} -> {v:?}"),
                 Err(e) => println!("[deeplink probe] {name} failed: {e}"),
             },
@@ -1106,10 +1112,11 @@ fn probe(lib: linker::Library) {
     }
     match lib.symbol("Java_com_roblox_universalapp_experience_JNIExperienceProtocol_getLaunchId") {
         None => println!("[deeplink probe] JNIExperienceProtocol.getLaunchId: not exported"),
-        Some(f) => match linker::game_activity::call_static_ret_string(
+        // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        Some(f) => match unsafe { linker::game_activity::call_static_ret_string(
             f,
             "com/roblox/universalapp/experience/JNIExperienceProtocol",
-        ) {
+        ) } {
             Ok(v) => println!("[deeplink probe] JNIExperienceProtocol.getLaunchId -> {v:?}"),
             Err(e) => println!("[deeplink probe] JNIExperienceProtocol.getLaunchId failed: {e}"),
         },

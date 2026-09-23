@@ -813,7 +813,8 @@ fn dispatch_touch(
     }
     let (w, h) = surface;
     for (contact, action) in d.pass {
-        let r = cordial_linker_sys::game_activity::pass_input(
+        // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        let r = unsafe { cordial_linker_sys::game_activity::pass_input(
             f,
             contact.id,
             contact.x,
@@ -821,7 +822,7 @@ fn dispatch_touch(
             action,
             w,
             h,
-        );
+        ) };
         if trace_touch() {
             eprintln!(
                 "[cordial] nativePassInput(id={}, x={}, y={}, action={action}, w={w}, h={h}) \
@@ -1064,7 +1065,8 @@ pub fn deliver_gamepad_connect(id: i32, gamepad_type: i32) {
         report_unregistered("nativeGamepadConnectEventWithGamepadType");
         return;
     }
-    let r = cordial_linker_sys::game_activity::gamepad_connect(f, id, gamepad_type);
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let r = unsafe { cordial_linker_sys::game_activity::gamepad_connect(f, id, gamepad_type) };
     if trace_gamepad() {
         eprintln!("[cordial] nativeGamepadConnect(id={id}, type={gamepad_type}) -> {r:?}");
     }
@@ -1076,7 +1078,8 @@ pub fn deliver_gamepad_disconnect(id: i32) {
         report_unregistered("nativeGamepadDisconnectEvent");
         return;
     }
-    let r = cordial_linker_sys::game_activity::gamepad_disconnect(f, id);
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let r = unsafe { cordial_linker_sys::game_activity::gamepad_disconnect(f, id) };
     if trace_gamepad() {
         eprintln!("[cordial] nativeGamepadDisconnect(id={id}) -> {r:?}");
     }
@@ -1088,7 +1091,8 @@ pub fn deliver_gamepad_button(id: i32, key_code: i32, action: i32) {
         report_unregistered("nativeGamepadButtonEvent");
         return;
     }
-    let r = cordial_linker_sys::game_activity::gamepad_button(f, id, key_code, action);
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let r = unsafe { cordial_linker_sys::game_activity::gamepad_button(f, id, key_code, action) };
     if trace_gamepad() {
         eprintln!("[cordial] nativeGamepadButton(id={id}, key={key_code}, action={action}) -> {r:?}");
     }
@@ -1100,7 +1104,8 @@ pub fn deliver_gamepad_axis(id: i32, axis: i32, x: f32, y: f32, z: f32) {
         report_unregistered("nativeGamepadAxisEvent");
         return;
     }
-    let r = cordial_linker_sys::game_activity::gamepad_axis(f, id, axis, x, y, z);
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let r = unsafe { cordial_linker_sys::game_activity::gamepad_axis(f, id, axis, x, y, z) };
     if trace_gamepad() {
         eprintln!("[cordial] nativeGamepadAxis(id={id}, axis={axis}, {x}, {y}, {z}) -> {r:?}");
     }
@@ -1112,9 +1117,10 @@ pub fn deliver_gamepad_supported_key(id: i32, key_code: i32, supported: bool, ga
         report_unregistered("nativeSetGamepadSupportedKeyWithGamepadType");
         return;
     }
-    let r = cordial_linker_sys::game_activity::gamepad_supported_key(
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let r = unsafe { cordial_linker_sys::game_activity::gamepad_supported_key(
         f, id, key_code, supported, gamepad_type,
-    );
+    ) };
     if trace_gamepad() {
         eprintln!(
             "[cordial] nativeSetGamepadSupportedKey(id={id}, key={key_code}, \
@@ -1135,9 +1141,10 @@ pub fn deliver_gamepad_supported_motion(
         report_unregistered("nativeSetGamepadSupportedMotionWithGamepadType");
         return;
     }
-    let r = cordial_linker_sys::game_activity::gamepad_supported_motion(
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let r = unsafe { cordial_linker_sys::game_activity::gamepad_supported_motion(
         f, id, axis, source, supported, gamepad_type,
-    );
+    ) };
     if trace_gamepad() {
         eprintln!(
             "[cordial] nativeSetGamepadSupportedMotion(id={id}, axis={axis}, source={source}, \
@@ -1254,10 +1261,11 @@ pub fn engine_wants_pointer_lock() -> Option<bool> {
     if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    match cordial_linker_sys::game_activity::call_static_bare_bool(
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    match unsafe { cordial_linker_sys::game_activity::call_static_bare_bool(
         f,
         "com/roblox/engine/jni/NativeInputInterface",
-    ) {
+    ) } {
         Ok(v) => {
             if trace_mouse() {
                 static LAST: Mutex<Option<bool>> = Mutex::new(None);
@@ -1328,7 +1336,8 @@ pub fn report_keyboard_state(current_geometry: (i32, i32)) {
     // Java callback rather than the JNI call it feeds; the shape is observed,
     // the 1:1 with the native call is not.
     let (w, h) = current_geometry;
-    let r = cordial_linker_sys::game_activity::update_keyboard_size(f, false, 0, h, w, 0);
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let r = unsafe { cordial_linker_sys::game_activity::update_keyboard_size(f, false, 0, h, w, 0) };
     if trace_text() {
         eprintln!("[cordial] updateKeyboardSize(visible=false, x=0, y={h}, w={w}, h=0) -> {r:?}");
     }
@@ -1478,7 +1487,8 @@ pub fn pass_key_event(down: bool, evdev_code: i32, modifiers: i32) {
         report_unregistered("nativePassKeyEvent");
         return;
     }
-    let r = cordial_linker_sys::game_activity::pass_key_event(f, down, key_code, modifiers, false);
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let r = unsafe { cordial_linker_sys::game_activity::pass_key_event(f, down, key_code, modifiers, false) };
     super::trace(format_args!(
         "nativePassKeyEvent(down={down}, keyCode={key_code}, modifiers={modifiers:#x}) -> {r:?}"
     ));
@@ -1684,7 +1694,8 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
     // one that turns out to be a no-op is nothing.
     let sync = SYNC_TEXTBOX.load(std::sync::atomic::Ordering::Relaxed);
     if !sync.is_null() {
-        if let Err(e) = cordial_linker_sys::game_activity::sync_textbox(sync, text, cursor) {
+        // SAFETY: `sync` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        if let Err(e) = unsafe { cordial_linker_sys::game_activity::sync_textbox(sync, text, cursor) } {
             if trace_text() {
                 eprintln!("[cordial] syncTextbox failed: {e}");
             }
@@ -1744,7 +1755,8 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
         static PASS_TEXT_FLAG: OnceLock<bool> = OnceLock::new();
         let flag = *PASS_TEXT_FLAG
             .get_or_init(|| std::env::var_os("CORDIAL_PASSTEXT_FLAG").is_some());
-        if let Err(e) = cordial_linker_sys::game_activity::pass_text(f, which, text, flag, cursor) {
+        // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        if let Err(e) = unsafe { cordial_linker_sys::game_activity::pass_text(f, which, text, flag, cursor) } {
             if trace_text() {
                 eprintln!("[cordial] passText failed: {e}");
             }
@@ -1949,7 +1961,8 @@ pub fn pass_mouse_move_delta(x: f32, y: f32, dx: f32, dy: f32) {
         report_unregistered("nativePassMouseMove");
         return;
     }
-    let r = cordial_linker_sys::game_activity::pass_mouse_move(f, x, y, dx, dy);
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let r = unsafe { cordial_linker_sys::game_activity::pass_mouse_move(f, x, y, dx, dy) };
     if trace_mouse() {
         eprintln!("[cordial] nativePassMouseMove(x={x}, y={y}, dx={dx}, dy={dy}) -> {r:?}");
     }
@@ -1973,7 +1986,8 @@ pub fn pass_mouse_button(x: f32, y: f32, down: bool, android_button: i32) {
         report_unregistered("nativePassMouseButton");
         return;
     }
-    let r = cordial_linker_sys::game_activity::pass_mouse_button(f, x, y, down, button);
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let r = unsafe { cordial_linker_sys::game_activity::pass_mouse_button(f, x, y, down, button) };
     if trace_mouse() {
         eprintln!(
             "[cordial] nativePassMouseButton(x={x}, y={y}, down={down}, \
@@ -2018,7 +2032,8 @@ pub fn wheel(handle: i64, x: f32, y: f32, hscroll: f32, vscroll: f32, event_time
     if f.is_null() {
         report_unregistered("nativePassMouseWheel");
     }
-    let passed = (!f.is_null()).then(|| cordial_linker_sys::game_activity::pass_mouse_wheel(f, x, y, v));
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    let passed = (!f.is_null()).then(|| unsafe { cordial_linker_sys::game_activity::pass_mouse_wheel(f, x, y, v) });
     if trace_wheel() {
         // The arguments as the engine receives them, and what the call
         // answered. Which of the two paths ran matters as much as the numbers:

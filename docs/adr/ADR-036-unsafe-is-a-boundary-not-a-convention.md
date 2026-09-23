@@ -178,19 +178,81 @@ produce a large diff across 542 sites" and asked that the diff be measured
 before committing to a level; measured, it was small enough to fix outright,
 so `unsafe_op_in_unsafe_fn` is `"deny"`, not a ratchet.
 
-## A pre-existing clippy failure, found and not fixed here
+## A pre-existing clippy failure, fixed
 
 Getting either clippy measurement above required `-A clippy::not_unsafe_ptr_arg_deref`.
-Without it, `cargo clippy --workspace` does not complete at all: `cordial-linker-sys`
-alone has 50 public functions clippy reports as "might dereference a raw
+Without it, `cargo clippy --workspace` did not complete at all: `cordial-linker-sys`
+alone had 50 public functions clippy reported as "might dereference a raw
 pointer but is not marked `unsafe`", and `not_unsafe_ptr_arg_deref` is in
-clippy's `correctness` group, which is deny-by-default -- so it stops the
+clippy's `correctness` group, which is deny-by-default -- so it stopped the
 whole workspace's clippy run before `cordial-runtime` or `cordial-shell`, both
-of which depend on `cordial-linker-sys`, are even reached. This is pre-existing
-on `main`, unrelated to unsafe-block documentation, and out of scope for this
-change: fixing 50 call sites' public signatures is its own piece of work, not
-a side effect of a lints change. It is filed as a follow-up rather than folded
-in here -- see the tracking issue below.
+of which depend on `cordial-linker-sys`, were even reached. This is now fixed,
+on branch `clippy-correctness`.
+
+**The fix is the pattern this ADR already argues for: `unsafe fn` plus a
+`# Safety` doc, not a handle newtype.** All 50 functions take a resolved JNI
+native (`native`/`f`: `*mut c_void`) that every call site already stores as a
+raw `usize` in its own long-lived state -- a bootstrap plan in `load.rs`, an
+`AtomicPtr` in `input.rs`, a `OnceLock` elsewhere -- and re-casts at each
+call. A newtype would have to live in that storage to buy anything, which
+means rewriting the zero-checks and struct fields around 84 call sites rather
+than just marking the call unsafe: a behaviour-risking diff for a change that
+is supposed to be type/contract-only. `crates/cordial-linker-sys/src/lib.rs`'s
+own header comment carries the full reasoning. Every one of the 84 call
+sites in `cordial-runtime` now wraps the call in `unsafe { }` with a `//
+SAFETY:` comment naming where the pointer was resolved.
+
+**Fixing it surfaced two things nobody had been able to see before, because
+nothing had ever gotten this far.** With `cordial-linker-sys` compiling,
+clippy reached `cordial-runtime` for the first time under this exact
+invocation and found:
+
+- **Two more `correctness`-group errors**, `clippy::eq_op` in
+  `android/capture.rs`'s CRC-32 implementation and `clippy::never_loop` in
+  `browser_tracker.rs`'s cookie-header parser. Neither was a logic bug on
+  inspection. The `eq_op` site, `0xffff_ffff ^ 0xffff_ffff`, is verified
+  correct against the standard CRC-32/ISO-HDLC check value
+  (`crc32(b"123456789") == 0xcbf4_3926`) -- it is just an obfuscated way to
+  write the constant it reduces to, and now says so. The `never_loop` site's
+  `for` loop over `;`-separated `Set-Cookie` parts always returned or broke on
+  its first iteration by design (only the first pair is the cookie; the rest
+  are attributes), so it is now a direct `.next()` instead of a loop shaped
+  like one.
+- **13 more `not_unsafe_ptr_arg_deref` instances inside `cordial-runtime`
+  itself** -- not part of the 50 above, and invisible to every prior clippy
+  run because the build never got past `cordial-linker-sys` to reach them.
+  Four follow the same "native resolved from `libroblox.so`" contract as the
+  first 50: `cookies::probe`, `cookies::restore` and `identity::push_user_id`
+  are now `unsafe fn` with the same doc pattern, and their three call sites
+  wrap accordingly. Two are the opposite direction -- `cookies::observe_host`
+  and `identity::observe_login` are sinks `native/cookies.cpp` and
+  `native/android_classes.cpp` call *into* Rust with a raw `*const c_char` --
+  and are now `unsafe extern "C" fn`; marking a C-called callback `unsafe`
+  changes nothing about its ABI, but it does mean the function-pointer types
+  it is registered through (`cookies_register_handler`'s `sink` parameter,
+  `identity_set_sinks`'s `on_login`) had to move from `extern "C" fn(...)` to
+  `unsafe extern "C" fn(...)` to keep passing it as a value. The remaining
+  seven are `cordial-runtime`'s from-scratch bionic pthread shim in
+  `bionic/pthread.rs` (`cond_init`, `cond_wait`, `cond_timedwait`, `once`,
+  `key_create`, `setspecific`) -- also C-called, also now `unsafe extern "C"
+  fn`, registered into the same `$fn as *const () as *mut c_void` table
+  `bionic::function_overrides` uses, which does not care whether the function
+  item is `unsafe`.
+
+**The `undocumented_unsafe_blocks` count is unchanged: 190 before, 190
+after**, both numbers from `tools/unsafe-audit.py --clippy` (the "before" run
+needed `-A clippy::not_unsafe_ptr_arg_deref` added back in to reach the same
+crates; the "after" run needed no flag at all, which is the fix working).
+Getting this far also let clippy reach `cordial-runtime`'s `cordial-run`
+binary target for the first time, which surfaced two more pre-existing gaps
+in `bin/load.rs` (`cordial_local_storage_set`'s `slice::from_raw_parts` and
+`cordial_local_storage_delete`'s `borrow_str` call, both untouched by this
+change otherwise) that would otherwise have pushed the total to 192. Those
+two got a `SAFETY:` comment each, matching their neighbours in the same
+`impl`, so this change is neutral on the ratchet rather than the one that
+happened to make it visible. The rest of the 190 -- almost all pre-existing,
+almost all in `cordial-runtime` and `cordial-linker-sys` -- is
+[issue #55](https://github.com/luohoa97/cordial/issues/55)'s to pay down.
 
 ## A worked example of the FFI-edge pattern, not a rewrite of it
 

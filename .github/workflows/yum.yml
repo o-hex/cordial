@@ -167,11 +167,20 @@ jobs:
           echo "signing=true" >> "$GITHUB_OUTPUT"
           echo "gpghome=$home" >> "$GITHUB_OUTPUT"
 
-      - name: Download the .rpm release.yml already built
+      - name: Download the .rpms release.yml already built
+        # release.yml's `rpm` job is matrixed over x86_64 and aarch64 now, and
+        # uploads one artifact per arch -- see apt.yml's identical comment on
+        # its own .deb download step for why this needs `pattern` and
+        # `merge-multiple` rather than a single fixed `name`.
+        # packaging/rpm/build-repo.sh already sorts by the arch it reads out
+        # of each .rpm's own filename (rpmbuild names them, e.g.
+        # cordial-0.17.0-1.fc44.aarch64.rpm), so flattening both artifacts'
+        # files into one dist/rpm directory needs no further change there.
         if: steps.gpg.outputs.signing == 'true'
         uses: actions/download-artifact@v4
         with:
-          name: cordial-rpm
+          pattern: cordial-rpm-*
+          merge-multiple: true
           path: dist/rpm
           github-token: ${{ github.token }}
           run-id: ${{ steps.source.outputs.run_id }}

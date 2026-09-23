@@ -147,6 +147,41 @@ permissions:
 # `timeout-minutes: 45` on the build job stays, but it is no longer load-bearing
 # for the queue: a stuck build cannot hold a group it is not in.
 
+# **Matrixed over x86_64 and aarch64 since 2026-09-23, and this is the one part
+# of that change genuinely unverified end to end.** flatpak-builder builds for
+# whatever architecture the machine running it is, so pointing `build` at
+# GitHub's free `ubuntu-24.04-arm` runner as well as `ubuntu-latest` produces
+# an aarch64 export with no change to the recipe itself -- `uname -m` inside
+# the container already returns `aarch64`, which is also exactly how OSTree
+# and Flatpak spell the architecture in a ref (`app/$APP_ID/aarch64/master`),
+# so that single value is read once per job and used everywhere below instead
+# of a second matrix axis that could drift from it.
+#
+# What is genuinely new, rather than a mechanical find-and-replace of the
+# literal `x86_64`, is that each matrix leg now produces its *own* local
+# `repo/` -- flatpak-builder starts from empty every run, and the two legs run
+# on two different machines with no shared filesystem -- and both have to end
+# up served from the one OSTree tree this workflow publishes to Pages.
+# Flatpak's own ref scheme (`app/$ID/$ARCH/$BRANCH`) is designed for exactly
+# this: Flathub itself serves many architectures out of one repository, with
+# no collision, because the architecture is part of the ref rather than a
+# property of the repository as a whole. So a single shared repo correctly
+# holding both architectures' refs is Flatpak's ordinary case, not a stretch.
+#
+# What is untested here is the *mechanics* of getting there from two separate
+# local repos built on two separate runners: the `merge` job below combines
+# them with `ostree pull-local`, once each, into a third repo that is what
+# actually gets published. `ostree pull-local` copying refs and objects
+# between two local repos with disjoint history (they share no common parent
+# commit -- each leg's `master` and `stable` are their own architecture's
+# lineage, not two branches of the same one) is standard OSTree usage and
+# not, so far as this comment's author could establish, something that needs
+# a shared ancestor to work. It has not been run against a real
+# flatpak-builder export of this workspace, on either architecture, because
+# authoring this change did not include running it. Treat the `merge` job as
+# INFERRED until somebody watches it produce a Pages tree that both an x86_64
+# and an aarch64 `flatpak install` succeed against.
+#
 # The published URL lives in packaging/cordial.flatpakrepo and is deliberately
 # not derived from github.repository here: the Url a user's flatpak remembers
 # must not change under them because the repository was renamed or forked.
@@ -163,7 +198,14 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: build (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+          - runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     # A ceiling, because there is a queue behind this.
     #
     # GitHub's default is six hours, and the concurrency group above means one
@@ -197,6 +239,15 @@ jobs:
         with:
           submodules: false
           fetch-tags: true
+
+      # The one value every arch-specific literal in this file now reads
+      # instead of spelling `x86_64` out -- see the header comment for why
+      # `uname -m` is the whole of what is needed rather than a second matrix
+      # axis. Set once, early, into GITHUB_ENV so every later step in this
+      # job -- not just `run:` steps, `with:`/`if:` expressions too -- sees
+      # `$ARCH` / `${{ env.ARCH }}` without re-deriving it.
+      - name: Read this runner's architecture the way OSTree spells it
+        run: echo "ARCH=$(uname -m)" >> "$GITHUB_ENV"
 
       # A push to main can carry a release tag on the same commit: the release
       # choreography here pushes main and the v* tag together
@@ -292,16 +343,30 @@ jobs:
               "org.gnome.Sdk//$v" \
               "org.freedesktop.Sdk.Extension.llvm20//$e"
 
-          rust_ref="runtime/org.freedesktop.Sdk.Extension.rust-stable/x86_64/$e"
-          rust_pin="385427f6dabe6d297cced114496cfa6e38bb93fe4c6fbee7fdabb97dd141d29a"
+          rust_ref="runtime/org.freedesktop.Sdk.Extension.rust-stable/$ARCH/$e"
+          # **This pinned commit is x86_64-specific, and that is now worth
+          # saying explicitly.** It was hashed against the x86_64 build of
+          # this extension on 2026-08-12; OSTree commits are per-architecture
+          # objects even though the hash carries no arch in its text, so this
+          # exact hash does not exist in the aarch64 leg's own commit lineage
+          # and pulling it there would 404 the same way the broken *current*
+          # commit does, for an unrelated reason. Rather than guess an
+          # aarch64 commit that was never measured, the fallback below is
+          # gated on $ARCH: on x86_64 it behaves exactly as before, and on
+          # aarch64 a broken plain install fails loudly instead of silently
+          # trying a pin that cannot be right.
           if flatpak install --user --noninteractive flathub \
                  "org.freedesktop.Sdk.Extension.rust-stable//$e"; then
               echo "rust-stable installed normally; the pin below is no longer needed"
-          else
+          elif [ "$ARCH" = "x86_64" ]; then
+              rust_pin="385427f6dabe6d297cced114496cfa6e38bb93fe4c6fbee7fdabb97dd141d29a"
               echo "::warning::rust-stable//$e will not pull from Flathub; falling back to pinned commit $rust_pin"
               ostree --repo="$HOME/.local/share/flatpak/repo" pull flathub "${rust_ref}@${rust_pin}"
               flatpak install --user --noninteractive --no-pull flathub \
                   "org.freedesktop.Sdk.Extension.rust-stable//$e"
+          else
+              echo "::error::rust-stable//$e will not pull from Flathub on $ARCH, and there is no pinned aarch64 commit to fall back to (see the comment above)." >&2
+              exit 1
           fi
 
       # The build step has no network (issue #3), so every crate arrives through
@@ -381,7 +446,7 @@ jobs:
         run: |
           set -euo pipefail
           ostree --repo=repo refs
-          ostree --repo=repo refs --delete "runtime/$APP_ID.Debug/x86_64/master" || true
+          ostree --repo=repo refs --delete "runtime/$APP_ID.Debug/$ARCH/master" || true
 
       # See the header comment for why this exists at all: GitHub Pages
       # replaces the whole site on every deploy, flatpak-builder only ever
@@ -408,8 +473,8 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
-          stable_ref="app/$APP_ID/x86_64/stable"
-          master_ref="app/$APP_ID/x86_64/master"
+          stable_ref="app/$APP_ID/$ARCH/stable"
+          master_ref="app/$APP_ID/$ARCH/master"
           ostree --repo=repo remote add --no-gpg-verify pages-live "$PAGES_REPO_URL"
           had_stable=true
           ostree --repo=repo pull pages-live "$stable_ref" || had_stable=false
@@ -439,6 +504,14 @@ jobs:
           fi
           ostree --repo=repo remote delete pages-live
 
+      # Run here, per architecture, on this leg's own single-arch `repo` --
+      # not only in `merge` below -- because the single-file bundle two steps
+      # from now is built from this local repo before the merge job ever
+      # sees it, and a summary is what lets that repo's own appstream branch
+      # exist for the bundle to carry. `merge` regenerates the summary again
+      # afterwards, over the combined tree, which is the one that actually
+      # gets published; this run is for the bundle's benefit and is not
+      # wasted even though its output here is never itself served.
       - name: Update the repository summary and appstream branch
         run: |
           set -euo pipefail
@@ -458,7 +531,7 @@ jobs:
           # to point at, and setting a default branch that does not exist
           # would break every install, not just new ones, rather than
           # printing the "No such branch" this is meant to avoid.
-          if ostree --repo=repo rev-parse "app/$APP_ID/x86_64/stable" >/dev/null 2>&1; then
+          if ostree --repo=repo rev-parse "app/$APP_ID/$ARCH/stable" >/dev/null 2>&1; then
             args+=(--default-branch=stable)
           fi
           # Without --prune and the summary rewrite the repository has objects
@@ -486,8 +559,18 @@ jobs:
           ref="${GITHUB_REF_NAME:-main}"
           # Pull-request refs such as 49/merge must not become directories.
           ref="${ref//\//-}"
-          out="Cordial-${ref}.flatpak"
+          # Arch-suffixed since this leg is one of two now: without it the
+          # x86_64 and aarch64 legs would both write "Cordial-${ref}.flatpak"
+          # and the second upload-artifact call below would collide with the
+          # first.
+          out="Cordial-${ref}-${ARCH}.flatpak"
+          # --arch named explicitly rather than left to build-bundle's own
+          # default (the host's `uname -m`, which happens to already be
+          # right here) -- this step runs on the same architecture it is
+          # bundling for by construction, but naming it removes the "happens
+          # to be" from that sentence.
           flatpak build-bundle repo "$out" "$APP_ID" master \
+            --arch="$ARCH" \
             --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
           ls -lh "$out"
           echo "BUNDLE=$out" >> "$GITHUB_ENV"
@@ -499,9 +582,28 @@ jobs:
       - name: Upload the bundle as a workflow artefact
         uses: actions/upload-artifact@v4
         with:
-          name: cordial-flatpak-bundle
+          name: cordial-flatpak-bundle-${{ env.ARCH }}
           path: ${{ env.BUNDLE }}
           if-no-files-found: error
+
+      # This leg's own local repo, handed to the `merge` job below so both
+      # architectures' refs end up in the one tree that actually gets
+      # published -- see the header comment for why a single shared repo can
+      # hold both without collision, and what about the merge itself is not
+      # yet verified. Not the same thing as the bundle just uploaded: the
+      # bundle is one ref packaged standalone, this is the whole local OSTree
+      # repository this leg built, objects and refs together.
+      - name: Upload this leg's OSTree repo, for the merge job to combine
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-repo-${{ env.ARCH }}
+          path: repo
+          if-no-files-found: error
+          # A build tree, not a release artefact -- nobody downloads this by
+          # hand, and it is only ever consumed by the very next job in this
+          # same run. The default 90 days would just be spending storage on
+          # every push for no reader.
+          retention-days: 1
 
       # Attaching this to the release, on a tag, and signing it, is the
       # `publish` job below -- not a step here. It used to be a bare
@@ -510,8 +612,133 @@ jobs:
       # a tag where this build finished first failed release.yml's way of
       # doing it before that job grew a create-if-missing check, and this was
       # the one artefact that never got signed. Splitting it into a separate
-      # job rather than a step also means it is not gated on the disk-heavy
-      # Pages assembly below, which this bundle has nothing to do with.
+      # job also means it is not gated on the disk-heavy Pages assembly,
+      # which now lives in the `merge` job below and which this bundle has
+      # nothing to do with.
+
+  merge:
+    name: Merge both architectures' repos and assemble the Pages tree
+    # Runs once, not matrixed -- combining two already-built repos is
+    # architecture-agnostic work (ostree deals in content-addressed objects,
+    # not in code it executes), so there is no reason to pay for an arm64
+    # runner here, or to do this twice.
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Only for the files "Assemble the Pages tree" below reads: the site,
+      # the icons, and the two static repo-definition files. Same reasoning
+      # as attach-to-release.yml's own sparse checkout.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+          sparse-checkout: |
+            site
+            packaging/icons
+            packaging/banner.svg
+            packaging/cordial.repo
+            packaging/cordial.flatpakrepo
+          sparse-checkout-cone-mode: false
+
+      - name: Install ostree and flatpak
+        # Not flatpak-builder: nothing here builds anything, it only combines
+        # two already-exported repos and re-runs the summary generation
+        # `flatpak build-update-repo` (the `flatpak` package's own command,
+        # not flatpak-builder's) already ran once per leg in `build` above.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak ostree
+
+      # Same step as in `build`, duplicated rather than shared, because a
+      # reusable-workflow extraction for one nine-line step would be more
+      # machinery than the step itself -- apt.yml, yum.yml and pacman.yml
+      # already each carry their own copy of this same shape for the same
+      # reason. Needed again here because the summary this job regenerates
+      # over the merged tree has to be signed the same way each leg's own
+      # per-arch summary already was.
+      - name: Import the signing key
+        id: gpg
+        env:
+          KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          KEYID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEY:-}" ]; then
+            echo "no FLATPAK_GPG_PRIVATE_KEY secret; the repository will be unsigned"
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          home="$RUNNER_TEMP/gnupg"
+          mkdir -p "$home"
+          chmod 700 "$home"
+          printf '%s' "$KEY" | gpg --homedir "$home" --batch --import
+          if [ -z "${KEYID:-}" ]; then
+            echo "FLATPAK_GPG_PRIVATE_KEY is set but FLATPAK_GPG_KEY_ID is not" >&2
+            exit 1
+          fi
+          echo "signing=true" >> "$GITHUB_OUTPUT"
+          echo "gpghome=$home" >> "$GITHUB_OUTPUT"
+
+      # One subdirectory per architecture (download-artifact's default
+      # behaviour for a multi-artifact `pattern` fetch with no
+      # merge-multiple) rather than flattened into one directory: unlike
+      # apt's or dnf's per-arch *files*, these are two whole OSTree
+      # repositories and have to stay two separate `--repo=` arguments for
+      # `ostree pull-local` below, not one merged directory tree.
+      - name: Download both architectures' repos
+        uses: actions/download-artifact@v4
+        with:
+          pattern: flatpak-repo-*
+          path: legs
+
+      # **The step this whole job exists for, and the one part of this
+      # change that is INFERRED rather than verified -- see the header
+      # comment.** `ostree pull-local` copies refs and their objects from one
+      # local repository into another; run once per leg, it leaves `merged`
+      # holding both architectures' `master` and `stable` refs side by side,
+      # each under its own `app/$APP_ID/<arch>/<branch>` name, which is
+      # exactly the namespacing Flatpak's own ref scheme is for. `init` first
+      # because `pull-local` pulls *into* an existing repository rather than
+      # creating one; `--mode=archive-z2` to match what flatpak-builder's own
+      # `--repo=repo` export already produced in each leg (a bare or
+      # mismatched-mode destination is a real way for a local OSTree pull to
+      # refuse, so this is not a formality).
+      - name: Combine both architectures' repos into one
+        run: |
+          set -euo pipefail
+          ostree --repo=merged init --mode=archive-z2
+          for arch_dir in legs/flatpak-repo-*; do
+            echo "==> pulling $arch_dir into the merged repo"
+            ostree --repo=merged pull-local "$arch_dir"
+          done
+          echo "==> refs in the merged repo:"
+          ostree --repo=merged refs
+
+      # Regenerates the summary and appstream branch over the *merged* tree,
+      # so the one that actually gets published describes both
+      # architectures -- each leg's own run of this same command in `build`
+      # only ever saw its own single-arch repo and was for that leg's bundle,
+      # not for what ends up on Pages. `--default-branch=stable` is guarded
+      # on any `stable` ref existing at all, for either architecture, rather
+      # than naming one arch the way `build`'s own per-leg guard does: a
+      # bare `flatpak install` resolves the branch name from this summary and
+      # then resolves the architecture itself from the installing host, so
+      # this guard only has to answer "does a stable channel exist yet",
+      # not "for which architecture".
+      - name: Update the merged repository's summary and appstream branch
+        run: |
+          set -euo pipefail
+          args=(--prune)
+          if [ "${{ steps.gpg.outputs.signing }}" = "true" ]; then
+            args+=(--gpg-homedir="${{ steps.gpg.outputs.gpghome }}"
+                   --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}")
+          fi
+          if ostree --repo=merged refs | grep -q '/stable$'; then
+            args+=(--default-branch=stable)
+          fi
+          flatpak build-update-repo "${args[@]}" merged
+          ostree --repo=merged refs
 
       # apt.yml owns building this tree -- see the long comment at the top of
       # that file for why it is a separate workflow and why it stops at a
@@ -667,7 +894,7 @@ jobs:
           # took the whole Pages deploy with it. Nothing else references the
           # banner but the README, so nothing else caught it.
           cp packaging/banner.svg pages/cordial.svg
-          mv repo pages/repo
+          mv merged pages/repo
 
           # The apt repository, downloaded above from apt.yml's latest green
           # run. Absent until a maintainer adds APT_GPG_PRIVATE_KEY /
@@ -787,12 +1014,15 @@ jobs:
       actions: write
     uses: ./.github/workflows/attach-to-release.yml
     with:
-      artifact_pattern: cordial-flatpak-bundle
+      # cordial-flatpak-bundle-* rather than the exact name: `build` is now
+      # matrixed over x86_64 and aarch64 and uploads one bundle artifact per
+      # arch, the same reason release.yml's own artifact_pattern is a glob.
+      artifact_pattern: cordial-flatpak-bundle-*
       file_globs: '*.flatpak'
-      expected_count: 1
+      expected_count: 2
 
   deploy:
-    needs: build
+    needs: merge
     # Two gates on purpose. The ref gate keeps pull requests from publishing;
     # the variable gate keeps *anything* from publishing until someone sets it,
     # which is the point at which they have also turned Pages on.

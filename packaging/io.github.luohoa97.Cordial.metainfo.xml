@@ -78,6 +78,20 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.18.0" date="2026-09-24">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.18.0</url>
+      <description>
+        <p>
+          Cordial starts again: a change on Roblox's side had it opening to a
+          grey window. It now fetches the same startup settings the Roblox
+          client itself uses.
+        </p>
+        <p>
+          ARM64 builds are published alongside x86_64. They have not been
+          tested on real ARM hardware yet.
+        </p>
+      </description>
+    </release>
     <release version="0.17.0" date="2026-09-16">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.17.0</url>
       <description>

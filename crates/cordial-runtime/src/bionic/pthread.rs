@@ -904,13 +904,20 @@ pub extern "C" fn getattr_np(thread: c_ulong, attr: *mut c_void) -> c_int {
 #[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub extern "C" fn cordial_pthread_attr_real(attr: *const c_void) -> *const c_void {
-    if attr.is_null() {
+    #[cfg(target_os = "android")]
+    {
         return attr;
     }
-    // SAFETY: as `attr_backing` above.
-    match unsafe { attr_backing(attr) } {
-        Some(backing) => backing,
-        None => attr,
+    #[cfg(not(target_os = "android"))]
+    {
+        if attr.is_null() {
+            return attr;
+        }
+        // SAFETY: as `attr_backing` above.
+        match unsafe { attr_backing(attr) } {
+            Some(backing) => backing,
+            None => attr,
+        }
     }
 }
 
@@ -1053,10 +1060,10 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
         f!("pthread_setspecific", setspecific),
     ];
     // `pthread_mutex_t` and `pthread_attr_t` need translating only on
-    // aarch64 -- see the module doc comment's table. On x86_64 the two libcs
-    // agree in size and these symbols are left to resolve straight from the
-    // host, exactly as before this fix.
-    #[cfg(target_arch = "aarch64")]
+    // aarch64 glibc hosts -- see the module doc comment's table. On x86_64
+    // the two libcs agree in size, and on Android Termux the host libc is
+    // already bionic, so these symbols resolve straight from the host.
+    #[cfg(all(target_arch = "aarch64", not(target_os = "android")))]
     v.extend([
         f!("pthread_mutex_init", mutex_init),
         f!("pthread_mutex_destroy", mutex_destroy),

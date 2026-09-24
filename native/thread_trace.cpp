@@ -120,7 +120,7 @@ void* trampoline(void* raw) {
 
 } // namespace
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) && !defined(__ANDROID__)
 // Defined in crates/cordial-runtime/src/bionic/pthread.rs, aarch64 only —
 // see that file's own comment on `cordial_pthread_attr_real` for why this
 // call exists and what it would silently overrun without it.
@@ -129,7 +129,7 @@ extern "C" const void* cordial_pthread_attr_real(const void* attr);
 
 extern "C" int cordial_pthread_create(pthread_t* thread, const pthread_attr_t* attr,
                                        void* (*start_routine)(void*), void* arg) {
-#if defined(__aarch64__)
+#if defined(__aarch64__) && !defined(__ANDROID__)
     attr = reinterpret_cast<const pthread_attr_t*>(cordial_pthread_attr_real(attr));
 #endif
     if (!g_trace) {

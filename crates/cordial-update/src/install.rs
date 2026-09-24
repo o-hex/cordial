@@ -693,6 +693,12 @@ pub fn file_into_store(
         }
         let entry = store::entry_dir_in(root, &version).expect("checked by is_valid_version above");
 
+        // This does not go through `store::adopt_current`, so it is the one
+        // caller that takes the store lock directly rather than getting it for
+        // free -- see [ADR-037](../../../docs/adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md).
+        // Held from here so both branches below are covered.
+        let _lock = store::lock(root).map_err(|e| io(root, e))?;
+
         // Already kept. The engine there is the same version, so only the
         // archives an entry kept without them is missing are added.
         if entry.join(engine::LIBRARY).is_file() {
@@ -702,6 +708,7 @@ pub fn file_into_store(
                     land(path, &target)?;
                 }
             }
+            store::ensure_content_hash(&entry);
             return Ok(version);
         }
 
@@ -714,6 +721,7 @@ pub fn file_into_store(
         // the way of the rename and holds nothing worth keeping.
         let _ = std::fs::remove_dir_all(&entry);
         std::fs::rename(&gathering, &entry).map_err(|e| io(&entry, e))?;
+        store::ensure_content_hash(&entry);
         Ok(version)
     })();
     let _ = std::fs::remove_dir_all(&gathering);

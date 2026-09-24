@@ -502,15 +502,38 @@ sorted order wins and the second is reported and skipped, because grants, event
 namespaces and settings directories are all keyed by id and the second claimant
 would otherwise inherit the first's approvals.
 
-Two details that cost time if you do not know them. The grants file is the
+One detail that costs time if you do not know it: the grants file is the
 authority, not your manifest — the broker is built from what the file says, and
 Settings only limits itself to offering switches for capabilities you actually
-requested. And `start_all` discovers only under the **user** plugin root; the
-system root where first-party plugins ship is read for static flag layers,
-asset overlays and the Settings list, but a plugin installed only there is not
-spawned — **INFERRED** from that call site rather than from a run. If you are
-developing something that will eventually ship with Cordial, develop it in the
-user root.
+requested.
+
+**Correction: `start_all` discovers and spawns from *both* roots, system
+first.** This used to say the system root — where first-party plugins ship —
+was read only for static flag layers, asset overlays and the Settings list,
+and that a plugin installed only there was not spawned, labelled `INFERRED`
+because that claim was read off the call site rather than a run. It was
+wrong, and a run is what caught it: `CORDIAL_SYSTEM_PLUGIN_DIR` pointed at a
+checkout's `plugins/` with nothing in the user root at all, and the log still
+read `plugins: 4 built-in, 0 installed` followed by `plugin flag-inspector:
+started` — a plugin that exists nowhere but the system root, running. Every
+first-party plugin Cordial ships (`flag-inspector`, `discord-presence`,
+`fps-flex`, `hide-gui`) is started exactly this way on an ordinary launch;
+there would be no working built-in plugins at all if the old claim had been
+true. If you are developing something that will eventually ship with
+Cordial, the user root is still the easier place to iterate on it — nothing
+about the system root's discovery changes that — but do not read "not
+spawned" as a reason it has to be there.
+
+**None of this waits for the next launch, since
+[ADR-038](adr/ADR-038-plugin-hot-swap.md).** A running client polls this
+profile's plugin roots, its `plugin-enabled.json` and its
+`plugin-grants.json`, notices a plugin installed, removed, updated, enabled,
+disabled or newly granted, and starts, stops or restarts exactly that
+plugin — through this same `start_all`/`spawn_one` path, not a second one.
+An update that changes your manifest's `capabilities` list is applied to the
+*restarted* process as the intersection of what the profile has granted and
+what the new manifest actually requests, never the raw grants-file entry a
+stale request list would otherwise still read as approved.
 
 ## Testing during development, without packaging
 

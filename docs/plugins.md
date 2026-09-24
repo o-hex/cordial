@@ -45,9 +45,18 @@ inside it, and the picker will not take it.
 
 If you are writing a plugin rather than installing one, skip the archive: put
 the folder straight into `~/.local/share/cordial/plugins/<plugin-id>/` so that
-its `plugin.json` is at `…/<plugin-id>/plugin.json`, and restart. Under Flatpak
-that path is `~/.var/app/io.github.luohoa97.Cordial/data/plugins/` instead,
-since that is where the sandbox keeps its data.
+its `plugin.json` is at `…/<plugin-id>/plugin.json`. Under Flatpak that path is
+`~/.var/app/io.github.luohoa97.Cordial/data/plugins/` instead, since that is
+where the sandbox keeps its data.
+
+**No restart needed, since [ADR-038](adr/ADR-038-plugin-hot-swap.md).** A
+client already running notices the new directory, the grant you add for it,
+and Settings' own switch within a second or two, and starts, stops or
+restarts exactly the plugin that changed rather than needing a fresh launch.
+That covers installing, updating, removing, enabling, disabling and granting
+— everything except a `flags.write` layer, which has always taken effect at
+the next launch and still does (ADR-005), because `FFlag`/`FInt`/`FString`
+are read once at startup regardless of who is asking to change them.
 
 **Trust the source.** A plugin runs as a real process on your machine. Cordial
 gives it no ambient permissions — no file access, no network, no environment, no

@@ -175,8 +175,11 @@ only the profile root and not the client.
 and unpack to `~/.local/share/cordial/plugins/<id>/`. They run as separate
 processes on Deno with named capabilities, default-deny, granted per profile in
 `plugin-grants.json`. Three ship with Cordial and all are off until enabled.
+Installing, updating, removing, enabling, disabling or granting one reaches an
+already-running client within a second or two, no restart needed.
 [`docs/plugins.md`](docs/plugins.md),
-[`docs/adr/ADR-007-host-resources-are-brokered.md`](docs/adr/ADR-007-host-resources-are-brokered.md).
+[`docs/adr/ADR-007-host-resources-are-brokered.md`](docs/adr/ADR-007-host-resources-are-brokered.md),
+[`docs/adr/ADR-038-plugin-hot-swap.md`](docs/adr/ADR-038-plugin-hot-swap.md).
 
 Runtime knobs — monitor, resolution, DPI scale, frame pacing, pointer lock,
 controller glyphs — are environment variables listed in

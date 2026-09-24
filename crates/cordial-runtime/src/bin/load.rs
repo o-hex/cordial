@@ -599,8 +599,7 @@ fn call_globals(lib: &linker::Library, when: &str) {
         let short = name.rsplit('_').next().unwrap_or(name);
         match lib.symbol(name) {
             None => println!("  {name} not exported"),
-            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-            Some(f) => match unsafe { linker::game_activity::appbridge_call_bare(f) } {
+            Some(f) => match linker::game_activity::appbridge_call_bare(f) {
                 Ok(()) => println!("  {short} ok ({when})"),
                 Err(e) => println!("  {short} failed ({when}): {e}"),
             },
@@ -651,11 +650,10 @@ extern "C" fn run_bootstrap() {
                     .unwrap_or_else(|| plan.settings.clone()),
                 _ => plan.settings.clone(),
             };
-            // SAFETY: `plan.preload_native as *mut std::ffi:...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-            match unsafe { linker::game_activity::preload_flag_overrides(
+            match linker::game_activity::preload_flag_overrides(
                 plan.preload_native as *mut std::ffi::c_void,
                 &body,
-            ) } {
+            ) {
                 Ok(()) => println!(
                     "    nativePreloadFlagOverrides ok ({shape}, {} bytes)",
                     body.len()
@@ -705,8 +703,7 @@ extern "C" fn run_bootstrap() {
                     .ok()
                     .and_then(|v| v.parse::<i64>().ok())
                     .unwrap_or(when);
-                // SAFETY: `plan.cached_native as *mut std::ffi::...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-                match unsafe { linker::game_activity::init_client_settings_cached_compressed(
+                match linker::game_activity::init_client_settings_cached_compressed(
                     plan.cached_native as *mut std::ffi::c_void,
                     &bytes,
                     a1,
@@ -714,7 +711,7 @@ extern "C" fn run_bootstrap() {
                     a3,
                     when,
                     flag,
-                ) } {
+                ) {
                     Ok(code) => println!(
                         "    nativeInitClientSettingsCachedCompressed ({} bytes, [{a1}|{a2}|{a3}], when {when}, flag {flag}) -> {code}",
                         bytes.len()
@@ -787,13 +784,12 @@ extern "C" fn run_bootstrap() {
         SETTINGS_DELIVERED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     if plan.settings_native != 0 {
-        // SAFETY: `plan.settings_native as *mut std::ffi...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-        match unsafe { linker::game_activity::init_client_settings(
+        match linker::game_activity::init_client_settings(
             plan.settings_native as *mut std::ffi::c_void,
             &plan.settings,
             "",
             "",
-        ) } {
+        ) {
             Ok(code) => println!("    nativeInitClientSettings -> {code}"),
             Err(e) => println!("    nativeInitClientSettings failed: {e}"),
         }
@@ -846,13 +842,12 @@ extern "C" fn run_bootstrap() {
                      ({} bytes)",
                     settings.len()
                 );
-                // SAFETY: `native as *mut std::ffi::c_void` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-                match unsafe { linker::game_activity::init_client_settings(
+                match linker::game_activity::init_client_settings(
                     native as *mut std::ffi::c_void,
                     &settings,
                     "",
                     "",
-                ) } {
+                ) {
                     Ok(code) => println!("  [experiment] second nativeInitClientSettings -> {code}"),
                     Err(e) => println!("  [experiment] second nativeInitClientSettings failed: {e}"),
                 }
@@ -891,10 +886,9 @@ extern "C" fn run_bootstrap() {
     // call site, which predates the early one and is what actually produces the
     // block, is untouched.
     if plan.post_native != 0 && std::env::var_os("CORDIAL_EARLY_POST").is_some() {
-        // SAFETY: `plan.post_native as *mut std::ffi::c_...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-        match unsafe { linker::game_activity::post_client_settings_loaded(
+        match linker::game_activity::post_client_settings_loaded(
             plan.post_native as *mut std::ffi::c_void,
-        ) } {
+        ) {
             Ok(()) => println!("    postClientSettingsLoadedInitialization3 ok"),
             Err(e) => println!("    postClientSettingsLoadedInitialization3 failed: {e}"),
         }
@@ -907,11 +901,10 @@ extern "C" fn run_bootstrap() {
         println!("  nativeInitializeNativeFlags is not exported by this build; no flag names sent");
     }
     if plan.flags_native != 0 {
-        // SAFETY: `plan.flags_native as *mut std::ffi::c...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-        match unsafe { linker::game_activity::init_flags(
+        match linker::game_activity::init_flags(
             plan.flags_native as *mut std::ffi::c_void,
             &plan.flag_names,
-        ) } {
+        ) {
             Ok(()) => println!("    flags initialised"),
             Err(e) => println!("    flag init failed: {e}"),
         }
@@ -1050,8 +1043,7 @@ fn wire_refresh_rate(lib: linker::Library) {
             if supported.is_empty() {
                 println!("  refresh: no plausible output to report yet");
             } else {
-                // SAFETY: `supported_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-                match unsafe { linker::game_activity::pass_supported_refresh_rates(supported_native, &supported) } {
+                match linker::game_activity::pass_supported_refresh_rates(supported_native, &supported) {
                     Ok(()) => println!("  refresh: nativePassSupportedRefreshRates {supported:?}"),
                     Err(e) => println!("  refresh: nativePassSupportedRefreshRates failed: {e}"),
                 }
@@ -1067,8 +1059,7 @@ fn wire_refresh_rate(lib: linker::Library) {
             let current = cordial_runtime::refresh::current_for(&outputs);
             if cordial_runtime::refresh::worth_announcing(previous_current.get(), current) {
                 if let Some(hz) = current {
-                    // SAFETY: `current_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-                    match unsafe { linker::game_activity::pass_current_refresh_rate(current_native, hz) } {
+                    match linker::game_activity::pass_current_refresh_rate(current_native, hz) {
                         Ok(()) => println!("  refresh: nativePassCurrentDisplayRefreshRate {hz}"),
                         Err(e) => println!("  refresh: nativePassCurrentDisplayRefreshRate failed: {e}"),
                     }
@@ -1135,12 +1126,11 @@ fn wire_battery_reporting(lib: linker::Library) {
         if changed {
             match cordial_runtime::battery::state_changed_args(&reading) {
                 Some((status, plugged)) => {
-                    // SAFETY: `state_changed_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-                    match unsafe { linker::game_activity::report_battery_state_changed(
+                    match linker::game_activity::report_battery_state_changed(
                         state_changed_native,
                         status,
                         plugged,
-                    ) } {
+                    ) {
                         Ok(()) => {
                             println!("  battery: reportBatteryStateChanged({status}, {plugged})")
                         }
@@ -1173,8 +1163,7 @@ fn wire_battery_reporting(lib: linker::Library) {
                 temperature_c: b.and_then(|b| b.temperature_tenths_c).map(|t| t as f32 / 10.0),
                 plugged: reading.plugged,
             };
-            // SAFETY: `status_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-            match unsafe { linker::game_activity::report_battery_status(status_native, &fields) } {
+            match linker::game_activity::report_battery_status(status_native, &fields) {
                 Ok(()) => println!("  battery: reportBatteryStatus {fields:?}"),
                 Err(e) => println!("  battery: reportBatteryStatus failed: {e}"),
             }
@@ -1608,59 +1597,13 @@ fn main() -> ExitCode {
     // process exiting — cleanly, by panic, or by SIGKILL — closes the
     // descriptor and releases it, which is the property a lock file holding a
     // PID would not have.
-    let claim = match claim_profile(&opt) {
+    let _claim = match claim_profile(&opt) {
         Ok(claim) => claim,
         Err(refusal) => {
             eprintln!("error: {refusal}");
             return ExitCode::from(3);
         }
     };
-
-    // Arm `CORDIAL_STARTUP_SELFRELAUNCH` before anything else touches the
-    // claim, for the same reason the claim itself is taken this early: once
-    // the engine starts, there is no later point that is not racing the
-    // freeze this exists to answer.
-    //
-    // **Capped at one hop, by refusing to arm on a process that is itself
-    // already a relaunch.** `CORDIAL_RELAUNCHED` is set on the child by the
-    // closure below and never on the first launch, so a relaunched instance
-    // that also stalls falls through to the ordinary stall report instead of
-    // relaunching again -- see `looper::selfrelaunch_enabled`'s doc for why an
-    // uncapped version would be the wrong failure mode to ship.
-    //
-    // The original argv, not a reconstruction from `opt`: `Options` has
-    // already thrown away anything it did not recognise, and a flag added
-    // after this code and not before it would silently be dropped from the
-    // relaunch. `args_os` is what the process was actually started with.
-    if std::env::var_os("CORDIAL_RELAUNCHED").is_none() {
-        let exe = std::env::current_exe().ok();
-        let relaunch_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        if let Some(exe) = exe {
-            let _ = cordial_runtime::android::looper::STARTUP_RELAUNCH.set(Box::new(move || {
-                let mut cmd = std::process::Command::new(&exe);
-                cmd.args(&relaunch_args);
-                cmd.env("CORDIAL_RELAUNCHED", "1");
-                // Same handoff `cordial-shell`'s launcher uses to give a
-                // spawned client its profile lock without a gap where
-                // neither process holds it -- see `Claim::hand_to`. Reused
-                // here for a client handing the same lock to its own
-                // successor rather than a shell handing it to a client.
-                claim.hand_to(&mut cmd);
-                match cmd.spawn() {
-                    // **`exit`, not `return`.** This runs on the pump's
-                    // watchdog thread, not `main`'s, and `main` may itself be
-                    // blocked inside the wedged engine -- the whole reason
-                    // `CORDIAL_STARTUP_RETRY` made things worse. `exit`
-                    // reclaims the process regardless of what any thread is
-                    // doing, which a plain return from this closure would not.
-                    Ok(_child) => std::process::exit(0),
-                    Err(e) => format!("{e}"),
-                }
-            }));
-        } else {
-            println!("  self-relaunch not armed: could not resolve the running executable's own path");
-        }
-    }
 
     // Before anything this profile might do reaches a network, including the
     // client-settings fetch further down -- which is a real HTTP request over
@@ -2235,296 +2178,6 @@ fn main() -> ExitCode {
                             let (width, height, _) = w.geometry();
                             cordial_runtime::android::config::set_screen(width, height);
                             let apk_path = asset_folder(&opt.apk);
-
-                            // `CORDIAL_SKIP_AGDK_SETTINGS=1`: deliver client
-                            // settings and flags before the app-bridge loop
-                            // below, matching the order Sober's own engine log
-                            // shows and `docs/traces/render-bringup-sequence.log`
-                            // confirms for real Android: `nativeInitClientSettings`
-                            // then `nativePostClientSettingsLoadedInitialization3`
-                            // both complete before any `nativeAppBridge*` native
-                            // is ever called.
-                            //
-                            // This is the missing half of `CORDIAL_SKIP_AGDK`,
-                            // not a new ordering idea. `CORDIAL_SKIP_AGDK=1`
-                            // alone dies today on "Can't initialize the
-                            // TaskScheduler before flags have been loaded"
-                            // (docs/NEXT.md, AGENTS.md) because this branch has
-                            // never called `nativeInitClientSettings` at all --
-                            // the `bootstrap_installed`/`BOOTSTRAP`/
-                            // `wait_for_settings_delivery` machinery a few
-                            // hundred lines down only exists inside the
-                            // `Some(f) =>` arm of `match native`, which
-                            // `skip_agdk` sets to `None` and so never reaches.
-                            //
-                            // Why this branch and not `CORDIAL_SYNC_BOOTSTRAP`
-                            // (which delivers the same data, just as early, on
-                            // the AGDK path): that switch measured no
-                            // difference (`docs/NEXT.md`, "Recovery and a
-                            // settings-race prevention attempt") because the
-                            // AGDK path's `nativeAppBridge*` calls are made by
-                            // the engine's *own* internally-spawned thread
-                            // inside `nativeGameGlobalInit`, on its own
-                            // schedule -- delivering the data earlier does not
-                            // move the call that races ahead of it. Here there
-                            // is no such thread: `skip_agdk` never calls
-                            // `initializeNativeCode`, so the calls below are
-                            // the only thing that starts the app bridge, all
-                            // made by this one thread, in the order this file
-                            // writes them.
-                            //
-                            // Deliberately does NOT call `NativeAppBridgeInterface
-                            // .nativeAppBridgeAppStart` (the "V1" native ahead of
-                            // V2Init in Sober's own log). Its five-string-plus-
-                            // bool signature is documented
-                            // (`docs/analysis/app-bridge.md` §1.2) but no
-                            // argument value has ever been observed, and that
-                            // same document's §7 records that nobody has
-                            // established whether V1 or V2 is what actually
-                            // wins in the shipping app. Inventing five argument
-                            // values to match a log line is exactly the
-                            // reasoning-from-a-binary AGENTS.md warns against;
-                            // the V2 sequence below is the one already
-                            // confirmed to render.
-                            //
-                            // UNVERIFIED beyond the mechanism: whether this
-                            // actually reaches a painted Home, or merely trades
-                            // the freeze for the blank screen the AGDK-skip
-                            // family has produced before (`docs/NEXT.md`,
-                            // mocktail-combination result) -- score with a
-                            // screenshot, not a present count.
-                            if std::env::var_os("CORDIAL_SKIP_AGDK_SETTINGS").is_some() {
-                                const FLAG_NAMES: &str =
-                                    include_str!("../native-flag-names.txt");
-
-                                // **First measurement of this switch crashed
-                                // here**: `RBXCRASH: UnhandledException
-                                // (St13runtime_error Path does not exist: "")`,
-                                // straight out of `nativeAppBridgeV2InitWithParams`,
-                                // with `nativeInitClientSettings`/`...Post...3`
-                                // both reporting success just before it. This
-                                // branch had never set a files/cache/external
-                                // directory before -- `skip_agdk` sets
-                                // `native = None`, so the `NativeSettingsInterface`
-                                // setters and the directory tree the `Some(f) =>`
-                                // arm below creates for the AGDK path never ran
-                                // -- and settling settings/flags is exactly what
-                                // makes the engine go looking for a directory it
-                                // was never given, where previously it aborted on
-                                // the missing flags first and never got that far.
-                                // Same tree and same four setters as the AGDK
-                                // path (`root`/`files`/`cache`/`external`
-                                // below), reused rather than re-derived --
-                                // duplicated here instead of factored out
-                                // because the AGDK arm's version also creates
-                                // `window`-dependent state this branch does not
-                                // have yet, and untangling the two was more risk
-                                // than the duplication.
-                                let root = std::env::var("CORDIAL_FILES_DIR").unwrap_or_else(|_| {
-                                    format!("{}/data", cordial_runtime::profile::active().display())
-                                });
-                                let files = format!("{root}/files");
-                                let cache = format!("{root}/cache");
-                                let external = format!("{root}/external");
-                                for d in [&files, &cache, &external] {
-                                    if let Err(e) = std::fs::create_dir_all(d) {
-                                        println!("  could not create {d}: {e}");
-                                    }
-                                }
-                                for base in [root.as_str(), "."] {
-                                    for rel in [
-                                        "files", "cache", "shared_prefs", "rbx-storage", "appData",
-                                        "appData/LocalStorage", "appData/rbx-storage",
-                                        "appData/ClientSettings", "files/appData",
-                                        "files/appData/LocalStorage", "files/appData/OTAPatchBackups",
-                                        "files/appData/rbx-storage", "cache/ContentProvider_2",
-                                        "cache/rbx-storage", "cache/sounds",
-                                        "sdcard/Android/data/com.roblox.client",
-                                        "sdcard/Android/data/com.roblox.client/files",
-                                        "sdcard/Android/data/com.roblox.client/cache",
-                                    ] {
-                                        let _ = std::fs::create_dir_all(format!("{base}/{rel}"));
-                                    }
-                                }
-                                const SETTINGS_CLASS: &str =
-                                    "com/roblox/engine/jni/NativeSettingsInterface";
-                                let dirs: &[(&str, Vec<&str>)] = &[
-                                    (
-                                        "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetFilesDirectory",
-                                        vec![files.as_str()],
-                                    ),
-                                    (
-                                        "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetCacheDirectory",
-                                        vec![cache.as_str()],
-                                    ),
-                                    (
-                                        "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetExternalDirectory",
-                                        vec![external.as_str()],
-                                    ),
-                                    (
-                                        "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetBaseDataDirectories",
-                                        vec![files.as_str(), cache.as_str()],
-                                    ),
-                                ];
-                                for (name, dir_args) in dirs {
-                                    match lib.symbol(name) {
-                                        None => println!("  {name} not exported"),
-                                        Some(f) => match linker::game_activity::call_static_strings(
-                                            f, SETTINGS_CLASS, dir_args,
-                                        ) {
-                                            Ok(()) => println!(
-                                                "  {} ok",
-                                                name.rsplit('_').next().unwrap_or(name)
-                                            ),
-                                            Err(e) => println!("  {name} failed: {e}"),
-                                        },
-                                    }
-                                }
-                                cordial_runtime::android::system::set_files_dir(
-                                    std::path::Path::new(files.as_str()),
-                                );
-
-                                let settings = cordial_runtime::client_settings::load(
-                                    opt.client_settings.as_deref(),
-                                )
-                                .unwrap_or_default();
-                                println!(
-                                    "  CORDIAL_SKIP_AGDK_SETTINGS: delivering settings \
-                                     ({} bytes) and flags before the app bridge",
-                                    settings.len()
-                                );
-                                match lib.symbol(
-                                    "Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings",
-                                ) {
-                                    None => println!("  nativeInitClientSettings not exported"),
-                                    Some(f) => match linker::game_activity::init_client_settings(
-                                        f, &settings, "", "",
-                                    ) {
-                                        Ok(code) => println!(
-                                            "  nativeInitClientSettings -> {code}"
-                                        ),
-                                        Err(e) => {
-                                            println!("  nativeInitClientSettings failed: {e}")
-                                        }
-                                    },
-                                }
-                                match lib.symbol(
-                                    "Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3",
-                                ) {
-                                    None => println!(
-                                        "  nativePostClientSettingsLoadedInitialization3 not exported"
-                                    ),
-                                    Some(f) => {
-                                        match linker::game_activity::post_client_settings_loaded(f) {
-                                            Ok(()) => println!(
-                                                "  nativePostClientSettingsLoadedInitialization3 ok"
-                                            ),
-                                            Err(e) => println!(
-                                                "  nativePostClientSettingsLoadedInitialization3 failed: {e}"
-                                            ),
-                                        }
-                                    }
-                                }
-                                match lib.symbol(
-                                    "Java_com_roblox_client_flags_FlagJniInterface_nativeInitializeNativeFlags",
-                                ) {
-                                    None => println!("  nativeInitializeNativeFlags not exported"),
-                                    Some(f) => match linker::game_activity::init_flags(f, FLAG_NAMES) {
-                                        Ok(()) => println!("  flags initialised"),
-                                        Err(e) => println!("  flag init failed: {e}"),
-                                    },
-                                }
-
-                                // **Second finding on this arm, past the
-                                // directory crash and the Vulkan osVersion
-                                // gate**: 5/5 pilot runs (`$S/sober-diff.md`)
-                                // reach a real, painted `APP_READY Landing` --
-                                // the signed-OUT page -- on a signed-in
-                                // profile, with `StartupController`/`NativeDM`
-                                // /`initEngine_`/any cookie line appearing
-                                // NOWHERE in the engine log. `StartAppParams`
-                                // (`native/init_params.cpp:1867`) already
-                                // carries the right `username`/`appUserId`
-                                // from `identity.rs` regardless of this
-                                // switch -- confirmed by `[cordial] app start
-                                // as a signed-in user` printing correctly --
-                                // so the identity is not the gap.
-                                //
-                                // The gap is this: `BOOTSTRAP.set`/
-                                // `set_bootstrap(Some(run_bootstrap))` a few
-                                // hundred lines down (search
-                                // `bootstrap_installed`) is the *only* place
-                                // that hook is installed, and it sits inside
-                                // the `Some(f) =>` arm of `match native` that
-                                // `skip_agdk` never reaches. Direct calls to
-                                // `nativeInitClientSettings`/etc. above
-                                // deliver the *data* the engine asks for, but
-                                // never let the engine make its *own*
-                                // `bootstrapTheApp` call and have it return
-                                // through Cordial's hook -- and the
-                                // `StartupController`/cookie-sync chain this
-                                // whole investigation is about
-                                // (`sync cookies from engine`) has, in every
-                                // capture taken of it so far, only ever been
-                                // seen firing from inside that engine-driven
-                                // callback, never from a direct call. Installed
-                                // here too so the engine can make that call
-                                // when it is ready to, on this arm's single
-                                // thread rather than AGDK's second one --
-                                // **UNVERIFIED whether this is sufficient by
-                                // itself**, next rebuild tests it directly.
-                                //
-                                // `run_bootstrap`'s own `BOOTSTRAP_RAN` guard
-                                // makes a second delivery from the engine
-                                // calling this a same-thread no-op rather than
-                                // a duplicate, the same property
-                                // `CORDIAL_SYNC_BOOTSTRAP` already relies on.
-                                {
-                                    const FLAG_NAMES_FOR_PLAN: &str =
-                                        include_str!("../native-flag-names.txt");
-                                    let (settings_body, settings_source) =
-                                        cordial_runtime::client_settings::load_reporting(
-                                            opt.client_settings.as_deref(),
-                                        );
-                                    let plan = BootstrapPlan {
-                                        settings_native: lib
-                                            .symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings")
-                                            .map_or(0, |p| p as usize),
-                                        post_native: lib
-                                            .symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3")
-                                            .map_or(0, |p| p as usize),
-                                        flags_native: lib
-                                            .symbol("Java_com_roblox_client_flags_FlagJniInterface_nativeInitializeNativeFlags")
-                                            .map_or(0, |p| p as usize),
-                                        preload_native: lib
-                                            .symbol("Java_com_roblox_client_startup_MainGameActivity_nativePreloadFlagOverrides")
-                                            .map_or(0, |p| p as usize),
-                                        cached_native: lib
-                                            .symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettingsCachedCompressed")
-                                            .map_or(0, |p| p as usize),
-                                        library: cordial_update::engine::library_in(
-                                            std::path::Path::new(&opt.lib_dir),
-                                        )
-                                        .display()
-                                        .to_string(),
-                                        cache_file: format!("{cache}/cache/flag_cache.dat"),
-                                        settings: settings_body.unwrap_or_default(),
-                                        settings_source: settings_source.to_string(),
-                                        flag_names: FLAG_NAMES_FOR_PLAN.to_string(),
-                                    };
-                                    if BOOTSTRAP.set(plan).is_ok() {
-                                        linker::game_activity::set_bootstrap(Some(run_bootstrap));
-                                        println!(
-                                            "  CORDIAL_SKIP_AGDK_SETTINGS: bootstrapTheApp hook \
-                                             also installed, for whatever engine-driven callback \
-                                             chain sync cookies from engine sits behind"
-                                        );
-                                    } else {
-                                        println!("  BOOTSTRAP already set; hook not reinstalled");
-                                    }
-                                }
-                            }
-
                             // Order taken from a Waydroid capture of the real
                             // Android client (docs/traces/render-bringup-sequence.log),
                             // which logs:
@@ -2553,39 +2206,6 @@ fn main() -> ExitCode {
                             // — so it stays here, last, for parity with the
                             // engine's own onCreate order, but is provably
                             // redundant for this particular crash.
-                            // `CORDIAL_SKIP_AGDK_SETTINGS=1` also calls the
-                            // "V1" `nativeAppBridgeAppStart` here, immediately
-                            // before the loop below (which starts with V2's
-                            // `nativeGameGlobalInit`) -- matching Sober's own
-                            // order, `s2.enginelog:62-63` in `$S/sober-diff.md`
-                            // (`nativeAppBridgeAppStart` at 3.328s,
-                            // `nativeAppBridgeV2Init` at 3.336s), also the
-                            // order in `docs/traces/render-bringup-sequence.log`.
-                            // Without it, this arm reached a real, painted
-                            // `APP_READY Landing` -- the signed-out page --
-                            // on a signed-in profile 5/5 times, with
-                            // `StartupController`/`NativeDM`/any cookie line
-                            // never appearing at all. `cordial_appbridge_app_start`
-                            // (`native/init_params.cpp`) builds all six
-                            // arguments on the C++ side; see its own doc
-                            // comment for the mocktail cross-check and why
-                            // the Android ID is a documented placeholder
-                            // rather than an invented one.
-                            //
-                            // UNVERIFIED whether this closes the gap by
-                            // itself -- installing the `bootstrapTheApp` hook
-                            // alone (tried first) did not.
-                            if std::env::var_os("CORDIAL_SKIP_AGDK_SETTINGS").is_some() {
-                                match lib.symbol(
-                                    "Java_com_roblox_engine_jni_NativeAppBridgeInterface_nativeAppBridgeAppStart__Ljava_lang_String_2Ljava_lang_String_2ZLjava_lang_String_2Ljava_lang_String_2Ljava_lang_String_2",
-                                ) {
-                                    None => println!("  nativeAppBridgeAppStart (V1) not exported"),
-                                    Some(f) => match linker::game_activity::appbridge_app_start(f) {
-                                        Ok(()) => println!("  nativeAppBridgeAppStart (V1) ok"),
-                                        Err(e) => println!("  nativeAppBridgeAppStart (V1) failed: {e}"),
-                                    },
-                                }
-                            }
                             for (name, run) in [
                                 ("nativeGameGlobalInit", 0),
                                 ("nativeUpdateAdapterInit", 0),
@@ -2600,72 +2220,6 @@ fn main() -> ExitCode {
                                     println!("  {name} not exported");
                                     continue;
                                 };
-                                // **Third finding on this arm.** Adding the
-                                // V1 `nativeAppBridgeAppStart` call above got
-                                // `StartupController finished starting: stage
-                                // = 2` to appear for the first time on this
-                                // arm (`$S/sober-diff.md`, `arm-pilot4/r1`) --
-                                // but still `APP_READY Landing`, still no
-                                // cookie line. Sober's own log
-                                // (`s2.enginelog:132`) calls
-                                // `nativeAppBridgeV2StartApp` at t=4.149s,
-                                // **478ms after** `StartupController finished
-                                // starting` at t=3.671s -- Sober's launcher
-                                // waits for that async completion before
-                                // handing the engine a real render surface.
-                                // This arm's loop calls
-                                // `nativeAppBridgeV2StartAppWithParams`
-                                // synchronously, within milliseconds of
-                                // `nativeAppBridgeStartLuaAppDM`, which on
-                                // `arm-pilot4/r1` is over a second *before*
-                                // `StartupController finished starting` (that
-                                // line landed at engine t=1.507s). The
-                                // hypothesis: handing over the surface before
-                                // the router has actually decided Home vs
-                                // Landing hands it whatever default DataModel
-                                // exists at that moment, not the one
-                                // `StartupController` would have produced.
-                                // Polls the engine's own log for that line
-                                // rather than a blind sleep, because the gap
-                                // is a race and not a fixed constant even in
-                                // Sober's own capture.
-                                if name == "nativeAppBridgeV2StartAppWithParams"
-                                    && std::env::var_os("CORDIAL_SKIP_AGDK_SETTINGS").is_some()
-                                {
-                                    let log_dir = format!(
-                                        "{}/data/files/appData/logs",
-                                        cordial_runtime::profile::active().display()
-                                    );
-                                    let wait_start = std::time::Instant::now();
-                                    let deadline = wait_start + std::time::Duration::from_secs(5);
-                                    let mut seen = false;
-                                    while std::time::Instant::now() < deadline {
-                                        if let Ok(entries) = std::fs::read_dir(&log_dir) {
-                                            let newest = entries
-                                                .flatten()
-                                                .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
-                                                .max_by_key(|e| {
-                                                    e.metadata().and_then(|m| m.modified()).ok()
-                                                });
-                                            if let Some(entry) = newest {
-                                                if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                                                    if text.contains("StartupController finished starting")
-                                                        || text.contains("StartupController started")
-                                                    {
-                                                        seen = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        std::thread::sleep(std::time::Duration::from_millis(50));
-                                    }
-                                    println!(
-                                        "  CORDIAL_SKIP_AGDK_SETTINGS: waited {:?} for \
-                                         StartupController before StartAppWithParams (seen={seen})",
-                                        wait_start.elapsed()
-                                    );
-                                }
                                 let r = match run {
                                     1 => linker::game_activity::appbridge_init(
                                         f, &apk_path, width, height,
@@ -3029,60 +2583,6 @@ fn main() -> ExitCode {
                             println!("  bootstrapTheApp installed");
                         } else {
                             println!("  bootstrapTheApp NOT installed (CORDIAL_NO_BOOTSTRAP)");
-                        }
-
-                        // **CORDIAL_SYNC_BOOTSTRAP=1: delivers settings and
-                        // flags here, synchronously, instead of leaving them
-                        // to race the engine's own asynchronous
-                        // `bootstrapTheApp` -- and measured, 2026-09-18, not
-                        // to be why Cordial needs the retry cycle it is
-                        // compared against.**
-                        //
-                        // A concurrent session compared Sober,
-                        // `$S/sober-comparison.md`: every signed-in Cordial
-                        // run enters `Forcing finalize experience
-                        // coordinator` / `did not finalize due to state`, and
-                        // 0 of 17 signed-in Sober launches do. The hypothesis
-                        // was that Cordial's settings/flags handshake only
-                        // lands before the app bridge when it wins a race
-                        // against `bootstrapTheApp` (measured elsewhere at
-                        // 0/75 winning it), where Sober has no second thread
-                        // to race at all.
-                        //
-                        // `run_bootstrap` is already idempotent for a
-                        // different reason -- the engine calls
-                        // `bootstrapTheApp` itself and `BOOTSTRAP_RAN.swap`
-                        // makes a second delivery a same-thread no-op
-                        // ("already delivered") -- so calling it here, before
-                        // `initializeNativeCode` even exists, needed no new
-                        // guard of its own, and it does exactly what it is
-                        // supposed to: confirmed in every run, the engine's
-                        // later async delivery always no-ops correctly, no
-                        // double registration, no crash. AGDK, its lifecycle
-                        // natives and its input registration are untouched,
-                        // unlike `CORDIAL_SKIP_AGDK` or the fuller
-                        // AGDK-bypass `$S/lifecycle-map.md` §6 proposed,
-                        // which loses the whole input path.
-                        //
-                        // **And it made no difference.** `$S/freeze-recovery.md`,
-                        // n=4: `Forcing finalize experience coordinator`
-                        // still logs exactly once in every run, identical to
-                        // an unmodified launch, and 3 of 4 still froze --
-                        // Cordial's healthy runs already ask for the retry
-                        // every time, ordering fixed or not. So the
-                        // settings/flags race is not what puts a run on the
-                        // retry-dependent path; whatever makes Sober's
-                        // coordinator finalize cleanly on its first attempt
-                        // is something else, not yet found. Left off, and
-                        // not chased further with the time available --
-                        // recorded so the next person does not re-run this
-                        // specific ordering fix expecting a different answer.
-                        if bootstrap_installed && std::env::var_os("CORDIAL_SYNC_BOOTSTRAP").is_some() {
-                            println!(
-                                "  CORDIAL_SYNC_BOOTSTRAP is on: delivering settings and flags \
-                                 before initializeNativeCode, ahead of the engine's own async bootstrapTheApp"
-                            );
-                            run_bootstrap();
                         }
 
                         // **Before `initializeNativeCode`, not after it.**
@@ -4485,79 +3985,6 @@ fn main() -> ExitCode {
                                             }
                                             if ms > 0 {
                                                 println!("  pre-bridge post: holding the bridge for {ms} ms");
-                                                std::thread::sleep(std::time::Duration::from_millis(ms));
-                                            }
-                                        }
-
-                                        // `CORDIAL_SOBER_ORDER=<ms>`: the
-                                        // fallback this arm's own pilot called
-                                        // for. `CORDIAL_POST_BEFORE_BRIDGE`
-                                        // alone (measured immediately above,
-                                        // `$S/sober-diff.md`) reached signed-in
-                                        // Home 5/5 on a pilot -- a real result --
-                                        // but the two-cycle placeholder-swap
-                                        // retry (`Forcing finalize experience
-                                        // coordinator`) still fired every time;
-                                        // it just always recovered instead of
-                                        // recovering 30-60% of the time. This
-                                        // switch goes one step further, toward
-                                        // Sober's own observed order
-                                        // (`nativeInitClientSettings` then
-                                        // `nativePostClientSettingsLoadedInitialization3`
-                                        // then the "V1" `nativeAppBridgeAppStart`
-                                        // then `nativeAppBridgeV2Init`,
-                                        // `s2.enginelog:60-63` in
-                                        // `$S/sober-diff.md`), all three calls
-                                        // made here, right before the V2 bridge,
-                                        // rather than left to
-                                        // `GameActivity.bootstrapTheApp`'s own
-                                        // engine-driven timing for the first
-                                        // two and never made at all for the
-                                        // third. `appbridge_app_start` is the
-                                        // same call this session already wired
-                                        // and measured on the `CORDIAL_SKIP_AGDK`
-                                        // arm; this is its first use with AGDK
-                                        // kept.
-                                        //
-                                        // Separate switch from
-                                        // `CORDIAL_POST_BEFORE_BRIDGE` on
-                                        // purpose: that one's own 5/5 result is
-                                        // worth being able to reproduce in
-                                        // isolation, not silently folded into a
-                                        // three-call experiment.
-                                        if let Some(ms) = std::env::var("CORDIAL_SOBER_ORDER")
-                                            .ok()
-                                            .and_then(|v| v.parse::<u64>().ok())
-                                        {
-                                            let settings = cordial_runtime::client_settings::load(
-                                                opt.client_settings.as_deref(),
-                                            )
-                                            .unwrap_or_default();
-                                            match lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings") {
-                                                None => println!("  Sober order: nativeInitClientSettings not exported"),
-                                                Some(f) => match linker::game_activity::init_client_settings(f, &settings, "", "") {
-                                                    Ok(code) => println!("  Sober order: nativeInitClientSettings -> {code}"),
-                                                    Err(e) => println!("  Sober order: nativeInitClientSettings failed: {e}"),
-                                                },
-                                            }
-                                            match lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3") {
-                                                None => println!("  Sober order: post3 not exported"),
-                                                Some(f) => match linker::game_activity::post_client_settings_loaded(f) {
-                                                    Ok(()) => println!("  Sober order: post3 ok"),
-                                                    Err(e) => println!("  Sober order: post3 failed: {e}"),
-                                                },
-                                            }
-                                            match lib.symbol(
-                                                "Java_com_roblox_engine_jni_NativeAppBridgeInterface_nativeAppBridgeAppStart__Ljava_lang_String_2Ljava_lang_String_2ZLjava_lang_String_2Ljava_lang_String_2Ljava_lang_String_2",
-                                            ) {
-                                                None => println!("  Sober order: nativeAppBridgeAppStart (V1) not exported"),
-                                                Some(f) => match linker::game_activity::appbridge_app_start(f) {
-                                                    Ok(()) => println!("  Sober order: nativeAppBridgeAppStart (V1) ok"),
-                                                    Err(e) => println!("  Sober order: nativeAppBridgeAppStart (V1) failed: {e}"),
-                                                },
-                                            }
-                                            if ms > 0 {
-                                                println!("  Sober order: holding the bridge for {ms} ms");
                                                 std::thread::sleep(std::time::Duration::from_millis(ms));
                                             }
                                         }

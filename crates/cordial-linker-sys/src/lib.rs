@@ -501,7 +501,6 @@ pub mod game_activity {
             err: *mut c_char,
             n: usize,
         ) -> c_int;
-        fn cordial_appbridge_app_start(f: *mut c_void, err: *mut c_char, n: usize) -> c_int;
         fn cordial_appbridge_update_surface_app(
             f: *mut c_void,
             assets: *const c_char,
@@ -1509,46 +1508,6 @@ pub mod game_activity {
         // SAFETY: as above.
         let rc = unsafe {
             cordial_appbridge_call_bare(native, err.as_mut_ptr() as *mut c_char, err.len())
-        };
-        if rc == 0 { Ok(()) } else { Err(take_err(err)) }
-    }
-
-    /// `NativeAppBridgeInterface.nativeAppBridgeAppStart(String base_url,
-    /// String user_agent, boolean, String android_id, String launch_source,
-    /// String)V` — the "V1" app-bridge entry, on a different class
-    /// (`NativeAppBridgeInterface`) than every other native this module
-    /// calls (`NativeGLInterface`). All six arguments are built on the C++
-    /// side (`cordial_appbridge_app_start`, `native/init_params.cpp`) rather
-    /// than threaded through here, because the user-agent string it needs is
-    /// `build_user_agent()`, a function private to that translation unit —
-    /// see its own doc comment for why reusing exactly that string, rather
-    /// than a second copy, matters.
-    ///
-    /// Sober's own engine log calls this immediately before
-    /// `nativeAppBridgeV2Init`, confirmed at
-    /// `s2.enginelog:62-63` (3.328s / 3.337s) in `$S/sober-diff.md`'s capture,
-    /// and `docs/traces/render-bringup-sequence.log` shows the same order on
-    /// real Android. Argument shape cross-checked against mocktail
-    /// (Apache-2.0, `~/Projects/mocktail/src/legacy/legacy_runtime.cc`
-    /// ~line 30524 for the call site, ~line 30116 for the thread that runs
-    /// it by default on the *same* thread as everything else — mocktail only
-    /// spawns a separate JNI-attached thread for this call when
-    /// `MOCKTAIL_APP_BRIDGE_APP_START_THREAD` is explicitly set, which it is
-    /// not by default) for the argument shape, not the values: mocktail's
-    /// `base_url`/`launch_source` are used as-is (there is nothing
-    /// Cordial-specific to say about Roblox's own API host or a launch-source
-    /// token neither project has observed a real device send), but the
-    /// user-agent is Cordial's own `build_user_agent()` and the Android ID
-    /// is mocktail's documented placeholder (`0000000000000000`) rather than
-    /// an invented one -- **Cordial has no existing Android ID anywhere in
-    /// its own tree** (`grep -rn android_id native/ crates/` is empty), so
-    /// the "already reports" premise this call was requested under does not
-    /// hold; flagged rather than silently substituted.
-    pub fn appbridge_app_start(native: *mut c_void) -> Result<(), String> {
-        let mut err = vec![0u8; 512];
-        // SAFETY: as above.
-        let rc = unsafe {
-            cordial_appbridge_app_start(native, err.as_mut_ptr() as *mut c_char, err.len())
         };
         if rc == 0 { Ok(()) } else { Err(take_err(err)) }
     }

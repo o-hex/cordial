@@ -31,6 +31,7 @@
 //! newest, and prunes the right one. That is a one-line bug with a
 //! months-later symptom.
 
+use crate::sha256::{Hasher, Sha256Hash};
 use std::cmp::Ordering;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,18 @@ pub const BUILDS: &str = "builds";
 /// and by what -- and an entry with no record is offered *with that said*,
 /// never hidden.
 pub const LOADED_BY: &str = ".loaded-by";
+
+/// A SHA-256 of the entry's own `libroblox.so`, written beside it.
+///
+/// Recorded once, by [`ensure_content_hash`], and trusted after that rather
+/// than recomputed on every launch. It hashes the engine rather than the APK
+/// it came out of because the APK is not a stable name for one build: ADR-025
+/// measured Google Play's split bundle and APKPure's monolithic archive
+/// carrying the same signed engine in containers 150 MB and 229 MB — a hash of
+/// either container would call those two downloads different builds, which is
+/// exactly backwards. [ADR-037](../../../docs/adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md)
+/// records why the directory itself stays named by version rather than by this.
+pub const CONTENT_SHA256: &str = ".content-sha256";
 
 /// How many entries to keep, counting the current one.
 ///
@@ -131,6 +144,14 @@ pub struct Entry {
     /// "you have this build and cannot select it" is information and hiding it
     /// is not.
     pub complete: bool,
+    /// A SHA-256 of this entry's `libroblox.so`, if one has been recorded.
+    ///
+    /// `None` for an entry kept before [ADR-037] shipped, and for one whose
+    /// hash could not be computed -- neither is fatal to launching it. See
+    /// [`CONTENT_SHA256`].
+    ///
+    /// [ADR-037]: ../../../docs/adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md
+    pub content_hash: Option<Sha256Hash>,
 }
 
 impl Entry {
@@ -185,6 +206,7 @@ pub fn list_in(root: &Path) -> Vec<Entry> {
             loaded_by: loaded_by(&dir),
             bytes: bytes_in(&dir),
             complete: dir.join(crate::install::BASE_APK).is_file(),
+            content_hash: content_hash(&dir),
             dir,
         });
     }
@@ -211,6 +233,107 @@ pub fn loaded_by(dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(dir.join(LOADED_BY)).ok()?;
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// The content hash recorded for the entry in `dir`, if there is one.
+pub fn content_hash(dir: &Path) -> Option<Sha256Hash> {
+    let text = std::fs::read_to_string(dir.join(CONTENT_SHA256)).ok()?;
+    Sha256Hash::parse(text.trim()).ok()
+}
+
+/// Record `hash` as `dir`'s content hash.
+fn record_content_hash(dir: &Path, hash: &Sha256Hash) -> io::Result<()> {
+    std::fs::write(dir.join(CONTENT_SHA256), hash.to_string())
+}
+
+/// A streamed SHA-256 of `path`, read a block at a time so a 100+ MB engine is
+/// never held whole -- the same reason [`crate::sha256::Hasher`] exists rather
+/// than `Sha256Hash::of` being used directly.
+fn hash_file(path: &Path) -> io::Result<Sha256Hash> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finish())
+}
+
+/// Make sure `entry` has a recorded content hash, computing one only if it
+/// does not already have one.
+///
+/// Called from [`adopt_current`], which is where every install path but
+/// [`crate::install::file_into_store`] already converges to key a build; that
+/// one calls this itself. See
+/// [ADR-037](../../../docs/adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md).
+///
+/// **The cache-hit path is the whole reason this is cheap to call on every
+/// launch.** `adopt_current` runs every time Cordial starts, to keep the
+/// single-slot path pointed at the current entry, and this would make every
+/// one of those launches hash a 100+ MB file if it re-hashed rather than
+/// trusted what is already on disk.
+///
+/// Failure is reported to the caller and is not fatal to keying the build --
+/// an entry with no recorded hash is exactly what one predating this feature
+/// looks like, and it still launches.
+pub fn ensure_content_hash(entry: &Path) -> Option<Sha256Hash> {
+    if let Some(existing) = content_hash(entry) {
+        return Some(existing);
+    }
+    let library = entry.join(crate::engine::LIBRARY);
+    if !library.is_file() {
+        return None;
+    }
+    let hash = hash_file(&library).ok()?;
+    record_content_hash(entry, &hash).ok()?;
+    Some(hash)
+}
+
+/// The entry under `root` whose recorded content hash is `hash`, if any.
+///
+/// A lookup primitive and deliberately unwired: nothing here yet uses it to
+/// recognise that a fresh download is byte-identical to a build already kept
+/// under a different version label and link rather than duplicate it. See
+/// ADR-037's "What would change this".
+pub fn find_by_content_hash(root: &Path, hash: &Sha256Hash) -> Option<Entry> {
+    list_in(root).into_iter().find(|e| e.content_hash.as_ref() == Some(hash))
+}
+
+/// An advisory lock over every write to the store at `root`, held for the
+/// duration of one mutation.
+///
+/// Three call sites key or prune a build --
+/// [`crate::provider::obtain_and_install`], [`crate::provider::obtain_into_store`]
+/// and `cordial-shell`'s extraction of a build Sober or the user already
+/// supplied -- and before this existed two of them took different lock files
+/// and the third took none. All three reach the store only through
+/// [`adopt_current`], [`prune_in`], [`remove_in`] or
+/// [`crate::install::file_into_store`], so the lock lives inside those four
+/// rather than at each caller. See
+/// [ADR-037](../../../docs/adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md).
+///
+/// **Blocking, unlike [`crate::provider::exclusive`].** That lock guards a
+/// network fetch a user is watching progress for, so it refuses a second
+/// attempt instantly rather than queue it invisibly. This one guards a handful
+/// of local renames and, at most, one pass over a 100+ MB file with no network
+/// in it -- so a second caller waiting a fraction of a second for the first to
+/// finish is the honest behaviour, and refusing an ordinary launch's keying
+/// step because a Version-page download happened to be mid-rename would fail
+/// for a reason nobody watching it could act on.
+pub(crate) fn lock(root: &Path) -> io::Result<std::fs::File> {
+    std::fs::create_dir_all(root)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join(".store.lock"))?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(io::Error::from)?;
+    Ok(file)
 }
 
 /// The store entry `path` resolves to, if it is one.
@@ -333,6 +456,10 @@ pub fn adopt_current(root: &Path, live: &Path) -> io::Result<Option<String>> {
     };
 
     std::fs::create_dir_all(root)?;
+    // Held for the rest of this function: everything below either renames or
+    // deletes something under `root`, and this is one of three places that
+    // does so -- see [`lock`].
+    let _lock = lock(root)?;
     if into.exists() {
         // The store already has this version. Whatever is in the single slot is
         // a second copy of a build already keyed, so the link replaces it
@@ -342,6 +469,7 @@ pub fn adopt_current(root: &Path, live: &Path) -> io::Result<Option<String>> {
         if into.join(crate::engine::LIBRARY).is_file() {
             std::fs::remove_dir_all(live)?;
             point_current_at(live, &into)?;
+            ensure_content_hash(&into);
             return Ok(Some(version));
         }
         std::fs::remove_dir_all(&into)?;
@@ -351,6 +479,7 @@ pub fn adopt_current(root: &Path, live: &Path) -> io::Result<Option<String>> {
     // path and the new one hold half a build.
     std::fs::rename(live, &into)?;
     point_current_at(live, &into)?;
+    ensure_content_hash(&into);
     Ok(Some(version))
 }
 
@@ -433,6 +562,12 @@ pub fn detach(live: &Path) -> io::Result<()> {
 /// build turns a deliberate choice into a launch failure with no explanation,
 /// which is the one outcome that makes the pin worse than not having it.
 pub fn prune_in(root: &Path, keep: usize, protect: &[String]) -> Vec<String> {
+    // Best-effort, matching the per-entry `is_ok()` below: a store this cannot
+    // lock right now is pruned on the next call rather than the caller being
+    // handed an error type it would only ever log.
+    let Ok(_lock) = lock(root) else {
+        return Vec::new();
+    };
     let all = list_in(root);
     let mut removed = Vec::new();
     // Newest first, so counting down the list keeps the newest `keep` and the
@@ -467,6 +602,7 @@ pub fn remove_in(root: &Path, live: &Path, version: &str, protect: &[String]) ->
     let Some(dir) = entry_dir_in(root, version) else {
         return Err(format!("{version:?} is not a Roblox version"));
     };
+    let _lock = lock(root).map_err(|e| format!("could not lock the build store: {e}"))?;
     if current_in(root, live).as_deref() == Some(version) {
         return Err(format!("Roblox {version} is the current build, and removing it would leave nothing to launch."));
     }
@@ -690,5 +826,98 @@ mod tests {
             std::fs::read(entry.join(crate::engine::LIBRARY)).unwrap(),
             b"the build being kept"
         );
+    }
+
+    #[test]
+    fn a_content_hash_round_trips_through_its_file() {
+        let scratch = Scratch::new("hash-roundtrip");
+        let dir = build(scratch.path(), "2.738.0.1393");
+        assert_eq!(content_hash(&dir), None, "nothing recorded yet");
+
+        let hash = Sha256Hash::of(b"an engine's bytes, in this test");
+        record_content_hash(&dir, &hash).unwrap();
+        assert_eq!(content_hash(&dir), Some(hash));
+    }
+
+    /// The property `ensure_content_hash` exists for: called on an entry with
+    /// no recorded hash it computes and records one from the real file: called
+    /// again it must return that *same* value even if the file underneath has
+    /// since changed, because the whole point of recording it once is not to
+    /// pay for a fresh pass over 100+ MB of engine on every ordinary launch.
+    #[test]
+    fn ensure_content_hash_computes_once_and_trusts_what_it_recorded() {
+        let scratch = Scratch::new("hash-ensure");
+        let dir = build(scratch.path(), "2.738.0.1393");
+        std::fs::write(dir.join(crate::engine::LIBRARY), b"the real engine bytes").unwrap();
+
+        let first = ensure_content_hash(&dir).expect("a library is there to hash");
+        assert_eq!(first, Sha256Hash::of(b"the real engine bytes"));
+
+        // The file changes underneath -- corruption, or a bug elsewhere -- but
+        // nothing here re-reads it, because a hash was already recorded.
+        std::fs::write(dir.join(crate::engine::LIBRARY), b"different bytes entirely").unwrap();
+        let second = ensure_content_hash(&dir).unwrap();
+        assert_eq!(second, first, "the stale recorded hash, not a fresh one");
+    }
+
+    #[test]
+    fn find_by_content_hash_locates_the_matching_entry() {
+        let scratch = Scratch::new("hash-find");
+        let root = scratch.path();
+        let a = build(root, "2.734.0.917");
+        let b = build(root, "2.738.0.1393");
+        std::fs::write(a.join(crate::engine::LIBRARY), b"engine A").unwrap();
+        std::fs::write(b.join(crate::engine::LIBRARY), b"engine B").unwrap();
+        ensure_content_hash(&a);
+        let hash_b = ensure_content_hash(&b).unwrap();
+
+        let found = find_by_content_hash(root, &hash_b).expect("engine B is in the store");
+        assert_eq!(found.version, "2.738.0.1393");
+        assert!(find_by_content_hash(root, &Sha256Hash::of(b"nothing kept this")).is_none());
+    }
+
+    /// `adopt_current` is what every install path but `file_into_store` already
+    /// funnels through, so hooking the hash in there is what makes it apply to
+    /// every one of them without touching a call site.
+    #[test]
+    fn adopting_a_build_records_its_content_hash() {
+        let scratch = Scratch::new("hash-adopt");
+        let root = scratch.path().join("builds");
+        let live = scratch.path().join("lib/x86_64");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join(crate::engine::LIBRARY), b"the adopted engine").unwrap();
+        crate::cache::record_version(&live, "2.738.0.1393").unwrap();
+
+        adopt_current(&root, &live).unwrap();
+        assert_eq!(
+            content_hash(&root.join("2.738.0.1393")),
+            Some(Sha256Hash::of(b"the adopted engine"))
+        );
+    }
+
+    /// The race this store lock exists to close: three code paths mutate one
+    /// directory and, before ADR-037, two of them used different lock files
+    /// and one used none. Holding the lock externally and measuring how long a
+    /// blocked mutator waits is the only way to observe "serialised" rather
+    /// than merely "did not corrupt anything on this run".
+    #[test]
+    fn concurrent_mutations_serialize_on_the_store_lock() {
+        let scratch = Scratch::new("concurrent");
+        let root = scratch.path().join("builds");
+        std::fs::create_dir_all(&root).unwrap();
+        build(&root, "1.0");
+
+        let held = lock(&root).unwrap();
+        let waited_root = root.clone();
+        let start = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            // Must block until the lock taken above is released below.
+            prune_in(&waited_root, 5, &[]);
+            start.elapsed()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(held);
+        let elapsed = handle.join().unwrap();
+        assert!(elapsed >= std::time::Duration::from_millis(180), "prune_in ran concurrently: {elapsed:?}");
     }
 }

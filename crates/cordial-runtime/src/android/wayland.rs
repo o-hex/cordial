@@ -1258,6 +1258,27 @@ struct PolledTextBoxInfo {
     /// The last answer good enough to place an editor from, if there has been
     /// one. `None` while the engine is still saying null or still mid-layout.
     usable: Option<cordial_linker_sys::game_activity::RawTextBoxInfo>,
+    /// A nonzero rectangle seen on the most recent ask, not yet committed to
+    /// `usable` because it has not been confirmed by a second, matching ask.
+    ///
+    /// Exists because of the search modal's own opening animation, measured
+    /// 2026-09-24: focusing it drives `property_generation` forward on every
+    /// resized frame, which bypasses `POLL_INTERVAL` below by that field's own
+    /// design, so this function is asked dozens of times a second while the
+    /// modal grows and every ask returns a slightly different rectangle
+    /// (`x=427 w=455` down through many intermediate steps to the settled
+    /// `x=332 w=592`, over roughly 700ms in that measurement). Committing
+    /// each one to `usable` immediately paints the editor at every
+    /// intermediate frame of the animation, narrower and offset from where
+    /// the box actually ends up -- which is what a first click's editor
+    /// "sitting above the box" turned out to be, not a stale cache or the
+    /// wrong source. Requiring the same rectangle twice in a row before
+    /// committing it waits out the animation instead of drawing every frame
+    /// of it; `resolve_textbox_geometry`'s carry-over keeps the previous
+    /// box's placement on screen for that whole window, which is already this
+    /// file's "hold still rather than jump" behaviour for a zero spec, simply
+    /// extended to a nonzero one that has not settled yet.
+    pending: Option<cordial_linker_sys::game_activity::RawTextBoxInfo>,
 }
 // SAFETY: every raw pointer field is either a `libwayland-client` proxy (only
 // ever touched from the single input-pump thread, matching the file-level
@@ -2448,12 +2469,19 @@ impl WaylandWindow {
             // below rather than waiting out the rest of the interval, which
             // is the whole reason `property_generation` is tracked at all.
             _ => {
-                *state = Some(PolledTextBoxInfo { generation, property_generation, asked: now, usable: None });
+                *state = Some(PolledTextBoxInfo {
+                    generation,
+                    property_generation,
+                    asked: now,
+                    usable: None,
+                    pending: None,
+                });
             }
         }
         let carried = state.as_ref().and_then(|p| p.usable);
+        let pending = state.as_ref().and_then(|p| p.pending);
         // SAFETY: `native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-        let answer = match unsafe { cordial_linker_sys::game_activity::textbox_info_now(native) } {
+        let fresh = match unsafe { cordial_linker_sys::game_activity::textbox_info_now(native) } {
             // **A zero height is the trap this call brings with it.** Asked on
             // the same pump tick as `showKeyboard`, the search modal answered
             // `x=596 y=10 w=42 h=0` -- caught mid-animation, expanding out of
@@ -2461,18 +2489,39 @@ impl WaylandWindow {
             // it look like an answer; the zero height makes it invisible. Same
             // test as the remembered spec gets, for the same reason.
             Ok(Some(i)) if i.width > 0.0 && i.height > 0.0 => Some(i),
-            // Null is ordinary, not a failure: it is what the whole sign-in
-            // page answers. Keep whatever the last poll found rather than
-            // dropping an editor that is currently placed correctly.
-            Ok(_) => carried,
+            Ok(_) => None,
             Err(e) => {
                 if super::input::trace_text() {
                     eprintln!("[cordial] nativeGetTextBoxInfo failed: {e}");
                 }
-                carried
+                None
             }
         };
-        *state = Some(PolledTextBoxInfo { generation, property_generation, asked: now, usable: answer });
+        // **Confirm before committing.** `fresh` may be one frame of the
+        // modal's own opening animation rather than its resting place -- see
+        // `PolledTextBoxInfo::pending`'s doc comment. Only a rectangle that
+        // repeats on two consecutive asks is trusted enough to place an
+        // editor from; a still-moving one is held as `pending` and the
+        // previous commit (or the carry-over above it, if there has not been
+        // one yet) keeps the editor on screen meanwhile, same as a genuinely
+        // unusable spec always has.
+        let (answer, new_pending) = match fresh {
+            Some(i) if pending == Some(i) => (Some(i), Some(i)),
+            Some(i) => (carried, Some(i)),
+            // A null answer is ordinary -- it is what the whole sign-in page
+            // answers -- and unrelated to the animation this gate is for, so
+            // it neither confirms nor restarts a pending rectangle; it only
+            // keeps whatever was already committed rather than dropping an
+            // editor that is currently placed correctly.
+            None => (carried, pending),
+        };
+        *state = Some(PolledTextBoxInfo {
+            generation,
+            property_generation,
+            asked: now,
+            usable: answer,
+            pending: new_pending,
+        });
         answer
     }
 

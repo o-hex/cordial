@@ -1685,7 +1685,7 @@ Remix", placeId 6520999642) that consumed the rest of the session's budget.
 Full per-cycle numbers, screenshots and the retraction are in
 `$SCRATCHPAD/textbox.md`.
 
-## Open: the editor sits above the box on a text field's first-ever focus, 2026-09-23
+## Fixed: the editor sits above the box on a text field's first-ever focus, 2026-09-23
 
 A maintainer report: the first time a TextBox is focused after launch, the
 GTK editor overlay appears well above the real box; every later focus in the
@@ -1770,19 +1770,82 @@ two connects) on the Home search bar, which is the one place the double
 connect has actually been observed.
 
 Two small, independent, verified fixes came out of this session's setup work
-and are committed on their own: `tools/text-input-e2e.py` hardcoded
-`target/release/cordial-run` with no override, which does not exist on a host
-that builds in the toolbox container (`CORDIAL_E2E_BINARY` now overrides it,
-same pattern as `CORDIAL_APK`/`CORDIAL_LIB_DIR`); and it hardcoded
-`~/.local/share/cordial` for the devctl socket, ignoring `XDG_DATA_HOME`
-entirely, so a throwaway-profile run -- exactly what AGENTS.md tells an agent
-to use -- connected to nothing (`ConnectionRefusedError`) while the client's
-real socket sat under the redirected directory. Both are now respected. The
-suite's full 14-assertion run still needs a signed-in profile to reach Home
-at all (`focus_box` clicks Home's search bar), so it was not run end to end
-this session for the same reason above; the two fixed code paths were each
-exercised and confirmed working individually (the sign-in-field measurement
-above used both).
+and are committed alongside the real one below: `tools/text-input-e2e.py`
+hardcoded `target/release/cordial-run` with no override, which does not exist
+on a host that builds in the toolbox container (`CORDIAL_E2E_BINARY` now
+overrides it, same pattern as `CORDIAL_APK`/`CORDIAL_LIB_DIR`); and it
+hardcoded `~/.local/share/cordial` for the devctl socket, ignoring
+`XDG_DATA_HOME` entirely, so a throwaway-profile run -- exactly what
+AGENTS.md tells an agent to use -- connected to nothing
+(`ConnectionRefusedError`) while the client's real socket sat under the
+redirected directory. Both are now respected.
+
+### 2026-09-24: CordialTest, cleared for at most 3 launches, gave the answer
+
+`CordialTest` became available (the freeze investigation using it finished)
+for a strictly capped session: 3 launches, no more, given the account's use
+that day. Launch 1 (of 3) reached Home and got the reading the whole
+investigation had been missing.
+
+**It is both leads at once, not one or the other.** Clicking Home's search
+bar: first `glViewTextBoxFocused() connect`, handle `140011189334144`,
+`showKeyboard` spec `x=516 y=10 w=358 h=36` -- the bar itself, real geometry,
+immediately. 123ms later, a **second** connect, a **different** handle
+(`140010950594688`) -- the search modal the bar opens, confirmed a distinct
+native object, not the same box refocusing. Its own `showKeyboard` spec is
+`x=0 y=0 w=0 h=0`, so `resolve_textbox_geometry`'s carry-over correctly holds
+the bar's last placement ("text editor placed from the previous box, while
+this one lays out"). Then `polled_textbox_info` takes over and **this is the
+second half of it**: `nativeGetTextBoxInfo` returns a different rectangle on
+every ask for about 700ms as the modal visually grows -- `x=427 w=455`,
+`x=397 w=497`, `x=394 w=502`, dozens more steps, down to `x=332 w=592` and
+staying there. Every one of those intermediate rectangles was being committed
+and painted immediately, which is what a screenshot taken any time in that
+700ms window sees as "the editor sitting on a narrower, shifted box" -- the
+exact shape of the three fresh-launch readings from 2026-09-23 above, each
+one just a different random sample of the same live animation. `resolve_
+textbox_geometry`'s own doc comment already named the zero-spec half of this
+("the real numbers arrive about a second afterwards"); what was missing was
+that the *nonzero* answers arriving in that second are not stable either.
+
+**The fix**, `crates/cordial-runtime/src/android/wayland.rs`,
+`polled_textbox_info`: a rectangle from `nativeGetTextBoxInfo` is no longer
+committed to `usable` -- the value the editor is actually drawn from -- on
+the ask that produces it. It is held as a new `pending` field and only
+promoted once the *same* rectangle repeats on the next ask (`RawTextBoxInfo`
+already derives `PartialEq`, the same equality `sync_text_overlay`'s own
+cache check already relies on). While a rectangle is unconfirmed, `usable`
+keeps whatever was already committed, so the existing carry-over machinery
+holds the editor at the bar's position exactly as it already does for a
+zeroed spec -- one behaviour extended to a second precondition, not a new
+one invented. `property_generation` is what was making this function get
+asked dozens of times a second during the animation (see its own doc
+comment, unchanged); nothing about that changed, only what an answer has to
+do before it is trusted.
+
+**Verified, launch 3 of 3** (launch 2 hit the unrelated, already-documented
+startup freeze -- presents stuck at 2, correctly detected and aborted rather
+than scored, one launch spent for nothing): the same click sequence as the
+diagnostic launch, rebuilt binary. First focus: `x=516 w=358` (the bar) at
+100-702ms, one connect to the modal's handle with the geometry still held at
+the bar's, then a single direct jump straight to `x=332 y=10 w=592 h=36` at
+802ms and stable for the remaining 1.6s of polling -- two committed
+rectangles for the whole focus where there were previously upwards of eighty.
+Second focus: `x=332 y=10 w=592 h=36` immediately, unchanged from before this
+fix (the modal is already expanded by then, so there is nothing to confirm).
+A `grim` capture of the composited window taken after the first focus
+settled shows the GTK caret sitting inside the search box exactly where the
+box is drawn (`$SCRATCHPAD/cordial-logs/verify3_first_grim.png`).
+
+`cargo build --release` (toolbox) and `cargo test -p cordial-runtime --lib`
+(388 passed, 0 failed) are both clean against this change. `tools/text-
+input-e2e.py`'s full run was not repeated on `CordialTest` -- the 3-launch
+budget was spent on the diagnostic, one wasted to the startup freeze, and the
+fix verification, in that order, with nothing left for a fourth launch.
+That suite's own assertions (typing, the double-insert guard, suppression
+while a box has focus) are unrelated to what this change touches, but it has
+not been run end to end since this fix landed and should be, on whatever
+signed-in profile is next available.
 
 ## The one rule
 

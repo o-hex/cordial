@@ -31,6 +31,13 @@ cordial-plugins = { path = "../cordial-plugins" }
 # only as a direct edge: this crate already pulls `cordial-update` in through
 # `cordial-shell`.
 cordial-update = { path = "../cordial-update" }
+# Only for `client_settings`'s `CORDIAL_SETTINGS_HISTORY` diagnostic: the
+# engine's own settings fetch is `.zst`-compressed
+# (`v2/settings-compressed/application/GoogleAndroidApp.zst`), and decoding a
+# copy of it needs a decoder somewhere. `cordial-plugins` already carries this
+# exact version for its own archive format, so this is not a new algorithm
+# entering the dependency tree, just a second direct edge to it.
+zstd = "0.13"
 # The window. ADR-011 makes it GTK4/libadwaita and says of the shell's window
 # and the engine's host window that they "are the same window"; the engine's
 # `wl_surface` is a subsurface of the one `cordial_shell::host_window` builds,

@@ -339,6 +339,7 @@ dependencies = [
  "ureq",
  "zbus",
  "zip",
+ "zstd",
 ]
 
 [[package]]

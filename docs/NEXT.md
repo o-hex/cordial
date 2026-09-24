@@ -21,6 +21,43 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## Fixed: a blank screen (signed in and signed out alike) traced to the wrong settings document, 2026-09-24
+
+A live Roblox rollout put the default AGDK startup path onto a single-cycle
+render with no `Forcing finalize` and a flat grey screen — signed in and on a
+brand-new signed-out profile alike, every launch, for roughly the two hours
+it was measured. `client_settings.rs` has fetched
+`clientsettingscdn.roblox.com/v2/settings/application/**AndroidApp**` since
+it was written (2026-07-31); the engine's own `DynamicFastVariableReloader`
+asks for **`GoogleAndroidApp`** instead, over a different, compressed
+endpoint. `docs/analysis/flag-init.md` §23.4 found the two documents differ
+(441 values, 2026-08-20) and called switching "worth correcting on its own
+terms... but a separate change" — deferred, not rejected, because the
+storage bug it was chasing then tested negative either way.
+
+Measured: signed-out throwaway profile, `AndroidApp` 10/10 blank,
+`GoogleAndroidApp` 10/10 Landing, delivery mechanism (`--client-settings`
+versus the normal cache) isolated and shown not to matter — content is what
+matters. Timestamps ruled out a race between delivery and the engine's own
+live re-fetch. Signed in on `CordialTest`, 3/3 reached real Home in a single
+cycle (screenshot-verified: username, friends list, recommended games) —
+Sober-shaped, no placeholder-swap needed at all when the document handed
+over is the right one.
+
+**Fix**: `client_settings.rs` fetches `GoogleAndroidApp` by default now.
+`CORDIAL_ENGINE_SETTINGS=0` reverts to the old `AndroidApp` endpoint, kept
+because a future rollout could reverse which one works and nothing here can
+tell that from either document's shape alone. Cordial's own flag overrides
+(`apply_overrides`) still apply on top either way — reconfirmed live with
+the existing `DFFlagRbxTransportUseRtcioRna` control.
+
+**Unverified**: whether this was a transient rollout incident or something
+that recurs; whether the classic two-cycle placeholder-swap freeze (the
+`FROZEN` bucket lower in this section, unrelated to this blank-screen
+symptom) is affected one way or the other by fetching the engine's own
+document instead of Cordial's — not measured, only the blank/Landing split
+was.
+
 ## Open: the startup freeze has a second failure on the other side of it, 2026-09-17
 
 Four things were measured on `4c9d1b5`, built with `just build toolbox`, all on
@@ -108,6 +145,79 @@ have been loaded`, and that path never calls `nativeInitClientSettings`,
 `nativePostClientSettingsLoadedInitialization3` or
 `nativeInitializeNativeFlags` at all, so the crash is that gap rather than a
 conflict between skipping AGDK and loading flags.
+
+## Recovery and a settings-race prevention attempt, both measured, 2026-09-18
+
+Prevention stays out of reach; recovery has a real but unproven candidate.
+Full data and method: `$S/freeze-recovery.md`.
+
+**`CORDIAL_STARTUP_RETRY=1` re-confirmed harmful, n=10 pairs against a fresh
+`d61375b`+`just build toolbox` binary.** This switch already carried a
+"must stay off" warning from a single anecdotal run on 2026-08-25
+(`b4368c1`); this session re-ran it properly. It fired 5 times across 10
+frozen-fated launches and **5 of 5 hung identically**: the announcement
+("Expect this to be the last line: the call does not return") is the literal
+last line of the log every time, confirmed by line count, not just eyeballing.
+`nativeAppBridgeStartLuaAppDM` never returns. Present-count FROZEN rate was
+unchanged by the switch (control 4/10, retry 5/10, Fisher p=1.0) — it cannot
+touch the initial freeze, only make it worse once it has happened. Left off.
+
+**A settings/flags race was floated as the prevention mechanism and refuted
+by measurement.** A concurrent session's Sober comparison
+(`$S/sober-comparison.md`) found Sober's engine never once logs `Forcing
+finalize experience coordinator` in 17 signed-in launches (0/17), where every
+signed-in Cordial run — good and frozen alike — logs it exactly once; the
+hypothesis was that Cordial's flags/settings handshake only lands ahead of
+the app bridge when it wins a race against the engine's own asynchronous
+`bootstrapTheApp` (measured elsewhere at 0/75 winning it), and that losing
+that race is what puts a run on the retry-dependent path. `CORDIAL_SYNC_BOOTSTRAP=1`
+(`load.rs`, right before `initializeNativeCode`) tests this directly: it calls
+the existing, already-idempotent `run_bootstrap()` synchronously, so the
+handshake is complete before the engine's own bootstrap thread is even
+created — confirmed working exactly as designed in every run (the engine's
+own later async delivery logs "already delivered" every time, no double
+registration). **It made no difference.** All 4 runs tried still logged
+`Forcing finalize experience coordinator` exactly once, the same as every
+plain run, and 3 of 4 were FROZEN by the engine-log discriminator (the
+present-count rule mis-scored one of those three as HEALTHY — `p10=1,p25=0`
+slipped past `p10==p25`, another instance of the known false-negative). n=4
+is not enough to rule the ordering fix out at a rate below its natural
+variance, but it directly contradicts "a run that never asks for the retry
+can never be stranded": Cordial's healthy runs already ask for the retry
+every time, ordering fixed or not, and recover from it or don't for reasons
+this change does not touch. **Left off, not pursued further with the time
+available**; the real difference between Sober's clean single-pass finalize
+and Cordial's is still open.
+
+**`CORDIAL_STARTUP_SELFRELAUNCH=1`, a genuinely different kind of recovery,
+mechanism verified, outcome unproven.** Rather than asking the wedged engine
+to do anything (`CORDIAL_STARTUP_RETRY`'s mistake), this exits the whole
+process and starts a fresh one, reusing the exact lock-handoff
+(`Claim::hand_to`/`claim_for_instance`) already built for the shell-to-client
+handoff — a client handing its own profile lock to its own successor rather
+than a shell handing it to a client. Capped at one hop via `CORDIAL_RELAUNCHED`.
+Verified working exactly as designed every time it fired: clean exit, new
+PID, lock adopted by the child (confirmed by the child completing cookie
+restore etc, which only happens once the lock is held), zero interference on
+a healthy run (the gate never opens above `RECOVERY_MAX_PRESENTS`). n=20
+pairs, signed-in `CordialTest`: control 6/20 FROZEN, selfrelaunch 3/20 FROZEN
+— **but the relaunch only fired 3 times, and all 3 of those fired instances
+still ended FROZEN**, because the freshly-relaunched attempt froze again too.
+Zero observed recoveries. The arm's lower overall FROZEN count is explained
+by fewer of its 20 first attempts freezing at all, not by the mechanism
+rescuing any of the ones that did — a distinction the top-line 6/20-vs-3/20
+number hides and the per-run log does not (`$S/freeze-recovery.md` has the
+per-run table). Fisher p on the top-line number is 0.225 one-tailed and would
+be the wrong thing to quote for this reason even if it were significant.
+**Not shipped as default.** The mechanism is sound and safe (never fires on
+a healthy run, cannot loop) but there is no positive evidence yet that a
+second attempt succeeds more often than a first one would anyway — plausibly
+because launches this close together are not independent (same machine load,
+same freshly-torn-down engine state), which would mean an immediate
+relaunch is the wrong recovery to make default even if teardown/bring-up
+were free. Whoever continues this should get more relaunch-fired samples
+before trusting a rate, and try a short delay before the relaunch as a
+cheap next arm.
 
 ## Open: the AppImage's base moved and its closure is now computed, measured 2026-09-13
 
@@ -1500,6 +1610,130 @@ either a way to enable the trace mid-run or a lighter filter at the source.
 The suspicious correlate, unproven: the Vulkan swapchain is recreated on
 entering an experience (`vkCreateSwapchainKHR ... old swapchain none` followed
 by `recreated`), between the lower that works and the lower that does not.
+
+### Mitigated behind a switch, UNVERIFIED against the live bug, 2026-09-18
+
+A dedicated investigation pass (own file, `$SCRATCHPAD/textbox-blank.md`,
+Diagnosis section) reproduced the mechanism 23 times across nested sway and
+host GNOME/Mutter -- held movement key, flooded pointer motion, both together
+-- and never once saw `HostWindow::repaint_now`'s 40ms deadline miss, nor a
+black-out. Every `repaint_now` painted in under ~6ms. That investigation's own
+conclusion: the repaint race `repaint_now`'s 0.17.0 logging exists to catch is
+real in principle (the function's own doc comment already records it being
+"reported on both GNOME and Hyprland" before that logging existed) but does
+not fire on this machine's two available compositors, so it could be measured
+but not triggered here.
+
+Given that, the change made is a **mitigation of the named mechanism, not a
+confirmed fix**: `CORDIAL_REPAINT_EXTENDED_WAIT`, off by default, makes
+`repaint_now` keep waiting on the same frame-clock signal past the existing
+40ms deadline, up to a 200ms backstop, before falling through to today's
+"proceed anyway" behaviour. With the switch unset, `repaint_now` is
+byte-for-byte the pre-existing function -- same deadline, same log line, same
+timing -- which is the control this change is measured against.
+`crates/cordial-shell/src/host_window.rs::repaint_wait_outcome` is the pure
+decision logic pulled out of the wait loop, with seven `#[test]`s in the same
+file covering a paint landing between the two deadlines (caught only when the
+switch is on), a paint that never lands (gives up at the backstop, not
+before), and a second, test-only switch below. A second env var,
+`CORDIAL_REPAINT_FORCE_MISS`, collapses the fast deadline to zero on demand so
+the race can be *triggered* rather than waited for, because 0/23 means it
+never fires naturally on this machine's compositors -- force-miss alone
+should reproduce the pre-mitigation worst case every time, and force-miss with
+the extended wait also on should catch the same forced miss instead.
+
+**Run on 2026-09-23: compiles and passes, but FORCE_MISS does not reproduce
+the grey/black screen -- treat the patch as unproven hardening, not a fix.**
+`cargo test -p cordial-shell` is clean (180 passed, 0 failed, 17 pre-existing
+GTK/Wayland-display tests ignored; all seven `repaint_wait_outcome` tests pass
+by name). Live measurement needed one correction first: the initial pass used
+`devctl screenshot` (`cordial_screenshot`) to check for the grey/black canvas,
+which reads Cordial's own Vulkan swapchain directly and is -- by the same
+design this file's own "text isn't centred" entry above already states --
+structurally blind to a compositor-stacking bug: the engine goes on rendering
+a good frame into its swapchain regardless of what the compositor puts on top
+of it. That first pass's "still renders, 0/10" was retracted as measured with
+the wrong instrument, not reported as a result. Redone with `grim` against the
+actual composited output (nested sway inside the `cordial` toolbox container,
+the same pattern `tools/text-input-e2e.py` uses), sanity-checked first against
+a known-flat state (1 distinct colour on an empty compositor vs 89,407 on real
+rendering, so the instrument can see the discriminator this needs).
+
+With that instrument: **Arm A** (`CORDIAL_REPAINT_FORCE_MISS=1`, extended wait
+off), 10/10 cycles in a joined experience (Brookhaven, chat box via
+`KEY_SLASH`) logged a confirmed `GaveUp` (a forced zero-wait restack, waited
+4.5-14.2µs every time) and every composited screenshot showed full rendering
+(72,588-80,781 distinct colours; docs/NEXT.md's own established discriminator
+for this bug is a handful of colours, not tens of thousands). **Arm B**
+(FORCE_MISS plus the extended wait) logged `PaintedExtended` directly on all
+10/10 cycles (718µs-7.16ms, well inside the 200ms backstop), same full
+rendering throughout. Repeated in `CORDIAL_FULLSCREEN=1` (Sober #1026's own
+correlate): 5/5 natural cycles with the switch off and 5/5 with it on, zero
+`GaveUp` either way, same as the pre-existing 0/23 windowed history. **Plain
+verdict: forcing the exact repaint-race mechanism, confirmed on every single
+cycle, does not produce the reported grey/black screen** in Brookhaven, via
+chat focus, on this hardware. This does not prove the mechanism never
+matters -- a precondition this session's environment did not hit (a specific
+compositor, first-focus-ever timing, a longer-held miss) could still be
+required -- but it is real evidence against "the repaint race alone, forced to
+its worst case, reliably produces the symptom", and the patch should be
+described that way rather than as a fix until something changes this. The
+natural windowed condition (switch on vs off, no forcing) was not re-measured
+with `grim` this session -- a real gap, not filled due to time spent chasing an
+unrelated, ultimately-unreached repro request (a custom TextBox inside "FNF:
+Remix", placeId 6520999642) that consumed the rest of the session's budget.
+Full per-cycle numbers, screenshots and the retraction are in
+`$SCRATCHPAD/textbox.md`.
+
+## Open: the editor sits above the box on a text field's first-ever focus, 2026-09-23
+
+A maintainer report: the first time a TextBox is focused after launch, the
+GTK editor overlay appears well above the real box; every later focus in the
+same process is placed correctly. **Reproduced and measured, root cause not
+confirmed -- no fix shipped.**
+
+Three independent fresh launches, Home's search field, `devctl textbox`
+read immediately on first focus and again on a second focus after a blur:
+the **second** focus is byte-identical across all three launches (`x=1062
+y=10 w=1292 h=36`); the **first** focus differs every launch and is always
+narrower and shifted right of that converged rectangle (`x=1193.48
+w=1053.04`, `x=1114.04 w=1195.92`, `x=1099.24 w=1223.52`). `placed=engine`
+in every case, first and second alike -- `resolve_textbox_geometry`'s
+fallback path (a real suspect, since it draws a crude synthesised bar when
+nothing else has answered) is ruled out by this: the value comes from the
+same source both times, so the bug is in what the engine reports on a fresh
+process's first read, not in which Cordial code path runs.
+
+**Two live leads, neither confirmed.** The raw engine log for these same
+three launches (`glViewTextBoxFocused`/`glViewTextBoxFocusLost` lines,
+`$SCRATCHPAD/cordial-logs/stage6_launch{1,2,3}.stdout`) shows the *first*
+click producing **two** `glViewTextBoxFocused() connect` events roughly
+140ms apart with no focus-lost between them, before the deliberate blur --
+consistent with focus handing off between two distinct native TextBox
+objects (the search bar, then the modal it opens) rather than one box's
+geometry settling over time, which would mean the test's "first focus"
+reading landed on whichever of the two objects the poll happened to catch,
+not a single box in two states. That would fit `resolve_textbox_geometry`'s
+own existing comment about the search modal opening with a placeholder spec
+before its real one arrives. A follow-up attempt to poll continuously
+through a first focus (rather than stopping at the first non-empty reading,
+which is what the original harness did) was attempted and did not reproduce
+a focus at all in one try, on an already heavily-loaded shared machine --
+inconclusive, not informative either way, and not repeated further this
+session.
+
+**Deliberately not fixed.** Shipping a change to `resolve_textbox_geometry`
+or its polling without knowing whether this is "the same box settling" or
+"two different boxes" would be exactly the guess this file's rules exist to
+prevent -- a debounce-on-first-reading fix is right for the former and
+merely delays showing a wrong-but-stable value for the latter. **Next step**:
+relaunch with `CORDIAL_TRACE_TEXT=1`, poll `textbox` every ~100ms through the
+whole first focus without stopping early, and correlate each reading's `gen=`
+field against the `glViewTextBoxFocused`/`FocusLost` timestamps to see
+whether the two connects carry different generations (two boxes) or the same
+one with changing geometry (one box, animating). Raw data:
+`$SCRATCHPAD/cordial-logs/stage6_results.json`,
+`$SCRATCHPAD/textbox.md`'s Stage 6 section.
 
 ## The one rule
 

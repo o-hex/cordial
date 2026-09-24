@@ -91,19 +91,21 @@ pub fn store_id(profile_dir: &Path, id: &str) -> std::io::Result<()> {
 /// is a device identity silently not being kept, which would look exactly like
 /// the endpoint having failed.
 pub fn tracker_from_set_cookie(header: &str) -> Option<String> {
-    for part in header.split(';') {
-        let part = part.trim();
-        let (name, value) = part.split_once('=')?;
-        if name.trim() == COOKIE {
-            let v = value.trim();
-            return (!v.is_empty()).then(|| v.to_string());
-        }
-        // Only the first pair is the cookie itself; everything after is
-        // attributes (Path, Domain, Max-Age). Stop rather than match an
-        // attribute that happens to share the name.
-        break;
+    // Only the first `;`-separated pair is the cookie itself; everything
+    // after is attributes (Path, Domain, Max-Age). This used to be a `for`
+    // loop over every pair with an unconditional `break` at the end of its
+    // body -- clippy's `never_loop` correctly noted that no iteration past
+    // the first ever happened, since every path through the body returns or
+    // breaks. The behaviour was already "look at the first pair only, in
+    // case an attribute happens to share the cookie's name"; this says that
+    // directly instead of looping to stop after one iteration.
+    let part = header.split(';').next()?.trim();
+    let (name, value) = part.split_once('=')?;
+    if name.trim() != COOKIE {
+        return None;
     }
-    None
+    let v = value.trim();
+    (!v.is_empty()).then(|| v.to_string())
 }
 
 /// What a bootstrap attempt produced.

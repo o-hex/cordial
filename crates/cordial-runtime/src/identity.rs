@@ -280,7 +280,14 @@ fn publish(id: &Identity) {
 /// unlike the cookie jar, none of this calls back into the engine, and a login
 /// that is not written before the process dies is a login the user has to do
 /// again.
-pub extern "C" fn observe_login(data: *const std::ffi::c_char) {
+///
+/// # Safety
+///
+/// `data`, if non-null, must be a nul-terminated C string valid for the
+/// duration of the call. Only `native/android_classes.cpp` ever calls this,
+/// through the function pointer [`cordial_linker_sys::game_activity::identity_set_sinks`]
+/// installs, and it holds to that contract.
+pub unsafe extern "C" fn observe_login(data: *const std::ffi::c_char) {
     if data.is_null() || !enabled() {
         return;
     }
@@ -394,15 +401,23 @@ pub fn restore() -> bool {
 /// Called from `load.rs` beside the cookie restore, for the reason recorded
 /// there: the natives on this class do nothing until
 /// `nativeAppBridgeV2InitWithParams` has run.
-pub fn push_user_id(set_native: *mut std::ffi::c_void) -> bool {
+///
+/// # Safety
+///
+/// `set_native` must be a live pointer to the exported `nativeSetUserId`,
+/// resolved via a symbol lookup against the loaded `libroblox.so` (never
+/// unloaded) -- the same contract
+/// [`cordial_linker_sys::game_activity::call_static_strings`] documents.
+pub unsafe fn push_user_id(set_native: *mut std::ffi::c_void) -> bool {
     let Some(id) = CURRENT.lock().ok().and_then(|c| c.clone()) else {
         return false;
     };
-    match cordial_linker_sys::game_activity::call_static_strings(
+    // SAFETY: `set_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    match unsafe { cordial_linker_sys::game_activity::call_static_strings(
         set_native,
         "com/roblox/engine/jni/NativeSettingsInterface",
         &[&id.user_id.to_string()],
-    ) {
+    ) } {
         Ok(()) => true,
         Err(e) => {
             eprintln!("[identity] nativeSetUserId failed: {e}");

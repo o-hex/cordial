@@ -10,6 +10,22 @@
 // [ADR-036](../../../docs/adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md).
 #![allow(unsafe_code)]
 
+// Every public function in `game_activity` and `jni` that takes a resolved
+// native function pointer (`native`/`f`: `*mut c_void`) is `unsafe fn` with a
+// `# Safety` doc, rather than wrapping the pointer in a handle newtype. Both
+// were considered (see ADR-036's "A pre-existing clippy failure" section and
+// the issue it links): the newtype was rejected because the pointer is not
+// held here at all -- every call site in `cordial-runtime` resolves it once
+// via `Library::symbol` and stores it as a raw `usize` in its own long-lived
+// state (a bootstrap plan, a `OnceLock`, an `AtomicPtr`), re-casting it back
+// to `*mut c_void` at each call. A newtype would have to live in that storage
+// to buy anything, which means rewriting the zero-checks and struct fields
+// those 84 call sites already use rather than just marking the call unsafe --
+// a behaviour-risking change for a lint fix that is not supposed to change
+// behaviour at all. Marking the function `unsafe` and documenting the
+// contract puts the obligation where the pointer's real origin already is:
+// the caller that resolved it.
+
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
 mod ffi {
@@ -234,7 +250,17 @@ pub mod jni {
     ///
     /// Any C++ exception is caught on the far side: letting one cross the FFI
     /// boundary gives a core dump and no explanation.
-    pub fn call_on_load(f: *mut c_void) -> Result<i32, String> {
+    ///
+    /// # Safety
+    ///
+    /// `f` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `f` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn call_on_load(f: *mut c_void) -> Result<i32, String> {
         let mut err = vec![0u8; 512];
         // SAFETY: `f` is libroblox's JNI_OnLoad export; `err` is a live buffer of
         // the length passed alongside it.
@@ -364,7 +390,17 @@ pub mod game_activity {
     /// `MainGameActivity.nativeAppBridgeSetInitParams` — where the service lives,
     /// what the device is, and what the viewport looks like. The engine renders
     /// its own app shell and draws nothing until it has these.
-    pub fn set_init_params(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn set_init_params(
         native: *mut c_void,
         assets: &str,
         width: i32,
@@ -524,10 +560,10 @@ pub mod game_activity {
             err: *mut c_char,
             n: usize,
         ) -> c_int;
-        fn cordial_cookies_set_host_sink(sink: Option<extern "C" fn(*const c_char)>);
+        fn cordial_cookies_set_host_sink(sink: Option<unsafe extern "C" fn(*const c_char)>);
         fn cordial_cookies_register_handler(f: *mut c_void, err: *mut c_char, n: usize) -> c_int;
         fn cordial_identity_set_sinks(
-            on_login: Option<extern "C" fn(*const c_char)>,
+            on_login: Option<unsafe extern "C" fn(*const c_char)>,
             on_logout: Option<extern "C" fn()>,
         );
         fn cordial_identity_publish(
@@ -625,7 +661,17 @@ pub mod game_activity {
     }
 
     /// `JNIAAssetManagerSetup.initNative` — hands the engine its asset manager.
-    pub fn asset_manager_init(native: *mut c_void) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn asset_manager_init(native: *mut c_void) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; `err` is a live buffer.
         let rc = unsafe {
@@ -635,7 +681,17 @@ pub mod game_activity {
     }
 
     /// `LocalStorageManager.initStorageManagerNativeV3`.
-    pub fn storage_init(native: *mut c_void, a: &str, b: &str) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn storage_init(native: *mut c_void, a: &str, b: &str) -> Result<(), String> {
         let ca = CString::new(a).map_err(|e| e.to_string())?;
         let cb = CString::new(b).map_err(|e| e.to_string())?;
         let mut err = vec![0u8; 512];
@@ -658,7 +714,17 @@ pub mod game_activity {
     /// app tells the engine which directories it owns. Nothing here called them,
     /// so the engine resolved `appData`, `cache`, `http` and `sounds` against the
     /// working directory instead of absolute storage.
-    pub fn call_static_strings(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn call_static_strings(
         native: *mut c_void,
         class_name: &str,
         args: &[&str],
@@ -688,7 +754,17 @@ pub mod game_activity {
     ///
     /// The engine's content store. See the C++ side for why this exists and what
     /// about the two paths is still unestablished.
-    pub fn init_storage_manager(native: *mut c_void, a: &str, b: &str) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn init_storage_manager(native: *mut c_void, a: &str, b: &str) -> Result<(), String> {
         let ca = CString::new(a).map_err(|e| e.to_string())?;
         let cb = CString::new(b).map_err(|e| e.to_string())?;
         let mut err = vec![0u8; 512];
@@ -709,7 +785,17 @@ pub mod game_activity {
     /// observe `NativeSettingsInterface.nativeIsLuaLoginEnabled()`'s own
     /// verdict for `docs/design/sign-in.md` — diagnostic-only, does not drive
     /// any UI or enter any credentials.
-    pub fn call_static_bare_bool(native: *mut c_void, class_name: &str) -> Result<bool, String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn call_static_bare_bool(native: *mut c_void, class_name: &str) -> Result<bool, String> {
         let cls = CString::new(class_name).map_err(|e| e.to_string())?;
         let mut out: c_int = -1;
         let mut err = vec![0u8; 512];
@@ -730,7 +816,17 @@ pub mod game_activity {
     ///
     /// Which rate to send when a window is on two outputs at once is decided in
     /// `cordial_runtime::refresh`, not here.
-    pub fn pass_current_refresh_rate(native: *mut c_void, hz: f32) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn pass_current_refresh_rate(native: *mut c_void, hz: f32) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; the buffer outlives the call.
         let rc = unsafe {
@@ -745,7 +841,17 @@ pub mod game_activity {
     /// supports, and there are none" is not a thing to tell a renderer, and the
     /// engine has been managing without the call at all — so saying nothing
     /// remains strictly better than saying that.
-    pub fn pass_supported_refresh_rates(native: *mut c_void, rates: &[f32]) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn pass_supported_refresh_rates(native: *mut c_void, rates: &[f32]) -> Result<(), String> {
         if rates.is_empty() {
             return Err("no plausible refresh rates to report".into());
         }
@@ -767,7 +873,17 @@ pub mod game_activity {
     /// `NativeGLInterface.reportBatteryStateChanged(II)V`. `status` and
     /// `plugged` are Android's own `BatteryManager` raw values — see
     /// `crates/cordial-runtime/src/battery.rs` for where they came from.
-    pub fn report_battery_state_changed(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn report_battery_state_changed(
         native: *mut c_void,
         status: i32,
         plugged: i32,
@@ -859,7 +975,17 @@ pub mod game_activity {
     }
 
     /// `NativeGLInterface.reportBatteryStatus(Lcom/roblox/engine/jni/model/BatteryStatus;)V`.
-    pub fn report_battery_status(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn report_battery_status(
         native: *mut c_void,
         status: &BatteryStatusFields,
     ) -> Result<(), String> {
@@ -934,7 +1060,17 @@ pub mod game_activity {
     /// `JNILinkingProtocol`'s message and field names are read this way — see
     /// `native/deeplink.cpp`. Purely a read of a constant the engine already
     /// holds; nothing is passed in.
-    pub fn call_static_ret_string(native: *mut c_void, class_name: &str) -> Result<String, String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn call_static_ret_string(native: *mut c_void, class_name: &str) -> Result<String, String> {
         let cls = CString::new(class_name).map_err(|e| e.to_string())?;
         let mut out = vec![0u8; 512];
         let mut err = vec![0u8; 512];
@@ -957,7 +1093,17 @@ pub mod game_activity {
     ///
     /// The returned boolean is the engine's own answer to "did I take this
     /// URL", and it is the only honest signal Cordial has about a deep link.
-    pub fn cold_start_protocol_launch(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn cold_start_protocol_launch(
         native: *mut c_void,
         class_name: &str,
         url: &str,
@@ -981,7 +1127,17 @@ pub mod game_activity {
     }
 
     /// `init(Context)` on one of the linking protocol classes.
-    pub fn protocol_init(native: *mut c_void, class_name: &str) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn protocol_init(native: *mut c_void, class_name: &str) -> Result<(), String> {
         let cls = CString::new(class_name).map_err(|e| e.to_string())?;
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; `cls`/`err` outlive the call.
@@ -1005,7 +1161,17 @@ pub mod game_activity {
     /// way. Asking the engine to compose it is the point: a subscriber that
     /// spelled the id itself would be guessing at a constant the engine owns,
     /// and would find out by never receiving anything.
-    pub fn call_static_two_strings_ret_string(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn call_static_two_strings_ret_string(
         native: *mut c_void,
         class_name: &str,
         a: &str,
@@ -1037,7 +1203,16 @@ pub mod game_activity {
         }
     }
 
-    pub fn call_static_string_ret_string(
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn call_static_string_ret_string(
         native: *mut c_void,
         class_name: &str,
         arg: &str,
@@ -1127,7 +1302,7 @@ pub mod game_activity {
     /// static lifetime, which is why the C side can hold them for the life of
     /// the process.
     pub fn identity_set_sinks(
-        on_login: extern "C" fn(*const c_char),
+        on_login: unsafe extern "C" fn(*const c_char),
         on_logout: extern "C" fn(),
     ) {
         // SAFETY: both are static function pointers with C ABI.
@@ -1178,9 +1353,19 @@ pub mod game_activity {
     /// `native/cookies.cpp` for why that split is where it is: the host is
     /// extracted before anything else reads the URL, because the query string
     /// of a Roblox URL can carry a one-time authentication ticket.
-    pub fn cookies_register_handler(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn cookies_register_handler(
         native: *mut c_void,
-        sink: extern "C" fn(*const c_char),
+        sink: unsafe extern "C" fn(*const c_char),
     ) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; `sink` is a plain
@@ -1199,7 +1384,17 @@ pub mod game_activity {
     /// half a cookie still parses as a cookie, and the engine would accept it
     /// on the next launch and fail authentication for a reason with no visible
     /// relationship to a buffer.
-    pub fn cookies_for_domain(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn cookies_for_domain(
         native: *mut c_void,
         class_name: &str,
         domain: &str,
@@ -1233,7 +1428,17 @@ pub mod game_activity {
     }
 
     /// A static native taking `(boolean, String)` — `setTaskSchedulerBackgroundMode`.
-    pub fn call_static_bool_string(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn call_static_bool_string(
         native: *mut c_void,
         class_name: &str,
         flag: bool,
@@ -1257,7 +1462,17 @@ pub mod game_activity {
     }
 
     /// `NativeSettingsInterface.nativeSetDeviceInfo(DeviceParams)`.
-    pub fn set_device_info(native: *mut c_void, width: i32, height: i32) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn set_device_info(native: *mut c_void, width: i32, height: i32) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; `err` outlives the call.
         let rc = unsafe {
@@ -1274,7 +1489,17 @@ pub mod game_activity {
 
     /// `FlagJniInterface.nativeInitializeNativeFlags` — what `bootstrapTheApp`
     /// exists to reach. Without it the engine reports `onFlagsFailed` and stops.
-    pub fn init_flags(native: *mut c_void, settings_json: &str) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn init_flags(native: *mut c_void, settings_json: &str) -> Result<(), String> {
         let json = CString::new(settings_json).map_err(|e| e.to_string())?;
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; both buffers outlive the call.
@@ -1293,7 +1518,17 @@ pub mod game_activity {
     /// network `ClientSettings` fetch. Not on the `ActivityNativeMain` chain
     /// Cordial drives (its only dex caller is a different startup path), so
     /// nothing else here calls it unless a caller in `load.rs` does.
-    pub fn read_local_flags(native: *mut c_void) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn read_local_flags(native: *mut c_void) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; `err` is a live buffer.
         let rc =
@@ -1303,7 +1538,17 @@ pub mod game_activity {
 
     /// A no-argument native on a named class. `nativeAppBridgeAppStart` is on
     /// `NativeAppBridgeInterface`, not `NativeGLInterface`.
-    pub fn call_bare_on(native: *mut c_void, class_name: &str) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn call_bare_on(native: *mut c_void, class_name: &str) -> Result<(), String> {
         let cls = CString::new(class_name).map_err(|e| e.to_string())?;
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; buffers outlive the call.
@@ -1323,7 +1568,17 @@ pub mod game_activity {
     /// *is* the host app in this architecture, so this is the legitimate
     /// interface, not a workaround. Returns the engine's own `int` result
     /// code, which is a better signal than anything printed to the log.
-    pub fn init_client_settings(native: *mut c_void, a: &str, b: &str, c: &str) -> Result<i32, String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn init_client_settings(native: *mut c_void, a: &str, b: &str, c: &str) -> Result<i32, String> {
         let ca = CString::new(a).map_err(|e| e.to_string())?;
         let cb = CString::new(b).map_err(|e| e.to_string())?;
         let cc = CString::new(c).map_err(|e| e.to_string())?;
@@ -1352,7 +1607,16 @@ pub mod game_activity {
     /// it. Returns the engine's own `int`, on the same reasoning as
     /// [`init_client_settings`]: the result code is a better signal than the log.
     #[allow(clippy::too_many_arguments)]
-    pub fn init_client_settings_cached_compressed(
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn init_client_settings_cached_compressed(
         native: *mut c_void,
         data: &[u8],
         a: &str,
@@ -1429,7 +1693,17 @@ pub mod game_activity {
     /// sentinel separates "the engine has this set to 0" from "the engine has
     /// never heard of it". Cordial spent a session unable to tell those apart
     /// for `FLogNativeDM`; see docs/analysis/flag-init.md §22.
-    pub fn get_fint(native: *mut c_void, name: &str, fallback: i32) -> Result<i32, String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn get_fint(native: *mut c_void, name: &str, fallback: i32) -> Result<i32, String> {
         let cn = CString::new(name).map_err(|e| e.to_string())?;
         let mut err = vec![0u8; 512];
         let mut out: c_int = 0;
@@ -1450,7 +1724,17 @@ pub mod game_activity {
     /// `NativeGLInterface.nativePostClientSettingsLoadedInitialization3(List)V`
     /// — the finishing step of the client-settings handshake, called with an
     /// empty `ArrayList`.
-    pub fn post_client_settings_loaded(native: *mut c_void) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn post_client_settings_loaded(native: *mut c_void) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: as above.
         let rc = unsafe {
@@ -1462,7 +1746,17 @@ pub mod game_activity {
     /// `MainGameActivity.nativePreloadFlagOverrides(String)V` — takes whatever
     /// JSON text is given and hands it straight through, so candidate shapes
     /// can be compared by their effect on the flags verdict / JNI trace.
-    pub fn preload_flag_overrides(native: *mut c_void, json: &str) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn preload_flag_overrides(native: *mut c_void, json: &str) -> Result<(), String> {
         let cs = CString::new(json).map_err(|e| e.to_string())?;
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; `cs`/`err` outlive the call.
@@ -1480,7 +1774,17 @@ pub mod game_activity {
     /// `NativeGLInterface.nativeAppBridgeV2InitWithParams` — the real app-bridge
     /// entry. The launcher Activity targets `ActivityNativeMain`, whose chain runs
     /// through here rather than through AGDK's `MainGameActivity`.
-    pub fn appbridge_init(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn appbridge_init(
         native: *mut c_void,
         assets: &str,
         width: i32,
@@ -1503,7 +1807,17 @@ pub mod game_activity {
     }
 
     /// A `NativeGLInterface` native taking no arguments — `nativeAppBridgeStartLuaAppDM`.
-    pub fn appbridge_call_bare(native: *mut c_void) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn appbridge_call_bare(native: *mut c_void) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: as above.
         let rc = unsafe {
@@ -1519,7 +1833,17 @@ pub mod game_activity {
     /// Two calls Sober makes and Cordial did not — see `update_surface` in
     /// `native/init_params.cpp` for the measurement. `game` selects the
     /// three-argument form, which takes an Activity as well.
-    pub fn appbridge_update_surface(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn appbridge_update_surface(
         native: *mut c_void,
         assets: &str,
         width: i32,
@@ -1540,7 +1864,16 @@ pub mod game_activity {
         if rc == 0 { Ok(()) } else { Err(take_err(err)) }
     }
 
-    pub fn appbridge_start_app(
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn appbridge_start_app(
         native: *mut c_void,
         assets: &str,
         width: i32,
@@ -1565,7 +1898,17 @@ pub mod game_activity {
     /// One of `JNIActivityLifecycleCallbacks`' natives. The engine stores
     /// per-Activity context — including the JNI environment it later reaches
     /// through — as these fire.
-    pub fn activity_lifecycle(native: *mut c_void, activity: &str) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn activity_lifecycle(native: *mut c_void, activity: &str) -> Result<(), String> {
         let a = CString::new(activity).map_err(|e| e.to_string())?;
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; `a` outlives the call.
@@ -1581,14 +1924,33 @@ pub mod game_activity {
     }
 
     /// A native taking nothing but the JNI pair — `nativeRetryInit`.
-    pub fn call_bare(native: *mut c_void) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn call_bare(native: *mut c_void) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: as above.
         let rc = unsafe { cordial_call_bare(native, err.as_mut_ptr() as *mut c_char, err.len()) };
         if rc == 0 { Ok(()) } else { Err(take_err(err)) }
     }
 
-    pub fn initialize(
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn initialize(
         native: *mut c_void,
         internal_path: &str,
         obb_path: &str,
@@ -2017,7 +2379,17 @@ pub mod game_activity {
     }
 
     /// `NativeGLInterface.nativePassKeyEvent` — Roblox's own keyboard path.
-    pub fn pass_key_event(native: *mut c_void, down: bool, key_code: i32, modifiers: i32, is_repeat: bool) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn pass_key_event(native: *mut c_void, down: bool, key_code: i32, modifiers: i32, is_repeat: bool) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: `err` outlives the call.
         let rc = unsafe {
@@ -2182,7 +2554,17 @@ pub mod game_activity {
     /// `native` is `Java_com_roblox_engine_jni_NativeGLInterface_nativeGetTextBoxInfo`,
     /// resolved by the loader. Calling this costs a JNI call and a Java object,
     /// so the caller owns the decision about how often — see `sync_text_overlay`.
-    pub fn textbox_info_now(native: *mut c_void) -> Result<Option<RawTextBoxInfo>, String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn textbox_info_now(native: *mut c_void) -> Result<Option<RawTextBoxInfo>, String> {
         let mut info = RawTextBoxInfo::default();
         let mut err = vec![0u8; 512];
         // SAFETY: `info` is a live, fully initialised mirror of the C++ struct
@@ -2265,7 +2647,17 @@ pub mod game_activity {
 
     /// `NativeGLInterface.updateKeyboardSize` — tells the engine an editor is
     /// up. Without it the engine focuses a box but never starts capturing.
-    pub fn update_keyboard_size(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn update_keyboard_size(
         native: *mut c_void, visible: bool, x: i32, y: i32, w: i32, h: i32,
     ) -> Result<(), String> {
         let mut err = vec![0u8; 512];
@@ -2281,7 +2673,17 @@ pub mod game_activity {
 
     /// `NativeGLInterface.syncTextboxTextAndCursorPosition2` — the per-keystroke
     /// text update. Takes no box handle: it applies to whatever has focus.
-    pub fn sync_textbox(native: *mut c_void, text: &str, cursor: i32) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn sync_textbox(native: *mut c_void, text: &str, cursor: i32) -> Result<(), String> {
         let t = CString::new(text).map_err(|e| e.to_string())?;
         let mut err = vec![0u8; 512];
         // SAFETY: `t` and `err` outlive the call.
@@ -2298,7 +2700,17 @@ pub mod game_activity {
     ///
     /// `which` is the handle from `showKeyboard`, which is how the engine knows
     /// which box the text belongs to.
-    pub fn pass_text(native: *mut c_void, which: i64, text: &str, flag: bool, cursor: i32) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn pass_text(native: *mut c_void, which: i64, text: &str, flag: bool, cursor: i32) -> Result<(), String> {
         let t = CString::new(text).map_err(|e| e.to_string())?;
         let mut err = vec![0u8; 512];
         // SAFETY: `t` and `err` outlive the call.
@@ -2313,7 +2725,17 @@ pub mod game_activity {
 
     /// `NativeInputInterface.nativePassMouseMove` — the path Roblox's interface
     /// actually reads, as distinct from AGDK's `onTouchEventNative`.
-    pub fn pass_mouse_move(native: *mut c_void, x: f32, y: f32, dx: f32, dy: f32) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn pass_mouse_move(native: *mut c_void, x: f32, y: f32, dx: f32, dy: f32) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; `err` outlives the call.
         let rc = unsafe {
@@ -2323,7 +2745,17 @@ pub mod game_activity {
     }
 
     /// `NativeInputInterface.nativePassMouseButton`.
-    pub fn pass_mouse_button(native: *mut c_void, x: f32, y: f32, down: bool, button: i32) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn pass_mouse_button(native: *mut c_void, x: f32, y: f32, down: bool, button: i32) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: as above.
         let rc = unsafe {
@@ -2338,7 +2770,17 @@ pub mod game_activity {
     /// `NativeInputInterface.nativePassMouseWheel(F,F,F)` — the wheel's
     /// equivalent of [`pass_mouse_button`], and the call Cordial had never
     /// made. `delta` is in detents, positive away from the user.
-    pub fn pass_mouse_wheel(native: *mut c_void, x: f32, y: f32, delta: f32) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn pass_mouse_wheel(native: *mut c_void, x: f32, y: f32, delta: f32) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: as above.
         let rc = unsafe {
@@ -2368,7 +2810,17 @@ pub mod game_activity {
     /// values are `INFERRED` from mocktail. See `cordial_input_pass_input` in
     /// `native/game_activity.cpp` for both, and `android::input::TOUCH_*` for
     /// the constants themselves.
-    pub fn pass_input(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn pass_input(
         native: *mut c_void,
         pointer_id: i32,
         x: f32,
@@ -2400,7 +2852,17 @@ pub mod game_activity {
     /// **This build ships no type-less connect**, so there is no way to announce
     /// a pad without naming a type, and no evidence available here says what the
     /// ordinals are. See `android::gamepad::gamepad_type`.
-    pub fn gamepad_connect(native: *mut c_void, id: i32, gamepad_type: i32) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn gamepad_connect(native: *mut c_void, id: i32, gamepad_type: i32) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: `native` is the exported JNI native; `err` outlives the call.
         let rc = unsafe {
@@ -2414,7 +2876,17 @@ pub mod game_activity {
 
     /// `nativeGamepadDisconnectEvent(I id)` — no type, because the engine kept
     /// the one it was given at connect.
-    pub fn gamepad_disconnect(native: *mut c_void, id: i32) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn gamepad_disconnect(native: *mut c_void, id: i32) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: as above.
         let rc = unsafe {
@@ -2428,7 +2900,17 @@ pub mod game_activity {
     /// `key_code` is read as an Android `KeyEvent.KEYCODE_BUTTON_*` and `action`
     /// as `ACTION_DOWN`/`ACTION_UP`. INFERRED from the Android platform contract
     /// the Java caller would have been working to; nothing observed it.
-    pub fn gamepad_button(native: *mut c_void, id: i32, key_code: i32, action: i32) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn gamepad_button(native: *mut c_void, id: i32, key_code: i32, action: i32) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: as above.
         let rc = unsafe {
@@ -2445,7 +2927,17 @@ pub mod game_activity {
     /// Three floats read as a `Vector3`, which is what Roblox's Lua
     /// `InputObject.Position` is for a thumbstick. INFERRED with no control
     /// behind it — the TV-remote family has no axis method to difference against.
-    pub fn gamepad_axis(native: *mut c_void, id: i32, axis: i32, x: f32, y: f32, z: f32) -> Result<(), String> {
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn gamepad_axis(native: *mut c_void, id: i32, axis: i32, x: f32, y: f32, z: f32) -> Result<(), String> {
         let mut err = vec![0u8; 512];
         // SAFETY: as above.
         let rc = unsafe {
@@ -2459,7 +2951,17 @@ pub mod game_activity {
 
     /// `nativeSetGamepadSupportedKeyWithGamepadType(I id, I keyCode, Z supported, I gamepadType)`
     /// — one call per button, before any button event.
-    pub fn gamepad_supported_key(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn gamepad_supported_key(
         native: *mut c_void, id: i32, key_code: i32, supported: bool, gamepad_type: i32,
     ) -> Result<(), String> {
         let mut err = vec![0u8; 512];
@@ -2478,7 +2980,17 @@ pub mod game_activity {
     /// The middle pair is read as Android's `(axis, source)` motion-range key.
     /// The least established of the six: `(IIIZI)` has one more `int` than the
     /// key variant and nothing to difference it against.
-    pub fn gamepad_supported_motion(
+    ///
+    /// # Safety
+    ///
+    /// `native` must be a live pointer to the exported JNI native this call
+    /// names, obtained via [`Library::symbol`] (or the module-level dlsym
+    /// equivalent) against a `libroblox.so` Cordial has `dlopen`'d and never
+    /// `dlclose`s. The C shim supplies the `JNIEnv`/`jobject` it invokes the
+    /// native with from the process's own `JavaVM`, not from anything passed
+    /// here -- so the one thing this call cannot check is that `native` really
+    /// is that resolved export and not a stale, null-masked, or wrong pointer.
+    pub unsafe fn gamepad_supported_motion(
         native: *mut c_void, id: i32, axis: i32, source: i32, supported: bool, gamepad_type: i32,
     ) -> Result<(), String> {
         let mut err = vec![0u8; 512];

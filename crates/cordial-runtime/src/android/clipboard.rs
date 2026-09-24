@@ -538,11 +538,15 @@ pub fn publish_probe(text: &str) -> Result<(), String> {
         .symbol("Java_com_roblox_universalapp_messagebus_MessageBus_publishRaw")
         .ok_or_else(|| "publishRaw is not exported".to_string())?;
     let payload = serde_json::json!({ "content": text }).to_string();
-    linker::game_activity::call_static_strings(
-        publish,
-        "com/roblox/universalapp/messagebus/MessageBus",
-        &[SET_CLIPBOARD_TEXT, &payload],
-    )
+    // SAFETY: `publish` was just resolved from the loaded `libroblox.so` above,
+    // and the library is never unloaded.
+    unsafe {
+        linker::game_activity::call_static_strings(
+            publish,
+            "com/roblox/universalapp/messagebus/MessageBus",
+            &[SET_CLIPBOARD_TEXT, &payload],
+        )
+    }
 }
 
 #[cfg(test)]

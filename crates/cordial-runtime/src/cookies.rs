@@ -152,7 +152,14 @@ pub fn where_kept() -> String {
 /// The sink `native/cookies.cpp` calls with each host whose cookies changed.
 ///
 /// Deliberately tiny, and deliberately not doing the read here — see `DIRTY`.
-pub extern "C" fn observe_host(host: *const std::ffi::c_char) {
+///
+/// # Safety
+///
+/// `host`, if non-null, must be a nul-terminated C string valid for the
+/// duration of the call. Only `native/cookies.cpp` ever calls this, through
+/// the function pointer [`cordial_linker_sys::game_activity::cookies_register_handler`]
+/// installs, and it holds to that contract.
+pub unsafe extern "C" fn observe_host(host: *const std::ffi::c_char) {
     if host.is_null() {
         return;
     }
@@ -437,7 +444,12 @@ pub fn flush(reason: &str) {
     // "wrong spelling" is to ask again once the engine is fully up.
     let push = PUSH.load(Ordering::Acquire);
     if push != 0 && std::env::var_os("CORDIAL_COOKIE_PROBE").is_some() {
-        probe(push as *mut std::ffi::c_void, native as *mut std::ffi::c_void, reason);
+        // SAFETY: `push`/`native` were resolved via symbol lookups against the
+        // loaded libroblox.so (never unloaded); see `PUSH`/`PULL`'s own
+        // initialisation.
+        unsafe {
+            probe(push as *mut std::ffi::c_void, native as *mut std::ffi::c_void, reason);
+        }
     }
 
     let mut hosts: BTreeSet<String> = SEED_HOSTS.iter().map(|h| h.to_string()).collect();
@@ -450,11 +462,12 @@ pub fn flush(reason: &str) {
 
     let mut records: Vec<(String, Jar)> = Vec::new();
     for host in hosts {
-        match cordial_linker_sys::game_activity::cookies_for_domain(
+        // SAFETY: `native as *mut std::ffi::c_void` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        match unsafe { cordial_linker_sys::game_activity::cookies_for_domain(
             native as *mut std::ffi::c_void,
             SETTINGS,
             &host,
-        ) {
+        ) } {
             // Converted on the way out, not on the way in. The store holds the
             // form the engine will accept back, so a restore is a straight
             // hand-over and the one place that has to understand the engine's
@@ -540,7 +553,15 @@ fn shape(jar: &Jar) -> String {
 ///
 /// The marker is a fixed, obviously-fake value, so this never handles a real
 /// session, and only byte counts are ever printed.
-pub fn probe(set_native: *mut std::ffi::c_void, get_native: *mut std::ffi::c_void, when: &str) {
+///
+/// # Safety
+///
+/// `set_native` and `get_native` must each be a live pointer to the
+/// respectively-named exported JNI native, resolved via a symbol lookup
+/// against the loaded `libroblox.so` (never unloaded) -- the same contract
+/// [`cordial_linker_sys::game_activity::call_static_strings`] and
+/// [`cordial_linker_sys::game_activity::cookies_for_domain`] document.
+pub unsafe fn probe(set_native: *mut std::ffi::c_void, get_native: *mut std::ffi::c_void, when: &str) {
     const MARKER: &str = "CORDIALPROBE=1";
     println!("  [cookies] probe at {when}: set the marker, then read it back");
     for domain in [
@@ -550,14 +571,16 @@ pub fn probe(set_native: *mut std::ffi::c_void, get_native: *mut std::ffi::c_voi
         "https://roblox.com",
         "https://www.roblox.com/",
     ] {
-        let set = cordial_linker_sys::game_activity::call_static_strings(
+        // SAFETY: `set_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        let set = unsafe { cordial_linker_sys::game_activity::call_static_strings(
             set_native,
             SETTINGS,
             &[domain, MARKER],
-        );
-        let got = cordial_linker_sys::game_activity::cookies_for_domain(
+        ) };
+        // SAFETY: `get_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        let got = unsafe { cordial_linker_sys::game_activity::cookies_for_domain(
             get_native, SETTINGS, domain,
-        );
+        ) };
         match (set, got) {
             (Ok(()), Ok(jar)) => println!(
                 "    {domain:<26} set ok, read back {} bytes, {}",
@@ -576,7 +599,14 @@ pub fn probe(set_native: *mut std::ffi::c_void, get_native: *mut std::ffi::c_voi
 /// before the app-bridge sequence starts: the engine begins hitting
 /// `authenticated/*` endpoints as soon as that chain runs, and a cookie that
 /// arrives after the first 401 is a cookie that arrived too late.
-pub fn restore(set_native: *mut std::ffi::c_void) -> usize {
+///
+/// # Safety
+///
+/// `set_native` must be a live pointer to the exported
+/// `nativeSetMultipleCookies`, resolved via a symbol lookup against the
+/// loaded `libroblox.so` (never unloaded) -- the same contract
+/// [`cordial_linker_sys::game_activity::call_static_strings`] documents.
+pub unsafe fn restore(set_native: *mut std::ffi::c_void) -> usize {
     if !enabled() {
         return 0;
     }
@@ -599,11 +629,12 @@ pub fn restore(set_native: *mut std::ffi::c_void) -> usize {
 
     let mut restored = 0;
     for (host, jar) in &records {
-        match cordial_linker_sys::game_activity::call_static_strings(
+        // SAFETY: `set_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        match unsafe { cordial_linker_sys::game_activity::call_static_strings(
             set_native,
             SETTINGS,
             &[host.as_str(), jar.expose()],
-        ) {
+        ) } {
             Ok(()) => restored += 1,
             Err(e) => eprintln!("[cookies] {host}: nativeSetMultipleCookies failed: {e}"),
         }
@@ -623,11 +654,12 @@ pub fn restore(set_native: *mut std::ffi::c_void) -> usize {
             // header form that went in, so a byte comparison would say "bigger,
             // fine" for a jar that had actually thrown the session away.
             let wanted = jar.expose().split("; ").filter(|p| !p.is_empty()).count();
-            match cordial_linker_sys::game_activity::cookies_for_domain(
+            // SAFETY: `pull as *mut std::ffi::c_void` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            match unsafe { cordial_linker_sys::game_activity::cookies_for_domain(
                 pull as *mut std::ffi::c_void,
                 SETTINGS,
                 host,
-            ) {
+            ) } {
                 Ok(back) => {
                     let got = to_settable(&back).split("; ").filter(|p| !p.is_empty()).count();
                     if got >= wanted {

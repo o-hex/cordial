@@ -2452,7 +2452,8 @@ impl WaylandWindow {
             }
         }
         let carried = state.as_ref().and_then(|p| p.usable);
-        let answer = match cordial_linker_sys::game_activity::textbox_info_now(native) {
+        // SAFETY: `native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        let answer = match unsafe { cordial_linker_sys::game_activity::textbox_info_now(native) } {
             // **A zero height is the trap this call brings with it.** Asked on
             // the same pump tick as `showKeyboard`, the search modal answered
             // `x=596 y=10 w=42 h=0` -- caught mid-animation, expanding out of

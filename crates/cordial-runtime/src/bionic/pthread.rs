@@ -256,7 +256,14 @@ unsafe fn resolve(
 
 // ---------------------------------------------------------------- condition vars
 
-pub extern "C" fn cond_init(cond: *mut c_void, attr: *const c_void) -> c_int {
+/// # Safety
+///
+/// `cond` must point at storage at least as large as bionic's
+/// `pthread_cond_t` (48 bytes; see [`BionicCond`]); `attr`, if non-null, must
+/// point at a `pthread_condattr_t` the host's `pthread_cond_init` can read.
+/// Both hold here: bionic code only ever hands this its own statically- or
+/// explicitly-declared `pthread_cond_t` and `pthread_condattr_t`.
+pub unsafe extern "C" fn cond_init(cond: *mut c_void, attr: *const c_void) -> c_int {
     if cond.is_null() {
         return libc_einval();
     }
@@ -338,7 +345,13 @@ macro_rules! cond_op {
 cond_op!(cond_signal, pthread_cond_signal);
 cond_op!(cond_broadcast, pthread_cond_broadcast);
 
-pub extern "C" fn cond_wait(cond: *mut c_void, mutex: *mut c_void) -> c_int {
+/// # Safety
+///
+/// `cond` must be a bionic `pthread_cond_t` this module has already seen
+/// (statically- or explicitly-initialised); `mutex` must point at storage the
+/// size of bionic's `pthread_mutex_t` (40 bytes), which is layout-identical to
+/// glibc's on x86-64 and so passes straight through.
+pub unsafe extern "C" fn cond_wait(cond: *mut c_void, mutex: *mut c_void) -> c_int {
     let Some(backing) = cond_backing(cond) else {
         return libc_einval();
     };
@@ -347,7 +360,11 @@ pub extern "C" fn cond_wait(cond: *mut c_void, mutex: *mut c_void) -> c_int {
     unsafe { pthread_cond_wait(backing, mutex) }
 }
 
-pub extern "C" fn cond_timedwait(
+/// # Safety
+///
+/// As [`cond_wait`], plus `abstime`, if non-null, must point at a
+/// `struct timespec`, which is identical between the two libcs.
+pub unsafe extern "C" fn cond_timedwait(
     cond: *mut c_void,
     mutex: *mut c_void,
     abstime: *const c_void,
@@ -934,7 +951,14 @@ extern "C" {
 /// every key it hands out, so a bionic key is always a negative `int`; glibc's
 /// are small non-negative ones and the first is 0. Code that treats key 0 as
 /// "no key allocated" would be wrong here in a way it never was on Android.
-pub extern "C" fn once(control: *mut c_int, init_routine: Option<extern "C" fn()>) -> c_int {
+///
+/// # Safety
+///
+/// `control` must point at 4 bytes of storage bionic's `pthread_once_t`
+/// occupies -- a statically- or `PTHREAD_ONCE_INIT`-initialised once-control
+/// that has never been passed to bionic's own implementation, per the
+/// comment above.
+pub unsafe extern "C" fn once(control: *mut c_int, init_routine: Option<extern "C" fn()>) -> c_int {
     if control.is_null() {
         return libc_einval();
     }
@@ -947,7 +971,12 @@ pub extern "C" fn once(control: *mut c_int, init_routine: Option<extern "C" fn()
 /// `pthread_key_create`. bionic's `pthread_key_t` is signed, glibc's is not,
 /// hence the local rather than a cast of the caller's pointer — and nothing is
 /// written back unless the host says it succeeded, which is bionic's contract.
-pub extern "C" fn key_create(
+///
+/// # Safety
+///
+/// `key` must point at 4 bytes of writable storage for the caller's
+/// `pthread_key_t`.
+pub unsafe extern "C" fn key_create(
     key: *mut c_int,
     destructor: Option<extern "C" fn(*mut c_void)>,
 ) -> c_int {
@@ -975,7 +1004,12 @@ pub extern "C" fn getspecific(key: c_int) -> *mut c_void {
     unsafe { host_pthread_getspecific(key as c_uint) }
 }
 
-pub extern "C" fn setspecific(key: c_int, value: *const c_void) -> c_int {
+/// # Safety
+///
+/// `value` is stored and handed back by [`getspecific`], never dereferenced
+/// here, so this has no requirement on it beyond being a value the caller
+/// intends to get back; `key` is an opaque scalar glibc rejects if invalid.
+pub unsafe extern "C" fn setspecific(key: c_int, value: *const c_void) -> c_int {
     // SAFETY: as above. `value` is stored, never dereferenced.
     unsafe { host_pthread_setspecific(key as c_uint, value) }
 }
@@ -1082,11 +1116,15 @@ mod tests {
     fn init_destroy_roundtrip_does_not_leak_state() {
         let mut storage = [0u64; 6];
         let cond = storage.as_mut_ptr() as *mut c_void;
-        assert_eq!(cond_init(cond, std::ptr::null()), 0);
-        assert_eq!(cond_destroy(cond), 0);
-        // Destroyed wrappers return to the zero state, so they can be reused.
-        assert_eq!(cond_init(cond, std::ptr::null()), 0);
-        assert_eq!(cond_destroy(cond), 0);
+        // SAFETY: `cond` is a live, correctly-sized `pthread_cond_t` on this
+        // thread's stack, per `cond_init`/`cond_destroy`'s own contracts.
+        unsafe {
+            assert_eq!(cond_init(cond, std::ptr::null()), 0);
+            assert_eq!(cond_destroy(cond), 0);
+            // Destroyed wrappers return to the zero state, so they can be reused.
+            assert_eq!(cond_init(cond, std::ptr::null()), 0);
+            assert_eq!(cond_destroy(cond), 0);
+        }
     }
 
     #[test]
@@ -1098,26 +1136,40 @@ mod tests {
         // bionic's PTHREAD_ONCE_INIT is 0, and so is glibc's. A control that
         // was only ever statically initialised is valid for both.
         let mut control: c_int = 0;
-        assert_eq!(once(&mut control, Some(init)), 0);
-        assert_eq!(once(&mut control, Some(init)), 0);
+        // SAFETY: `control` is a live, statically-zeroed `pthread_once_t` on
+        // this thread's stack, per `once`'s own contract.
+        unsafe {
+            assert_eq!(once(&mut control, Some(init)), 0);
+            assert_eq!(once(&mut control, Some(init)), 0);
+        }
         assert_eq!(RUNS.load(Ordering::SeqCst), 1);
 
         // The control, not the routine, is what remembers. A second control
         // runs it again — otherwise the count above proves nothing.
         let mut second: c_int = 0;
-        assert_eq!(once(&mut second, Some(init)), 0);
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(once(&mut second, Some(init)), 0);
+        }
         assert_eq!(RUNS.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn thread_specific_data_round_trips() {
         let mut key: c_int = -1;
-        assert_eq!(key_create(&mut key, None), 0);
+        // SAFETY: `key` is a live 4-byte slot on this thread's stack, per
+        // `key_create`/`setspecific`'s own contracts.
+        unsafe {
+            assert_eq!(key_create(&mut key, None), 0);
+        }
         // A key with nothing stored reads as null, which is what the caller
         // that used to get a stubbed 0 was entitled to expect.
         assert!(getspecific(key).is_null());
         let value = 0xC0FFEEusize as *const c_void;
-        assert_eq!(setspecific(key, value), 0);
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(setspecific(key, value), 0);
+        }
         assert_eq!(getspecific(key), value as *mut c_void);
         assert_eq!(key_delete(key), 0);
     }
@@ -1128,8 +1180,11 @@ mod tests {
         // it reads the slot table hanging off the thread pointer, which for a
         // host-created thread is glibc's.
         let mut key: c_int = -1;
-        assert_eq!(key_create(&mut key, None), 0);
-        assert_eq!(setspecific(key, 1 as *const c_void), 0);
+        // SAFETY: as `thread_specific_data_round_trips` above.
+        unsafe {
+            assert_eq!(key_create(&mut key, None), 0);
+            assert_eq!(setspecific(key, 1 as *const c_void), 0);
+        }
 
         let elsewhere = key;
         let seen = std::thread::spawn(move || getspecific(elsewhere) as usize)
@@ -1142,8 +1197,12 @@ mod tests {
 
     #[test]
     fn null_arguments_are_refused_rather_than_dereferenced() {
-        assert_eq!(once(std::ptr::null_mut(), None), libc_einval());
-        assert_eq!(key_create(std::ptr::null_mut(), None), libc_einval());
+        // SAFETY: both refuse a null argument before doing anything with it,
+        // which is exactly what this test asserts.
+        unsafe {
+            assert_eq!(once(std::ptr::null_mut(), None), libc_einval());
+            assert_eq!(key_create(std::ptr::null_mut(), None), libc_einval());
+        }
     }
 
     #[test]

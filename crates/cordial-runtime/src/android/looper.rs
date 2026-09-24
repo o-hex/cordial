@@ -440,6 +440,45 @@ fn startup_retry_enabled() -> bool {
     *ON.get_or_init(|| matches!(std::env::var("CORDIAL_STARTUP_RETRY").as_deref(), Ok("1") | Ok("on")))
 }
 
+/// What to try when `CORDIAL_STARTUP_SELFRELAUNCH=1` and the engine has
+/// stopped during startup: exec a fresh instance and exit this one. Installed
+/// by `load.rs`'s `main`, which is the only place that holds both the
+/// profile's [`cordial_shell::profile::Claim`] and the original argv needed to
+/// reproduce this launch. `None` means either the switch is off or this
+/// process is itself already a relaunch -- see the doc on where it is armed.
+///
+/// Returns a `String` only on failure (the spawn itself did not start); on
+/// success this calls [`std::process::exit`] and never returns at all, which
+/// is why the signature cannot be `Result` without a variant nobody can name.
+pub static STARTUP_RELAUNCH: OnceLock<Box<dyn Fn() -> String + Send + Sync>> = OnceLock::new();
+
+/// `CORDIAL_STARTUP_SELFRELAUNCH=1`: when the engine stops during startup,
+/// exit this process and start a fresh one, before ever telling the user this
+/// run failed.
+///
+/// **Why this and not `CORDIAL_STARTUP_RETRY`.** That switch asks the wedged
+/// engine's own entry point to try again, and the entry point never returns --
+/// see that switch's doc. It is worse than the freeze because the call is made
+/// from the pump thread, so asking blocks the one thread that was still
+/// serving input and the window stops responding at all. A whole-process
+/// relaunch asks nothing of the wedged thread: `exit`/`SIGKILL` reclaims a
+/// process regardless of what any of its threads are doing, which is the
+/// property `CORDIAL_STARTUP_RETRY` does not have.
+///
+/// Measured 2026-09-18, `$S/freeze-recovery.md`: signed-in `CordialTest`,
+/// interleaved against a plain-default control. See that file for the tally
+/// and the time-to-Home distribution before trusting this in a context those
+/// runs did not cover.
+///
+/// Opt-in (`CORDIAL_STARTUP_SELFRELAUNCH=1`) while this is being measured.
+/// **Flip the default only once `$S/freeze-recovery.md` says so for the build
+/// under test** -- this comment is the one place that decision is recorded,
+/// not the commit that first wired the switch.
+fn selfrelaunch_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("CORDIAL_STARTUP_SELFRELAUNCH").as_deref(), Ok("1") | Ok("on")))
+}
+
 /// The most frames a client may have drawn and still be treated as stuck in
 /// startup rather than merely idle.
 ///
@@ -1191,11 +1230,31 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                 );
                 flush_stdout();
             }
-            if startup_retry_enabled()
-                && !recovery_tried
+            let stall_confirmed = !recovery_tried
                 && now <= RECOVERY_MAX_PRESENTS
-                && stall_since.elapsed() >= std::time::Duration::from_secs(6)
-            {
+                && stall_since.elapsed() >= std::time::Duration::from_secs(6);
+            // Self-relaunch takes priority when both are armed, because it is
+            // the one that has been measured to leave the client no worse off
+            // than the freeze it is answering -- see `selfrelaunch_enabled`'s
+            // doc. `recovery_tried` still gates both, so a build that somehow
+            // has both switches set on the same launch tries exactly one
+            // thing, once.
+            if stall_confirmed && selfrelaunch_enabled() && STARTUP_RELAUNCH.get().is_some() {
+                recovery_tried = true;
+                println!(
+                    "[android] the engine has drawn {now} frames and stopped; \
+                     CORDIAL_STARTUP_SELFRELAUNCH is on, so this process is relaunching itself \
+                     once rather than showing this run's failure. Expect this to be the last \
+                     line unless the relaunch could not even start."
+                );
+                flush_stdout();
+                let relaunch = STARTUP_RELAUNCH.get().unwrap();
+                let err = relaunch();
+                // Only reached if `spawn` itself failed -- a successful
+                // relaunch calls `std::process::exit` and never returns here.
+                println!("[android] self-relaunch failed to start: {err}");
+                flush_stdout();
+            } else if stall_confirmed && startup_retry_enabled() {
                 recovery_tried = true;
                 if let Some(retry) = STARTUP_RECOVERY.get() {
                     println!(

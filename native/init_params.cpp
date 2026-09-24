@@ -2927,6 +2927,76 @@ int cordial_appbridge_call_bare(void* fn, char* err, size_t err_len) {
     }
 }
 
+/// `NativeAppBridgeInterface.nativeAppBridgeAppStart(String, String,
+/// boolean, String, String, String)V` — the "V1" app-bridge entry
+/// (`docs/analysis/app-bridge.md` §1.2), on a different class than every
+/// other native in this file. Sober's own engine log calls this immediately
+/// before `nativeAppBridgeV2Init` on every signed-in launch
+/// (`$S/sober-diff.md`, `s2.enginelog:62-63`, 3.328s/3.337s), and real
+/// Android's own capture (`docs/traces/render-bringup-sequence.log`) shows
+/// the same order. Cordial's `CORDIAL_SKIP_AGDK`+`CORDIAL_SKIP_AGDK_SETTINGS`
+/// arm never called it and landed on the signed-out `Landing` page despite a
+/// correct `StartAppParams` identity and a correctly-delivered client
+/// settings/flags handshake -- this is the next thing to try, not a fix
+/// already confirmed to work.
+///
+/// Argument shape and the four non-Cordial-specific values (`base_url`,
+/// the `boolean`, `launch_source`, and the trailing empty string) are taken
+/// from mocktail (Apache-2.0), `~/Projects/mocktail/src/legacy/legacy_runtime.cc`,
+/// the call site around its `AppBridgeAppStartThread`/`EngineStartupThread`
+/// (~line 30116 and ~30524-30531): `(base_url, user_agent, JNI_FALSE,
+/// android_id, launch_source, "")`, run by default synchronously on the
+/// caller's own thread -- the separate JNI-attached thread mocktail also
+/// supports for this call is opt-in
+/// (`MOCKTAIL_APP_BRIDGE_APP_START_THREAD`), not its default, so nothing here
+/// needs one either.
+///
+/// `user_agent` reuses Cordial's own `build_user_agent()` (this file) rather
+/// than mocktail's placeholder, because it is the one value here Cordial
+/// already computes honestly and has a documented reason to want consistent
+/// across every call site. `android_id` is mocktail's own placeholder
+/// default, `"0000000000000000"`, deliberately, not an invented one:
+/// **Cordial has no Android ID of its own anywhere in this tree** —
+/// `grep -rn "android_id" native/ crates/` returns nothing — so the premise
+/// that one already exists to reuse does not hold, and mocktail's documented
+/// placeholder is the closest thing to "not invented" available. `base_url`
+/// and `launch_source` are mocktail's values verbatim: neither this project
+/// nor mocktail has captured what a real non-Android client sends here, and
+/// Roblox's own API host is not something to guess at either way.
+int cordial_appbridge_app_start(void* fn, char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jstring, jstring, jboolean, jstring, jstring, jstring);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or the native is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeAppBridgeInterface");
+        auto* jenv = env->GetJNIEnv();
+        auto self = (jobject)cordial::to_jni(env, cls);
+        auto base_url = cordial::S_pub("https://www.roblox.com/");
+        auto user_agent = cordial::S_pub(cordial::build_user_agent().c_str());
+        auto android_id = cordial::S_pub("0000000000000000");
+        auto launch_source = cordial::S_pub("AppAndroidV");
+        auto empty = cordial::S_pub("");
+        reinterpret_cast<Call>(fn)(
+            jenv, self,
+            (jstring)cordial::to_jni(env, base_url),
+            (jstring)cordial::to_jni(env, user_agent),
+            JNI_FALSE,
+            (jstring)cordial::to_jni(env, android_id),
+            (jstring)cordial::to_jni(env, launch_source),
+            (jstring)cordial::to_jni(env, empty));
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
 } // extern "C"
 
 extern "C" {

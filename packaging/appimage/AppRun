@@ -187,15 +187,24 @@ if [ -z "${CORDIAL_APPIMAGE_WRAPPED:-}" ] \
         # exists, same reasoning as /usr/lib64 just above: a host that lacks
         # it entirely was never going to need this bind, and overlaying the
         # whole of /usr/lib to manufacture it from nothing would put the
-        # loader (/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 on this
-        # family) behind an overlayfs for no gain. This directory is not
-        # itself a symlink to /usr/lib64 the way Arch's is, so the overlay
-        # stays narrow the same way /usr/libexec's does.
-        if [ -d /usr/lib/x86_64-linux-gnu ]; then
-            args+=(--overlay-src /usr/lib/x86_64-linux-gnu --tmp-overlay /usr/lib/x86_64-linux-gnu
-                   --bind "${APPDIR}/usr/libexec/webkitgtk-6.0" /usr/lib/x86_64-linux-gnu/webkitgtk-6.0)
+        # loader (/usr/lib/<triplet>/ld-linux-*.so.* on this family) behind an
+        # overlayfs for no gain. This directory is not itself a symlink to
+        # /usr/lib64 the way Arch's is, so the overlay stays narrow the same
+        # way /usr/libexec's does.
+        #
+        # `$(uname -m)-linux-gnu` rather than the literal `x86_64-linux-gnu`
+        # this was measured against: an AppImage cannot execute on a host of a
+        # different architecture than it was built for, so the multiarch
+        # triplet this process is actually running under is always the one
+        # whichever libwebkitgtk-6.0.so got bundled was itself built against
+        # -- `uname -m` at this point in AppRun and `uname -m` in the build
+        # container that produced this AppDir necessarily agree.
+        multiarch_dir="/usr/lib/$(uname -m)-linux-gnu"
+        if [ -d "$multiarch_dir" ]; then
+            args+=(--overlay-src "$multiarch_dir" --tmp-overlay "$multiarch_dir"
+                   --bind "${APPDIR}/usr/libexec/webkitgtk-6.0" "$multiarch_dir/webkitgtk-6.0")
             if [ -d "${APPDIR}/usr/lib/webkitgtk-6.0/injected-bundle" ]; then
-                args+=(--bind "${APPDIR}/usr/lib/webkitgtk-6.0/injected-bundle" /usr/lib/x86_64-linux-gnu/webkitgtk-6.0/injected-bundle)
+                args+=(--bind "${APPDIR}/usr/lib/webkitgtk-6.0/injected-bundle" "$multiarch_dir/webkitgtk-6.0/injected-bundle")
             fi
         fi
 

@@ -4,8 +4,8 @@
 
 # Cordial
 
-Runs Roblox's official Android x86-64 build natively on Linux, with no emulator,
-container or virtual machine. GPL-3.0-or-later.
+Runs Roblox's official Android build natively on Linux, with no emulator,
+container or virtual machine, on x86-64 or aarch64. GPL-3.0-or-later.
 
 <p align="center">
   <a href="https://discord.gg/qJzU3Xfr9b">
@@ -88,9 +88,13 @@ Diagram and data flow: [`docs/architecture.md`](docs/architecture.md).
 
 ## Install
 
-x86-64 Linux, Wayland. X11 starts through Flatpak's fallback socket but is not
-developed further
+x86-64 or aarch64 Linux, Wayland. X11 starts through Flatpak's fallback socket
+but is not developed further
 ([`docs/adr/ADR-011-wayland-and-libadwaita.md`](docs/adr/ADR-011-wayland-and-libadwaita.md)).
+aarch64 is new and untested on real ARM64 hardware — see
+[`docs/multiarch.md`](docs/multiarch.md) for what has and has not been
+checked. The Arch package is x86-64 only; Arch Linux itself does not build for
+aarch64.
 
 You also need Roblox's Android build. Cordial does not ship it. First run has a
 **Download Roblox** button that fetches it from APKPure and refuses anything
@@ -126,7 +130,7 @@ on a stand-in, not on a real machine without WebKitGTK, and not outside Fedora
 ([`docs/install.md`](docs/install.md#appimage)):
 
 ```bash
-chmod +x Cordial-x86_64.AppImage && ./Cordial-x86_64.AppImage
+chmod +x Cordial-*.AppImage && ./Cordial-*.AppImage   # -x86_64 or -aarch64
 ```
 
 **Packages** from the releases page. All artefacts are cosign-signed. The
@@ -135,9 +139,9 @@ produce an unsigned repository. AUR submission is blocked on account sign-ups
 being closed.
 
 ```bash
-sudo apt install ./cordial_*_amd64.deb
-sudo dnf install ./cordial-*.x86_64.rpm
-sudo pacman -U cordial-*-x86_64.pkg.tar.zst
+sudo apt install ./cordial_*_amd64.deb      # or _arm64.deb
+sudo dnf install ./cordial-*.x86_64.rpm     # or .aarch64.rpm
+sudo pacman -U cordial-*-x86_64.pkg.tar.zst # x86-64 only -- see above
 ```
 
 **From source:**

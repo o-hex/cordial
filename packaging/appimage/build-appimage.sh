@@ -108,6 +108,37 @@ target_dir="${CARGO_TARGET_DIR:-$repo/target}"
 tools_dir="${CORDIAL_APPIMAGE_TOOLS_DIR:-$target_dir/appimage-tools}"
 mkdir -p "$tools_dir"
 
+# The architecture this container is actually running on, not the one Cordial
+# is being cross-packaged for -- there is no cross-packaging here, linuxdeploy
+# and appimagetool both run as ordinary binaries on the build host, and each
+# ships a separate AppImage per architecture with no universal build. Fixed to
+# the two names both projects' own release pages spell this way -- `uname -m`
+# already returns exactly `x86_64` or `aarch64`, which is also how linuxdeploy
+# and appimagetool name their own release assets, so no translation table is
+# needed the way Debian's amd64/arm64 spelling needs one elsewhere in
+# packaging/.
+appimage_arch=$(uname -m)
+case "$appimage_arch" in
+    x86_64)
+        linuxdeploy_sha256=c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
+        appimagetool_sha256=46fdd785094c7f6e545b61afcfb0f3d98d8eab243f644b4b17698c01d06083d1
+        ;;
+    aarch64)
+        # Computed by hand against the actual release assets the same way the
+        # x86_64 pair above was, not copied from anywhere that publishes them:
+        # linuxdeploy/linuxdeploy releases/download/1-alpha-20251107-1/linuxdeploy-aarch64.AppImage
+        # and AppImage/appimagetool releases/download/1.9.0/appimagetool-aarch64.AppImage,
+        # fetched and hashed on 2026-09-23. Bump alongside the x86_64 sums if
+        # either tool's pinned version ever changes.
+        linuxdeploy_sha256=620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff
+        appimagetool_sha256=04f45ea45b5aa07bb2b071aed9dbf7a5185d3953b11b47358c1311f11ea94a96
+        ;;
+    *)
+        echo "error: no pinned linuxdeploy/appimagetool build for architecture '$appimage_arch'" >&2
+        exit 1
+        ;;
+esac
+
 fetch_pinned() {
     # A fixed release and its own sha256, computed by hand against the file
     # this pins and checked in here rather than trusted from a remote
@@ -128,13 +159,13 @@ fetch_pinned() {
 }
 
 fetch_pinned \
-    https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage \
-    c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d \
-    "$tools_dir/linuxdeploy-x86_64.AppImage"
+    "https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-${appimage_arch}.AppImage" \
+    "$linuxdeploy_sha256" \
+    "$tools_dir/linuxdeploy-${appimage_arch}.AppImage"
 fetch_pinned \
-    https://github.com/AppImage/appimagetool/releases/download/1.9.0/appimagetool-x86_64.AppImage \
-    46fdd785094c7f6e545b61afcfb0f3d98d8eab243f644b4b17698c01d06083d1 \
-    "$tools_dir/appimagetool-x86_64.AppImage"
+    "https://github.com/AppImage/appimagetool/releases/download/1.9.0/appimagetool-${appimage_arch}.AppImage" \
+    "$appimagetool_sha256" \
+    "$tools_dir/appimagetool-${appimage_arch}.AppImage"
 
 # Both tools are themselves AppImages, and this normally needs FUSE to mount.
 # A container has none, so this extracts and runs instead -- the same
@@ -303,7 +334,12 @@ webkit_pkg_files() {
         dpkg-query -L libwebkitgtk-6.0-4
     fi
 }
-webkit_libexec=$(webkit_pkg_files | grep -E '/(libexec|lib64|lib/x86_64-linux-gnu)/webkitgtk-6.0$' | head -1)
+# `[a-z0-9_]+-linux-gnu` rather than the literal `x86_64-linux-gnu`: this is
+# Debian's multiarch triplet, which names the *build host's* architecture
+# (aarch64-linux-gnu on the arm64 runner), not Cordial's own -- the pattern
+# generalises to whichever container this actually runs in rather than
+# assuming the one it was first measured against.
+webkit_libexec=$(webkit_pkg_files | grep -E '/(libexec|lib64|lib/[a-z0-9_]+-linux-gnu)/webkitgtk-6.0$' | head -1)
 webkit_bundle=$(webkit_pkg_files | grep -m1 '/webkitgtk-6.0/injected-bundle$' || true)
 deploy_args=(--executable "$appdir/usr/bin/cordial-shell" --executable "$appdir/usr/bin/cordial-run")
 if [ -n "$webkit_libexec" ] && [ -d "$webkit_libexec" ]; then
@@ -361,7 +397,7 @@ for tool in bwrap xdg-dbus-proxy; do
     deploy_args+=(--executable "$tool_path")
 done
 
-"$tools_dir/linuxdeploy-x86_64.AppImage" \
+"$tools_dir/linuxdeploy-${appimage_arch}.AppImage" \
     --appdir "$appdir" \
     "${deploy_args[@]}" \
     --desktop-file "$appdir/io.github.luohoa97.Cordial.desktop" \
@@ -473,7 +509,20 @@ echo "==> completing the dependency closure linuxdeploy's excludelist dropped"
 # The second is the graphics stack: nothing renders without a matching driver
 # underneath, and bundling a driver-adjacent library ties the AppImage to
 # whatever GPU stack happened to be in the build container.
-never_bundle_libs="libEGL.so.1 libGLX.so.0 libGL.so.1 libOpenGL.so.0 libGLdispatch.so.0 libgbm.so.1 libdrm.so.2 libGLESv2.so.2 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 libresolv.so.2 libutil.so.1 libnsl.so.1 libanl.so.1 libcrypt.so.1 ld-linux-x86-64.so.2 libstdc++.so.6 libgcc_s.so.1"
+# The dynamic linker's own soname is not spelled the same way on every
+# architecture -- glibc's aarch64 loader is `ld-linux-aarch64.so.1`, not the
+# x86_64 `ld-linux-x86-64.so.2` -- so this is read off the interpreter this
+# container's own compiler actually produced rather than assumed. `readelf -p
+# .interp` on either of the two binaries just linked answers that directly,
+# with no case statement mapping `uname -m` onto a loader name that could
+# itself go stale on a third architecture.
+ld_linux=$(readelf -p .interp "$appdir/usr/bin/cordial-shell" 2>/dev/null \
+    | grep -oE 'ld-linux[a-zA-Z0-9._-]*\.so\.[0-9]+' | head -1)
+if [ -z "$ld_linux" ]; then
+    echo "error: could not read the ELF interpreter out of cordial-shell's .interp section" >&2
+    exit 1
+fi
+never_bundle_libs="libEGL.so.1 libGLX.so.0 libGL.so.1 libOpenGL.so.0 libGLdispatch.so.0 libgbm.so.1 libdrm.so.2 libGLESv2.so.2 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 libresolv.so.2 libutil.so.1 libnsl.so.1 libanl.so.1 libcrypt.so.1 $ld_linux libstdc++.so.6 libgcc_s.so.1"
 is_never_bundled() {
     local name="$1" g
     for g in $never_bundle_libs; do
@@ -580,9 +629,9 @@ FLOOREOF
 fi
 
 echo "==> appimagetool"
-outfile="$outdir/Cordial-${CORDIAL_DESCRIBE}-x86_64.AppImage"
+outfile="$outdir/Cordial-${CORDIAL_DESCRIBE}-${appimage_arch}.AppImage"
 mkdir -p "$outdir"
-ARCH=x86_64 "$tools_dir/appimagetool-x86_64.AppImage" "$appdir" "$outfile"
+ARCH="$appimage_arch" "$tools_dir/appimagetool-${appimage_arch}.AppImage" "$appdir" "$outfile"
 
 chmod +x "$outfile"
 ls -lh "$outfile"

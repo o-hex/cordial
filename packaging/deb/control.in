@@ -1,6 +1,7 @@
 # Template for the DEBIAN/control file inside the staged package root.
-# packaging/deb/build-deb.sh fills in @VERSION@ and writes the result; this
-# file is not itself valid control syntax and is not installed anywhere.
+# packaging/deb/build-deb.sh fills in @VERSION@ and @ARCH@ and writes the
+# result; this file is not itself valid control syntax and is not installed
+# anywhere.
 #
 # One stanza, not a source-package Source:/Build-Depends: pair, because this
 # is built by dpkg-deb directly rather than by dpkg-buildpackage -- see
@@ -10,7 +11,12 @@ Package: cordial
 Version: @VERSION@
 Section: games
 Priority: optional
-Architecture: amd64
+# Filled in from `dpkg --print-architecture`, not hardcoded -- this used to
+# say `amd64` unconditionally, which was correct until a build on an aarch64
+# runner produced a package that claimed to be amd64 and would have installed
+# on the wrong architecture's dpkg without complaint (or, more likely,
+# refused with a foreign-architecture error that named the wrong problem).
+Architecture: @ARCH@
 Maintainer: luohoa97 <luohoa97@users.noreply.github.com>
 Homepage: https://github.com/luohoa97/cordial
 # Hand-translated from the same soname list packaging/rpm/cordial.spec's
@@ -45,11 +51,12 @@ Depends: libgtk-4-1, libadwaita-1-0, libwebkitgtk-6.0-4,
 # done yet; see docs/NEXT.md.
 Recommends: sober
 Description: run Roblox's official Android build natively on Linux
- Cordial loads Roblox's official Android x86-64 libroblox.so natively: a
- ported AOSP bionic linker, a bionic/glibc shim, libjnivm in place of
- Android's ART, and a framework layer that answers the calls the client
- makes into the platform. There is no emulator, no container and no virtual
- machine.
+ Cordial loads Roblox's official Android libroblox.so natively, for whichever
+ architecture this package was built for (x86-64 or aarch64): a ported AOSP
+ bionic linker, a bionic/glibc shim, libjnivm in place of Android's ART, and a
+ framework layer that answers the calls the client makes into the platform.
+ There is no emulator, no container and no virtual machine, and no CPU
+ translation -- it can only load a Roblox build for its own architecture.
  .
  CORDIAL SHIPS NO ROBLOX BUILD. On first run it offers to fetch one and
  installs it only if Roblox's own signing certificate signed it. Roblox

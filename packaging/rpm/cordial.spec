@@ -61,10 +61,17 @@ URL:            https://github.com/luohoa97/cordial
 Source0:        %{archivename}.tar.zst
 Source1:        %{archivename}-vendor.tar.zst
 
-# x86-64 only, and this is architectural rather than an untested-elsewhere
-# caveat: the engine is Roblox's Android **x86-64** build, executed natively
-# with no CPU translation. See docs/multiarch.md.
-ExclusiveArch:  x86_64
+# x86-64 or aarch64, and nothing else -- this is architectural rather than an
+# untested-elsewhere caveat: the engine is Roblox's own Android build, executed
+# natively with no CPU translation, so the only machines this can run on are
+# ones Roblox itself ships a matching arm64-v8a or x86_64 library for. See
+# docs/multiarch.md, which as of the aarch64 port has confirmed the code path
+# is architecture-generic but has NOT independently confirmed ADR-001's
+# read-only-engine-text guarantee against an arm64-v8a libroblox.so, nor
+# checked behaviour on a 16K-page-size ARM64 host (Asahi, some SBCs) -- read
+# that document before treating an aarch64 %{name} as equivalent to the x86-64
+# one in anything but "it builds and loads".
+ExclusiveArch:  x86_64 aarch64
 
 BuildRequires:  cargo-rpm-macros >= 24
 BuildRequires:  cargo
@@ -133,13 +140,28 @@ Requires:       hicolor-icon-theme
 # A suggestion rather than a dependency, because a user-supplied APK does just
 # as well and neither one comes from this package. Sober is a Flatpak and has
 # no RPM, so this cannot be a Recommends that resolves.
-%global sober_hint ~/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/
+#
+# Sober's directory segment is named after the Android ABI (this package's
+# %{_arch} is rpm's own name for it, not Android's -- "aarch64" against
+# "arm64-v8a" -- so it is spelled out here rather than reused). Only checked
+# against a real Sober install on x86_64; the aarch64 spelling is INFERRED
+# from that naming pattern, the same caveat `cordial_update::provider::local`
+# carries for the same reason.
+%ifarch x86_64
+%global sober_abi x86_64
+%endif
+%ifarch aarch64
+%global sober_abi arm64-v8a
+%endif
+%global sober_hint ~/.var/app/org.vinegarhq.Sober/data/sober/packages/%{sober_abi}/com.roblox.client/
 
 %description
-Cordial loads Roblox's official Android x86-64 libroblox.so natively on Linux:
-a ported AOSP bionic linker, a bionic/glibc shim, libjnivm in place of Android's
+Cordial loads Roblox's official Android libroblox.so natively on Linux, for
+whichever architecture this package was built for (x86-64 or aarch64): a
+ported AOSP bionic linker, a bionic/glibc shim, libjnivm in place of Android's
 ART, and a framework layer that answers the calls the client makes into the
-platform. There is no emulation and no CPU translation.
+platform. There is no emulation and no CPU translation -- this package can
+only load a Roblox build for its own architecture.
 
 CORDIAL SHIPS NO ROBLOX BUILD. On first run it offers to fetch one and installs
 it only if Roblox's own signing certificate signed it. Roblox publishes no

@@ -357,7 +357,22 @@ const EPOLLHUP: u32 = 0x010;
 const EPOLL_CTL_ADD: c_int = 1;
 const EPOLL_CTL_DEL: c_int = 2;
 
-#[repr(C, packed)]
+/// glibc's `struct epoll_event` is packed on x86_64 and nowhere else --
+/// `bits/epoll.h` `#define`s `__EPOLL_PACKED` to `__attribute__((packed))`
+/// there and leaves it undefined (so `sys/epoll.h`'s own `#ifndef` gives it
+/// an empty expansion) on every other architecture, aarch64 included.
+/// Confirmed by reading both headers directly rather than assuming: x86_64's
+/// `bits/epoll.h` has the `#define`, aarch64's does not. An unconditionally
+/// packed Rust definition made every event the kernel wrote land 4 bytes
+/// short of where this code read it back on aarch64 (12-byte packed layout
+/// assumed, 16-byte natural layout actual, `data` at offset 4 instead of 8)
+/// -- silently: the size and field order still matched, only the stride and
+/// offset were wrong, so `epoll_wait` returned success and every event
+/// decoded from garbage. That is what `a_readable_fd_is_reported_with_its_ident`
+/// and the two wake tests were catching, and it means the same was true of a
+/// real ARM64 client, not just the tests.
+#[cfg_attr(target_arch = "x86_64", repr(C, packed))]
+#[cfg_attr(not(target_arch = "x86_64"), repr(C))]
 #[derive(Clone, Copy)]
 struct EpollEvent {
     events: u32,
@@ -1907,6 +1922,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn epoll_event_matches_glibcs_own_layout_for_this_architecture() {
+        // 12 bytes packed on x86_64 (bits/epoll.h defines __EPOLL_PACKED to
+        // __attribute__((packed))); 16 bytes naturally aligned everywhere
+        // else, aarch64 included (that header leaves __EPOLL_PACKED
+        // undefined there, so sys/epoll.h's own #ifndef gives it an empty
+        // expansion). Getting this wrong does not fail to compile or to
+        // link -- it reads every event at the wrong offset and stride, which
+        // is what silently broke this looper on aarch64 before this test
+        // existed.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(std::mem::size_of::<EpollEvent>(), 12);
+        #[cfg(not(target_arch = "x86_64"))]
+        assert_eq!(std::mem::size_of::<EpollEvent>(), 16);
+    }
 
     #[test]
     fn an_infinite_poll_returns_instead_of_blocking_forever() {

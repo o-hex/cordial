@@ -149,13 +149,21 @@ install -Dm644 third_party/mocktail-webview/LICENSE "$docdir/mocktail-webview-Ap
 install -Dm644 packaging/deb/copyright "$docdir/copyright"
 
 mkdir -p "$root/DEBIAN"
+# `dpkg --print-architecture` reads the *building* dpkg's own configured
+# architecture, which on this container is whatever the runner actually is --
+# amd64 on an x86_64 runner, arm64 on an aarch64 one -- so this needs no
+# uname-based guessing and no case statement mapping Rust's target_arch names
+# onto Debian's (which disagree: aarch64 is "arm64" here, not "aarch64").
+debarch=$(dpkg --print-architecture)
+echo "==> debian architecture: $debarch"
+
 # `control.in` is a template with a comment header explaining itself, and
 # **a Debian control file has no comment syntax at all** -- dpkg-deb reads a
 # leading `#` as a malformed field and stops with "parsing file ... near line
 # 0", which names the line it could not read rather than the one at fault.
 # That is exactly how this failed in CI on 2026-08-27. Strip the comments and
 # any blank lines they leave in front of the first real field.
-sed -e "s/@VERSION@/${debversion}/" -e "/^#/d" packaging/deb/control.in \
+sed -e "s/@VERSION@/${debversion}/" -e "s/@ARCH@/${debarch}/" -e "/^#/d" packaging/deb/control.in \
   | sed -e "/./,$ !d" > "$root/DEBIAN/control"
 # A control file that begins with anything but a field is not worth handing to
 # dpkg-deb, whose error would again name the wrong line.
@@ -180,7 +188,7 @@ fi
 install -m755 packaging/deb/postinst "$root/DEBIAN/postinst"
 
 mkdir -p "$outdir"
-out="$outdir/cordial_${debversion}_amd64.deb"
+out="$outdir/cordial_${debversion}_${debarch}.deb"
 dpkg-deb --build --root-owner-group "$root" "$out"
 
 echo

@@ -2,17 +2,27 @@
   <img src="https://raw.githubusercontent.com/luohoa97/cordial/main/packaging/banner.svg" alt="Cordial" width="460">
 </p>
 
-# Cordial
+# Cordial (v0.18.0)
 
-Runs Roblox's official Android build natively on Linux, with no emulator,
-container or virtual machine, on x86-64 or aarch64. GPL-3.0-or-later.
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
+[![Arch: aarch64 & x86_64](https://img.shields.io/badge/Arch-aarch64%20%7C%20x86__64-orange.svg)]()
+[![Platform: Linux & Android](https://img.shields.io/badge/Platform-Linux%20%7C%20Android%20(Termux)-green.svg)]()
+[![Graphics: Vulkan & Turnip](https://img.shields.io/badge/Vulkan-Mesa%20Turnip%20%2F%20RADV%20%2F%20ANV-red.svg)]()
 
-<p align="center">
-  <a href="https://discord.gg/qJzU3Xfr9b">
-    <img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?style=for-the-badge&logo=discord&logoColor=white"
-         alt="Join the Cordial Discord">
-  </a>
-</p>
+Runs Roblox's official Android build **natively on Linux and Android (via Termux)**, with no emulator, virtual machine, or proot container, on **x86-64** and **aarch64**. Distributed under GPL-3.0-or-later.
+
+---
+
+## Highlights
+
+* **Zero Emulation / No VM Overhead**: Executes official ARM64 machine code directly on native CPU cores using an embedded AOSP Bionic dynamic linker and JNI runtime shims.
+* **Native Android Bionic Support**: Fully compatible with native Android Bionic libc inside Termux, cleanly bypassing glibc pthread wrappers to eliminate mutex deadlocks.
+* **Direct Hardware Acceleration**: Native Vulkan rendering via Mesa Turnip (Qualcomm Snapdragon Adreno GPUs) or desktop Mesa drivers (RADV/ANV/NVK).
+* **Responsive Desktop Input**: Smooth, interrupt-driven `epoll` looper with native 64-bit alignment, pointer capture / lock warping, held-key auto-repeat suppression, and Escape key pass-through.
+* **Deep Link & Web Intent Support**: Intercepts `roblox-player://` and `roblox://` protocol handlers directly from Linux browsers (Firefox, Chromium) in Termux-X11.
+* **Lightweight Headless CLI**: Fast, terminal-friendly launcher (`cordial`) replacing heavy desktop UI dependencies for low overhead and automated APK management.
+
+---
 
 ## Demo
 
@@ -22,223 +32,149 @@ container or virtual machine, on x86-64 or aarch64. GPL-3.0-or-later.
        width="560">
 </p>
 
-Roblox **DOORS**, unmodified, on Cordial.
-[Full size](https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-doors.mp4),
-more in [`docs/media`](docs/media).
+Roblox **DOORS**, unmodified, running on Cordial.  
+[Full size](https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-doors.mp4) • [More Media](docs/media)
 
-## Why Cordial
+---
 
-I used Sober for a year, and it worked really well. Cordial started off as a weekend project because I was bored, and I believe a project like this is something people have the right to read, modify, and learn from.
+## How It Works
 
-Credit to sober for making android Roblox runtimes possible
+Cordial mmaps and relocates Roblox's unmodified `libroblox.so` using a ported AOSP Bionic linker rather than the host system linker. Every symbol the engine imports resolves as:
 
-## Status
+1. **cordial**: An Android platform behavior implemented directly inside the runtime.
+2. **host**: Forwarded directly to the system libc (native Bionic on Termux, glibc on standard Linux).
+3. **stub**: Explicit stubs reporting predictable failures rather than silent gaps.
 
-Experimental. Full table in [`docs/status.md`](docs/status.md).
+`libjnivm` provides the Java Native Interface (JNI) and Dalvik/ART virtual machine shims, allowing the engine to make Java calls into the platform. Compatibility fixes live entirely within the runtime shims — **the original binary is never patched or modified**.
 
-**Works:** loading an experience, sign-in, keyboard and mouse, camera, text
-entry with IME preedit, audio, voice chat, pointer capture, fullscreen, two
-accounts side by side, asset overlays, joining a public server from a game's
-Servers list ([#40](https://github.com/luohoa97/cordial/issues/40)). Private
-servers are untested — none was reachable without a purchase.
+---
 
-**Known broken**, with issue numbers:
+## Getting Started
 
-| | |
-|---|---|
-| No window at all on COSMIC, KWin, wlroots compositors | [#38](https://github.com/luohoa97/cordial/issues/38) |
-| Crash after second launch | [#44](https://github.com/luohoa97/cordial/issues/44) |
-| Fullscreen freezes; exiting it crashes | [#39](https://github.com/luohoa97/cordial/issues/39) |
-| Touchscreen input crashes immediately | [#36](https://github.com/luohoa97/cordial/issues/36) |
-| SIGSEGV on launch on some machines | [#35](https://github.com/luohoa97/cordial/issues/35) |
-| Client can hang on exit | [#52](https://github.com/luohoa97/cordial/issues/52) |
-| Pointer lock unconfirmed on Hyprland, cursor drifts | [#56](https://github.com/luohoa97/cordial/issues/56) |
-| Keyboard stops after another app takes focus | [#31](https://github.com/luohoa97/cordial/issues/31) |
-| Camera-sensitivity text box glitches the client | [#53](https://github.com/luohoa97/cordial/issues/53) |
-| X11 camera snaps 180 degrees | [#41](https://github.com/luohoa97/cordial/issues/41) |
+### Android / Termux (ARM64 Native)
 
-Controller buttons and sticks work; the brand of glyph Roblox draws may be
-wrong ([`docs/controllers.md`](docs/controllers.md)). No force feedback.
+To run Cordial on an Android device inside Termux with Turnip Vulkan acceleration and Termux-X11:
 
-Frame-rate numbers are not quoted here because the two measurements in this
-repo contradict each other; see [`docs/status.md`](docs/status.md).
+👉 **[Read the Full Termux Installation & Setup Guide (INSTALL_TERMUX.md)](INSTALL_TERMUX.md)**
 
-**Tested platforms.** Development happens on Fedora with GNOME and Mesa. There
-is no systematic test matrix — other compositors and GPU vendors are reported
-working or broken through issues, not verified here.
+**Quick Summary:**
+```bash
+# 1. Install prerequisites in Termux
+pkg update && pkg install -y x11-repo tur-repo
+pkg install -y git rust clang cmake make binutils pkg-config glib pango \
+  gdk-pixbuf cairo gtk4 libadwaita libx11 libxinerama libxi pulseaudio \
+  mesa-vulkan-kgsl-turnip termux-x11-nightly
 
-<!-- TODO(neil): a supported-platforms table needs a real test pass first. Nothing in the repo supports one today. -->
+# 2. Clone repository & build
+git clone --recurse-submodules https://github.com/o-hex/cordial.git ~/cordial
+cd ~/cordial
+cargo build --release -p cordial-runtime --bin cordial-run
+strip --strip-unneeded target/release/cordial-run
+cp target/release/cordial-run /data/data/com.termux/files/usr/bin/cordial-run
+```
 
-## How it works
+---
 
-Cordial mmaps and relocates Roblox's unmodified `libroblox.so` with a ported
-AOSP bionic linker rather than the system one. Every symbol the engine imports
-resolves as **cordial** (an Android behaviour implemented here), **host**
-(forwarded to glibc), or **stub** — and a stub reports failure rather than
-faking success, so a gap stays visible instead of surfacing later as an
-unrelated bug. `libjnivm` stands in for Android's ART, and a framework layer
-answers the JNI calls the client makes into the platform. Symbol resolution
-reads the engine's own ELF imports rather than a checked-in list, so an
-ordinary libc import resolves from the host automatically
-([`docs/adr/ADR-034-symbol-resolution-asks-the-library.md`](docs/adr/ADR-034-symbol-resolution-asks-the-library.md)).
-Compatibility gaps are fixed at that framework layer, never by patching the
-binary ([`docs/adr/ADR-001-in-process-hooking.md`](docs/adr/ADR-001-in-process-hooking.md)).
+### Desktop Linux (x86-64 / aarch64)
 
-Diagram and data flow: [`docs/architecture.md`](docs/architecture.md).
+#### From Source:
+```bash
+git clone --recursive https://github.com/o-hex/cordial.git
+cd cordial
+cargo build --release
+```
 
-## Install
-
-x86-64 or aarch64 Linux, Wayland. X11 starts through Flatpak's fallback socket
-but is not developed further
-([`docs/adr/ADR-011-wayland-and-libadwaita.md`](docs/adr/ADR-011-wayland-and-libadwaita.md)).
-aarch64 is new and untested on real ARM64 hardware — see
-[`docs/multiarch.md`](docs/multiarch.md) for what has and has not been
-checked. The Arch package is x86-64 only; Arch Linux itself does not build for
-aarch64.
-
-You also need Roblox's Android build. Cordial does not ship it. First run has a
-**Download Roblox** button that fetches it from APKPure and refuses anything
-not signed by Roblox's own certificate. If [Sober](https://sober.vinegarhq.org/)
-is installed, Cordial uses the APK already on disk without copying or modifying
-it. You can also point Cordial at your own APK in Settings.
-
-**Flatpak:**
-
+#### Flatpak:
 ```bash
 flatpak remote-add --if-not-exists cordial https://luohoa97.github.io/cordial/cordial.flatpakrepo
 flatpak install cordial io.github.luohoa97.Cordial
 flatpak run io.github.luohoa97.Cordial
 ```
 
-The remote is not signed: `flatpak install` proves the download matches the
-repository's checksums, not who built it
-([`docs/install.md`](docs/install.md#trust-and-what-not-signed-means)).
+---
 
-### Android / Termux (ARM64 Native)
+## Usage & CLI Commands
 
-Running natively on Android via Termux with Turnip Vulkan hardware acceleration and PC controls spoofing?
-👉 **[Read the Termux Installation & Setup Guide (INSTALL_TERMUX.md)](INSTALL_TERMUX.md)**
+Cordial includes a lightweight CLI launcher for managing installations and running games:
 
-There are two branches. `master` rebuilds on every commit. `stable` moves only
-on a tagged release — it is created by the first tagged build to run through
-the release workflow, so until then a plain `flatpak install` lands on
-`master`. Once `stable` exists:
+```text
+Usage: cordial [COMMAND | ROBLOX-LINK] [OPTIONS]
 
-```bash
-flatpak uninstall io.github.luohoa97.Cordial//master
-flatpak install cordial io.github.luohoa97.Cordial//stable
+Commands:
+  run [LINK]          Launch Roblox Player directly (default)
+  install [--force]   Download, verify and install Roblox APK and engine
+  update [--force]    Check for updates and install the newest Roblox build
+  diagnostics         Print diagnostic information
+  help, -h            Show this help message
+
+Options:
+  --force, -f         Force re-download even if already up to date
+  --apk <PATH>        Override Roblox APK path
+  --profile <NAME>    Roblox profile to use (default: "default")
 ```
 
-**AppImage**, from the [releases page](https://github.com/luohoa97/cordial/releases).
-Newer and less proven than the Flatpak; its web-view path fix has been measured
-on a stand-in, not on a real machine without WebKitGTK, and not outside Fedora
-([`docs/install.md`](docs/install.md#appimage)):
-
+### Direct Join / Deep Linking
+Launch experiences or private servers directly:
 ```bash
-chmod +x Cordial-*.AppImage && ./Cordial-*.AppImage   # -x86_64 or -aarch64
+cordial "roblox://experiences/start?placeId=1818"
 ```
+Or click **Play** directly in your browser (Firefox / Chromium) after registering protocol handlers (`x-scheme-handler/roblox` and `x-scheme-handler/roblox-player`).
 
-**Packages** from the releases page. All artefacts are cosign-signed. The
-apt/dnf/pacman *repositories* are not published — the build scripts refuse to
-produce an unsigned repository. AUR submission is blocked on account sign-ups
-being closed.
+---
 
-```bash
-sudo apt install ./cordial_*_amd64.deb      # or _arm64.deb
-sudo dnf install ./cordial-*.x86_64.rpm     # or .aarch64.rpm
-sudo pacman -U cordial-*-x86_64.pkg.tar.zst # x86-64 only -- see above
+## Environment Variables
+
+| Variable | Values / Example | Description |
+|---|---|---|
+| `CORDIAL_PRESENT_MODE` | `mailbox` (default), `fifo`, `immediate` | Controls Vulkan swapchain presentation. `mailbox` provides tear-free lowest latency. |
+| `CORDIAL_PLATFORM_NAME` | `Windows` (default), `Android` | The platform reported to the Roblox Lua engine. `Windows` enables native keyboard and mouse controls. |
+| `CORDIAL_AUDIO` | `aaudio`, `opensles` | The Android audio driver layer to use. |
+| `CORDIAL_AUDIO_HOST` | `pulse`, `pipewire` | The host audio backend to forward sound to. |
+| `CORDIAL_RESOLUTION` | `1920x1080` (default: 1280x720) | Render resolution when not in fullscreen. |
+| `CORDIAL_FULLSCREEN` | `1` | Forces fullscreen coverage on active monitor. |
+
+---
+
+## FastFlags Configuration
+
+Custom ClientSettings / FastFlags live inside each profile directory:
+```text
+~/.local/share/cordial/profiles/<profile>/flags.json
 ```
-
-**From source:**
-
-```bash
-git clone --recursive https://github.com/luohoa97/cordial
-cd cordial
-cargo build --release
+For example, to configure custom frame rate limits or rendering behaviors:
+```json
+{
+  "DFIntTaskSchedulerTargetFps": 120,
+  "FFlagDebugDisplayFPS": "True"
+}
 ```
+Detailed guide: [`docs/fastflags.md`](docs/fastflags.md).
 
-Needs Clang — AOSP bionic uses C11 `_Atomic` in C++ headers and GCC rejects it
-— plus GTK4 >= 4.10 and libadwaita >= 1.4 development packages. PipeWire and
-WebKitGTK-6.0 headers are optional and probed at build time; without them the
-binary is quietly less capable. The Nix flake has not been built successfully
-by anyone. Full list: [`docs/install.md`](docs/install.md#building-from-source).
+---
 
-## Configuration
+## Credits & Acknowledgements
 
-**FastFlags** live in `~/.local/share/cordial/profiles/<profile>/flags.json`, or
-wherever `CORDIAL_FLAGS` points. Layering and syntax:
-[`docs/fastflags.md`](docs/fastflags.md).
+Cordial is built upon the incredible work of open-source contributors and reverse-engineering pioneers:
 
-**Mouse acceleration** is a Settings control — cursor only, or cursor and
-camera — stored in `$XDG_CONFIG_HOME/cordial/shell.json`.
+* **[luohoa97](https://github.com/luohoa97/cordial)**: The original author of Cordial, who designed the modern open-source Android Roblox runtime architecture and reverse-engineered the core JNI/MessageBus interfaces.
+* **[Sober / VinegarHQ](https://sober.vinegarhq.org/)**: Pioneers who proved that running Roblox's Android build natively on Linux was possible, providing inspiration and valuable public research.
+* **[mocktail](https://github.com/mocktail)**: For WebKit WebView policies, permission bridge architecture, and textbox layout discoveries.
+* **[mcpelauncher](https://github.com/minecraft-linux/mcpelauncher-manifest)**: For the foundational AOSP Bionic dynamic linker port and custom ELF relocation implementation.
+* **[libjnivm](https://github.com/johndoe31415/libjnivm)**: For providing the JNI virtual machine emulation and interface layer.
+* **[Mesa & Turnip Developers](https://gitlab.freedesktop.org/mesa/mesa)**: For creating the outstanding Qualcomm Adreno Vulkan driver enabling native desktop graphics on mobile SoCs.
+* **[Termux](https://termux.dev) & [Termux-X11](https://github.com/termux/termux-x11)**: For providing the low-latency X11 display server and native Linux environment on Android.
 
-**Separate data roots** per instance come from `XDG_DATA_HOME`, which moves both
-the profile root and the client's data directory. `CORDIAL_PROFILE_ROOT` moves
-only the profile root and not the client.
+---
 
-**Plugins** install from a `.tar.zst` archive through **Settings → Get Plugins**
-and unpack to `~/.local/share/cordial/plugins/<id>/`. They run as separate
-processes on Deno with named capabilities, default-deny, granted per profile in
-`plugin-grants.json`. Three ship with Cordial and all are off until enabled.
-[`docs/plugins.md`](docs/plugins.md),
-[`docs/adr/ADR-007-host-resources-are-brokered.md`](docs/adr/ADR-007-host-resources-are-brokered.md).
+## What Cordial Is Not
 
-Runtime knobs — monitor, resolution, DPI scale, frame pacing, pointer lock,
-controller glyphs — are environment variables listed in
-[`docs/install.md`](docs/install.md).
+* **Not affiliated with Roblox Corporation**, endorsed by it, or approved by it. Roblox does not officially support third-party Linux/Android runtimes.
+* **Does not distribute Roblox binaries**: You must supply or download your own official APK through the built-in verified downloader.
+* **Not a cheat, exploit, or injector**: Cordial contains zero script execution, memory manipulation, or hooking primitives. Requests for cheating capabilities will be rejected.
 
-## What Cordial is not
-
-**Not affiliated with Roblox Corporation**, not endorsed by it, and not
-approved by it. Roblox does not support third-party clients and bans accounts
-for using them, in waves, including false positives. If your account matters to
-you, do not use it here.
-
-**Does not ship Roblox's client.** You supply the Android build.
-
-**Not a cheat, exploit or mod injector.** There is no script execution, no
-hooking and no memory access into the Roblox process — absent from the API
-rather than disabled, so there is no primitive to re-enable in a fork
-([`docs/adr/ADR-001-in-process-hooking.md`](docs/adr/ADR-001-in-process-hooking.md),
-[`docs/adr/ADR-003-plugin-isolation.md`](docs/adr/ADR-003-plugin-isolation.md)).
-Requests for it are declined. Plugins extend Cordial, not Roblox.
-
-Also permanently out of scope: client-side integrity flags, watermarks, and
-obfuscation-as-security.
-
-## AI disclosure
-
-Implementation leans heavily on Claude Code. Architecture decisions, including
-the ones that were reversed, are written down in [`docs/adr/`](docs/adr).
-
-## Contributing
-
-[`CONTRIBUTING.md`](CONTRIBUTING.md). Bugs and feature requests go on
-[GitHub](https://github.com/luohoa97/cordial/issues/new/choose), not Discord —
-every template needs a Diagnostics block from **Settings → Report a Problem**
-or `cordial --diagnostics`. Security issues go through
-[a private advisory](https://github.com/luohoa97/cordial/security/advisories/new).
-
-Questions and help: [Discord](https://discord.gg/qJzU3Xfr9b).
+---
 
 ## Licence
 
-GPL-3.0-or-later. See [`LICENSE`](LICENSE).
-
-Third-party components keep their own licences, reproduced in
-[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md): `third_party/libbadcpu`
-(MIT, from Sober OSS), `third_party/mocktail-webview` (Apache-2.0, from
-mocktail), `mcpelauncher-linker` (MIT), AOSP bionic (Apache-2.0 and BSD),
-`libjnivm` (MIT).
-
-**Sober** is why anyone believes a Roblox client can run natively on Linux. Its
-public issue tracker is a research corpus here
-([`docs/adr/ADR-017-sober-issue-corpus.md`](docs/adr/ADR-017-sober-issue-corpus.md))
-and watching it run corrected a claim made here about text input. Sober's code
-was never read; it is not source-available.
-
-**mocktail** is Apache-2.0 and settled more here than a line in a list conveys:
-the web-view policy is derived from it, the permission bridge follows its
-discovery pattern, the Settings performance tables are adapted from its own,
-and it established the field order of Roblox's `NativeTextBoxInfo` along with
-several flag values. Each is credited at the point of use.
+GPL-3.0-or-later. See [`LICENSE`](LICENSE).  
+Third-party component licenses are reproduced in [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).

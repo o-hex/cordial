@@ -1735,6 +1735,55 @@ one with changing geometry (one box, animating). Raw data:
 `$SCRATCHPAD/cordial-logs/stage6_results.json`,
 `$SCRATCHPAD/textbox.md`'s Stage 6 section.
 
+**2026-09-24: the exact next step above was run, on a different box, and came
+back clean -- the bug is not "any fresh process's first TextBox focus."**
+Nested sway (`GDK_BACKEND=wayland`, held keyboard/pointer devices, matching
+`tools/text-input-e2e.py`'s own setup), `CORDIAL_TRACE_TEXT=1`, polling
+`textbox` continuously through the whole first focus rather than stopping at
+the first non-empty reading. On the sign-in form's username field -- reached
+signed-out, on a throwaway profile that had never focused any TextBox before
+-- the first-ever focus and a second focus after a blur are **identical**:
+same handle (`140057368699008`), same geometry (`x=470 y=295.00003 w=340
+h=22`) both times, one `glViewTextBoxFocused() connect` per click, no second
+connect. This rules out a generic "first read in a fresh process is cold"
+mechanism outright: if that were the cause, this box would show it too, and
+it does not.
+
+That leaves the search-bar-then-modal pattern (Home only) as the standing
+explanation for the double connect, but it could not be tested this session:
+a throwaway signed-out profile reaches **Landing**, not **Home** -- this
+project's own established distinction -- and Landing has no bar-that-opens-
+a-modal field. The Create Account form's Birthday field looked like a
+candidate (a bar with a calendar icon, plausibly opening a picker) and was
+tried; it never calls `showKeyboard` at all (`focus` stayed `none` the whole
+poll window), so whatever widget draws it is not a `TextBox` and it answers
+nothing about this bug. Reaching Home needs a signed-in profile, `CordialTest`
+was off limits for this session (in use elsewhere), and no other profile on
+this machine was this session's to sign into -- the same shape of stop
+`docs/NEXT.md`'s 2026-08-30 "text isn't centred" entry above already
+recorded once. **Not fixed, for the same reason as before: the evidence
+needed to choose between "one box settling" and "two boxes" still points at
+Home specifically, and this session could not reach Home.** Whoever can
+should repeat exactly this test (continuous `textbox` polling,
+`CORDIAL_TRACE_TEXT=1`, watch `glViewTextBoxFocused`/`handle=` at each of the
+two connects) on the Home search bar, which is the one place the double
+connect has actually been observed.
+
+Two small, independent, verified fixes came out of this session's setup work
+and are committed on their own: `tools/text-input-e2e.py` hardcoded
+`target/release/cordial-run` with no override, which does not exist on a host
+that builds in the toolbox container (`CORDIAL_E2E_BINARY` now overrides it,
+same pattern as `CORDIAL_APK`/`CORDIAL_LIB_DIR`); and it hardcoded
+`~/.local/share/cordial` for the devctl socket, ignoring `XDG_DATA_HOME`
+entirely, so a throwaway-profile run -- exactly what AGENTS.md tells an agent
+to use -- connected to nothing (`ConnectionRefusedError`) while the client's
+real socket sat under the redirected directory. Both are now respected. The
+suite's full 14-assertion run still needs a signed-in profile to reach Home
+at all (`focus_box` clicks Home's search bar), so it was not run end to end
+this session for the same reason above; the two fixed code paths were each
+exercised and confirmed working individually (the sign-in-field measurement
+above used both).
+
 ## The one rule
 
 **Grep the capture before disassembling anything.**

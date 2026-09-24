@@ -248,7 +248,12 @@ def main():
 
     os.makedirs(OUT, exist_ok=True)
     log_path = os.path.join(OUT, "client.log")
-    binary = os.path.join(ROOT, "target/release/cordial-run")
+    # Overridable for the same reason CORDIAL_APK/CORDIAL_LIB_DIR already are:
+    # AGENTS.md's build split means a host that builds in the toolbox
+    # container has no `target/release` at all, and building bare cargo into
+    # one to satisfy this default would be the two-CARGO_TARGET_DIRs mistake
+    # that file warns about, not a fix.
+    binary = os.environ.get("CORDIAL_E2E_BINARY", os.path.join(ROOT, "target/release/cordial-run"))
     apk = os.environ.get(
         "CORDIAL_APK",
         os.path.expanduser("~/.var/app/org.vinegarhq.Sober/data/sober/packages/"
@@ -325,8 +330,15 @@ def main():
         # Ready is not laid out, and nothing in the log marks that.
         time.sleep(14)
 
-        dev = Devctl(os.path.expanduser(
-            f"~/.local/share/cordial/profiles/{args.profile}/devctl.sock"))
+        # XDG_DATA_HOME-aware: AGENTS.md tells agents to redirect it so a
+        # throwaway run does not collide with someone else's `default`
+        # profile, and a hardcoded `~/.local/share` here would silently watch
+        # the wrong socket (or none) for exactly the run that most needs
+        # isolation -- confirmed the hard way, `ConnectionRefusedError`
+        # against the real home directory while the client's actual socket
+        # sat under the redirected one.
+        data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        dev = Devctl(os.path.join(data_home, "cordial", "profiles", args.profile, "devctl.sock"))
         print(f"== {dev.send('info')}")
 
         # **Is this client actually running?** About a third of launches hit the

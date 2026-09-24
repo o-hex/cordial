@@ -235,10 +235,17 @@ jobs:
       # nothing; adding fetch-tags finds `v0.16.0`, and the extra fetch is
       # small -- tag refs only, no extra commit history -- so fetch-depth
       # stays at its default of 1 rather than growing to 0.
+      #
+      # **Except on a tag push, where fetch-tags breaks the checkout itself**:
+      # v0.18.0's tag run failed both builds with "Cannot fetch both <sha> and
+      # refs/tags/v0.18.0 to refs/tags/v0.18.0", because checkout already
+      # fetches the triggering tag and fetch-tags asks for it a second time.
+      # On a tag run the tag is present without it, so the step below still
+      # finds it; only a push to main needs the extra tag fetch.
       - uses: actions/checkout@v4
         with:
           submodules: false
-          fetch-tags: true
+          fetch-tags: ${{ github.ref_type != 'tag' }}
 
       # The one value every arch-specific literal in this file now reads
       # instead of spelling `x86_64` out -- see the header comment for why

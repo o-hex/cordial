@@ -4548,6 +4548,27 @@ fn main() -> ExitCode {
                                                     println!("  {n} plugin(s) running");
                                                 }
 
+                                                // ADR-038's hot-swap
+                                                // reconciler: notices a
+                                                // plugin installed, removed,
+                                                // updated, enabled, disabled
+                                                // or granted something new in
+                                                // this profile while this
+                                                // client keeps running, and
+                                                // starts, stops or restarts
+                                                // exactly that plugin through
+                                                // the same `spawn_one`
+                                                // `start_all` just used.
+                                                // Started unconditionally,
+                                                // after `start_all` rather
+                                                // than before it, so its
+                                                // first tick's "what is
+                                                // running" snapshot already
+                                                // matches what `start_all`
+                                                // just spawned instead of
+                                                // racing it.
+                                                cordial_runtime::plugin_host::start_reconciler();
+
                                                 // ADR-026's core bus, from the
                                                 // client rather than from a
                                                 // plugin. Until this line

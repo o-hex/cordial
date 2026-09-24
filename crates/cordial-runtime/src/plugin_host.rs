@@ -29,7 +29,7 @@ use cordial_plugins::broker::Broker;
 use cordial_plugins::capability::Capability;
 use cordial_plugins::core_events::{self, CoreEvent};
 use cordial_plugins::events::EventRegistry;
-use cordial_plugins::host::{authorise, Delivered, Plugin as PluginProc, Pump, Writer};
+use cordial_plugins::host::{authorise, kill_process_group, Delivered, Plugin as PluginProc, Pump, Writer};
 use cordial_plugins::presence::{DiscordPresence, PresencePayload};
 use cordial_plugins::protocol::{Push, Request, Response};
 use cordial_plugins::preferences;
@@ -57,6 +57,30 @@ struct Listener {
     granted: BTreeSet<Capability>,
 }
 
+/// What the hot-swap reconciler (ADR-038) needs to know about a plugin that
+/// is currently running, kept separate from [`Listener`] because the two
+/// exist for unrelated readers: `Listener` is `publish_core`'s address book,
+/// consulted from whichever client thread just observed something worth
+/// telling plugins about. This is `reconcile_tick`'s own bookkeeping,
+/// consulted once a second from a thread that otherwise touches nothing else
+/// here, and mixing the two would mean every future change to one has to
+/// reason about whether it also disturbs the other.
+struct RunningPlugin {
+    /// The process's own pid, not the sandbox's -- `bwrap`, when present, is
+    /// an ancestor of this pid rather than the pid itself, and
+    /// `host::kill_process_group` signals the *group* it leads regardless.
+    /// See `PluginProc::pid`'s own doc for why a bare pid rather than a
+    /// handle: this plugin's `PluginProc` is owned by the thread serving it,
+    /// not by anything the reconciler can reach.
+    pid: u32,
+    /// What `desired_state` would have to compute again to notice this
+    /// plugin unchanged. Always the *raw* grants-file entry, never the
+    /// intersected set a restart may have actually handed the broker -- see
+    /// `cordial_plugins::reconcile::Desired::snapshot` for why recording the
+    /// narrower set here would read as a permanent, spurious `Regrant`.
+    snapshot: cordial_plugins::reconcile::Snapshot,
+}
+
 /// State shared by every plugin's serving thread within one Cordial run.
 ///
 /// Fresh every launch, the same as `Broker` always is — nothing here persists
@@ -76,6 +100,40 @@ struct Shared {
     /// event goes through a `Pump` so the client never waits. See
     /// [`publish_core`] for why that distinction is the whole point.
     listeners: Arc<Mutex<BTreeMap<String, Listener>>>,
+    /// The reconciler's own view of what is running -- see [`RunningPlugin`].
+    /// A plugin started by `spawn_one` is inserted here at the same moment it
+    /// joins `writers` and `listeners`; `serve`'s cleanup tail removes it at
+    /// the same moment it removes the other two, so all three maps agree on
+    /// "is this plugin running" for exactly as long as it actually is.
+    running: Arc<Mutex<BTreeMap<String, RunningPlugin>>>,
+    /// Ids `stop_one` has signalled but not yet seen leave `running`.
+    ///
+    /// **Why this exists, found live rather than reasoned out in advance.**
+    /// The first version of this reconciler had no such set: `stop_one` sent
+    /// `SIGKILL` to the process group and waited up to two seconds, and if
+    /// teardown had not finished by then it gave up and returned, trusting
+    /// the *next* tick's fresh `diff` to notice the plugin was still in
+    /// `running` and try again. On a host under real memory pressure -- the
+    /// exact live verification this ADR records -- two seconds was not
+    /// always enough, and there was no next attempt: as soon as the plugin
+    /// was re-enabled (this project's own verification toggled it back on
+    /// within the same second), `desired_state` matched the still-present,
+    /// still-unremoved `running` entry byte for byte, `diff` read that as
+    /// "nothing changed", and the kill that never finished was never
+    /// retried. The plugin's process was mid-death and its bookkeeping said
+    /// it was fine.
+    ///
+    /// An id in this set is excluded from *both* sides of the next `diff`
+    /// entirely -- not "unchanged", which is what produced the bug, and not
+    /// eligible for a fresh `Start` either, because a plugin whose kill has
+    /// not been confirmed is not safely re-startable: two processes
+    /// answering to the same id would violate the one-process-per-plugin
+    /// invariant every other part of this module assumes. `reconcile_tick`
+    /// re-sends `SIGKILL` to anything still in this set on every tick before
+    /// it looks at `desired_state` at all -- cheap and idempotent, since
+    /// signalling an already-dead process group costs one syscall and
+    /// changes nothing.
+    stopping: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl Shared {
@@ -84,6 +142,8 @@ impl Shared {
             events: Arc::new(Mutex::new(EventRegistry::new())),
             writers: Arc::new(Mutex::new(BTreeMap::new())),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
+            running: Arc::new(Mutex::new(BTreeMap::new())),
+            stopping: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 }
@@ -242,109 +302,186 @@ pub fn start_all() -> usize {
             continue;
         }
 
-        let entry = match plugin.entry_path() {
-            Ok(e) => e,
-            Err(e) => {
-                println!("  plugin {id}: {e}");
-                let _ = cordial_plugins::health::record(&health_path, &id, &e.to_string());
-                continue;
-            }
-        };
         // **Unpacked plugins reload as they are edited; installed ones do
         // not.** An installed plugin does not change under a running client,
         // so watching one is a thread doing nothing; an unpacked one is by
         // definition the thing somebody is working on. Deno's own `--watch`
-        // does the reloading -- see `sandbox::command`.
+        // does the reloading -- see `sandbox::command`. It is also why an
+        // unpacked plugin is invisible to the hot-swap reconciler below:
+        // `reconcile::desired_state` never returns one, so this flag is the
+        // one thing `spawn_one` cannot recompute from `plugin` alone and has
+        // to be told.
         let unpacked = manifest::unpacked_dirs().iter().any(|d| *d == plugin.dir);
-        match PluginProc::spawn_with(&id, &entry, unpacked) {
-            Ok(mut proc) => {
-                // The handshake, before the plugin has asked for anything, so
-                // that reading its own configuration — the first thing most
-                // plugins do — costs no round trip. Best effort: a plugin that
-                // died on startup is reported by its stdout closing, not here.
-                let _ = proc.push(&settings::init_push(
-                    Some(&store),
-                    &plugin.manifest.preferences,
-                    &id,
-                    &granted,
-                ));
-
-                // Registered before the process is handed to its own thread:
-                // another plugin's `events.publish` has to be able to find
-                // this writer immediately, not only once this thread gets
-                // around to inserting it, which would be a race against
-                // whichever plugin started first getting to publish first.
-                shared.writers.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), proc.writer());
-
-                // The core bus's end of the same plugin, registered at the
-                // same moment and for the same reason: a `client.launch`
-                // published the instant `start_all` returns must find this
-                // plugin, not race the thread that is about to serve it.
-                //
-                // A `Pump` rather than the `Writer` above -- see
-                // `publish_core`. Its own thread does the blocking write, so
-                // the client thread that published never touches this pipe.
-                shared.listeners.lock().unwrap_or_else(|e| e.into_inner()).insert(
-                    id.clone(),
-                    Listener { pump: Arc::new(Pump::start(proc.writer())), granted: granted.clone() },
-                );
-
-                let mut broker = Broker::new();
-                broker.grant(&id, granted);
-                let store = store.clone();
-                let shared = shared.clone();
-                let plugin_dir = plugin.dir.clone();
-                let declared = plugin.manifest.preferences.clone();
-                let grants_path = grants_path.clone();
-                std::thread::Builder::new()
-                    .name(format!("plugin:{id}"))
-                    .spawn(move || serve(proc, broker, store, shared, plugin_dir, declared, grants_path))
-                    .ok();
-                started += 1;
-                println!("  plugin {id}: started");
-                // **Clearing matters as much as recording.** A warning left
-                // behind after the thing is fixed teaches people to ignore
-                // warnings, which costs more than the one it was pointing at.
-                // Writes nothing when there was nothing to clear.
-                let _ = cordial_plugins::health::clear(&health_path, &id);
-            }
-            Err(e) => {
-                // **Name Deno, because that is nearly always what this is.**
-                // The comment here used to say "No such file or directory"
-                // meant Deno was missing and then printed the bare errno
-                // anyway, so the message a user got named no file and read as
-                // a Cordial bug. It is worse than that: no packaging format
-                // Cordial ships installs Deno -- not the deb, the rpm, either
-                // AUR package, the AppImage or the Flatpak -- so on a normal
-                // install this is not an edge case, it is what happens to
-                // everybody. It went unnoticed because the machine this was
-                // written on has Deno from Homebrew.
-                let missing = e.kind() == std::io::ErrorKind::NotFound;
-                let detail = if missing {
-                    // Inside the Flatpak there is no route to a host package
-                    // manager or to https://deno.com's installer -- the
-                    // sandbox has no host filesystem access at all -- so the
-                    // native install advice is not something a Flatpak user
-                    // can act on. Settings already has a "Deno is not
-                    // installed" row with a Download button for exactly this
-                    // case (see `settings.rs`'s "Plugin runtime" group), so
-                    // point there instead.
-                    if cordial_plugins::sandbox::in_flatpak() {
-                        "Deno is not installed; plugins are Deno programs (ADR-008). Open Settings \u{2192} Plugins and use Download to fetch it, then restart Cordial."
-                            .to_string()
-                    } else {
-                        "Deno is not installed; plugins are Deno programs (ADR-008). Install your distribution's `deno` package, or from https://deno.com, then restart Cordial."
-                            .to_string()
-                    }
-                } else {
-                    format!("could not start: {e}")
-                };
-                println!("  plugin {id}: {detail}");
-                let _ = cordial_plugins::health::record(&health_path, &id, &detail);
-            }
+        if spawn_one(&plugin, granted.clone(), granted, unpacked, &grants_path, &health_path, &store, &shared) {
+            started += 1;
         }
     }
     started
+}
+
+/// Bring one plugin up: resolve its entry module, spawn it, run the
+/// handshake, register it in every map [`Shared`] holds, and start the
+/// thread that serves it. Returns whether it started.
+///
+/// **The one supervisor a fresh launch and a hot swap both use.** `start_all`
+/// calls this once per plugin it decided to run; `reconcile_tick` calls it
+/// for exactly the ids [`cordial_plugins::reconcile::diff`] says need
+/// starting or restarting. A second, parallel spawn path for the reconciler
+/// would mean the two could drift on what "started" means -- which maps get
+/// updated, in which order, what the handshake carries -- and the failure
+/// mode of that drift is a plugin that behaves differently depending on
+/// which of two nearly-identical code paths happened to bring it up, which
+/// is exactly the kind of thing nobody notices until a bug report describes
+/// behaviour that "only happens sometimes".
+///
+/// Everything about *deciding* to call this -- is it enabled, does it have
+/// code, does it hold a capability, does its grant need intersecting against
+/// a fresh manifest -- is the caller's job. This function's only opinion is
+/// how to start something once that decision has already been made.
+///
+/// `effective_granted` is what the broker enforces for the process this call
+/// spawns. `tracked_granted` is what `RunningPlugin::snapshot` remembers for
+/// the next `reconcile_tick`'s comparison against `desired_state`'s raw
+/// grants-file read. They are the same value for `start_all` and for the
+/// reconciler bringing up a plugin that was not running at all; they differ
+/// only when a hot-swap restart hands the broker `intersect_for_restart`'s
+/// narrower set while still wanting the bookkeeping to reflect what the
+/// profile actually granted -- see [`RunningPlugin`]'s doc for why the
+/// narrower set would misfire on every tick after if it were recorded
+/// instead.
+#[allow(clippy::too_many_arguments)]
+fn spawn_one(
+    plugin: &manifest::Plugin,
+    effective_granted: BTreeSet<Capability>,
+    tracked_granted: BTreeSet<Capability>,
+    unpacked: bool,
+    grants_path: &Path,
+    health_path: &Path,
+    store: &Store,
+    shared: &Shared,
+) -> bool {
+    let id = plugin.manifest.id.clone();
+    let entry = match plugin.entry_path() {
+        Ok(e) => e,
+        Err(e) => {
+            println!("  plugin {id}: {e}");
+            let _ = cordial_plugins::health::record(health_path, &id, &e.to_string());
+            return false;
+        }
+    };
+    match PluginProc::spawn_with(&id, &entry, unpacked) {
+        Ok(mut proc) => {
+            // Captured before `proc` moves into the serving thread below --
+            // see `RunningPlugin::pid` for why the reconciler needs a bare
+            // pid rather than a handle on `proc` itself.
+            let pid = proc.pid();
+
+            // The handshake, before the plugin has asked for anything, so
+            // that reading its own configuration — the first thing most
+            // plugins do — costs no round trip. Best effort: a plugin that
+            // died on startup is reported by its stdout closing, not here.
+            let _ = proc.push(&settings::init_push(
+                Some(store),
+                &plugin.manifest.preferences,
+                &id,
+                &effective_granted,
+            ));
+
+            // Registered before the process is handed to its own thread:
+            // another plugin's `events.publish` has to be able to find
+            // this writer immediately, not only once this thread gets
+            // around to inserting it, which would be a race against
+            // whichever plugin started first getting to publish first.
+            shared.writers.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), proc.writer());
+
+            // The core bus's end of the same plugin, registered at the
+            // same moment and for the same reason: a `client.launch`
+            // published the instant `start_all` returns must find this
+            // plugin, not race the thread that is about to serve it.
+            //
+            // A `Pump` rather than the `Writer` above -- see
+            // `publish_core`. Its own thread does the blocking write, so
+            // the client thread that published never touches this pipe.
+            shared.listeners.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                id.clone(),
+                Listener {
+                    pump: Arc::new(Pump::start(proc.writer())),
+                    granted: effective_granted.clone(),
+                },
+            );
+
+            // The reconciler's own record. `fingerprint_of` reads the same
+            // two small files `desired_state` already read to decide this
+            // plugin was worth starting; a third read a moment later is the
+            // price of `spawn_one` not being handed a `Desired` directly --
+            // `start_all` has no such value, only a bare `manifest::Plugin`.
+            shared.running.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                id.clone(),
+                RunningPlugin {
+                    pid,
+                    snapshot: cordial_plugins::reconcile::Snapshot {
+                        fingerprint: cordial_plugins::reconcile::fingerprint_of(plugin),
+                        granted: tracked_granted,
+                        version: plugin.manifest.version.clone(),
+                    },
+                },
+            );
+
+            let mut broker = Broker::new();
+            broker.grant(&id, effective_granted);
+            let store = store.clone();
+            let shared = shared.clone();
+            let plugin_dir = plugin.dir.clone();
+            let declared = plugin.manifest.preferences.clone();
+            let grants_path = grants_path.to_path_buf();
+            std::thread::Builder::new()
+                .name(format!("plugin:{id}"))
+                .spawn(move || serve(proc, broker, store, shared, plugin_dir, declared, grants_path))
+                .ok();
+            println!("  plugin {id}: started");
+            // **Clearing matters as much as recording.** A warning left
+            // behind after the thing is fixed teaches people to ignore
+            // warnings, which costs more than the one it was pointing at.
+            // Writes nothing when there was nothing to clear.
+            let _ = cordial_plugins::health::clear(health_path, &id);
+            true
+        }
+        Err(e) => {
+            // **Name Deno, because that is nearly always what this is.**
+            // The comment here used to say "No such file or directory"
+            // meant Deno was missing and then printed the bare errno
+            // anyway, so the message a user got named no file and read as
+            // a Cordial bug. It is worse than that: no packaging format
+            // Cordial ships installs Deno -- not the deb, the rpm, either
+            // AUR package, the AppImage or the Flatpak -- so on a normal
+            // install this is not an edge case, it is what happens to
+            // everybody. It went unnoticed because the machine this was
+            // written on has Deno from Homebrew.
+            let missing = e.kind() == std::io::ErrorKind::NotFound;
+            let detail = if missing {
+                // Inside the Flatpak there is no route to a host package
+                // manager or to https://deno.com's installer -- the
+                // sandbox has no host filesystem access at all -- so the
+                // native install advice is not something a Flatpak user
+                // can act on. Settings already has a "Deno is not
+                // installed" row with a Download button for exactly this
+                // case (see `settings.rs`'s "Plugin runtime" group), so
+                // point there instead.
+                if cordial_plugins::sandbox::in_flatpak() {
+                    "Deno is not installed; plugins are Deno programs (ADR-008). Open Settings \u{2192} Plugins and use Download to fetch it, then restart Cordial."
+                        .to_string()
+                } else {
+                    "Deno is not installed; plugins are Deno programs (ADR-008). Install your distribution's `deno` package, or from https://deno.com, then restart Cordial."
+                        .to_string()
+                }
+            } else {
+                format!("could not start: {e}")
+            };
+            println!("  plugin {id}: {detail}");
+            let _ = cordial_plugins::health::record(health_path, &id, &detail);
+            false
+        }
+    }
 }
 
 /// Register every enabled plugin's own `overlay/` directory with the asset
@@ -405,6 +542,227 @@ pub fn register_static_overlays() -> usize {
 /// process spawning to do it.
 fn enabled_in_profile(profile_dir: &std::path::Path, id: &str) -> bool {
     enablement::is_enabled(profile_dir, id)
+}
+
+/// Start the hot-swap reconciler (ADR-038): a thread that notices when a
+/// plugin was installed, removed, updated, enabled, disabled or granted
+/// something new in this profile, and starts, stops or restarts exactly that
+/// plugin so a running client matches what a fresh launch would.
+///
+/// Always started, whether or not `start_all` found anything to run --
+/// installing the *first* plugin while Cordial is already open has to be
+/// noticed too, and a thread that mostly sleeps costs nothing worth guarding
+/// behind a flag most users would never think to set. `CORDIAL_PLUGIN_RECONCILE=0`
+/// exists anyway, for the same reason `CORDIAL_DEV_CONTROL` is opt-out-able
+/// rather than assumed safe: a developer chasing something else entirely
+/// should be able to rule this out as the cause without reading its source
+/// first.
+pub fn start_reconciler() {
+    if std::env::var("CORDIAL_PLUGIN_RECONCILE").as_deref() == Ok("0") {
+        println!("  plugins: hot-swap reconciler disabled (CORDIAL_PLUGIN_RECONCILE=0)");
+        return;
+    }
+    // A poll, not `inotify`. `refresh_grant` above already established the
+    // house pattern for "did this change under a running plugin" -- an
+    // `mtime` check cheap enough to make on every request -- and this is
+    // the same idea widened to a fixed interval instead of "whenever a
+    // request happens to arrive", because unlike a grant change, a plugin
+    // appearing, disappearing or being disabled has no in-flight request to
+    // piggyback the check on. A dedicated interval env var rather than
+    // reusing anything millisecond-shaped that already existed, so a test
+    // can run this loop hundreds of times a second without also speeding up
+    // something unrelated.
+    let interval_ms: u64 = std::env::var("CORDIAL_PLUGIN_RECONCILE_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let system_root = manifest::system_plugin_root();
+    let user_root = manifest::plugin_root();
+    let profile = crate::profile::active();
+    let grants_path = grants::path_in(&profile);
+    let health_path = cordial_plugins::health::path_in(&profile);
+    let store = Store::new(&profile);
+    let shared = shared().clone();
+    std::thread::Builder::new()
+        .name("plugin-reconcile".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            reconcile_tick(&system_root, &user_root, &profile, &grants_path, &health_path, &store, &shared);
+        })
+        .ok();
+}
+
+/// One pass: compare what is running against what this profile now wants,
+/// and start, stop or restart exactly the ids that differ.
+///
+/// Retries any kill a previous tick issued but has not yet seen finish, and
+/// excludes those ids from this tick's `diff` entirely before doing anything
+/// else -- see [`Shared::stopping`]'s doc for the bug a first version of this
+/// function shipped without that guard, found live rather than reasoned out
+/// in advance.
+fn reconcile_tick(
+    system_root: &Path,
+    user_root: &Path,
+    profile: &Path,
+    grants_path: &Path,
+    health_path: &Path,
+    store: &Store,
+    shared: &Shared,
+) {
+    // Cheap and idempotent: a process group that already died answers with
+    // ESRCH, which `kill_process_group` already swallows, and a process
+    // group still dying just gets signalled again -- SIGKILL cannot be
+    // caught, so a second one changes nothing about a kill already in
+    // flight, only shortens the wait for one that had not landed yet.
+    {
+        let running = shared.running.lock().unwrap_or_else(|e| e.into_inner());
+        let stopping = shared.stopping.lock().unwrap_or_else(|e| e.into_inner());
+        for id in stopping.iter() {
+            if let Some(r) = running.get(id) {
+                kill_process_group(r.pid);
+            }
+        }
+    }
+
+    let mut desired = cordial_plugins::reconcile::desired_state(system_root, user_root, profile);
+    let mut previous: BTreeMap<String, cordial_plugins::reconcile::Snapshot> = shared
+        .running
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(id, running)| (id.clone(), running.snapshot.clone()))
+        .collect();
+    // Frozen out of both sides of the diff, not left to compare as
+    // "unchanged" -- an id whose kill has not been confirmed is not safely
+    // re-startable (two processes could end up answering to the same id) and
+    // must not be read as matching `desired_state` just because nothing on
+    // disk has moved since it was asked to stop. It re-enters ordinary
+    // diffing the moment `serve`'s cleanup tail actually removes it from
+    // `shared.running`, which also clears it from `shared.stopping`.
+    let busy = shared.stopping.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if !busy.is_empty() {
+        previous.retain(|id, _| !busy.contains(id));
+        desired.retain(|id, _| !busy.contains(id));
+    }
+
+    for (id, change) in cordial_plugins::reconcile::diff(&previous, &desired) {
+        match change {
+            cordial_plugins::reconcile::Change::Start => {
+                let Some(want) = desired.get(&id) else { continue };
+                println!("  plugin {id}: now wanted (installed, enabled or granted while running), starting");
+                spawn_one(
+                    &want.plugin,
+                    want.granted.clone(),
+                    want.granted.clone(),
+                    false,
+                    grants_path,
+                    health_path,
+                    store,
+                    shared,
+                );
+            }
+            cordial_plugins::reconcile::Change::Stop => {
+                stop_one(&id, shared, "no longer wanted (removed, disabled, or nothing left granted)");
+            }
+            cordial_plugins::reconcile::Change::Restart { from_version, to_version } => {
+                let Some(want) = desired.get(&id) else { continue };
+                let reason = match (&from_version, &to_version) {
+                    (Some(from), Some(to)) if from != to => format!("updated {from} \u{2192} {to}"),
+                    _ => "updated (content changed)".to_string(),
+                };
+                if !stop_one(&id, shared, &reason) {
+                    // Its own teardown has not finished inside the wait
+                    // `stop_one` gives it -- see that function's doc. Spawning
+                    // the replacement anyway would race the old process's
+                    // cleanup for the maps `spawn_one` is about to write into,
+                    // so this tick leaves it and the next one tries again;
+                    // `desired`'s fingerprint has not moved, so the next tick
+                    // sees the same `Restart` and is not fooled into thinking
+                    // nothing changed.
+                    continue;
+                }
+                // ADR-038's safety rule, and the one place in this whole
+                // module it applies: a plugin whose files just changed gets
+                // only what its *new* manifest actually requests, never the
+                // full raw grant a stale request list would otherwise still
+                // read as approved. `want.granted` (used for `Start`, and for
+                // `tracked_granted` below) stays the raw grants-file entry on
+                // purpose -- see `intersect_for_restart`'s own doc.
+                let effective = cordial_plugins::reconcile::intersect_for_restart(
+                    &want.granted,
+                    &want.plugin.requested,
+                );
+                if effective.is_empty() {
+                    // Matches `start_all`'s own invariant, continuously: a
+                    // plugin holding nothing does not run. The profile's
+                    // grant did not change, only the manifest asking less of
+                    // it than before -- so this is not a `Stop` from the
+                    // user's point of view, and the next line says so rather
+                    // than reporting a silent success.
+                    println!(
+                        "  plugin {id}: updated, but its new manifest requests nothing this \
+                         profile already granted; not restarting"
+                    );
+                    continue;
+                }
+                spawn_one(&want.plugin, effective, want.granted.clone(), false, grants_path, health_path, store, shared);
+            }
+            cordial_plugins::reconcile::Change::Regrant => {
+                // No action: `refresh_grant` already carries this plugin's
+                // own next request to the fresh grant it will find on its
+                // own `mtime` check. Logged so the change is visible even if
+                // the plugin is idle for a while, without pretending this
+                // reconciler did anything to cause it.
+                println!("  plugin {id}: capability grant changed; already in effect for its next call");
+            }
+        }
+    }
+}
+
+/// Kill `id`'s process group and wait briefly for its serving thread to
+/// finish the same teardown any other exit runs -- see `serve`'s tail.
+/// Returns whether that teardown was observed to finish within the wait.
+///
+/// **A `false` here is not a failure, only a "not yet".** `id` is added to
+/// [`Shared::stopping`] before the kill is sent and stays there when the
+/// wait times out, so the next `reconcile_tick` retries the signal and keeps
+/// `id` out of its diff entirely until `serve`'s cleanup tail actually
+/// removes it -- see that field's doc for why a version of this function
+/// that simply gave up after one try was wrong, measured live rather than
+/// reasoned out in advance.
+///
+/// **Waiting here at all, rather than returning the moment the signal is
+/// sent, still matters for a restart.** The common case is a serving
+/// thread's cleanup running within milliseconds of its blocking
+/// `next_request` read seeing the killed process's stdout close, and a
+/// restart that can confirm that inside this one call spawns the
+/// replacement in the same tick it stopped the original, rather than
+/// waiting a full extra `reconcile_tick` interval for no reason. The bound
+/// is short because the retry above is what actually guarantees forward
+/// progress now; this wait is a latency optimisation for the ordinary case,
+/// not the mechanism correctness depends on.
+fn stop_one(id: &str, shared: &Shared, why: &str) -> bool {
+    let pid = shared.running.lock().unwrap_or_else(|e| e.into_inner()).get(id).map(|r| r.pid);
+    let Some(pid) = pid else {
+        // Already gone -- another tick, or the plugin exiting on its own,
+        // got there first. Nothing to signal and nothing to wait for, and
+        // nothing to leave behind in `stopping` either.
+        shared.stopping.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        return true;
+    };
+    println!("  plugin {id}: {why}, stopping");
+    shared.stopping.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string());
+    kill_process_group(pid);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if !shared.running.lock().unwrap_or_else(|e| e.into_inner()).contains_key(id) {
+            // `serve`'s own tail already cleared `stopping` for us.
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    println!("  plugin {id}: still tearing down after 2s; retrying next tick");
+    false
 }
 
 fn serve(
@@ -482,6 +840,21 @@ fn serve(
     // count it as a recipient. Dropping the `Pump` closes its channel, which
     // is what ends that thread.
     shared.listeners.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    // And the reconciler's own record, so `reconcile_tick` stops seeing this
+    // id as running the moment its ordinary teardown has actually finished
+    // -- see `stop_one`, which waits on exactly this removal before treating
+    // a stop as complete and, for a restart, before spawning the
+    // replacement. Removing it here rather than in `stop_one` itself is what
+    // keeps this a *normal* shutdown: a plugin that exits on its own, or
+    // dies, or sends something unreadable, leaves the same way as one the
+    // reconciler killed, through this one tail rather than a second one only
+    // the hot-swap path runs.
+    shared.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    // And any outstanding-kill marker `stop_one` left -- this plugin is
+    // provably gone now, whatever put it here. A plugin that exits or
+    // crashes on its own without ever having been asked to stop was never in
+    // this set, and removing an absent id from a `BTreeSet` is a no-op.
+    shared.stopping.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     crate::android::asset::unregister_plugin_root(&id);
     proc.kill();
 }

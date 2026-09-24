@@ -580,6 +580,14 @@ impl HostWindow {
             let toolbar_for_fs = host.toolbar.clone();
             host.window.connect_fullscreened_notify(move |w| {
                 toolbar_for_fs.set_reveal_top_bars(title_bar.revealed(w.is_fullscreen()));
+                // Leaving fullscreen left the bar missing until the app menu
+                // was opened and closed. The reveal alone need not reach the
+                // compositor: GSK can judge a fullscreen-transition frame
+                // undamaged and skip the commit, the same failure f56e466 hit
+                // for the canvas. Queue a redraw from idle, once the notify has
+                // returned, so the revealed bar is actually presented.
+                let w = w.clone();
+                glib::idle_add_local_once(move || w.queue_draw());
             });
         }
         host.window.add_css_class("cordial-engine-host");

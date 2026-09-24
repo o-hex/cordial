@@ -554,6 +554,9 @@ mod tests {
             loaded_by: loaded_by.map(Into::into),
             bytes: 118_732_400,
             complete,
+            // No fixture here has a real engine on disk to hash; `None` is
+            // exactly what `ensure_content_hash` reports for the same reason.
+            content_hash: None,
         }
     }
 

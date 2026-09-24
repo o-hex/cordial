@@ -1292,6 +1292,18 @@ fn install_webview_presenter() {
     // and says so on every one -- which is the state the maintainer was
     // looking at when Join navigated instead of joining.
     cordial_shell::webview::set_bridge_sink(cordial_runtime::webview::forward_bridge_message);
+
+    // The close counterpart: `cordial_runtime::webview::on_close_window`
+    // cannot touch `cordial_shell`'s `AdwDialog` directly (see that crate's
+    // dependency direction, noted beside `set_bridge_sink` above), so this
+    // hands it a closure that can. Re-enters the GTK thread for the same
+    // reason the presenter itself does -- `close-window` can arrive on
+    // whichever thread the engine published from, same as `openWindow`.
+    cordial_runtime::webview::set_close_handler(|| {
+        gtk4::glib::MainContext::default().invoke(|| {
+            cordial_shell::webview::close_current();
+        });
+    });
     println!("  webview: presenter installed; an openWindow request will now be attached to the host window");
 
     // Said here, at startup, rather than left for the first `openWindow` to
@@ -1360,6 +1372,16 @@ fn install_webview_presenter() {
             Ok(()) => println!("  webview: openWindow handed to the browser"),
             Err(e) => println!("  webview: openWindow could not be opened: {e}"),
         }
+    });
+    // There is no dialog for a `closeWindow` message to close -- `openWindow`
+    // went to the user's own browser, a tab this process has no handle to and
+    // no business closing. Said plainly rather than left silent, the same
+    // reason the presenter above prints instead of just opening.
+    cordial_runtime::webview::set_close_handler(|| {
+        println!(
+            "  webview: closeWindow arrived, but this build has no in-app window to close -- \
+             openWindow already went to your browser"
+        );
     });
 }
 

@@ -485,6 +485,64 @@ pub fn set_presenter(f: impl Fn(OpenWindowRequest) + Send + Sync + 'static) {
     }
 }
 
+/// The presenter's close counterpart: what actually makes the currently open
+/// window go away when something other than a click on it decided it should.
+/// Installed once, from `load.rs`, the same shape and for the same reason as
+/// [`set_presenter`] -- this module knows the engine's message bus, and
+/// nothing here can safely touch a `gtk4`/`libadwaita` object, which is why
+/// closing goes through a callback into `cordial_shell::webview::
+/// close_current` rather than this module reaching for one directly.
+type CloseHandler = dyn Fn() + Send + Sync;
+static CLOSE_HANDLER: OnceLock<std::sync::Arc<CloseHandler>> = OnceLock::new();
+
+/// Install the handler [`on_close_window`] calls once the engine has actually
+/// published on `close-window`'s bus id. Only the first call takes effect,
+/// the same discipline [`set_presenter`] holds itself to, for the same
+/// reason: two handlers racing to close (or fail to close) the same window is
+/// a bug worth seeing, not one that resolves itself.
+pub fn set_close_handler(f: impl Fn() + Send + Sync + 'static) {
+    if CLOSE_HANDLER.set(std::sync::Arc::new(f)).is_err() {
+        println!("  webview: set_close_handler called twice; keeping the first handler installed");
+    }
+}
+
+/// The sink `cordial_messagebus_subscribe` calls when the engine publishes on
+/// `close-window`'s bus id -- `getCloseWindowId`, read but never subscribed
+/// to before this change. `STRING_GETTERS`'s own comment grouped it with
+/// `getOpenWindowId` and `getMutateWindowId` as one of three parallel
+/// host-facing commands and left it untried.
+///
+/// **Measured, not still open: the engine does not publish on this for a
+/// join.** Live on 2026-09-24, this subscription resolved cleanly (`arm()`'s
+/// log shows `subscribed to WebView.closeWindow`), and a real signed-in join
+/// from the Servers list -- a public Brookhaven server, clicked, the
+/// `RequestGameJob` bridge payload arriving and `Game.launch` publishing
+/// correctly, the game visibly running behind the still-open dialog in a
+/// `grim` capture -- never once reached this callback. That is why the web
+/// window staying open is fixed in [`route_as_hybrid_launch`] instead, by
+/// closing once a join is actually published, rather than here. This
+/// subscription is kept rather than removed: `close-window` may still be
+/// what the engine uses for a window it opened and wants closed for some
+/// other reason (a completed sign-in, a finished purchase) that this session
+/// had no signed-out account or spare Robux to exercise, and answering it
+/// costs nothing if it never fires.
+///
+/// The payload is not parsed -- [`report_window_closed`]'s own doc gives the
+/// reason a close message has nothing worth reading out of it (no window
+/// identifier exists in this protocol's vocabulary, and Cordial never has
+/// more than one window open), and the same reasoning applies to the message
+/// arriving in this direction.
+extern "C" fn on_close_window(_json: *const c_char) {
+    println!("[webview] closeWindow message arrived from the engine; closing the open web window");
+    match CLOSE_HANDLER.get() {
+        Some(close) => close(),
+        None => println!(
+            "[webview] no close handler installed (arm() ran before install_webview_presenter, \
+             or the `webview` feature is off); the window the engine asked to close will stay open"
+        ),
+    }
+}
+
 /// Synthesise the one message nobody could produce by clicking: drive the
 /// installed presenter directly with `url`, bypassing the engine, the message
 /// bus and `parse_open_window` entirely.
@@ -807,6 +865,64 @@ pub fn arm(mut symbol: impl FnMut(&str) -> Option<*mut c_void>) {
         ),
     }
 
+    // The other host-facing command in the same trio as `openWindow`: the
+    // engine asking Cordial to close a window it opened. Best-effort and
+    // deliberately not a reason to bail the rest of `arm` out -- a build
+    // missing `getCloseWindowId`, or one where this particular subscribe
+    // fails, still leaves `openWindow` working, which matters more.
+    match get("close-window") {
+        Some(close_window_id) => {
+            // SAFETY: `get_message_id` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            match unsafe {
+                cordial_linker_sys::game_activity::call_static_two_strings_ret_string(
+                    get_message_id,
+                    BUS,
+                    &protocol,
+                    &close_window_id,
+                )
+            } {
+                Ok(close_window_bus_id) => match CString::new(close_window_bus_id.clone()) {
+                    Ok(id) => {
+                        let mut err = vec![0u8; 512];
+                        // SAFETY: `do_subscribe_raw` resolved under its own name above, and used the same way as the `openWindow` subscription; every buffer outlives the call.
+                        let rc = unsafe {
+                            cordial_messagebus_subscribe(
+                                do_subscribe_raw,
+                                id.as_ptr(),
+                                Some(on_close_window),
+                                err.as_mut_ptr() as *mut c_char,
+                                err.len(),
+                            )
+                        };
+                        if rc == 0 {
+                            println!(
+                                "  webview: subscribed to {close_window_bus_id} \
+                                 ({protocol}.{close_window_id}); a closeWindow message will now \
+                                 close the open window"
+                            );
+                        } else {
+                            println!(
+                                "  webview: subscribing to {close_window_bus_id} failed: {}",
+                                take_err(err)
+                            );
+                        }
+                    }
+                    Err(_) => println!(
+                        "  webview: the close-window bus id getMessageId returned has a NUL in \
+                         it: {close_window_bus_id:?}"
+                    ),
+                },
+                Err(e) => println!(
+                    "  webview: getMessageId({protocol:?}, {close_window_id:?}) failed: {e}"
+                ),
+            }
+        }
+        None => println!(
+            "  webview: no getCloseWindowId in this build's vocabulary; a closeWindow message \
+             cannot be subscribed to"
+        ),
+    }
+
     // The close report. `getMessageId` and `protocol` are the same values
     // just used for `openWindow`'s bus id -- this is the same class asked
     // for a different method id, not a second lookup of anything already
@@ -939,6 +1055,22 @@ pub fn hybrid_launch_enabled() -> bool {
 /// present but not a JSON string is treated the same as one absent, rather
 /// than passed on as some other type `crate::deeplink::publish_hybrid_game_launch`
 /// was never written to expect.
+///
+/// **Also closes the web window, once the publish actually succeeds.** Live
+/// on 2026-09-24: joining from the Servers list, with a subscription to
+/// `close-window` (`WebView.closeWindow`, confirmed both exported and
+/// subscribable — see `arm`'s log) armed and watching, never once saw the
+/// engine publish on it, across a real click on a real public server that
+/// joined correctly (screenshot and log both showed the dialog still open,
+/// Join buttons still live, with the game already running behind it). So
+/// Sober closing the window and Cordial not is not a message Cordial was
+/// failing to answer; nothing arrives to answer. This is the fallback the
+/// maintainer asked for: the earliest honest signal available, closing only
+/// once [`crate::deeplink::publish_hybrid_game_launch`] has actually put the
+/// join on the bus, not merely once this function decided to claim the
+/// message -- a failed publish leaves nothing happening, and closing the
+/// window over that would strand the player looking at a blank canvas with
+/// no way back to the server list they were just on.
 fn route_as_hybrid_launch(message: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(message) else {
         return false;
@@ -963,7 +1095,23 @@ fn route_as_hybrid_launch(message: &str) -> bool {
         str_field("joinAttemptOrigin"),
         str_field("browserTrackerId"),
     ) {
-        Ok(()) => println!("[webview] hybrid launch: handed off to deeplink::publish_hybrid_game_launch"),
+        Ok(()) => {
+            println!("[webview] hybrid launch: handed off to deeplink::publish_hybrid_game_launch");
+            // The join is actually on the bus now -- close the same way
+            // `close-window` would have, so `WebView.handleWindowClose`
+            // still reports it and the canvas-raise in `load.rs` still runs.
+            // See this function's own doc for why this, and not a
+            // `close-window` subscription, is what actually closes the
+            // window: that subscription is armed and watching, and nothing
+            // ever arrives on it.
+            match CLOSE_HANDLER.get() {
+                Some(close) => close(),
+                None => println!(
+                    "[webview] no close handler installed; the web window will stay open over \
+                     the game that just started"
+                ),
+            }
+        }
         Err(e) => println!("[webview] hybrid launch: could not publish: {e}"),
     }
     true
@@ -1335,6 +1483,28 @@ mod tests {
             });
         }
         assert_eq!(CALLS.load(O::SeqCst), 1, "the second presenter must never run");
+    }
+
+    /// Same discipline as [`set_presenter_keeps_the_first_installation`], for
+    /// the close side: `set_close_handler` must keep the first installation
+    /// rather than let a second one silently win or silently do nothing. Runs
+    /// against `on_close_window` directly rather than through
+    /// `cordial_messagebus_subscribe`, which needs a real JNI environment
+    /// this test has none of -- the same limit `arm_does_nothing_when_the_
+    /// vocabulary_is_not_exported`'s own doc gives for why `arm` cannot be
+    /// exercised further here.
+    #[test]
+    fn set_close_handler_keeps_the_first_installation() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        set_close_handler(|| {
+            CALLS.fetch_add(1, O::SeqCst);
+        });
+        set_close_handler(|| {
+            CALLS.fetch_add(100, O::SeqCst);
+        });
+        on_close_window(std::ptr::null());
+        assert_eq!(CALLS.load(O::SeqCst), 1, "the second close handler must never run");
     }
 
     /// `CORDIAL_WEBVIEW_TEST`'s request must carry chrome that marks it as a

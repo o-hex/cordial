@@ -233,6 +233,57 @@ fn hybrid_launch_enabled() -> bool {
 type BridgeSink = dyn Fn(&str) + Send + Sync;
 static BRIDGE_SINK: std::sync::OnceLock<std::sync::Arc<BridgeSink>> = std::sync::OnceLock::new();
 
+/// The dialog most recently presented by [`open`], so a close that did not
+/// originate from the user's own click on it -- the engine asking on
+/// `close-window`, or `cordial_runtime::webview` deciding a join has actually
+/// started -- has something to call `.close()` on. `None` once that dialog's
+/// own `closed` signal has fired, by whichever path.
+///
+/// GTK objects are `Rc`-refcounted, not atomically, so this may only be
+/// touched from the thread that calls [`open`] -- the GTK main thread, the
+/// same one `install_webview_presenter` already re-enters via
+/// `glib::MainContext::default().invoke` before doing anything else with a
+/// dialog. That single-thread invariant is the whole justification for the
+/// `unsafe impl` below, the same shape
+/// `cordial_runtime::android::wayland::HostWindowCell` already uses for the
+/// identical reason.
+struct CurrentDialogCell(std::cell::RefCell<Option<adw::Dialog>>);
+// SAFETY: see the doc comment above -- GTK-main-thread-only by construction.
+unsafe impl Send for CurrentDialogCell {}
+unsafe impl Sync for CurrentDialogCell {}
+static CURRENT_DIALOG: CurrentDialogCell = CurrentDialogCell(std::cell::RefCell::new(None));
+
+/// Close the currently-open web window, the same way a user dismissing it
+/// would, so everything already wired to `AdwDialog`'s own `closed` signal --
+/// `load.rs`'s canvas-raise and its `report_window_closed` call to the engine
+/// -- still runs. Callers do not need a second, parallel "tell the engine it
+/// closed" step; that is the entire point of going through the same signal
+/// rather than reaching for a lower-level teardown.
+///
+/// Must be called from the GTK main thread, same as [`open`] itself --
+/// callers re-enter it via `glib::MainContext::default().invoke` first.
+///
+/// Returns `false`, and says why, both when there was nothing open to close
+/// and when `AdwDialog::close` itself declined the request -- either is worth
+/// seeing rather than folding into a single silent no-op, the discipline this
+/// whole module holds itself to for every other refusal.
+pub fn close_current() -> bool {
+    let dialog = CURRENT_DIALOG.0.borrow().clone();
+    match dialog {
+        Some(dialog) => {
+            let accepted = dialog.close();
+            if !accepted {
+                eprintln!("[webview] close_current: the open dialog did not accept the close request");
+            }
+            accepted
+        }
+        None => {
+            eprintln!("[webview] close_current: no web window is currently open");
+            false
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BridgeHandler {
     ExecuteRoblox,
@@ -750,6 +801,23 @@ pub fn open(parent: &(impl IsA<gtk4::Widget> + Clone), request: &WindowRequest) 
 
     view.load_uri(&request.url);
     dialog.present(Some(parent));
+
+    // Tracked for [`close_current`], and untracked again the moment this
+    // dialog's own `closed` signal fires -- by any path, not only that
+    // function's -- so a stale handle here never outlives the window it
+    // names. Guarded by identity, not just by clearing unconditionally: a
+    // second `open()` call that presented a newer dialog before this one
+    // got around to closing must not have its entry erased by the older
+    // dialog's own belated signal.
+    *CURRENT_DIALOG.0.borrow_mut() = Some(dialog.clone());
+    let tracked = dialog.clone();
+    dialog.connect_closed(move |_| {
+        let mut slot = CURRENT_DIALOG.0.borrow_mut();
+        if slot.as_ref() == Some(&tracked) {
+            *slot = None;
+        }
+    });
+
     Some(dialog)
 }
 

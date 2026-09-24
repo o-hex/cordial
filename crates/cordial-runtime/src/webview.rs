@@ -559,6 +559,21 @@ static PUBLISH_RAW_NATIVE: OnceLock<usize> = OnceLock::new();
 /// not establish.
 static SIGNAL_JAVASCRIPT_CALLBACK_NATIVE: OnceLock<usize> = OnceLock::new();
 
+/// `CORDIAL_TRACE_BRIDGE=1` -- print a bridge command's contents rather than
+/// just its byte length.
+///
+/// Written for issue #40: the one fact missing from that whole thread was
+/// what the Servers page's Join button actually sends, and a length is not
+/// enough to answer it. Off by default for the same reason
+/// `CORDIAL_TRACE_TEXT_SHOW_PASSWORDS` is -- a bridge command is exactly as
+/// likely to carry a private-server `accessCode` as a text box is to carry a
+/// password, and `forward_bridge_message`'s own doc already makes that
+/// argument for this direction.
+pub fn trace_bridge() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_TRACE_BRIDGE").is_some())
+}
+
 /// The sink `cordial_messagebus_subscribe` calls when the engine publishes
 /// `openWindow`.
 ///
@@ -891,6 +906,65 @@ pub fn report_window_closed() {
     }
 }
 
+/// The runtime half of the default fix for issue #40/#34, on unless
+/// `CORDIAL_WEBVIEW_DISABLE_HYBRID_LAUNCH` is set --
+/// `cordial_shell::webview`'s own doc on `hybrid_launch_enabled` describes it
+/// in full. The shell's injected script wraps `Roblox.Hybrid.Game.launchGame`
+/// and posts its JSON payload through `executeRoblox` exactly as any other
+/// bridge message; this is what recognises that specific payload on arrival
+/// here and answers it differently. Named identically to the shell's own
+/// escape hatch so one setting turns the whole feature off on both ends,
+/// rather than leaving the shell intercepting a call this half then ignores.
+pub fn hybrid_launch_enabled() -> bool {
+    std::env::var_os("CORDIAL_WEBVIEW_DISABLE_HYBRID_LAUNCH").is_none()
+}
+
+/// Recognises a live `Roblox.Hybrid.Game.launchGame` interception inside an
+/// ordinary `executeRoblox` message, by its `requestType` -- the one field
+/// round 6 of issue #40 confirmed is always present and always
+/// `"RequestGameJob"` for this call, on two different games. Returns whether
+/// the message was claimed: `true` means this function decided what to do
+/// with it and [`forward_bridge_message`] must not also forward it to
+/// `signalJavascriptCallback`, which expects the engine's own "Hybrid
+/// Module" JSON-RPC envelope (`moduleID`/`functionName`) -- a shape this
+/// project has never confirmed and this payload does not match, so
+/// forwarding it there too would not do anything except make the log read as
+/// if two things happened when one did.
+///
+/// Every field below is read with `and_then(|v| v.as_str())`, so a field
+/// present but not a JSON string is treated the same as one absent, rather
+/// than passed on as some other type `crate::deeplink::publish_hybrid_game_launch`
+/// was never written to expect.
+fn route_as_hybrid_launch(message: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(message) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.get("requestType").and_then(|v| v.as_str()) != Some("RequestGameJob") {
+        return false;
+    }
+    let str_field = |k: &str| object.get(k).and_then(|v| v.as_str());
+    let Some(place_id) = str_field("placeId") else {
+        println!(
+            "[webview] hybrid launch payload has no string placeId; not publishing anything"
+        );
+        return true;
+    };
+    match crate::deeplink::publish_hybrid_game_launch(
+        place_id,
+        str_field("instanceId"),
+        str_field("joinAttemptId"),
+        str_field("joinAttemptOrigin"),
+        str_field("browserTrackerId"),
+    ) {
+        Ok(()) => println!("[webview] hybrid launch: handed off to deeplink::publish_hybrid_game_launch"),
+        Err(e) => println!("[webview] hybrid launch: could not publish: {e}"),
+    }
+    true
+}
+
 /// Hand an approved bridge message to `WebViewProtocol.signalJavascriptCallback`.
 ///
 /// The receiving half of `cordial_shell::webview::set_bridge_sink`, wired to
@@ -924,12 +998,20 @@ pub fn report_window_closed() {
 /// and a native that does dereference it fails loudly on the error path below
 /// rather than silently doing nothing.
 ///
-/// **The message itself is never logged**, only its length. A bridge command
-/// carries whatever the page and the engine are mid-conversation about, and
-/// `docs/analysis/webview-surface.md` §4's rule about one-time authentication
-/// tickets in a web-view url applies to this direction exactly as it does to
-/// that one.
+/// **The message itself is never logged**, only its length, unless
+/// [`trace_bridge`] is on. A bridge command carries whatever the page and the
+/// engine are mid-conversation about, and `docs/analysis/webview-surface.md`
+/// §4's rule about one-time authentication tickets in a web-view url applies
+/// to this direction exactly as it does to that one -- which is why the
+/// switch is opt-in and named for what it does, the same shape as
+/// `CORDIAL_TRACE_TEXT_SHOW_PASSWORDS`.
 pub fn forward_bridge_message(message: &str) {
+    if trace_bridge() {
+        println!("[webview] bridge message (CORDIAL_TRACE_BRIDGE=1): {message}");
+    }
+    if hybrid_launch_enabled() && route_as_hybrid_launch(message) {
+        return;
+    }
     let Some(native) = SIGNAL_JAVASCRIPT_CALLBACK_NATIVE.get() else {
         // Loud, for the same reason `report_window_closed` is: a page that
         // believes its command was delivered, next to a log that said

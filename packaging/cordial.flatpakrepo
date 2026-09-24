@@ -22,6 +22,21 @@
 #
 # Url has to be the OSTree repository, not the site root: the site root is the
 # project's web page and a browser hitting it should get that.
+#
+# The repository carries two branches. `stable` is only ever moved by a
+# tagged release and is this remote's default, so the install command above
+# lands there with no branch named. `master` moves on every push to main and
+# is what installing before this comment existed put you on -- if `flatpak
+# list` shows `io.github.luohoa97.Cordial` on branch `master`, move to the
+# release channel with:
+#
+#     flatpak uninstall io.github.luohoa97.Cordial//master
+#     flatpak install cordial io.github.luohoa97.Cordial//stable
+#
+# (add --user to both if you installed with it). To stay on master instead --
+# every commit, not just releases -- name it explicitly:
+#
+#     flatpak install cordial io.github.luohoa97.Cordial//master
 
 [Flatpak Repo]
 Title=Cordial

@@ -89,15 +89,28 @@ take a number vs. a severity name) is not resolved by this**: with no VRService
 output in either arm, there is no signal to calibrate the channel's log
 verbosity syntax against, on or off.
 
-A fourth check, run only in the "on" arm since it is a control against a fixed
-baseline (a real dlopen would be a positive result on its own, regardless of
-what an "off" run shows): `CORDIAL_TRACE_PATHS=1` traces every path-taking libc
-call, including `dlopen`, without wrapping any variadic function (the thing
-that makes `CORDIAL_TRACE=1` unsafe to use here). ~10,600 path-taking calls were
-logged over the 30 s run; grepping for `openxr`, `oculus`, `libopenxr`, or any
-`.so` name containing `vr` returns nothing. **The engine never attempted to
-open a VR runtime library, static-linked into `libroblox.so` or otherwise**, in
-this run.
+**Retracted 2026-09-16. The fourth check below never measured what it claimed,
+and its conclusion does not follow.** It read: `CORDIAL_TRACE_PATHS=1` traces
+every path-taking libc call, *including `dlopen`*, and since grepping ~10,600
+logged calls for `openxr`, `oculus`, `libopenxr` or any `.so` name containing
+`vr` returned nothing, **the engine never attempted to open a VR runtime
+library**.
+
+`dlopen` is not traced. `native/system_paths.cpp` wraps nine calls and `dlopen`
+is not among them: `stat`, `lstat`, `access`, `opendir`, `realpath`,
+`readlink`, `fopen`, `open`, `statvfs`. Every `dlopen` in the tree belongs to
+upstream bionic under `third_party/`. A grep of that log for a library name
+could only ever have found one incidentally, through an `open` of the file --
+so "returns nothing" is what this instrument prints whether the engine tried to
+load a VR runtime or not, and the bolded sentence was unfalsifiable as written.
+
+The three remaining instruments -- the dumped Java class surface, the
+`Constructed Unresolved symbol` / stub-call log, and the engine's own log
+stream -- are unaffected and are what this document's verdict actually rests
+on. Left in place rather than deleted, because the reasoning is the point: this
+is the fourth measurement in one investigation that could not distinguish the
+two cases it was quoted to separate, and it produced the most confident
+sentence in the file.
 
 ## Classification of the wall
 
@@ -128,6 +141,61 @@ Reaching a joined, signed-in place with a VR flag set and repeating the same
 three-instrument comparison (`dump-classes`, unresolved-symbol log,
 `FLog`/`DFLog` VRService output) would close the one gap left here. That needs
 a signed-in test account and a place to join, both out of scope for this run.
+
+## Four further routes, all tested 2026-09-16, all negative
+
+This document's own hedge above is the honest one and it still stands: the
+joined-place arm is untested. Everything else reachable from the shell has now
+been tried, and the baseline it is measured against is a **4584-line**
+`--dump-classes` dump, byte-identical across every arm of all four.
+
+**A live OpenXR runtime present.** The earlier absence of one was an unrecorded
+gap in this document, and closing it changed nothing: three arms -- flags off,
+flags on with no runtime, flags on with Monado 25.1.0 serving and
+`XR_RUNTIME_JSON` set -- gave an identical class dump, no unresolved symbols,
+and normalised stderr streams diffing to zero lines, reproduced twice.
+
+**The unpublished binary-string names through `flags.json`.** This document
+notes at line 26 that `DebugEnableVREmulator`, `IsVRAppBuild` and the rest were
+never injected. They have been now, under `FFlag`, `DFFlag`, `SFFlag` and bare,
+delivered and accepted (`nativeInitClientSettings -> 0`, override counts exactly
+as written), across three launches and a control. Nothing moved. Checking for a
+prefix rule first showed there is none to find: 44 served names are
+`FFlagDebug*` and 45 are `DFFlagDebug*`.
+
+**The overrides channel, and this is the strongest of the four because it
+carries its own positive control.** `nativeInitClientSettings`'s *second*
+argument is the overrides document -- established by return-code
+discrimination, malformed JSON giving `1` there and nothing in the third
+position. That channel demonstrably works: `{"DFLogHttpTraceLight":"7"}`
+through it alone moved the engine's own trace-line count from 0 to 47, twice,
+with `HttpTraceError` unchanged as a specificity check. The VR names through
+that same proven-live channel, in the same shape, did nothing.
+
+**Calling the exported VR natives directly.** `NativeGLInterface` exports a
+whole VR input surface -- `isVRVirtualInputFlagEnabled()Z`,
+`enableVRVirtualInput(Z)V`, `setVRCameraCFrame(FFF)V`,
+`setVirtualVRJoyStickPosition(FF)V`,
+`setVRWorldRayCFrameFromScreenPosition(IFFI)V` -- all `GLOBAL FUNC` in dynsym
+and all declared in the dex. Cordial is the Java side, so calling them is the
+published interface working as designed, not interposition. The getter returns
+`false`; `enableVRVirtualInput(true)` returns cleanly and the getter still
+returns `false`; no `VRService` line appears with all three log channels at
+`"7"`. These are the input half of a path that needs a device to already exist.
+
+Taken together: the wall is not the flags, not the settings documents, not the
+platform layer and not the exported natives. It is that nothing constructs a VR
+device, and the only demonstrated way to make one is a byte written at a
+per-build address -- which [ADR-001](../adr/ADR-001-in-process-hooking.md) and
+[ADR-003](../adr/ADR-003-plugin-isolation.md) make absent rather than disabled.
+
+**Two corrections to claims made while chasing this, both mine.** A previous
+summary asserted `SurfaceController::disableVR` fires unconditionally at
+startup; the string exists in the binary but never appears in the log, whose
+actual shape is `HH:MM:SS.mmm D/tag message` rather than `FLog::Tag`. And the
+baseline was quoted at 4572 lines in one brief; it is 4584. Neither changed a
+verdict, and both are recorded because an unchecked number repeated twice
+becomes a fact.
 
 ## Reproducing
 

@@ -78,6 +78,21 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.17.0" date="2026-09-16">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.17.0</url>
+      <description>
+        <p>
+          Starting a second profile while one is already running now shows a
+          warning first and asks you to accept or cancel, because
+          multi-instancing risks a Roblox ban. It only asks once.
+        </p>
+        <p>
+          The Flatpak has a stable channel that only moves on a tagged
+          release; every install before this one is still on the channel
+          that tracks main and needs a manual move to reach it.
+        </p>
+      </description>
+    </release>
     <release version="0.16.0" date="2026-09-15">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.16.0</url>
       <description>

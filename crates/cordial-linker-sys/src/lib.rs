@@ -1932,6 +1932,7 @@ pub mod game_activity {
         ) -> c_int;
         fn cordial_textbox_handle() -> i64;
         fn cordial_textbox_generation() -> c_int;
+        fn cordial_textbox_property_generation() -> c_int;
         fn cordial_textbox_text(buf: *mut c_char, n: c_int) -> c_int;
         fn cordial_registered_natives(
             class_name: *const c_char, out: *mut c_char, n: usize,
@@ -2045,6 +2046,15 @@ pub mod game_activity {
     pub fn textbox_generation() -> u32 {
         // SAFETY: a plain atomic load on the C++ side.
         unsafe { cordial_textbox_generation() as u32 }
+    }
+
+    /// Bumped by `onLuaTextBoxPropertyChangedCallback`, deliberately a
+    /// separate counter from [`textbox_generation`] — see the comment on
+    /// `g_textbox_property_generation` in `native/android_classes.cpp` for
+    /// why folding the two together would be wrong, not just redundant.
+    pub fn textbox_property_generation() -> u32 {
+        // SAFETY: a plain atomic load on the C++ side.
+        unsafe { cordial_textbox_property_generation() as u32 }
     }
 
     /// The spec for the editor that has to be drawn over the focused text box,

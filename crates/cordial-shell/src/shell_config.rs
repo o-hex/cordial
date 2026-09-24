@@ -842,6 +842,22 @@ pub struct ShellConfig {
     /// field's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marketplace_public_key: Option<String>,
+    /// Whether `multi_instance_warning` has already been shown and accepted.
+    ///
+    /// Per-user rather than per-profile, deliberately: the warning is about
+    /// running two *different* profiles at once, and putting the flag inside
+    /// one profile's own directory — the way `plugin-consent-seen.json` sits
+    /// inside it — would mean it resets for every profile somebody creates,
+    /// so the very act of setting up the second profile the warning is about
+    /// would make it fire again. `shell.json` is this shell's one piece of
+    /// state that already lives above every profile, which is the shape this
+    /// flag needs.
+    ///
+    /// **Remembered on purpose, unlike `root_warning`, which is not.** See
+    /// `multi_instance_warning.rs`'s module comment for the distinction and
+    /// why each warning landed on a different answer.
+    #[serde(default)]
+    pub multi_instance_warning_seen: bool,
 }
 
 fn default_fullscreen_accel() -> String {
@@ -872,6 +888,7 @@ impl Default for ShellConfig {
             fullscreen_accel: default_fullscreen_accel(),
             marketplace_index_dir: None,
             marketplace_public_key: None,
+            multi_instance_warning_seen: false,
         }
     }
 }
@@ -1246,5 +1263,24 @@ mod tests {
         let older = r#"{"gamemode":true,"graphics":"automatic","mangohud":false}"#;
         let parsed: ShellConfig = serde_json::from_str(older).expect("an older shell.json must load");
         assert_eq!(parsed.present_mode, PresentMode::Mailbox);
+    }
+
+    /// Everybody's `shell.json` predates the multi-instance warning, and a
+    /// launcher that refused to start over a field it has just invented would
+    /// be a worse failure than the warning itself. It must also default to
+    /// unseen, not seen — an install that never asked must not silently skip
+    /// the one warning this feature exists to show.
+    #[test]
+    fn an_older_config_without_the_multi_instance_flag_has_not_seen_the_warning() {
+        let older = r#"{"gamemode":true,"profile":"default"}"#;
+        let parsed: ShellConfig = serde_json::from_str(older).expect("an older shell.json must load");
+        assert!(!parsed.multi_instance_warning_seen);
+    }
+
+    #[test]
+    fn accepting_the_multi_instance_warning_round_trips() {
+        let p = scratch("multi-instance.json");
+        save(&p, &ShellConfig { multi_instance_warning_seen: true, ..Default::default() }).unwrap();
+        assert!(load(&p).multi_instance_warning_seen);
     }
 }

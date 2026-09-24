@@ -576,10 +576,8 @@ fn check(origin: Option<install::Origin>, then: impl Fn(Checked) + 'static) {
                     // message: the entries below did arrive, and are shown.
                     // This says only that the label this window looked for
                     // was not the one Roblox's navigation used.
-                    entries_why = Some(format!(
-                        "Roblox's navigation did not label a current release; showing the \
-                         newest one listed instead, the week of {date}."
-                    ));
+                    entries_why =
+                        Some(format!("Showing the newest notes listed, week of {date}."));
                     Some(entries)
                 }
                 Err(why) => {
@@ -1588,10 +1586,7 @@ fn status_lines(checked: &Option<Checked>, automatic: Automatic) -> (String, Str
             "Whether this build is current cannot be established".to_string(),
             format!(
                 "Roblox's newest release notes are for engine {latest}. Cordial cannot tell which \
-                 engine the APK here is: {}/AndroidApp answers HTTP 500 while WindowsPlayer \
-                 answers 200, and an APK you obtained yourself carries no version this can read. \
-                 Saying \"up to date\" on that would be a guess.",
-                version::ENDPOINT.trim_end_matches('/')
+                 engine the APK here is, so saying \"up to date\" would be a guess."
             ),
         ),
         (Some(here), Some(latest)) => (
@@ -1679,11 +1674,7 @@ fn version_line(recorded: Option<String>) -> String {
         // version out of. Naming a specific cause it cannot verify would be
         // the same kind of guess the second half of this sentence already
         // refuses to make.
-        None => "Not known. Cordial only recognises a version for a build it both fetched itself \
-                 and is currently the one in use — an APK you obtained elsewhere, or a fetched \
-                 build that is no longer the effective one, carries no version this reads, and it \
-                 will not guess one."
-            .to_string(),
+        None => "Not known.".to_string(),
     }
 }
 
@@ -1726,11 +1717,10 @@ pub(crate) fn cache_line(engine: bool, stamp: Option<String>, current: bool) -> 
 /// therefore metered, and somebody told only "metered" answers "no it isn't".
 fn connection_line(metered: Metered) -> String {
     let verdict = if metered.is_metered() {
-        "Treated as metered, so Download on metered connection is the switch that governs it. \
-         Only an explicit unmetered answer takes the other branch, because reading a guess the \
-         cheap way is how a data allowance pays for 115 MB nobody asked for."
+        "Treated as metered, so Download on metered connection governs it. Only an explicit \
+         unmetered answer takes the other branch."
     } else {
-        "Treated as unmetered, so Download on Wi-Fi is the switch that governs it."
+        "Treated as unmetered, so Download on metered connection does not need to be on."
     };
     format!("{}.\n{verdict}", metered.describe())
 }
@@ -1935,7 +1925,7 @@ mod tests {
         assert!(!c.update_available());
         let (title, body) = status_lines(&Some(c), Automatic::Background);
         assert!(title.contains("cannot be established"), "{title}");
-        assert!(body.contains("HTTP 500"), "{body}");
+        assert!(body.contains("cannot tell which"), "{body}");
         assert!(!body.contains("up to date") || body.contains("would be a guess"), "{body}");
     }
 
@@ -2184,8 +2174,7 @@ mod tests {
     #[test]
     fn an_unknown_roblox_version_says_why_rather_than_guessing() {
         let line = version_line(None);
-        assert!(line.contains("Not known"), "{line}");
-        assert!(line.contains("will not guess"), "{line}");
+        assert_eq!(line, "Not known.");
         assert!(version_line(Some("0.732.23.7321040".into())).contains("0.732.23.7321040"));
     }
 
@@ -2251,7 +2240,7 @@ mod tests {
 
         let plain = connection_line(Metered::No);
         assert!(plain.contains("Treated as unmetered"), "{plain}");
-        assert!(plain.contains("Download on Wi-Fi"), "{plain}");
+        assert!(plain.contains("Download on metered connection"), "{plain}");
     }
 
     #[test]

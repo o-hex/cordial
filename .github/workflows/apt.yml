@@ -201,11 +201,22 @@ jobs:
           echo "signing=true" >> "$GITHUB_OUTPUT"
           echo "gpghome=$home" >> "$GITHUB_OUTPUT"
 
-      - name: Download the .deb release.yml already built
+      - name: Download the .debs release.yml already built
+        # release.yml's `deb` job is matrixed over x86_64 and aarch64 and
+        # uploads one artifact per arch (cordial-deb-x86_64, cordial-deb-
+        # aarch64) rather than one shared name, so upload-artifact@v4's own
+        # collision refusal is what forces `pattern` here instead of `name` --
+        # a single fixed name would only ever match one leg. merge-multiple
+        # flattens both artifacts' files into one dist/deb directory rather
+        # than nesting each under its own artifact-name subdirectory, which is
+        # what packaging/apt/build-repo.sh below expects: it sorts the .debs
+        # it is handed by the Architecture field inside each one, not by which
+        # directory they arrived in.
         if: steps.gpg.outputs.signing == 'true'
         uses: actions/download-artifact@v4
         with:
-          name: cordial-deb
+          pattern: cordial-deb-*
+          merge-multiple: true
           path: dist/deb
           github-token: ${{ github.token }}
           run-id: ${{ steps.source.outputs.run_id }}

@@ -41,8 +41,8 @@ use crate::shell_config::ShellConfig;
 /// Said above the choice, not after a failure, because the failure it pre-empts
 /// looks like Cordial breaking: Roblox refuses clients older than a minimum it
 /// sets server-side, whenever it chooses, and every pin ends there eventually.
-const SERVER_MINIMUM: &str = "Roblox stops accepting old versions whenever it chooses. \
-     A pinned build that starts refusing to join games has been retired by Roblox, not broken by Cordial.";
+const SERVER_MINIMUM: &str =
+    "A pinned build that stops joining games was retired by Roblox, not broken by Cordial.";
 
 /// What a row says about one build, beneath its version number.
 ///
@@ -133,17 +133,31 @@ pub fn build_version_page(config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesP
 
     let downloads = adw::PreferencesGroup::builder()
         .title("Available to download")
+        // No architecture named here: the mirror provider already filters by
+        // the host's own ABI (`cordial_update::apk::HOST_ABI`), so every row
+        // this group can show is one this machine can run.
         .description(
-            "Versions APKPure lists for x86-64. Each is checked against Roblox's signature before \
-             Cordial keeps it, and downloading one makes it this profile's build.",
+            "Signature-checked before Cordial keeps it; downloading one makes it this profile's build.",
         )
         .build();
     let download_rows = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
     download_rows.add_css_class("boxed-list");
-    downloads.add(&download_rows);
+    // The meter before the row list, not after it. It used to sit below every
+    // row this group has to offer -- measured live (nested-compositor
+    // screenshots, 2026-09-23): with the ~30 rows APKPure typically lists,
+    // the meter renders correctly and reports real progress
+    // ("11% -- 25 MB of 229 MB, 204 MB to go") from the moment a download
+    // starts, but it sits far enough below the fold that nobody scrolls to
+    // it, which is indistinguishable from no progress bar existing at all.
+    // Reported as exactly that: "Downloading a Roblox build shows no
+    // progress bar." The download-rows list can only grow, so ordering is
+    // the fix rather than a size on the group -- the row that was clicked
+    // already shows a Stop button in place either way.
     let meter = Meter::new();
     meter.widget().set_margin_top(12);
+    meter.widget().set_margin_bottom(12);
     downloads.add(meter.widget());
+    downloads.add(&download_rows);
 
     let view = Rc::new(View {
         page: page.downgrade(),

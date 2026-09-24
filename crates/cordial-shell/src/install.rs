@@ -103,7 +103,16 @@ pub fn sober_apk() -> PathBuf {
 /// without a test having to write to `HOME`, which is process-wide and would
 /// interleave with every other test in this crate that reads it.
 fn sober_apk_under(home: &Path) -> PathBuf {
-    home.join(".var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk")
+    // Sober names this directory segment after the same Android ABI string
+    // `cordial_update::apk::HOST_ABI` spells on x86_64: "x86_64". Not verified
+    // for aarch64 -- Sober is a project this codebase may observe running but
+    // never inspect (AGENTS.md) -- so this is INFERRED from the x86_64 naming
+    // pattern, not confirmed against a real Sober install on ARM. See the same
+    // caveat in `cordial_update::provider::local`.
+    home.join(format!(
+        ".var/app/org.vinegarhq.Sober/data/sober/packages/{}/com.roblox.client/base.apk",
+        cordial_update::apk::HOST_ABI
+    ))
 }
 
 /// Where Cordial keeps the engine it extracted. Same path `just dev` uses, so
@@ -394,7 +403,15 @@ fn locate_with(
         // reaches the store: this branch is every launch after the first, and
         // the extraction below -- the only other place that keys -- runs only
         // when Roblox changes. A no-op once the cache is a link.
-        let split = apk.parent().map(|d| d.join(format!("split_config.{}.apk", cordial_update::apk::HOST_ABI)));
+        // `cordial_update::install::SPLIT_APK`, not a filename rebuilt from
+        // `HOST_ABI` here: Play spells the split with underscores
+        // (`split_config.arm64_v8a.apk`) while `HOST_ABI` keeps the hyphen the
+        // APK's own `lib/arm64-v8a/` directory uses (see that constant's own
+        // comment). The two spellings are identical for x86_64, which is why
+        // rebuilding it from `HOST_ABI` here compiled and passed on that
+        // architecture while quietly constructing the wrong filename
+        // (`split_config.arm64-v8a.apk`) for aarch64.
+        let split = apk.parent().map(|d| d.join(cordial_update::install::SPLIT_APK));
         let mut archives: Vec<&Path> = vec![apk.as_path()];
         if let Some(split) = split.as_deref().filter(|s| s.is_file()) {
             archives.push(split);
@@ -544,7 +561,9 @@ fn engine_candidates(apk: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-/// Pull `lib/x86_64/libroblox.so` out of the first archive that has it.
+/// Pull [`LIBRARY_IN_APK`] (`lib/x86_64/libroblox.so` on x86-64,
+/// `lib/arm64-v8a/libroblox.so` on aarch64) out of the first archive that has
+/// it.
 ///
 /// Written to a temporary name and renamed into place, because a launch
 /// interrupted halfway leaves a 40 MB file that looks exactly like a complete
@@ -679,12 +698,13 @@ mod tests {
         // The engine is not in base.apk on a split build. Asserting otherwise
         // is the mistake this ordering exists to stop, so the order is pinned.
         let dir = scratch("candidates");
-        for name in ["base.apk", "split_config.x86_64.apk", "split_config.en.apk"] {
+        let split_name = cordial_update::install::SPLIT_APK;
+        for name in ["base.apk", split_name, "split_config.en.apk"] {
             std::fs::write(dir.join(name), b"not really a zip").unwrap();
         }
         let candidates = engine_candidates(&dir.join("base.apk"));
         assert_eq!(candidates[0], dir.join("base.apk"));
-        assert!(candidates.contains(&dir.join("split_config.x86_64.apk")));
+        assert!(candidates.contains(&dir.join(split_name)));
     }
 
     #[test]
@@ -695,9 +715,10 @@ mod tests {
         let p = sober_apk_under(Path::new("/home/someone"));
         assert_eq!(
             p,
-            Path::new(
-                "/home/someone/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk"
-            )
+            Path::new(&format!(
+                "/home/someone/.var/app/org.vinegarhq.Sober/data/sober/packages/{}/com.roblox.client/base.apk",
+                cordial_update::apk::HOST_ABI
+            ))
         );
     }
 

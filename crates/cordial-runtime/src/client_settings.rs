@@ -18,9 +18,13 @@
 //! 120.11 [FLog::DynamicFastVariableReloader] DynamicFastVariableReloader finished flag fetch
 //! ```
 //!
-//! Note the application name: the engine asks for **`GoogleAndroidApp`**, where
-//! this file asks for `AndroidApp`. Whether the two documents differ in anything
-//! Cordial cares about is **not established**; nobody has diffed them.
+//! Note the application name: the engine asks for **`GoogleAndroidApp`**, and
+//! since 2026-09-24 this file does too by default ([`ENGINE_URL`],
+//! `CORDIAL_ENGINE_SETTINGS=0` reverts to the `AndroidApp` document it fetched
+//! before that). They are not the same document -- `docs/analysis/flag-init.md`
+//! SS23.4 counted 441 differing values -- and a live rollout made the
+//! difference between a blank screen and a working Landing page, 20/20 launches
+//! each way; see [`ENGINE_URL`]'s doc comment for the measurement.
 //!
 //! What that reloader costs is written up on [`apply_overrides`], because it is
 //! the thing that decides how long an override survives.
@@ -62,11 +66,45 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// Roblox's settings CDN. The application name is `AndroidApp`; it is not a
-/// guess — `AndroidClient`, `AndroidPlayer`, `AndroidClientSettings` and
+/// Roblox's settings CDN, application name `AndroidApp` -- not a guess,
+/// `AndroidClient`, `AndroidPlayer`, `AndroidClientSettings` and
 /// `AndroidAppSettings` all return HTTP 400 "The application name is invalid",
-/// and `AndroidApp` returns the real 1.2 MB document.
+/// and `AndroidApp` returns a real document. **No longer the default fetch**
+/// as of 2026-09-24 -- see [`ENGINE_URL`] -- kept as the
+/// `CORDIAL_ENGINE_SETTINGS=0` escape hatch, since `AndroidApp` was never
+/// shown to be *wrong*, only shown to sometimes disagree with the document
+/// the engine asks for itself.
 const URL: &str = "https://clientsettingscdn.roblox.com/v2/settings/application/AndroidApp";
+
+/// The exact URL the engine's own `DynamicFastVariableReloader` asks for
+/// (captured from `DFLogHttpTraceLight` on a signed-in 2.734.0.917 -- see
+/// this module's top doc comment). **The default fetch since 2026-09-24**;
+/// `CORDIAL_ENGINE_SETTINGS=0` reverts to [`URL`] for the document handed to
+/// `nativeInitClientSettings`.
+///
+/// **Why this is the default now**: this module's own doc comment had said
+/// since it was written that whether the `AndroidApp` and
+/// `GoogleAndroidApp` documents differ in anything Cordial cares about was
+/// "not established; nobody has diffed them." `docs/analysis/flag-init.md`
+/// SS23.4 later diffed them (441 differing values) and called switching
+/// "worth correcting on its own terms... but a separate change from this
+/// one" -- deferred, not rejected, because the storage bug it was chasing
+/// then tested negative either document. It stopped being a deferrable
+/// correction on 2026-09-24: a live Roblox rollout made `AndroidApp` (`URL`,
+/// what this file fetched by default until now) produce a single-cycle
+/// render with no `Forcing finalize` and a flat grey screen, on both a
+/// signed-in profile and a brand-new signed-out one, while `GoogleAndroidApp`
+/// produced Landing normally -- 20/20 launches each way, delivery mechanism
+/// held constant (isolated from document identity by feeding a
+/// byte-identical copy of the `AndroidApp` cache file through
+/// `--client-settings` and getting the same blank result, ruling out
+/// "explicit vs cached" as the variable). This is one incident's evidence,
+/// not a general claim that `GoogleAndroidApp` is always the better choice --
+/// `CORDIAL_ENGINE_SETTINGS=0` exists because a future rollout could reverse
+/// which endpoint works, and this file cannot tell that from either
+/// document's shape alone.
+const ENGINE_URL: &str =
+    "https://clientsettingscdn.roblox.com/v2/settings-compressed/application/GoogleAndroidApp.zst";
 
 /// How long a cached copy is used before refetching.
 ///
@@ -81,6 +119,29 @@ fn cache_path() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir)
         .join("cordial/clientsettings.json")
+}
+
+/// Where a document fetched from [`ENGINE_URL`] is cached, kept separate
+/// from [`cache_path`] so the two endpoints never overwrite each other's
+/// copy -- important now that they are known to sometimes disagree.
+fn engine_cache_path() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cordial/enginesettings.json")
+}
+
+/// GET `url` and decompress it as a zstd stream, returning the UTF-8 text.
+/// Shared between [`history::fetch_engine_copy`] (an observational side
+/// fetch, never handed to the engine) and the `CORDIAL_ENGINE_SETTINGS`
+/// branch of [`load_base`] (which does hand its result to the engine) --
+/// both ask the same compressed endpoint, so one decompressor.
+fn fetch_and_decompress(url: &str) -> Result<String, String> {
+    let raw = cordial_update::http::get_bytes(url).map_err(|e| e.to_string())?;
+    let decompressed =
+        zstd::stream::decode_all(std::io::Cursor::new(raw)).map_err(|e| format!("zstd decode: {e}"))?;
+    String::from_utf8(decompressed).map_err(|e| format!("not utf-8: {e}"))
 }
 
 fn fresh(path: &Path) -> Option<String> {
@@ -114,15 +175,22 @@ fn plausible(body: &str) -> bool {
 pub enum Source {
     /// `--client-settings <path>`, and it read.
     Explicit,
-    /// The on-disk cache, still inside `MAX_AGE`.
+    /// `CORDIAL_ENGINE_SETTINGS=0`'s on-disk cache ([`cache_path`]), still
+    /// inside `MAX_AGE`.
     FreshCache,
-    /// A live fetch from the CDN.
+    /// `CORDIAL_ENGINE_SETTINGS=0`, live fetch from [`URL`].
     Fetched,
-    /// The fetch failed and a stale cache answered in its place.
+    /// The fetch failed and a stale cache answered in its place. Whichever
+    /// of the two endpoints was in use, not necessarily [`URL`]'s.
     StaleCache,
     /// Nothing did. The engine gets an empty document and resolves almost
     /// every flag to its own compiled default -- this is why.
     Nothing(String),
+    /// The default since 2026-09-24: [`ENGINE_URL`] rather than [`URL`],
+    /// fresh from its own cache ([`engine_cache_path`]).
+    EngineDocumentCached,
+    /// The default since 2026-09-24, live fetch.
+    EngineDocumentFetched,
 }
 
 impl std::fmt::Display for Source {
@@ -131,6 +199,8 @@ impl std::fmt::Display for Source {
             Source::Explicit => write!(f, "--client-settings"),
             Source::FreshCache => write!(f, "cache"),
             Source::Fetched => write!(f, "fetched"),
+            Source::EngineDocumentCached => write!(f, "engine document, cache"),
+            Source::EngineDocumentFetched => write!(f, "engine document, fetched"),
             Source::StaleCache => write!(f, "stale cache, fetch failed"),
             Source::Nothing(why) => write!(f, "nothing: {why}"),
         }
@@ -152,6 +222,9 @@ pub fn load(explicit: Option<&str>) -> Option<String> {
 /// path prints it; see `load.rs`'s `BootstrapPlan`.
 pub fn load_reporting(explicit: Option<&str>) -> (Option<String>, Source) {
     let (body, source) = load_base(explicit);
+    if let Some(dir) = history::dir() {
+        history::record(&dir, body.as_deref(), &source);
+    }
     (body.map(apply_overrides), source)
 }
 
@@ -172,6 +245,74 @@ fn load_base(explicit: Option<&str>) -> (Option<String>, Source) {
             }
         };
     }
+    // Default since 2026-09-24: fetch the document the engine itself asks
+    // for (ENGINE_URL, GoogleAndroidApp) rather than the AndroidApp document
+    // this file fetched from 2026-07-31 to here. AndroidApp was never chosen
+    // for a measured advantage over GoogleAndroidApp -- it was the only
+    // application name, of the four tried by probing, that did not answer
+    // HTTP 400 "The application name is invalid", at a time before anyone
+    // had found the engine fetches its own document under a different name
+    // at all (see this module's top doc comment; `docs/analysis/flag-init.md`
+    // SS23.4 found the two documents differ by 441 values and called
+    // switching "worth correcting on its own terms... but a separate change
+    // from this one", deferred rather than rejected). Measured 2026-09-24: a
+    // live Roblox rollout made AndroidApp produce a single-cycle render with
+    // no `Forcing finalize` and a blank screen -- signed in and signed out
+    // alike, 10/10 launches -- while GoogleAndroidApp reached Landing/Home
+    // normally in the same 10/10, delivery mechanism held constant. Cordial's
+    // own flag overrides (`apply_overrides`, below) still apply on top
+    // regardless of which document this fetches -- confirmed live with the
+    // existing `DFFlagRbxTransportUseRtcioRna` control this file already
+    // uses elsewhere: with it forced to `false`, the engine's own "Initialized
+    // RtcIoRna with 1 event loop threads" line is absent from the log; without
+    // it, present twice. `CORDIAL_ENGINE_SETTINGS=0` is the escape hatch back
+    // to the old endpoint, kept rather than deleted in case some future
+    // rollout makes AndroidApp the one that works and GoogleAndroidApp the
+    // one that does not.
+    if std::env::var("CORDIAL_ENGINE_SETTINGS").as_deref() != Ok("0") {
+        let cache = engine_cache_path();
+        if let Some(body) = fresh(&cache) {
+            return (Some(body), Source::EngineDocumentCached);
+        }
+        // No fallback to `cache_path()` (the old AndroidApp cache) on
+        // failure here, on purpose: a warm `clientsettings.json` from before
+        // this switch flipped holds the *other* document, and serving it as
+        // though it were the engine's own would silently reintroduce the
+        // exact confusion this default exists to end. The failure mode when
+        // both this fetch and `engine_cache_path()` are empty (a fresh
+        // install, network down) is the same one `AndroidApp` already had in
+        // the equivalent case: `Source::Nothing`, an empty document, and the
+        // engine resolving almost every flag to its own compiled default --
+        // not a new regression, the pre-existing "nothing is coming" path.
+        return match fetch_and_decompress(ENGINE_URL) {
+            // Same reasoning as `fetch()`: a bad application name or an
+            // outage can answer with a well-formed body that is not a
+            // settings document, and caching that would look like a flag
+            // problem rather than a fetch problem for MAX_AGE afterwards.
+            Ok(body) if plausible(&body) => {
+                if let Some(parent) = cache.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&cache, &body);
+                (Some(body), Source::EngineDocumentFetched)
+            }
+            Ok(_) => {
+                let why = format!("{ENGINE_URL} answered with something that is not a settings document");
+                match std::fs::read_to_string(&cache) {
+                    Ok(body) => (Some(body), Source::StaleCache),
+                    Err(_) => (None, Source::Nothing(why)),
+                }
+            }
+            Err(why) => match std::fs::read_to_string(&cache) {
+                Ok(body) => (Some(body), Source::StaleCache),
+                Err(_) => (None, Source::Nothing(why)),
+            },
+        };
+    }
+
+    // CORDIAL_ENGINE_SETTINGS=0: the old AndroidApp endpoint, kept as the
+    // escape hatch. Its own cache (`cache_path()`) is likewise never
+    // consulted by the branch above, for the same reason in reverse.
     let cache = cache_path();
     if let Some(body) = fresh(&cache) {
         return (Some(body), Source::FreshCache);
@@ -365,6 +506,183 @@ fn fetch() -> Result<String, String> {
     }
 }
 
+/// `CORDIAL_SETTINGS_HISTORY=<dir>`: keep every settings document this
+/// process sees, instead of the single overwritten copy `cache_path()` keeps.
+///
+/// Added to chase a live finding, 2026-09-24: Cordial's default AGDK startup
+/// intermittently collapses from its usual two-cycle placeholder-swap into a
+/// single cycle with no `Forcing finalize` and a blank render, and the one
+/// thing observed to track it across otherwise-identical runs is the byte
+/// size the engine itself logs after its own fetch (`getFlags: success =
+/// true, payload's size = N`). That size is not one this file's own fetch
+/// produces -- `URL` above asks for `AndroidApp`, uncompressed, over
+/// `/v2/settings/`; the engine asks for `GoogleAndroidApp`, compressed, over
+/// `/v2/settings-compressed/` (see this module's top doc comment) -- so
+/// answering "what changed" needs a copy of *that* document, not just
+/// Cordial's own.
+///
+/// This does not read the engine's traffic. ADR-001 rules out anything that
+/// would need hooking the engine's process to get it, and nothing here does
+/// that: `fetch_engine_copy` is an independent request Cordial's own process
+/// makes, moments apart from the engine's, to the same public CDN URL the
+/// engine is about to ask for itself. The two are not guaranteed to be
+/// byte-identical to what the engine received -- a live rollout could in
+/// principle answer differently a few seconds later, to a second connection
+/// -- but it is the closest thing to that document obtainable without
+/// touching the engine at all, and is intended to be checked against the
+/// engine's own logged size after the fact, not assumed to match it.
+mod history {
+    use super::Source;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub fn dir() -> Option<PathBuf> {
+        std::env::var_os("CORDIAL_SETTINGS_HISTORY").map(PathBuf::from)
+    }
+
+    fn stamp_millis() -> u128 {
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+    }
+
+    /// Writes `bytes` under `dir` as `<millis>-<size>-<tag>.json`. Best-effort
+    /// and silent on failure beyond a printed line: a diagnostic that could
+    /// abort a launch would be worse than the blank screen it exists to
+    /// explain, and `println!` rather than a logger for the same reason the
+    /// rest of this launch path uses it -- `appData/logs/*.log` is the
+    /// engine's, this process's own stdout is Cordial's.
+    fn save(dir: &Path, tag: &str, bytes: &[u8]) {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            println!("  settings history: {}: {e}", dir.display());
+            return;
+        }
+        let name = format!("{}-{}-{tag}.json", stamp_millis(), bytes.len());
+        let path = dir.join(&name);
+        match std::fs::write(&path, bytes) {
+            Ok(()) => println!("  settings history: wrote {name}"),
+            Err(e) => println!("  settings history: {}: {e}", path.display()),
+        }
+    }
+
+    /// Called once per [`super::load_reporting`], whatever `dir()` names.
+    /// Keeps the document this process actually used (tagged with which
+    /// [`Source`] it came from, since a cache hit and a live fetch answering
+    /// the same generation are not the same evidence), and separately fetches
+    /// and decompresses the engine's own URL, saved under its own tag.
+    pub fn record(dir: &Path, body: Option<&str>, source: &Source) {
+        record_with(dir, body, source, fetch_engine_copy)
+    }
+
+    /// Split from [`record`] so the engine-side fetch can be swapped out in a
+    /// test: this is a unit test, not an integration test, and it should not
+    /// depend on this host's network reaching a real Roblox CDN to pass.
+    fn record_with(
+        dir: &Path,
+        body: Option<&str>,
+        source: &Source,
+        fetch: impl FnOnce() -> Result<String, String>,
+    ) {
+        if let Some(body) = body {
+            let tag = match source {
+                Source::Explicit => "cordial-androidapp-explicit",
+                Source::FreshCache => "cordial-androidapp-freshcache",
+                Source::Fetched => "cordial-androidapp-fetched",
+                Source::StaleCache => "cordial-androidapp-stalecache",
+                Source::Nothing(_) => "cordial-androidapp-nothing",
+                Source::EngineDocumentCached => "cordial-enginedoc-cached",
+                Source::EngineDocumentFetched => "cordial-enginedoc-fetched",
+            };
+            save(dir, tag, body.as_bytes());
+        }
+        match fetch() {
+            Ok(decompressed) => save(dir, "engine-googleandroidapp", decompressed.as_bytes()),
+            Err(why) => println!("  settings history: engine copy: {why}"),
+        }
+    }
+
+    fn fetch_engine_copy() -> Result<String, String> {
+        super::fetch_and_decompress(super::ENGINE_URL)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn save_names_the_file_with_timestamp_and_byte_size() {
+            let dir = std::env::temp_dir().join("cordial-settings-history-test");
+            let _ = std::fs::remove_dir_all(&dir);
+            save(&dir, "sometag", b"12345");
+            let entries: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            let name = &entries[0];
+            assert!(name.ends_with("-5-sometag.json"), "{name}");
+            // The prefix before the byte count is a millisecond timestamp:
+            // digits only, non-empty, so a reader can sort the directory by
+            // filename and get chronological order for free.
+            let millis = name.split('-').next().unwrap();
+            assert!(!millis.is_empty() && millis.chars().all(|c| c.is_ascii_digit()), "{name}");
+        }
+
+        #[test]
+        fn dir_reads_the_env_switch() {
+            std::env::remove_var("CORDIAL_SETTINGS_HISTORY");
+            assert_eq!(dir(), None);
+            std::env::set_var("CORDIAL_SETTINGS_HISTORY", "/tmp/somewhere");
+            assert_eq!(dir(), Some(PathBuf::from("/tmp/somewhere")));
+            std::env::remove_var("CORDIAL_SETTINGS_HISTORY");
+        }
+
+        #[test]
+        fn record_with_no_body_writes_nothing_for_the_cordial_side() {
+            let dir = std::env::temp_dir().join("cordial-settings-history-test-nobody");
+            let _ = std::fs::remove_dir_all(&dir);
+            record_with(&dir, None, &Source::Fetched, || Err("no network in a unit test".into()));
+            // No body and a failed engine fetch: nothing to save on either
+            // side, so `save` is never called and the directory is never
+            // even created -- a missing directory here is the pass case, not
+            // an error to unwrap past.
+            let entries: Vec<_> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(entries.is_empty(), "{entries:?}");
+        }
+
+        #[test]
+        fn record_tags_the_cordial_side_document_with_its_source() {
+            let dir = std::env::temp_dir().join("cordial-settings-history-test-tagged");
+            let _ = std::fs::remove_dir_all(&dir);
+            record_with(&dir, Some("{}"), &Source::StaleCache, || {
+                Err("no network in a unit test".into())
+            });
+            let entries: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert!(entries[0].ends_with("-2-cordial-androidapp-stalecache.json"), "{}", entries[0]);
+        }
+
+        #[test]
+        fn record_saves_the_engine_copy_under_its_own_tag_when_the_fetch_succeeds() {
+            let dir = std::env::temp_dir().join("cordial-settings-history-test-enginecopy");
+            let _ = std::fs::remove_dir_all(&dir);
+            record_with(&dir, None, &Source::Fetched, || Ok(r#"{"applicationSettings":{}}"#.into()));
+            let entries: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert!(entries[0].ends_with("-engine-googleandroidapp.json"), "{}", entries[0]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -434,6 +752,15 @@ mod tests {
     /// make this test read the developer's real profile and fail for anyone who
     /// has overrides, which is exactly what it did once one existed. The
     /// behaviour under test is path-versus-network, and that is `load_base`.
+    #[test]
+    fn engine_cache_path_never_collides_with_the_androidapp_cache_path() {
+        // The two endpoints are now known to sometimes disagree (2026-09-24
+        // finding), so a shared cache file would let one silently answer for
+        // the other -- exactly the kind of "looks like a flag problem" bug
+        // this module already warns about for a mismatched application name.
+        assert_ne!(cache_path(), engine_cache_path());
+    }
+
     #[test]
     fn an_explicit_path_bypasses_the_network() {
         let dir = std::env::temp_dir().join("cordial-cs-test");

@@ -45,6 +45,23 @@
 # .deb -- see packaging/deb/control.in's own comment on why that list is
 # translated by hand from the same soname list the other three formats
 # already carry.
+#
+# **appimage, deb and rpm are matrixed over x86_64 and aarch64; arch is not.**
+# GitHub gives free arm64 runners on a public repository (`ubuntu-24.04-arm`),
+# and the three container images these jobs already use --
+# `registry.fedoraproject.org/fedora:44`, `ubuntu:24.04`, `ubuntu:25.10` -- are
+# confirmed multi-arch (`podman manifest inspect` lists an arm64 entry for
+# each), so pointing the same container at an arm64 runner is not a new
+# assumption, just an unused one until now. `archlinux:base-devel` is not: Arch
+# Linux proper ships no aarch64 build at all -- aarch64 is a separate project,
+# Arch Linux ARM, with its own repositories and its own base images, and
+# neither `podman manifest inspect` nor Docker Hub's own tag listing shows an
+# arm64 entry for `archlinux:base-devel` because there genuinely isn't one.
+# Building against ALARM's image instead would not be "the same package on a
+# different arch" the way the other three jobs are -- it is a different
+# distribution with its own package names and its own PKGBUILD conventions --
+# so the `arch` job stays x86_64-only until that is a decision somebody
+# actually wants to make, not a gap filled in by the side effect of a CI edit.
 
 name: Native packages
 
@@ -127,15 +144,33 @@ jobs:
     # own glibc is 2.39, exactly the floor, and its GTK (4.14.5), libadwaita
     # (1.5.0) and WebKitGTK 6.0 (2.52.6) all clear what the workspace's Cargo
     # features now ask for after ADR-032 also found that floor was wrong.
-    name: AppImage (Ubuntu 24.04)
-    runs-on: ubuntu-latest
+    name: AppImage (Ubuntu 24.04, ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      # x86_64 on the ordinary runner, aarch64 on GitHub's free arm64 runner --
+      # same container image both times (ubuntu:24.04 is confirmed multi-arch;
+      # see the header comment), so nothing about the recipe below changes
+      # between legs except what runs-on picks and what packaging/appimage/
+      # build-appimage.sh reads off `uname -m` for itself (the linuxdeploy and
+      # appimagetool downloads, and the multiarch library paths -- see that
+      # script's own comments).
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container: ubuntu:24.04
     # Generous rather than measured: nobody has timed a green run of this job,
     # because authoring it did not include running it (this worktree was
     # asked not to build, to avoid confounding a frame-rate measurement
     # running on the same machine). test.yml's own cargo test --workspace
     # runs in well under this on the same toolchain; linuxdeploy's dependency
-    # walk and appimagetool's squashing add to that, not replace it.
+    # walk and appimagetool's squashing add to that, not replace it. Not
+    # re-measured for the aarch64 leg, which has never run at all -- if it
+    # turns out to need materially longer or shorter, that is this comment's
+    # next correction, not a reason to guess a different number now.
     timeout-minutes: 75
     steps:
       - name: Install build and packaging tools
@@ -174,8 +209,14 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: appimage-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: appimage-cargo-
+          # Keyed by arch as well as by Cargo.lock: the two runners are
+          # different machines with different caches, and a registry cache is
+          # source only (no compiled objects), so there is no correctness risk
+          # in sharing one -- but restore-keys falling back to the *other*
+          # arch's cache on a miss would restore nothing useful and cost the
+          # download anyway, just with an extra round trip first.
+          key: appimage-cargo-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: appimage-cargo-${{ matrix.arch }}-
       - name: Build the AppImage
         run: packaging/appimage/build-appimage.sh --outdir dist/appimage
       - name: Refuse a tag that disagrees with Cargo.toml
@@ -220,7 +261,10 @@ jobs:
       - name: Upload the AppImage
         uses: actions/upload-artifact@v4
         with:
-          name: cordial-appimage
+          # Arch-suffixed so the two matrix legs' uploads do not collide --
+          # upload-artifact@v4 refuses a second upload under a name already
+          # used in this run, unlike v3's silent merge.
+          name: cordial-appimage-${{ matrix.arch }}
           path: dist/appimage/*.AppImage
           if-no-files-found: error
 
@@ -238,8 +282,16 @@ jobs:
     # produces, not a comment fix, and nobody has watched a 24.04 .deb job go
     # green end to end. That is the only thing keeping it here -- not the
     # dependency floor, which no longer excludes the LTS. See ADR-032.
-    name: .deb (Ubuntu 25.10)
-    runs-on: ubuntu-latest
+    name: .deb (Ubuntu 25.10, ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container: ubuntu:25.10
     timeout-minutes: 60
     steps:
@@ -273,8 +325,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: deb-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: deb-cargo-
+          # See the appimage job's identical comment: keyed by arch so a miss
+          # on one runner never restores the other runner's cache.
+          key: deb-cargo-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: deb-cargo-${{ matrix.arch }}-
       - name: Validate the desktop file
         # appstream-util's package name is not verified for Ubuntu 24.04 --
         # unlike desktop-file-validate, which README.md and the other three
@@ -297,13 +351,21 @@ jobs:
       - name: Upload the .deb
         uses: actions/upload-artifact@v4
         with:
-          name: cordial-deb
+          name: cordial-deb-${{ matrix.arch }}
           path: dist/deb/*.deb
           if-no-files-found: error
 
   rpm:
-    name: .rpm (Fedora 44)
-    runs-on: ubuntu-latest
+    name: .rpm (Fedora 44, ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container: registry.fedoraproject.org/fedora:44
     # %check runs the workspace's test suite once inside this job (with the
     # same three session-bus-dependent skips packaging/rpm/cordial.spec
@@ -332,18 +394,37 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: rpm-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: rpm-cargo-
+          # See the appimage job's identical comment: keyed by arch so a miss
+          # on one runner never restores the other runner's cache.
+          key: rpm-cargo-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rpm-cargo-${{ matrix.arch }}-
       - name: Build the binary RPM
         run: packaging/rpm/build-rpm.sh --outdir dist/rpm
       - name: Upload the RPM
         uses: actions/upload-artifact@v4
         with:
-          name: cordial-rpm
+          # rpmbuild names the file after the host's own %{_arch} already
+          # (e.g. cordial-0.17.0-1.fc44.aarch64.rpm), so the *filename* needed
+          # no change for this -- packaging/rpm/build-repo.sh already sorts by
+          # the arch it reads out of that name. Only the artifact name needs
+          # it, for the same upload-artifact@v4 collision reason the appimage
+          # and deb jobs give.
+          name: cordial-rpm-${{ matrix.arch }}
           path: dist/rpm/**/*.rpm
           if-no-files-found: error
 
   arch:
+    # **x86_64 only, deliberately, not yet a gap.** See the header comment for
+    # why: Arch Linux proper has no aarch64 build at all -- that is a separate
+    # project, Arch Linux ARM, with its own repositories and base images, not
+    # a drop-in substitute for `archlinux:base-devel` -- so there is no
+    # official multi-arch image to point this job's runner at the way the
+    # other three jobs' containers already are. Cross-building an Arch package
+    # with `makepkg` for a foreign architecture, or building against an
+    # unofficial ALARM image, are both real options somebody could choose, but
+    # neither is "the same recipe on a different runner" the way the rest of
+    # this file is, so neither is done here without that being an explicit
+    # decision rather than a side effect of this change.
     name: Arch package (archlinux:base-devel)
     runs-on: ubuntu-latest
     container: archlinux:base-devel
@@ -443,4 +524,8 @@ jobs:
       # nothing else, however many of them there end up being.
       artifact_pattern: cordial-*
       file_globs: '*.AppImage *.deb *.rpm *.pkg.tar.zst'
-      expected_count: 4
+      # appimage x2 (x86_64, aarch64) + deb x2 + rpm x2 + arch x1 (x86_64
+      # only -- see that job's own comment) = 7. Update this arithmetic in the
+      # same commit as any change to which of the four jobs above are
+      # matrixed and over how many legs.
+      expected_count: 7

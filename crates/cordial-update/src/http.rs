@@ -26,6 +26,7 @@
 
 use crate::url_policy;
 use crate::Unreachable;
+use std::io::Read as _;
 use std::time::Duration;
 
 /// Identifies this as Cordial, truthfully. ADR-015: never pretends to be the
@@ -78,6 +79,40 @@ pub fn get_text(url: &str) -> Result<String, Unreachable> {
         return Err(Unreachable::Status { url: final_url, status, body });
     }
     Ok(body)
+}
+
+/// GET `url` and return its raw bytes, rather than requiring UTF-8.
+///
+/// [`get_text`] assumes the body decodes as text, which the CDN's compressed
+/// settings documents (`.zst`) do not -- reading one through `get_text` would
+/// either fail outright or silently mangle it under lossy conversion,
+/// depending on the underlying reader. Split out rather than made the default
+/// so every existing caller, which does want text and the clearer error
+/// `get_text` gives on a genuine encoding problem, is untouched.
+pub fn get_bytes(url: &str) -> Result<Vec<u8>, Unreachable> {
+    let host = url_policy::host_of(url)?;
+    let agent = url_policy::agent(CONNECT, TIMEOUT);
+    let (final_url, mut response) =
+        url_policy::walk(&agent, url, &url_policy::Allowed::exactly(host), &[])?;
+
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = response.body_mut().with_config().limit(MAX_BODY).read_to_string().unwrap_or_default();
+        return Err(Unreachable::Status { url: final_url, status, body });
+    }
+    // `read_to_vec` is not a thing on this ureq version's `BodyWithConfig`
+    // (only `read_to_string`, text-shaped); `download.rs` already reads a
+    // response this way for the same reason, via the plain `std::io::Read`
+    // the config hands back.
+    let mut buf = Vec::new();
+    response
+        .body_mut()
+        .with_config()
+        .limit(MAX_BODY)
+        .reader()
+        .read_to_end(&mut buf)
+        .map_err(|e| Unreachable::Transport { url: final_url, why: e.to_string() })?;
+    Ok(buf)
 }
 
 /// GET `url` and parse the body as JSON.

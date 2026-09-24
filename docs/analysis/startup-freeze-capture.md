@@ -21,6 +21,32 @@ variable and it is **not** established which of the two matters, or whether
 both do. Do not read this document as saying the freeze needs a headless
 compositor; it says nobody has separated them yet.
 
+**Corrected 2026-09-17: the freeze does not need a nested compositor.** The
+survey was rerun as a two-by-two, ten launches an arm, one client on the
+machine at a time, on a `just build toolbox` binary of `4c9d1b5`:
+
+```text
+signed in,  nested sway   7 / 10 frozen
+signed in,  host GNOME    4 / 10 frozen
+signed out, nested sway   0 / 10 frozen
+signed out, host GNOME    0 / 10 frozen
+```
+
+Sign-in is the variable. The host session reproduces it, so the 0/7 above was
+too few launches rather than a property of the host. Whether nested sway
+raises the rate is not separable at n=10; the intervals overlap.
+
+**The same descriptor has now been caught in two states.** One frozen client
+captured that day spun: the engine thread was in `looper_poll_once` with
+`timeout_millis=0`, at 9.8 M polls a second and 103% CPU, which matches the
+captures below. The three `0-gdb` captures in `docs/NEXT.md` (2026-09-01) found
+the same pipe parked instead: `timeout_millis=-1`, clamped by
+`BLOCK_CEILING_MS` to 20 polls a second, at 1.6% CPU. In both, Cordial's own
+pump was healthy and nothing wrote the pipe. Two engine call sites waiting on
+one pipe that is never written would explain both readings. That is
+**INFERRED**: no session has caught both states. So a CPU reading alone does
+not tell you whether a client is frozen.
+
 ## What a frozen client is doing
 
 Two readings, and the second one is only meaningful because of the first.

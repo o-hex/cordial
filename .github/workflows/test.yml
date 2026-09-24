@@ -15,6 +15,17 @@
 # scripts die with a pkg-config hint that reads as a missing package rather
 # than an old one, which is a bad hour for whoever meets it first.
 # `justfile`'s `build toolbox` recipe carries the same list.
+#
+# **Matrixed over x86_64 and aarch64, both on real hardware.** GitHub gives an
+# arm64 runner (`ubuntu-24.04-arm`) free on a public repository, and
+# `registry.fedoraproject.org/fedora:44` is confirmed multi-arch, so this
+# costs nothing to add and is worth more than the emulated smoke test
+# elsewhere in this project's toolchain: it is `cargo test` actually executing
+# aarch64 code on an aarch64 CPU, not qemu standing in for one. This is
+# separate from whether *Cordial itself* runs on aarch64 -- see
+# docs/multiarch.md and packaging/rpm/cordial.spec's `ExclusiveArch` for that
+# question, which this test matrix does not answer by itself, only exercises
+# the workspace's own Rust and native code on the architecture.
 name: test
 
 on:
@@ -24,7 +35,15 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container: registry.fedoraproject.org/fedora:44
     steps:
       - name: Install the toolchain

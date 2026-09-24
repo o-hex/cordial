@@ -1533,7 +1533,8 @@ impl HostWindow {
         clock.begin_updating();
 
         let ctx = glib::MainContext::default();
-        let deadline = Instant::now() + Duration::from_millis(40);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(40);
         while !painted.get() && Instant::now() < deadline {
             if !ctx.iteration(false) {
                 // Nothing pending this instant; yield rather than spin a core
@@ -1544,6 +1545,35 @@ impl HostWindow {
 
         clock.end_updating();
         clock.disconnect(handler);
+
+        // **The 40 ms deadline used to expire silently.** Nothing checked
+        // `painted` after the loop above, so a slow frame clock and a
+        // genuinely broken one produced the same thing: the restack went out
+        // regardless, and whether the doc comment's "one frame of flash" case
+        // had actually been hit was unfalsifiable from a user's report of "a
+        // second or a split millisecond" of grey. Reported on both GNOME and
+        // Hyprland, which is itself a reason to suspect a paint that is
+        // slower than 40 ms on some compositor rather than the ordering fix
+        // above, which is compositor-agnostic.
+        //
+        // Logged on the timeout path only. The success path is the common
+        // one -- every textbox focus and blur goes through here -- and a line
+        // on every one of those would bury the rare case it is meant to
+        // surface, the same reasoning `set_engine_stacking`'s own log gives
+        // for staying off the per-frame path. Elapsed time on a *successful*
+        // paint is still worth having when actively chasing this, so it goes
+        // out under `CORDIAL_TRACE_TEXT` -- already the opt-in for text-entry
+        // tracing and already read by this same focus/blur path on the
+        // engine side (`android_classes.cpp`'s `showKeyboard`), rather than a
+        // new variable for one more line in the same feature.
+        if !painted.get() {
+            eprintln!(
+                "[shell] repaint_now: no GTK frame landed within 40ms (waited {:?}); the engine restack went out anyway and may show a frame of the wrong layer",
+                started.elapsed()
+            );
+        } else if std::env::var_os("CORDIAL_TRACE_TEXT").is_some() {
+            eprintln!("[shell] repaint_now: painted after {:?}", started.elapsed());
+        }
     }
 
     pub fn queue_commit(&self) {

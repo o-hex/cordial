@@ -263,6 +263,21 @@ names a user and is refused for having no place.
 Everything else in the launcher query is named in the log and dropped.
 `launchmode` must be `play`: `app` and `edit` are not requests to join anything.
 
+**This refusal has an exception now, and it is a different code path rather
+than a loosened check.** It exists because this section's own input — a
+browser-clicked `roblox-player:` link — only ever gives Cordial a bare
+`placeId` to work with, so carrying one of the parameters above out of it
+*alone* would join the wrong server. Issue #40/#34 found a second, later way
+a join reaches this file: intercepting the Servers-list Join button's own
+`Roblox.Hybrid.Game.launchGame` call (`docs/analysis/app-bridge.md`), which
+hands over the whole payload the page built, including a real `instanceId`
+naming one server. Nothing is lost there the way it would be here, so
+`deeplink::publish_hybrid_game_launch` carries the instance forward as
+`gameInstanceId` instead of refusing — see that function's own doc and
+`crates/cordial-runtime/src/deeplink.rs`'s `SERVER_SELECTING` comment for the
+full reasoning. This section's own refusal is unchanged and still correct for
+the input it guards.
+
 ### 6.3 `describe` printed the ticket, and now does not
 
 **A correction to what this document and the code both implied.** `JoinUrl::describe`
@@ -314,6 +329,16 @@ the other crate.
   the refusal names the parameter and not its value (§6.2).
 - `JoinUrl::describe` printed the desktop form's `gameinfo` ticket before this
   change and does not after (§6.3).
+- **A join through this publish mechanism does land in the requested game,
+  and in the specific requested server, not just the place.** Issue #40/#34's
+  fix (`docs/analysis/app-bridge.md`) extends this same `Linking.detectURL`
+  publish with `gameInstanceId` and the join-attempt fields, on a real
+  signed-in click from a game's Servers list. 8/8 attempts across two public
+  games, each confirmed against the engine's own join log naming the exact
+  server id requested. This is the first signed-in measurement anything in
+  this document had; the gaps below that a signed-in account would close are
+  closed by it specifically for this path, not for `--join-url`,
+  `roblox-player://` or the `gameinfo` ticket question, which remain open.
 
 **Inferred, not verified:**
 

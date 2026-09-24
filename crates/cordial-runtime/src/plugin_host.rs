@@ -321,8 +321,21 @@ pub fn start_all() -> usize {
                 // written on has Deno from Homebrew.
                 let missing = e.kind() == std::io::ErrorKind::NotFound;
                 let detail = if missing {
-                    "Deno is not installed; plugins are Deno programs (ADR-008). Install your distribution's `deno` package, or from https://deno.com, then restart Cordial."
-                        .to_string()
+                    // Inside the Flatpak there is no route to a host package
+                    // manager or to https://deno.com's installer -- the
+                    // sandbox has no host filesystem access at all -- so the
+                    // native install advice is not something a Flatpak user
+                    // can act on. Settings already has a "Deno is not
+                    // installed" row with a Download button for exactly this
+                    // case (see `settings.rs`'s "Plugin runtime" group), so
+                    // point there instead.
+                    if cordial_plugins::sandbox::in_flatpak() {
+                        "Deno is not installed; plugins are Deno programs (ADR-008). Open Settings \u{2192} Plugins and use Download to fetch it, then restart Cordial."
+                            .to_string()
+                    } else {
+                        "Deno is not installed; plugins are Deno programs (ADR-008). Install your distribution's `deno` package, or from https://deno.com, then restart Cordial."
+                            .to_string()
+                    }
                 } else {
                     format!("could not start: {e}")
                 };

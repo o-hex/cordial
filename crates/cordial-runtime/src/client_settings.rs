@@ -220,8 +220,16 @@ pub fn load(explicit: Option<&str>) -> Option<String> {
 /// As [`load`], but says where the document came from (or why there is none)
 /// rather than discarding that fact. The default (`bootstrapTheApp`) launch
 /// path prints it; see `load.rs`'s `BootstrapPlan`.
+///
+/// Timed, because this runs inside the engine's `bootstrapTheApp` callback on
+/// the default path: whatever it takes is time the engine waits on Cordial.
+/// A synchronous fetch here was suspected of causing the signed-in startup
+/// freeze and measured not to (2026-09-24, docs/analysis/startup-freeze-capture.md).
 pub fn load_reporting(explicit: Option<&str>) -> (Option<String>, Source) {
+    let start = std::time::Instant::now();
     let (body, source) = load_base(explicit);
+    let elapsed = start.elapsed();
+    println!("  client settings: load_base took {}ms ({source})", elapsed.as_millis());
     if let Some(dir) = history::dir() {
         history::record(&dir, body.as_deref(), &source);
     }

@@ -248,3 +248,28 @@ The startup experiments tried before this (`CORDIAL_SYNC_BOOTSTRAP`,
 `CORDIAL_SKIP_AGDK_SETTINGS` with a V1 `nativeAppBridgeAppStart`,
 `CORDIAL_SOBER_ORDER`) were each refuted and are removed; they are recorded
 in 179ac13.
+
+## Later on 2026-09-24: delivery path and latency, both refuted
+
+Signed in, interleaved, flag cache reset per run:
+
+| condition | FROZEN |
+|---|---|
+| default, with `CORDIAL_SETTINGS_HISTORY`'s extra fetch in the callback | 3/10 |
+| `--client-settings` file, same extra fetch | 0/10 |
+| default, no extra fetch | 0/10 |
+| `--client-settings` file of the same document, no extra fetch | 0/10 |
+| default, stale cache (synchronous network fetch, 38-261 ms) | 1/8 |
+| default, warm cache (0-4 ms) | 0/8 |
+| warm cache plus a 300 ms sleep in the callback | 0/3 |
+
+Neither how the document arrives nor how long delivery takes separates
+frozen from good: the one stale-cache freeze had a 42 ms fetch, the 261 ms
+one did not freeze, and an injected 300 ms did nothing.
+
+**The rate itself has dropped**: 4 frozen in 49 signed-in runs across these
+batches, against 40-70% before this day. Two things changed on the default
+path that day: the settings document (`GoogleAndroidApp`, 89d494a) and
+`DeviceStaticParams.osVersion` "15" to "33" (d803c47). The second can be
+compared directly, `"15"` against `"33"` on one build; the first cannot while
+the `AndroidApp` document blanks.

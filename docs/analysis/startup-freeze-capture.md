@@ -221,23 +221,27 @@ shipped as default.
 
 ## The settings document, 2026-09-24
 
-The rebuild the freeze hangs in (`Forcing finalize experience coordinator`,
-then `~UgcExperienceController()` never arriving) looks to be caused by
-Cordial handing the engine a different client-settings document from the one
-the engine fetches for itself. Cordial fetched `AndroidApp`; the engine's own
-reloader fetches `GoogleAndroidApp`. Sober never logs the rebuild.
+Cordial fetched the `AndroidApp` client-settings document; the engine's own
+reloader fetches `GoogleAndroidApp`. A Roblox rollout that day left
+`AndroidApp` unable to start the client (grey window, 10/10), while
+`GoogleAndroidApp` reached Landing 10/10. That is fixed in 89d494a (0.18.0).
 
-Measured the same day, while a Roblox rollout left the `AndroidApp` document
-unable to start the client at all: with `GoogleAndroidApp` delivered, 10/10
-signed-out launches reached Landing and 13/13 signed-in launches reached Home,
-all in one cycle with no `Forcing finalize`. Before this change every
-signed-in run in this project's history logged that line. Shipped as the
-default in 89d494a (0.18.0).
+**It does not fix the freeze, and the mismatch is not what causes it.** For a
+few hours that day every run started in one cycle with no
+`Forcing finalize`, which looked like the fix. It was the rollout of the
+moment. Later the same day, signed in, n=10 each, interleaved:
 
-**Not yet shown to fix the freeze.** The control arm (`AndroidApp`) blanked
-rather than rebuilding on the day, so it never entered the path that freezes.
-The comparison that settles it: the pre-rollout `AndroidApp` document
-delivered with `--client-settings` against the default, signed in.
+| | two cycles | FROZEN | GOOD |
+|---|---|---|---|
+| pre-rollout `AndroidApp` document via `--client-settings` (mismatched) | 10/10 | 0/10 | 10/10 |
+| default, `GoogleAndroidApp` (matched) | 10/10 | 3/10 | 7/10 |
+
+The frozen runs have the classic signature: `sync cookies from engine`, then
+no `~UgcExperienceController()`, presents stopped. Untested lead: the
+control also differs in *how* the document arrives (`--client-settings`
+reads a file; the default goes through the fetch and cache path). The arm
+that separates the two is the `GoogleAndroidApp` document delivered with
+`--client-settings`.
 
 The startup experiments tried before this (`CORDIAL_SYNC_BOOTSTRAP`,
 `CORDIAL_STARTUP_RETRY`, `CORDIAL_STARTUP_SELFRELAUNCH`,

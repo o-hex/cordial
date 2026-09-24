@@ -233,14 +233,12 @@ struct PointerLockState {
     locked: bool,
     suppressed: bool,
     ignore_next_warp: bool,
-    needs_warp: bool,
     /// Consecutive locked `MotionNotify` events discarded while waiting for
     /// the confirmed echo of the last recentring warp. See
     /// [`locked_pointer_delta`] for why a single check on the very next event
     /// was not enough, and [`MAX_WARP_ECHO_WAIT`] for the bound.
     warp_echo_wait: u8,
     centre: (i32, i32),
-    last_pos: (i32, i32),
     saved_root: Option<(i32, i32)>,
 }
 
@@ -250,10 +248,8 @@ impl PointerLockState {
             locked: false,
             suppressed: false,
             ignore_next_warp: false,
-            needs_warp: false,
             warp_echo_wait: 0,
             centre: (0, 0),
-            last_pos: (0, 0),
             saved_root: None,
         }
     }
@@ -1022,9 +1018,7 @@ impl HostWindow {
 
             state.locked = true;
             state.ignore_next_warp = true;
-            state.needs_warp = false;
             state.centre = centre;
-            state.last_pos = centre;
             state.saved_root = saved_root;
         }
 
@@ -1076,9 +1070,7 @@ impl HostWindow {
 
             state.locked = false;
             state.ignore_next_warp = false;
-            state.needs_warp = false;
             state.centre = (0, 0);
-            state.last_pos = (0, 0);
 
             (was_locked, saved_root)
         };
@@ -1483,7 +1475,6 @@ impl HostWindow {
                         }
                         state.ignore_next_warp = false;
                         state.warp_echo_wait = 0;
-                        state.last_pos = centre;
                         return;
                     }
                     LockedMotion::Waiting => {
@@ -1496,25 +1487,52 @@ impl HostWindow {
                         }
                         return;
                     }
-                    LockedMotion::Real(..) => {
+                    LockedMotion::Real(dx, dy) => {
                         // Either the ordinary case (no warp outstanding) or
                         // `MAX_WARP_ECHO_WAIT` was reached, in which case the
                         // wait is abandoned here rather than left stuck at
                         // the bound forever.
                         state.warp_echo_wait = 0;
-                        // Compute true incremental delta from the previous reported position.
-                        // This prevents cumulative delta duplication when multiple motion events
-                        // arrive in a single batch before the XWarpPointer request finishes.
-                        let dx = ev.x - state.last_pos.0;
-                        let dy = ev.y - state.last_pos.1;
-                        state.last_pos = (ev.x, ev.y);
                         (dx, dy)
                     }
                 };
                 let (cx, cy) = centre;
 
+                // Preserve the existing Android/AGDK motion path while the
+                // pointer is captured. The absolute position remains the
+                // capture centre, but Roblox still sees the same MotionEvent
+                // sequence it saw before pointer locking was introduced.
+                let input = self
+                    .input
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+
+                let buttons = input.buttons;
+                let down_time = input.down_time_ms;
+                let now = input.clock.elapsed().as_millis() as i64;
+                drop(input);
+
+                let action =
+                    if buttons != 0 {
+                        ACTION_MOVE
+                    } else {
+                        ACTION_HOVER_MOVE
+                    };
+
+                deliver_mouse(
+                    handle,
+                    action,
+                    cx as f32,
+                    cy as f32,
+                    buttons,
+                    0,
+                    now,
+                    down_time,
+                );
+
+                // The relative delta is still delivered through Roblox's
+                // NativeInputInterface path for camera rotation.
                 if dx != 0 || dy != 0 {
-                    state.needs_warp = true;
                     drop(state);
 
                     if super::input::trace_mouse() {
@@ -1524,17 +1542,37 @@ impl HostWindow {
                         );
                     }
 
-                    // Deliver relative delta to Roblox's NativeInputInterface for camera look.
-                    // Note: deliver_mouse (AGDK touch) is deliberately NOT called here,
-                    // matching Wayland backend (see wayland.rs:3839); sending stationary touch events
-                    // at (cx, cy) interferes with Roblox's camera rotation and floods event queues.
                     super::input::pass_mouse_move_delta(
-                        centre.0 as f32,
-                        centre.1 as f32,
+                        cx as f32,
+                        cy as f32,
                         dx as f32,
                         dy as f32,
                     );
+
+                    let mut state = self
+                        .pointer_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+
+                    state.ignore_next_warp = true;
+                    drop(state);
+
+                    unsafe {
+                        (self.xlib.warp_pointer)(
+                            self.display,
+                            0,
+                            self.window,
+                            0,
+                            0,
+                            0,
+                            0,
+                            cx,
+                            cy,
+                        );
+                        (self.xlib.flush)(self.display);
+                    }
                 }
+
                 return;
             }
         }
@@ -1717,21 +1755,22 @@ impl HostWindow {
             report_keyboard_state((gw, gh));
         }
 
-        // Drain any events already sitting in Xlib's client queue.
-        // Only if the queue is empty do we poll the connection socket.
-        if unsafe { (self.xlib.pending)(self.display) } <= 0 {
-            let mut pfd = PollFd { fd: self.conn_fd, events: POLLIN, revents: 0 };
-            let ready = unsafe { poll(&mut pfd as *mut PollFd as *mut c_void, 1, 0) };
-            if ready <= 0 {
-                return;
-            }
+        let mut pfd = PollFd { fd: self.conn_fd, events: POLLIN, revents: 0 };
+        // SAFETY: `pfd` is a live array of length 1; a 0ms timeout makes this a
+        // pure non-blocking check.
+        let ready = unsafe { poll(&mut pfd as *mut PollFd as *mut c_void, 1, 0) };
+        if ready <= 0 {
+            return;
         }
 
         // Bounded so a burst of queued motion events cannot turn one drain
         // call into unbounded work inside the render loop's own timing
         // budget.
-        const MAX_EVENTS_PER_DRAIN: usize = 256;
+        const MAX_EVENTS_PER_DRAIN: usize = 64;
         for _ in 0..MAX_EVENTS_PER_DRAIN {
+            // SAFETY: `self.display` is open; reached only after `poll` above
+            // found the connection readable (or a previous iteration left
+            // events already queued client-side).
             if unsafe { (self.xlib.pending)(self.display) } <= 0 {
                 break;
             }
@@ -1833,38 +1872,6 @@ impl HostWindow {
         }
 
         self.sync_pointer_lock();
-
-        // Recentring: if the locked pointer moved away from centre during this drain,
-        // warp it back to centre ONCE per frame rather than on every single sub-pixel packet.
-        // This avoids flooding the X11 connection socket with hundreds of warp roundtrips per second.
-        {
-            let mut state = self
-                .pointer_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-
-            if state.locked && state.needs_warp {
-                state.needs_warp = false;
-                state.ignore_next_warp = true;
-                let (cx, cy) = state.centre;
-                drop(state);
-
-                unsafe {
-                    (self.xlib.warp_pointer)(
-                        self.display,
-                        0,
-                        self.window,
-                        0,
-                        0,
-                        0,
-                        0,
-                        cx,
-                        cy,
-                    );
-                    (self.xlib.flush)(self.display);
-                }
-            }
-        }
     }
 
     /// The window changed size. Update what the engine is told about it.

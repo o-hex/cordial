@@ -483,11 +483,21 @@ public:
 
     static std::shared_ptr<DeviceStaticParams> Create() {
         auto p = std::make_shared<DeviceStaticParams>();
-        // Desktop values, deliberately. Roblox reads this once and believes it for
-        // the session, so it is the single most load-bearing place to be honest
-        // about what Cordial is. Claiming to be a particular phone would invite
-        // device-specific workarounds that do not apply here.
-        p->osVersion       = str("15");
+        // Desktop values, deliberately, with one exception below. Roblox reads
+        // this once and believes it for the session, so it is the single most
+        // load-bearing place to be honest about what Cordial is. Claiming to be
+        // a particular phone would invite device-specific workarounds that do
+        // not apply here.
+        //
+        // `osVersion` is the exception: it is a compatibility gate, not a
+        // description, which is why `DeviceParams`' copy (`init_params.cpp`)
+        // is already "33". With "15" here, a startup path that reads this
+        // object's field logged `Mode 6 failed: Android version is too old to
+        // activate Vulkan` and never presented (5/5, 2026-09-23). 33 is the API
+        // level a real device reports, `docs/traces/waydroid-roblox-startup.log.gz`:
+        // `OS Ver. = 13, Lvl = 33`. The default path reached Vulkan with either
+        // value in two control runs.
+        p->osVersion       = str("33");
         p->deviceName      = str("Cordial");
         p->manufacturer    = str("Cordial");
         p->deviceSku       = str("cordial");

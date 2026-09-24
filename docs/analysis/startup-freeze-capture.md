@@ -204,3 +204,43 @@ is to count freezes rather than explain one.
 gdb rather than lldb, deliberately. On a genuinely deadlocked client here lldb
 produced one frame per thread, twice; gdb walked the same process and named
 both halves. A one-frame backtrace is not an answer.
+
+## Recovery and prevention, both attempted and neither proven, 2026-09-18
+
+See `docs/NEXT.md`'s "Recovery and a settings-race prevention attempt" entry
+for the full account. In short: `CORDIAL_STARTUP_RETRY` is re-confirmed to
+make a frozen client worse (the retried call never returns, 5/5 this
+session); a settings/flags-ordering fix aimed at matching Sober's clean
+single-pass finalize (`CORDIAL_SYNC_BOOTSTRAP`) made no measured difference
+to whether the finalize-retry line appears at all; and a whole-process
+self-relaunch (`CORDIAL_STARTUP_SELFRELAUNCH`) is mechanically sound but was
+observed to recover 0 of 3 fired attempts in this session's n=20 batch — not
+enough evidence to trust a rate, and possibly evidence that a freeze this
+soon after teardown is not an independent event. None of the three is
+shipped as default.
+
+## The settings document, 2026-09-24
+
+The rebuild the freeze hangs in (`Forcing finalize experience coordinator`,
+then `~UgcExperienceController()` never arriving) looks to be caused by
+Cordial handing the engine a different client-settings document from the one
+the engine fetches for itself. Cordial fetched `AndroidApp`; the engine's own
+reloader fetches `GoogleAndroidApp`. Sober never logs the rebuild.
+
+Measured the same day, while a Roblox rollout left the `AndroidApp` document
+unable to start the client at all: with `GoogleAndroidApp` delivered, 10/10
+signed-out launches reached Landing and 13/13 signed-in launches reached Home,
+all in one cycle with no `Forcing finalize`. Before this change every
+signed-in run in this project's history logged that line. Shipped as the
+default in 89d494a (0.18.0).
+
+**Not yet shown to fix the freeze.** The control arm (`AndroidApp`) blanked
+rather than rebuilding on the day, so it never entered the path that freezes.
+The comparison that settles it: the pre-rollout `AndroidApp` document
+delivered with `--client-settings` against the default, signed in.
+
+The startup experiments tried before this (`CORDIAL_SYNC_BOOTSTRAP`,
+`CORDIAL_STARTUP_RETRY`, `CORDIAL_STARTUP_SELFRELAUNCH`,
+`CORDIAL_SKIP_AGDK_SETTINGS` with a V1 `nativeAppBridgeAppStart`,
+`CORDIAL_SOBER_ORDER`) were each refuted and are removed; they are recorded
+in 179ac13.

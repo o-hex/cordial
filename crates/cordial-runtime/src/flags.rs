@@ -81,6 +81,14 @@ pub enum Source {
     /// for a mode whose tables nothing on this project's hardware has
     /// measured.
     Performance,
+    /// The Settings → Frame rate limit choice, or a measurement run's
+    /// `CORDIAL_FRAME_RATE_LIMIT`. See [`FrameRateLimit`] for the whole of the
+    /// reasoning; kept apart from [`Source::Performance`] for the same reason
+    /// that is its own variant rather than folded into [`Source::Builtin`] --
+    /// the report is read to find out why a flag has the value it has, and
+    /// "you chose a frame rate cap" is a different answer from "you chose a
+    /// worker-pool mode".
+    FrameRateLimit,
 }
 
 impl Source {
@@ -90,6 +98,7 @@ impl Source {
             Source::Plugin(id) => format!("plugin:{id}"),
             Source::Builtin => "built-in".into(),
             Source::Performance => "performance mode".into(),
+            Source::FrameRateLimit => "frame rate limit".into(),
         }
     }
 }
@@ -624,6 +633,188 @@ fn performance_layer() -> Layer {
     Layer { source: Source::Performance, values }
 }
 
+/// The Settings row's frame-rate cap, alongside the display's own refresh and
+/// FIFO/MAILBOX ([`crate::android::vulkan`]) as the third lever `fastflags.md`
+/// says raising the frame rate takes.
+///
+/// **The reset this exists to fix, established rather than assumed.**
+/// `client_settings.rs`'s `apply_overrides` doc comment and
+/// `docs/analysis/flag-init.md` §47/§49 both measure the same mechanism: the
+/// engine's own `DynamicFastVariableReloader` fetches Roblox's settings
+/// document at t≈1.6–2.3 s and again near t≈120 s and *reapplies it*, which
+/// reverts any `DF*` override -- `DFIntTaskSchedulerTargetFps` among
+/// them -- for a key that document contains. That is not a Cordial bug to
+/// patch; it is the engine periodically doing what an Android client's own
+/// settings service is supposed to do. `FIntTaskSchedulerTargetFps` -- the
+/// same name, durable family -- was tried as an escape and measured to do
+/// nothing (§49), so switching families is not an option for this flag.
+///
+/// The fix applied here is not to stop the reloader -- ADR-001 already rules
+/// out anything that would need reaching into the engine to do that -- it is
+/// to out-run it: `bin/load.rs`'s `CORDIAL_REASSERT_FLAGS_MS` re-calls
+/// `nativeInitClientSettings` on a timer for the life of the process, which
+/// `client_settings.rs` already established works (`nativeInitClientSettings`
+/// answers `0` and the new values take effect on a second call, measured
+/// 2026-09-01) and which `flag-init.md`'s three-arm HTTP-trace experiment
+/// quantifies. The [`Performance`] layer's lesson applies again here: the
+/// choice belongs behind a switch someone opts into, because it is measured on
+/// this project's plugin-delivery mechanism and not on whether a session that
+/// reasserts every few seconds ever shows an artefact from doing so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameRateLimit {
+    /// Sets nothing. What Cordial has always done -- the engine's own default,
+    /// which tracks the display refresh closely enough in ordinary use that
+    /// nobody filed it as a cap until they went looking for one.
+    #[default]
+    Display,
+    /// `DFIntTaskSchedulerTargetFps` set to this value, reasserted on a timer.
+    Cap(u32),
+    /// A cap large enough that no display or GPU on this project's hardware
+    /// reaches it -- **9999, extrapolated rather than measured.**
+    /// `flag-init.md` §49 measured the flag tracking 10, 15, 20 and (a
+    /// non-binding) 45; nobody has tried a number this large, and if a future
+    /// build clamps or rejects an implausible cap that would be new
+    /// information this comment does not have. `Cap(u32)` was not reused for
+    /// it because "unlimited" is a request never to be capped, not a request
+    /// for 9999 fps specifically, and a machine that can somehow exceed that
+    /// number should not be held to it by an implementation detail.
+    Unlimited,
+}
+
+impl FrameRateLimit {
+    /// The literal value sent for [`FrameRateLimit::Unlimited`]. A named
+    /// constant rather than a bare `9999` at both call sites, so the value in
+    /// [`frame_rate_limit_flags`] and the value asserted against in tests
+    /// cannot drift apart.
+    pub const UNLIMITED_TARGET: u32 = 9999;
+
+    pub fn parse(text: &str) -> Option<FrameRateLimit> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "" | "display" | "auto" => Some(FrameRateLimit::Display),
+            "unlimited" | "uncapped" | "off" => Some(FrameRateLimit::Unlimited),
+            other => other.parse::<u32>().ok().filter(|n| *n > 0).map(FrameRateLimit::Cap),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            FrameRateLimit::Display => "display refresh".into(),
+            FrameRateLimit::Cap(n) => format!("{n}"),
+            FrameRateLimit::Unlimited => "unlimited".into(),
+        }
+    }
+}
+
+/// The environment variable the shell sets to choose a [`FrameRateLimit`],
+/// following the same reasoning [`PERFORMANCE_ENV`]'s doc gives: `FInt`/`FFlag`
+/// overrides are read once at engine startup, so the choice has to be settled
+/// before the process starts, and an absent variable is what leaves a plugin
+/// room to have its own opinion through [`FRAME_RATE_LIMIT_KEY`].
+pub const FRAME_RATE_LIMIT_ENV: &str = "CORDIAL_FRAME_RATE_LIMIT";
+
+/// The flag-layer key a plugin may set instead, on the same footing
+/// `android::vulkan::PRESENT_MODE_KEY` gives `CordialPresentMode`: a
+/// `Cordial`-prefixed name that rides this module's layering for precedence
+/// and provenance and that `client_settings.rs::is_roblox_flag` filters back
+/// out before anything reaches Roblox's settings document.
+pub const FRAME_RATE_LIMIT_KEY: &str = "CordialFrameRateLimit";
+
+/// Which choice is in force: the environment first (what the shell and a
+/// measurement run both set), then the flag layers, then [`FrameRateLimit::Display`] --
+/// the identical order [`performance`] and `android::vulkan::resolve_present_mode`
+/// already use, and for the identical reason: the environment has to be able to
+/// overrule a plugin that was installed to do something else.
+pub fn frame_rate_limit() -> FrameRateLimit {
+    if let Ok(text) = std::env::var(FRAME_RATE_LIMIT_ENV) {
+        if !text.trim().is_empty() {
+            return match FrameRateLimit::parse(&text) {
+                Some(choice) => choice,
+                None => {
+                    println!(
+                        "  flags: {FRAME_RATE_LIMIT_ENV}={text:?} is not a frame rate limit; \
+                         using display refresh. Known: display, a number of fps, unlimited"
+                    );
+                    FrameRateLimit::Display
+                }
+            };
+        }
+    }
+    let resolved = resolve(collect_without_frame_rate_limit());
+    match resolved.get(FRAME_RATE_LIMIT_KEY).and_then(|r| FrameRateLimit::parse(&r.value)) {
+        Some(choice) => choice,
+        None => FrameRateLimit::Display,
+    }
+}
+
+/// The `DFIntTaskSchedulerTargetFps` override a choice asks for, empty on
+/// [`FrameRateLimit::Display`] -- exactly [`performance_flags`]'s shape, for
+/// the reason [`BUILTIN`]'s doc gives at length: an inference (here, that 9999
+/// behaves as "uncapped" rather than being clamped to something else) belongs
+/// behind a switch somebody chooses rather than a default everybody pays for
+/// silently.
+pub fn frame_rate_limit_flags(choice: FrameRateLimit) -> Vec<(String, String)> {
+    match choice {
+        FrameRateLimit::Display => Vec::new(),
+        FrameRateLimit::Cap(n) => {
+            vec![("DFIntTaskSchedulerTargetFps".to_string(), n.to_string())]
+        }
+        FrameRateLimit::Unlimited => {
+            vec![("DFIntTaskSchedulerTargetFps".to_string(), FrameRateLimit::UNLIMITED_TARGET.to_string())]
+        }
+    }
+}
+
+/// The layer [`frame_rate_limit`]'s choice contributes, empty on `Display`.
+/// Sits at the same precedence as [`performance_layer`] -- a default a plugin
+/// or the user's own `flags.json` may still overrule, which is right for a
+/// value nobody has measured beyond 20 fps.
+fn frame_rate_limit_layer() -> Layer {
+    let choice = frame_rate_limit();
+    let values: BTreeMap<String, String> = frame_rate_limit_flags(choice).into_iter().collect();
+    if !values.is_empty() {
+        println!("  flags: frame rate limit set to {} ({} flag(s))", choice.label(), values.len());
+    }
+    Layer { source: Source::FrameRateLimit, values }
+}
+
+/// [`collect`] without the frame-rate-limit layer itself, so [`frame_rate_limit`]
+/// can read the plugin/user layers for [`FRAME_RATE_LIMIT_KEY`] without calling
+/// itself -- `collect` calls [`frame_rate_limit_layer`], which calls
+/// [`frame_rate_limit`], and a plain `collect()` call here would recurse.
+fn collect_without_frame_rate_limit() -> Vec<Layer> {
+    let mut layers = vec![builtin_layer(), performance_layer()];
+    let profile = crate::profile::active();
+    let mut seen: std::collections::BTreeMap<String, PathBuf> = Default::default();
+    for root in plugin_dirs() {
+        let mut ids: Vec<String> = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        ids.sort();
+        for id in ids {
+            if !seen.contains_key(&id) {
+                seen.insert(id, root.clone());
+            }
+        }
+    }
+    for (id, root) in seen {
+        if !cordial_plugins::enablement::is_enabled(&profile, &id) {
+            continue;
+        }
+        let path = root.join(&id).join("flags.json");
+        if let Some(layer) = read_layer(&path, Source::Plugin(id)) {
+            layers.push(layer);
+        }
+    }
+    if let Some(layer) = read_layer(&user_path(), Source::User) {
+        layers.push(layer);
+    }
+    layers
+}
+
 /// Physical cores, counted from the kernel's own topology.
 ///
 /// `available_parallelism` reports threads, which is the wrong number here. Each
@@ -672,7 +863,7 @@ pub fn collect() -> Vec<Layer> {
         migrate_legacy_user_file(&crate::profile::active());
     });
 
-    let mut layers = vec![builtin_layer(), performance_layer()];
+    let mut layers = vec![builtin_layer(), performance_layer(), frame_rate_limit_layer()];
 
     // System first, so a first-party id is claimed before the user directory is
     // read and a same-id user directory cannot take it. Sorted within each root
@@ -1139,7 +1330,10 @@ pub(crate) mod tests {
     /// other, which is the flake this is written to avoid rather than repeat.
     pub(crate) static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn scratch(tag: &str) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
+    // `pub(crate)` so `frame_rate_limit_tests` (this file, below) can share the
+    // same scratch-and-lock helper rather than a second copy of it -- the same
+    // reasoning `ENV`'s own `pub(crate)` already gives for `plugin_host.rs`.
+    pub(crate) fn scratch(tag: &str) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
         let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("cordial-flags-test-{tag}"));
         let _ = std::fs::remove_dir_all(&root);
@@ -1369,5 +1563,128 @@ mod performance_tests {
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         assert!(p >= 1, "{p}");
         assert!(p <= threads, "physical {p} cannot exceed threads {threads}");
+    }
+}
+
+#[cfg(test)]
+mod frame_rate_limit_tests {
+    use super::*;
+
+    #[test]
+    fn display_is_the_default_and_sets_nothing() {
+        assert_eq!(FrameRateLimit::default(), FrameRateLimit::Display);
+        assert!(frame_rate_limit_flags(FrameRateLimit::Display).is_empty());
+    }
+
+    #[test]
+    fn a_cap_sets_exactly_the_target_fps_flag() {
+        let v = frame_rate_limit_flags(FrameRateLimit::Cap(120));
+        assert_eq!(v, vec![("DFIntTaskSchedulerTargetFps".to_string(), "120".to_string())]);
+    }
+
+    #[test]
+    fn unlimited_sets_the_named_constant_not_a_bare_literal() {
+        let v = frame_rate_limit_flags(FrameRateLimit::Unlimited);
+        assert_eq!(
+            v,
+            vec![(
+                "DFIntTaskSchedulerTargetFps".to_string(),
+                FrameRateLimit::UNLIMITED_TARGET.to_string()
+            )]
+        );
+        // Pinned literally too: a change to the constant should be a visible,
+        // deliberate edit to this test, not something that happens to still
+        // pass because both sides read the same constant.
+        assert_eq!(FrameRateLimit::UNLIMITED_TARGET, 9999);
+    }
+
+    #[test]
+    fn parse_recognises_every_spelling_the_setting_and_env_var_use() {
+        assert_eq!(FrameRateLimit::parse(""), Some(FrameRateLimit::Display));
+        assert_eq!(FrameRateLimit::parse("display"), Some(FrameRateLimit::Display));
+        assert_eq!(FrameRateLimit::parse("Auto"), Some(FrameRateLimit::Display));
+        assert_eq!(FrameRateLimit::parse("unlimited"), Some(FrameRateLimit::Unlimited));
+        assert_eq!(FrameRateLimit::parse("UNCAPPED"), Some(FrameRateLimit::Unlimited));
+        assert_eq!(FrameRateLimit::parse("120"), Some(FrameRateLimit::Cap(120)));
+        assert_eq!(FrameRateLimit::parse(" 90 "), Some(FrameRateLimit::Cap(90)));
+    }
+
+    #[test]
+    fn a_zero_or_negative_cap_is_not_a_real_choice() {
+        // Zero is not established to mean "uncapped" for this flag (see
+        // `FrameRateLimit::Unlimited`'s own doc) and a negative number is not
+        // a frame rate at all, so both must be refused rather than silently
+        // becoming DFIntTaskSchedulerTargetFps=0, which nothing here has
+        // measured the effect of.
+        assert_eq!(FrameRateLimit::parse("0"), None);
+        assert_eq!(FrameRateLimit::parse("-30"), None);
+        assert_eq!(FrameRateLimit::parse("not-a-number"), None);
+    }
+
+    #[test]
+    fn the_environment_variable_wins_over_the_flag_layer_which_wins_over_the_default() {
+        let (root, _g) = super::tests::scratch("frame-rate-limit-precedence");
+        std::env::set_var("CORDIAL_PROFILE_ROOT", &root);
+        std::env::remove_var(FRAME_RATE_LIMIT_ENV);
+        assert_eq!(frame_rate_limit(), FrameRateLimit::Display, "nothing set anywhere");
+
+        let profile = crate::profile::active();
+        std::fs::create_dir_all(&profile).unwrap();
+        write_user_layer(
+            &profile,
+            &[(FRAME_RATE_LIMIT_KEY.to_string(), "144".to_string())].into_iter().collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            frame_rate_limit(),
+            FrameRateLimit::Cap(144),
+            "the flag layer should be read once the env var is absent"
+        );
+
+        std::env::set_var(FRAME_RATE_LIMIT_ENV, "unlimited");
+        assert_eq!(
+            frame_rate_limit(),
+            FrameRateLimit::Unlimited,
+            "the environment must win over a flags.json entry, the same order \
+             performance() and resolve_present_mode() already use"
+        );
+
+        std::env::remove_var(FRAME_RATE_LIMIT_ENV);
+        std::env::remove_var("CORDIAL_PROFILE_ROOT");
+    }
+
+    #[test]
+    fn an_unparseable_env_value_falls_back_to_display_rather_than_the_flag_layer() {
+        let _g = super::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(FRAME_RATE_LIMIT_ENV, "quite fast please");
+        assert_eq!(frame_rate_limit(), FrameRateLimit::Display);
+        std::env::remove_var(FRAME_RATE_LIMIT_ENV);
+    }
+
+    #[test]
+    fn collect_includes_the_frame_rate_limit_layer_and_the_user_still_wins() {
+        let (root, _g) = super::tests::scratch("frame-rate-limit-collect");
+        std::env::set_var("CORDIAL_PROFILE_ROOT", &root);
+        std::env::set_var(FRAME_RATE_LIMIT_ENV, "90");
+
+        let resolved = resolve(collect());
+        assert_eq!(resolved["DFIntTaskSchedulerTargetFps"].value, "90");
+        assert_eq!(resolved["DFIntTaskSchedulerTargetFps"].source, Source::FrameRateLimit);
+
+        // A user override of the same key still wins -- the same precedence
+        // `the_user_beats_a_plugin` asserts for a plugin, one layer over.
+        let profile = crate::profile::active();
+        std::fs::create_dir_all(&profile).unwrap();
+        write_user_layer(
+            &profile,
+            &[("DFIntTaskSchedulerTargetFps".to_string(), "30".to_string())].into_iter().collect(),
+        )
+        .unwrap();
+        let resolved = resolve(collect());
+        assert_eq!(resolved["DFIntTaskSchedulerTargetFps"].value, "30");
+        assert_eq!(resolved["DFIntTaskSchedulerTargetFps"].source, Source::User);
+
+        std::env::remove_var(FRAME_RATE_LIMIT_ENV);
+        std::env::remove_var("CORDIAL_PROFILE_ROOT");
     }
 }

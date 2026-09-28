@@ -50,19 +50,34 @@ an interface that simply has no such control.
 
 | What you want | Where it is |
 |---|---|
-| Stop drawing being pinned to your display's refresh | **Settings → General → Graphics → Frame pacing**, or the FPS Flex plugin — the same lever, so use one or the other |
-| Raise the engine's own target frame rate | the `DFIntTaskSchedulerTargetFps` FastFlag |
+| Stop drawing being pinned to your display's refresh | **Settings → General → Graphics → Frame pacing** (Mailbox is the default since it was measured more responsive than FIFO), or the FPS Flex plugin — the same lever, so use one or the other |
+| Raise the engine's own target frame rate, and keep it there | **Settings → General → Graphics → Frame rate limit** |
 
 They are not the same setting and neither substitutes for the other: Frame pacing
 is `VkSwapchainCreateInfoKHR::presentMode`, which decides whether a finished
-frame waits for the next refresh, and the flag is what the engine's scheduler
-aims at. Leaving the first on FIFO caps you at your panel's rate whatever the
-flag says.
+frame waits for the next refresh, and Frame rate limit is what the engine's own
+scheduler aims at. Leaving Frame pacing on FIFO caps you at your panel's rate
+whatever Frame rate limit says.
+
+**Setting `DFIntTaskSchedulerTargetFps` by hand in `flags.json` still works, and
+now has a documented reason it can stop holding.** The flag is in the `DF*`
+family, which Roblox's own client re-reads from its servers a few seconds into
+a run and again roughly every two minutes — a game refreshing its FastFlags is
+not a Cordial bug, but it does mean a flag written once at launch can be reverted
+to Roblox's own value mid-session. This is what the report below was hitting.
+**Settings → Frame rate limit does not have this problem**: it re-applies its
+chosen value on a timer for the life of the client rather than writing it once,
+specifically to survive the engine's own refresh. Reaching for `flags.json`
+directly still works for a value the Settings row does not offer, but it gets
+none of that protection.
 
 **One report of the flag not holding**, on a machine that reached 240 and fell
-back to 60 after a few minutes. Not reproduced here and not explained; if you
-see the same, [say so on the tracker](https://github.com/luohoa97/cordial/issues)
-rather than assuming your value was wrong.
+back to 60 after a few minutes — this is the mechanism above: the engine's own
+settings refresh reverted a `flags.json` entry that was only ever written once.
+If you see the same *with Frame rate limit set in Settings* rather than a hand
+edited flag, that is a different report and [worth filing on the
+tracker](https://github.com/luohoa97/cordial/issues) — the reassertion interval
+itself has not been measured against a live, signed-in session.
 
 Values may be written as booleans, numbers or strings — Roblox stores them all
 as strings and Cordial converts. The overrides are merged into the settings

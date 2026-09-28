@@ -1255,6 +1255,61 @@ fn build_general_page(
     }
     group.add(&present);
 
+    // Order has to match FrameRateLimit::index/from_index.
+    //
+    // Off by default -- "Display refresh" is first and is what a fresh install
+    // already does, matching Frame pacing's own row just above rather than the
+    // Renderer row's "recommended value first" framing, because there is no
+    // recommendation here yet: nothing on this project's hardware has measured
+    // a cap above the display's own refresh, only that the mechanism holding
+    // one in place against the engine's own reset works (see
+    // `cordial_runtime::flags::FrameRateLimit`'s doc).
+    let frame_rate_model = gtk::StringList::new(&[
+        crate::shell_config::FrameRateLimit::Display.row_label(),
+        crate::shell_config::FrameRateLimit::Cap90.row_label(),
+        crate::shell_config::FrameRateLimit::Cap120.row_label(),
+        crate::shell_config::FrameRateLimit::Cap144.row_label(),
+        crate::shell_config::FrameRateLimit::Cap240.row_label(),
+        crate::shell_config::FrameRateLimit::Unlimited.row_label(),
+    ]);
+    let frame_rate = adw::ComboRow::builder()
+        .title("Frame rate limit")
+        // What a user can act on: what changing it does, and the caveat that
+        // would otherwise read as the setting not working -- the same shape
+        // Frame pacing's own subtitle takes just above. The mechanics -- that
+        // this sets `DFIntTaskSchedulerTargetFps` and keeps re-setting it
+        // against Roblox's own periodic settings refresh -- are in
+        // `shell_config::FrameRateLimit` and `cordial_runtime::flags::FrameRateLimit`
+        // beside the code.
+        .subtitle(
+            "Raises the engine's own frame cap above your display's refresh. \
+             Unlimited is not measured to be free of side effects.",
+        )
+        .model(&frame_rate_model)
+        .selected(config.borrow().frame_rate_limit.index())
+        .build();
+    frame_rate.set_subtitle_lines(2);
+    frame_rate.add_suffix(&detail(
+        "This is a different lever from Frame pacing above: Frame pacing decides whether a \
+         finished frame waits for your display's refresh, and this decides how fast the engine \
+         tries to produce one in the first place. Raising this without also leaving Frame \
+         pacing off FIFO will not uncap anything, because FIFO still queues each present \
+         against the display clock.\n\n\
+         A game can reset FastFlags it fetches from Roblox mid-session; Cordial now \
+         re-applies this choice on a timer rather than setting it once, but the interval between \
+         reassertions has not itself been measured against a live session.",
+    ));
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        frame_rate.connect_selected_notify(move |row| {
+            config.borrow_mut().frame_rate_limit =
+                crate::shell_config::FrameRateLimit::from_index(row.selected());
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&frame_rate);
+
     // A switch rather than a combo, because it is one question with two
     // answers, and it lives beside Frame pacing rather than under Performance
     // because it decides what Cordial tells the engine about the machine --

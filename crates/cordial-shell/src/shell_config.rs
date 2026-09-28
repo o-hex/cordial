@@ -407,6 +407,100 @@ impl PresentMode {
     }
 }
 
+/// The Frame rate limit row: how high `DFIntTaskSchedulerTargetFps` may go,
+/// reasserted by `cordial_runtime::flags::FrameRateLimit` against the engine's
+/// own periodic settings refresh -- see that type's doc comment for the whole
+/// of the mechanism and why a single flag written once was not enough.
+///
+/// **Separate from [`PresentMode`], not a replacement for it.** `fastflags.md`
+/// already documents these as two different levers -- Frame pacing is
+/// `VkSwapchainCreateInfoKHR::presentMode`, this is the engine's own
+/// scheduler target -- and `PresentMode::default()` has been `Mailbox`
+/// (uncapped, no tearing) since before this row existed, so a fresh install
+/// already asks the driver for an uncapped present mode. What was still
+/// missing, and what a user actually reported breaking, was a way to raise the
+/// *engine's* own cap and have it stay raised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrameRateLimit {
+    /// Sets nothing. The engine's own default, and what every Cordial before
+    /// this row shipped.
+    Display,
+    Cap90,
+    Cap120,
+    Cap144,
+    Cap240,
+    /// `DFIntTaskSchedulerTargetFps` set far past anything this project's
+    /// hardware has reached -- see
+    /// `cordial_runtime::flags::FrameRateLimit::UNLIMITED_TARGET`'s doc for
+    /// why that is a reasoned number rather than a measured one.
+    Unlimited,
+}
+
+impl Default for FrameRateLimit {
+    fn default() -> Self {
+        FrameRateLimit::Display
+    }
+}
+
+impl FrameRateLimit {
+    /// Order matches the `AdwComboRow` model in `settings.rs`, as
+    /// [`PresentMode::index`] does. Display refresh is 0 because it is the
+    /// default and the row lists it first, the same reasoning the Renderer row
+    /// gives for putting Automatic first there.
+    pub fn index(self) -> u32 {
+        match self {
+            FrameRateLimit::Display => 0,
+            FrameRateLimit::Cap90 => 1,
+            FrameRateLimit::Cap120 => 2,
+            FrameRateLimit::Cap144 => 3,
+            FrameRateLimit::Cap240 => 4,
+            FrameRateLimit::Unlimited => 5,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            0 => FrameRateLimit::Display,
+            1 => FrameRateLimit::Cap90,
+            2 => FrameRateLimit::Cap120,
+            3 => FrameRateLimit::Cap144,
+            4 => FrameRateLimit::Cap240,
+            _ => FrameRateLimit::Unlimited,
+        }
+    }
+
+    /// The word `cordial_runtime::flags::FrameRateLimit::parse` takes out of
+    /// `CORDIAL_FRAME_RATE_LIMIT`. Always `Some`, unlike
+    /// [`PresentMode::as_env`] -- there is no flag-layer state a plugin loses
+    /// by this being sent unconditionally, because
+    /// `cordial_runtime::flags::FRAME_RATE_LIMIT_KEY` is only consulted when
+    /// the environment variable is *absent*, and the shell always sets it (see
+    /// `launch.rs`), the same unconditional send `CORDIAL_THROTTLE` already
+    /// uses for a row with no plugin-facing flag either.
+    pub fn as_env(self) -> &'static str {
+        match self {
+            FrameRateLimit::Display => "display",
+            FrameRateLimit::Cap90 => "90",
+            FrameRateLimit::Cap120 => "120",
+            FrameRateLimit::Cap144 => "144",
+            FrameRateLimit::Cap240 => "240",
+            FrameRateLimit::Unlimited => "unlimited",
+        }
+    }
+
+    pub fn row_label(self) -> &'static str {
+        match self {
+            FrameRateLimit::Display => "Display refresh",
+            FrameRateLimit::Cap90 => "90 fps",
+            FrameRateLimit::Cap120 => "120 fps",
+            FrameRateLimit::Cap144 => "144 fps",
+            FrameRateLimit::Cap240 => "240 fps",
+            FrameRateLimit::Unlimited => "Unlimited",
+        }
+    }
+}
+
 /// Which PipeWire sink Roblox's audio goes to, by stable `node.name`.
 ///
 /// Empty — the default — means *follow the system default sink*, and it has to
@@ -720,6 +814,16 @@ pub struct ShellConfig {
     /// upgrading gets a different feel than they had.
     #[serde(default)]
     pub present_mode: PresentMode,
+    /// How far `DFIntTaskSchedulerTargetFps` may be raised, and reasserted, on
+    /// top of the present mode above. See [`FrameRateLimit`] for the reasoning
+    /// and the reset it exists to survive.
+    ///
+    /// `#[serde(default)]` for the same reason `present_mode` carries it: a
+    /// `shell.json` written before this row existed has no such key, and it
+    /// must load as `Display` -- what every build before this one already
+    /// did -- rather than fail to parse.
+    #[serde(default)]
+    pub frame_rate_limit: FrameRateLimit,
     /// Whether Cordial reads `/dev/input/js*` and tells Roblox about pads.
     ///
     /// On by default. Off is a real setting rather than a debugging knob:
@@ -895,6 +999,7 @@ impl Default for ShellConfig {
             graphics: "automatic".to_string(),
             graphics_optimization_mode: GraphicsOptimization::default(),
             present_mode: PresentMode::default(),
+            frame_rate_limit: FrameRateLimit::default(),
             gamepad: true,
             close_on_leave: false,
             unpacked_plugins: Vec::new(),
@@ -1286,6 +1391,67 @@ mod tests {
         let older = r#"{"gamemode":true,"graphics":"automatic","mangohud":false}"#;
         let parsed: ShellConfig = serde_json::from_str(older).expect("an older shell.json must load");
         assert_eq!(parsed.present_mode, PresentMode::Mailbox);
+    }
+
+    /// A fresh install sends nothing extra: the frame rate stays capped at the
+    /// display refresh, which is what every Cordial before this row shipped.
+    #[test]
+    fn a_fresh_install_does_not_raise_the_frame_rate_cap() {
+        assert_eq!(ShellConfig::default().frame_rate_limit, FrameRateLimit::Display);
+        assert_eq!(FrameRateLimit::default().as_env(), "display");
+    }
+
+    /// Unlike [`PresentMode::as_env`], every variant here is `Some` in effect --
+    /// there is no plugin-facing state an unconditional send would make
+    /// unreachable, so the row is simpler than Frame pacing in exactly the way
+    /// its own doc comment says.
+    ///
+    /// This cannot also assert that `cordial_runtime::flags::FrameRateLimit::parse`
+    /// accepts these exact spellings back -- `cordial-shell` cannot depend on
+    /// `cordial-runtime` (see `refresh_watch.rs`'s header for the cyclic-crate
+    /// error that already ruled that out for a different pair of types), the
+    /// same wall this enum's own doc comment names. `cordial_runtime::flags`'s
+    /// `parse_recognises_every_spelling_the_setting_and_env_var_use` test is
+    /// the other half of this contract, on the correct side of that wall.
+    #[test]
+    fn every_choice_names_itself_to_the_client() {
+        for (mode, spelling) in [
+            (FrameRateLimit::Display, "display"),
+            (FrameRateLimit::Cap90, "90"),
+            (FrameRateLimit::Cap120, "120"),
+            (FrameRateLimit::Cap144, "144"),
+            (FrameRateLimit::Cap240, "240"),
+            (FrameRateLimit::Unlimited, "unlimited"),
+        ] {
+            assert_eq!(mode.as_env(), spelling);
+        }
+    }
+
+    /// The combo model's positions and the enum must not drift apart -- the
+    /// same rule [`present_mode_survives_the_combo_row_round_trip`] checks for
+    /// Frame pacing, one row down.
+    #[test]
+    fn frame_rate_limit_survives_the_combo_row_round_trip() {
+        for mode in [
+            FrameRateLimit::Display,
+            FrameRateLimit::Cap90,
+            FrameRateLimit::Cap120,
+            FrameRateLimit::Cap144,
+            FrameRateLimit::Cap240,
+            FrameRateLimit::Unlimited,
+        ] {
+            assert_eq!(FrameRateLimit::from_index(mode.index()), mode);
+        }
+    }
+
+    /// A `shell.json` from before this row existed must still load, and must
+    /// read as `Display` -- what every build before this one already did --
+    /// rather than fail to parse or silently raise somebody's cap.
+    #[test]
+    fn an_older_config_without_the_frame_rate_limit_key_keeps_the_cap_it_had() {
+        let older = r#"{"gamemode":true,"graphics":"automatic","mangohud":false}"#;
+        let parsed: ShellConfig = serde_json::from_str(older).expect("an older shell.json must load");
+        assert_eq!(parsed.frame_rate_limit, FrameRateLimit::Display);
     }
 
     /// Everybody's `shell.json` predates the multi-instance warning, and a

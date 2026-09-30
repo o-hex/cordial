@@ -266,6 +266,10 @@ pub fn build(
     // is why the launcher looks the same as it always did on every run where no
     // link arrives.
     let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    // Above the join banner: it is about the whole session and standing, where
+    // a queued join is about one click. Not revealed on Wayland, so the
+    // launcher there is unchanged.
+    body.append(&crate::x11_notice::build(crate::x11_notice::running_on_x11()));
     body.append(join.banner());
     body.append(&clamp);
     toasts.set_child(Some(&body));
@@ -337,7 +341,7 @@ pub fn build(
     primary_menu.append(Some("_Preferences"), Some("win.settings::"));
     // The one report screen. The About dialog and the launcher's X11 notice
     // open the same thing; see `report.rs`.
-    primary_menu.append(Some("_Report a Problem"), Some("win.report"));
+    primary_menu.append(Some("_Report a Problem"), Some(crate::x11_notice::REPORT_ACTION));
     primary_menu.append(Some("_About Cordial"), Some("win.about"));
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")

@@ -45,6 +45,7 @@ mod root_warning;
 mod settings;
 mod shell_config;
 mod updater;
+mod x11_notice;
 // The window itself needs webkitgtk6.0-devel, which an immutable host does not
 // have; the policy beside it needs nothing and is always compiled, because it is
 // the part that has to be right and it should be under test everywhere.

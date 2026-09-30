@@ -71,6 +71,7 @@ All 42. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDO
 | [ADR-042](adr/ADR-042-texture-format-query-observability.md) | Vulkan texture-format queries are counted and, test-only, maskable — nothing is translated |
 | [ADR-043](adr/ADR-043-the-roblox-build-is-the-binarys-architecture.md) | The Roblox build's architecture is the binary's; choosing another needs a second runtime, so Settings shows it read-only |
 | [ADR-044](adr/ADR-044-settings-reach-a-running-game.md) | Settings that can change reach a running game over a small socket; the rest say "Applies at next launch" |
+| [ADR-045](adr/ADR-045-one-report-screen-outside-settings.md) | One Report a Problem screen, outside Settings; the launcher says so when the game will open on X11 |
 
 ## Design notes
 

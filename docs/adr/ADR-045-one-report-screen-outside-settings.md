@@ -1,0 +1,45 @@
+# ADR-045: One report screen, outside Settings, and a notice on X11
+
+**Status:** accepted
+**Date:** 2026-09-30
+**Related:** [ADR-011](ADR-011-wayland-and-libadwaita.md), [ADR-024](ADR-024-x11-is-supported-again.md), [ADR-030](ADR-030-reports-arrive-from-discord.md)
+
+## Decision
+
+1. **The diagnostics block lives on one screen, `report.rs`, titled "Report a
+   Problem".** It has the block, Copy, Save to a file, and a link to the issue
+   form. It replaces Settings' Report page and the About dialog's
+   Troubleshooting page, which showed the same `diagnostics::report()` text
+   and were found separately or not at all.
+2. **It is an `AdwDialog` of its own, not the About dialog's Troubleshooting
+   page.** `AdwAboutDialog` cannot be opened on a chosen page, and the
+   launcher's X11 notice has to land exactly here. The About dialog no longer
+   sets `debug_info`. Its "Report an Issue" row is intercepted with
+   `activate-link` and opens this screen instead of the web form; the row
+   keeps libadwaita's external-link icon, which is not quite true.
+3. **Settings holds settings.** Its pages are Roblox, Updates, Version, General,
+   Plugins and FastFlags. Report was the one page that was not a setting.
+   The entry points are the main menu's "Report a Problem", the About dialog,
+   and the launcher notice.
+4. **The launcher shows a notice when the game will open on X11.** An
+   `AdwBanner`: "X11 support is buggy. If something goes wrong, try Wayland."
+   with a Report a Problem button. "Will open on X11" is the loader's own rule,
+   `cordial_runtime::android::backend()`: `CORDIAL_X11` set, or no
+   `WAYLAND_DISPLAY`. `x11_notice::uses_x11` repeats it over the same two
+   variables, and the two must be changed together. It is deliberately not "the
+   launcher's GDK display is X11": a session exporting `GDK_BACKEND=x11` over a
+   Wayland compositor runs the game on Wayland.
+
+## Rejected
+
+**A link inside the banner text.** `AdwBanner` exposes no `activate-link`, so a
+link would have opened a web page or needed a walk of the banner's internal
+widgets. The banner's button is the libadwaita way to attach an action.
+
+## Not verified
+
+Under real X11 the launcher was not photographed: Xwayland would not start in
+the nested compositor used here (`/tmp/.X11-unix` not owned by the user inside
+the container). The banner was shown with `CORDIAL_X11=1` on Wayland, which
+takes the same branch; the no-`WAYLAND_DISPLAY` branch is covered by a unit test
+of `uses_x11` only.

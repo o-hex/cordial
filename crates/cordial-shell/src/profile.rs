@@ -791,6 +791,92 @@ pub fn all_pinned_versions() -> Vec<String> {
     pinned
 }
 
+/// What deleting a profile left undone, for the caller to say.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Removed {
+    /// Set when the desktop keyring could not be reached, so a session token
+    /// kept there for this profile could not be erased. The files are gone.
+    pub keyring_unreached: Option<String>,
+}
+
+/// Why a profile was not deleted.
+#[derive(Debug)]
+pub enum RemoveError {
+    /// No such profile.
+    Missing,
+    /// Open in a running client, or not usable. Deleting a profile a client is
+    /// writing to is the two-writers corruption ADR-012 exists to prevent, and
+    /// the same lock that guards a launch refuses it.
+    Claim(Error),
+    /// The saved sign-in could not be erased, so **nothing was deleted**.
+    Erase(String),
+    /// The sign-in is gone and the directory could not be removed.
+    Delete(String),
+}
+
+impl std::fmt::Display for RemoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoveError::Missing => f.write_str("there is no such profile"),
+            RemoveError::Claim(e) => write!(f, "{e}"),
+            RemoveError::Erase(e) => write!(f, "{e}. Nothing was deleted."),
+            RemoveError::Delete(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Delete a profile: its saved sign-in, settings, FastFlags, plugin grants,
+/// window state and Roblox's own data for it.
+///
+/// **The saved sign-in is erased first, from the keyring as well as the
+/// profile.** Keyring entries are keyed by the profile's directory
+/// (`secrets::attributes`), so deleting the directory alone would leave a live
+/// session token in the keyring with nothing that would ever read or remove it,
+/// and a later profile in the same place would inherit it. If either erase
+/// fails, nothing is deleted.
+///
+/// The profile's lock is taken the way a launch takes it, so a profile open in
+/// a running client is refused rather than pulled out from under it. The
+/// directory is renamed aside before it is removed, so an interrupted deletion
+/// leaves no half-profile under the old name; the leftover has a name `list`
+/// does not offer and the next attempt clears it.
+///
+/// It does not decide which profile is "current": that is a launcher setting,
+/// and the caller has to pick another.
+///
+/// Adapted from DamnShabu/stacked's `remove_profile` (GPL-3.0-or-later).
+pub fn remove(name: &str) -> Result<Removed, RemoveError> {
+    remove_with(name, || match crate::secrets::usable() {
+        Ok(()) => (crate::secrets::Store::Keyring, None),
+        Err(why) => (crate::secrets::Store::File, Some(why)),
+    })
+}
+
+/// [`remove`] with the choice of secret store made by the caller, so the file
+/// branch is testable without a session bus.
+pub fn remove_with(
+    name: &str,
+    pick_store: impl FnOnce() -> (crate::secrets::Store, Option<String>),
+) -> Result<Removed, RemoveError> {
+    if !list().iter().any(|n| n == name) {
+        return Err(RemoveError::Missing);
+    }
+    let claim = acquire(name).map_err(RemoveError::Claim)?;
+    let dir = claim.profile_dir().to_path_buf();
+    let (store, keyring_unreached) = pick_store();
+    for kind in [crate::secrets::Kind::Cookies, crate::secrets::Kind::Identity] {
+        crate::secrets::erase(store, &dir, kind)
+            .map_err(|e| RemoveError::Erase(format!("could not erase the saved {}: {e}", kind.name())))?;
+    }
+    let aside = dir.with_file_name(format!(".{name}.removing"));
+    let _ = std::fs::remove_dir_all(&aside);
+    std::fs::rename(&dir, &aside)
+        .and_then(|()| std::fs::remove_dir_all(&aside))
+        .map_err(|e| RemoveError::Delete(format!("{}: {e}", dir.display())))?;
+    drop(claim);
+    Ok(Removed { keyring_unreached })
+}
+
 /// A size for a sentence.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [(&str, u64); 3] = [("GB", 1_000_000_000), ("MB", 1_000_000), ("kB", 1_000)];
@@ -898,6 +984,84 @@ mod tests {
         std::fs::create_dir_all(&p).unwrap();
         std::env::set_var("CORDIAL_PROFILE_ROOT", &p);
         (p, guard)
+    }
+
+    fn file_store() -> (crate::secrets::Store, Option<String>) {
+        (crate::secrets::Store::File, None)
+    }
+
+    #[test]
+    fn deleting_a_profile_removes_its_directory_and_its_saved_sign_in() {
+        let (root, _g) = scratch("remove");
+        drop(acquire("gone").unwrap());
+        drop(acquire("kept").unwrap());
+        let dir = dir("gone").unwrap();
+        std::fs::write(dir.join("cookies"), "session").unwrap();
+        std::fs::write(dir.join("identity"), "who").unwrap();
+        std::fs::create_dir_all(dir.join("data/files")).unwrap();
+        std::fs::write(dir.join("data/files/x"), "y").unwrap();
+
+        assert_eq!(remove_with("gone", file_store).unwrap(), Removed::default());
+
+        assert!(!dir.exists(), "the directory must be gone");
+        assert_eq!(list(), vec!["kept".to_string()], "only the named profile goes");
+        assert!(!root.join(".gone.removing").exists(), "no half-deleted directory is left behind");
+    }
+
+    #[test]
+    fn a_profile_that_is_open_is_refused_and_untouched() {
+        let (_root, _g) = scratch("remove-busy");
+        let running = acquire("live").unwrap();
+        std::fs::write(dir("live").unwrap().join("cookies"), "session").unwrap();
+        assert!(matches!(remove_with("live", file_store), Err(RemoveError::Claim(Error::Busy(..)))));
+        assert!(dir("live").unwrap().join("cookies").is_file(), "a refused deletion must delete nothing");
+        drop(running);
+    }
+
+    #[test]
+    fn a_profile_that_does_not_exist_is_missing_and_is_not_created() {
+        let (_root, _g) = scratch("remove-missing");
+        assert!(matches!(remove_with("nothing", file_store), Err(RemoveError::Missing)));
+        assert!(list().is_empty(), "asking to delete must not create it");
+    }
+
+    /// A previous deletion that died between the rename and the removal.
+    #[test]
+    fn an_interrupted_deletion_does_not_block_the_next() {
+        let (root, _g) = scratch("remove-leftover");
+        drop(acquire("again").unwrap());
+        std::fs::create_dir_all(root.join(".again.removing/data")).unwrap();
+        remove_with("again", file_store).unwrap();
+        assert!(!root.join(".again.removing").exists());
+        assert!(!list().contains(&"again".to_string()));
+    }
+
+    /// **Needs a session bus and a Secret Service**, and writes one entry
+    /// keyed by a scratch path into it, which the deletion removes again. Run
+    /// with `--ignored` on a desktop session; it is the branch the file tests
+    /// cannot reach.
+    #[test]
+    #[ignore = "uses the desktop's Secret Service"]
+    fn deleting_a_profile_erases_its_keyring_session() {
+        use crate::secrets::{Kind, Store};
+        if crate::secrets::usable().is_err() {
+            eprintln!("no usable Secret Service here; nothing was tested");
+            return;
+        }
+        let (_root, _g) = scratch("remove-keyring");
+        drop(acquire("signed-in").unwrap());
+        let dir = dir("signed-in").unwrap();
+        crate::secrets::save(Store::Keyring, &dir, Kind::Cookies, "a session token").unwrap();
+        assert_eq!(crate::secrets::load(Store::Keyring, &dir, Kind::Cookies).as_deref(), Some("a session token"));
+
+        remove("signed-in").unwrap();
+
+        // The directory is gone, so read the same key back through the service.
+        assert_eq!(
+            crate::secrets::load(Store::Keyring, &dir, Kind::Cookies),
+            None,
+            "the token must not outlive the profile"
+        );
     }
 
     #[test]

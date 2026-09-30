@@ -182,6 +182,9 @@ MangoHud's Vulkan layer is installed. Install routes and what it shows:
 people running the same engine, what Cordial does about it, and the Flatpak
 driver-extension trap: [`docs/nvidia.md`](docs/nvidia.md).
 
+**Profiles** are picked and created above the Launch button, and the trash button beside them deletes the
+shown one, its keyring sign-in included, after a confirmation.
+
 **Separate data roots** per instance come from `XDG_DATA_HOME`, which moves both
 the profile root and the client's data directory. `CORDIAL_PROFILE_ROOT` moves
 only the profile root and not the client.

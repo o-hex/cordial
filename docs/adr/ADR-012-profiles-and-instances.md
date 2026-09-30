@@ -457,3 +457,17 @@ stronger costs more than the problem.
 If Roblox ever ships storage that tolerates concurrent access from two clients,
 the lock becomes unnecessary and same-profile multi-instance becomes free.
 Nothing suggests that is coming.
+
+## Added 2026-09-30: deleting a profile
+
+A profile could be created and never deleted. The launcher's profile row now has
+a Delete button, backed by `profile::remove`: it takes the profile's lock the way
+a launch does (so an open profile is refused), erases the saved sign-in from the
+desktop keyring as well as the profile (entries are keyed by the profile's
+directory, so removing the directory alone would leave a live token behind), and
+only then renames the directory aside and removes it. If the sign-in cannot be
+erased nothing is deleted. Where the keyring cannot be reached the files are
+still removed and the launcher says a keyring entry may remain. The row moves to
+another profile afterwards, or to `default`, which is created when next
+launched.
+

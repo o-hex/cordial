@@ -178,6 +178,9 @@ struct Switcher {
     config_path: Rc<PathBuf>,
     row: adw::ComboRow,
     model: gtk::StringList,
+    /// Deletes the profile shown. Insensitive when there is none on disk to
+    /// delete, which is the state of a fresh install.
+    delete: gtk::Button,
     /// Set while [`Switcher::refresh`] is rewriting the model, because
     /// `set_selected` emits the same notification a user's choice does. Without
     /// it, repopulating the list writes whatever happens to be at the selected
@@ -231,7 +234,9 @@ impl Switcher {
         // incidental: `profile::acquire` creates the directory on its way to the
         // lock, so asking whether a not-yet-created profile is free would create
         // it — a launcher conjuring an account out of drawing its own subtitle.
-        let availability = offered().iter().any(|n| *n == name).then(|| availability(&name));
+        let exists = offered().contains(&name);
+        self.delete.set_sensitive(exists);
+        let availability = exists.then(|| availability(&name));
         let pin = profile::dir(&name).ok().and_then(|d| profile::pinned_version(&d));
         self.row.set_subtitle(&with_pin(subtitle(&name, availability.as_ref()), pin.as_deref()));
     }
@@ -277,11 +282,17 @@ pub fn build(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> Choo
     row.set_subtitle_lines(3);
     row.set_list_factory(Some(&list_factory()));
 
+    let delete = gtk::Button::from_icon_name("user-trash-symbolic");
+    delete.set_tooltip_text(Some("Delete profile…"));
+    delete.set_valign(gtk::Align::Center);
+    delete.add_css_class("flat");
+
     let switcher = Switcher {
         config,
         config_path,
         row: row.clone(),
         model,
+        delete: delete.clone(),
         updating: Rc::new(Cell::new(false)),
     };
 
@@ -314,6 +325,18 @@ pub fn build(config: Rc<RefCell<ShellConfig>>, config_path: Rc<PathBuf>) -> Choo
         });
     }
     row.add_suffix(&new);
+
+    // Beside "New profile…", for the same reason it is a button and not a list
+    // entry: an action is not a value. It deletes the profile the row shows.
+    {
+        let switcher = switcher.clone();
+        delete.connect_clicked(move |button| {
+            if let Some(window) = button.root().and_downcast::<gtk::Window>() {
+                delete_current(&window, &switcher);
+            }
+        });
+    }
+    row.add_suffix(&delete);
 
     switcher.refresh();
 
@@ -412,6 +435,78 @@ fn list_factory() -> gtk::SignalListItemFactory {
     });
 
     factory
+}
+
+/// What the confirmation says. Split from the dialog so the wording, which is
+/// the only thing standing between somebody and an unrecoverable deletion, is
+/// tested.
+///
+/// **It names the keyring**, because the sign-in is the part people do not think
+/// of as "in the profile", and it says the deletion cannot be undone.
+fn delete_body(name: &str, data_bytes: u64) -> String {
+    let data = if data_bytes == 0 {
+        "Roblox's data for it".to_string()
+    } else {
+        format!("Roblox's data for it ({})", profile::human_bytes(data_bytes))
+    };
+    format!(
+        "This deletes profile {name:?}: its saved sign-in, including the copy in your desktop \
+         keyring, its settings, FastFlags and plugin grants, and {data}. It cannot be undone."
+    )
+}
+
+/// Confirm, then delete the profile the row shows and move to another.
+///
+/// **The confirmation is a real one**: a destructive-appearance response that is
+/// not the default, so Enter cancels. Deleting the shown profile is allowed,
+/// unlike the fork's command line, which refused the current profile: here the
+/// shown profile *is* the current one, and refusing would make the only profile
+/// undeletable. Afterwards the row moves to whichever profile remains, or back
+/// to `default`, which is created when it is next launched.
+fn delete_current(parent: &gtk::Window, switcher: &Switcher) {
+    let name = switcher.current();
+    if !offered().contains(&name) {
+        return;
+    }
+    let bytes = profile::dir(&name).map(|d| profile::engine_data_bytes(&d)).unwrap_or(0);
+    let dialog = adw::AlertDialog::builder()
+        .heading(format!("Delete profile {name:?}?"))
+        .body(delete_body(&name, bytes))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let switcher = switcher.clone();
+    let parent = parent.clone();
+    let present_parent = parent.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "delete" {
+            return;
+        }
+        match profile::remove(&name) {
+            Ok(removed) => {
+                let next = offered().into_iter().next().unwrap_or_else(|| "default".to_string());
+                switcher.choose(&next);
+                switcher.refresh();
+                if let Some(why) = removed.keyring_unreached {
+                    crate::window::alert(
+                        &parent,
+                        "Profile deleted, but not its keyring entry",
+                        &format!(
+                            "The desktop keyring was not available ({why}), so a sign-in kept there for \
+                             this profile could not be erased. Remove it in your keyring application \
+                             (Seahorse, KeePassXC) under \"Cordial\"."
+                        ),
+                    );
+                }
+            }
+            Err(e) => crate::window::alert(&parent, "Cordial could not delete that profile", &e.to_string()),
+        }
+    });
+    dialog.present(Some(&present_parent));
 }
 
 /// Make a profile, or say why not.
@@ -605,6 +700,15 @@ mod tests {
                 "{name} is offered by the list but refused by the create dialog"
             );
         }
+    }
+
+    #[test]
+    fn the_confirmation_names_the_profile_the_keyring_and_that_it_cannot_be_undone() {
+        let body = delete_body("alt", 0);
+        assert!(body.contains("\"alt\""), "{body}");
+        assert!(body.contains("keyring"), "{body}");
+        assert!(body.contains("cannot be undone"), "{body}");
+        assert!(delete_body("alt", 2_500_000_000).contains("2.5 GB"), "{}", delete_body("alt", 2_500_000_000));
     }
 
     #[test]

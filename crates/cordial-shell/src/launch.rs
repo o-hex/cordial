@@ -141,6 +141,10 @@ pub struct Instance {
     /// immediately — an exit code on its own says nothing about what was run.
     pub command_line: String,
     tail: Tail,
+    /// Where this client listens for live setting changes, and what it was
+    /// started with, so `live` can send it only what differs (ADR-044).
+    pub live_socket: PathBuf,
+    pub launched_with: Vec<cordial_shell::live_wire::Update>,
 }
 
 /// Per-launch values that may be absent for an ordinary button launch.
@@ -333,6 +337,7 @@ pub fn spawn(
     // One value decides where everything else lives, and an argument cannot
     // change while the client runs, which is exactly what the dynamic DFFlag
     // families exist for (ADR-013).
+    let profile_dir = claim.profile_dir().to_path_buf();
     let profile_name = claim
         .profile_dir()
         .file_name()
@@ -607,7 +612,13 @@ pub fn spawn(
     // quitting the shell would be the thing that released it.
     drop(claim);
 
-    Ok(Instance { child, command_line, tail })
+    Ok(Instance {
+        child,
+        command_line,
+        tail,
+        live_socket: cordial_shell::live_wire::socket_path(&profile_dir),
+        launched_with: crate::live::live_updates(&config),
+    })
 }
 
 fn pin_secret_store(command: &mut Command, store: Option<Store>) {

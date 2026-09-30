@@ -1082,6 +1082,10 @@ fn try_launch_tracked(
     };
     join.clear();
     lifecycle.client_started();
+    // From here Settings changes reach this client as well as the next launch:
+    // see `live`. Registered with the values its environment carried, so a
+    // change made while it loads is sent once its socket exists.
+    crate::live::register(instance.pid(), instance.live_socket.clone(), instance.launched_with.clone());
 
     let starting = starting_dialog(&window, &profile_name, url.is_some());
 
@@ -1153,6 +1157,7 @@ fn try_launch_tracked(
     let lifecycle = lifecycle.clone();
     let pid = glib::Pid(instance.pid() as i32);
     glib::child_watch_add_local(pid, move |_, wait_status| {
+        crate::live::unregister(pid.0 as u32);
         // Named rather than left to the closure's drop, because *when* it is
         // released is the whole point: the application must not quit before
         // the crash page below has been put on screen.

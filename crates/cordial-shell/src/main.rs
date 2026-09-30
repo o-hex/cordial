@@ -35,6 +35,7 @@ mod download_progress;
 mod install;
 mod instructions;
 mod launch;
+mod live;
 mod multi_instance_warning;
 mod profile_switcher;
 mod refresh_watch;
@@ -277,6 +278,11 @@ fn start(app: &libadwaita::Application, shell: &Rc<RefCell<Option<window::Shell>
     // matches whatever the user last chose in Appearance, rather than
     // flashing the libadwaita default and then correcting itself.
     config.borrow().appearance.apply();
+
+    // Running games follow Settings (ADR-044). Leaked on purpose: the watch has
+    // to outlive every window and dropping the guard would stop it.
+    let live_watch = live::start(&config_path, &config.borrow());
+    std::mem::forget(live_watch);
 
     *shell.borrow_mut() = Some(window::build(app, config, config_path));
 }

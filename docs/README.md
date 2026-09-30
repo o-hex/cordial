@@ -24,7 +24,7 @@ order a newcomer would want it.
 
 ## ADRs
 
-All 42. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDOVER.md#the-adr-index) carries every record's own status line.
+All 47. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDOVER.md#the-adr-index) carries every record's own status line.
 
 | | |
 |---|---|
@@ -74,6 +74,7 @@ All 42. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDO
 | [ADR-044](adr/ADR-044-settings-reach-a-running-game.md) | Settings that can change reach a running game over a small socket; the rest say "Applies at next launch" |
 | [ADR-045](adr/ADR-045-one-report-screen-outside-settings.md) | One Report a Problem screen, outside Settings; the launcher says so when the game will open on X11 |
 | [ADR-046](adr/ADR-046-nvidia-is-gated-on-the-vendor-id.md) | NVIDIA behaviour is gated on the device's vendor id, advisory unless the evidence is strong, and says what is inferred |
+| [ADR-047](adr/ADR-047-the-canvas-is-lowered-only-under-a-presented-frame.md) | The canvas is lowered under GTK only once GTK has presented a frame, so a stalled GTK never leaves a grey screen |
 
 ## Design notes
 

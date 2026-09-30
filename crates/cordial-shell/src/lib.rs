@@ -51,6 +51,7 @@ pub mod network;
 pub mod nvidia;
 pub mod plugin_preferences;
 pub mod profile;
+pub mod stacking_gate;
 pub mod title_bar;
 // Not pulled in by `host_window` or `network` -- registered here on its own
 // so `cordial-runtime` can reach it as `cordial_shell::refresh_watch`, which

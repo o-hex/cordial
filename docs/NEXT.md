@@ -21,6 +21,22 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## Fixed in part: the grey screen of #53 reproduces with no Vulkan, and the restack is now gated, 2026-09-30
+
+Nested KWin, `VK_ICD_FILENAMES=/nonexistent`, signed out, `fakefocus`: the engine
+falls back to GLES3, GTK to its GL renderer, and GTK then never attaches a buffer
+to the window surface again (`gdk_gl_context_make_current() failed` every 15 s,
+`repaint_now: no GTK frame landed within 40ms`). The old ordering lowered the
+canvas regardless, three times out of three, over the last opaque buffer. With
+Vulkan present, or with `GSK_RENDERER=cairo`, GTK presents and nothing is wrong.
+The restack now waits for a presented GTK frame and otherwise keeps the canvas
+above; see ADR-047. **The editor is still invisible in that configuration**; the
+remaining work is choosing cairo automatically when the engine will have no
+Vulkan. This also corrects the 2026-09-23 note that forcing `repaint_now`'s miss
+did not reproduce it: that forced the timeout on a GTK that then painted late,
+which is not the same as a GTK that never presents. `after-paint` is not
+evidence of a commit; it fired on a frame with no attach behind it.
+
 ## Open: two frozen specimens at last, one with the condition-variable wrapper removed; the network is not what they wait on, 2026-09-30
 
 Build `Cordial 0.20.1 (bb5620b54-dirty)` (the dirt is the `third_party/mcpelauncher-linker`

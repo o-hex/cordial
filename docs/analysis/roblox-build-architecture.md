@@ -309,11 +309,19 @@ the other one needs a second runtime, not a setting**
 Each needs a machine state this one was not in (memory 5 GB available, disk
 12 GB, and an explicit refusal of the image pull):
 
-1. **Vulkan reachability under qemu-user (decides 3a).** In an arm64 Fedora 44
-   container under host binfmt: install `vulkan-tools mesa-vulkan-drivers`, run
-   `vulkaninfo --summary` with `/dev/dri` mapped. Record `deviceName` and
-   `deviceType` (`PHYSICAL_DEVICE_TYPE_CPU` means llvmpipe). This is minutes and
-   settles the GPU question by itself.
+1. **Vulkan reachability under qemu-user (decides 3a): measured 2026-09-30,
+   and it fails.** In an arm64 Fedora 44 container (`podman run --arch arm64
+   --device /dev/dri`, `uname -m` = `aarch64`) with `vulkan-tools
+   mesa-vulkan-drivers` installed, `vulkaninfo --summary` on this Intel host
+   lists one device:
+
+       deviceType = PHYSICAL_DEVICE_TYPE_CPU
+       deviceName = llvmpipe (LLVM 22.1.8, 128 bits)
+
+   So an arm64 client under qemu-user would render on the CPU, emulated. The
+   route in 3a is closed on this hardware. Not separated: whether the Intel
+   driver is missing from Fedora's aarch64 Mesa build or present but unable to
+   reach the GPU through qemu-user; either way there is no GPU device.
 2. **The arm64 `cordial-run`.** `target-aarch64/release/cordial-run` (built
    2026-09-24, 61 commits behind `main`) exists but was not used: it belongs to
    another session's target directory and is stale. A fresh build with

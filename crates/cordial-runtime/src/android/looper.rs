@@ -1486,10 +1486,56 @@ fn teardown(handle: i64) {
         }
     }
 
+    // **A watchdog, because the engine's own teardown can wait for ever.**
+    // Issue #52: one launch in seven on X11 never exited, and SIGTERM did
+    // nothing -- the main thread was parked in `pthread_cond_wait` inside the
+    // engine's lifecycle callback, called from here, on a condition nothing
+    // was going to signal (that session had presented a single frame). The
+    // signal handler only asks this loop to stop, and this loop was already
+    // stopped, so nothing short of SIGKILL ended it.
+    //
+    // Nothing is lost by cutting it short: the cookie jar was written just
+    // before this call, and the profile lock and every descriptor are the
+    // kernel's to release. The watchdog is a separate thread because the
+    // stuck one cannot time itself out, and it stands down as soon as the
+    // sequence returns, so an ordinary exit is untouched.
+    //
+    // **It exits with `TEARDOWN_TIMEOUT_EXIT`, not zero.** The first version
+    // called `_exit(0)`, so a client that had to be cut off reported the same
+    // success as one that shut down, and a launcher, a script or a bug report
+    // could not tell them apart. Nothing else here returns 124, so the exit
+    // status alone now says the sequence did not finish.
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let finished = finished.clone();
+        let limit = teardown_limit();
+        std::thread::Builder::new()
+            .name("teardown-watchdog".into())
+            .spawn(move || {
+                watch_teardown(&finished, limit, || {
+                    eprintln!(
+                        "[android] the engine's shutdown sequence has not returned after {}s; \
+                         exiting without it, with status {TEARDOWN_TIMEOUT_EXIT} (issue #52). \
+                         Cookies were saved before it started.",
+                        limit.as_secs()
+                    );
+                    extern "C" {
+                        fn _exit(status: c_int) -> !;
+                    }
+                    // SAFETY: `_exit` runs no handlers and touches no memory;
+                    // the stuck thread holds nothing the kernel will not
+                    // reclaim.
+                    unsafe { _exit(TEARDOWN_TIMEOUT_EXIT) }
+                });
+            })
+            .ok();
+    }
+
     step("onWindowFocusChangedNative(false)", game_activity::window_focus(handle, false));
     for name in TEARDOWN_LIFECYCLE_SEQUENCE {
         step(name, game_activity::lifecycle(handle, name));
     }
+    finished.store(true, std::sync::atomic::Ordering::Release);
 
     // A brief grace period. The engine's flag-cache/telemetry writes this
     // chain triggers are not guaranteed to be finished by the time
@@ -1503,6 +1549,42 @@ fn teardown(handle: i64) {
     while std::time::Instant::now() < grace {
         looper_poll_once(50, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
     }
+}
+
+/// How long the engine's shutdown sequence gets before the watchdog in
+/// [`teardown`] ends the process. Ten seconds: a healthy sequence returns in
+/// well under one, including the grace period, and somebody who closed the
+/// window is not going to wait longer than this before reaching for a kill.
+/// `CORDIAL_TEARDOWN_TIMEOUT_S` changes it, for investigating a slow teardown.
+fn teardown_limit() -> std::time::Duration {
+    let secs = std::env::var("CORDIAL_TEARDOWN_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(10);
+    std::time::Duration::from_secs(secs)
+}
+
+/// The status the teardown watchdog exits with. 124 is `timeout(1)`'s own
+/// "the command timed out", which is what this is, and no other exit path in
+/// `cordial-run` uses it.
+const TEARDOWN_TIMEOUT_EXIT: c_int = 124;
+
+/// Call `on_expiry` if `finished` has not been set within `limit`, and return
+/// without calling it if it is set first. Split out of [`teardown`] so the
+/// stand-down and the expiry can both be tested without a stuck engine.
+fn watch_teardown(finished: &std::sync::atomic::AtomicBool, limit: std::time::Duration, on_expiry: impl FnOnce()) {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if finished.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if finished.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    on_expiry();
 }
 
 /// Add a descriptor to the calling thread's looper so `pollOnce` returns as soon
@@ -2026,6 +2108,36 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(2),
             "teardown took too long; its grace period must be bounded"
         );
+    }
+
+    /// The watchdog must fire when the sequence never returns, and must not
+    /// when it does. The second is the one that matters to everybody whose
+    /// exit is ordinary: a watchdog that fires anyway turns every clean
+    /// shutdown into status 124.
+    #[test]
+    fn the_teardown_watchdog_fires_only_when_the_sequence_does_not_return() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stuck = AtomicBool::new(false);
+        let mut fired = false;
+        watch_teardown(&stuck, std::time::Duration::from_millis(50), || fired = true);
+        assert!(fired, "a sequence that never finishes must be cut off");
+
+        let done = AtomicBool::new(true);
+        let mut fired = false;
+        watch_teardown(&done, std::time::Duration::from_millis(500), || fired = true);
+        assert!(!fired, "a sequence that returned must not be cut off");
+
+        // Finishing part-way through the wait stands the watchdog down.
+        let finishing = std::sync::Arc::new(AtomicBool::new(false));
+        let setter = finishing.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            setter.store(true, Ordering::Release);
+        });
+        let mut fired = false;
+        watch_teardown(&finishing, std::time::Duration::from_secs(5), || fired = true);
+        t.join().unwrap();
+        assert!(!fired);
     }
 
     #[test]

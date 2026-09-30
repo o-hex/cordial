@@ -181,6 +181,19 @@ env:
                                      texture-format-query-observability.md. Off
                                      by default; never changes what a shipped
                                      client tells the engine
+  CORDIAL_FORCE_GPU_VENDOR=0x10de[@550.163.01]
+                                     behave as though the GPU were NVIDIA's (or
+                                     as another vendor id) for the code that is
+                                     gated on it, optionally with that driver
+                                     version. Changes what Cordial decides and
+                                     nothing the engine sees. A test-only
+                                     substitute for hardware this project lacks;
+                                     see docs/adr/ADR-046-nvidia-is-gated-on-
+                                     the-vendor-id.md. Off by default
+  CORDIAL_TEST_FAIL_PRESENT_MODES=N  on an NVIDIA-gated device, make the first N
+                                     present-mode queries fail with
+                                     VK_ERROR_UNKNOWN so the retry can be watched
+                                     recovering. Test-only
 ";
 
 fn parse() -> Result<Options, String> {

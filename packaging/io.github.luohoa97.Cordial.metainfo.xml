@@ -78,6 +78,22 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.23.0" date="2026-10-01">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.23.0</url>
+      <description>
+        <p>
+          A doctor that checks your display, GPU, sound and Roblox install, on
+          one Report a Problem screen. The game no longer goes grey when a text
+          box takes focus without working Vulkan.
+        </p>
+        <p>
+          NVIDIA GPUs and drivers are named in diagnostics, with warnings for
+          known-bad drivers. Audio output, GameMode, controllers and the title
+          bar change while you play. FastFlags can be imported from Bloxstrap,
+          Fishstrap or Sober, and profiles can be deleted.
+        </p>
+      </description>
+    </release>
     <release version="0.22.0" date="2026-09-30">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.22.0</url>
       <description>

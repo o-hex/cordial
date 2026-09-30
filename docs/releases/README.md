@@ -51,8 +51,19 @@ it needs a `v*` policy added there first.
 2. Commit, then **check the commit touches what you expect and nothing from a
    submodule**.
 3. Tag and push the commit and the tag.
+
+   `packaging/aur/cordial-bin/` is bumped *after* the release exists, in its own
+   commit (`Bump cordial-bin to 0.20.1` was one), because its PKGBUILD pins the
+   release asset's URL and sha256 and neither exists until CI has built the
+   package.
 4. Watch `Native packages`, `Flatpak` and `Publish Arch packaging` on the tag.
-   The three publishers should run for the tag and skip for `main`.
+   The three publishers should run for the tag and skip for `main`. The Flatpak
+   remote follows the push to `main` instead: a run whose commit carries a `v*`
+   tag points `stable` at that build, and any other run carries the published
+   `stable` forward unchanged.
+
+   Pushing to the AUR is not part of any workflow. See
+   [PUBLISHING.md](../../packaging/aur/PUBLISHING.md).
 5. Avoid pushing again to `main` while those are in flight — each push
    supersedes the previous run through its concurrency group, and a runs list
    full of `cancelled` reads exactly like breakage.

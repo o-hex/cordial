@@ -11,9 +11,7 @@ the outcome of.
    [`packaging/cordial.flatpakrepo`](../../packaging/cordial.flatpakrepo)
    already gives `flatpak remote-add` and
    [`apt-repository.md`](apt-repository.md) gives `apt`. This is what §1
-   below covers, and it is built -- but, as of this writing, not yet signed
-   or published; see "Current status" below before assuming the commands in
-   this document already work.
+   below covers, and it is built, signed and published; see "Current status".
 2. **The `cordial` package in Fedora proper** -- in the repos every `dnf
    install` reaches by default, with no third-party `.repo` file added
    first. §2 below is the honest assessment of that path, and it is not
@@ -21,23 +19,12 @@ the outcome of.
 
 ## Current status
 
-**Nobody has generated `RPM_GPG_PRIVATE_KEY` yet, and this repository's CI has
-no such secret as of this writing.** `.github/workflows/yum.yml` builds
-nothing until that changes -- its "Import the signing key" step exits
-cleanly on a missing secret and every step after it is skipped, so the
-workflow reports success while producing no `cordial-rpm-repo` artifact for
-`flatpak.yml` to find. `packaging/rpm/build-repo.sh` itself refuses outright
-to build an unsigned repository at all, for the reason given below, so there
-is no lesser artifact it could produce instead. Until the secret exists,
-`https://luohoa97.github.io/cordial/rpm/` and every URL under it 404 --
-cleanly, the same way `https://luohoa97.github.io/cordial/apt/` does today
-for the identical reason on the apt side (verified directly: both `/apt/`
-and `/apt/dists/stable/InRelease` return 404 against the live site while the
-site root and `cordial.flatpakrepo` both return 200, and the `apt.yml` run
-log names the missing secret as the reason in those exact words). This
-section is here so that gap is discovered by reading this document rather
-than by `dnf install` failing; it is removed the day signing switches on, in
-the same commit that adds the fingerprint under "The key" below.
+**Published and signed.** On 2026-09-30 `rpm/44/x86_64/repodata/repomd.xml.asc`
+verified as a good signature against `rpm/RPM-GPG-KEY-cordial`, and
+`rpm/44/aarch64/` exists too. `dnf install` was not run. Only `rpm/44/` exists,
+for the reason under "Why $releasever" below. The paragraphs further down that
+speak of a missing secret or of 404s on `/rpm/` describe the state before the
+key was added.
 
 ## §1. Cordial's own repository
 
@@ -245,11 +232,8 @@ curl -fsSL https://luohoa97.github.io/cordial/rpm/RPM-GPG-KEY-cordial | gpg --sh
 
 ### The key
 
-**No key exists yet.** Once `RPM_GPG_KEY_ID` is set, this section is where
-its fingerprint goes, published out of band from the install commands above
-so a user has a second source to check against. Until this section names a
-fingerprint, there is nothing at the published URL to check it against in
-the first place.
+**The key exists.** Its fingerprint is in [`docs/install.md`](../install.md); it was read from the published file on 2026-09-30 and has not been confirmed by whoever holds the key. A second source, out of band from the site,
+still wants to be added here by whoever holds the key.
 
 ### Key rotation
 

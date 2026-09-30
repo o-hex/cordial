@@ -1,10 +1,13 @@
 # Publishing to the AUR
 
-Three packages live under `packaging/aur/`, all complete and none ever
-published. That is the single cheapest piece of reach Cordial is leaving on the
-table: Arch users are a large share of the people who run Roblox on Linux at
-all, mocktail has three AUR packages, and Cordial has none — not because the
-packaging is missing but because nobody has pushed it.
+Three packages live under `packaging/aur/`, and all three are on the AUR:
+`cordial`, `cordial-bin` and `cordial-git`. **The AUR copies lag this tree.** On
+2026-09-30 the AUR's own listing (`aur.archlinux.org/rpc/v5/info`) showed
+`cordial` and `cordial-bin` at 0.17.0-1 and `cordial-git` at
+0.17.0.r0.g5412f88-1, last modified 2026-09-20, under the maintainer name
+`taxin`, while `packaging/aur/cordial/PKGBUILD` says 0.20.1. Nothing pushes to
+the AUR automatically; every release needs the steps below run by hand, once per
+package, by whoever holds that account's SSH key.
 
 - **`cordial-git/`** builds whatever commit is at the tip of `main`.
 - **`cordial/`** builds a tagged release, and is also what

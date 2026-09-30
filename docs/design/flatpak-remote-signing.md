@@ -1,7 +1,11 @@
 # Signing the Flatpak remote — the procedure, for whoever holds the key
 
-**Status: the CI side is built and waiting; nobody has generated a key.** This
-document is the other half of that sentence in
+**Status: done.** A key exists and the published remote has been signed with it
+since at least 2026-09-29 (`summary.sig` is served and the
+`.flatpakrepo` carries a `GPGKey`); the fingerprint is in
+[`docs/install.md`](../install.md). What follows was written before that, and is
+kept as the procedure for rotating or regenerating the key. This
+document is the other half of the sentence in
 [`.github/workflows/flatpak.yml`](../../.github/workflows/flatpak.yml) — "switches
 on the day a maintainer adds a key" — written down precisely enough that adding
 one is fifteen minutes of following steps rather than an afternoon of reading

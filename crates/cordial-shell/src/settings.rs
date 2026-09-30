@@ -1515,13 +1515,21 @@ fn build_plugin_row(
     if let Some(dir) = profile_dir {
         let failures = cordial_plugins::health::load(&cordial_plugins::health::path_in(dir));
         if let Some(failure) = failures.get(&id) {
-            let warning = gtk::Image::from_icon_name("dialog-error-symbolic");
-            warning.add_css_class("error");
+            // **An update waiting for approval is not a failure.** It is the
+            // reconciler declining to run a new version on a grant nobody
+            // gave it (ADR-038), and the way out is the switches below, so
+            // it gets the warning icon and no "Failed:" in front of it.
+            let approval = cordial_plugins::health::is_approval_notice(&failure.message);
+            let warning = gtk::Image::from_icon_name(if approval {
+                "dialog-warning-symbolic"
+            } else {
+                "dialog-error-symbolic"
+            });
+            warning.add_css_class(if approval { "warning" } else { "error" });
             warning.set_tooltip_text(Some(&failure.message));
-            warning.update_property(&[gtk::accessible::Property::Label(&format!(
-                "Failed: {}",
-                failure.message
-            ))]);
+            let label =
+                if approval { failure.message.clone() } else { format!("Failed: {}", failure.message) };
+            warning.update_property(&[gtk::accessible::Property::Label(&label)]);
             expander.add_suffix(&warning);
         }
     }

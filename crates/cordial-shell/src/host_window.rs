@@ -328,6 +328,7 @@ pub struct HostWindow {
     /// Separate from `canvas_see_through`, which both the editor and a dialog
     /// set: those two want opposite answers here. See `input_region`.
     dialog_up: std::cell::Cell<bool>,
+    canvas_in_input_region: std::cell::Cell<bool>,
     /// The frame clock's counter when a lowering was last prepared, and whether
     /// `after-paint` has fired since. `None` when no lowering is being
     /// prepared. See [`HostWindow::arm_present_probe`].
@@ -1032,6 +1033,7 @@ impl HostWindow {
             opaque_unsized: std::cell::Cell::new(false),
             canvas_rect: std::cell::Cell::new(None),
             dialog_up: std::cell::Cell::new(false),
+            canvas_in_input_region: std::cell::Cell::new(false),
             present_probe: std::cell::RefCell::new(None),
             editor_seeding,
             editor_changed,
@@ -1586,6 +1588,13 @@ impl HostWindow {
         self.refresh_input_region();
     }
 
+    pub fn set_canvas_in_input_region(&self, on: bool) {
+        if self.canvas_in_input_region.replace(on) == on {
+            return;
+        }
+        self.refresh_input_region();
+    }
+
     pub fn set_canvas_see_through(&self, on: bool) {
         if on {
             // **Every layer, not just the window.** Making the toplevel
@@ -1626,7 +1635,11 @@ impl HostWindow {
             (surface.width(), surface.height()),
             canvas,
             self.editor_rect.get(),
-            self.dialog_up.get(),
+            claims_whole_window(
+                self.dialog_up.get(),
+                self.canvas_in_input_region.get(),
+                self.canvas_see_through.get(),
+            ),
         );
         surface.set_input_region(Some(&region));
     }
@@ -2291,6 +2304,10 @@ impl HostWindow {
 /// `surface` is the whole surface including any CSD shadow, and is widened to
 /// cover the content if a configure has left it briefly smaller -- a region
 /// that does not reach the canvas would clip the hole rather than the chrome.
+fn claims_whole_window(dialog_up: bool, canvas_in_input_region: bool, see_through: bool) -> bool {
+    dialog_up || (canvas_in_input_region && !see_through)
+}
+
 fn input_region(
     surface: (i32, i32),
     content: (i32, i32, i32, i32),
@@ -2582,6 +2599,15 @@ mod tests {
         let region = input_region(surface, content, Some(editor), false);
         let (cx, cy, cw, ch) = content;
         assert!(!region.contains_point(cx + cw / 2, cy + ch / 2));
+    }
+
+    #[test]
+    fn a_toplevel_pointer_lock_keeps_the_raised_canvas_in_the_input_region() {
+        assert!(!claims_whole_window(false, false, false));
+        assert!(claims_whole_window(false, true, false));
+        assert!(!claims_whole_window(false, true, true));
+        assert!(claims_whole_window(true, false, true));
+        assert!(claims_whole_window(true, true, true));
     }
 
     #[test]

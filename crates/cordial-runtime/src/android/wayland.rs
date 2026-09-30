@@ -1930,6 +1930,10 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         (host.wl.flush)(display);
     }
 
+    if !host.pointer_constraints.is_null() && !no_pointer_lock() && WaylandWindow::constrain_toplevel() {
+        host.host.0.set_canvas_in_input_region(true);
+    }
+
     Ok(host)
 }
 
@@ -3223,6 +3227,11 @@ impl WaylandWindow {
         unpack_pointer_position(self.pointer_pos.load(Ordering::Acquire))
     }
 
+    fn canvas_centre(&self) -> (f32, f32) {
+        let (w, h, _) = self.geometry();
+        (w as f32 / 2.0, h as f32 / 2.0)
+    }
+
     fn dispatch_pointer_motion(&self, x: f32, y: f32) {
         self.set_pointer_position(x, y);
         let handle = self.active_handle.load(Ordering::Relaxed);
@@ -3916,6 +3925,7 @@ static SHIFT_DURING_RIGHT_DRAG: AtomicBool = AtomicBool::new(false);
 /// would kill the camera for good with nothing on screen to explain it,
 /// which is the same shape as the Escape latch this release just removed.
 static RIGHT_DRAG_LATCH_SINCE: AtomicI64 = AtomicI64::new(0);
+static ENGINE_OWNS_LOCK: AtomicBool = AtomicBool::new(false);
 
 
 /// `CORDIAL_NO_POINTER_LOCK=1` — never capture the pointer, whatever the engine
@@ -3989,6 +3999,12 @@ unsafe extern "C" fn locked_pointer_locked(_data: *mut c_void, _lp: *mut c_void)
     // be drained by.
     super::input::reset_mouse_delta();
     super::input::forget_pending_unlocked_delta();
+    if ENGINE_OWNS_LOCK.load(Ordering::Acquire) {
+        if let Some(w) = current() {
+            let (cx, cy) = w.canvas_centre();
+            w.set_pointer_position(cx, cy);
+        }
+    }
     if super::input::trace_mouse() {
         eprintln!("[cordial] pointer lock: compositor sent locked");
     }
@@ -4455,10 +4471,24 @@ impl WaylandWindow {
         // `false` with the menu open, `true` again on closing it. The latch was
         // duplicating a decision the engine had already made correctly.
         let want = asked;
+        if want {
+            let owned = engine_wants
+                && (!dragging
+                    || LOCK_WANTED_BEFORE_RIGHT_DRAG.load(Ordering::Acquire)
+                    || SHIFT_DURING_RIGHT_DRAG.load(Ordering::Acquire));
+            ENGINE_OWNS_LOCK.store(owned, Ordering::Release);
+            if owned && POINTER_LOCK_ACTIVE.load(Ordering::Acquire) {
+                let (cx, cy) = self.canvas_centre();
+                self.set_pointer_position(cx, cy);
+            }
+        }
 
         let held = !self.locked_pointer.lock().unwrap_or_else(|e| e.into_inner()).is_null();
+        let lockable_here = !Self::constrain_toplevel() || POINTER_ON_CANVAS.load(Ordering::Acquire);
         if want && !held {
-            self.lock_pointer();
+            if lockable_here {
+                self.lock_pointer();
+            }
         } else if !want && held {
             self.release_pointer();
         } else if want && held && self.lock_went_dead() {
@@ -4620,7 +4650,19 @@ fn constrain_toplevel() -> bool {
         if slot.is_null() {
             return;
         }
-        let (x, y) = self.pointer_position();
+        let centre = ENGINE_OWNS_LOCK.swap(false, Ordering::AcqRel);
+        let (x, y) = if centre {
+            let (cx, cy) = self.canvas_centre();
+            self.set_pointer_position(cx, cy);
+            if Self::constrain_toplevel() {
+                let (ox, oy) = *self.placed_at.lock().unwrap_or_else(|e| e.into_inner());
+                (cx + ox as f32, cy + oy as f32)
+            } else {
+                (cx, cy)
+            }
+        } else {
+            self.pointer_position()
+        };
         // SAFETY: `*slot` is the live locked-pointer proxy; the two calls match
         // `set_cursor_position_hint`'s "ff" and `destroy`'s empty signature,
         // the latter sent with the destroy flag its `type="destructor"`
@@ -4635,6 +4677,10 @@ fn constrain_toplevel() -> bool {
                 f32_to_fixed(x),
                 f32_to_fixed(y),
             );
+            if centre {
+                let target = if Self::constrain_toplevel() { self.parent_surface } else { self.surface };
+                (self.wl.marshal_flags)(target, WL_SURFACE_COMMIT, std::ptr::null(), 1, 0);
+            }
             (self.wl.marshal_flags)(
                 *slot,
                 LOCKED_POINTER_DESTROY,
@@ -4656,7 +4702,8 @@ fn constrain_toplevel() -> bool {
         super::input::reset_mouse_delta();
         super::input::forget_pending_unlocked_delta();
         if super::input::trace_mouse() {
-            eprintln!("[cordial] pointer lock: released, cursor hinted to ({x}, {y})");
+            let how = if centre { " (canvas centre, committed)" } else { "" };
+            eprintln!("[cordial] pointer lock: released, cursor hinted to ({x}, {y}){how}");
         }
     }
 

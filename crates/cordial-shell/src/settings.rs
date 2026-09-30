@@ -2603,7 +2603,7 @@ fn build_plugins_page(
                 Ok(path) => {
                     row_for_click.set_title("Deno is installed");
                     row_for_click.set_subtitle(&format!(
-                        "{}. Plugins start with the client, so this takes effect at the next launch.",
+                        "{}. A running client starts the plugins that were waiting for it within a few seconds; no restart needed.",
                         path.display()
                     ));
                     button.set_visible(false);

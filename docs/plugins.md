@@ -29,7 +29,7 @@ registry format, signature checking and an installer, and no populated registry
 to point them at. Until there is, a plugin arrives as a directory or an archive
 and you put it in place yourself.
 
-**Settings → Get Plugins → Plugin archive (`.tar.zst`)**, and choose the file.
+**Settings → Plugins → Install from a file → Plugin archive (`.tar.zst`)**, and choose the file.
 Cordial unpacks it into place, and it then appears under Plugins, switched off,
 with the permissions it is asking for listed. Nothing runs until you say so.
 

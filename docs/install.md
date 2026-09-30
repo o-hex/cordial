@@ -6,10 +6,11 @@ how the release signatures and repository trust actually work.
 
 ## What you need
 
-- x86-64 Linux
-- A Wayland session. X11 still starts, through Flatpak's fallback socket, but
-  [ADR-011](adr/ADR-011-wayland-and-libadwaita.md) makes Wayland the
-  backend Cordial targets and says X11 is not developed further
+- x86-64 Linux, or aarch64 (see [`multiarch.md`](multiarch.md) for what has
+  been checked there)
+- A Wayland session. X11 is supported too, as of
+  [ADR-024](adr/ADR-024-x11-is-supported-again.md), which superseded
+  ADR-011's "not developed further"; Wayland is still the primary backend
 - Roblox's official Android client, which **you supply** — Cordial ships no
   Roblox code, APK or assets and never will
 
@@ -56,9 +57,9 @@ Uninstall with `flatpak uninstall io.github.luohoa97.Cordial`, and
 profiles, the sign-in and the extracted Roblox build gone.
 
 That command installs the `stable` branch, which only moves on a tagged
-release. There is also `master`, which moves on every commit to main — the
-remote used to publish only that branch, so an install from before this
-paragraph existed is on it, and will keep tracking main until you move it:
+release. There is also `master`, which moves on every commit to main. The
+remote used to publish only `master`, so an install from before `stable`
+existed is on it and keeps tracking main until you move it:
 
 ```bash
 flatpak uninstall io.github.luohoa97.Cordial//master
@@ -70,12 +71,13 @@ rather than releases, `flatpak install cordial io.github.luohoa97.Cordial//maste
 says so explicitly.
 
 **The AppImage is one file that runs on any distribution.** No remote to add,
-no package manager, nothing installed system-wide — download `Cordial-x86_64.AppImage`
-from [the releases page](https://github.com/luohoa97/cordial/releases), then:
+no package manager, nothing installed system-wide — download
+`Cordial-<version>-<commit>-x86_64.AppImage` (or `-aarch64`) from
+[the releases page](https://github.com/luohoa97/cordial/releases), then:
 
 ```bash
-chmod +x Cordial-x86_64.AppImage
-./Cordial-x86_64.AppImage
+chmod +x Cordial-*.AppImage
+./Cordial-*.AppImage
 ```
 
 It carries GTK4, libadwaita and WebKitGTK with it, so it does not care what
@@ -123,9 +125,7 @@ sudo apt install ./cordial_*_amd64.deb
 
 Verifying it first is worth the two commands — see
 [Verifying a release download](#verifying-a-release-download). The repository
-below is the nicer route once it is up, and **it is not up yet**: it publishes
-nothing until a maintainer adds a signing key, so following these commands
-today gets you a 404 rather than Cordial.
+below is the other route, and it keeps you current through `apt upgrade`.
 
 Cordial's own repository, not a package in Debian or Ubuntu itself — see
 [`docs/design/apt-repository.md`](design/apt-repository.md) for why
@@ -150,29 +150,23 @@ as every other package format here.
 
 **Verify the key before you trust it.** A `curl` in a doc is exactly the kind
 of instruction a supply-chain attack looks like, so check what you just
-downloaded against the fingerprint published in
-[`docs/design/apt-repository.md`](design/apt-repository.md#the-key), out
-of band from this file:
+downloaded against the fingerprint below:
 
 ```bash
 gpg --show-keys --with-fingerprint /etc/apt/keyrings/cordial-archive-keyring.gpg
 ```
 
-**Nothing is signed yet.** No `APT_GPG_PRIVATE_KEY` secret exists in this
-repository's CI as of this writing, and
-[`packaging/apt/build-repo.sh`](../packaging/apt/build-repo.sh) refuses outright
-to build an unsigned repository rather than publish one that only works with
-`[trusted=yes]` — so the commands above will not install anything until a
-maintainer generates and adds the key. This paragraph is here so that gap
-does not have to be discovered by `apt update` failing; it is removed the day
-signing switches on, in the same commit that adds the fingerprint above.
+The repository is signed: `dists/stable/InRelease` carries an OpenPGP
+signature, and the key above has this fingerprint:
 
-Verified live on 2026-08-30: `https://luohoa97.github.io/cordial/apt/` and
-`.../apt/dists/stable/InRelease` both return 404 while the site root and
-`cordial.flatpakrepo` return 200 — exactly what an absent
-`APT_GPG_PRIVATE_KEY` predicts, and nothing more, which is worth saying
-because a 404 on part of a published site otherwise looks like breakage
-rather than an accurately-documented gap.
+    E6BE 3043 5BD6 3471 FD1A  B331 DC05 1D16 7161 8AA6
+
+**INFERRED, not yet checked out of band:** that fingerprint was read from the
+published keyring on 2026-09-30, the same place a compromised site would have
+changed it. Whoever holds the key should confirm it, and this line should say
+so when they have. What was observed that day: `InRelease` verified as a good
+signature against that keyring, and the `amd64` and `arm64` `Packages` files
+both listed 0.20.1-1. `apt install` itself was not run.
 
 ## dnf (Fedora, RHEL, and derivatives)
 
@@ -189,9 +183,7 @@ Note the `.fcNN` in the filename: only one Fedora release is built at a time
 [`packaging/rpm/build-rpm.sh`](../packaging/rpm/build-rpm.sh)'s header. Verifying
 first is worth the two commands — see
 [Verifying a release download](#verifying-a-release-download). The repository
-below is the nicer route once it is up, and **it is not up yet**: it publishes
-nothing until a maintainer adds a signing key, so following these commands
-today gets you a 404 rather than Cordial.
+below is the other route, and it keeps you current through `dnf upgrade`.
 
 Cordial's own repository, not a package in Fedora's own repos — see
 [`docs/design/rpm-repository.md`](design/rpm-repository.md) for why
@@ -212,25 +204,24 @@ for the full argument. **If your `dnf` reports a `$releasever` other than
 for a different release; that is by design, not a bug to report, until
 `release.yml` builds a second release.
 
-**Verify the key before you trust it**, out of band from this file:
+**Verify the key before you trust it:**
 
 ```bash
 curl -fsSL https://luohoa97.github.io/cordial/rpm/RPM-GPG-KEY-cordial | gpg --show-keys
 ```
 
-against the fingerprint published in
-[`docs/design/rpm-repository.md`](design/rpm-repository.md#the-key).
+against this fingerprint:
 
-**Nothing is signed yet.** No `RPM_GPG_PRIVATE_KEY` secret exists in this
-repository's CI as of this writing, and
-[`packaging/rpm/build-repo.sh`](../packaging/rpm/build-repo.sh) refuses outright
-to build an unsigned repository — more strictly than the apt side, because a
-dnf `.repo` file with `gpgcheck=0` baked in gives a user nothing to
-consciously opt out of the way apt's `[trusted=yes]` does, see
-[`docs/design/rpm-repository.md`](design/rpm-repository.md) for why that
-asymmetry means this repository is never published unsigned at all. The
-commands above will not install anything until a maintainer generates and
-adds the key.
+    E5FA CC1B D170 8EC9 4FFF  5817 FDD1 0A8B 6D7F 10B9
+
+The `.repo` file sets `repo_gpgcheck=1` and `gpgcheck=0`: what is signed is
+each release directory's `repodata/repomd.xml`, not the individual `.rpm`
+([`docs/design/rpm-repository.md`](design/rpm-repository.md) has the reason).
+
+**INFERRED, not yet checked out of band**, on the same terms as the apt key
+above: read from the published site on 2026-09-30. That day
+`rpm/44/x86_64/repodata/repomd.xml.asc` verified as a good signature against
+that key, and `dnf install` was not run.
 
 ## pacman (Arch and derivatives)
 
@@ -248,22 +239,36 @@ Verifying it first is two commands and is worth doing — see
 signature is keyless, so there is no Cordial key to add to your keyring and
 none to trust.
 
-**The AUR is the ordinary route and is blocked, not missing.**
-[`packaging/aur/cordial/PKGBUILD`](../packaging/aur/cordial/PKGBUILD) and its
-`cordial-git` counterpart are complete and pass `namcap`, but **AUR account
-sign-ups are currently closed**, so neither can be submitted. That is the only
-thing standing between you and `paru -S cordial`.
+**The AUR** has `cordial`, `cordial-bin` and `cordial-git`
+([`packaging/aur/`](../packaging/aur) is where they are kept). Pushing to it is
+a manual step, so they lag: on 2026-09-30 the AUR's own listing showed all three
+at 0.17.0 while the tree is at 0.20.1. Prefer the release package or the
+repository below until that is caught up. The procedure is in
+[`packaging/aur/PUBLISHING.md`](../packaging/aur/PUBLISHING.md).
 
-**Cordial's own pacman repository is built and publishes nothing.** The
-workflow, the `repo-add` script and the `pacman.conf` stanza all exist, and
-[`packaging/pacman/build-repo.sh`](../packaging/pacman/build-repo.sh) refuses
-outright to build an unsigned repository — so until a maintainer generates a
-signing key and adds `ARCH_GPG_PRIVATE_KEY` to CI,
-`https://luohoa97.github.io/cordial/arch/` is a 404 and there is nothing to add
-to `pacman.conf`. No instructions are printed for it yet, deliberately — a
-fingerprint that does not exist and a pacman-key command that cannot work are
-worse than saying plainly the repository is not up. See
-[`docs/design/pacman-repository.md`](design/pacman-repository.md).
+**Cordial's own pacman repository** is published and signed. Import its key and
+add it to `pacman.conf`:
+
+```bash
+curl -fsSL https://luohoa97.github.io/cordial/arch/cordial-archive-keyring.asc \
+    | sudo pacman-key --add -
+sudo pacman-key --lsign-key C82BBD7D82744F804A68DA8B3A69D3241BA6288F
+```
+
+```
+[cordial]
+Server = https://luohoa97.github.io/cordial/arch/$arch
+SigLevel = DatabaseRequired PackageNever
+```
+
+The database is signed and the packages are not, which is what
+`DatabaseRequired PackageNever` says
+([`docs/design/pacman-repository.md`](design/pacman-repository.md) explains why).
+**INFERRED, not yet checked out of band:** that fingerprint was read from the
+published keyring on 2026-09-30. On that day `cordial.db.sig` verified as a
+good signature against it; `pacman -Sy` was not run, and neither was the
+`pacman.conf` stanza. The `SigLevel` line comes from the design note, which says
+itself that it was reasoned from `pacman.conf(5)` rather than tried.
 
 ## Verifying a release download
 
@@ -293,28 +298,39 @@ transparency log. For public release artefacts that is the point rather than a
 cost: it is what lets you check, a year later, that a file was signed by this
 workflow at that tag.
 
-This covers the release page. **The Flatpak remote and the APT repository are a
-different question and are still unsigned** — those need an OpenPGP key that
-Sigstore cannot supply, and the next section says what that means.
+This covers the release page. **The Flatpak remote and the apt, dnf and pacman
+repositories are a different question**: they use OpenPGP keys that Sigstore
+cannot supply, and the next section says what those cover.
 
-## Trust, and what "not signed" means
+## Trust, and what the Flatpak signature covers
 
-**The Flatpak remote is not signed.** There is no GPG key on it, so
-`flatpak install` verifies that the download matches the repository's own
-checksums and nothing beyond that. What it does not do is prove who built it:
-anyone who can write to the GitHub Pages site — including anyone who takes
-over the GitHub account, and GitHub itself — can serve a different package
-under the same name and your machine will install it without complaint. That
-is a weaker guarantee than Flathub's and you should know which one you are
-getting. Signing is wired up in
-[`.github/workflows/flatpak.yml`](../.github/workflows/flatpak.yml) and switches
-on the day a maintainer adds a key — the precise procedure for that is written
-down in
-[`docs/design/flatpak-remote-signing.md`](design/flatpak-remote-signing.md) so
-it does not have to be worked out under pressure. A remote added while it was
-unsigned stays unverified, so re-add it once signing is live. If you would
-rather not extend that trust at all, [building from source](#building-from-source)
-below is the whole of the alternative.
+**The Flatpak remote is signed.** The published `cordial.flatpakrepo` carries a
+GPG key, and the repository summary has a detached signature, so `flatpak
+install` verifies that what it downloads was signed by that key and not merely
+that it matches the repository's own checksums. The key:
+
+    8364 5E9B 8F6C 4B29 227D  4629 4310 E617 967A BDD8
+
+Observed on 2026-09-30: `summary.sig` is published, and with that key imported
+into a throwaway OSTree repository `ostree remote refs` reads the summary with
+`gpg-verify-summary` on; the same command against a remote with no key fails
+with `Can't check signature: public key not found`. `flatpak install` itself was
+not run against it. The fingerprint has the same standing as the apt one above:
+read from the published file, not confirmed out of band.
+
+**A remote added while it was unsigned stays unverified.** Flatpak records
+`gpg-verify=false` when the remote is added, and a later signed definition does
+not change it. If you added it before the signing key existed, remove and re-add
+it (`flatpak remote-delete cordial`, then the `remote-add` above).
+
+What a signature does not do is make the GitHub Pages site trustworthy to host
+it: whoever holds the private key, which lives as a repository secret, can sign
+anything. That is still a weaker arrangement than Flathub's. Signing is set up in
+[`.github/workflows/flatpak.yml`](../.github/workflows/flatpak.yml), and
+[`docs/design/flatpak-remote-signing.md`](design/flatpak-remote-signing.md) is how
+the key was meant to be generated. If you would rather not extend that trust,
+[building from source](#building-from-source) below is the whole of the
+alternative.
 
 **Cordial is not on Flathub, and on current policy it cannot be.** Flathub's
 generative-AI policy does not allow applications containing AI-generated or
@@ -354,13 +370,13 @@ what Cordial downloads or when.
 
 **You do not need this to run Cordial** — the package routes above are
 measured to work. Build from source if you are changing Cordial, if you would
-rather not extend trust to an unsigned remote, or if you want a build with your
-own patches in it.
+rather not extend trust to a remote signed by a key held as a CI secret, or if
+you want a build with your own patches in it.
 
 Building needs rather more than running does:
 
 - **Clang** — AOSP bionic uses C11 `_Atomic` inside C++ headers and GCC rejects it
-- **GTK4 (≥ 4.10) and libadwaita (≥ 1.4)** development packages — the core shell
+- **GTK4 (≥ 4.12) and libadwaita (≥ 1.5)** development packages — the core shell
   in `crates/cordial-shell` is `AdwApplicationWindow`/`AdwToolbarView` end to
   end (see [ADR-002](adr/ADR-002-core-shell-and-ui-handoff.md) and
   [ADR-011](adr/ADR-011-wayland-and-libadwaita.md)), and `gtk4-sys`/

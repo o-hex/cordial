@@ -239,7 +239,8 @@ fn add_appearance_groups(page: &adw::PreferencesPage, config: Rc<RefCell<ShellCo
     // Says when it applies, because it does not apply to a window already open
     // and a setting that appears to do nothing is worse than one that explains
     // itself.
-    bar_row.set_subtitle("Hidden removes the title bar without fullscreen. Applies to the next launch.");
+    bar_row.set_subtitle("Hidden removes the title bar without fullscreen.");
+    next_launch(&bar_row, "title_bar");
     bar_row.add_suffix(&detail(
         "Hidden also removes the window controls. Use your desktop's window shortcuts to move or close the game.",
     ));
@@ -247,6 +248,35 @@ fn add_appearance_groups(page: &adw::PreferencesPage, config: Rc<RefCell<ShellCo
     page.add(&window_group);
 
 }
+
+/// Mark a row whose setting a running game does not pick up.
+///
+/// Live settings say nothing (ADR-044); a row that changes nothing until the
+/// client restarts has to say so, or it is a control that appears to do nothing.
+/// The key is checked against `live::CLASSIFICATION` so a row cannot claim to be
+/// next-launch while the table says it is live, or the reverse.
+fn next_launch(row: &impl IsA<adw::ActionRow>, key: &str) {
+    debug_assert_eq!(
+        crate::live::classify(key),
+        Some(crate::live::Applies::NextLaunch),
+        "{key} is not a next-launch setting"
+    );
+    let row = row.upcast_ref::<adw::ActionRow>();
+    let base = row.subtitle().map(|s| s.to_string()).unwrap_or_default();
+    row.set_subtitle(&if base.is_empty() {
+        NEXT_LAUNCH.to_string()
+    } else {
+        format!("{base} {NEXT_LAUNCH}")
+    });
+    // A row limited to N lines is limited to N+1 now; without this the note is
+    // the first thing ellipsised.
+    let lines = row.subtitle_lines();
+    if lines > 0 {
+        row.set_subtitle_lines(lines + 1);
+    }
+}
+
+const NEXT_LAUNCH: &str = "Applies at next launch.";
 
 /// The small `i` button that carries what a row cannot afford to say in its
 /// subtitle.
@@ -733,6 +763,7 @@ fn build_performance_group(
         .active(config.borrow().gamemode)
         .build();
     gamemode.set_subtitle_lines(2);
+    next_launch(&gamemode, "gamemode");
     {
         let config = config.clone();
         let config_path = config_path.clone();
@@ -841,6 +872,12 @@ fn build_performance_group(
         .sensitive(layer.is_some())
         .build();
     mangohud.set_subtitle_lines(3);
+    // Only when the row is offering the switch; the other subtitle is an
+    // explanation of why it is dead, and "applies at next launch" to a switch
+    // that cannot be pressed is noise.
+    if layer.is_some() {
+        next_launch(&mangohud, "mangohud");
+    }
     // Only when it is there to describe: see `detail`, and the comment above.
     if let Some(path) = &layer {
         mangohud.add_suffix(&detail(&format!(
@@ -886,6 +923,9 @@ fn build_performance_group(
         .sensitive(vkbasalt_layer.is_some())
         .build();
     vkbasalt.set_subtitle_lines(3);
+    if vkbasalt_layer.is_some() {
+        next_launch(&vkbasalt, "vkbasalt");
+    }
     if let Some(path) = &vkbasalt_layer {
         let profile = config.borrow().profile.clone();
         let config_note = match crate::launch::vkbasalt_config_path(&profile) {
@@ -1005,6 +1045,7 @@ fn build_audio_group(
         .selected(chosen.index_in(&names))
         .build();
     row.set_subtitle_lines(2);
+    next_launch(&row, "audio_output");
     row.add_suffix(&detail(
         "System default is a standing instruction rather than a snapshot: change your \
          desktop's default while playing and the game follows.\n\nThis is Cordial's \
@@ -1184,7 +1225,10 @@ fn build_general_page(
         .title("Graphics")
         // "The choice is settled before Roblox loads its renderer" is why it
         // needs a relaunch; the user only needs the "needs a relaunch".
-        .description("Takes effect the next time you press Roblox.")
+        // Says it for the whole group: the renderer, the graphics optimisation,
+        // frame pacing and controllers are all settled before the engine draws
+        // anything.
+        .description("Applies at next launch.")
         .build();
 
     // **Not backed by `FStringDebugGraphicsPreferredBackend` any more.** That

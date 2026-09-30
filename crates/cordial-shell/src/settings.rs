@@ -1223,10 +1223,12 @@ fn build_general_page(
         .title("Graphics")
         // "The choice is settled before Roblox loads its renderer" is why it
         // needs a relaunch; the user only needs the "needs a relaunch".
-        // Says it for the whole group: the renderer, the graphics optimisation,
-        // frame pacing and controllers are all settled before the engine draws
-        // anything.
-        .description("Applies at next launch.")
+        // Says it for the rows that need it: the renderer, the graphics
+        // optimisation and frame pacing are settled before the engine draws
+        // anything. Controllers is not among them -- it takes effect while a
+        // game is running (ADR-044) -- so the sentence names what it covers
+        // instead of claiming the whole group.
+        .description("The renderer, optimisation mode and frame pacing apply at next launch.")
         .build();
 
     // **Not backed by `FStringDebugGraphicsPreferredBackend` any more.** That

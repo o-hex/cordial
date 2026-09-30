@@ -159,6 +159,12 @@ fn apply(update: &Update) -> Option<String> {
         // A request to gamemoded, made on the spot. The note is whatever the
         // daemon said that was not "yes", or that it has not answered yet.
         Update::Gamemode(on) => crate::gamemode::set_enabled(*on),
+        // Stored here and acted on by the pump's next `gamepad::poll`, which is
+        // the thread the engine's natives may be called from.
+        Update::Gamepad(on) => {
+            crate::android::gamepad::set_enabled(*on);
+            None
+        }
     };
     // Narrated because this project debugs by reading the client's output, and
     // "the setting reached the process" is the fact worth being able to see.
@@ -170,7 +176,9 @@ fn value_word(update: &Update) -> String {
     match update {
         Update::PointerAcceleration(a) => a.as_str().to_string(),
         Update::Throttle(t) => t.as_str().to_string(),
-        Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) | Update::Gamemode(b) => b.to_string(),
+        Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) | Update::Gamemode(b) | Update::Gamepad(b) => {
+            b.to_string()
+        }
         Update::AudioOutput(name) if name.is_empty() => "the system default".to_string(),
         Update::AudioOutput(name) => name.clone(),
     }
@@ -250,6 +258,7 @@ fn current() -> BTreeMap<String, Value> {
     m.insert("carry_launch_ticket".into(), Value::from(crate::deeplink::carry_ticket()));
     m.insert("audio_output".into(), Value::from(audio::current()));
     m.insert("gamemode".into(), Value::from(crate::gamemode::current()));
+    m.insert("gamepad".into(), Value::from(crate::android::gamepad::current_enabled()));
     m
 }
 
@@ -343,6 +352,7 @@ mod tests {
             "{\"set\":{\"throttle\":\"sometimes\"}}\n",
             "{\"set\":{\"audio_output\":true}}\n",
             "{\"set\":{\"gamemode\":\"yes\"}}\n",
+            "{\"set\":{\"gamepad\":1}}\n",
             "{\"set\":{\"audio_output\":\"a\\u0000b\"}}\n",
         ] {
             let r = handle(bad);
@@ -396,6 +406,22 @@ mod tests {
 
         // Control: the opposite message flips it back.
         assert_eq!(set(before).values["gamemode"], before);
+    }
+
+    #[test]
+    fn a_gamepad_change_reaches_the_switch_and_get_reports_it() {
+        let _g = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = crate::android::gamepad::current_enabled();
+        let set = |on: bool| handle(&live_wire::encode_set(&[Update::Gamepad(on)]));
+
+        let r = set(!before);
+        assert!(r.ok && r.applied == vec!["gamepad".to_string()], "{r:?}");
+        assert_eq!(r.values["gamepad"], !before);
+        assert_eq!(crate::android::gamepad::current_enabled(), !before);
+
+        // Control: the opposite message flips it back in the same process.
+        assert_eq!(set(before).values["gamepad"], before);
+        assert_eq!(crate::android::gamepad::current_enabled(), before);
     }
 
     #[test]

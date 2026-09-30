@@ -71,7 +71,7 @@ pub const CLASSIFICATION: &[(&str, Applies, &str)] = &[
     ("graphics", Applies::NextLaunch, "the backend is settled before the engine's first dlopen of libvulkan"),
     ("graphics_optimization_mode", Applies::NextLaunch, "device profile and core count are read during engine initialisation"),
     ("present_mode", Applies::NextLaunch, "read when the swapchain is created; the engine decides when that happens again"),
-    ("gamepad", Applies::NextLaunch, "read once; switching off mid-session would need a disconnect sent for every announced pad, which is unmeasured"),
+    ("gamepad", Applies::Live, "the pump polls it each tick; switching off sends the engine a disconnect for every announced pad, the same call an unplugged one gets"),
     ("close_on_leave", Applies::Live, "consulted when the engine's log reports leaving a game"),
     ("unpacked_plugins", Applies::NextLaunch, "the folder list is an environment variable of the client; edits inside a listed folder already reload (ADR-038)"),
     ("carry_launch_ticket", Applies::Live, "consulted each time a link is translated"),
@@ -109,6 +109,7 @@ pub fn live_updates(config: &ShellConfig) -> Vec<Update> {
         // and empty for "follow the default".
         Update::AudioOutput(config.audio_output.env_value().unwrap_or("").to_string()),
         Update::Gamemode(config.gamemode),
+        Update::Gamepad(config.gamepad),
     ]
 }
 

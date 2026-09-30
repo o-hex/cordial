@@ -43,7 +43,7 @@
 | `throttle` | live | the pump reads it each tick (it used to be read once) |
 | `close_on_leave` | live | consulted when the log reports leaving a game |
 | `carry_launch_ticket` | live | consulted each time a link is translated |
-| `gamepad` | next launch | switching off mid-session needs a disconnect for every announced pad; unmeasured |
+| `gamepad` | live | the pump polls it each tick; switching off sends a disconnect for every announced pad |
 | `gamemode` | live | registration with gamemoded is per pid; the client registers or withdraws on the spot |
 | `graphics`, `graphics_optimization_mode` | next launch | settled before engine initialisation |
 | `present_mode` | next launch | read at swapchain creation |
@@ -107,6 +107,23 @@ test process afterwards: 0 before, 2 (registered) after a live enable, 0 after a
 live disable. The rest is unit tests against a fake daemon: one `RegisterGame`
 and one `UnregisterGame` for an on and an off, nothing sent for a repeat, a
 declined or absent daemon leaving the client unregistered.
+
+## Controllers
+
+`gamepad::enabled` was a `OnceLock` read from the environment. It is an atomic
+now, and turning it off makes the pump's next `poll` (the thread the engine's
+natives are called from) send `deliver_gamepad_disconnect` for every pad that had
+been announced and close the device files. That is the call an unplugged
+pad already gets, so the engine is being asked to handle nothing it does not
+handle when somebody pulls a cable. A pad that was opened but never announced
+gets no disconnect: the engine was never told it existed. Turning it on needs
+nothing: the two-second rescan finds the pads and announces them as at launch.
+
+Unit tests cover the withdrawal with an injected disconnect (announced pads told
+once, unannounced ones not, files released, a second tick a no-op) and the switch
+changing in both directions after it was seeded. **No pad was attached for
+this, and the client was not run, so the engine's reaction to the disconnect is
+INFERRED** from its being the unplug path, not observed.
 
 ## Consequences
 

@@ -102,16 +102,19 @@ pub enum Update {
     AudioOutput(String),
     /// Whether the client is registered with Feral GameMode's daemon.
     Gamemode(bool),
+    /// Whether the client reads `/dev/input/js*` and feeds the engine pads.
+    Gamepad(bool),
 }
 
 /// The keys [`Update`] can carry, which are also the `shell.json` field names.
-pub const KEYS: [&str; 6] = [
+pub const KEYS: [&str; 7] = [
     "pointer_acceleration",
     "throttle",
     "close_on_leave",
     "carry_launch_ticket",
     "audio_output",
     "gamemode",
+    "gamepad",
 ];
 
 /// Longest sink name accepted. PipeWire node names are short; the bound is
@@ -134,6 +137,7 @@ impl Update {
             Update::CarryLaunchTicket(_) => "carry_launch_ticket",
             Update::AudioOutput(_) => "audio_output",
             Update::Gamemode(_) => "gamemode",
+            Update::Gamepad(_) => "gamepad",
         }
     }
 
@@ -141,7 +145,7 @@ impl Update {
         match self {
             Update::PointerAcceleration(a) => Value::from(a.as_str()),
             Update::Throttle(t) => Value::from(t.as_str()),
-            Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) | Update::Gamemode(b) => {
+            Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) | Update::Gamemode(b) | Update::Gamepad(b) => {
                 Value::from(*b)
             }
             Update::AudioOutput(name) => Value::from(name.as_str()),
@@ -164,6 +168,7 @@ impl Update {
             "close_on_leave" => value.as_bool().map(Update::CloseOnLeave).ok_or_else(bad),
             "carry_launch_ticket" => value.as_bool().map(Update::CarryLaunchTicket).ok_or_else(bad),
             "gamemode" => value.as_bool().map(Update::Gamemode).ok_or_else(bad),
+            "gamepad" => value.as_bool().map(Update::Gamepad).ok_or_else(bad),
             "audio_output" => value
                 .as_str()
                 .filter(|n| valid_sink_name(n))
@@ -279,6 +284,7 @@ mod tests {
             Update::CarryLaunchTicket(false),
             Update::AudioOutput("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()),
             Update::Gamemode(false),
+            Update::Gamepad(false),
         ]
     }
 
@@ -347,6 +353,7 @@ mod tests {
             r#"{"set":{"throttle":"off","carry_launch_ticket":1}}"#,
             r#"{"set":{"audio_output":true}}"#,
             r#"{"set":{"gamemode":"on"}}"#,
+            r#"{"set":{"gamepad":0}}"#,
             r#"{"set":{"audio_output":"a\u0000b"}}"#,
         ] {
             assert!(decode(bad).is_err(), "{bad} should be refused");

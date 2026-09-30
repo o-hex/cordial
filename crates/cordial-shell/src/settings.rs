@@ -794,7 +794,7 @@ fn build_performance_group(
         // acceleration off system-wide will find it changes only speed. Said
         // here because the obvious reading of the title is that turning it on
         // introduces acceleration from nowhere.
-        .subtitle("Camera movement is raw by default, which is what a camera wants.")
+        .subtitle("Cursor and camera by default. Choose Only the cursor for raw camera movement.")
         .model(&accel_model)
         .selected(config.borrow().pointer_acceleration.index())
         .build();

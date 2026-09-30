@@ -162,8 +162,8 @@ by anyone. Full list: [`docs/install.md`](docs/install.md#building-from-source).
 wherever `CORDIAL_FLAGS` points. Layering and syntax:
 [`docs/fastflags.md`](docs/fastflags.md).
 
-**Mouse acceleration** is a Settings control — cursor only, or cursor and
-camera — stored in `$XDG_CONFIG_HOME/cordial/shell.json`.
+**Mouse acceleration** is a Settings control — cursor and camera (the
+default), or cursor only for raw camera movement — stored in `$XDG_CONFIG_HOME/cordial/shell.json`.
 
 **Shaders**, sharpening and anti-aliasing over the game through
 [vkBasalt](https://github.com/DadSchoorse/vkBasalt)'s Vulkan layer, are a

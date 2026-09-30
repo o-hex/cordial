@@ -1414,6 +1414,8 @@ fn build_source_group(config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesGroup
         }
     }
 
+    group.add(&build_architecture_row());
+
     let source_row = adw::ActionRow::builder()
         .title("Download source")
         .subtitle(source_line(&Source::configured()))
@@ -1436,6 +1438,44 @@ fn build_source_group(config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesGroup
     }
 
     group
+}
+
+/// What a person calls the architecture of the build this Cordial installs.
+///
+/// `arm64-v8a` is Android's ABI spelling and means nothing to somebody reading
+/// a settings page; everything else is already a name they would use.
+fn architecture_name(abi: &str) -> &str {
+    match abi {
+        "arm64-v8a" => "arm64",
+        other => other,
+    }
+}
+
+/// The one line under "Roblox build". Says why there is no dropdown, because a
+/// read-only row beside an updater reads as a control that has gone missing.
+const BUILD_ARCHITECTURE_SUBTITLE: &str =
+    "Other builds need translation, which Cordial cannot do yet.";
+
+/// Which architecture's Roblox build Cordial installs. Informational only.
+///
+/// **Not a dropdown, deliberately.** The architecture is a compile-time
+/// property of this binary (`cordial_update::apk::HOST_ABI`), and the spike in
+/// `docs/analysis/roblox-build-architecture.md` found no translation route that
+/// reaches the GPU, so a list offering the other architecture would be a
+/// control that changes nothing. ADR-043 records the decision and what would
+/// reopen it.
+fn build_architecture_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("Roblox build")
+        .subtitle(BUILD_ARCHITECTURE_SUBTITLE)
+        .build();
+    let value = gtk::Label::builder()
+        .label(format!("{} (this computer)", architecture_name(cordial_update::apk::HOST_ABI)))
+        .css_classes(["dim-label"])
+        .valign(gtk::Align::Center)
+        .build();
+    row.add_suffix(&value);
+    row
 }
 
 /// The dropdown and the two switches.
@@ -1786,6 +1826,18 @@ fn heading(release: &Release, notes: &Notes) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_build_row_names_architectures_the_way_a_person_would() {
+        // `arm64-v8a` is Android's spelling; the row shows what a user calls it,
+        // and the host's own value must be one of the two this build can be.
+        assert_eq!(architecture_name("arm64-v8a"), "arm64");
+        assert_eq!(architecture_name("x86_64"), "x86_64");
+        assert!(matches!(
+            architecture_name(cordial_update::apk::HOST_ABI),
+            "arm64" | "x86_64"
+        ));
+    }
     use cordial_update::Sha256Hash;
 
     fn release(major: u32) -> Release {

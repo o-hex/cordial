@@ -1270,6 +1270,7 @@ superseded by 024, which restores X11).
 | [ADR-040](adr/ADR-040-the-engine-already-runs-mimalloc.md) | The engine already runs mimalloc, so there is no allocator to switch | Accepted |
 | [ADR-041](adr/ADR-041-vkbasalt-post-processing.md) | vkBasalt post-processing is a driver-stack layer, not in-process hooking | Accepted |
 | [ADR-042](adr/ADR-042-texture-format-query-observability.md) | Vulkan texture-format queries are counted and, test-only, maskable — nothing is translated | Accepted |
+| [ADR-043](adr/ADR-043-the-roblox-build-is-the-binarys-architecture.md) | The Roblox build's architecture is the binary's; choosing another needs a second runtime, so Settings shows it read-only | Accepted |
 
 ## A whole class of bug: hooks that register and never bind
 

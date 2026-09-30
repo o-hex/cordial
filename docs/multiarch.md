@@ -66,7 +66,19 @@ The port cannot assume 4K aarch64 behaves like x86-64.
 floor. That closes a real slice of the unknown for the price of one APK.
 
 **No translation layer will be designed.** If a future host has no matching ABI, the
-answer is "unsupported", not "write a JIT". Reopening this requires reopening Task A.
+answer is "unsupported", not "write a JIT".
+
+**Reopened and re-measured, 2026-09-30.** The last sentence here used to say reopening
+this required reopening Task A. The spike in
+[`analysis/roblox-build-architecture.md`](analysis/roblox-build-architecture.md) is that
+reopening, and it changes the reasoning without changing the answer: choosing the other
+architecture's `libroblox.so` is the easy half, and running it needs a second
+`cordial-run` with its whole userland under a CPU translator, because the engine is
+loaded into `cordial-run`'s own address space. No route that reaches the GPU was found
+(qemu-user's was measured: `vulkaninfo` in an arm64 container lists only llvmpipe, a
+CPU device; FEX and box64 need arm64 hardware nobody here has). Settings therefore shows a read-only "Roblox build" row and
+no dropdown; [ADR-043](adr/ADR-043-the-roblox-build-is-the-binarys-architecture.md)
+records the decision and what would reopen it.
 
 **No Quest/VR target.** The Quest build ships no x86 code, so supporting it would mandate
 exactly the translation path this decision exists to avoid. Linux desktop only.
@@ -128,7 +140,9 @@ says nothing about real 16K-page hardware. What the "cheapest next step" paragra
 below asked for is now half-done rather than not-done: a real, Roblox-signed
 arm64-v8a `libroblox.so` was fetched (via `cordial_update`'s own mirror path,
 signature verified, fingerprint matches this module's own documented one) and loaded
-under emulation — `cordial-run` got through the bionic linker, `JNI_OnLoad`, GameActivity
+under emulation (a one-off session; **no command line for it was kept, so
+it is not repeatable from this document** -- the spike's section 7 lists what a repeat
+needs) — `cordial-run` got through the bionic linker, `JNI_OnLoad`, GameActivity
 native init, and the engine's own flag initialisation (139 flags, by name) before the
 smoke test's time bound ended, with no crash and no undefined symbol. The specific
 `readelf --dyn-syms`/`DT_TEXTREL`/`p_align` check this paragraph asks for was not

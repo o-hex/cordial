@@ -21,7 +21,7 @@ body:
     attributes:
       label: Diagnostics
       description: |
-        Required. Get it from the **Copy diagnostics** button at **Settings → Report a Problem**, or from a terminal — `cordial --diagnostics` (.deb/.rpm/Arch), `flatpak run io.github.luohoa97.Cordial --diagnostics` (Flatpak), `./Cordial-*.AppImage --diagnostics` (AppImage), or `cordial-shell --diagnostics` (built from source). It works even when the client cannot start at all — a missing library, a GTK too old, no display — because it is answered before anything else in the process runs, which is exactly the report that most needs it.
+        Required. Get it from the **Copy** button under **Report a Problem** in the main menu, or from a terminal — `cordial --diagnostics` (.deb/.rpm/Arch), `flatpak run io.github.luohoa97.Cordial --diagnostics` (Flatpak), `./Cordial-*.AppImage --diagnostics` (AppImage), or `cordial-shell --diagnostics` (built from source). It works even when the client cannot start at all — a missing library, a GTK too old, no display — because it is answered before anything else in the process runs, which is exactly the report that most needs it.
 
         Six rows, looking like this:
         ```

@@ -71,7 +71,7 @@ const SHORT_DESCRIPTIONS: Record<string, string> = {
   // web template lists the command for all four install types; there is no room
   // for that in 100 characters, and the button works on every one of them.
   "diagnostics":
-    "Settings → Report a Problem → Copy diagnostics. That button works on every install.",
+    "Main menu → Report a Problem → Copy. That button works on every install.",
   "which-feature":
     'What you tried, and what happened instead. "Nothing happened" is a good answer.',
   "engine-log": "The client's own output, if you have it. Trim it to the interesting part.",

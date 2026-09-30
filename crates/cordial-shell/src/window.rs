@@ -335,7 +335,9 @@ pub fn build(
     // parameter type mismatch" and does nothing, which is what the header-bar
     // button this replaced had to be wired around.
     primary_menu.append(Some("_Preferences"), Some("win.settings::"));
-    primary_menu.append(Some("_Report a Problem"), Some("win.settings::report"));
+    // The one report screen. The About dialog and the launcher's X11 notice
+    // open the same thing; see `report.rs`.
+    primary_menu.append(Some("_Report a Problem"), Some("win.report"));
     primary_menu.append(Some("_About Cordial"), Some("win.about"));
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
@@ -518,18 +520,27 @@ pub fn build(
         });
     }
 
-    // **About, with the diagnostics block as its Troubleshooting section.**
+    // **The report screen, and the only place the diagnostics block lives.**
     //
-    // `AdwAboutDialog` carries a Troubleshooting page with a copy button and a
-    // "Save as" built in, and `debug_info` is what fills it. That is the same
-    // text `Settings -> Report a Problem` shows and `--diagnostics` prints, from
-    // the one function, so the three can never drift.
-    //
-    // It is here because three separate reporters could not find the block at
-    // all. One typed `flatpak run cordial --diagnostic` and got "Invalid id";
-    // another ran `cordial --diagnostics`, got "command not found", and wrote
-    // *that* into the diagnostics field of their report. Settings -> Report a
-    // Problem is not where anyone looks for it. About -> Troubleshooting is.
+    // The primary menu, the launcher's X11 notice and the About dialog's issue
+    // row all come here. There used to be two copies of the block -- a page in
+    // Settings and the About dialog's Troubleshooting page -- and a reporter who
+    // found one did not know about the other. Three separate reporters could
+    // not find the block at all: one typed `flatpak run cordial --diagnostic`
+    // and got "Invalid id", another ran `cordial --diagnostics`, got "command
+    // not found", and wrote *that* into the diagnostics field of their report.
+    // A menu entry named for what they are trying to do is where they look.
+    let report_action = gtk::gio::SimpleAction::new("report", None);
+    {
+        let window = window.clone();
+        report_action.connect_activate(move |_, _| crate::report::present(&window));
+    }
+
+    // About: what this is, who made it, and where to get help. It no longer
+    // carries the diagnostics block itself -- `debug_info` is what filled the
+    // Troubleshooting page, and that page duplicated the report screen. The
+    // issue row below opens the report screen instead of the web form, because
+    // the form asks for the block and this is where it is copied from.
     let about_action = gtk::gio::SimpleAction::new("about", None);
     {
         let window = window.clone();
@@ -540,7 +551,7 @@ pub fn build(
                 .version(cordial_shell::version::full())
                 .developer_name("The Cordial contributors")
                 .website("https://github.com/luohoa97/cordial")
-                .issue_url("https://github.com/luohoa97/cordial/issues/new/choose")
+                .issue_url(ABOUT_REPORT_LINK)
                 // The Discord, under libadwaita's own "Support Questions"
                 // heading, because that is where support actually happens and
                 // it was reachable from nowhere in the application. `README`
@@ -558,15 +569,24 @@ pub fn build(
                 // assumed -- a licence stated wrongly in an About dialog is
                 // worse than one not stated at all, because it is believed.
                 .license_type(gtk::License::Gpl30)
-                .debug_info(crate::diagnostics::report())
-                .debug_info_filename("cordial-diagnostics.txt")
                 .build();
+            // Stacked over the About dialog rather than the launcher, so closing
+            // it lands back on About.
+            dialog.connect_activate_link(|about, uri| {
+                if uri != ABOUT_REPORT_LINK {
+                    // Not ours: let libadwaita open it as it always did.
+                    return false;
+                }
+                crate::report::present(about);
+                true
+            });
             dialog.present(Some(&window));
         });
     }
 
     let actions = gtk::gio::SimpleActionGroup::new();
     actions.add_action(&about_action);
+    actions.add_action(&report_action);
     actions.add_action(&launch_action);
     actions.add_action(&settings_action);
     actions.add_action(&profile_action);
@@ -717,6 +737,12 @@ pub fn build(
     browser_shell
 }
 
+/// The address the About dialog's issue row carries, which `connect_activate_link`
+/// intercepts and turns into the report screen. Not a scheme anything else
+/// handles, so a row the interception somehow missed fails visibly in the
+/// portal rather than opening a page that is not the one described.
+const ABOUT_REPORT_LINK: &str = "cordial-internal:report";
+
 /// How long to wait after the last `notify::default-width`/`default-height`
 /// before writing the settled size to disk. Long enough that an interactive
 /// drag -- which fires this on every frame the compositor delivers -- settles
@@ -821,7 +847,7 @@ fn persist_window_size(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) 
     }
 }
 
-/// `CORDIAL_SHELL_PRESENT=settings,settings=updates,update,launch,maximise,fullscreen`
+/// `CORDIAL_SHELL_PRESENT=settings,settings=updates,update,report,about,launch,maximise,fullscreen`
 /// opens those windows at startup and puts the launcher into those states.
 ///
 /// A test seam, and it exists because there is no other way to photograph these
@@ -836,7 +862,7 @@ fn persist_window_size(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) 
 /// **`settings=<page>` opens Settings on a named page**, which is the same
 /// problem one level down: the window has five tabs and a photograph of it shows
 /// one. The names are the `name` each `AdwPreferencesPage` is built with —
-/// `roblox`, `updates`, `version`, `general`, `plugins`, `report` — and an unknown one
+/// `roblox`, `updates`, `version`, `general`, `plugins`, `fastflags` — and an unknown one
 /// is libadwaita's warning to answer, not this function's, because a name that
 /// silently fell back to the first page would produce a screenshot captioned as
 /// something it is not.
@@ -861,6 +887,12 @@ fn open_on_start(window: &adw::Window, update_button: &gtk::Button) {
                     let _ = window.activate_action("win.settings", Some(&page.to_variant()));
                 }
                 "update" => update_button.emit_clicked(),
+                "report" => {
+                    let _ = window.activate_action("win.report", None);
+                }
+                "about" => {
+                    let _ = window.activate_action("win.about", None);
+                }
                 "launch" => {
                     let _ = window.activate_action("win.launch", None);
                 }

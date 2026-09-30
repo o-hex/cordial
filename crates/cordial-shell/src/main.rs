@@ -39,6 +39,7 @@ mod live;
 mod multi_instance_warning;
 mod profile_switcher;
 mod refresh_watch;
+mod report;
 mod roblox_versions;
 mod root_warning;
 mod settings;
@@ -128,8 +129,8 @@ fn main() -> libadwaita::glib::ExitCode {
              Options:\n\
              \x20 --diagnostics  Print which Cordial and Roblox build this is, the\n\
              \x20                distribution, and how Cordial was installed. Paste\n\
-             \x20                it into a bug report. Settings has the same block\n\
-             \x20                behind a Copy button.\n\
+             \x20                it into a bug report. The main menu's Report a\n\
+             \x20                Problem shows the same block behind a Copy button.\n\
              \x20 -h, --help     This.\n\
              \n\
              `cordial-run` is the loader this launches and is not meant to be run\n\

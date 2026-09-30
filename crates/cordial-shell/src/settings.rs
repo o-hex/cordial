@@ -8,7 +8,7 @@
 //! graphics preference to be usable, without a terminal.
 //!
 //! `AdwPreferencesDialog` with several `AdwPreferencesPage`s — Roblox, Updates,
-//! Version, General, Plugins, FastFlags, Report — each becomes its own tab/sidebar entry for free;
+//! Version, General, Plugins, FastFlags — each becomes its own tab/sidebar entry for free;
 //! that is libadwaita's own page-switcher, not something built here. Appearance
 //! used to be its own page; its two groups live inside General now, and
 //! `build_preferences_window`'s own comment explains why.
@@ -1071,140 +1071,6 @@ fn build_audio_group(
 /// only by the X11 backend and do nothing on the Wayland one the launcher asks
 /// for, so a row for either would be a control that changes nothing — which is
 /// exactly what the Renderer row turned out to be until this change.
-/// Where a report goes. One constant, because the Settings row and the page
-/// description both name it and two copies drift.
-const ISSUES_URL: &str = "https://github.com/luohoa97/cordial/issues/new/choose";
-
-/// The page that turns "it doesn't work" into a report somebody can act on.
-///
-/// **A terminal is not a reasonable thing to require here.** `cordial-shell
-/// --diagnostics` prints the same block and is the right answer for anyone
-/// already in a shell, but the people whose reports are hardest to act on are
-/// the ones who installed a Flatpak from a link and have never opened one. The
-/// button and the flag share `diagnostics::report`, so the two can never drift
-/// into telling different stories about the same machine.
-///
-/// The text is shown as well as copied. Somebody is about to paste it into a
-/// public issue and is entitled to read it first -- and to edit out the
-/// hostname in `uname -a` if they would rather, which is the argument for a
-/// visible block over a button that silently uploads.
-fn build_report_page(parent: &impl IsA<gtk::Window>) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::builder()
-        .title("Report")
-        .name("report")
-        .icon_name("dialog-warning-symbolic")
-        .build();
-
-    let group = adw::PreferencesGroup::builder()
-        .title("Diagnostics")
-        // **One line.** This said four, explaining what the block contains and
-        // what it does not -- true, and none of it what somebody opening this
-        // page wants. They came to copy the thing. The block is right there and
-        // says what it contains by containing it, and the reasoning about what
-        // is deliberately absent lives in `diagnostics.rs` next to the code
-        // that decides it.
-        .description("Paste this into a GitHub issue.")
-        .build();
-
-    let text = crate::diagnostics::report();
-
-    // Monospace and selectable: the columns only line up in a fixed-width font,
-    // and somebody who wants one line rather than the block should be able to
-    // take it without the button's all-or-nothing.
-    let view = gtk::TextView::builder()
-        .editable(false)
-        .monospace(true)
-        .cursor_visible(false)
-        // **Wrapped, because `uname -a` is longer than any settings window.**
-        // Without this the System line ran off the right edge with no scrollbar
-        // and no way to see the rest -- the Copy button had the whole string,
-        // but somebody checking what they were about to paste into a public
-        // issue could not read the one line most likely to make them think
-        // twice. `WordChar` rather than `Word`: a kernel version has no spaces
-        // to break at.
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .top_margin(12)
-        .bottom_margin(12)
-        .left_margin(12)
-        .right_margin(12)
-        .build();
-    view.buffer().set_text(&text);
-    let frame = gtk::Frame::new(None);
-    frame.set_child(Some(&view));
-    frame.set_margin_top(6);
-
-    let copy = gtk::Button::with_label("Copy");
-    copy.set_valign(gtk::Align::Center);
-    let copied = text.clone();
-    copy.connect_clicked(move |b| {
-        if let Some(display) = gtk::gdk::Display::default() {
-            display.clipboard().set_text(&copied);
-            // The label is the confirmation. A toast needs an overlay this page
-            // does not own, and a button that looks identical after a press is
-            // one people press three times.
-            b.set_label("Copied");
-            let b = b.clone();
-            glib::timeout_add_seconds_local_once(2, move || b.set_label("Copy"));
-        }
-    });
-
-    let row = adw::ActionRow::builder().title("Copy diagnostics").build();
-    row.add_suffix(&copy);
-    group.add(&row);
-    group.add(&frame);
-    page.add(&group);
-
-    let where_group = adw::PreferencesGroup::builder()
-        .title("Bugs and feature requests")
-        // The row below says where it goes and the form asks for the block. A
-        // paragraph here repeated both.
-        .build();
-
-    // A link row rather than prose with a URL in it: this window is the last
-    // place somebody is before they give up, and it should take one press to
-    // get from here to the form.
-    let issues = adw::ActionRow::builder()
-        .title("Open an issue")
-        .subtitle(ISSUES_URL.trim_start_matches("https://"))
-        .activatable(true)
-        .build();
-    // `go-next-symbolic`, and checked on disk rather than guessed: the first
-    // attempt used `external-link-symbolic`, which is in no icon theme here and
-    // rendered as the missing-image glyph. `go-next-symbolic` ships in Adwaita
-    // (`symbolic/actions/`) and is the affordance libadwaita already uses for a
-    // row that takes you somewhere.
-    issues.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-    // **`GtkUriLauncher`, not `cordial_plugins::urlopen`, and the difference is
-    // focus.** Both reach `org.freedesktop.portal.OpenURI`, so both work inside
-    // the Flatpak sandbox where a spawned `xdg-open` would not. But `urlopen`
-    // is the *plugin* path: a plugin has no window, so it passes an empty
-    // parent handle and no activation token, and GNOME's focus-stealing
-    // prevention answers that by declining to raise the browser -- you get a
-    // "Firefox is ready" notification instead of the page you asked for.
-    //
-    // This row has a window to offer. `UriLauncher::launch` takes the parent
-    // and hands the portal what it needs to raise the browser properly, which
-    // is the whole reason to use the GTK wrapper rather than call the portal by
-    // hand a second time. `urlopen` is left exactly as it is: it is correct for
-    // the caller it has, which never has a window (ADR-007).
-    let parent_for_link = parent.as_ref().clone();
-    issues.connect_activated(move |_| {
-        gtk::UriLauncher::new(ISSUES_URL).launch(
-            Some(&parent_for_link),
-            gtk::gio::Cancellable::NONE,
-            |result| {
-                if let Err(e) = result {
-                    eprintln!("[cordial] could not open the issue tracker: {e}");
-                }
-            },
-        );
-    });
-    where_group.add(&issues);
-    page.add(&where_group);
-
-    page
-}
-
 fn build_general_page(
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
@@ -2909,7 +2775,7 @@ fn add_get_plugins_groups(
 pub(crate) const CONTENT_WIDTH: i32 = 640;
 pub(crate) const CONTENT_HEIGHT: i32 = 720;
 
-/// Builds the settings dialog: Roblox, Updates, General, Plugins, Report, one
+/// Builds the settings dialog: Roblox, Updates, Version, General, Plugins, FastFlags, one
 /// `AdwPreferencesPage` each.
 ///
 /// **`AdwPreferencesDialog`, not `AdwPreferencesWindow`.** The window form has
@@ -2956,7 +2822,6 @@ pub fn build_preferences_window(
     add_developer_group(parent, config, config_path, &plugins);
     window.add(&plugins);
     window.add(&build_fastflags_page(config_for_flags, &window));
-    window.add(&build_report_page(parent));
 
     window
 }

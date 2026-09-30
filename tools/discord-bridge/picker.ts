@@ -52,8 +52,8 @@ export function pickerMessage(forms: IssueForm[], repoUrl: string): unknown {
       ),
       separator(),
       text(
-        "Every form asks for the diagnostics block. Get it from **Settings \u2192 " +
-          "Report a Problem \u2192 Copy diagnostics**, or run `cordial --diagnostics` " +
+        "Every form asks for the diagnostics block. Get it from **Main menu \u2192 " +
+          "Report a Problem \u2192 Copy**, or run `cordial --diagnostics` " +
           "\u2014 it works even when the client will not start, which is the report " +
           "that needs it most.",
       ),

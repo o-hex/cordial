@@ -355,6 +355,11 @@ mod tests {
     #[test]
     fn a_bad_or_foreign_request_changes_nothing_and_says_why() {
         let _g = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        // `current()` reads every module's state, and two of them have tests that
+        // flip theirs; hold their locks so the comparison below sees only what
+        // the requests did.
+        let _gm = crate::gamemode::TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _gp = crate::android::gamepad::TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let before = current();
         for bad in [
             "not json\n",
@@ -403,6 +408,8 @@ mod tests {
     #[test]
     fn a_gamemode_change_is_recorded_and_get_reports_it() {
         let _g = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        // The gamemode module's own tests move the same state, under their lock.
+        let _gm = crate::gamemode::TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let before = crate::gamemode::current();
         let set = |on: bool| handle(&live_wire::encode_set(&[Update::Gamemode(on)]));
 
@@ -422,6 +429,7 @@ mod tests {
     #[test]
     fn a_gamepad_change_reaches_the_switch_and_get_reports_it() {
         let _g = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        let _gp = crate::android::gamepad::TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let before = crate::android::gamepad::current_enabled();
         let set = |on: bool| handle(&live_wire::encode_set(&[Update::Gamepad(on)]));
 

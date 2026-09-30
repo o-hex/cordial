@@ -161,6 +161,11 @@ const SWITCH_ON: u8 = 1;
 const SWITCH_OFF: u8 = 2;
 static SWITCH: AtomicU8 = AtomicU8::new(SWITCH_UNSET);
 
+/// Taken by every test that moves [`SWITCH`], here and in `live_settings`, whose
+/// whole-map comparisons would otherwise catch it mid-flip.
+#[cfg(test)]
+pub(crate) static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Set when the switch has gone off and pads may still be held. The pump checks
 /// it each tick, so turning the setting off costs a relaxed load and not a lock
 /// on a path that runs thousands of times a second.
@@ -838,10 +843,9 @@ mod tests {
     /// environment only seeds it.
     #[test]
     fn the_switch_can_be_turned_off_and_back_on_after_it_was_seeded() {
-        use super::{current_enabled, set_enabled, SWITCH, SWITCH_UNSET};
+        use super::{current_enabled, set_enabled, SWITCH, SWITCH_UNSET, TEST_GUARD};
         use std::sync::atomic::Ordering;
-        static ONLY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ONLY.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         SWITCH.store(SWITCH_UNSET, Ordering::Relaxed);
         let seeded = current_enabled();
         set_enabled(!seeded);

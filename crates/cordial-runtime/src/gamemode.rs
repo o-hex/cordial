@@ -78,6 +78,13 @@ struct State {
 
 static STATE: Mutex<State> = Mutex::new(State { enabled: None, registered: false, started: false });
 
+/// The state above is process-global, so every test that changes it -- here and
+/// in `live_settings`, which reaches it through the socket handler -- takes this
+/// one lock. Two locks, one per test module, let the two modules' tests overlap
+/// and fail each other, which is what a whole-suite run did the first time.
+#[cfg(test)]
+pub(crate) static TEST_GUARD: Mutex<()> = Mutex::new(());
+
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -325,9 +332,7 @@ mod tests {
         }
     }
 
-    /// The shared state is process-global, so tests of the live path take this
-    /// lock and put it back.
-    static GLOBALS: Mutex<()> = Mutex::new(());
+    use super::TEST_GUARD as GLOBALS;
 
     #[test]
     fn a_live_change_before_startup_only_records_the_wish() {

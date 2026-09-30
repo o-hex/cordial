@@ -225,6 +225,12 @@ pub fn report() -> String {
         ("System", uname()),
         ("Distro", distro()),
         ("Session", session()),
+        // The NVIDIA kernel module and, in a Flatpak, whether the sandbox has
+        // the userspace driver that goes with it. Always present, and says so
+        // when there is no NVIDIA module: a mismatched Flatpak extension is the
+        // best-attested NVIDIA failure this project has a record of, and it
+        // looks like "no supported graphics device" until somebody asks.
+        ("Graphics", cordial_shell::nvidia::graphics_line()),
     ];
     for (label, value) in rows {
         out.push_str(&format!("{label:<9} {value}\n"));
@@ -247,8 +253,8 @@ mod tests {
         // literal that have to be remembered together: the literal was 6 when
         // a seventh row was added, and the failure it produced said nothing
         // about which row was new.
-        const LABELS: [&str; 7] =
-            ["Cordial", "Licence", "Install", "Roblox", "System", "Distro", "Session"];
+        const LABELS: [&str; 8] =
+            ["Cordial", "Licence", "Install", "Roblox", "System", "Distro", "Session", "Graphics"];
         let text = report();
         for label in LABELS {
             let line = text

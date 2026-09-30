@@ -101,6 +101,27 @@ pub fn describe(status: &std::process::ExitStatus) -> String {
     }
 }
 
+/// The line under the title: what happened, and -- only when the client's own
+/// output and the machine both say it applies -- a hint about the NVIDIA driver.
+///
+/// Both hints are silent unless the client reported that it rendered on an
+/// NVIDIA device (`cordial_shell::nvidia::crash_hint` reads that from the
+/// output) or the Flatpak is missing the driver the host runs, which is a fact
+/// about the install and not a guess about the crash. Each says "may". The
+/// wording, the evidence and the tests live in `cordial_shell::nvidia`.
+fn description(status: &std::process::ExitStatus, output: &str) -> String {
+    let mut text = describe(status);
+    let extra = [
+        cordial_shell::nvidia::crash_hint(output),
+        cordial_shell::nvidia::flatpak_gl_here().advice(),
+    ];
+    for hint in extra.into_iter().flatten() {
+        text.push_str("\n\n");
+        text.push_str(&hint);
+    }
+    text
+}
+
 /// Show the crash, transient for `parent`.
 ///
 /// `output` is what the client last printed, already redacted; `command_line`
@@ -115,7 +136,7 @@ pub fn present(
     let status_page = adw::StatusPage::builder()
         .icon_name("dialog-error-symbolic")
         .title("Roblox stopped unexpectedly")
-        .description(describe(status))
+        .description(description(status, output))
         .build();
 
     let body = gtk::Box::new(gtk::Orientation::Vertical, 12);

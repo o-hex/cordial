@@ -18,6 +18,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod config;
 pub mod editor_font;
+pub mod etc_decode;
 pub mod frame_pacing;
 pub mod gamepad;
 pub mod gl;
@@ -26,6 +27,7 @@ pub mod input;
 pub mod looper;
 pub mod system;
 pub mod vulkan;
+pub mod vulkan_etc;
 pub mod wayland;
 pub mod window;
 
@@ -40,6 +42,10 @@ static TRACE: AtomicBool = AtomicBool::new(false);
 /// watch which of these it reached.
 pub fn set_trace(on: bool) {
     TRACE.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn tracing() -> bool {
+    TRACE.load(Ordering::Relaxed)
 }
 
 pub(crate) fn trace(args: std::fmt::Arguments<'_>) {

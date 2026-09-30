@@ -549,8 +549,19 @@ extern "C" fn vk_get_instance_proc_addr(instance: *mut c_void, name: *const c_ch
         // loader would give a native Linux Vulkan app. Forwarding unconditionally
         // is correct because `instance`, once created, is a real host
         // `VkInstance`: see `vk_create_instance`.
-        _ => unsafe { (h.get_instance_proc_addr)(instance, name) },
+        _ => {
+            let p = unsafe { (h.get_instance_proc_addr)(instance, name) };
+            super::vulkan_etc::hook(bytes, p).unwrap_or(p)
+        }
     }
+}
+
+pub(super) fn host_instance_proc(name: &CStr) -> *mut c_void {
+    let Some(h) = host() else {
+        return std::ptr::null_mut();
+    };
+    let inst = INSTANCE.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
+    unsafe { (h.get_instance_proc_addr)(inst, name.as_ptr()) }
 }
 
 /// The host's `vkGetDeviceProcAddr`, so device-level lookups can be forwarded
@@ -567,7 +578,8 @@ extern "C" fn vk_get_device_proc_addr(device: *mut c_void, name: *const c_char) 
     let host: extern "C" fn(*mut c_void, *const c_char) -> *mut c_void =
         unsafe { std::mem::transmute(f) };
     // SAFETY: Vulkan's contract is a NUL-terminated name.
-    match unsafe { CStr::from_ptr(name) }.to_bytes() {
+    let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
+    match bytes {
         b"vkQueuePresentKHR" => {
             HOST_QUEUE_PRESENT.store(host(device, name) as usize, std::sync::atomic::Ordering::Relaxed);
             vk_queue_present_khr as *const () as *mut c_void
@@ -587,7 +599,10 @@ extern "C" fn vk_get_device_proc_addr(device: *mut c_void, name: *const c_char) 
                 .store(host(device, name) as usize, std::sync::atomic::Ordering::Relaxed);
             vk_create_shader_module as *const () as *mut c_void
         }
-        _ => host(device, name),
+        _ => {
+            let p = host(device, name);
+            super::vulkan_etc::hook(bytes, p).unwrap_or(p)
+        }
     }
 }
 
@@ -940,7 +955,13 @@ extern "C" fn vk_create_device(
     // SAFETY: resolved from the host loader for exactly this name, and called
     // with the caller's own arguments unchanged.
     let f: Fn_ = unsafe { std::mem::transmute(f) };
-    f(physical_device, create_info, allocator, device_out)
+    let stripped = super::vulkan_etc::strip_device_features(physical_device, create_info);
+    let info = stripped.as_ref().map_or(create_info, |s| s.as_ptr());
+    let rc = f(physical_device, info, allocator, device_out);
+    if rc == VK_SUCCESS && !device_out.is_null() {
+        super::vulkan_etc::device_created(physical_device, unsafe { *device_out });
+    }
+    rc
 }
 
 /// What the present-mode setting asked for.
@@ -1762,6 +1783,8 @@ extern "C" fn vk_get_physical_device_format_properties(
     // SAFETY: resolved from the host loader for exactly this name.
     let f: Fn_ = unsafe { std::mem::transmute(f) };
     f(physical_device, format, out);
+    let raw: extern "C" fn(*mut c_void, u32, *mut c_void) = unsafe { std::mem::transmute(f) };
+    super::vulkan_etc::patch_format_properties(physical_device, format, out as *mut c_void, raw);
 
     let family = format_family(format);
     if (family == "etc2" || family == "astc") && mask_mobile_texture_formats() {

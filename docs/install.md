@@ -239,12 +239,13 @@ Verifying it first is two commands and is worth doing — see
 signature is keyless, so there is no Cordial key to add to your keyring and
 none to trust.
 
-**The AUR** has `cordial`, `cordial-bin` and `cordial-git`
-([`packaging/aur/`](../packaging/aur) is where they are kept). Pushing to it is
-a manual step, so they lag: on 2026-09-30 the AUR's own listing showed all three
-at 0.17.0 while the tree is at 0.20.1. Prefer the release package or the
-repository below until that is caught up. The procedure is in
-[`packaging/aur/PUBLISHING.md`](../packaging/aur/PUBLISHING.md).
+**The AUR packages are not published by this project.** `cordial`,
+`cordial-bin` and `cordial-git` on the AUR belong to an account that is not the
+maintainer's (`taxin-404`). On 2026-09-30 they were copies of
+[`packaging/aur/`](../packaging/aur) from 0.17.0, fetching only from this
+repository, and `cordial-bin`'s checksum matched the official 0.17.0 release
+file. Nobody here reviews what that account publishes next, so prefer the
+release package or the signed pacman repository below.
 
 **Cordial's own pacman repository** is published and signed. Import its key and
 add it to `pacman.conf`:

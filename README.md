@@ -138,9 +138,9 @@ sudo pacman -U cordial-*-x86_64.pkg.tar.zst # x86-64 only -- see above
 ```
 
 Signed apt, dnf and pacman repositories are published too; the setup commands
-are in [`docs/install.md`](docs/install.md). The AUR has `cordial`,
-`cordial-bin` and `cordial-git`, but they are pushed by hand and were last
-pushed at 0.17.0.
+are in [`docs/install.md`](docs/install.md). The `cordial`,
+`cordial-bin` and `cordial-git` packages on the AUR are maintained by someone
+outside this project and were last updated at 0.17.0.
 
 **From source:**
 

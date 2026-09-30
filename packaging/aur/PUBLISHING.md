@@ -1,13 +1,15 @@
 # Publishing to the AUR
 
-Three packages live under `packaging/aur/`, and all three are on the AUR:
-`cordial`, `cordial-bin` and `cordial-git`. **The AUR copies lag this tree.** On
-2026-09-30 the AUR's own listing (`aur.archlinux.org/rpc/v5/info`) showed
-`cordial` and `cordial-bin` at 0.17.0-1 and `cordial-git` at
-0.17.0.r0.g5412f88-1, last modified 2026-09-20, under the maintainer name
-`taxin`, while `packaging/aur/cordial/PKGBUILD` says 0.20.1. Nothing pushes to
-the AUR automatically; every release needs the steps below run by hand, once per
-package, by whoever holds that account's SSH key.
+Three packages live under `packaging/aur/`. **The AUR packages of the same
+names are not this project's.** They were submitted and are maintained by
+`taxin-404` (`taxin404@duck.com`), an account the maintainer does not own. On
+2026-09-30 all three were at 0.17.0, last modified 2026-09-20: copies of this
+directory's files at that version with the maintainer line changed, fetching
+only from `github.com/luohoa97/cordial`, and `cordial-bin`'s sha256 matched the
+official v0.17.0 release asset. What that account pushes later is not reviewed
+here. Publishing this project's own packages would need those names adopted
+(ask the maintainer, or file an AUR request) or different names; until then
+the steps below are what a maintainer of those packages would run.
 
 - **`cordial-git/`** builds whatever commit is at the tip of `main`.
 - **`cordial/`** builds a tagged release, and is also what

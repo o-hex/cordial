@@ -156,6 +156,9 @@ fn apply(update: &Update) -> Option<String> {
             println!("  live: audio_output: {moved} playing stream(s) moved");
             (!note.is_empty()).then_some(note)
         }
+        // A request to gamemoded, made on the spot. The note is whatever the
+        // daemon said that was not "yes", or that it has not answered yet.
+        Update::Gamemode(on) => crate::gamemode::set_enabled(*on),
     };
     // Narrated because this project debugs by reading the client's output, and
     // "the setting reached the process" is the fact worth being able to see.
@@ -167,7 +170,7 @@ fn value_word(update: &Update) -> String {
     match update {
         Update::PointerAcceleration(a) => a.as_str().to_string(),
         Update::Throttle(t) => t.as_str().to_string(),
-        Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) => b.to_string(),
+        Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) | Update::Gamemode(b) => b.to_string(),
         Update::AudioOutput(name) if name.is_empty() => "the system default".to_string(),
         Update::AudioOutput(name) => name.clone(),
     }
@@ -246,6 +249,7 @@ fn current() -> BTreeMap<String, Value> {
     m.insert("close_on_leave".into(), Value::from(crate::game_log::current_close_on_leave()));
     m.insert("carry_launch_ticket".into(), Value::from(crate::deeplink::carry_ticket()));
     m.insert("audio_output".into(), Value::from(audio::current()));
+    m.insert("gamemode".into(), Value::from(crate::gamemode::current()));
     m
 }
 
@@ -338,6 +342,7 @@ mod tests {
             "{\"exec\":\"ls\"}\n",
             "{\"set\":{\"throttle\":\"sometimes\"}}\n",
             "{\"set\":{\"audio_output\":true}}\n",
+            "{\"set\":{\"gamemode\":\"yes\"}}\n",
             "{\"set\":{\"audio_output\":\"a\\u0000b\"}}\n",
         ] {
             let r = handle(bad);
@@ -372,6 +377,25 @@ mod tests {
         assert_eq!(audio::current(), "");
 
         set(&before);
+    }
+
+    #[test]
+    fn a_gamemode_change_is_recorded_and_get_reports_it() {
+        let _g = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = crate::gamemode::current();
+        let set = |on: bool| handle(&live_wire::encode_set(&[Update::Gamemode(on)]));
+
+        // Startup registration has not run in a unit test, so this only records
+        // the wish and there is nothing to tell the daemon. The daemon side is
+        // exercised in `gamemode`'s own tests with a fake one.
+        let r = set(!before);
+        assert!(r.ok && r.applied == vec!["gamemode".to_string()], "{r:?}");
+        assert_eq!(r.values["gamemode"], !before);
+        assert!(!r.notes.contains_key("gamemode"), "{r:?}");
+        assert_eq!(handle(&live_wire::encode_get()).values["gamemode"], !before);
+
+        // Control: the opposite message flips it back.
+        assert_eq!(set(before).values["gamemode"], before);
     }
 
     #[test]

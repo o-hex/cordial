@@ -63,7 +63,7 @@ pub const CLASSIFICATION: &[(&str, Applies, &str)] = &[
     ("title_bar", Applies::NextLaunch, "the game window's header bar is built when the client starts"),
     ("roblox", Applies::NextLaunch, "which build to run is located at launch"),
     ("profile", Applies::NextLaunch, "names the profile the next client runs"),
-    ("gamemode", Applies::NextLaunch, "registered with gamemoded once, at client start"),
+    ("gamemode", Applies::Live, "registration with gamemoded is per pid and can be made or withdrawn at any time"),
     ("throttle", Applies::Live, "the pump reads the policy every tick"),
     ("pointer_acceleration", Applies::Live, "read on every locked-pointer motion event"),
     ("automatic_updates", Applies::Shell, "read by the shell when a check runs"),
@@ -108,6 +108,7 @@ pub fn live_updates(config: &ShellConfig) -> Vec<Update> {
         // The same string the launch environment carries, trimmed the same way,
         // and empty for "follow the default".
         Update::AudioOutput(config.audio_output.env_value().unwrap_or("").to_string()),
+        Update::Gamemode(config.gamemode),
     ]
 }
 

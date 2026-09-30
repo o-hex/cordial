@@ -100,11 +100,19 @@ pub enum Update {
     /// same string `CORDIAL_AUDIO_SINK` carries at launch, so a choice has one
     /// spelling whether it arrives at spawn or afterwards.
     AudioOutput(String),
+    /// Whether the client is registered with Feral GameMode's daemon.
+    Gamemode(bool),
 }
 
 /// The keys [`Update`] can carry, which are also the `shell.json` field names.
-pub const KEYS: [&str; 5] =
-    ["pointer_acceleration", "throttle", "close_on_leave", "carry_launch_ticket", "audio_output"];
+pub const KEYS: [&str; 6] = [
+    "pointer_acceleration",
+    "throttle",
+    "close_on_leave",
+    "carry_launch_ticket",
+    "audio_output",
+    "gamemode",
+];
 
 /// Longest sink name accepted. PipeWire node names are short; the bound is
 /// there so a value cannot approach [`MAX_LINE`] and so the client never hands
@@ -125,6 +133,7 @@ impl Update {
             Update::CloseOnLeave(_) => "close_on_leave",
             Update::CarryLaunchTicket(_) => "carry_launch_ticket",
             Update::AudioOutput(_) => "audio_output",
+            Update::Gamemode(_) => "gamemode",
         }
     }
 
@@ -132,7 +141,9 @@ impl Update {
         match self {
             Update::PointerAcceleration(a) => Value::from(a.as_str()),
             Update::Throttle(t) => Value::from(t.as_str()),
-            Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) => Value::from(*b),
+            Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) | Update::Gamemode(b) => {
+                Value::from(*b)
+            }
             Update::AudioOutput(name) => Value::from(name.as_str()),
         }
     }
@@ -152,6 +163,7 @@ impl Update {
             }
             "close_on_leave" => value.as_bool().map(Update::CloseOnLeave).ok_or_else(bad),
             "carry_launch_ticket" => value.as_bool().map(Update::CarryLaunchTicket).ok_or_else(bad),
+            "gamemode" => value.as_bool().map(Update::Gamemode).ok_or_else(bad),
             "audio_output" => value
                 .as_str()
                 .filter(|n| valid_sink_name(n))
@@ -266,6 +278,7 @@ mod tests {
             Update::CloseOnLeave(true),
             Update::CarryLaunchTicket(false),
             Update::AudioOutput("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()),
+            Update::Gamemode(false),
         ]
     }
 
@@ -333,6 +346,7 @@ mod tests {
             r#"{"set":{"close_on_leave":"yes"}}"#,
             r#"{"set":{"throttle":"off","carry_launch_ticket":1}}"#,
             r#"{"set":{"audio_output":true}}"#,
+            r#"{"set":{"gamemode":"on"}}"#,
             r#"{"set":{"audio_output":"a\u0000b"}}"#,
         ] {
             assert!(decode(bad).is_err(), "{bad} should be refused");

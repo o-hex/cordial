@@ -763,7 +763,6 @@ fn build_performance_group(
         .active(config.borrow().gamemode)
         .build();
     gamemode.set_subtitle_lines(2);
-    next_launch(&gamemode, "gamemode");
     {
         let config = config.clone();
         let config_path = config_path.clone();

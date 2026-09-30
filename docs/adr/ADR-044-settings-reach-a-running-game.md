@@ -26,8 +26,9 @@
    keys that moved. The shell's own saves, hand edits and a second shell
    instance all arrive this way, so no settings row has to call anything. A
    file that fails to parse changes nothing; it is not read as the defaults.
-4. **Client side, each live setting is an atomic** in the module that uses it,
-   initialised from the launch environment. The launch environment is still
+4. **Client side, each live setting is an atomic** in the module that uses it
+   (two are not: the audio sink is a string the backend owns, and gamemode is a
+   registration with a daemon), initialised from the launch environment. The launch environment is still
    set, so a client started by hand or by an older shell behaves as before.
 5. **A client that has not answered yet is retried** once a second for about
    half a minute, then left until the wanted values change. A client registers
@@ -43,7 +44,7 @@
 | `close_on_leave` | live | consulted when the log reports leaving a game |
 | `carry_launch_ticket` | live | consulted each time a link is translated |
 | `gamepad` | next launch | switching off mid-session needs a disconnect for every announced pad; unmeasured |
-| `gamemode` | next launch | registered with gamemoded once |
+| `gamemode` | live | registration with gamemoded is per pid; the client registers or withdraws on the spot |
 | `graphics`, `graphics_optimization_mode` | next launch | settled before engine initialisation |
 | `present_mode` | next launch | read at swapchain creation |
 | `mangohud`, `vkbasalt` | next launch | Vulkan layers load at instance creation |
@@ -87,6 +88,25 @@ with no `default` metadata, are **INFERRED**: the client checks for the metadata
 object and reports its absence instead of claiming the move. The client itself
 was not run for this change; the native backend and the socket handler were
 exercised separately.
+
+## GameMode
+
+`cordial_runtime::gamemode` (moved out of `load.rs` so the socket can reach it)
+keeps a wish and a fact: whether the setting is on, and whether gamemoded has
+said yes to `RegisterGame`. A live change stores the wish and, once startup
+registration has run, asks the daemon for whatever differs. A change that arrives
+before that only stores the wish, which startup then honours instead of the
+environment. The call runs on its own thread and is waited for 1.5 s, because
+`call_method` blocks for as long as the daemon takes and the socket serves one
+peer at a time; a slow daemon gets a note saying the request is still in flight.
+A daemon that declines, or is not there (the ordinary case), leaves the client
+unregistered and the reply says why.
+
+Checked against the session's real `gamemoded`, asking it `QueryStatus` for the
+test process afterwards: 0 before, 2 (registered) after a live enable, 0 after a
+live disable. The rest is unit tests against a fake daemon: one `RegisterGame`
+and one `UnregisterGame` for an on and an off, nothing sent for a repeat, a
+declined or absent daemon leaving the client unregistered.
 
 ## Consequences
 

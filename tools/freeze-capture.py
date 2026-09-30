@@ -20,8 +20,10 @@ Written to files under OUTDIR:
   wrappers.txt  every live Cordial condition-variable wrapper (bionic::pthread),
                 its glibc backing object decoded, and any thread whose futex sits
                 inside one. `waiters > 0` beside pending `g_signals` on a cond
-                is a lost wakeup; healthy clients show neither (92-94 wrappers,
-                no duplicates, none anomalous, on 2026-09-29).
+                is a lost wakeup; healthy clients show none (92-95 wrappers,
+                no duplicates, on 2026-09-29/30; idle pools legitimately show
+                waiters with g_signals 0). Needs XDG_DATA_HOME in the environment
+                for the devctl step, or devctl.txt says connection refused.
   sockets.txt   `ss -tnpei` rows for this pid (tcp_info: bytes, last-rx times),
                 the socket fds, and which epoll instance registers which fd
   devctl.txt    `info` and `loopers` from the control socket, if it is up
@@ -262,9 +264,14 @@ for wa, ptr in found:
     wseq, g1s, r0, r1, s0, s1, orig, wrefs, sig0, sig1 = struct.unpack("<QQIIIIIIII", raw)
     waiters = wrefs >> 3
     tag = ""
-    if waiters or sig0 >> 1 or sig1 >> 1:
-        tag = "  <== waiters/signals non-zero"
+    # Waiters alone are an idle pool (healthy clients show three or more such
+    # conds with g_signals 0, 2026-09-30); a lost wakeup is waiters BESIDE a
+    # pending signal.
+    if waiters and (sig0 >> 1 or sig1 >> 1):
+        tag = "  <== waiters beside pending signals (lost wakeup shape)"
         suspicious.append(wa)
+    elif sig0 >> 1 or sig1 >> 1:
+        tag = "  (signals pending, no waiters)"
     wl.append(f"wrapper {wa:#x} [{where(wa)}] -> backing {ptr:#x} wseq={wseq:#x} g1_start={g1s:#x} "
               f"g_refs=({r0},{r1}) g_size=({s0},{s1}) orig={orig:#x} wrefs={wrefs:#x}(waiters={waiters}) "
               f"g_signals=({sig0:#x},{sig1:#x}){tag}")

@@ -21,6 +21,88 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## Open: two frozen specimens at last, one with the condition-variable wrapper removed; the network is not what they wait on, 2026-09-30
+
+Build `Cordial 0.20.1 (bb5620b54-dirty)` (the dirt is the `third_party/mcpelauncher-linker`
+submodule marker), signed-in `CordialTest` on a nested headless sway, three
+launches from 11:04 before the round was stopped early (a third of the 16 budgeted).
+`tools/freeze-capture.py` ran against both frozen clients before anything else
+attached, again five minutes later, and both stayed frozen throughout.
+
+| run | arm | client | verdict | presents at 1/3/5/7/9/11 s |
+|---|---|---|---|---|
+| r01 | control | free | healthy, Home | 0 / 2 / 67 / 78 |
+| r02 | `CORDIAL_COND_PASSTHROUGH=1` | free | **frozen** | 0 / 2 / 2 / 2 / 2 / 2 |
+| r03 | control | core 0 + one busy loop | **frozen** | 0 / 1 / 1 / 1 / 1 / 1 |
+
+**The wrapper is not necessary.** r02 froze with `pthread_cond_*` handed straight
+to glibc: `wrappers.txt` found zero wrappers in it, and the freeze is otherwise
+the same shape as the control's -- `Forcing finalize`, no `~UgcExperienceController`,
+`sync cookies from engine`, `presents` fixed. One frozen passthrough client is
+enough for that claim; it says nothing about the rate (1 of 1 there, 1 of 2
+controls).
+
+**The finalize thread is in the engine's own park in both, not in a cond wrap.** The
+thread that logs `Forcing finalize` (log id `9996c6c0` / `527fc6c0`, mapped to its
+LWP through gdb's `Thread 0x...`), in both clients:
+
+```
+r02 (P) tid 328193  futex 0x7fe90be8cf0c  op=0x89 val=0x4  timeout NULL  raw syscall() frame
+r03 (C) tid 352125  futex 0x7fc5ae9fa50c  op=0x89 val=0x3  timeout NULL  raw syscall() frame
+```
+
+Both addresses are in the anonymous rw region shared with the `RBX Worker` parkers
+(the same 128-byte-stride array), neither inside a Cordial cond backing (in r03,
+where 90 wrappers exist, `wrappers.txt` says so by name). The word and
+the value did not change across the five minutes in either. So this is `0x89`, not
+the `0x189` a healthy gdb-launched run showed (a glibc cond wait), and it is the
+same park an idle worker sits in: **INFERRED** that this thread may be idle rather than
+waiting *for* anything, i.e. that the missing thing is a task or continuation nobody
+posted, not a wake nobody sent.
+
+**No lost wakeup in the Cordial wrappers.** In r03, 90 wrappers, none duplicated, and
+conds with waiters (4 in the first capture; 6, 29 and 1 in the second) all with
+`g_signals = 0` -- an idle pool. The
+tool's old tag ("waiters/signals non-zero") fired on those and on three conds in the healthy
+r01, so it over-reported; `freeze-capture.py` now flags waiters only beside pending
+signals, and none of the three captures has one.
+
+**The 1 ms `HttpClient` poll is the LAN websocket, and the freeze does not wait on it.**
+In both, the poll is `poll(nfds=2, timeout=1)` with `fd=90`/`92` at `events=0x4`
+(`POLLOUT`), and `ss -tnpei` gives that socket as `SYN-SENT` to `10.110.101.222:5052`.
+That is the websocket that times out at 60 s in every run, healthy ones and Sober
+included (`docs/HANDOVER.md` row for `10.110.101.222:5052`); the healthy r01 also had
+two of them in `SYN-SENT`. It ended in `Connection timed out after 59999 ms` at 61.1 s
+in r02 (61.2 s in r03) and the poll went back to `poll(1 eventfd, 69 s)`; the client
+stayed frozen. **This retires the 2026-09-29 reading that in a frozen client curl believes
+one transfer is still in flight for minutes.**
+
+**The engine's HTTP layer is alive in a frozen client.** In r02 the same `HttpClient`
+thread (`8bfff6c0`, the one that logged `sync cookies from engine`) completed the
+settings refresh at 120, 240 and 360 s (`Settings Date header`, `writeFlagCache`,
+`DynamicFastVariableReloader finished flag fetch`), and `HttpThreadPool`/`Main`
+cond values moved between the two captures. Nothing is stuck in networking, the
+cookie callback, the getaddrinfo shim or the trust store: every one of them is
+demonstrably exercised after the freeze started.
+
+**Where the chain ends.** One `Main`-named engine thread parked in the engine's own
+futex park since 1.4 s, every worker idle in the same park, the HTTP thread
+serving requests, the AGDK thread spinning as documented. Nothing Cordial answers is
+implicated by this evidence, so no fix is made: a toggle would be a guess. Not
+done, and not authorised this round: the `shutdown(fd)` poke (moot now -- the socket
+it was meant for is the benign websocket) and anything that calls into the process.
+
+**Also settled cheaply.** The `client settings ... (engine document, fetched)` line in the
+healthy r01 against `(cache)` in both frozen runs is `MAX_AGE` (six hours): r01 was the
+first launch in thirteen hours. Not a discriminator; every earlier back-to-back round was
+all-cache.
+
+**Not done.** Thirteen of the sixteen budgeted launches were not made (stopped at three
+by request), so there is no per-arm rate: control 1 frozen of 2, passthrough 1 of 1.
+`devctl.txt` in r02's capture says connection refused, because `freeze-capture.py` reads
+`XDG_DATA_HOME` and the harness had not exported it; r03 onwards has it. The captures are
+in `~/.cache/cordial-handoff/freeze-round7/`.
+
 ## Open: eight launches, no frozen specimen; the engine's condition variables were Cordial's all along, and two "frozen" signatures are also healthy, 2026-09-29 (late)
 
 Eight signed-in `CordialTest` launches, 21:01-21:29 local, nested headless sway,

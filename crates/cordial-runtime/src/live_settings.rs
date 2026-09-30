@@ -6,11 +6,14 @@
 //! socket inside the profile and applies the few settings that are read on a
 //! hot path and can safely change: each one is an atomic in the module that
 //! uses it, so applying a message is a store from this thread and needs no
-//! hand-off to the pump (unlike `devctl`, which calls engine natives).
+//! hand-off to the pump (unlike `devctl`, which calls engine natives). The one
+//! exception is the audio sink, which is changed by the audio backend itself
+//! (`cordial_audio_set_output`): it re-links the streams PipeWire already has
+//! and never touches the engine's OpenSL ES or AAudio objects.
 //!
 //! **What this is not.** It is not `devctl`. That socket is opt-in, drives input
 //! and captures frames, and must stay off for anyone who did not ask for it
-//! (ADR-019); this one is always on, and can only set the four values in
+//! (ADR-019); this one is always on, and can only set the values in
 //! `cordial_shell::live_wire::Update`. Anything else in a message is refused or
 //! reported as ignored. It also does not reach the engine, read files, or
 //! start anything.
@@ -112,31 +115,52 @@ pub fn handle(line: &str) -> Reply {
         Ok(Request::Get) => Reply { ok: true, values: current(), ..Reply::default() },
         Ok(Request::Set { updates, ignored }) => {
             let mut applied = Vec::new();
+            let mut notes = BTreeMap::new();
             for u in &updates {
-                apply(*u);
+                if let Some(note) = apply(u) {
+                    notes.insert(u.key().to_string(), note);
+                }
                 applied.push(u.key().to_string());
             }
-            Reply { ok: true, applied, ignored, values: current(), error: None }
+            Reply { ok: true, applied, ignored, values: current(), notes, error: None }
         }
     }
 }
 
-fn apply(update: Update) {
-    match update {
+/// Applies one update. The `Some` is something worth telling the shell about
+/// that is not a failure: a sink change with nothing playing has nothing to move.
+fn apply(update: &Update) -> Option<String> {
+    let note = match update {
         Update::PointerAcceleration(a) => {
-            crate::android::wayland::set_pointer_acceleration(a == Accel::Always)
+            crate::android::wayland::set_pointer_acceleration(*a == Accel::Always);
+            None
         }
-        Update::Throttle(t) => crate::android::input::set_throttle_policy(match t {
-            Throttle::Visible => crate::android::input::ThrottleWhen::Visible,
-            Throttle::Unfocused => crate::android::input::ThrottleWhen::Unfocused,
-            Throttle::Off => crate::android::input::ThrottleWhen::Off,
-        }),
-        Update::CloseOnLeave(b) => crate::game_log::set_close_on_leave(b),
-        Update::CarryLaunchTicket(b) => crate::deeplink::set_carry_ticket(b),
-    }
+        Update::Throttle(t) => {
+            crate::android::input::set_throttle_policy(match t {
+                Throttle::Visible => crate::android::input::ThrottleWhen::Visible,
+                Throttle::Unfocused => crate::android::input::ThrottleWhen::Unfocused,
+                Throttle::Off => crate::android::input::ThrottleWhen::Off,
+            });
+            None
+        }
+        Update::CloseOnLeave(b) => {
+            crate::game_log::set_close_on_leave(*b);
+            None
+        }
+        Update::CarryLaunchTicket(b) => {
+            crate::deeplink::set_carry_ticket(*b);
+            None
+        }
+        Update::AudioOutput(name) => {
+            let (moved, note) = audio::set_output(name);
+            println!("  live: audio_output: {moved} playing stream(s) moved");
+            (!note.is_empty()).then_some(note)
+        }
+    };
     // Narrated because this project debugs by reading the client's output, and
     // "the setting reached the process" is the fact worth being able to see.
-    println!("  live: {} -> {}", update.key(), value_word(&update));
+    println!("  live: {} -> {}", update.key(), value_word(update));
+    note
 }
 
 fn value_word(update: &Update) -> String {
@@ -144,6 +168,52 @@ fn value_word(update: &Update) -> String {
         Update::PointerAcceleration(a) => a.as_str().to_string(),
         Update::Throttle(t) => t.as_str().to_string(),
         Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) => b.to_string(),
+        Update::AudioOutput(name) if name.is_empty() => "the system default".to_string(),
+        Update::AudioOutput(name) => name.clone(),
+    }
+}
+
+/// The audio backend's end of `audio_output`. Declared rather than wrapped in a
+/// module of its own because it is two calls into `native/pipewire_backend.cpp`.
+mod audio {
+    use std::ffi::CString;
+    use std::os::raw::c_char;
+
+    extern "C" {
+        fn cordial_audio_set_output(name: *const c_char, note: *mut c_char, note_len: usize) -> usize;
+        fn cordial_audio_output(out: *mut c_char, out_len: usize) -> usize;
+    }
+
+    /// Aim playback at `name` (empty for the system default). Returns how many
+    /// playing streams moved and a note when the answer is more than "all of
+    /// them".
+    pub fn set_output(name: &str) -> (usize, String) {
+        // The wire has already refused control characters, which include NUL, so
+        // this only fails if a caller skipped that check. Refused rather than
+        // truncated at the NUL into a different sink.
+        let Ok(c) = CString::new(name) else {
+            return (0, "the sink name contains a NUL byte".to_string());
+        };
+        let mut note = vec![0u8; 512];
+        // Safety: `c` is NUL-terminated and outlives the call; `note` is writable
+        // for `note.len()` bytes and the callee NUL-terminates within it.
+        let moved = unsafe {
+            cordial_audio_set_output(c.as_ptr(), note.as_mut_ptr().cast::<c_char>(), note.len())
+        };
+        (moved, nul_terminated(&note))
+    }
+
+    /// The sink in force, empty for the system default.
+    pub fn current() -> String {
+        let mut buf = vec![0u8; 512];
+        // Safety: as above.
+        unsafe { cordial_audio_output(buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
+        nul_terminated(&buf)
+    }
+
+    fn nul_terminated(buf: &[u8]) -> String {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
     }
 }
 
@@ -175,6 +245,7 @@ fn current() -> BTreeMap<String, Value> {
     );
     m.insert("close_on_leave".into(), Value::from(crate::game_log::current_close_on_leave()));
     m.insert("carry_launch_ticket".into(), Value::from(crate::deeplink::carry_ticket()));
+    m.insert("audio_output".into(), Value::from(audio::current()));
     m
 }
 
@@ -266,6 +337,8 @@ mod tests {
             "not json\n",
             "{\"exec\":\"ls\"}\n",
             "{\"set\":{\"throttle\":\"sometimes\"}}\n",
+            "{\"set\":{\"audio_output\":true}}\n",
+            "{\"set\":{\"audio_output\":\"a\\u0000b\"}}\n",
         ] {
             let r = handle(bad);
             assert!(!r.ok, "{bad:?} should fail");
@@ -274,6 +347,40 @@ mod tests {
         let r = handle("{\"set\":{\"unheard_of\":1}}\n");
         assert!(r.ok && r.applied.is_empty() && r.ignored == vec!["unheard_of".to_string()]);
         assert_eq!(current(), before, "nothing above may have moved a setting");
+    }
+
+    #[test]
+    fn a_sink_change_reaches_the_audio_backend_and_get_reports_it() {
+        let _g = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = audio::current();
+
+        let set = |name: &str| handle(&live_wire::encode_set(&[Update::AudioOutput(name.into())]));
+        let r = set("a-sink-that-does-not-exist");
+        assert!(r.ok, "{r:?}");
+        assert_eq!(r.applied, vec!["audio_output".to_string()]);
+        assert_eq!(r.values["audio_output"], "a-sink-that-does-not-exist");
+        assert_eq!(audio::current(), "a-sink-that-does-not-exist");
+        // No stream is playing in a unit test. The reply says so instead of
+        // letting "applied" be read as "you will hear it".
+        assert!(r.notes.contains_key("audio_output"), "{r:?}");
+
+        // A get reports what is in force, and the opposite change flips it back;
+        // empty is the system default.
+        assert_eq!(handle(&live_wire::encode_get()).values["audio_output"], "a-sink-that-does-not-exist");
+        let back = set("");
+        assert_eq!(back.values["audio_output"], "");
+        assert_eq!(audio::current(), "");
+
+        set(&before);
+    }
+
+    #[test]
+    fn a_sink_name_with_a_control_character_changes_nothing() {
+        let _g = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = audio::current();
+        let r = handle("{\"set\":{\"audio_output\":\"two\\nlines\"}}\n");
+        assert!(!r.ok);
+        assert_eq!(audio::current(), before);
     }
 
     #[test]

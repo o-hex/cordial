@@ -84,8 +84,10 @@ std::vector<DeviceInfo> enumerate_devices();
 /// `node.name` — `alsa_output.pci-0000_00_1f.3-...`, not an index and not a
 /// description.
 ///
-/// Read once from `CORDIAL_AUDIO_SINK`, which the shell sets from the Audio
-/// row in its settings. Empty is the ordinary state and means "follow
+/// Seeded from `CORDIAL_AUDIO_SINK` (which the shell sets from the Audio row in
+/// its settings) the first time it is asked, and replaced by
+/// [`set_output_device`] thereafter. Returned by value: it can change under the
+/// caller. Empty is the ordinary state and means "follow
 /// whatever the session calls the default sink", *and keeps following it* —
 /// PipeWire moves a stream with no `PW_KEY_TARGET_OBJECT` when the default
 /// changes, so the absence of a target is not a snapshot of today's default
@@ -103,7 +105,38 @@ std::vector<DeviceInfo> enumerate_devices();
 /// One reader, here, on the same argument `aaudio.h` makes for `CORDIAL_AUDIO`:
 /// each file calling `getenv` for itself is how a switch comes to mean two
 /// different things in one process.
-const std::string& configured_output_device();
+std::string configured_output_device();
+
+/// What [`set_output_device`] did.
+struct OutputSwitch {
+    /// Playback streams re-aimed while they were playing.
+    size_t moved = 0;
+    /// Set when the answer is not simply "moved them all" -- nothing was
+    /// playing, the session could not be asked, the host's backend has no
+    /// notion of a sink. Empty means nothing needs saying. It travels back to
+    /// the shell, because a setting that claims to have applied and did not is
+    /// the failure ADR-044 is written against.
+    std::string note;
+};
+
+/// Change the sink mid-game. `name` is a `node.name` as above, empty for the
+/// system default.
+///
+/// **The engine's streams are not recreated.** Its OpenSL ES players and AAudio
+/// streams keep their `pw_stream`, their buffers and their callbacks, so the
+/// objects FMOD holds stay valid and the mixer does not see an underrun. What
+/// changes is where the session manager links each stream, which is done the
+/// way `pw-metadata <node> target.object <sink>` and `pactl move-sink-input`
+/// do it: by writing the `target.object` key for the stream's node into the
+/// `default` metadata. **Updating the stream's own properties does not do this**
+/// -- measured on WirePlumber 0.5.14, `pw_stream_update_properties` with a new
+/// `target.object` returned success and the link stayed where it was, so the
+/// first design for this (and the obvious one) moved nothing.
+///
+/// Streams opened after this call use the new value. `configured_output_device`
+/// is seeded from `CORDIAL_AUDIO_SINK` at first use, so a client launched with
+/// the variable behaves as before.
+OutputSwitch set_output_device(const std::string& name);
 
 /// The node name a playback stream should actually connect to, given what the
 /// user asked for.
@@ -567,5 +600,21 @@ struct CordialAudioSink {
 size_t cordial_audio_sinks(CordialAudioSink** out);
 
 void cordial_audio_sinks_free(CordialAudioSink* sinks, size_t count);
+
+/// Re-aims the running process's playback at `name` (a `node.name`; null or
+/// empty for the system default). Returns how many streams moved. `note`
+/// receives a NUL-terminated explanation when the answer is not a plain "all of
+/// them moved" and an empty string otherwise; it is always written when
+/// `note_len` is non-zero. See `cordial::audio::set_output_device`.
+///
+/// Called from `cordial-runtime`'s live-settings socket (ADR-044), on a thread
+/// that is neither the engine's nor PipeWire's.
+size_t cordial_audio_set_output(const char* name, char* note, size_t note_len);
+
+/// Copies the sink currently asked for (empty for the system default) into
+/// `out` as a NUL-terminated string, truncated to `out_len - 1` bytes, and
+/// returns its full length. What the live-settings socket reports back, so the
+/// shell sees what is in force and not what it asked for.
+size_t cordial_audio_output(char* out, size_t out_len);
 
 } // extern "C"

@@ -1045,7 +1045,6 @@ fn build_audio_group(
         .selected(chosen.index_in(&names))
         .build();
     row.set_subtitle_lines(2);
-    next_launch(&row, "audio_output");
     row.add_suffix(&detail(
         "System default is a standing instruction rather than a snapshot: change your \
          desktop's default while playing and the game follows.\n\nThis is Cordial's \

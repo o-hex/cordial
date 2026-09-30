@@ -1,8 +1,8 @@
 //! The message set the shell uses to change a running client's settings.
 //!
 //! **A fixed vocabulary, not a command channel.** Each [`Update`] is one
-//! setting that the client reads on a hot path and can therefore change without
-//! a restart (ADR-044 has the classification and the reasons). The shell sends
+//! setting that the client reads on a hot path, or can act on in place, and can
+//! therefore change without a restart (ADR-044 has the classification and the reasons). The shell sends
 //! `{"set":{"pointer_acceleration":"unlocked"}}`; the client answers with a
 //! [`Reply`]. There is no verb that runs anything, reads a file, or reaches the
 //! engine, and an unknown key is reported back rather than acted on. A plugin
@@ -90,17 +90,32 @@ impl Throttle {
 /// One setting a running client can change. Adding a variant here is the whole
 /// of "making a setting live" on the wire; the client must also read it from a
 /// place that can change (see `cordial_runtime::live_settings`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Update {
     PointerAcceleration(Accel),
     Throttle(Throttle),
     CloseOnLeave(bool),
     CarryLaunchTicket(bool),
+    /// The PipeWire sink's `node.name`, or empty for the system default. The
+    /// same string `CORDIAL_AUDIO_SINK` carries at launch, so a choice has one
+    /// spelling whether it arrives at spawn or afterwards.
+    AudioOutput(String),
 }
 
 /// The keys [`Update`] can carry, which are also the `shell.json` field names.
-pub const KEYS: [&str; 4] =
-    ["pointer_acceleration", "throttle", "close_on_leave", "carry_launch_ticket"];
+pub const KEYS: [&str; 5] =
+    ["pointer_acceleration", "throttle", "close_on_leave", "carry_launch_ticket", "audio_output"];
+
+/// Longest sink name accepted. PipeWire node names are short; the bound is
+/// there so a value cannot approach [`MAX_LINE`] and so the client never hands
+/// a hostile length to the native side.
+pub const MAX_SINK_NAME: usize = 256;
+
+/// Whether `name` is a sink name the client will pass on: no control
+/// characters, bounded. Empty is valid and means the system default.
+pub fn valid_sink_name(name: &str) -> bool {
+    name.len() <= MAX_SINK_NAME && !name.chars().any(char::is_control)
+}
 
 impl Update {
     pub fn key(&self) -> &'static str {
@@ -109,6 +124,7 @@ impl Update {
             Update::Throttle(_) => "throttle",
             Update::CloseOnLeave(_) => "close_on_leave",
             Update::CarryLaunchTicket(_) => "carry_launch_ticket",
+            Update::AudioOutput(_) => "audio_output",
         }
     }
 
@@ -117,6 +133,7 @@ impl Update {
             Update::PointerAcceleration(a) => Value::from(a.as_str()),
             Update::Throttle(t) => Value::from(t.as_str()),
             Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) => Value::from(*b),
+            Update::AudioOutput(name) => Value::from(name.as_str()),
         }
     }
 
@@ -135,6 +152,11 @@ impl Update {
             }
             "close_on_leave" => value.as_bool().map(Update::CloseOnLeave).ok_or_else(bad),
             "carry_launch_ticket" => value.as_bool().map(Update::CarryLaunchTicket).ok_or_else(bad),
+            "audio_output" => value
+                .as_str()
+                .filter(|n| valid_sink_name(n))
+                .map(|n| Update::AudioOutput(n.to_string()))
+                .ok_or_else(bad),
             _ => Err(format!("{key}: not a live setting")),
         }
     }
@@ -208,6 +230,13 @@ pub struct Reply {
     pub ignored: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub values: BTreeMap<String, Value>,
+    /// Things the client applied but wants said: `audio_output` with nothing
+    /// playing has nothing to move, and on a backend with no notion of a sink it
+    /// cannot move anything. Keyed by setting. Present so "applied" is never
+    /// read as "you will hear it", which is the claim a settings row must not
+    /// make on the client's behalf.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub notes: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -236,6 +265,7 @@ mod tests {
             Update::Throttle(Throttle::Off),
             Update::CloseOnLeave(true),
             Update::CarryLaunchTicket(false),
+            Update::AudioOutput("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()),
         ]
     }
 
@@ -264,6 +294,19 @@ mod tests {
     }
 
     #[test]
+    fn a_sink_name_may_be_empty_and_may_not_be_enormous() {
+        // Empty is the system default, which is a choice and not an error.
+        let Request::Set { updates, .. } = decode(r#"{"set":{"audio_output":""}}"#).unwrap() else {
+            panic!("a set decodes to a set")
+        };
+        assert_eq!(updates, vec![Update::AudioOutput(String::new())]);
+        let long = format!(r#"{{"set":{{"audio_output":"{}"}}}}"#, "a".repeat(MAX_SINK_NAME + 1));
+        assert!(decode(&long).is_err());
+        assert!(valid_sink_name("bluez_output.AA_BB_CC.1"));
+        assert!(!valid_sink_name("two\nlines"));
+    }
+
+    #[test]
     fn get_round_trips() {
         assert_eq!(decode(&encode_get()).unwrap(), Request::Get);
     }
@@ -289,6 +332,8 @@ mod tests {
             r#"{"set":{"pointer_acceleration":true}}"#,
             r#"{"set":{"close_on_leave":"yes"}}"#,
             r#"{"set":{"throttle":"off","carry_launch_ticket":1}}"#,
+            r#"{"set":{"audio_output":true}}"#,
+            r#"{"set":{"audio_output":"a\u0000b"}}"#,
         ] {
             assert!(decode(bad).is_err(), "{bad} should be refused");
         }
@@ -321,6 +366,8 @@ mod tests {
     fn a_reply_round_trips_and_a_failure_says_why() {
         let mut ok = Reply { ok: true, applied: vec!["throttle".into()], ..Reply::default() };
         ok.values.insert("throttle".into(), Value::from("off"));
+        assert_eq!(Reply::decode(&ok.encode()).unwrap(), ok);
+        ok.notes.insert("audio_output".into(), "nothing was playing".into());
         assert_eq!(Reply::decode(&ok.encode()).unwrap(), ok);
         let bad = Reply::failure("nope");
         let back = Reply::decode(&bad.encode()).unwrap();

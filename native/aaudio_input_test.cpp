@@ -81,10 +81,7 @@ uint32_t CaptureStream::read(void* dst, uint32_t size) {
 uint64_t CaptureStream::dropped_bytes() const { return 0; }
 uint32_t active_capture_streams() { return g_capture_count.load(); }
 bool host_backend_available() { return true; }
-const std::string& configured_output_device() {
-    static const std::string empty;
-    return empty;
-}
+std::string configured_output_device() { return {}; }
 const char* host_backend_name() { return "fake"; }
 const char* effective_backend_name() { return "fake"; }
 std::unique_ptr<OutputStream> make_output_stream() { return std::make_unique<FakeOutputStream>(); }

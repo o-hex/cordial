@@ -245,6 +245,10 @@ if(PIPEWIRE_FOUND)
     pipewire_backend_test.cpp)
   target_include_directories(cordial_pipewire_backend_test PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
   target_compile_definitions(cordial_pipewire_backend_test PRIVATE CORDIAL_HAVE_PIPEWIRE=1)
+  # Without this the asserts are compiled out of a release build, which is what
+  # this binary was for a long time: it printed "ok" for checks that never ran,
+  # and one of them was already wrong.
+  target_compile_options(cordial_pipewire_backend_test PRIVATE -UNDEBUG)
   add_custom_command(TARGET cordial_pipewire_backend_test POST_BUILD
     COMMAND cordial_pipewire_backend_test
     COMMENT "Running pipewire_backend fill_pcm checks (no PipeWire session needed)")

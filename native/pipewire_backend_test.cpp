@@ -277,21 +277,52 @@ void the_factory_always_returns_a_stream() {
 /// the first one's answer and no warning. Asserting that the cached answer
 /// survives a later `setenv` is what makes that contract visible instead of
 /// being a thing somebody discovers by changing the variable at runtime.
-void an_unknown_host_backend_falls_back_to_pipewire() {
-    // Whatever the environment says, the only backend this build has is
-    // PipeWire, so every answer is the same one. ADR-023 schedules PulseAudio
-    // and ALSA behind this name.
+void the_host_backend_is_read_once() {
+    // Unset means "detect", which `host_backend_name` spells "auto"; this used
+    // to assert "pipewire", which stopped being true when detection arrived and
+    // went unnoticed because this binary was built with NDEBUG and none of its
+    // asserts ran. The value is cached on first read, so changing the variable
+    // afterwards must change nothing -- that is what is left to check here.
     const char* first = cordial::audio::host_backend_name();
-    assert(std::strcmp(first, "pipewire") == 0);
+    assert(std::strcmp(first, "auto") == 0);
     ::setenv("CORDIAL_AUDIO_HOST", "something-that-does-not-exist", 1);
     assert(std::strcmp(cordial::audio::host_backend_name(), first) == 0);
     ::unsetenv("CORDIAL_AUDIO_HOST");
-    std::printf("ok: an_unknown_host_backend_falls_back_to_pipewire\n");
+    std::printf("ok: the_host_backend_is_read_once\n");
+}
+
+void a_live_change_of_sink_is_seen_by_the_next_reader_and_says_what_it_could_not_do() {
+    // The seed comes from the environment, once. This is the only reader in this
+    // binary, so nothing has consumed it yet.
+    ::setenv("CORDIAL_AUDIO_SINK", "sink-from-the-environment", 1);
+    assert(cordial::audio::configured_output_device() == "sink-from-the-environment");
+
+    // No stream is open, so nothing can be moved and no session is touched. The
+    // value still changes, because a stream opened a moment later must use it,
+    // and the answer says nothing moved rather than implying it did.
+    cordial::audio::OutputSwitch r = cordial::audio::set_output_device("sink-b");
+    assert(cordial::audio::configured_output_device() == "sink-b");
+    assert(r.moved == 0);
+    assert(!r.note.empty());
+
+    // Control: the opposite change flips it back, and empty is the default.
+    r = cordial::audio::set_output_device("");
+    assert(cordial::audio::configured_output_device().empty());
+    assert(r.moved == 0);
+
+    // And the environment is not read a second time: it would undo the above.
+    assert(cordial::audio::configured_output_device().empty());
+    ::unsetenv("CORDIAL_AUDIO_SINK");
+    std::printf("ok: a_live_change_of_sink_is_seen_by_the_next_reader_and_says_what_it_could_not_do\n");
 }
 
 } // namespace
 
 int main() {
+    // These two are read once and cached, so a developer who builds with either
+    // set in the shell would otherwise fail a check that is about the code.
+    ::unsetenv("CORDIAL_AUDIO_HOST");
+    ::unsetenv("CORDIAL_AUDIO_SINK");
     a_full_queue_fills_the_buffer_exactly();
     an_empty_queue_produces_silence_not_stale_bytes();
     a_short_queue_fills_what_it_has_and_pads_the_rest_with_silence();
@@ -306,7 +337,8 @@ int main() {
     a_null_fell_back_pointer_is_allowed();
     the_shells_device_list_survives_being_asked_for_nothing();
     the_factory_always_returns_a_stream();
-    an_unknown_host_backend_falls_back_to_pipewire();
+    the_host_backend_is_read_once();
+    a_live_change_of_sink_is_seen_by_the_next_reader_and_says_what_it_could_not_do();
     std::printf("all pipewire_backend checks passed\n");
     return 0;
 }

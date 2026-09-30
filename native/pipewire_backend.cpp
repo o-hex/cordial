@@ -36,6 +36,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #ifdef CORDIAL_HAVE_PIPEWIRE
 
@@ -99,6 +102,7 @@ struct Library {
     int (*stream_queue_buffer)(pw_stream*, pw_buffer*);
     int (*stream_set_active)(pw_stream*, bool);
     int (*stream_update_params)(pw_stream*, const spa_pod**, uint32_t);
+    uint32_t (*stream_get_node_id)(pw_stream*);
 
     // Device enumeration only. The registry and metadata objects it walks are
     // reached through `pw_core_get_registry` / `pw_registry_bind`, which are
@@ -150,6 +154,7 @@ bool load_library() {
         {"pw_stream_queue_buffer", reinterpret_cast<void**>(&g_lib.stream_queue_buffer)},
         {"pw_stream_set_active", reinterpret_cast<void**>(&g_lib.stream_set_active)},
         {"pw_stream_update_params", reinterpret_cast<void**>(&g_lib.stream_update_params)},
+        {"pw_stream_get_node_id", reinterpret_cast<void**>(&g_lib.stream_get_node_id)},
         {"pw_proxy_destroy", reinterpret_cast<void**>(&g_lib.proxy_destroy)},
     };
     for (const Entry& e : entries) {
@@ -753,26 +758,6 @@ std::string choose_output_target(const std::string& requested,
 
 } // namespace testing
 
-const std::string& configured_output_device() {
-    static const std::string name = [] {
-        const char* v = std::getenv("CORDIAL_AUDIO_SINK");
-        std::string s = v ? v : "";
-        // A variable set to the empty string is the same instruction as one
-        // that is not set: follow the default. `launch.rs` omits it rather
-        // than sending an empty value, but a hand-run client with
-        // `CORDIAL_AUDIO_SINK=` in its environment must not end up asking for
-        // a sink literally called "".
-        if (!s.empty()) {
-            std::fprintf(stderr,
-                "I/Cordial-OpenSLES         output device: playback will be aimed at PipeWire "
-                "sink '%s' (CORDIAL_AUDIO_SINK). Unset it to follow the system default.\n",
-                s.c_str());
-        }
-        return s;
-    }();
-    return name;
-}
-
 std::string resolve_output_target(const std::string& requested) {
     if (requested.empty()) return {};
 
@@ -799,6 +784,160 @@ std::string resolve_output_target(const std::string& requested) {
             requested.c_str(), sinks.size());
     }
     return target;
+}
+
+// --------------------------------------------------- moving live streams
+
+namespace {
+
+/// Every output `pw_stream` that is connected, so a change of sink can reach
+/// them. Capture streams are never in it: the sink choice has no bearing on a
+/// microphone, and the privacy rule at the top of `audio_classes.cpp` is
+/// easier to keep when nothing here can reach one.
+///
+/// **Lock order, because this file has been bitten by one.** `close()` takes
+/// this mutex on its own and only then the thread-loop lock; `open()` takes it
+/// only after it has released the loop; `retarget_live_streams` takes the loop
+/// lock first and this mutex briefly inside it. Nothing ever waits for the loop
+/// while holding this mutex, so there is no cycle to form.
+std::mutex g_live_mutex;
+std::vector<pw_stream*> g_live_streams;
+
+void register_live_stream(pw_stream* stream) {
+    std::lock_guard<std::mutex> lock(g_live_mutex);
+    g_live_streams.push_back(stream);
+}
+
+void unregister_live_stream(pw_stream* stream) {
+    std::lock_guard<std::mutex> lock(g_live_mutex);
+    for (size_t i = 0; i < g_live_streams.size(); ++i) {
+        if (g_live_streams[i] == stream) {
+            g_live_streams.erase(g_live_streams.begin() + static_cast<std::ptrdiff_t>(i));
+            return;
+        }
+    }
+}
+
+/// Finds the `default` metadata object's id. Needs the loop locked.
+uint32_t find_default_metadata(Session* session, pw_registry* registry, spa_hook* listener) {
+    struct Found { uint32_t id = SPA_ID_INVALID; } found;
+    pw_registry_events events{};
+    events.version = PW_VERSION_REGISTRY_EVENTS;
+    events.global = [](void* data, uint32_t id, uint32_t, const char* type, uint32_t,
+                        const spa_dict* props) {
+        auto* f = static_cast<Found*>(data);
+        if (!type || std::strcmp(type, PW_TYPE_INTERFACE_Metadata) != 0) return;
+        const char* name = dict_get(props, PW_KEY_METADATA_NAME);
+        if (name && std::strcmp(name, "default") == 0) f->id = id;
+    };
+    pw_registry_add_listener(registry, listener, &events, &found);
+    round_trip(session);
+    spa_hook_remove(listener);
+    return found.id;
+}
+
+} // namespace
+
+/// Re-aims every connected output stream at `requested`. See
+/// `set_output_device` in the header for why this writes metadata rather than
+/// updating the stream's properties.
+///
+/// `requested` empty means the system default, expressed as `-1`: measured on
+/// WirePlumber 0.5.14 to put a stream that had been aimed at a named sink back
+/// on the default. *Deleting* the key was the tempting way to say it and is
+/// wrong, because it restores the stream's own `target.object` -- the sink it
+/// was opened on -- rather than the default.
+OutputSwitch retarget_live_streams(const std::string& requested) {
+    OutputSwitch result;
+
+    // Before anything is locked: this enumerates, and enumeration takes the
+    // loop lock.
+    {
+        std::lock_guard<std::mutex> lock(g_live_mutex);
+        if (g_live_streams.empty()) {
+            result.note =
+                "no PipeWire playback stream is open, so there was nothing to move; the "
+                "choice applies to streams opened from now on";
+            return result;
+        }
+    }
+    Session* session = get_session();
+    if (!session) {
+        result.note = "no PipeWire session to ask";
+        return result;
+    }
+    const std::string target = resolve_output_target(requested);
+    const bool to_default = target.empty();
+    if (!requested.empty() && to_default) {
+        result.note = "sink '" + requested +
+                      "' is not in this PipeWire session; playing on the system default "
+                      "instead, and the choice is kept for when it returns";
+    }
+
+    g_lib.thread_loop_lock(session->loop);
+
+    // Copied with the loop held. A stream cannot be destroyed while it is, so
+    // every pointer in the copy stays valid until the unlock below.
+    std::vector<pw_stream*> streams;
+    {
+        std::lock_guard<std::mutex> lock(g_live_mutex);
+        streams = g_live_streams;
+    }
+
+    pw_registry* registry = pw_core_get_registry(session->core, PW_VERSION_REGISTRY, 0);
+    if (!registry) {
+        g_lib.thread_loop_unlock(session->loop);
+        result.note = "pw_core_get_registry failed; playback stays where it was";
+        return result;
+    }
+    spa_hook registry_listener{};
+    const uint32_t metadata_id = find_default_metadata(session, registry, &registry_listener);
+
+    pw_proxy* metadata = nullptr;
+    if (metadata_id != SPA_ID_INVALID) {
+        metadata = static_cast<pw_proxy*>(pw_registry_bind(
+            registry, metadata_id, PW_TYPE_INTERFACE_Metadata, PW_VERSION_METADATA, 0));
+    }
+
+    if (!metadata) {
+        // No `default` metadata means no session manager that reads it, or none
+        // at all. **Saying so is the point**: a move that cannot be made must not
+        // be reported as made.
+        result.note = "this PipeWire session has no 'default' metadata (is a session manager "
+                      "running?); playing streams stay on their sink until the next launch";
+    } else {
+        for (pw_stream* stream : streams) {
+            const uint32_t node = g_lib.stream_get_node_id(stream);
+            if (node == SPA_ID_INVALID) continue;
+            int rc = to_default
+                         ? pw_metadata_set_property(reinterpret_cast<pw_metadata*>(metadata), node,
+                                                    PW_KEY_TARGET_OBJECT, "Spa:Id", "-1")
+                         : pw_metadata_set_property(reinterpret_cast<pw_metadata*>(metadata), node,
+                                                    PW_KEY_TARGET_OBJECT, "Spa:String",
+                                                    target.c_str());
+            if (rc < 0) {
+                std::fprintf(stderr,
+                    "W/Cordial-Audio           could not move PipeWire node %u (%s).\n", node,
+                    spa_strerror(rc));
+                if (result.note.empty()) {
+                    result.note = "at least one stream could not be moved";
+                }
+                continue;
+            }
+            ++result.moved;
+        }
+        // The sets are requests on the same connection as this sync, so the
+        // server has them by the time it answers.
+        round_trip(session);
+        g_lib.proxy_destroy(metadata);
+    }
+    g_lib.proxy_destroy(reinterpret_cast<pw_proxy*>(registry));
+    g_lib.thread_loop_unlock(session->loop);
+
+    std::fprintf(stderr,
+        "I/Cordial-Audio           output sink -> %s: %zu playing stream(s) re-linked.\n",
+        to_default ? "the system default" : target.c_str(), result.moved);
+    return result;
 }
 
 // ---------------------------------------------------------- CallbackStream
@@ -1090,6 +1229,16 @@ bool CallbackStream::open(uint32_t sample_bits, bool is_float, const char* node_
     }
 
     g_lib.thread_loop_unlock(session->loop);
+
+    // After the unlock, for the lock order the registry's comment sets out.
+    register_live_stream(impl_->stream);
+    // A change of sink that landed while this stream was connecting went
+    // looking for streams and did not find this one. Ask again if the choice
+    // moved from what this stream was opened with.
+    const std::string sink_now = configured_output_device();
+    if (sink_now != (target_node_name ? std::string(target_node_name) : std::string())) {
+        retarget_live_streams(sink_now);
+    }
     return true;
 }
 
@@ -1097,6 +1246,7 @@ void CallbackStream::close() {
     if (!impl_ || !impl_->stream) return;
     impl_->running.store(false, std::memory_order_relaxed);
     Session* session = impl_->session;
+    unregister_live_stream(impl_->stream);
     if (session) {
         // The loop lock is the only lock this class ever takes, and it is
         // never held while anything else is. `process` runs on this same loop
@@ -1505,11 +1655,17 @@ bool PlaybackStream::open(uint32_t rate_hz, uint32_t channels, uint32_t bits_per
         impl_->stream = nullptr;
         return false;
     }
+
+    register_live_stream(impl_->stream);
+    // See the same lines in `CallbackStream::open`.
+    const std::string wanted = configured_output_device();
+    if (wanted != target_node_name) retarget_live_streams(wanted);
     return true;
 }
 
 void PlaybackStream::close() {
     if (!impl_->stream) return;
+    unregister_live_stream(impl_->stream);
     Session* session = get_session();
     if (session) {
         g_lib.thread_loop_lock(session->loop);
@@ -1622,19 +1778,14 @@ std::vector<DeviceInfo> enumerate_devices() { return {}; }
 
 uint32_t active_capture_streams() { return 0; }
 
-/// The user's choice is still read and still reported, even though nothing
-/// here can act on it. Returning empty instead would make a build without
-/// pipewire-devel report "following the system default" to anyone who asked,
-/// which is a different and untrue thing from "there is no audio at all".
-const std::string& configured_output_device() {
-    static const std::string name = [] {
-        const char* v = std::getenv("CORDIAL_AUDIO_SINK");
-        return std::string(v ? v : "");
-    }();
-    return name;
-}
-
 std::string resolve_output_target(const std::string&) { return {}; }
+
+/// There is no stream to move and no session to ask. Said, not silently zero.
+OutputSwitch retarget_live_streams(const std::string&) {
+    OutputSwitch r;
+    r.note = "this build has no PipeWire support, so there is no playback to move";
+    return r;
+}
 
 namespace testing {
 
@@ -1707,6 +1858,74 @@ PlaybackStream::QueueState PlaybackStream::state() const { return {0, 0}; }
 } // namespace cordial::audio
 
 #endif // CORDIAL_HAVE_PIPEWIRE
+
+// ------------------------------------------------------- the output device
+//
+// Outside the `#ifdef`, because both arms need one answer to "which sink was
+// asked for" and two copies of a variable that can change at run time is how a
+// setting ends up meaning two things in one process.
+
+namespace cordial::audio {
+
+OutputSwitch retarget_live_streams(const std::string& requested);
+
+namespace {
+
+std::mutex g_output_mutex;
+std::string g_output_device;
+bool g_output_seeded = false;
+
+/// Reads `CORDIAL_AUDIO_SINK` the first time anybody asks. Needs
+/// `g_output_mutex`.
+void seed_output_device_locked() {
+    if (g_output_seeded) return;
+    g_output_seeded = true;
+    const char* v = std::getenv("CORDIAL_AUDIO_SINK");
+    // A variable set to the empty string is the same instruction as one that is
+    // not set: follow the default. `launch.rs` omits it rather than sending an
+    // empty value, but a hand-run client with `CORDIAL_AUDIO_SINK=` in its
+    // environment must not end up asking for a sink literally called "".
+    g_output_device = v ? v : "";
+    if (!g_output_device.empty()) {
+        std::fprintf(stderr,
+            "I/Cordial-OpenSLES         output device: playback will be aimed at PipeWire "
+            "sink '%s' (CORDIAL_AUDIO_SINK). Unset it to follow the system default.\n",
+            g_output_device.c_str());
+    }
+}
+
+} // namespace
+
+std::string configured_output_device() {
+    std::lock_guard<std::mutex> lock(g_output_mutex);
+    seed_output_device_locked();
+    return g_output_device;
+}
+
+OutputSwitch set_output_device(const std::string& name) {
+    {
+        std::lock_guard<std::mutex> lock(g_output_mutex);
+        seed_output_device_locked();
+        g_output_device = name;
+    }
+    std::fprintf(stderr, "I/Cordial-Audio           output device set to %s.\n",
+                 name.empty() ? "the system default" : ("'" + name + "'").c_str());
+    OutputSwitch result = retarget_live_streams(name);
+
+    // A host backend that has no sink to move a stream between. Said here and
+    // not in the backend, because the backends own their streams and none of
+    // them is in the registry that `retarget_live_streams` walks.
+    const char* asked = host_backend_name();
+    if (std::strcmp(asked, "alsa") == 0 || std::strcmp(asked, "oss") == 0 ||
+        std::strcmp(asked, "pulse") == 0) {
+        result.note = std::string("CORDIAL_AUDIO_HOST=") + asked +
+                      " cannot move a stream that is already playing; the choice applies "
+                      "to streams opened from now on";
+    }
+    return result;
+}
+
+} // namespace cordial::audio
 
 // ---------------------------------------------------------------- the seam
 //
@@ -1905,6 +2124,21 @@ size_t cordial_audio_sinks(CordialAudioSink** out) {
     }
     *out = list;
     return count;
+}
+
+size_t cordial_audio_set_output(const char* name, char* note, size_t note_len) {
+    const cordial::audio::OutputSwitch r =
+        cordial::audio::set_output_device(name ? std::string(name) : std::string());
+    if (note && note_len > 0) {
+        std::snprintf(note, note_len, "%s", r.note.c_str());
+    }
+    return r.moved;
+}
+
+size_t cordial_audio_output(char* out, size_t out_len) {
+    const std::string now = cordial::audio::configured_output_device();
+    if (out && out_len > 0) std::snprintf(out, out_len, "%s", now.c_str());
+    return now.size();
 }
 
 void cordial_audio_sinks_free(CordialAudioSink* sinks, size_t count) {

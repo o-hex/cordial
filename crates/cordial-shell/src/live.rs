@@ -77,7 +77,7 @@ pub const CLASSIFICATION: &[(&str, Applies, &str)] = &[
     ("carry_launch_ticket", Applies::Live, "consulted each time a link is translated"),
     ("mangohud", Applies::NextLaunch, "a Vulkan layer, loaded at instance creation"),
     ("vkbasalt", Applies::NextLaunch, "a Vulkan layer, loaded at instance creation"),
-    ("audio_output", Applies::NextLaunch, "the PipeWire backend reads the sink once per process"),
+    ("audio_output", Applies::Live, "the running streams are re-linked to the new sink in place; a host backend with no sink to move between (ALSA, OSS, PulseAudio) applies it to streams opened afterwards"),
     ("fullscreen_accel", Applies::NextLaunch, "bound when the launcher window is built; no Settings row"),
     ("marketplace_index_dir", Applies::Shell, "read when the Plugins page loads"),
     ("marketplace_public_key", Applies::Shell, "read when the Plugins page loads"),
@@ -105,13 +105,16 @@ pub fn live_updates(config: &ShellConfig) -> Vec<Update> {
         }),
         Update::CloseOnLeave(config.close_on_leave),
         Update::CarryLaunchTicket(config.carry_launch_ticket),
+        // The same string the launch environment carries, trimmed the same way,
+        // and empty for "follow the default".
+        Update::AudioOutput(config.audio_output.env_value().unwrap_or("").to_string()),
     ]
 }
 
 /// The updates in `wanted` that differ from what `have` says is in force. A key
 /// `have` lacks counts as different.
 pub fn changed(have: &[Update], wanted: &[Update]) -> Vec<Update> {
-    wanted.iter().filter(|w| !have.contains(w)).copied().collect()
+    wanted.iter().filter(|w| !have.contains(w)).cloned().collect()
 }
 
 /// Parse `shell.json` strictly. `None` for a missing, unreadable or malformed
@@ -219,7 +222,7 @@ impl State {
         if let Some(t) = self.targets.iter_mut().find(|t| t.pid == pid) {
             for u in updates {
                 t.sent.retain(|s| s.key() != u.key());
-                t.sent.push(*u);
+                t.sent.push(u.clone());
             }
             t.failures = 0;
         }
@@ -282,8 +285,15 @@ fn deliver_once() {
     let plan = state().plan();
     for (pid, socket, updates) in plan {
         match send(&socket, &updates) {
-            Ok(_) => {
+            Ok(reply) => {
                 state().delivered(pid, &updates);
+                // What the client applied but could not fully do, such as a sink
+                // change with nothing playing. Said here because the settings
+                // window has no place to show it and "applied" alone would be
+                // read as "you will hear it".
+                for (key, note) in &reply.notes {
+                    println!("  shell: pid {pid}: {key}: {note}");
+                }
                 println!(
                     "  shell: live settings -> pid {pid}: {}",
                     updates.iter().map(|u| u.key()).collect::<Vec<_>>().join(", ")
@@ -476,6 +486,31 @@ mod tests {
         assert_eq!(
             moved,
             vec![Update::PointerAcceleration(Accel::Unlocked), Update::CloseOnLeave(true)]
+        );
+    }
+
+    #[test]
+    fn the_audio_output_reaches_the_wire_as_the_launch_environment_spells_it() {
+        let audio = |c: &ShellConfig| {
+            live_updates(c).into_iter().find(|u| u.key() == "audio_output").unwrap()
+        };
+        let mut c = ShellConfig::default();
+        assert_eq!(audio(&c), Update::AudioOutput(String::new()), "no choice is the empty string");
+
+        // Stored with stray whitespace, sent the way CORDIAL_AUDIO_SINK is: trimmed.
+        c.audio_output = shell_config::AudioOutput("  alsa_output.usb-Headset  ".into());
+        assert_eq!(audio(&c), Update::AudioOutput("alsa_output.usb-Headset".into()));
+
+        // Control: of everything in the config, only this key moved.
+        let before = live_updates(&ShellConfig::default());
+        assert_eq!(
+            changed(&before, &live_updates(&c)),
+            vec![Update::AudioOutput("alsa_output.usb-Headset".into())]
+        );
+        // And choosing the default again is a change too, back to empty.
+        assert_eq!(
+            changed(&live_updates(&c), &before),
+            vec![Update::AudioOutput(String::new())]
         );
     }
 

@@ -137,7 +137,7 @@ pub fn uses_x11(cordial_x11_set: bool, wayland_display_set: bool) -> bool {
 /// probe (a child process, bounded) unless `inputs.probe_vulkan` is off.
 pub fn machine(inputs: &Inputs) -> Vec<Check> {
     let env = Env::from_process();
-    let mut out = vec![root(), session(&env)];
+    let mut out = vec![build_origin(&crate::version::origin()), root(), session(&env)];
     out.extend(gpu(&env, inputs));
     out.push(audio(&env));
     let bus = session_bus();
@@ -249,6 +249,21 @@ fn is_path_char(c: char) -> bool {
 
 // ---------------------------------------------------------------------------
 // Checks
+
+/// Which build this is, for whoever reads the output. Never a warning: an
+/// unofficial build is not a fault, only a fact the person answering a report
+/// wants first. A hint and not a check -- see `version::Origin`.
+pub fn build_origin(origin: &crate::version::Origin) -> Check {
+    if origin.is_official() {
+        return check(Level::Ok, origin.text(), "");
+    }
+    check(
+        Level::Info,
+        origin.text(),
+        "Not one of the project's own releases, so the project cannot see what this build changed. \
+         Say so if you report a problem.",
+    )
+}
 
 pub fn root() -> Check {
     // SAFETY: `geteuid` takes no arguments and cannot fail.
@@ -860,6 +875,17 @@ mod tests {
         assert!(!uses_x11(false, true), "a Wayland session with nothing forced");
         assert!(uses_x11(true, true), "CORDIAL_X11 forces X11 over a compositor");
         assert!(uses_x11(false, false), "no compositor leaves X11");
+    }
+
+    #[test]
+    fn the_build_origin_is_a_note_and_never_a_warning() {
+        use crate::version::Origin;
+        let official = build_origin(&Origin::Official);
+        assert_eq!((official.level, official.what.as_str()), (Level::Ok, "Official build"));
+        let fork = build_origin(&Origin::Unofficial { remote: Some("https://github.com/a/b".into()) });
+        assert_eq!(fork.level, Level::Info);
+        assert_eq!(fork.what, "Unofficial build from https://github.com/a/b");
+        assert!(fork.fix.contains("Say so"));
     }
 
     #[test]

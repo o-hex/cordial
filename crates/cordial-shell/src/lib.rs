@@ -37,6 +37,7 @@
 // see ADR-036's discussion of why that trade was rejected workspace-wide.
 #![allow(unsafe_code)]
 
+mod build_remote;
 pub mod branding;
 pub mod doctor;
 pub mod host_window;

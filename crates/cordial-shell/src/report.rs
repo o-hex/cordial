@@ -25,6 +25,33 @@ use std::rc::Rc;
 /// dialog's link both name it and two copies drift.
 pub const ISSUES_URL: &str = "https://github.com/luohoa97/cordial/issues/new/choose";
 
+/// Where "Open an issue" goes, and a note when that is not obvious.
+///
+/// **An unofficial build reports to the repository it was built from when that
+/// is known**, since the project cannot see what a fork changed and a report
+/// filed upstream about somebody else's patch costs both sides an evening. When
+/// it is not known -- a tarball, a distro package, a checkout with a local-path
+/// remote -- the link stays upstream's and the note says the build is not
+/// official; the diagnostics block carries the same fact in its Build line, so
+/// the report is marked whichever way it is sent. A hint for triage only: see
+/// `version::Origin`.
+pub fn issues_target(origin: &cordial_shell::version::Origin) -> (String, Option<&'static str>) {
+    use cordial_shell::version::UPSTREAM_REPO;
+    if origin.is_official() {
+        return (ISSUES_URL.to_string(), None);
+    }
+    match origin.github_slug() {
+        Some(slug) if !slug.eq_ignore_ascii_case(UPSTREAM_REPO) => (
+            format!("https://github.com/{slug}/issues/new/choose"),
+            Some("Unofficial build: this goes to the repository it was built from."),
+        ),
+        _ => (
+            ISSUES_URL.to_string(),
+            Some("Unofficial build: mention that when you report it. The diagnostics say so."),
+        ),
+    }
+}
+
 /// The file name the Save button offers. The same one the About dialog's own
 /// Troubleshooting page offered, so anyone who knew it does not have to learn
 /// a second.
@@ -154,9 +181,14 @@ pub fn build() -> adw::Dialog {
     // A link row rather than prose with a URL in it: this is the last place
     // somebody is before they give up, and it should take one press to get from
     // here to the form.
+    let (issues_url, issues_note) = issues_target(&cordial_shell::version::origin());
+    let subtitle = match issues_note {
+        Some(note) => format!("{}\n{note}", issues_url.trim_start_matches("https://")),
+        None => issues_url.trim_start_matches("https://").to_string(),
+    };
     let issues = adw::ActionRow::builder()
         .title("Open an issue")
-        .subtitle(ISSUES_URL.trim_start_matches("https://"))
+        .subtitle(glib::markup_escape_text(&subtitle))
         .activatable(true)
         .build();
     // `go-next-symbolic`, checked on disk rather than guessed: the first
@@ -172,7 +204,7 @@ pub fn build() -> adw::Dialog {
     // the portal what it needs to raise the browser properly.
     issues.connect_activated(move |row| {
         let parent = row.root().and_downcast::<gtk::Window>();
-        gtk::UriLauncher::new(ISSUES_URL).launch(
+        gtk::UriLauncher::new(&issues_url).launch(
             parent.as_ref(),
             gtk::gio::Cancellable::NONE,
             |result| {
@@ -224,4 +256,39 @@ fn check_row(check: &Check) -> adw::ActionRow {
 /// Puts the report screen up over `parent`.
 pub fn present(parent: &impl IsA<gtk::Widget>) {
     build().present(Some(parent));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cordial_shell::version::Origin;
+
+    #[test]
+    fn an_official_build_reports_upstream_with_no_note() {
+        assert_eq!(issues_target(&Origin::Official), (ISSUES_URL.to_string(), None));
+    }
+
+    #[test]
+    fn an_unofficial_build_reports_to_the_repository_it_came_from() {
+        let fork = Origin::Unofficial { remote: Some("https://github.com/somebody/cordial".into()) };
+        let (url, note) = issues_target(&fork);
+        assert_eq!(url, "https://github.com/somebody/cordial/issues/new/choose");
+        assert!(note.is_some());
+    }
+
+    /// Unknown, or not GitHub, or a checkout of upstream itself: upstream's
+    /// link, marked. Never a guessed address on another host.
+    #[test]
+    fn where_the_origin_is_unknown_the_link_stays_upstreams_and_is_marked() {
+        for origin in [
+            Origin::Unofficial { remote: None },
+            Origin::Unofficial { remote: Some("https://codeberg.org/a/b".into()) },
+            Origin::Unofficial { remote: Some("https://github.com/luohoa97/cordial".into()) },
+            Origin::Unofficial { remote: Some("https://github.com/Luohoa97/Cordial".into()) },
+        ] {
+            let (url, note) = issues_target(&origin);
+            assert_eq!(url, ISSUES_URL, "{origin:?}");
+            assert!(note.is_some_and(|n| n.contains("Unofficial")), "{origin:?}");
+        }
+    }
 }

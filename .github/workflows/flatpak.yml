@@ -195,6 +195,10 @@ env:
   # that step silently pull from the wrong tree, or from nothing, rather than
   # fail loudly.
   PAGES_REPO_URL: https://luohoa97.github.io/cordial/repo/
+  # See release.yml. The Flatpak build cannot see this variable (flatpak-builder
+  # gives its build a clean environment; INFERRED, not run), so "Stamp the
+  # build" below also writes it to a file build.rs reads.
+  CORDIAL_OFFICIAL_BUILD: ${{ github.repository }}
 
 jobs:
   build:
@@ -430,6 +434,9 @@ jobs:
           fi
           echo "signing=true" >> "$GITHUB_OUTPUT"
           echo "gpghome=$home" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp the build with the repository that built it
+        run: printf '%s' "$CORDIAL_OFFICIAL_BUILD" > .cordial-official-build
 
       - name: Build and export
         run: |

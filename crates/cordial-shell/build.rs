@@ -17,7 +17,13 @@
 
 use std::process::Command;
 
+// The same file the library compiles and tests; see its header for why.
+#[path = "src/build_remote.rs"]
+mod build_remote;
+
 fn main() {
+    stamp_origin();
+
     // These catch a commit, a checkout and a staging operation, which is most of
     // what moves the stamp.
     //
@@ -163,5 +169,58 @@ fn main() {
     if let Some(sha) = sha {
         let suffix = if dirty { "-dirty" } else { "" };
         println!("cargo:rustc-env=CORDIAL_GIT_SHA={sha}{suffix}");
+    }
+}
+
+/// Whether this is the project's own build, and where the source was cloned
+/// from. **Triage for a bug report and nothing else**, exactly as `version::NOTICE`
+/// is a notice and not a watermark: nothing may read it back or behave
+/// differently because of it, and it is trivially spoofable, since a fork can
+/// set the same variable or delete the stamp. What it does is tell a maintainer
+/// reading a report whether the reporter ran a release the project made.
+///
+/// Two facts are emitted, separately, because they are separate claims:
+///
+/// - `CORDIAL_OFFICIAL_BUILD`: what the release workflows set, the repository
+///   that ran them (`${{ github.repository }}`). A fork's own CI stamps the
+///   fork's name, so it is reported as the fork's without anybody editing the
+///   workflow. The Flatpak build is sandboxed and cannot see the environment,
+///   so `flatpak.yml` also writes it to `.cordial-official-build`, read here as
+///   the fallback.
+/// - `CORDIAL_BUILD_REMOTE`: the checkout's git remote, reduced by
+///   `build_remote::clean` to a plain `https://host/owner/repo`, credentials
+///   and local paths removed, because it is compiled into a shipped binary.
+fn stamp_origin() {
+    println!("cargo:rerun-if-env-changed=CORDIAL_OFFICIAL_BUILD");
+    println!("cargo:rerun-if-changed=../../.git/config");
+
+    let from_file = || std::fs::read_to_string("../../.cordial-official-build").ok();
+    let official = std::env::var("CORDIAL_OFFICIAL_BUILD")
+        .ok()
+        .or_else(from_file)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if let Some(official) = official {
+        println!("cargo:rustc-env=CORDIAL_OFFICIAL_BUILD={official}");
+    }
+
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    // `origin` when there is one, otherwise whichever remote comes first.
+    let remote = git(&["remote", "get-url", "origin"]).or_else(|| {
+        let first = git(&["remote"])?.lines().next()?.to_string();
+        git(&["remote", "get-url", &first])
+    });
+    if let Some(url) = remote.as_deref().and_then(build_remote::clean) {
+        println!("cargo:rustc-env=CORDIAL_BUILD_REMOTE={url}");
     }
 }

@@ -62,3 +62,6 @@ tools/discord-bridge/node_modules/
 
 # Kept locally, never committed (see rescued/README.md).
 /rescued/
+
+# Written by flatpak.yml for build.rs; never committed.
+/.cordial-official-build

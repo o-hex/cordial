@@ -221,6 +221,10 @@ pub fn report() -> String {
         // scanning room to say nothing the reader lacks.
         ("Licence", "GPL-3.0-or-later".into()),
         ("Install", install_method()),
+        // Whether the release workflows built this or somebody else did. A
+        // hint for triage and nothing more; see `version::Origin`, and it names
+        // a public repository, never a path.
+        ("Build", cordial_shell::version::origin().text()),
         ("Roblox", roblox()),
         ("System", uname()),
         ("Distro", distro()),
@@ -261,8 +265,8 @@ mod tests {
         // literal that have to be remembered together: the literal was 6 when
         // a seventh row was added, and the failure it produced said nothing
         // about which row was new.
-        const LABELS: [&str; 8] =
-            ["Cordial", "Licence", "Install", "Roblox", "System", "Distro", "Session", "Graphics"];
+        const LABELS: [&str; 9] =
+            ["Cordial", "Licence", "Install", "Build", "Roblox", "System", "Distro", "Session", "Graphics"];
         let text = report();
         for label in LABELS {
             let line = text

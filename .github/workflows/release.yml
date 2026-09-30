@@ -135,6 +135,15 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
+# Stamps every binary built here with the repository that ran the workflow, so
+# a bug report can say "Official build". A fork's own run stamps the fork's
+# name and is reported as that fork's. Triage only, and trivially spoofed:
+# crates/cordial-shell/build.rs and version::Origin say why nothing may ever
+# read it back. The AppImage, deb and rpm scripts and makepkg inherit it; the
+# rpm and makepkg legs are INFERRED to pass it through to cargo.
+env:
+  CORDIAL_OFFICIAL_BUILD: ${{ github.repository }}
+
 jobs:
   appimage:
     # **Not Fedora, since ADR-032.** Fedora 44's glibc is 2.43, four minor

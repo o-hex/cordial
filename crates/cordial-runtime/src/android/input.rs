@@ -1610,8 +1610,10 @@ fn track_key_held(down: bool, evdev_code: i32) {
 ///
 /// The shell's "Slow the game down in the background" row sets this; see
 /// `cordial_shell::shell_config::ThrottleWhen`, which holds the reasoning for
-/// why `Visible` is the default rather than `Unfocused`. Parsed once, because
-/// the launch settles it and nothing changes it mid-run.
+/// why `Visible` is the default rather than `Unfocused`. Parsed from the
+/// environment once for the starting value; the shell's live-settings socket
+/// can change it afterwards ([`set_throttle_policy`], ADR-044), so the pump
+/// reads it every tick instead of caching it.
 ///
 /// **This governs the keepalive only.** `onWindowFocusChangedNative` is driven
 /// on every genuine transition whatever this says — the engine is told the
@@ -1627,12 +1629,32 @@ pub enum ThrottleWhen {
 }
 
 pub fn throttle_policy() -> ThrottleWhen {
-    static POLICY: std::sync::OnceLock<ThrottleWhen> = std::sync::OnceLock::new();
-    *POLICY.get_or_init(|| match std::env::var("CORDIAL_THROTTLE").as_deref() {
-        Ok("unfocused") => ThrottleWhen::Unfocused,
-        Ok("off") => ThrottleWhen::Off,
+    match throttle_cell().load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ThrottleWhen::Unfocused,
+        2 => ThrottleWhen::Off,
         _ => ThrottleWhen::Visible,
+    }
+}
+
+fn throttle_cell() -> &'static std::sync::atomic::AtomicU8 {
+    static POLICY: std::sync::OnceLock<std::sync::atomic::AtomicU8> = std::sync::OnceLock::new();
+    POLICY.get_or_init(|| {
+        std::sync::atomic::AtomicU8::new(match std::env::var("CORDIAL_THROTTLE").as_deref() {
+            Ok("unfocused") => 1,
+            Ok("off") => 2,
+            _ => 0,
+        })
     })
+}
+
+/// Change the keepalive policy in a running client.
+pub fn set_throttle_policy(policy: ThrottleWhen) {
+    let code = match policy {
+        ThrottleWhen::Visible => 0,
+        ThrottleWhen::Unfocused => 1,
+        ThrottleWhen::Off => 2,
+    };
+    throttle_cell().store(code, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether the keepalive should run this tick.

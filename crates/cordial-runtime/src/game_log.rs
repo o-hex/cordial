@@ -320,9 +320,31 @@ fn logs_dir() -> PathBuf {
 /// wants it deliberately: they launched from a deep link to play one game and
 /// have no use for the home screen afterwards. Somebody who did not ask and
 /// meets it once has lost their session to a setting they did not know existed.
+///
+/// The environment gives the starting value; the shell's live-settings socket
+/// can change it afterwards ([`set_close_on_leave`], ADR-044), which is safe to
+/// read on the log poll's schedule because it is one relaxed atomic load.
 fn close_on_leave() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| close_on_leave_for(std::env::var("CORDIAL_CLOSE_ON_LEAVE").ok().as_deref()))
+    close_on_leave_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn close_on_leave_cell() -> &'static std::sync::atomic::AtomicBool {
+    static ON: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
+    ON.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(close_on_leave_for(
+            std::env::var("CORDIAL_CLOSE_ON_LEAVE").ok().as_deref(),
+        ))
+    })
+}
+
+/// Change the quit-on-leave choice in a running client.
+pub fn set_close_on_leave(on: bool) {
+    close_on_leave_cell().store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The value in force, for the live-settings `get` reply.
+pub fn current_close_on_leave() -> bool {
+    close_on_leave()
 }
 
 /// The gate's decision, split out so it can be tested -- `close_on_leave`

@@ -4079,7 +4079,11 @@ unsafe extern "C" fn relative_pointer_motion(
 
 /// Whether to pass the compositor's accelerated deltas through to the camera.
 ///
-/// Read once. Consulted only from the locked branch of
+/// Initialised from the environment and changeable afterwards through
+/// [`set_pointer_acceleration`] (the shell's live-settings socket, ADR-044).
+/// It stays a single relaxed atomic load on the hot path: the lookup that used
+/// to be cached in a `OnceLock<bool>` is now a `OnceLock<AtomicBool>`, so the
+/// environment is still read once. Consulted only from the locked branch of
 /// `relative_pointer_motion` — the unlocked cursor takes the accelerated pair
 /// unconditionally and never calls this, see that function's own comment for
 /// why there is no equivalent switch for it. A locked pointer still reports
@@ -4090,15 +4094,33 @@ unsafe extern "C" fn relative_pointer_motion(
 /// before reaching here; it no longer is, which is why "consulted on every
 /// relative-motion event" would now be the wrong claim to make here.
 fn pointer_acceleration() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    pointer_acceleration_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn pointer_acceleration_cell() -> &'static std::sync::atomic::AtomicBool {
+    static ON: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
         // "unlocked" is the only value that turns this off, leaving the camera
         // on raw movement; anything else, including the variable being absent,
         // uses the accelerated pair, matching the shell's default. "unlocked"
         // names what happens rather than pretending Cordial can disable
         // acceleration for the unlocked cursor, because it cannot.
-        !matches!(std::env::var("CORDIAL_POINTER_ACCEL").as_deref(), Ok("unlocked"))
+        std::sync::atomic::AtomicBool::new(!matches!(
+            std::env::var("CORDIAL_POINTER_ACCEL").as_deref(),
+            Ok("unlocked")
+        ))
     })
+}
+
+/// Change the camera-acceleration choice in a running client. `true` passes the
+/// compositor's accelerated deltas through, `false` uses the raw pair.
+pub fn set_pointer_acceleration(accelerated: bool) {
+    pointer_acceleration_cell().store(accelerated, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The value in force, for the live-settings `get` reply.
+pub fn current_pointer_acceleration() -> bool {
+    pointer_acceleration()
 }
 
 static RELATIVE_POINTER_LISTENER: RelativePointerListener =

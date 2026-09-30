@@ -401,6 +401,9 @@ fn enter_run_dir(opt: &mut Options) {
     // because `profile::active()` has latched by now, and the socket belongs
     // inside the profile so ADR-012's one-instance lock already covers it.
     cordial_runtime::devctl::start();
+    // The live-settings socket, unlike the one above, is always on: it can only
+    // set four hot-path values and lives in a private directory (ADR-044).
+    cordial_runtime::live_settings::start();
 
     let root = cordial_runtime::profile::active().join("run");
     if let Err(e) = std::fs::create_dir_all(root.join("exe")) {

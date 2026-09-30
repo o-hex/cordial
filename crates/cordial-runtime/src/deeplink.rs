@@ -413,11 +413,28 @@ pub enum Translated {
 /// exchange for not typing a password. That is a reasonable trade to offer and
 /// not one to make for them, which is why there is a switch in Settings rather
 /// than a better default.
+///
+/// The environment gives the starting value; the shell's live-settings socket
+/// can change it afterwards ([`set_carry_ticket`], ADR-044). It is consulted
+/// each time a link is translated, so a change applies to the next link and
+/// not to one already handed to the engine.
 pub fn carry_ticket() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(std::env::var("CORDIAL_DEEPLINK_CARRY_TICKET").ok().as_deref(), Some("1"))
+    carry_ticket_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn carry_ticket_cell() -> &'static std::sync::atomic::AtomicBool {
+    static ON: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(matches!(
+            std::env::var("CORDIAL_DEEPLINK_CARRY_TICKET").ok().as_deref(),
+            Some("1")
+        ))
     })
+}
+
+/// Change whether a browser sign-in ticket is passed on, in a running client.
+pub fn set_carry_ticket(on: bool) {
+    carry_ticket_cell().store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether a ticket is shaped like one, and so may be formatted into a URL.

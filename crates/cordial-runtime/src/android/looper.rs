@@ -810,10 +810,13 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
     // `visible-off`/`visible-on` -- the same override as `focus_override`, for
     // the other half of the policy. See the call site.
     let mut visible_override: Option<bool> = None;
-    // Read once here rather than per tick. `CORDIAL_THROTTLE=off` is also the
-    // control for every measurement of what this gate saves: it restores the
-    // unconditional keepalive in the same binary and the same session.
-    let policy = super::input::throttle_policy();
+    // `CORDIAL_THROTTLE=off` is also the control for every measurement of what
+    // this gate saves: it restores the unconditional keepalive in the same
+    // binary and the same session. **Re-read each tick** (one relaxed atomic
+    // load) because the shell can change it while the client runs, ADR-044;
+    // this used to be read once here, which would have made a live change do
+    // nothing while the setting page said it had applied.
+    let mut policy = super::input::throttle_policy();
     let mut motion = false;
     // `touch-on`/`touch-off` and `look-on`/`look-off` isolate the two halves
     // `motion-on` drives together, to find which one the idle throttle
@@ -1373,6 +1376,7 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
                 Some(v) => Some(v),
                 None => super::backend_visible(),
             };
+            policy = super::input::throttle_policy();
             if super::input::keepalive_wanted(policy, observed, visible) {
                 super::input::idle_keepalive();
             }

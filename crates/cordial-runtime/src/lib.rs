@@ -42,6 +42,7 @@ pub mod graphics;
 pub mod headless;
 pub mod identity;
 pub mod linking;
+pub mod live_settings;
 pub mod permissions;
 pub mod plugin_host;
 pub mod profile;

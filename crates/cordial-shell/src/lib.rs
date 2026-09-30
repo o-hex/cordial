@@ -42,6 +42,11 @@ pub mod host_window;
 pub mod json_highlight;
 pub mod live_wire;
 pub mod network;
+// What Cordial does only when the GPU is NVIDIA's, and the parsing the shell and
+// the runtime both need for it. In the library half for the reason `network`
+// is: `cordial-runtime` already depends on this crate and needs the same
+// vendor gate and driver decode the launcher's diagnostics and crash page use.
+pub mod nvidia;
 pub mod plugin_preferences;
 pub mod profile;
 pub mod title_bar;

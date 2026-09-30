@@ -1514,12 +1514,17 @@ mod tests {
         // SAFETY: `thread` came from the `cordial_pthread_create` call above.
         assert_eq!(unsafe { pthread_join(thread, std::ptr::null_mut()) }, 0);
 
-        assert_eq!(
-            SEEN_STACK.load(Ordering::SeqCst) as usize,
-            REQUESTED_STACK,
-            "the new thread must see the stack size that was set on the attr \
-             it was created with, round-tripped through pthread_create and \
-             pthread_getattr_np"
+        // At least, not exactly: glibc may round a requested stack up, and on
+        // Fedora 44 aarch64 a 1 MiB request came back as 2 MiB and failed the
+        // v0.21.0 RPM build. What matters is that the attr's size reached the
+        // thread rather than being dropped for the default, which is 8 MiB or
+        // more, so the bound above keeps that failure visible.
+        let seen = SEEN_STACK.load(Ordering::SeqCst) as usize;
+        assert!(
+            seen >= REQUESTED_STACK && seen <= 4 * REQUESTED_STACK,
+            "the new thread must see at least the stack size that was set on \
+             the attr it was created with, round-tripped through \
+             pthread_create and pthread_getattr_np (saw {seen})"
         );
         assert_eq!(attr_destroy(attr), 0);
     }

@@ -11,6 +11,8 @@ order a newcomer would want it.
 | [`fastflags.md`](fastflags.md) | Overriding Roblox's FastFlags, and how layering between user/plugin/base works |
 | [`controllers.md`](controllers.md) | Why controller button glyphs may show the wrong brand |
 | [`rich-presence.md`](rich-presence.md) | The bundled Discord Rich Presence plugin: what it does, and what is not wired up yet |
+| [`shaders.md`](shaders.md) | The vkBasalt switch: sharpening and anti-aliasing over the game, and its config file |
+| [`mangohud.md`](mangohud.md) | The MangoHUD switch: what it shows, and how to install the layer |
 | [`plugins.md`](plugins.md) | Installing a plugin from an archive, and why Cordial fetches Deno |
 | [`architecture.md`](architecture.md) | How the pieces fit, as a diagram: shell, linker, symbol table, JNI, framework, plugins |
 | [`HANDOVER.md`](HANDOVER.md) | Written for whoever takes this on: every open thread, which claims are `INFERRED`, and the traps |

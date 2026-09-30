@@ -4,7 +4,7 @@ Cordial can hand the client's frame to
 [vkBasalt](https://github.com/DadSchoorse/vkBasalt), an open-source Vulkan
 implicit layer, for a sharpen pass and an anti-alias pass before it reaches the
 screen. Off by default, because it changes what is drawn: **Settings →
-Performance → Shaders (vkBasalt)**.
+General → Performance → Shaders (vkBasalt)**.
 
 The switch is only offered once vkBasalt is actually installed — a settings row
 that turns on and does nothing is worse than no row at all.
@@ -19,7 +19,9 @@ that turns on and does nothing is worse than no row at all.
   `org.freedesktop.Platform`'s own `VulkanLayer` extension point, the same one
   MangoHUD uses, so Cordial's manifest needs nothing added for it to be seen.
 
-Restart Cordial after installing; the settings row only checks at startup.
+Settings looks for the layer each time it is opened, so a host package is
+picked up by reopening it. A Flatpak extension is mounted when the sandbox
+starts, so quit Cordial and start it again.
 
 ## Config
 

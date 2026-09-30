@@ -298,23 +298,24 @@ pub fn apply_pin(build: Build, profile_dir: &Path) -> Result<Build, NotFound> {
 /// [`cordial_update::apk_signature::Refusal`] distinguishes "somebody changed
 /// this file" from "this is intact and is not Roblox's", and collapsing them
 /// into one shrug is what that type exists to prevent.
-fn verified_once(apk: &Path, cache: &Path) -> Result<(), NotFound> {
+///
+/// Returns the fingerprint when it had to verify, for [`locate_with`] to
+/// record once the engine directory has settled. Recording it here, before an
+/// extraction replaces that directory, wrote it into the build being replaced
+/// and cost a second verification on the next launch.
+///
+/// The fingerprint comes back with the archive's stamp as it was *before* the
+/// digest, so what is recorded describes the bytes that were checked.
+fn verified_once(apk: &Path, cache: &Path) -> Result<Option<(String, String)>, NotFound> {
     let pinned = cordial_update::apk_signature::pinned();
-    if let Some(known) = cordial_update::cache::recorded_signer(cache) {
+    if let Some(known) = cordial_update::cache::recorded_signer(cache, apk) {
         if pinned.iter().any(|p| p.eq_ignore_ascii_case(&known)) {
-            return Ok(());
+            return Ok(None);
         }
     }
+    let stamp = cordial_update::cache::stamp_for(apk);
     match cordial_update::apk_signature::verify_signed_by(apk, &pinned) {
-        Ok(signer) => {
-            // Not fatal if it cannot be written: the cost is verifying again
-            // next launch, which is slow rather than wrong. The same shape as
-            // the version and stamp writes below.
-            if let Err(e) = cordial_update::cache::record_signer(cache, &signer.certificate_sha256) {
-                println!("  shell: verified {} but could not record it: {e}", apk.display());
-            }
-            Ok(())
-        }
+        Ok(signer) => Ok(stamp.map(|s| (signer.certificate_sha256, s))),
         Err(e) => Err(NotFound::Unusable(format!(
             "Cordial will not run {}: {e}.\n\nThis is the archive Cordial was pointed at, not \
              one it downloaded. Clear the APK in Settings to let Cordial find or fetch a build \
@@ -344,7 +345,7 @@ pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
 /// `browser_account::profile::matching_profile_with`, for the same reason.
 fn locate_with(
     configured: &RobloxInstall,
-    verify: impl FnOnce(&Path, &Path) -> Result<(), NotFound>,
+    verify: impl FnOnce(&Path, &Path) -> Result<Option<(String, String)>, NotFound>,
 ) -> Result<Build, NotFound> {
     let Some((apk, _)) = effective_apk(configured) else {
         return Err(NotFound::NoBuild);
@@ -357,8 +358,21 @@ fn locate_with(
     }
     // Before any of the four paths below returns a `Build`, so that none of
     // them can hand the loader an archive nobody established the origin of.
-    verify(&apk, &engine_cache())?;
+    let fresh_signer = verify(&apk, &engine_cache())?;
+    let build = locate_verified(configured, apk)?;
+    // Not fatal if it cannot be written: the cost is verifying again next
+    // launch, which is slow rather than wrong. The same shape as the version
+    // and stamp writes in `locate_verified`.
+    if let Some((fingerprint, stamp)) = fresh_signer {
+        if let Err(e) = cordial_update::cache::record_signer_stamped(&engine_cache(), &fingerprint, &stamp) {
+            println!("  shell: verified {} but could not record it: {e}", build.apk.display());
+        }
+    }
+    Ok(build)
+}
 
+/// The rest of [`locate_with`], once the archive's signature is established.
+fn locate_verified(configured: &RobloxInstall, apk: PathBuf) -> Result<Build, NotFound> {
     // An explicit --lib-dir wins and is not second-guessed: someone who set it
     // has a reason, and quietly extracting over the top of it would hide a
     // mismatch between the engine they meant to test and the one they got.
@@ -525,11 +539,13 @@ fn key_into_store(store_root: &Path, cache: &Path, archives: &[&Path]) {
             for trouble in cordial_update::store::keep_archives(&entry, archives) {
                 println!("  shell: {keyed} is kept without its archives: {trouble}");
             }
-            let dropped = cordial_update::store::prune_in(
-                store_root,
-                cordial_update::store::KEEP,
-                &cordial_shell::profile::all_pinned_versions(),
-            );
+            // The build just keyed is the one about to run: pruning protected
+            // pins and not it, so keying a build older than the newest few
+            // deleted it at once, and every launch after extracted it again.
+            // Found by review.
+            let mut protect = cordial_shell::profile::all_pinned_versions();
+            protect.push(keyed.clone());
+            let dropped = cordial_update::store::prune_in(store_root, cordial_update::store::KEEP, &protect);
             if !dropped.is_empty() {
                 println!("  shell: removed older builds: {}", dropped.join(", "));
             }
@@ -767,13 +783,13 @@ mod tests {
         std::fs::write(&apk, apk_holding(b"the old engine")).unwrap();
         let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
 
-        let first = locate_with(&install, |_, _| Ok(())).unwrap();
+        let first = locate_with(&install, |_, _| Ok(None)).unwrap();
         assert_eq!(std::fs::read(first.lib_dir.join(LIBRARY)).unwrap(), b"the old engine");
 
         // A new Roblox build lands at the same path, which is exactly what
         // Sober updating does.
         std::fs::write(&apk, apk_holding(b"the new engine, which is longer")).unwrap();
-        let second = locate_with(&install, |_, _| Ok(())).unwrap();
+        let second = locate_with(&install, |_, _| Ok(None)).unwrap();
         let got = std::fs::read(second.lib_dir.join(LIBRARY)).unwrap();
 
         match previous {
@@ -802,11 +818,11 @@ mod tests {
         std::fs::write(&apk, apk_holding(b"the engine")).unwrap();
         let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
 
-        let build = locate_with(&install, |_, _| Ok(())).unwrap();
+        let build = locate_with(&install, |_, _| Ok(None)).unwrap();
         // Something no extraction would ever produce, so its survival is proof
         // the second call did not extract.
         std::fs::write(build.lib_dir.join(LIBRARY), b"left alone").unwrap();
-        let again = locate_with(&install, |_, _| Ok(())).unwrap();
+        let again = locate_with(&install, |_, _| Ok(None)).unwrap();
         let got = std::fs::read(again.lib_dir.join(LIBRARY)).unwrap();
 
         match previous {
@@ -814,6 +830,43 @@ mod tests {
             None => std::env::remove_var("XDG_CACHE_HOME"),
         }
         assert_eq!(got, b"left alone", "an unchanged APK must not re-extract");
+    }
+
+    /// **Keying a build older than the newest few must not delete it.** Pruning
+    /// protected the profiles' pins and not the build just keyed, so a build
+    /// that sorted below `KEEP` newer ones -- Sober's copy after Cordial has
+    /// fetched newer builds, say -- was removed the moment it was kept, and the
+    /// next launch extracted it again, every launch. Delete the `protect.push`
+    /// in `key_into_store` and the final assertion fails.
+    #[test]
+    fn keying_an_older_build_does_not_prune_the_build_just_keyed() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("keyed-older");
+        let previous = std::env::var_os("XDG_DATA_HOME");
+        // `all_pinned_versions` reads the real profile root otherwise.
+        std::env::set_var("XDG_DATA_HOME", dir.join("data"));
+
+        let store = dir.join("builds");
+        for newer in ["2.760.0.1", "2.750.0.1", "2.740.0.1"] {
+            let entry = store.join(newer);
+            std::fs::create_dir_all(&entry).unwrap();
+            std::fs::write(entry.join(LIBRARY), b"engine").unwrap();
+        }
+        let live = dir.join("lib/x86_64");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join(LIBRARY), b"engine").unwrap();
+        cordial_update::cache::record_version(&live, "2.700.0.1").unwrap();
+
+        key_into_store(&store, &live, &[]);
+
+        match previous {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        assert!(
+            store.join("2.700.0.1").join(LIBRARY).is_file(),
+            "the build about to run must survive the prune that follows keying it"
+        );
     }
 
     #[test]

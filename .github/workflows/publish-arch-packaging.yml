@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           want="${{ steps.tag.outputs.version }}"
-          got=$(sed -n 's/^pkgver=//p' packaging/aur/cordial/PKGBUILD | head -1)
+          got=$(sed -n '/^pkgver=/{s///;p;q;}' packaging/aur/cordial/PKGBUILD)
           if [ "$got" != "$want" ]; then
             echo "::error::packaging/aur/cordial/PKGBUILD says pkgver=$got but the tag is v$want."
             echo "::error::Its source= pins #tag=v\$pkgver, so Chaotic-AUR would build v$got."

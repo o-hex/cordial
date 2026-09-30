@@ -761,7 +761,10 @@ jobs:
             args+=(--gpg-homedir="${{ steps.gpg.outputs.gpghome }}"
                    --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}")
           fi
-          if ostree --repo=merged refs | grep -q '/stable$'; then
+          # Not `refs | grep -q`: grep -q exits at the first match and can leave
+          # ostree writing into a closed pipe, which pipefail reports as failure.
+          refs=$(ostree --repo=merged refs)
+          if grep -q '/stable$' <<<"$refs"; then
             args+=(--default-branch=stable)
           fi
           flatpak build-update-repo "${args[@]}" merged
@@ -1008,9 +1011,12 @@ jobs:
           set -euo pipefail
           du -sh pages pages/repo
           echo "largest objects:"
-          find pages/repo -type f -printf '%s\t%p\n' | sort -rn | head -5
+          # sed rather than head: head exits after five lines, sort is then
+          # killed by SIGPIPE ("sort: fflush failed: Broken pipe"), and under
+          # pipefail that failed run 36518320870's merge job over a diagnostic.
+          find pages/repo -type f -printf '%s\t%p\n' | sort -rn | sed -n 1,5p
           bytes=$(du -sb pages | cut -f1)
-          big=$(find pages -type f -size +99M | head -5)
+          big=$(find pages -type f -size +99M | sed -n 1,5p)
           if [ -n "$big" ]; then
             echo "::error::files over GitHub Pages' 100 MB per-file limit:"
             echo "$big"

@@ -199,7 +199,7 @@ jobs:
           mapfile -t pkgs < <(find dist/arch -type f -name '*.pkg.tar.zst' ! -name '*-debug-*' | sort)
           if [ "${#pkgs[@]}" -eq 0 ]; then
             echo "::error::no .pkg.tar.zst found under dist/arch after downloading cordial-arch" >&2
-            find dist/arch -type f | head -20 >&2
+            find dist/arch -type f | sed -n 1,20p >&2
             exit 1
           fi
           printf 'found %s package(s):\n' "${#pkgs[@]}"

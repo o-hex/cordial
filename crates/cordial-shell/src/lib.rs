@@ -38,6 +38,7 @@
 #![allow(unsafe_code)]
 
 pub mod branding;
+pub mod doctor;
 pub mod host_window;
 pub mod json_highlight;
 pub mod live_wire;
@@ -76,6 +77,7 @@ pub mod secrets;
 /// because the window Roblox runs in is built by `cordial-runtime`, which
 /// depends on this crate and has to read and write the same records.
 pub mod version;
+pub mod vulkan_probe;
 pub mod window_state;
 pub mod webview_policy;
 #[cfg(feature = "webview")]

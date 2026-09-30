@@ -13,10 +13,13 @@
 //! launcher's X11 notice has to land on exactly this screen. The About dialog
 //! links here instead of carrying a second copy.
 
+use cordial_shell::doctor::{Check, Level};
 use libadwaita as adw;
 use libadwaita::glib;
 use libadwaita::gtk;
 use libadwaita::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Where a report goes. One constant, because the row here and the About
 /// dialog's link both name it and two copies drift.
@@ -29,7 +32,11 @@ const SAVE_NAME: &str = "cordial-diagnostics.txt";
 
 /// Builds the report screen. Nothing is shown until it is presented.
 pub fn build() -> adw::Dialog {
-    let text = crate::diagnostics::report();
+    let block = crate::diagnostics::report();
+    // What Copy and Save hand over. Starts as the block alone and gains the
+    // doctor's checks when they finish, so a press before that still copies
+    // something true rather than waiting on a driver.
+    let text = Rc::new(RefCell::new(block.clone()));
 
     let page = adw::PreferencesPage::new();
 
@@ -59,7 +66,7 @@ pub fn build() -> adw::Dialog {
         .left_margin(12)
         .right_margin(12)
         .build();
-    view.buffer().set_text(&text);
+    view.buffer().set_text(&block);
     let frame = gtk::Frame::new(None);
     frame.set_child(Some(&view));
     frame.set_margin_top(6);
@@ -69,7 +76,7 @@ pub fn build() -> adw::Dialog {
     let copied = text.clone();
     copy.connect_clicked(move |b| {
         if let Some(display) = gtk::gdk::Display::default() {
-            display.clipboard().set_text(&copied);
+            display.clipboard().set_text(&copied.borrow());
             // The label is the confirmation. A button that looks identical
             // after a press is one people press three times.
             b.set_label("Copied");
@@ -89,7 +96,7 @@ pub fn build() -> adw::Dialog {
     let saved = text.clone();
     save.connect_clicked(move |b| {
         let parent = b.root().and_downcast::<gtk::Window>();
-        let text = saved.clone();
+        let text = saved.borrow().clone();
         gtk::FileDialog::builder()
             .title("Save diagnostics")
             .initial_name(SAVE_NAME)
@@ -114,6 +121,34 @@ pub fn build() -> adw::Dialog {
     group.add(&save_row);
     group.add(&frame);
     page.add(&group);
+
+    // The doctor's checks. Filled in when they finish: the Vulkan question
+    // runs a child process and the D-Bus ones can wait on a session bus, so
+    // they are asked on a worker and the screen opens at once.
+    let checks_group = adw::PreferencesGroup::builder()
+        .title("This machine")
+        .description("Checking…")
+        .build();
+    page.add(&checks_group);
+    {
+        let checks_group = checks_group.clone();
+        let text = text.clone();
+        glib::MainContext::default().spawn_local(async move {
+            // Offline: opening a report screen is not a reason to make a
+            // network request. `cordial --doctor` asks the mirror; this does not.
+            let result = gtk::gio::spawn_blocking(|| crate::doctor_run::checks(true)).await;
+            match result {
+                Ok(checks) => {
+                    checks_group.set_description(Some(&cordial_shell::doctor::verdict(&checks)));
+                    for check in &checks {
+                        checks_group.add(&check_row(check));
+                    }
+                    *text.borrow_mut() = crate::diagnostics::with_checks(&block, &checks);
+                }
+                Err(_) => checks_group.set_description(Some("The checks could not be run.")),
+            }
+        });
+    }
 
     let where_group = adw::PreferencesGroup::builder().title("Bugs and feature requests").build();
     // A link row rather than prose with a URL in it: this is the last place
@@ -160,6 +195,30 @@ pub fn build() -> adw::Dialog {
         .content_height(680)
         .child(&toolbar)
         .build()
+}
+
+/// One check as a row: the finding as the title, what to do about it as the
+/// subtitle, and an icon that carries the level for somebody who does not read
+/// the words first. The text goes through `private` and is escaped, because a
+/// row's title and subtitle are Pango markup and a GPU or driver name may
+/// contain `&` or `<`.
+fn check_row(check: &Check) -> adw::ActionRow {
+    let (icon, class) = match check.level {
+        Level::Ok => ("object-select-symbolic", "success"),
+        Level::Info => ("dialog-information-symbolic", "dim-label"),
+        Level::Warn => ("dialog-warning-symbolic", "warning"),
+        Level::Fail => ("dialog-error-symbolic", "error"),
+    };
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&cordial_shell::doctor::private(&check.what)))
+        .build();
+    if !check.fix.trim().is_empty() {
+        row.set_subtitle(&glib::markup_escape_text(&cordial_shell::doctor::private(check.fix.trim())));
+    }
+    let image = gtk::Image::from_icon_name(icon);
+    image.add_css_class(class);
+    row.add_prefix(&image);
+    row
 }
 
 /// Puts the report screen up over `parent`.

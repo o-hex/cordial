@@ -31,6 +31,7 @@ mod crash;
 mod deep_link;
 mod browser_account;
 mod diagnostics;
+mod doctor_run;
 mod download_progress;
 mod install;
 mod instructions;
@@ -111,6 +112,18 @@ fn main() -> libadwaita::glib::ExitCode {
         print!("{}", diagnostics::report());
         return libadwaita::glib::ExitCode::SUCCESS;
     }
+    // `--doctor` for the same reasons, and it must not go through the
+    // single-instance forwarding either: it is a question about this machine,
+    // asked of this process.
+    if flags.iter().any(|a| a == "--doctor") {
+        return libadwaita::glib::ExitCode::from(doctor_run::run(&flags));
+    }
+    // What `--doctor` runs, in a child of this binary, to ask Vulkan for its
+    // devices without loading a driver into the launcher. Not in `--help`: it
+    // prints a private line format for the doctor to read.
+    if flags.iter().any(|a| a == "--vulkan-probe") {
+        return libadwaita::glib::ExitCode::from(cordial_shell::vulkan_probe::run_probe_mode());
+    }
     // **`--help` printed nothing at all and exited 0**, which is how a flag
     // gets shipped and never found. `GApplication` only prints its own usage
     // for options it was told about, and this binary registers none -- it takes
@@ -132,6 +145,10 @@ fn main() -> libadwaita::glib::ExitCode {
              \x20                distribution, and how Cordial was installed. Paste\n\
              \x20                it into a bug report. The main menu's Report a\n\
              \x20                Problem shows the same block behind a Copy button.\n\
+             \x20 --doctor       Check this machine for what stops Roblox running: the\n\
+             \x20                display, GPU and Vulkan, sound, keyring and more, each\n\
+             \x20                with what to do about it. Exits 1 only if something\n\
+             \x20                will stop it starting. --offline skips the update check.\n\
              \x20 -h, --help     This.\n\
              \n\
              `cordial-run` is the loader this launches and is not meant to be run\n\

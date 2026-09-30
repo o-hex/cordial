@@ -160,6 +160,10 @@ by anyone. Full list: [`docs/install.md`](docs/install.md#building-from-source).
 wherever `CORDIAL_FLAGS` points. Layering and syntax:
 [`docs/fastflags.md`](docs/fastflags.md).
 
+**Something not working?** `cordial --doctor` checks the display, GPU and
+Vulkan, sound, keyring and the Roblox build, with what to do about each; Report
+a Problem in the main menu shows the same. [`docs/doctor.md`](docs/doctor.md).
+
 **Mouse acceleration** is a Settings control — cursor and camera (the
 default), or cursor only for raw camera movement — stored in `$XDG_CONFIG_HOME/cordial/shell.json`.
 

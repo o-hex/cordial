@@ -26,7 +26,9 @@
    with a Report a Problem button. "Will open on X11" is the loader's own rule,
    `cordial_runtime::android::backend()`: `CORDIAL_X11` set, or no
    `WAYLAND_DISPLAY`. `x11_notice::uses_x11` repeats it over the same two
-   variables, and the two must be changed together. It is deliberately not "the
+   variables, and the two must be changed together. (Since the doctor states
+   the same rule, `x11_notice::uses_x11` calls `doctor::uses_x11` in the
+   library; the loader's copy is the one left to keep in step.) It is deliberately not "the
    launcher's GDK display is X11": a session exporting `GDK_BACKEND=x11` over a
    Wayland compositor runs the game on Wayland.
 
@@ -43,3 +45,10 @@ the nested compositor used here (`/tmp/.X11-unix` not owned by the user inside
 the container). The banner was shown with `CORDIAL_X11=1` on Wayland, which
 takes the same branch; the no-`WAYLAND_DISPLAY` branch is covered by a unit test
 of `uses_x11` only.
+
+## Added 2026-09-30
+
+The screen also carries the doctor's checks under "This machine", and Copy and
+Save include them. They are asked on a worker, without the network, so the
+screen opens at once; the text Copy hands over is the block alone until they
+finish. See [`docs/doctor.md`](../doctor.md).

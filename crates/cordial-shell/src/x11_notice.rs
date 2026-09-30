@@ -33,7 +33,8 @@ pub const BUTTON: &str = "Report a Problem";
 /// split `diagnostics::roblox_in` makes: the environment is process-wide and
 /// would interleave with every other test that touches it.
 pub fn uses_x11(cordial_x11_set: bool, wayland_display_set: bool) -> bool {
-    cordial_x11_set || !wayland_display_set
+    // One rule, in the library, because the doctor states it too.
+    cordial_shell::doctor::uses_x11(cordial_x11_set, wayland_display_set)
 }
 
 /// [`uses_x11`] for this process.

@@ -238,6 +238,14 @@ pub fn report() -> String {
     out
 }
 
+/// [`report`] with the doctor's checks under it, for the report screen's Copy
+/// and Save. The checks are rendered by `doctor::render`, which puts the home
+/// directory as `~` and names no profile, so the whole is still safe to paste
+/// in public.
+pub fn with_checks(block: &str, checks: &[cordial_shell::doctor::Check]) -> String {
+    format!("{block}\nChecks\n{}", cordial_shell::doctor::render(checks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +293,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The copied text is the block and then the checks, and the block is
+    /// unchanged: `--diagnostics` and the templates read it by its labels.
+    #[test]
+    fn the_checks_follow_the_block_without_changing_it() {
+        use cordial_shell::doctor::{check, Level};
+        let block = report();
+        let full = with_checks(&block, &[check(Level::Warn, "odd", "do this")]);
+        assert!(full.starts_with(&block));
+        assert!(full.contains("\nChecks\nwarn  odd\n      do this\n"), "{full}");
+        assert!(full.trim_end().ends_with("1 warning; Roblox should still start."), "{full}");
     }
 
     /// An unreadable `os-release` is `unknown`, not a panic and not a blank.

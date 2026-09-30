@@ -78,6 +78,19 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.21.0" date="2026-09-30">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.21.0</url>
+      <description>
+        <p>
+          Plugins that cannot start are reported once instead of retried every
+          second, and a plugin update asking for permissions you never granted
+          waits for approval.
+        </p>
+        <p>
+          Mouse acceleration now applies to the camera by default.
+        </p>
+      </description>
+    </release>
     <release version="0.20.1" date="2026-09-29">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.20.1</url>
       <description>

@@ -588,6 +588,22 @@ mod tests {
         assert_eq!(ok.len(), 1);
     }
 
+    /// `probe_with` on a script this test process has just written. Another
+    /// test forking in parallel can inherit the script's write descriptor for
+    /// a moment, and exec then fails with ETXTBSY ("Text file busy"); that
+    /// failed CI once on a correct probe. Retry that one error only.
+    fn probe_fresh_script(script: &std::path::Path, deadline: Duration) -> Result<Vec<Device>, Failure> {
+        for _ in 0..50 {
+            match probe_with(script, deadline) {
+                Err(Failure::Crashed(why)) if why.contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+        probe_with(script, deadline)
+    }
+
     /// A child that hangs is killed and reported, not waited for.
     #[test]
     fn a_probe_that_hangs_times_out() {
@@ -597,7 +613,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let started = Instant::now();
-        assert_eq!(probe_with(&script, Duration::from_millis(300)), Err(Failure::TimedOut));
+        assert_eq!(probe_fresh_script(&script, Duration::from_millis(300)), Err(Failure::TimedOut));
         assert!(started.elapsed() < Duration::from_secs(5), "the hung child was waited for");
     }
 
@@ -609,7 +625,7 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\nkill -SEGV $$\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(probe_with(&script, Duration::from_secs(5)), Err(Failure::Crashed(_))));
+        assert!(matches!(probe_fresh_script(&script, Duration::from_secs(5)), Err(Failure::Crashed(_))));
     }
 
     #[test]

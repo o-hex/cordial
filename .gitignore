@@ -59,3 +59,6 @@ tools/discord-bridge/*-app.env
 tools/discord-bridge/.env.*
 tools/discord-bridge/node_modules/
 .vscode
+
+# Kept locally, never committed (see rescued/README.md).
+/rescued/

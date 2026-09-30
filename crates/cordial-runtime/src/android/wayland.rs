@@ -208,7 +208,7 @@
 //! them on one seat is tolerated stays a question this can answer by running.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use libadwaita as adw;
@@ -4123,6 +4123,38 @@ pub fn current_pointer_acceleration() -> bool {
     pointer_acceleration()
 }
 
+/// The title-bar choice a live change has asked for, or [`TITLE_BAR_UNSET`] when
+/// none has and the launch environment still stands.
+static TITLE_BAR: AtomicU8 = AtomicU8::new(TITLE_BAR_UNSET);
+const TITLE_BAR_UNSET: u8 = u8::MAX;
+
+/// Set by [`set_title_bar`] and cleared by the pump, which is the only thread
+/// GTK objects may be touched from. The live socket's thread cannot call
+/// `HostWindow::set_title_bar` itself, so it leaves the request here.
+static TITLE_BAR_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Ask for a different title bar on the game window (ADR-044). Takes effect on
+/// the pump's next turn, which is at most a few tens of milliseconds away; a
+/// request made before the window exists is applied when it first pumps.
+pub fn set_title_bar(choice: cordial_shell::title_bar::TitleBar) {
+    TITLE_BAR.store(choice.index() as u8, Ordering::Relaxed);
+    TITLE_BAR_PENDING.store(true, Ordering::Relaxed);
+}
+
+/// The title bar in force, for the live `get` reply: the last one asked for, or
+/// the launch environment's if none has been.
+pub fn current_title_bar() -> cordial_shell::title_bar::TitleBar {
+    match TITLE_BAR.load(Ordering::Relaxed) {
+        TITLE_BAR_UNSET => cordial_shell::title_bar::TitleBar::from_env(),
+        v => cordial_shell::title_bar::TitleBar::from_index(u32::from(v)),
+    }
+}
+
+/// The change the pump has yet to apply, taken so it is applied once.
+pub(crate) fn take_pending_title_bar() -> Option<cordial_shell::title_bar::TitleBar> {
+    TITLE_BAR_PENDING.swap(false, Ordering::Relaxed).then(current_title_bar)
+}
+
 static RELATIVE_POINTER_LISTENER: RelativePointerListener =
     RelativePointerListener { relative_motion: relative_pointer_motion };
 
@@ -5910,6 +5942,11 @@ impl WaylandWindow {
         // any traffic on the display connection — and the display connection
         // is exactly where a click on the header bar arrives, so the idle case
         // is the only one that waits.
+        // A live title-bar change, applied here because this is the GTK thread.
+        if let Some(choice) = take_pending_title_bar() {
+            self.host.0.set_title_bar(choice);
+            println!("[cordial] title bar: now {choice:?}");
+        }
         self.host.0.pump();
         // The close button destroys the toplevel inside the `pump` just above,
         // and the surface proxies below go with it. `looper::pump` only learns

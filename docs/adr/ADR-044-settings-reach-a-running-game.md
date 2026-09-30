@@ -49,7 +49,8 @@
 | `present_mode` | next launch | read at swapchain creation |
 | `mangohud`, `vkbasalt` | next launch | Vulkan layers load at instance creation |
 | `audio_output` | live | the playing streams are re-linked to the new sink in place; see below |
-| `title_bar`, `roblox`, `profile`, `unpacked_plugins`, `fullscreen_accel` | next launch | built or chosen at launch |
+| `title_bar` | live | revealed, hidden or restyled on the game window in place |
+| `roblox`, `profile`, `unpacked_plugins`, `fullscreen_accel` | next launch | built or chosen at launch |
 | `appearance`, `automatic_updates`, `download_on`, `marketplace_*`, `multi_instance_warning_seen` | shell | read by the shell itself |
 
 ## Audio output
@@ -124,6 +125,29 @@ once, unannounced ones not, files released, a second tick a no-op) and the switc
 changing in both directions after it was seeded. **No pad was attached for
 this, and the client was not run, so the engine's reaction to the disconnect is
 INFERRED** from its being the unplug path, not observed.
+
+## Title bar
+
+The header bar is a property of the game window, which lives in the client, so
+the live socket cannot touch it (GTK objects belong to the pump's thread). It
+leaves the choice in an atomic and a pending flag; `WaylandWindow::pump` applies
+it before it next iterates GTK. `HostWindow::set_title_bar` reveals or hides the
+`ToolbarView`'s top bars, honouring fullscreen as the fullscreen handler does,
+and loads or clears the compact stylesheet, which is now a provider of its own
+rather than text appended to the main sheet.
+
+**The window keeps its size, so the canvas takes the difference.** That reaches
+the engine as an ordinary resize and inherits whatever the resize path does,
+including the swapchain rebuild that Sober #2180 and issues #35/#39 report
+crashing on some drivers; toggling the row is one resize. That path was not run
+for this change (INFERRED). The X11 backend has no Cordial header bar at all,
+so the setting did nothing there at launch and does nothing there now.
+
+Verified against real GTK in a nested headless sway on its own display
+(`crates/cordial-shell/tests/title_bar_window.rs`, run with `--ignored`): started
+on the default bar at 46 px, Hidden gave 0 and no reveal, Compact 40, and
+Default again 46, so the compact sheet was removed and not just outvoted. The
+existing Hidden-at-launch fixture still passes.
 
 ## Consequences
 

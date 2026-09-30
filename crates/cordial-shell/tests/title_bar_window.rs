@@ -34,3 +34,56 @@ fn hidden_title_bar_only_changes_mapped_game_window() {
     launcher.window().close();
     game.window().close();
 }
+
+/// Run GTK's main loop for `ms`, which is how an animated reveal is let finish.
+fn spin(ms: u64) {
+    let end = std::time::Instant::now() + Duration::from_millis(ms);
+    let ctx = libadwaita::glib::MainContext::default();
+    while std::time::Instant::now() < end {
+        ctx.iteration(false);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The live change of ADR-044: a window that is already up takes a different
+/// title bar without being rebuilt. Launched with the default, so every
+/// assertion below is about a change and not about the starting state.
+#[test]
+#[ignore = "requires a Wayland display; launch without CORDIAL_TITLE_BAR"]
+fn the_title_bar_can_change_while_the_game_window_is_up() {
+    libadwaita::init().unwrap();
+    assert_eq!(TitleBar::from_env(), TitleBar::Default, "launch this test without CORDIAL_TITLE_BAR");
+    let game = HostWindow::with_canvas("Cordial live title bar fixture", 640, 480);
+    game.present();
+    game.wait_until_mapped(Duration::from_secs(5)).unwrap();
+    spin(400);
+
+    // Starting point: the ordinary bar.
+    assert!(game.toolbar().reveals_top_bars());
+    let ordinary = game.toolbar().top_bar_height();
+    assert!(ordinary > 0);
+    assert_eq!(game.title_bar(), TitleBar::Default);
+
+    // Hidden takes it away, and the space with it.
+    game.set_title_bar(TitleBar::Hidden);
+    spin(800);
+    assert_eq!(game.title_bar(), TitleBar::Hidden);
+    assert!(!game.toolbar().reveals_top_bars());
+    assert_eq!(game.toolbar().top_bar_height(), 0);
+
+    // Compact brings it back shorter than the ordinary one; the stylesheet is
+    // what makes the difference, so this is the only place it is measured.
+    game.set_title_bar(TitleBar::Compact);
+    spin(800);
+    assert!(game.toolbar().reveals_top_bars());
+    let compact = game.toolbar().top_bar_height();
+    assert!(compact > 0 && compact < ordinary, "compact {compact} should be shorter than {ordinary}");
+
+    // Control: back to the default restores exactly the height it started at,
+    // so the compact sheet was removed and not merely outvoted.
+    game.set_title_bar(TitleBar::Default);
+    spin(800);
+    assert_eq!(game.toolbar().top_bar_height(), ordinary);
+    println!("title-bar live: default={ordinary} hidden=0 compact={compact} default-again={ordinary}");
+    game.window().close();
+}

@@ -165,6 +165,11 @@ fn apply(update: &Update) -> Option<String> {
             crate::android::gamepad::set_enabled(*on);
             None
         }
+        // Left for the pump, which is the thread GTK objects belong to.
+        Update::TitleBar(t) => {
+            crate::android::wayland::set_title_bar(*t);
+            None
+        }
     };
     // Narrated because this project debugs by reading the client's output, and
     // "the setting reached the process" is the fact worth being able to see.
@@ -179,6 +184,7 @@ fn value_word(update: &Update) -> String {
         Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) | Update::Gamemode(b) | Update::Gamepad(b) => {
             b.to_string()
         }
+        Update::TitleBar(t) => live_wire::title_bar_word(*t).to_string(),
         Update::AudioOutput(name) if name.is_empty() => "the system default".to_string(),
         Update::AudioOutput(name) => name.clone(),
     }
@@ -259,6 +265,10 @@ fn current() -> BTreeMap<String, Value> {
     m.insert("audio_output".into(), Value::from(audio::current()));
     m.insert("gamemode".into(), Value::from(crate::gamemode::current()));
     m.insert("gamepad".into(), Value::from(crate::android::gamepad::current_enabled()));
+    m.insert(
+        "title_bar".into(),
+        Value::from(live_wire::title_bar_word(crate::android::wayland::current_title_bar())),
+    );
     m
 }
 
@@ -353,6 +363,7 @@ mod tests {
             "{\"set\":{\"audio_output\":true}}\n",
             "{\"set\":{\"gamemode\":\"yes\"}}\n",
             "{\"set\":{\"gamepad\":1}}\n",
+            "{\"set\":{\"title_bar\":\"tiny\"}}\n",
             "{\"set\":{\"audio_output\":\"a\\u0000b\"}}\n",
         ] {
             let r = handle(bad);
@@ -422,6 +433,25 @@ mod tests {
         // Control: the opposite message flips it back in the same process.
         assert_eq!(set(before).values["gamepad"], before);
         assert_eq!(crate::android::gamepad::current_enabled(), before);
+    }
+
+    #[test]
+    fn a_title_bar_change_is_left_for_the_pump_once_and_get_reports_it() {
+        use cordial_shell::title_bar::TitleBar;
+        let _g = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        let set = |t: TitleBar| handle(&live_wire::encode_set(&[Update::TitleBar(t)]));
+
+        let r = set(TitleBar::Hidden);
+        assert!(r.ok && r.applied == vec!["title_bar".to_string()], "{r:?}");
+        assert_eq!(r.values["title_bar"], "hidden");
+        // No window exists in a unit test, so what can be checked is the hand-off:
+        // the pump finds exactly one change waiting, and it is the one asked for.
+        assert_eq!(crate::android::wayland::take_pending_title_bar(), Some(TitleBar::Hidden));
+        assert_eq!(crate::android::wayland::take_pending_title_bar(), None, "applied once");
+
+        // Control: the opposite message is a different change, not a repeat.
+        assert_eq!(set(TitleBar::Default).values["title_bar"], "default");
+        assert_eq!(crate::android::wayland::take_pending_title_bar(), Some(TitleBar::Default));
     }
 
     #[test]

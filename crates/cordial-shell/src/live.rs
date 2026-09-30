@@ -60,7 +60,7 @@ pub enum Applies {
 /// without somebody deciding what it does to a running game.
 pub const CLASSIFICATION: &[(&str, Applies, &str)] = &[
     ("appearance", Applies::Shell, "the shell's own theme, applied by the row itself"),
-    ("title_bar", Applies::NextLaunch, "the game window's header bar is built when the client starts"),
+    ("title_bar", Applies::Live, "the header bar is revealed, hidden or restyled on the game window in place; the window keeps its size, so the canvas takes the difference"),
     ("roblox", Applies::NextLaunch, "which build to run is located at launch"),
     ("profile", Applies::NextLaunch, "names the profile the next client runs"),
     ("gamemode", Applies::Live, "registration with gamemoded is per pid and can be made or withdrawn at any time"),
@@ -110,6 +110,7 @@ pub fn live_updates(config: &ShellConfig) -> Vec<Update> {
         Update::AudioOutput(config.audio_output.env_value().unwrap_or("").to_string()),
         Update::Gamemode(config.gamemode),
         Update::Gamepad(config.gamepad),
+        Update::TitleBar(config.title_bar),
     ]
 }
 

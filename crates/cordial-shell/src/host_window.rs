@@ -253,6 +253,13 @@ pub struct HostWindow {
     /// Font size and colours for the current box. Reloaded when a box takes
     /// focus rather than styled per keystroke -- see [`HostWindow::set_text_overlay`].
     editor_css: gtk::CssProvider,
+    /// The title-bar preference in force. A cell because it changes while the
+    /// window is up (ADR-044), and shared because the fullscreen handler reads
+    /// it each time the window enters or leaves fullscreen and must see the
+    /// current choice, not the one the window was built with.
+    title_bar: std::rc::Rc<std::cell::Cell<crate::title_bar::TitleBar>>,
+    /// Holds [`COMPACT_SHEET`] when the bar is compact and nothing otherwise.
+    compact_css: gtk::CssProvider,
     /// Where the editor is in surface coordinates, so the input-region punch
     /// can hand that one rectangle back to GTK. `None` when nothing is focused.
     editor_rect: std::cell::Cell<Option<(i32, i32, i32, i32)>>,
@@ -620,6 +627,37 @@ fn canvas_cursor() -> Option<&'static str> {
     }
 }
 
+/// The sheet that makes the header bar compact, loaded into its own provider so
+/// the preference can change while the window is up (ADR-044): clearing a
+/// provider is one call, where removing rules from the middle of the main sheet
+/// would mean parsing all of it again.
+///
+/// The close button's right margin is one pixel short of its
+/// other three, and that asymmetry is deliberate. Reported as
+/// the x sitting too far left, with the gap to the right edge
+/// visibly larger than the gap above and below it -- which it
+/// was, by exactly one pixel. The two gaps are computed
+/// differently: the horizontal one is a sum of paddings
+/// (`windowhandle` insets its `GtkCenterBox` child equally on
+/// both sides, and the button's own margin adds to that), while
+/// the vertical one is whatever centring leaves over once the
+/// bar's height is settled by something else entirely -- the
+/// title label, not this sheet, which is also why the
+/// `min-height` below does not bind. Measured with
+/// `examples/compact_bar_offsets.rs`: 8/8/9 before, 8/8/8
+/// after, against the unmodified sheet in the same session.
+///
+/// A pixel off one margin is the smallest change that squares
+/// them. Equalising them properly would mean driving the bar's
+/// height from this sheet rather than the label's, which is the
+/// aggressive compaction 3d67e59 already tried and got reverted
+/// for.
+const COMPACT_SHEET: &str = " .cordial-engine-host headerbar { min-height: 30px; padding: 0 6px; } \
+                 .cordial-engine-host headerbar windowcontrols button { \
+                     min-width: 24px; min-height: 24px; padding: 0; \
+                     margin: 2px 1px 2px 2px; \
+                 }";
+
 impl HostWindow {
     /// Build the window with an empty canvas in the content slot.
     ///
@@ -654,6 +692,7 @@ impl HostWindow {
         canvas.set_cursor_from_name(canvas_cursor());
         let host = Self::new(title, width, height + chrome_height, &canvas);
         host.toolbar.set_reveal_top_bars(title_bar.revealed(false));
+        host.title_bar.set(title_bar);
 
         // Hide the header bar while fullscreen. Restore it afterwards only
         // when the saved preference has not hidden windowed chrome too.
@@ -671,8 +710,9 @@ impl HostWindow {
         // gap it was sitting in.
         {
             let toolbar_for_fs = host.toolbar.clone();
+            let choice = host.title_bar.clone();
             host.window.connect_fullscreened_notify(move |w| {
-                toolbar_for_fs.set_reveal_top_bars(title_bar.revealed(w.is_fullscreen()));
+                toolbar_for_fs.set_reveal_top_bars(choice.get().revealed(w.is_fullscreen()));
                 // Leaving fullscreen left the bar missing until the app menu
                 // was opened and closed. The reveal alone need not reach the
                 // compositor: GSK can judge a fullscreen-transition frame
@@ -706,14 +746,13 @@ impl HostWindow {
         // libadwaita default nearer 47px, which read as "the x in the title bar
         // looks off and the titlebar looks short". That is now opt-in through
         // the Appearance page rather than the only option.
-        let compact = title_bar == crate::title_bar::TitleBar::Compact;
         // The see-through state is a class rather than the default, and that
         // distinction is the whole lesson of 5a295e3. A permanently transparent
         // toplevel shows the desktop whenever the engine is not painting, which
         // is a window nobody can find. Transparent *only while the engine is
         // deliberately lowered* is safe, because in that state the engine is by
         // definition the thing painting the canvas.
-        let mut sheet = String::from(
+        let sheet = String::from(
             ".cordial-engine-host drawingarea { background-color: transparent; } \
              .cordial-engine-host headerbar { \
                  background-color: @headerbar_bg_color; \
@@ -762,40 +801,20 @@ impl HostWindow {
                  padding: 6px 10px; \
              }",
         );
-        if compact {
-            sheet.push_str(
-                // The close button's right margin is one pixel short of its
-                // other three, and that asymmetry is deliberate. Reported as
-                // the x sitting too far left, with the gap to the right edge
-                // visibly larger than the gap above and below it -- which it
-                // was, by exactly one pixel. The two gaps are computed
-                // differently: the horizontal one is a sum of paddings
-                // (`windowhandle` insets its `GtkCenterBox` child equally on
-                // both sides, and the button's own margin adds to that), while
-                // the vertical one is whatever centring leaves over once the
-                // bar's height is settled by something else entirely -- the
-                // title label, not this sheet, which is also why the
-                // `min-height` below does not bind. Measured with
-                // `examples/compact_bar_offsets.rs`: 8/8/9 before, 8/8/8
-                // after, against the unmodified sheet in the same session.
-                //
-                // A pixel off one margin is the smallest change that squares
-                // them. Equalising them properly would mean driving the bar's
-                // height from this sheet rather than the label's, which is the
-                // aggressive compaction 3d67e59 already tried and got reverted
-                // for.
-                " .cordial-engine-host headerbar { min-height: 30px; padding: 0 6px; } \
-                 .cordial-engine-host headerbar windowcontrols button { \
-                     min-width: 24px; min-height: 24px; padding: 0; \
-                     margin: 2px 1px 2px 2px; \
-                 }",
-            );
-        }
         let css = gtk::CssProvider::new();
         css.load_from_string(&sheet);
         gtk::style_context_add_provider_for_display(
             &WidgetExt::display(&host.window),
             &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        // After the main sheet at the same priority, so where both name the same
+        // property this one wins, as it did when it was appended to it.
+        host.compact_css
+            .load_from_string(if title_bar == crate::title_bar::TitleBar::Compact { COMPACT_SHEET } else { "" });
+        gtk::style_context_add_provider_for_display(
+            &WidgetExt::display(&host.window),
+            &host.compact_css,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
         // The editor's own sheet, empty until a box takes focus and reloaded
@@ -984,6 +1003,8 @@ impl HostWindow {
             text_layer,
             editor,
             editor_css,
+            title_bar: std::rc::Rc::new(std::cell::Cell::new(crate::title_bar::TitleBar::Default)),
+            compact_css: gtk::CssProvider::new(),
             editor_rect: std::cell::Cell::new(None),
             editor_multiline,
             editor_multiline_scroll,
@@ -2070,6 +2091,32 @@ impl HostWindow {
         } else {
             self.window.unfullscreen();
         }
+    }
+
+    /// Change the title-bar preference while the window is up (ADR-044).
+    ///
+    /// The window keeps the size it has: the bar's height comes out of the
+    /// canvas or goes back into it, which reaches the engine as the ordinary
+    /// resize it already handles, and the window is not resized to keep the
+    /// canvas constant because that would move a window the user placed.
+    ///
+    /// Honours fullscreen the way the handler in `with_canvas` does: a bar the
+    /// user asked to see is not revealed under a fullscreen game.
+    pub fn set_title_bar(&self, choice: crate::title_bar::TitleBar) {
+        self.title_bar.set(choice);
+        self.toolbar.set_reveal_top_bars(choice.revealed(self.window.is_fullscreen()));
+        self.compact_css.load_from_string(
+            if choice == crate::title_bar::TitleBar::Compact { COMPACT_SHEET } else { "" },
+        );
+        // See the fullscreen handler: a reveal alone need not reach the
+        // compositor, so ask for a frame once this call has returned.
+        let w = self.window.clone();
+        glib::idle_add_local_once(move || w.queue_draw());
+    }
+
+    /// The preference in force.
+    pub fn title_bar(&self) -> crate::title_bar::TitleBar {
+        self.title_bar.get()
     }
 }
 

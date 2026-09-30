@@ -104,10 +104,32 @@ pub enum Update {
     Gamemode(bool),
     /// Whether the client reads `/dev/input/js*` and feeds the engine pads.
     Gamepad(bool),
+    /// The game window's header bar.
+    TitleBar(crate::title_bar::TitleBar),
+}
+
+/// A title-bar choice in the words `CORDIAL_TITLE_BAR` and `shell.json` use.
+pub fn title_bar_word(t: crate::title_bar::TitleBar) -> &'static str {
+    use crate::title_bar::TitleBar;
+    match t {
+        TitleBar::Default => "default",
+        TitleBar::Compact => "compact",
+        TitleBar::Hidden => "hidden",
+    }
+}
+
+pub fn parse_title_bar(word: &str) -> Option<crate::title_bar::TitleBar> {
+    use crate::title_bar::TitleBar;
+    match word {
+        "default" => Some(TitleBar::Default),
+        "compact" => Some(TitleBar::Compact),
+        "hidden" => Some(TitleBar::Hidden),
+        _ => None,
+    }
 }
 
 /// The keys [`Update`] can carry, which are also the `shell.json` field names.
-pub const KEYS: [&str; 7] = [
+pub const KEYS: [&str; 8] = [
     "pointer_acceleration",
     "throttle",
     "close_on_leave",
@@ -115,6 +137,7 @@ pub const KEYS: [&str; 7] = [
     "audio_output",
     "gamemode",
     "gamepad",
+    "title_bar",
 ];
 
 /// Longest sink name accepted. PipeWire node names are short; the bound is
@@ -138,6 +161,7 @@ impl Update {
             Update::AudioOutput(_) => "audio_output",
             Update::Gamemode(_) => "gamemode",
             Update::Gamepad(_) => "gamepad",
+            Update::TitleBar(_) => "title_bar",
         }
     }
 
@@ -149,6 +173,7 @@ impl Update {
                 Value::from(*b)
             }
             Update::AudioOutput(name) => Value::from(name.as_str()),
+            Update::TitleBar(t) => Value::from(title_bar_word(*t)),
         }
     }
 
@@ -169,6 +194,9 @@ impl Update {
             "carry_launch_ticket" => value.as_bool().map(Update::CarryLaunchTicket).ok_or_else(bad),
             "gamemode" => value.as_bool().map(Update::Gamemode).ok_or_else(bad),
             "gamepad" => value.as_bool().map(Update::Gamepad).ok_or_else(bad),
+            "title_bar" => {
+                value.as_str().and_then(parse_title_bar).map(Update::TitleBar).ok_or_else(bad)
+            }
             "audio_output" => value
                 .as_str()
                 .filter(|n| valid_sink_name(n))
@@ -285,6 +313,7 @@ mod tests {
             Update::AudioOutput("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()),
             Update::Gamemode(false),
             Update::Gamepad(false),
+            Update::TitleBar(crate::title_bar::TitleBar::Hidden),
         ]
     }
 
@@ -354,6 +383,8 @@ mod tests {
             r#"{"set":{"audio_output":true}}"#,
             r#"{"set":{"gamemode":"on"}}"#,
             r#"{"set":{"gamepad":0}}"#,
+            r#"{"set":{"title_bar":"tiny"}}"#,
+            r#"{"set":{"title_bar":true}}"#,
             r#"{"set":{"audio_output":"a\u0000b"}}"#,
         ] {
             assert!(decode(bad).is_err(), "{bad} should be refused");

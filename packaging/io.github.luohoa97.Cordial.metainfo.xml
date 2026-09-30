@@ -78,6 +78,19 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.22.0" date="2026-09-30">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.22.0</url>
+      <description>
+        <p>
+          Mouse acceleration, background throttling and two other settings now
+          apply to a running game without a restart, and settings that need a
+          restart say so.
+        </p>
+        <p>
+          Settings shows which Roblox build this Cordial installs.
+        </p>
+      </description>
+    </release>
     <release version="0.21.1" date="2026-09-30">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.21.1</url>
       <description>

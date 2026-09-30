@@ -39,21 +39,19 @@ Experimental. Full table in [`docs/status.md`](docs/status.md).
 **Works:** loading an experience, sign-in, keyboard and mouse, camera, text
 entry with IME preedit, audio, voice chat, pointer capture, fullscreen, two
 accounts side by side, asset overlays, joining a public server from a game's
-Servers list, and joining a private server (confirmed in 0.19.0;
-[#40](https://github.com/luohoa97/cordial/issues/40) is still open).
+Servers list, and joining a private server (0.19.0). The reporter of
+[#40](https://github.com/luohoa97/cordial/issues/40) has not yet confirmed it.
 
 **Known broken**, with issue numbers:
 
 | | |
 |---|---|
-| No window at all on COSMIC, KWin, wlroots compositors | [#38](https://github.com/luohoa97/cordial/issues/38) |
-| Crash after second launch | [#44](https://github.com/luohoa97/cordial/issues/44) |
+| No window on some COSMIC, KWin and wlroots setups (it opens on KWin on a Steam Deck) | [#38](https://github.com/luohoa97/cordial/issues/38) |
 | Fullscreen freezes; exiting it crashes | [#39](https://github.com/luohoa97/cordial/issues/39) |
 | Touchscreen input crashes immediately | [#36](https://github.com/luohoa97/cordial/issues/36) |
 | SIGSEGV on launch on some machines | [#35](https://github.com/luohoa97/cordial/issues/35) |
 | Client can hang on exit | [#52](https://github.com/luohoa97/cordial/issues/52) |
 | Pointer lock unconfirmed on Hyprland, cursor drifts | [#56](https://github.com/luohoa97/cordial/issues/56) |
-| Keyboard stops after another app takes focus | [#31](https://github.com/luohoa97/cordial/issues/31) |
 | Camera-sensitivity text box glitches the client | [#53](https://github.com/luohoa97/cordial/issues/53) |
 | X11 camera snaps 180 degrees | [#41](https://github.com/luohoa97/cordial/issues/41) |
 

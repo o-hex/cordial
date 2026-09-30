@@ -139,9 +139,10 @@ rather than text appended to the main sheet.
 
 **The window keeps its size, so the canvas takes the difference.** That reaches
 the engine as an ordinary resize and inherits whatever the resize path does,
-including the swapchain rebuild that Sober #2180 and issues #35/#39 report
-crashing on some drivers; toggling the row is one resize. That path was not run
-for this change (INFERRED). The X11 backend has no Cordial header bar at all,
+including the swapchain rebuild that Sober #2180 reports crashing on NVIDIA
+drivers (535 and 550) and that issues #35 and #39 report crashing on other
+hardware, whose cause is not known; toggling the row is one resize. That path
+was not run for this change (INFERRED). The X11 backend has no Cordial header bar at all,
 so the setting did nothing there at launch and does nothing there now.
 
 Verified against real GTK in a nested headless sway on its own display
@@ -174,11 +175,12 @@ same size". The two ways to make one are both worse than saying "next launch":
 report a wrong extent for a poll (a swapchain at the wrong size, then another),
 or return `VK_ERROR_OUT_OF_DATE_KHR` from a present and hope the engine treats
 it as it should. Neither was tried, because the client was not run for this
-change, and swapchain rebuilds are the path Sober #2180 and issues #35 and #39
-report crashing on some drivers. Making the *next* rebuild use the new mode (an
-atomic in place of the `OnceLock`) would apply at the next resize or experience
-entry, which is what the code comment on `present_mode_choice` already argued
-is worse than a plain "next launch". A route that changes the mode without a
+change, and swapchain rebuilds are the path Sober #2180 (NVIDIA drivers only)
+and issues #35 and #39 (a Steam Deck, and an unknown GPU) report crashing.
+Making the *next* rebuild use the new mode (an atomic in place of the
+`OnceLock`) would apply at the next resize or experience entry, which is what
+the code comment on `present_mode_choice` already argued is worse than a plain
+"next launch". A route that changes the mode without a
 rebuild exists on paper, `VK_EXT_swapchain_maintenance1`'s per-present mode,
 but the engine does not enable it and it was not investigated (INFERRED).
 

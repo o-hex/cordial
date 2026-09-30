@@ -173,6 +173,10 @@ Flatpak extension, the generated config's path and its toggle key are all in
 MangoHud's Vulkan layer is installed. Install routes and what it shows:
 [`docs/mangohud.md`](docs/mangohud.md).
 
+**NVIDIA graphics** have not been tested on NVIDIA hardware. What is known from
+people running the same engine, what Cordial does about it, and the Flatpak
+driver-extension trap: [`docs/nvidia.md`](docs/nvidia.md).
+
 **Separate data roots** per instance come from `XDG_DATA_HOME`, which moves both
 the profile root and the client's data directory. `CORDIAL_PROFILE_ROOT` moves
 only the profile root and not the client.

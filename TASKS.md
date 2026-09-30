@@ -90,6 +90,14 @@ and the NVIDIA workaround are in effect.
 - **Caveat:** unverifiable on this machine — the development box is an Intel
   13th-gen part, so the NVIDIA path cannot be exercised here. Ships as
   `INFERRED` unless someone with NVIDIA hardware confirms it.
+- **Decided 2026-09-30: not applied.** mocktail's own comment on the flag
+  (`scripts/real_bringup_smoke.sh`) gives its reason as a non-atomic
+  `fseek`/`fread` pair in its libc bridge, which is not an NVIDIA fault; no Sober
+  issue mentions shader threading; and `flags.rs` (`BUILTIN`) records what an
+  inferred default cost last time. Still available in `flags.json`, and step 10
+  of the tester plan in
+  [docs/analysis/nvidia-support.md](docs/analysis/nvidia-support.md) measures it.
+  See [ADR-046](docs/adr/ADR-046-nvidia-is-gated-on-the-vendor-id.md).
 
 ---
 

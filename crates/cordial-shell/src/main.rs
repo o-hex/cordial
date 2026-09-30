@@ -32,6 +32,7 @@ mod deep_link;
 mod browser_account;
 mod diagnostics;
 mod doctor_run;
+mod flag_import;
 mod download_progress;
 mod install;
 mod instructions;
@@ -118,6 +119,11 @@ fn main() -> libadwaita::glib::ExitCode {
     if flags.iter().any(|a| a == "--doctor") {
         return libadwaita::glib::ExitCode::from(doctor_run::run(&flags));
     }
+    // Also before the `GApplication`, and for a scripting reason: importing a
+    // flag list should work over ssh and from a dotfiles script, with no window.
+    if flags.iter().any(|a| a == "--import-flags") {
+        return libadwaita::glib::ExitCode::from(flag_import::run(&flags));
+    }
     // What `--doctor` runs, in a child of this binary, to ask Vulkan for its
     // devices without loading a driver into the launcher. Not in `--help`: it
     // prints a private line format for the doctor to read.
@@ -149,6 +155,10 @@ fn main() -> libadwaita::glib::ExitCode {
              \x20                display, GPU and Vulkan, sound, keyring and more, each\n\
              \x20                with what to do about it. Exits 1 only if something\n\
              \x20                will stop it starting. --offline skips the update check.\n\
+             \x20 --import-flags FILE|-|--sober\n\
+             \x20                Merge a Bloxstrap, Fishstrap or Sober FastFlag list into\n\
+             \x20                a profile (--profile NAME, --replace). Skips a bad entry\n\
+             \x20                and names it; the rest are kept.\n\
              \x20 -h, --help     This.\n\
              \n\
              `cordial-run` is the loader this launches and is not meant to be run\n\

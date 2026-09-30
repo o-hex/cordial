@@ -75,6 +75,30 @@ the client is running. That distinction matters if you are building anything
 that changes flags dynamically — a plugin loaded part-way through a session
 cannot change a startup flag, whatever it writes.
 
+## Importing a list from another launcher
+
+**Settings, FastFlags, Import…** reads a Bloxstrap or Fishstrap
+`ClientAppSettings.json`, or Sober's `config.json` (only its `fflags` object;
+the `FFlagExample` placeholder a stock Sober install carries is dropped), and
+merges the flags into this profile's. The same from a terminal:
+
+```bash
+cordial --import-flags ClientAppSettings.json     # or - for standard input
+cordial --import-flags --sober                    # finds Sober's own config
+cordial --import-flags list.json --profile NAME --replace
+```
+
+Flags already set are kept unless the list sets them again; `--replace` starts
+from empty instead. Values are checked by the flag's prefix: `FFlag` takes
+`True` or `False`, `FInt` a whole number, and `FLog` takes anything, because
+log channels are declared as a number (`"7"`) or a severity (`"Info"`,
+`"Warning,6"`) and which one a channel wants is not visible from outside.
+
+**One entry the check refuses does not stop the rest.** It is skipped and named,
+and everything else is imported. A name with no FastFlag prefix is imported and
+listed, so a typo shows. The Sober config path outside the Flatpak
+(`~/.config/sober/config.json`) is `INFERRED`; only the Flatpak's has been seen.
+
 ## Layers and provenance
 
 Flags come from more than one place, and each source owns its own file:

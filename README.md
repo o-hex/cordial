@@ -157,8 +157,9 @@ by anyone. Full list: [`docs/install.md`](docs/install.md#building-from-source).
 ## Configuration
 
 **FastFlags** live in `~/.local/share/cordial/profiles/<profile>/flags.json`, or
-wherever `CORDIAL_FLAGS` points. Layering and syntax:
-[`docs/fastflags.md`](docs/fastflags.md).
+wherever `CORDIAL_FLAGS` points. Settings → FastFlags → Import reads a
+Bloxstrap, Fishstrap or Sober list (`cordial --import-flags` does it from a
+terminal). Layering, syntax and import: [`docs/fastflags.md`](docs/fastflags.md).
 
 **Something not working?** `cordial --doctor` checks the display, GPU and
 Vulkan, sound, keyring and the Roblox build, with what to do about each; Report

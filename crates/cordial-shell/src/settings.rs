@@ -2965,11 +2965,13 @@ fn build_fastflags_page(
     let group = adw::PreferencesGroup::builder()
         .title("Engine flag overrides")
         .description(
-            "The same format Bloxstrap uses, so a list pastes straight in. Applies the next \
-             time you press Roblox.",
+            "The same format Bloxstrap uses, so a list pastes straight in, and Import reads a \
+             Bloxstrap, Fishstrap or Sober list from a file. Applies the next time you press \
+             Roblox.",
         )
         .build();
 
+    let import = gtk::Button::with_label("Import…");
     let clear = gtk::Button::with_label("Clear all");
     let apply = gtk::Button::with_label("Apply");
     apply.add_css_class("suggested-action");
@@ -3033,6 +3035,7 @@ fn build_fastflags_page(
     // to the height of a wrapped path, which is the same mistake the header
     // suffix made one paragraph up.
     let actions = gtk::Box::builder().spacing(6).valign(gtk::Align::Center).build();
+    actions.append(&import);
     actions.append(&clear);
     actions.append(&apply);
 
@@ -3101,6 +3104,44 @@ fn build_fastflags_page(
     });
     refresh(&view.buffer());
 
+    // **Import merges into what is there and saves at once**, unlike the text
+    // box, which saves on Apply: choosing a file is the whole gesture, and a
+    // second press to confirm it would be the step people forget. What was in
+    // the box, saved or not, is kept and the file's flags land on top; the box
+    // then shows what was written. Per entry, so one value the check refuses
+    // costs that flag and not the list -- see `flag_document::import`.
+    {
+        let view = view.clone();
+        let dialog = dialog.clone();
+        let profile_dir = profile_dir.clone();
+        import.connect_clicked(move |button| {
+            let Some(dir) = profile_dir.clone() else {
+                dialog.add_toast(adw::Toast::new("There is no profile directory to save into."));
+                return;
+            };
+            let parent = button.root().and_downcast::<gtk::Window>();
+            let json = gtk::FileFilter::new();
+            json.set_name(Some("Flag lists (JSON)"));
+            json.add_suffix("json");
+            let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&json);
+            let view = view.clone();
+            let dialog = dialog.clone();
+            gtk::FileDialog::builder()
+                .title("Import FastFlags")
+                .filters(&filters)
+                .build()
+                .open(parent.as_ref(), gtk::gio::Cancellable::NONE, move |result| {
+                    // A dismissed picker is an error result too.
+                    let Ok(file) = result else { return };
+                    let Some(source) = file.path() else {
+                        dialog.add_toast(adw::Toast::new("That file has no path Cordial can read."));
+                        return;
+                    };
+                    import_flags_file(&view, &dialog, &dir, &source);
+                });
+        });
+    }
     {
         let view = view.clone();
         clear.connect_clicked(move |_| {
@@ -3156,6 +3197,79 @@ fn build_fastflags_page(
     }
 
     page
+}
+
+/// The body of the FastFlags page's Import button: read `source`, merge it into
+/// the editor's current document, save, and say what happened.
+///
+/// Split from the button so the widget wiring stays a few lines. Everything that
+/// decides anything is `flag_document::import` and `merge`, which are tested;
+/// this only moves their results to the screen.
+fn import_flags_file(
+    view: &gtk::TextView,
+    dialog: &adw::PreferencesDialog,
+    profile_dir: &std::path::Path,
+    source: &std::path::Path,
+) {
+    use cordial_plugins::flag_document as fd;
+    use gtk::prelude::{TextBufferExt, TextViewExt};
+
+    let text = match std::fs::read_to_string(source) {
+        Ok(t) => t,
+        Err(e) => {
+            dialog.add_toast(adw::Toast::new(&format!("Could not read {}: {e}", source.display())));
+            return;
+        }
+    };
+    let imported = match fd::import(&text) {
+        Ok(i) => i,
+        Err(e) => {
+            dialog.add_toast(adw::Toast::new(&format!("Nothing imported: {e}")));
+            return;
+        }
+    };
+    let buffer = view.buffer();
+    let current = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+    // The box may hold a document that does not parse; merging into it would
+    // discard whatever is wrong with it.
+    let mut flags = match fd::parse(&current) {
+        Ok(f) => f,
+        Err(e) => {
+            dialog.add_toast(adw::Toast::new(&format!("Fix the editor first, then import: {e}")));
+            return;
+        }
+    };
+    let (added, changed) = fd::merge(&mut flags, &imported.flags);
+    if let Err(e) = fd::write(&fd::path_in(profile_dir), &flags) {
+        dialog.add_toast(adw::Toast::new(&format!("Could not save: {e}")));
+        return;
+    }
+    if let Ok(pretty) = serde_json::to_string_pretty(&flags) {
+        buffer.set_text(&format!("{pretty}\n"));
+    }
+    let summary = format!("{} Applies at the next launch.", fd::summary(&imported, added, changed));
+    if imported.skipped.is_empty() && imported.unrecognised.is_empty() {
+        dialog.add_toast(adw::Toast::new(&summary));
+        return;
+    }
+    // Skipped entries are named, in a dialog rather than a toast: a toast is
+    // gone in a few seconds and the list is the part somebody has to act on.
+    let mut body = String::new();
+    if !imported.skipped.is_empty() {
+        body.push_str(&format!("Not imported:\n{}", fd::describe_skipped(&imported)));
+    }
+    if !imported.unrecognised.is_empty() {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&format!(
+            "Imported, but these do not start with a FastFlag prefix, so check the spelling:\n{}",
+            imported.unrecognised.join("\n")
+        ));
+    }
+    let alert = adw::AlertDialog::new(Some(&summary), Some(&body));
+    alert.add_response("ok", "OK");
+    alert.present(Some(dialog));
 }
 
 #[cfg(test)]

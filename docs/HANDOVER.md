@@ -41,8 +41,11 @@ project's life the client rendered a login form nobody could type into.
 
 **The single most valuable habit here is refusing to state a result you did not
 observe.** Several commits exist only to retract an earlier claim, and they are
-the good ones. `docs/NEXT.md` is the long-form working record; it is 1700 lines
-and it is honest, including about the things that turned out to be wrong.
+the good ones. `docs/NEXT.md` is the long-form working record; on 2026-09-30 it is about
+5,850 lines and it is honest, including about the things that turned out to be
+wrong. This page does not summarise it. The startup freeze and the text-box
+glitches, which the maintainer has said gate a 1.0, live there and nowhere else:
+read its first screen, then the newest `## Open:` entry.
 
 ## What needs an account, and therefore needs you
 
@@ -114,25 +117,138 @@ is known rather than guessed: `libroblox.so` creates its own Vulkan device and
 that layer and filtering `vkEnumeratePhysicalDevices`, which is not intercepted
 at all today.
 
-## The release channel split, and why it does nothing yet
+## Releases, and how they reach people
 
-Every push to main redeploys the GitHub Pages site, and that site carries the
-OSTree Flatpak repo — so an installed release used to drift with main on every
-`flatpak update`. That was the bug behind "releases keep updating to a new
-commit".
+State on 2026-09-30: 0.20.1 is the latest release and everything below is
+current at it. The release pages run v0.2.0 to v0.20.1 (`gh release list`).
+v0.6.0 is a tag with no release page. Notes for 0.8.0 onward are in
+`docs/releases/`; 0.7.0's exist only on its release page, and `CHANGELOG.md`
+stops at 0.6.0 by design.
 
-There are now two refs. `master` keeps moving, as before. `stable` is written
-only by a commit that carries a `v*` tag. Both publish from the same
-main-triggered deploy, because the `github-pages` environment has a deployment
-branch policy naming `main` and nothing else — a tagged deploy is refused by the
-environment regardless of what the workflow says, and v0.6.0 is the run that
-showed it. Do not "fix" this by gating the deploy on tags.
+| Route | State | Follows |
+|---|---|---|
+| Flatpak remote (`cordial`, on GitHub Pages) | Signed. `stable` exists and is the default, for x86_64 and aarch64. | `stable` moves only on a release commit; `master` moves on every push to `main` |
+| apt, dnf (Fedora 44 only), pacman repositories | Published and signed, on the same Pages site under `/apt/`, `/rpm/`, `/arch/`. At 0.20.1 on 2026-09-30: the apt `Packages` file, the dnf `repomd.xml` (with its `.asc`) and the pacman `cordial.db` (with its `.sig`) were fetched and read; no package was installed from them. | Tags only |
+| GitHub release assets | AppImage, `.deb`, `.rpm`, `.pkg.tar.zst` and the Flatpak bundle, each with a keyless Sigstore `.cosign.bundle` | Tags only |
+| AUR | Not ours. See below. | Nobody in this project |
 
-**`stable` does not exist until a tagged release runs through it**, and until
-then the published summary carries `master` only with no default-branch key —
-which is correct, because pointing a default at a missing ref would break every
-install rather than just new ones. Existing users stay on `master` until they
-migrate by hand; the command is in `docs/install.md`.
+### Cutting one
+
+[`docs/releases/README.md`](releases/README.md) is the procedure and it is
+accurate. The parts that matter to a new maintainer:
+
+- **The version lives in six files.** 40a42a5 ("Cordial 0.20.1") is the worked
+  example: `Cargo.toml`, `Cargo.lock`, `docs/releases/v0.20.1.md`,
+  `packaging/aur/cordial/PKGBUILD`, its `.SRCINFO`, and the newest `<release>`
+  in `packaging/io.github.luohoa97.Cordial.metainfo.xml`. CI checks two of
+  them; v0.15.1 was tagged with four done and went red.
+- **`docs/releases/vX.Y.Z.md` is the body of the GitHub release page.**
+  `.github/workflows/attach-to-release.yml` creates the release from that file
+  (`--notes-file`) if nothing has created it yet, and refuses rather than fall
+  back to a list of commit subjects. So the notes must exist before the tag.
+- **`packaging/aur/cordial-bin/` is bumped afterwards, in its own commit**,
+  because its PKGBUILD pins the release asset's URL and sha256 and neither
+  exists until CI has built the package. 1ba36ba is the example: the hash came
+  from `sha256sum` on the attached `.pkg.tar.zst`, and the commit says it was
+  not built with `makepkg`.
+- **Tagging is what publishes apt, dnf and pacman.** A push to `main` builds
+  them and the publishers skip on purpose.
+- **The Flatpak `stable` channel is the exception, and it is published by the
+  main-branch run, not the tag run.** The `github-pages` environment has a
+  deployment branch policy naming `main` only, so a tagged deploy is refused.
+  The step "Check whether this commit carries a release tag" in
+  `.github/workflows/flatpak.yml` looks for a `v*` tag on the commit the
+  `main` push built. If there is one, `stable` is pointed at that build. If
+  not, the currently published `stable` is carried forward. So push `main` and
+  the tag together, and do not expect `stable` to move from a tag pushed alone.
+  Do not fix this by gating the deploy on tags; v0.6.0 is the run that showed
+  why.
+- **Do not push to `main` again while the release runs are going.** Each push
+  cancels the previous run through its concurrency group, and a list full of
+  `cancelled` reads like breakage.
+
+### The Flatpak pipeline
+
+`.github/workflows/flatpak.yml`, four jobs. `build` is a matrix of
+`ubuntu-latest` (x86_64) and `ubuntu-24.04-arm` (aarch64), each producing its
+own OSTree repository and a bundle, and is where `stable` is carried forward or
+pointed at a tagged build ("Carry the stable channel forward, or point it at
+this release"). `merge` combines the two repositories, rewrites and signs the
+summary, and assembles the Pages tree. `deploy` needs `merge`,
+runs only on `main`, and only when the repository variable `PUBLISH_PAGES` is
+`true`; it replaces the whole Pages site, which also carries `/apt/`, `/rpm/`
+and `/arch/`, assembled from the latest successful `apt.yml`, `yum.yml` and
+`pacman.yml` runs, so those trees lag by one push. `publish` runs on tags and
+attaches the bundles through `attach-to-release.yml`.
+
+Pages has no incremental publish, which is why carrying `stable` forward is a
+step at all: without it the first ordinary push after a release would delete
+the release channel.
+
+Two failures on 2026-09-29, both fixed on `main` and both worth knowing because
+neither showed as a code problem:
+
+- **fc04d22.** 0.19.0's `cordial-debug` pacman package was over Pages' 100 MB
+  per-file limit, so the payload check failed on every run from 2026-09-28 and
+  the remote stopped updating. Users saw `flatpak update` find nothing until
+  0.20.1. `pacman.yml` now leaves `-debug` packages out of the repository
+  (they stay on the release page), and `flatpak.yml` drops `/arch/` with a
+  warning instead of failing if a file that size ever reaches it.
+- **2050e35.** Carrying `stable` forward pulls it as a `pages-live:` remote
+  ref and left that ref behind; the merge's `pull-local` then failed with
+  "Invalid ref name", so no untagged run could publish once `stable` existed.
+  The carry-forward now deletes the remote ref and the merge pulls named refs
+  only. That commit says it was checked against throwaway local repositories
+  and not yet in CI; main runs since then have passed, apart from the flake described next.
+
+One more, found afterwards. Run 36518320870 (the commit that bumped
+`cordial-bin`) failed in `merge`, step "Report the payload size": a diagnostic
+`find | sort -rn | head -5` under `set -o pipefail` printed `sort: fflush
+failed: Broken pipe` and exited 2, because `head` closed the pipe early. Runs
+36555156089 and 36563959547 passed on the same tree, so it is an intermittent
+race and not a payload problem. It could have cost a release its Pages deploy.
+The workflows now use `sed -n 1,5p` for these listings (commit "Workflows: stop
+early-closing pipes failing under pipefail"); until that is pushed and has run
+in CI, it is fixed in the tree and unobserved in the pipeline.
+
+### The signing keys
+
+Four separate GPG keys sign the four repositories: Flatpak, apt, rpm and
+pacman. Separate on purpose, so one leaked secret does not compromise all
+four. Each private half is a repository secret (`FLATPAK_GPG_PRIVATE_KEY`,
+`APT_GPG_PRIVATE_KEY`, `RPM_GPG_PRIVATE_KEY`, `ARCH_GPG_PRIVATE_KEY`, each
+with a `*_GPG_KEY_ID` beside it). Read from the published keys on 2026-09-30,
+all four were created 2026-08-30 and **all four expire on 2028-08-29**:
+
+| Key | Fingerprint |
+|---|---|
+| Flatpak | 8364 5E9B 8F6C 4B29 227D 4629 4310 E617 967A BDD8 |
+| apt | E6BE 3043 5BD6 3471 FD1A B331 DC05 1D16 7161 8AA6 |
+| rpm | E5FA CC1B D170 8EC9 4FFF 5817 FDD1 0A8B 6D7F 10B9 |
+| pacman | C82B BD7D 8274 4F80 4A68 DA8B 3A69 D324 1BA6 288F |
+
+**GitHub secrets are write-only.** They can be replaced and never read back, so
+if the private halves exist only as secrets, nobody can recover them, and a new
+maintainer cannot rotate anything gracefully. Where the offline copies are is
+not recorded anywhere in this repository, and this page does not guess: **ask
+the maintainer**, and write the answer here. What happens to users when a key
+expires is `INFERRED` (signature checks start failing until they fetch a new
+key); nobody has run it. The generation and rotation procedures are in
+`docs/design/flatpak-remote-signing.md`, `apt-repository.md`, `rpm-repository.md`
+and `pacman-repository.md`. Those notes' later paragraphs still describe the
+time before the keys existed; their "The key" sections are current.
+
+### The AUR
+
+`cordial`, `cordial-bin` and `cordial-git` exist on the AUR, and **they belong
+to a third party, `taxin-404`, not to the maintainer** (20c23ff;
+`packaging/aur/PUBLISHING.md`). On 2026-09-30 all three were at 0.17.0, last
+modified 2026-09-20, with `cordial-bin`'s sha256 matching the official v0.17.0
+asset. They are copies of `packaging/aur/` fetching only from this repository.
+What that account pushes next is not reviewed by anyone here. The project has
+never published to the AUR itself; `PUBLISHING.md` is the procedure for whoever
+owns those names, and the names would first have to be adopted or the packages
+renamed. Which of those the maintainer wants is an open question.
 
 ## Per-profile network egress (ADR-016), and what is still missing
 
@@ -245,6 +361,11 @@ filter that makes the raw corpus worth searching by hand.
 **Fullscreen offsets the content** — right and down on entering, then bleeding
 up and left past the window edge on restore. Issue #7.
 
+*Status 2026-09-30: issue #7 is closed (completed, 2026-08-15, no comment
+saying what fixed it). The offset was not re-measured for this note. NEXT.md
+still carries fullscreen entries as open (the fullscreen grey canvas, 2026-09-28),
+and the maintainer counts that one as a 1.0 blocker.*
+
 **The lead previously recorded here is disproved.** It said the swapchain extent
 comes from `wayland::current().geometry()`, that geometry is written only by
 `apply_resize`, and that `apply_resize` early-returns when the size is unchanged
@@ -290,9 +411,18 @@ control and it has not been run. Ruled out already: ASTC support (this
 developer's Intel iGPU has it) and a fall back to the software rasteriser
 (`intel_icd` and `libvulkan_intel.so` are both installed).
 
+*Status 2026-09-30: not re-checked. Nothing in this entry has been confirmed
+or refuted since it was written.*
+
 **Typing into text fields draws nothing** until the field loses focus. The
 per-keystroke sync path is understood; what is missing is an EditText-equivalent
 overlay. `CORDIAL_TRACE_TEXT=1`.
+
+*Status 2026-09-30: the headline is out of date. Typing has drawn in the box
+since 0.7.0, whose release page says a focused TextBox gets a `gtk::Text` with
+a caret; `docs/status.md` lists it as working. Text-box glitches remain (the
+black canvas on first focus in an experience, the fullscreen grey), and the
+maintainer counts them as a 1.0 blocker. They are in NEXT.md.*
 
 **Shift+F5 does not open Roblox's stats menu.** Two candidates, neither
 established: the key path sends an evdev keycode with Android `META_*` modifier
@@ -300,9 +430,17 @@ bits, which is a mixed vocabulary and mixed vocabulary is what cost four failed
 keyboard theories before — or these are desktop-only debug shortcuts that the
 Android build never wires at all. Settling it is cheap.
 
+*Status 2026-09-30: not re-checked.*
+
 **Web views are unimplemented**, which is why a lot of Roblox's UI does nothing.
 Needs `webkitgtk6.0-devel`; it is absent on the developer's host and present in
 their distrobox.
+
+*Status 2026-09-30: out of date. Web views render in a signed-in WebKitGTK
+window and both bridge formats observed from the engine reach the runtime
+(`docs/status.md`; the 0.7.0 release page calls the in-experience web view
+verified). What `status.md` says is still missing is interactive coverage of
+more pages.*
 
 **There is no Roblox Android build to download.** ADR-015 permits fetching and
 the entire fetcher is built and proven — streaming, SHA-256, zip refusals,
@@ -312,6 +450,12 @@ is 500, and `roblox.com/download` offers Google Play and the Amazon Appstore and
 no file. Sober does not fetch from Roblox either; it routes users through Google
 Play. Aptoide is deliberately not wired — a mirror offering only a hash it
 supplied itself is verification theatre.
+
+*Status 2026-09-30: out of date. ADR-025 (accepted) lets Cordial fetch the build
+from APKPure when it can prove Roblox signed it, and the first-run
+**Download Roblox** button does that (README, `docs/install.md`). The paragraph
+above is the state before that decision; the ADR is where the reasoning for the
+change is.*
 
 ## The application ID, and why it is not org.cordial.Cordial
 
@@ -1038,6 +1182,7 @@ Re-run before believing that one.
 
 ## Layout
 
+    crates/cordial-linker-sys  builds the C++ side: bionic linker port, shims
     crates/cordial-runtime   the loader, bionic shim, Android framework layer
     crates/cordial-shell     the launcher; also owns the shared window definition
     crates/cordial-plugins   registry, dependency resolution, unpacking
@@ -1063,12 +1208,68 @@ Unifying them is a genuinely good first contribution.
 ## House style
 
 Comments explain *why*, anchored in the failure that motivated the code. Commit
-messages say what you measured, and they are long here on purpose. British-ish
+messages are short: a subject and a few lines saying what changed, what was
+measured and what is unverified. They used to be long here on purpose, and
+AGENTS.md now says that was wrong; the reasoning belongs in an ADR. British-ish
 prose, no emoji, no bullet-list comment blocks. Read the surrounding file before
 writing; the voice is consistent and matching it is not optional.
 
 Arguing with an ADR is welcome — ADR-004 was reversed exactly that way. What is
 not acceptable is quietly contradicting one in code.
+
+## The ADR index
+
+All 42 records in `docs/adr/`, as of 2026-09-30, with the status line each one
+carries. Regenerate it with a loop over `docs/adr/*.md` (the H1 and the
+`**Status:**` line) rather than editing rows by hand. Four are still
+`proposed` (020, 021, 022, 027). The
+reversals to know about are ADR-004 (superseded by 010) and ADR-011 (partly
+superseded by 024, which restores X11).
+
+| ADR | Decision | Status |
+|---|---|---|
+| [ADR-001](adr/ADR-001-in-process-hooking.md) | In-process hooking of the Roblox process | Rejected |
+| [ADR-002](adr/ADR-002-core-shell-and-ui-handoff.md) | Core shell, UI handoff, and the cold-start ordering | Accepted |
+| [ADR-003](adr/ADR-003-plugin-isolation.md) | Plugins have no memory access to Cordial | Accepted |
+| [ADR-004](adr/ADR-004-plugin-asset-overrides.md) | Plugins do not override Roblox's assets | Superseded by ADR-010 |
+| [ADR-005](adr/ADR-005-flag-service.md) | The flag service has two surfaces, because flags have two lifetimes | Accepted |
+| [ADR-006](adr/ADR-006-plugin-events-and-first-party.md) | Plugins may declare their own events, and some plugins ship with Cordial | Accepted |
+| [ADR-007](adr/ADR-007-host-resources-are-brokered.md) | Plugins never hold host permissions; Cordial brokers them | Accepted |
+| [ADR-008](adr/ADR-008-plugins-are-typescript-on-deno.md) | Plugins are TypeScript on Deno | Accepted |
+| [ADR-009](adr/ADR-009-capture-yes-overlay-injection-no.md) | Cordial is capturable, and ships no overlay injection point | Accepted |
+| [ADR-010](adr/ADR-010-plugin-asset-overlays.md) | Plugins may overlay Roblox's assets, non-destructively | Accepted |
+| [ADR-011](adr/ADR-011-wayland-and-libadwaita.md) | Wayland is the display backend, and the window is libadwaita | Superseded in part by ADR-024 (restores X11); the rest stands |
+| [ADR-012](adr/ADR-012-profiles-and-instances.md) | A profile is storage; an instance is a window | Accepted |
+| [ADR-013](adr/ADR-013-per-profile-configuration.md) | Configuration belongs to the profile; code belongs to the machine | Accepted |
+| [ADR-014](adr/ADR-014-plugin-registry-and-unpacking.md) | Plugins are published through a signed static index, and unpacked as hostile | Accepted |
+| [ADR-015](adr/ADR-015-fetching-the-roblox-build.md) | Cordial may fetch the Roblox build, and may never ship one | Accepted |
+| [ADR-016](adr/ADR-016-per-profile-network-egress.md) | A profile can refuse to run without a VPN, checked by a command it names | Accepted, amended 2026-09-08 |
+| [ADR-017](adr/ADR-017-sober-issue-corpus.md) | A local, incremental corpus of Sober's issue tracker | Accepted |
+| [ADR-018](adr/ADR-018-plugin-sub-sandboxing.md) | Plugins get an OS sandbox under Deno, and it does not replace the broker | Accepted |
+| [ADR-019](adr/ADR-019-development-control-surface.md) | A development control surface, in coordinates and pixels | Accepted |
+| [ADR-020](adr/ADR-020-declarative-plugin-preferences.md) | A plugin declares its preferences; Cordial draws them | Proposed |
+| [ADR-021](adr/ADR-021-everything-is-a-plugin.md) | Everything is a plugin; code is a property, not a category | Proposed |
+| [ADR-022](adr/ADR-022-plugins-observe-decide-act.md) | A plugin observes, decides and acts; that is what justifies a runtime | Proposed |
+| [ADR-023](adr/ADR-023-host-audio-backends.md) | PipeWire is the primary audio backend, and the others go behind a seam | Accepted |
+| [ADR-024](adr/ADR-024-x11-is-supported-again.md) | X11 is supported again, and it gets the editor | Accepted |
+| [ADR-025](adr/ADR-025-fetching-from-a-third-party-mirror.md) | Cordial may fetch the build from a third-party mirror, if it can prove Roblox signed it | Accepted |
+| [ADR-026](adr/ADR-026-the-core-event-bus.md) | Cordial publishes what it observes, and plugins may never veto it | Accepted |
+| [ADR-027](adr/ADR-027-plugin-overlays.md) | Plugins describe an overlay; Cordial draws it | Proposed |
+| [ADR-028](adr/ADR-028-x11-input-comes-from-xinput2.md) | X11 input comes from XInput2, with the warp as the fallback | Accepted |
+| [ADR-029](adr/ADR-029-overlays-are-three-decisions.md) | An overlay is three decisions, and every overlay makes all three | Accepted |
+| [ADR-030](adr/ADR-030-reports-arrive-from-discord.md) | Reports arrive from Discord, as forms rather than as messages | Accepted |
+| [ADR-031](adr/ADR-031-the-launcher-outlives-its-window.md) | The launcher outlives its window, and the client is a child process | Accepted |
+| [ADR-032](adr/ADR-032-appimage-build-base-moves-to-ubuntu-24-04.md) | The AppImage's build base moves to Ubuntu 24.04, and the version floor that blocked it was wrong | Accepted |
+| [ADR-033](adr/ADR-033-roblox-versions-are-a-keyed-store.md) | Roblox builds live in a keyed store, and a profile names one | Accepted, partly implemented (see the end) |
+| [ADR-034](adr/ADR-034-symbol-resolution-asks-the-library.md) | Symbol resolution asks the library, not a checked-in list | Accepted, 2026-09-13 |
+| [ADR-035](adr/ADR-035-browser-account-routing.md) | Match browser joins to saved accounts | Accepted, 2026-09-15 |
+| [ADR-036](adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md) | The unsafe/safe boundary is a lint, not a convention | Accepted, 2026-09-16 |
+| [ADR-037](adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md) | The build store's three writers share one lock, and an entry now proves its own bytes | Accepted, implemented |
+| [ADR-038](adr/ADR-038-plugin-hot-swap.md) | A running client reconciles its plugin set; nothing pushes to it | Accepted |
+| [ADR-039](adr/ADR-039-a-runtime-backend-seam-and-why-macos-waits.md) | A runtime-backend seam is cheap to describe and not worth building yet | Accepted, no code changes |
+| [ADR-040](adr/ADR-040-the-engine-already-runs-mimalloc.md) | The engine already runs mimalloc, so there is no allocator to switch | Accepted |
+| [ADR-041](adr/ADR-041-vkbasalt-post-processing.md) | vkBasalt post-processing is a driver-stack layer, not in-process hooking | Accepted |
+| [ADR-042](adr/ADR-042-texture-format-query-observability.md) | Vulkan texture-format queries are counted and, test-only, maskable — nothing is translated | Accepted |
 
 ## A whole class of bug: hooks that register and never bind
 

@@ -46,11 +46,12 @@
 | `gamepad` | live | the pump polls it each tick; switching off sends a disconnect for every announced pad |
 | `gamemode` | live | registration with gamemoded is per pid; the client registers or withdraws on the spot |
 | `graphics`, `graphics_optimization_mode` | next launch | settled before engine initialisation |
-| `present_mode` | next launch | read at swapchain creation |
+| `present_mode` | next launch | a swapchain field; only the engine rebuilds swapchains, see below |
 | `mangohud`, `vkbasalt` | next launch | Vulkan layers load at instance creation |
 | `audio_output` | live | the playing streams are re-linked to the new sink in place; see below |
 | `title_bar` | live | revealed, hidden or restyled on the game window in place |
-| `roblox`, `profile`, `unpacked_plugins`, `fullscreen_accel` | next launch | built or chosen at launch |
+| `roblox`, `profile`, `fullscreen_accel` | next launch | built or chosen at launch |
+| `unpacked_plugins` | next launch | the reconciler never sees unpacked plugins, by design (ADR-038) |
 | `appearance`, `automatic_updates`, `download_on`, `marketplace_*`, `multi_instance_warning_seen` | shell | read by the shell itself |
 
 ## Audio output
@@ -148,6 +149,45 @@ Verified against real GTK in a nested headless sway on its own display
 on the default bar at 46 px, Hidden gave 0 and no reveal, Compact 40, and
 Default again 46, so the compact sheet was removed and not just outvoted. The
 existing Hidden-at-launch fixture still passes.
+
+## What stays next launch, re-checked against the code
+
+`mangohud` and `vkbasalt` are environment variables on the client (`MANGOHUD=1`,
+`ENABLE_VKBASALT=1`, set in `launch.rs`) that the Vulkan loader reads when the
+engine creates its instance. `graphics` decides whether Cordial offers a Vulkan
+loader at all, before the engine's first `dlopen`; `graphics_optimization_mode`
+is the device profile and core count `native/init_params.cpp` hands the engine
+during initialisation; `roblox`, `profile` and `fullscreen_accel` choose what is
+started. None of those can be re-read by something already running.
+
+**`present_mode` was expected to be live by making Cordial rebuild the swapchain
+the way it does on a resize, and Cordial does not do that.** Cordial only
+substitutes the mode in `vkCreateSwapchainKHR` (`vk_create_swapchain_inner`) and
+debounces the extent it reports (`settle_resize_extent`). The *engine* rebuilds
+its swapchain, and it does so when the `currentExtent` it reads from
+`vkGetPhysicalDeviceSurfaceCapabilitiesKHR` changes (how a fullscreen toggle has
+been seen to cause one; that it is the only trigger is INFERRED);
+`vkAcquireNextImageKHR` is
+not interposed and the present path forwards `VK_SUBOPTIMAL_KHR` and
+`VK_ERROR_OUT_OF_DATE_KHR` untouched. So there is no lever for "rebuild at the
+same size". The two ways to make one are both worse than saying "next launch":
+report a wrong extent for a poll (a swapchain at the wrong size, then another),
+or return `VK_ERROR_OUT_OF_DATE_KHR` from a present and hope the engine treats
+it as it should. Neither was tried, because the client was not run for this
+change, and swapchain rebuilds are the path Sober #2180 and issues #35 and #39
+report crashing on some drivers. Making the *next* rebuild use the new mode (an
+atomic in place of the `OnceLock`) would apply at the next resize or experience
+entry, which is what the code comment on `present_mode_choice` already argued
+is worse than a plain "next launch". A route that changes the mode without a
+rebuild exists on paper, `VK_EXT_swapchain_maintenance1`'s per-present mode,
+but the engine does not enable it and it was not investigated (INFERRED).
+
+`unpacked_plugins` was not done. ADR-038 excludes unpacked plugins from the
+reconciler on purpose, so that Deno's own `--watch` and the reconciler are never
+two supervisors of one process; taking a changed folder list live means a
+second start and stop path beside `start_all`, in the code that decides what a
+plugin may do, with nothing here to run it against. That is a change to
+ADR-038, not a setting.
 
 ## Consequences
 

@@ -76,6 +76,7 @@ All 47. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDO
 | [ADR-046](adr/ADR-046-nvidia-is-gated-on-the-vendor-id.md) | NVIDIA behaviour is gated on the device's vendor id, advisory unless the evidence is strong, and says what is inferred |
 | [ADR-047](adr/ADR-047-the-canvas-is-lowered-only-under-a-presented-frame.md) | The canvas is lowered under GTK only once GTK has presented a frame, so a stalled GTK never leaves a grey screen |
 | [ADR-048](adr/ADR-048-labels-and-edits-from-discord.md) | Labels and edits from Discord are allowlisted, attributed and logged before they happen |
+| [ADR-050](adr/ADR-050-other-runtimes-are-launched-not-built.md) | Other runtimes (Mac O' Blox) are detected and launched, never built into Cordial; parked until after 1.0 |
 
 ## Design notes
 

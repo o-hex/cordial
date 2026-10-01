@@ -99,7 +99,10 @@ not signed by Roblox's own certificate. If [Sober](https://sober.vinegarhq.org/)
 is installed, Cordial uses the APK already on disk without copying or modifying
 it. You can also point Cordial at your own APK in Settings.
 
-**Flatpak:**
+**Flatpak (recommended):** it runs on the same GNOME 50 runtime everywhere, with
+the GTK, WebKit, Vulkan loader and audio libraries Cordial is built and tested
+against. Most compatibility problems reported with the other packages, from a
+distribution's own versions of those libraries, do not happen in it.
 
 ```bash
 flatpak remote-add --if-not-exists cordial https://luohoa97.github.io/cordial/cordial.flatpakrepo

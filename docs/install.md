@@ -40,9 +40,12 @@ build dependencies are under [Building from source](#building-from-source) below
 Building from source is for people changing Cordial, not for people running
 it — see below.
 
-**Flatpak is the one to pick if you have no reason to prefer the other.** It is
-sandboxed, it updates in place, and the manifest is the reference every other
-package here is built to match.
+**Flatpak is the recommended install.** It is sandboxed, it updates in place,
+and the manifest is the reference every other package here is built to match.
+It also runs on one fixed runtime (GNOME 50), so the GTK, WebKit, Vulkan loader
+and audio libraries are the ones Cordial is tested against rather than whatever
+version a distribution ships. Most compatibility problems reported with the
+other packages come from those differences.
 
 ```bash
 flatpak remote-add --if-not-exists cordial \

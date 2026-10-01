@@ -78,6 +78,20 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.23.1" date="2026-10-01">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.23.1</url>
+      <description>
+        <p>
+          FastFlags such as the frame rate target no longer reset while you
+          play, and Settings has a frame rate limit that applies in game.
+        </p>
+        <p>
+          The text editor appears without working Vulkan, pointer lock works on
+          KDE Plasma, missing textures on GPUs without ETC2 are decoded, and
+          fullscreen no longer crashes on AMD's RADV driver.
+        </p>
+      </description>
+    </release>
     <release version="0.23.0" date="2026-10-01">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.23.0</url>
       <description>

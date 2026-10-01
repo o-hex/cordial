@@ -995,6 +995,13 @@ pub enum DeviceProfile {
     /// Worth knowing before choosing it: roblox.com reads this one as
     /// `data-app-type="uwp"` — a Microsoft Store app, which Cordial is not.
     PcWindows11,
+    /// The Quest build behind an OpenXR session: platform name `MetaOS`, no
+    /// keyboard or mouse, the bare app token for a User-Agent. **The default
+    /// under `cordial-run --guest-arm64`**, which sets
+    /// [`DEVICE_PROFILE_ENV`] to it unless it is already set; under the PC
+    /// identity the engine was told it ran on Windows beside `isVrDevice`,
+    /// and games asking `UserInputService.VREnabled` got false.
+    MetaQuest,
 }
 
 impl DeviceProfile {
@@ -1005,6 +1012,7 @@ impl DeviceProfile {
             }
             "roblox-app" | "app" | "roblox" => Some(DeviceProfile::RobloxApp),
             "android" | "android-tablet" | "tablet" => Some(DeviceProfile::AndroidTablet),
+            "meta-quest" | "quest" | "metaos" => Some(DeviceProfile::MetaQuest),
             _ => None,
         }
     }
@@ -1014,6 +1022,7 @@ impl DeviceProfile {
             DeviceProfile::RobloxApp => "roblox-app",
             DeviceProfile::AndroidTablet => "android-tablet",
             DeviceProfile::PcWindows11 => "pc-windows-11",
+            DeviceProfile::MetaQuest => "meta-quest",
         }
     }
 }
@@ -1073,7 +1082,7 @@ pub fn device_profile() -> DeviceProfile {
                     println!(
                         "  flags: {DEVICE_PROFILE_ENV}={text:?} is not a device profile; \
                          using pc-windows-11. Known: roblox-app, android-tablet, \
-                         pc-windows-11"
+                         pc-windows-11, meta-quest"
                     );
                     return DeviceProfile::PcWindows11;
                 }
@@ -1256,6 +1265,8 @@ pub(crate) mod tests {
         assert_eq!(DeviceProfile::parse("windows"), Some(DeviceProfile::PcWindows11));
         assert_eq!(DeviceProfile::parse("roblox-app"), Some(DeviceProfile::RobloxApp));
         assert_eq!(DeviceProfile::parse(" Roblox "), Some(DeviceProfile::RobloxApp));
+        assert_eq!(DeviceProfile::parse("meta-quest"), Some(DeviceProfile::MetaQuest));
+        assert_eq!(DeviceProfile::MetaQuest.label(), "meta-quest");
         assert_eq!(DeviceProfile::parse("ps5"), None);
     }
 

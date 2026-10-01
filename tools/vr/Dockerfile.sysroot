@@ -1,0 +1,26 @@
+# The Ubuntu 24.04 filesystem tools/vr/build-aarch64.sh compiles against,
+# built with `docker build --platform linux/arm64` (under qemu-user) or
+# `linux/amd64`, then `docker export`ed as a sysroot. It is never itself a
+# build environment, so it carries headers and libraries only -- the
+# compilers are the host's. 24.04 because the AppImage base is 24.04
+# (ADR-032), and the package list is release.yml's AppImage job minus its
+# packaging tools and compilers.
+FROM ubuntu:24.04
+RUN export DEBIAN_FRONTEND=noninteractive \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libc6-dev libstdc++-13-dev libgcc-13-dev zlib1g-dev \
+      libssl-dev \
+      libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev \
+      libpipewire-0.3-dev libpulse-dev libasound2-dev \
+      libwayland-dev libvulkan-dev libxkbcommon-dev libglib2.0-dev \
+      mesa-vulkan-drivers \
+ && rm -rf /var/lib/apt/lists/*
+# Boost's headers are for dynarmic (crates/cordial-guest), which includes
+# boost::icl and boost::variant and find_package()s Boost rather than
+# bundling it. A layer of its own so that adding it did not invalidate the
+# one above, whose apt run under qemu-user is the slow step for arm64.
+RUN export DEBIAN_FRONTEND=noninteractive \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends libboost-dev \
+ && rm -rf /var/lib/apt/lists/*

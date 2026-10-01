@@ -301,6 +301,21 @@ fn handle(line: &str) -> String {
             None => "err natives <java/class/Name>".into(),
         },
         "loopers" => loopers_line(),
+        // `leavegame` -- what Android's Java calls when the player leaves a
+        // game, so leaving can be tested without a hand on the Leave button.
+        "leavegame" => match crate::game_launch::request_leave() {
+            Ok(()) => "ok leavegame queued for the looper".into(),
+            Err(e) => format!("err leavegame: {e}"),
+        },
+        // `joinplace <placeId>` -- the deep link `--join-url` publishes, but
+        // into a running client, so a join after a leave can be tested.
+        "joinplace" => match it.next().and_then(|v| v.parse::<u64>().ok()) {
+            Some(place) => match crate::game_launch::request_join(place) {
+                Ok(()) => "ok joinplace queued for the looper".into(),
+                Err(e) => format!("err joinplace: {e}"),
+            },
+            None => "err joinplace <placeId>".into(),
+        },
         "move" => match (num(it.next()), num(it.next())) {
             (Some(x), Some(y)) => {
                 push(Cmd::Move { x, y });
@@ -441,11 +456,23 @@ fn info_line() -> String {
         crate::android::glcount::QUEUE_PRESENT.load(Ordering::Relaxed);
     let (w, h) = crate::android::vulkan::last_extent();
     format!(
-        "ok presents={presents}{} accepted={} extent={w}x{h} pid={}",
+        "ok presents={presents}{}{} accepted={} extent={w}x{h} pid={}",
         crate::android::frame_pacing::summary().map(|s| format!(" {s}")).unwrap_or_default(),
+        xr_info(),
         ACCEPTED.load(Ordering::Relaxed),
         std::process::id(),
     )
+}
+
+/// The guest engine's OpenXR frames, when it has any: an XR engine never
+/// calls `vkQueuePresentKHR`, so `presents` stays 0 and `xr_frames` counts
+/// `xrEndFrame` instead (`guest_xr`).
+fn xr_info() -> String {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(s) = crate::guest_xr::info() {
+        return format!(" {s}");
+    }
+    String::new()
 }
 
 /// What the focused field currently contains, so a test can assert on it.
@@ -578,9 +605,11 @@ fn now_ms() -> i64 {
 
 /// Apply everything queued. Called from the pump, once per tick.
 ///
-/// The handle is the pump's own `game_activity_handle`; the wheel path is the
-/// only one that needs it, because it goes through AGDK's motion queue rather
-/// than through a bare native the way the others do.
+/// The handle is the pump's own `game_activity_handle`, or 0 under
+/// `--app-bridge`, which has none. Every verb drives the plain
+/// `NativeInputInterface`/`NativeGLInterface` natives, which take no handle,
+/// and the AGDK queue beside them where there is one; with 0 the AGDK calls
+/// refuse ("no native handle") and the plain ones still run.
 pub fn apply_queued(handle: i64) {
     for cmd in drain() {
         match cmd {

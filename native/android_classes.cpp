@@ -28,6 +28,10 @@
 #include <vector>
 #include <memory>
 
+/// Set when the engine reports `gameDidLeave`; taken by `game_launch::tick`.
+static std::atomic<bool> g_game_left{false};
+extern "C" int cordial_take_game_left() { return g_game_left.exchange(false, std::memory_order_acq_rel) ? 1 : 0; }
+
 // ------------------------------------------------------- focused text box
 //
 // Which text box the engine currently has focus in, learned from
@@ -866,6 +870,10 @@ public:
         // is no such core event, and nothing subscribes. This is still the right
         // place for both, which is why the note stays.
         fprintf(stderr, "[roblox] gameDidLeave\n");
+        // On Android this reaches `ExperienceSession`, whose ending gives the
+        // app half its surface back. Under --app-bridge `game_launch::tick`
+        // plays that part, from the looper, when it sees this flag.
+        g_game_left.store(true, std::memory_order_release);
     }
     static void onAppShellReloadNeeded(ENV*, Class*) {}
 

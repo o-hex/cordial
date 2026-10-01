@@ -39,12 +39,14 @@ struct Options {
     gl_probe: bool,
     window_seconds: Option<u64>,
     game_activity: bool,
+    app_bridge: bool,
     join_url: Option<cordial_runtime::deeplink::JoinUrl>,
     run_seconds: u64,
     host_libc: bool,
     jni_onload: bool,
     dump_classes: Option<String>,
     verbose: bool,
+    guest_arm64: bool,
 }
 
 const USAGE: &str = "\
@@ -78,6 +80,11 @@ usage: cordial-load --lib-dir <dir> [options]
   --host-libc       also resolve libc from the host (ABI-unsafe; diagnostic only)
   --jni-onload      stand up a JavaVM and call JNI_OnLoad
   --game-activity   implies --jni-onload; bring Roblox up and hand it a surface
+  --app-bridge      implies --game-activity, for a build with no GameActivity
+                    (the Quest build exports no initializeNativeCode). Runs the
+                    same bring-up with Cordial delivering the settings itself,
+                    as ActivityNativeMain's Java does, and the surface through
+                    the app bridge alone
   --join-url <url>  a roblox-player:// or roblox:// link from a browser click,
                     handed to the engine during bring-up. Rejected unless it is
                     one of those two schemes, printable ASCII, and under 2 kB.
@@ -91,6 +98,14 @@ usage: cordial-load --lib-dir <dir> [options]
                     and scripted runs, not the way a session is meant to end
   --dump-classes <f>  implies --jni-onload; write the Java classes Roblox asked
                     for to <f> — the observed Phase 2 backlog
+  --guest-arm64     link an arm64 libroblox.so (the Quest build) for the
+                    dynarmic translator instead of loading an x86-64 one.
+                    Runs its constructors under the translator, and with
+                    --jni-onload its JNI_OnLoad (docs/vr/dynarmic-design.md,
+                    M3), or with --app-bridge the whole bring-up (M4).
+                    CORDIAL_GUEST_OMIT=<a,b> leaves those imports
+                    unanswered; CORDIAL_GUEST_HWCAP_ATOMICS=1 advertises LSE,
+                    which the translator lacks (the M3 control)
   -v, --verbose     list every symbol and how it resolved
 
 env:
@@ -101,6 +116,24 @@ env:
                                      functions with fixed-arity ones, which is
                                      not ABI-safe — it changes behaviour)
   CORDIAL_ANDROID_TRACE=1            log Android API calls (safe; no variadics)
+  CORDIAL_TIME_CTORS=1               time the constructors apart from linking
+                                     (needs patches/0003)
+  CORDIAL_GUEST_MONITOR=global       --guest-arm64: dynarmic's exact exclusive
+                                     monitor instead of inline CAS (the default)
+  CORDIAL_GUEST_PROFILE=1            --guest-arm64: report host-side time of
+                                     guest-to-host calls
+  CORDIAL_GUEST_CODE_CACHE_MIB=<n>   --guest-arm64: each Jit's code cache
+  CORDIAL_GUEST_TLS_KEYS=host        --guest-arm64: pthread keys as host glibc
+                                     keys behind stubs (a control; the default
+                                     is bionic's key map read by guest code)
+  CORDIAL_GUEST_UNSAFE_FP=nan,recip,fma
+                                     --guest-arm64: dynarmic's inexact FP
+                                     optimisations (off; measured no gain)
+  CORDIAL_GUEST_THREADS=0            --guest-arm64: pthread_create fails with
+                                     EAGAIN (a control)
+  CORDIAL_GUEST_TRACE_THREADS=1      --guest-arm64: a line per guest thread
+  CORDIAL_GUEST_TRACE_SVC=1          --guest-arm64 --jni-onload: every stub
+                                     call from JNI_OnLoad on
   CORDIAL_MONITOR=<n>                open the window on the nth monitor (0 is
                                      the first), instead of the primary one
   CORDIAL_WINDOW_POS=<x>,<y>         explicit window position; wins over
@@ -219,12 +252,14 @@ fn parse() -> Result<Options, String> {
         gl_probe: false,
         window_seconds: None,
         game_activity: false,
+        app_bridge: false,
         join_url: None,
         run_seconds: 15,
         host_libc: false,
         jni_onload: false,
         dump_classes: None,
         verbose: false,
+        guest_arm64: false,
     };
     // Before anything can latch a profile. ADR-012's move used to be driven only
     // from the shell's `main`, so a client started any other way — `just client`,
@@ -296,6 +331,11 @@ fn parse() -> Result<Options, String> {
                 opt.jni_onload = true;
                 opt.game_activity = true;
             }
+            "--app-bridge" => {
+                opt.jni_onload = true;
+                opt.game_activity = true;
+                opt.app_bridge = true;
+            }
             // The URL a browser click produced, forwarded by the shell. It is
             // validated here, at the edge, rather than anywhere further in:
             // this is the process boundary the value crosses, and a bad one
@@ -314,6 +354,7 @@ fn parse() -> Result<Options, String> {
                 opt.jni_onload = true;
                 opt.dump_classes = Some(args.next().ok_or("--dump-classes needs a path")?);
             }
+            "--guest-arm64" => opt.guest_arm64 = true,
             "-v" | "--verbose" => opt.verbose = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unrecognised argument: {other}")),
@@ -322,7 +363,51 @@ fn parse() -> Result<Options, String> {
     if opt.lib_dir.is_empty() {
         return Err("--lib-dir is required".into());
     }
+    if opt.guest_arm64 {
+        // The Quest build keeps its engine storage apart from the phone
+        // build's within the same profile, and shares the sign-in (ADR-053).
+        cordial_runtime::profile::set_build(cordial_runtime::profile::Build::Quest);
+        // The Quest build is a VR device's engine and runs here only behind
+        // an OpenXR session; `InitParams.isVrDevice` says so (init_params.cpp).
+        if std::env::var_os("CORDIAL_VR_DEVICE").is_none() {
+            std::env::set_var("CORDIAL_VR_DEVICE", "1");
+        }
+        // And presented as one: the PC identity's "Windows" platform name
+        // beside `isVrDevice` left games' `UserInputService.VREnabled` false.
+        // `CORDIAL_DEVICE_PROFILE=pc-windows-11` is the control.
+        if std::env::var_os(cordial_runtime::flags::DEVICE_PROFILE_ENV).is_none() {
+            std::env::set_var(cordial_runtime::flags::DEVICE_PROFILE_ENV, "meta-quest");
+        }
+        if !cfg!(target_arch = "x86_64") {
+            return Err("--guest-arm64 needs the x86-64 build: dynarmic has no arm64 host backend".into());
+        }
+        // Refused rather than ignored: the translator runs the constructors
+        // and JNI_OnLoad (M3), and nothing after them yet. A window or the
+        // GL probe would call engine natives the guest path cannot reach.
+        if opt.gl_probe || opt.window_seconds.is_some() || (opt.game_activity && !opt.app_bridge) {
+            return Err("--guest-arm64 runs the constructors and JNI_OnLoad, or with --app-bridge the \
+                        bring-up after them; GameActivity and the GL probes are not translated"
+                .into());
+        }
+    }
     Ok(opt)
+}
+
+/// Where the APK's assets are unpacked, under the cache root.
+fn assets_root() -> std::path::PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        // The Quest build's assets apart from the phone build's. One directory
+        // re-extracted whenever the APK changed would ping-pong between the two
+        // on every switch, leave each build's extra files in the other's tree
+        // (the Quest APK carries `shaders_vulkan_mobile_vr.pack`), and rewrite
+        // files under a client of the other build still reading them.
+        .join(match cordial_runtime::profile::build() {
+            cordial_runtime::profile::Build::Phone => "cordial/assets",
+            cordial_runtime::profile::Build::Quest => "cordial/assets-arm64-v8a",
+        })
 }
 
 /// The directory the engine should treat as its asset folder.
@@ -360,11 +445,7 @@ fn parse() -> Result<Options, String> {
 /// and asset paths still work without it.
 fn asset_folder(apk: &Option<String>) -> String {
     let Some(apk) = apk else { return String::new() };
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("cordial/assets");
+    let base = assets_root();
     match cordial_runtime::android::asset::extract_to(&base) {
         Ok(dir) => {
             // The overlay resolver needs the *extraction root*, not the
@@ -428,7 +509,7 @@ fn enter_run_dir(opt: &mut Options) {
     // set four hot-path values and lives in a private directory (ADR-044).
     cordial_runtime::live_settings::start();
 
-    let root = cordial_runtime::profile::active().join("run");
+    let root = cordial_runtime::profile::engine_root().join("run");
     if let Err(e) = std::fs::create_dir_all(root.join("exe")) {
         println!("  could not create {}: {e}", root.display());
         return;
@@ -436,11 +517,7 @@ fn enter_run_dir(opt: &mut Options) {
 
     // The trust store, from the APK's own copy. Linked rather than copied so a
     // re-extracted bundle is picked up without a stale duplicate.
-    let ca = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("cordial/assets/ssl/cacert.pem");
+    let ca = assets_root().join("ssl/cacert.pem");
     let link_ca = |dest: std::path::PathBuf| {
         if !ca.exists() {
             return;
@@ -465,9 +542,7 @@ fn enter_run_dir(opt: &mut Options) {
     // `CORDIAL_EARLY_DIRS=files` produces exactly that, and the control in the
     // same session does not. One symlink removes the dependency on which root
     // wins the race.
-    let files_root = std::env::var("CORDIAL_FILES_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| cordial_runtime::profile::active().join("data"));
+    let files_root = cordial_runtime::profile::engine_data();
     link_ca(files_root.join("files/exe/cacert.pem"));
 
     if let Err(e) = std::env::set_current_dir(&root) {
@@ -1785,6 +1860,15 @@ fn main() -> ExitCode {
             println!("  overlay: watching for changes (CORDIAL_OVERLAY_WATCH)");
         }
     }
+    // Held the profile's lock since `claim_profile` above, and nothing has
+    // opened engine storage yet: the one moment a move of it is safe.
+    if cordial_runtime::profile::build() == cordial_runtime::profile::Build::Quest {
+        match cordial_shell::profile::migrate_quest_storage(&cordial_runtime::profile::active()) {
+            Ok(true) => println!("profiles: moved this profile's earlier Quest storage into quest/ (ADR-053)"),
+            Ok(false) => {}
+            Err(e) => println!("profiles: could not move earlier Quest storage into quest/ ({e}); starting fresh beside it"),
+        }
+    }
     enter_run_dir(&mut opt);
 
     // Answers "which of my mod's files can never apply" without starting the
@@ -1878,6 +1962,26 @@ fn main() -> ExitCode {
     // of this log should see the choice before its consequence.
     cordial_runtime::bionic::announce_audio_backend();
 
+    // `--guest-arm64` links the Quest build for the translator and runs its
+    // constructors (M2, M3). With `--app-bridge` the bring-up below then
+    // carries on with that library exactly as it would with a native one,
+    // its `Java_*` exports reaching the guest through host entries (M4).
+    #[cfg(target_arch = "x86_64")]
+    let guest_lib = if opt.guest_arm64 {
+        match guest_arm64_link(&opt) {
+            Ok(lib) => Some(lib),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let guest_lib: Option<linker::Library> = None;
+
+    let (lib, defer_ctors, android_libpath, time_ctors, elapsed) = 'link: {
+    if let Some(lib) = guest_lib {
+        break 'link (lib, false, false, false, std::time::Duration::ZERO);
+    }
     // Ask the engine what it imports rather than trusting the checked-in list.
     // `docs/analysis/undefined-symbols.tsv` still generates the stubs, but it is
     // no longer the gate: a Roblox update that adds an ordinary libc import used
@@ -1894,7 +1998,23 @@ fn main() -> ExitCode {
         opt.lib_dir
     );
 
-    let table = symtab::build(opt.host_libc, &imports);
+    let mut table = symtab::build(opt.host_libc, &imports);
+
+    // An import another library in the same directory exports is the linker's
+    // to resolve against that library, and is not a gap. The Quest build's 73
+    // `xr*` and `ovr_*` imports are all of that kind, and counting them buried
+    // the three that were real. See `elf::defined_symbols_in_dir`.
+    let siblings = cordial_runtime::elf::defined_symbols_in_dir(std::path::Path::new(&opt.lib_dir));
+    let before = table.unprovidable.len();
+    table.unprovidable.retain(|u| !siblings.contains(&u.symbol));
+    let answered_by_siblings = before - table.unprovidable.len();
+    if answered_by_siblings > 0 {
+        println!(
+            "  {answered_by_siblings} more imports are exported by other libraries in {}, \
+             which the linker searches",
+            opt.lib_dir
+        );
+    }
     let totals = table.totals();
 
     println!(
@@ -1918,9 +2038,17 @@ fn main() -> ExitCode {
     // Both of these are empty on a build whose imports the checked-in list
     // already covers, so anything printed here is news.
     for (symbol, library) in &table.beyond_stub_table {
+        // Cordial's own implementations reach this list too when the TSV
+        // predates them, and "from the host" would then misname the answer.
+        let by_cordial = table.libraries.get(library).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.symbol == symbol.as_str() && e.source == symtab::Source::Cordial)
+        });
+        let whence = if by_cordial { "implemented by Cordial" } else { "resolved from the host" };
         println!(
             "  note: {symbol} is not in docs/analysis/undefined-symbols.tsv; \
-             resolved from the host under {library}"
+             {whence} under {library}"
         );
     }
     if !table.unprovidable.is_empty() {
@@ -2042,7 +2170,17 @@ fn main() -> ExitCode {
     // it. Also needs constructors deferred, for the same reason as above: the
     // override has to be in place before whatever reads it runs.
     let android_libpath = std::env::var_os("CORDIAL_ANDROID_LIBPATH").is_some();
-    if defer_ctors || android_libpath {
+    // `CORDIAL_TIME_CTORS=1`: the same deferral, used only to put a clock
+    // around the constructors on their own, since `dlopen` otherwise times
+    // linking and construction as one. It is the native half of the M3
+    // comparison in docs/vr/dynarmic-design.md §9.2 (the translator's half
+    // is `--guest-arm64`'s own timing line), and needs patches/0003.
+    let time_ctors = std::env::var_os("CORDIAL_TIME_CTORS").is_some() && !defer_ctors && !android_libpath;
+    if time_ctors && !linker::defer_available() {
+        eprintln!("CORDIAL_TIME_CTORS needs patches/0003, which this loader was built without");
+        return ExitCode::FAILURE;
+    }
+    if defer_ctors || android_libpath || time_ctors {
         linker::defer_next_ctors(true);
     }
 
@@ -2058,9 +2196,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    (lib, defer_ctors, android_libpath, time_ctors, elapsed)
+    };
 
     let (code_base, code_size) = lib.code_region();
     println!("\nLOADED in {:.0?}", elapsed);
+    let ctors_started = Instant::now();
+    if time_ctors {
+        linker::run_deferred_ctors(lib);
+        println!("TIMING constructors: {:.3?}", ctors_started.elapsed());
+    }
 
     // **Here, and only here.** A build in the keyed store records which Cordial
     // last got it as far as a successful `dlopen`, because Cordial's own shim
@@ -2119,8 +2264,7 @@ fn main() -> ExitCode {
         };
         println!("cordial-agent-defer: JavaVM at {vm:p} (Cordial's own jnivm; libroblox.so's constructors have not run)");
 
-        let root = std::env::var("CORDIAL_FILES_DIR")
-            .unwrap_or_else(|_| format!("{}/data", cordial_runtime::profile::active().display()));
+        let root = cordial_runtime::profile::engine_data().display().to_string();
         let files = format!("{root}/files");
         let cache = format!("{root}/cache");
         let external = format!("{root}/external");
@@ -2255,11 +2399,19 @@ fn main() -> ExitCode {
             };
             println!("\nJavaVM at {vm:p}; calling JNI_OnLoad");
 
+            let onload_started = Instant::now();
             // SAFETY: `p` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
             match unsafe { linker::jni::call_on_load(p) } {
                 // JNI versions are 0x000M_000m; 0x00010006 is JNI_VERSION_1_6.
                 Ok(rc) => {
                     println!("JNI_OnLoad returned {rc:#x} = JNI {}.{}", rc >> 16, rc & 0xffff);
+                    if time_ctors {
+                        println!(
+                            "TIMING first constructor to JNI_OnLoad returning: {:.3?} (JNI_OnLoad {:.3?})",
+                            ctors_started.elapsed(),
+                            onload_started.elapsed()
+                        );
+                    }
                 }
                 Err(e) => {
                     println!("JNI_OnLoad failed: {e}");
@@ -2369,10 +2521,16 @@ fn main() -> ExitCode {
                     }
                 }
 
-                match native {
-                    None if !skip_agdk => eprintln!("  initializeNativeCode is not exported"),
-                    None => {}
-                    Some(f) => {
+                // `--app-bridge` enters the same bring-up with no
+                // `initializeNativeCode` at all, because the Quest build exports
+                // none: its launcher is ActivitySplash -> ActivityNativeMain, the
+                // same chain Roblox's own phone build takes on Android (see
+                // `cordial_game_activity_start`'s comment), and no GameActivity
+                // native exists in that libroblox.so to register.
+                match (native, opt.app_bridge) {
+                    (None, false) if !skip_agdk => eprintln!("  initializeNativeCode is not exported"),
+                    (None, false) => {}
+                    (f, _) => {
                         // `initStorageManagerNativeV3` takes *two different*
                         // directories. The Waydroid capture shows the real
                         // client using `<app>/files` and `<app>/cache`, with the
@@ -2388,9 +2546,7 @@ fn main() -> ExitCode {
                         // while everything else in the process had moved to
                         // `profiles/<name>`, so the engine's own storage ended up
                         // in a directory nothing else looked at.
-                        let root = std::env::var("CORDIAL_FILES_DIR").unwrap_or_else(|_| {
-                            format!("{}/data", cordial_runtime::profile::active().display())
-                        });
+                        let root = cordial_runtime::profile::engine_data().display().to_string();
                         let files = format!("{root}/files");
                         // Kept separately because `files` is moved into a
                         // closure further down, and the disk report needs the
@@ -2735,9 +2891,29 @@ fn main() -> ExitCode {
                         println!("  uiMode: night={}", if dark { "yes" } else { "no" });
                         linker::game_activity::set_ui_mode_night(if dark { 1 } else { 0 });
 
-                        println!("\ncalling GameActivity.initializeNativeCode");
-                        // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-                        match unsafe { linker::game_activity::initialize(f, &files, &files, &files) } {
+                        // Without GameActivity nothing calls `bootstrapTheApp`
+                        // back, so the settings are delivered here, on this
+                        // thread, where `initializeNativeCode` would have
+                        // triggered them. That is ActivityNativeMain's order in
+                        // the Waydroid capture too: `nativeInitClientSettings`
+                        // and the flags arrive from Java before
+                        // `nativeAppBridgeAppStart`. The handle is 0, which every
+                        // AGDK call below either refuses or is skipped for.
+                        let initialized = match f {
+                            Some(f) if !opt.app_bridge => {
+                                println!("\ncalling GameActivity.initializeNativeCode");
+                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                unsafe { linker::game_activity::initialize(f, &files, &files, &files) }
+                            }
+                            _ => {
+                                println!("\napp bridge: no GameActivity; delivering settings from this thread");
+                                if bootstrap_installed {
+                                    run_bootstrap();
+                                }
+                                Ok(0)
+                            }
+                        };
+                        match initialized {
                             Ok(handle) => {
                                 println!("  native handle {handle:#x}");
 
@@ -4417,6 +4593,43 @@ fn main() -> ExitCode {
                                             }
                                         }
 
+                                        // The Quest app's app-half manager starts
+                                        // the app and then hands a Runnable to a
+                                        // fresh single-thread executor whose only
+                                        // call is `initMaquettesSDK(Activity)`
+                                        // (dex call graph: `ih/e.F` invokes
+                                        // `StartAppWithParams`, then
+                                        // `Executors.newSingleThreadExecutor` and
+                                        // `execute(new ih/e$c)`; `ih/e$c.run` is
+                                        // the native's only caller). Nothing called
+                                        // it here, so the engine never started the
+                                        // Meta platform SDK and logged
+                                        // `MaquettesDataNotification: SDK not
+                                        // initialized` on every menu change. The
+                                        // SDK fails honestly behind it (guest_ovr).
+                                        // `CORDIAL_NO_MAQUETTES_INIT` is the control.
+                                        if opt.app_bridge && std::env::var_os("CORDIAL_NO_MAQUETTES_INIT").is_none() {
+                                            if let Some(f) = lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeGLInterface_initMaquettesSDK",
+                                            ) {
+                                                let addr = f as usize;
+                                                let spawned = std::thread::Builder::new()
+                                                    .name("maquettes-sdk".into())
+                                                    .spawn(move || {
+                                                        match unsafe { linker::game_activity::call_static_activity(
+                                                            addr as *mut std::ffi::c_void,
+                                                            "com/roblox/engine/jni/NativeGLInterface",
+                                                        ) } {
+                                                            Ok(()) => println!("  initMaquettesSDK returned"),
+                                                            Err(e) => println!("  initMaquettesSDK failed: {e}"),
+                                                        }
+                                                    });
+                                                if let Err(e) = spawned {
+                                                    println!("  initMaquettesSDK: no thread: {e}");
+                                                }
+                                            }
+                                        }
+
                                         // The two `UpdateSurface...WithPlatformParams` calls,
                                         // here because this is where Sober makes them — at about
                                         // 3.79s, immediately after StartApp and before any join.
@@ -4477,9 +4690,18 @@ fn main() -> ExitCode {
                                         );
 
                                         report_disk(&data_root, DiskMoment::BeforeLaunch);
-                                        match linker::game_activity::start(
-                                            handle, width, height, format,
-                                        ) {
+                                        // No AGDK lifecycle to drive without
+                                        // GameActivity: the surface has already
+                                        // gone through StartAppWithParams and
+                                        // UpdateSurfaceApp above, which is all
+                                        // ActivityNativeMain delivers on Android.
+                                        let started = if opt.app_bridge {
+                                            println!("  app bridge: no AGDK lifecycle; surface delivered through the bridge only");
+                                            Ok(())
+                                        } else {
+                                            linker::game_activity::start(handle, width, height, format)
+                                        };
+                                        match started {
                                             Ok(()) => {
                                                 println!("  surface handed to the engine");
 
@@ -4635,11 +4857,11 @@ fn main() -> ExitCode {
                                                 // registered yet, the same
                                                 // not-yet-vs-failed distinction the
                                                 // other AGDK natives use.
-                                                match linker::game_activity::set_input_connection(handle) {
+                                                if !opt.app_bridge { match linker::game_activity::set_input_connection(handle) {
                                                     Ok(Some(())) => println!("  InputConnection registered with the engine"),
                                                     Ok(None) => println!("  setInputConnectionNative not registered yet; IME state will not reach Cordial"),
                                                     Err(e) => println!("  setInputConnectionNative failed: {e}"),
-                                                }
+                                                } }
                                                 let secs = opt.run_seconds;
                                                 if secs == 0 {
                                                     println!(
@@ -4819,6 +5041,15 @@ fn main() -> ExitCode {
                                                 // Roblox can never request the
                                                 // microphone.
                                                 cordial_runtime::permissions::arm(|name| lib.symbol(name));
+                                                // Play. On Android the Java app
+                                                // answers the app shell's
+                                                // `Game.launch`; under AGDK the
+                                                // engine answers it itself, so
+                                                // only the app-bridge bring-up
+                                                // subscribes.
+                                                if opt.app_bridge {
+                                                    cordial_runtime::game_launch::arm(|name| lib.symbol(name), &apk_path, width, height);
+                                                }
                                                 install_webview_presenter();
 
                                                 // A dev-only trigger, in the same family as
@@ -4848,7 +5079,7 @@ fn main() -> ExitCode {
 
                                                 cordial_runtime::android::looper::pump(
                                                     std::time::Duration::from_secs(secs),
-                                                    Some(handle),
+                                                    (!opt.app_bridge).then_some(handle),
                                                 );
                                                 // Ungated, unlike the block below: this
                                                 // is the one line somebody debugging a
@@ -4948,11 +5179,7 @@ fn main() -> ExitCode {
     // Whether Roblox's own storage came up, which the engine's `RbxStorage::init
     // [INIT]` line would say if it were not logged before the log file exists.
     // The same `files` directory the tree above was created under.
-    cordial_runtime::storage::report(std::path::Path::new(&format!(
-        "{}/files",
-        std::env::var("CORDIAL_FILES_DIR")
-            .unwrap_or_else(|_| format!("{}/data", cordial_runtime::profile::active().display()))
-    )));
+    cordial_runtime::storage::report(&cordial_runtime::profile::engine_data().join("files"));
 
     stubs::report();
 
@@ -5527,4 +5754,444 @@ mod disk_tests {
         // and the profile is not always on the one the user is watching.
         assert!(after.contains("profiles/x/files"), "{after}");
     }
+}
+
+/// `--guest-arm64`: link the Quest build's arm64 `libroblox.so` into this
+/// x86-64 process for the translator (docs/vr/dynarmic-design.md §2, M2),
+/// then run its constructors and, with `--jni-onload`, its `JNI_OnLoad`
+/// (M3; `guest_arm64_run`).
+///
+/// The linker leaves the engine's constructors for the translator
+/// (`patches/0006`), since they are guest code. The link itself establishes
+/// that every import has an answer the guest can safely jump to, and that
+/// every relocation was applied -- the linker logs the count per type, to be
+/// checked against `llvm-readelf -r`.
+#[cfg(target_arch = "x86_64")]
+fn guest_arm64_link(opt: &Options) -> Result<linker::Library, ExitCode> {
+    use cordial_runtime::guest_link::{self, Answer};
+    use std::collections::BTreeSet;
+
+    let path = std::path::Path::new(&opt.lib_dir).join(&opt.library);
+    let read = (|| -> std::io::Result<_> {
+        Ok((
+            cordial_runtime::elf::undefined_symbols(&path)?,
+            cordial_runtime::elf::undefined_data_symbols(&path)?,
+            cordial_runtime::elf::needed_libraries(&path)?,
+        ))
+    })();
+    let (imports, data, needed) = match read {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("guest: cannot read {}: {e}", path.display());
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    println!(
+        "guest arm64: {} imports by {} ({} data), DT_NEEDED {}",
+        imports.len(),
+        opt.library,
+        data.len(),
+        needed.join(" ")
+    );
+
+    // Which implementation a dispatching stub calls is the native path's
+    // choice, so the guest and the x86-64 engine get the same answer.
+    let native = symtab::build(opt.host_libc, &imports);
+    // TLS slot 5 and the `__stack_chk_guard` import must hold the same
+    // canary, or the engine's first function that reads one and checks
+    // against the other aborts.
+    // LL/SC is inline compare-and-swap against the value LDXR loaded
+    // (`IgnoreGlobalMonitor`) unless `CORDIAL_GUEST_MONITOR=global` asks for
+    // dynarmic's exact exclusive monitor. Measured on the engine at M4
+    // (design §9.3): the monitor cost about a quarter of the process's CPU at
+    // Landing and a second of start-up. What is given up is exactness under
+    // ABA, which the outline-atomics helpers the engine's atomics go through
+    // do not rely on -- a value compare is C++'s own compare_exchange.
+    let monitor = match std::env::var("CORDIAL_GUEST_MONITOR").as_deref() {
+        Ok("global") => cordial_guest::MonitorMode::Global,
+        _ => cordial_guest::MonitorMode::Ignore,
+    };
+    // `CORDIAL_GUEST_CODE_CACHE_MIB`: each Jit's code cache, reserved and
+    // committed as it fills. The engine's start-up outgrew design §4's 64 MiB
+    // on the main thread's Jit (§9.3).
+    let code_cache = std::env::var("CORDIAL_GUEST_CODE_CACHE_MIB").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(cordial_guest::Options::default().code_cache, |m| m << 20);
+    // `CORDIAL_GUEST_UNSAFE_FP=nan,recip,fma`: dynarmic's inexact FP
+    // optimisations, for measuring (M7). Off unless named.
+    let unsafe_fp = std::env::var("CORDIAL_GUEST_UNSAFE_FP").unwrap_or_default().split(',')
+        .map(|f| match f {
+            "nan" => cordial_guest::UNSAFE_FP_INACCURATE_NAN,
+            "recip" => cordial_guest::UNSAFE_FP_REDUCED_ERROR,
+            "fma" => cordial_guest::UNSAFE_FP_UNFUSE_FMA,
+            _ => 0,
+        })
+        .fold(0, |a, b| a | b);
+    if unsafe_fp != 0 {
+        println!("guest unsafe FP optimisations: {unsafe_fp:#x}");
+    }
+    let rt = cordial_guest::Runtime::new(cordial_guest::Options {
+        stack_guard: cordial_runtime::bionic::stack_chk_guard(),
+        code_cache,
+        unsafe_fp,
+        monitor,
+        profile: std::env::var_os("CORDIAL_GUEST_PROFILE").is_some(),
+        ..cordial_guest::Options::default()
+    });
+    // The engine executes `svc #0` itself as well as calling `syscall()`;
+    // both get the same translation (guest_sys.rs).
+    rt.set_syscall_handler(cordial_runtime::guest_sys::raw_syscall());
+    println!("guest monitor: {monitor:?}");
+    let omit: BTreeSet<String> = std::env::var("CORDIAL_GUEST_OMIT")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let table = guest_link::build(&rt, &native, &imports, &data, &needed, &omit);
+
+    let (page, page_end) = rt.stub_page();
+    println!("guest stub page: {page:#x}..{page_end:#x}");
+    println!("guest symbol table, by answer:");
+    for a in [Answer::Cordial, Answer::Host, Answer::Thunk, Answer::OpenXr, Answer::Stop,
+              Answer::Data, Answer::WeakNull, Answer::Unanswered] {
+        println!("  {:<12} {}", a.label(), table.count(a));
+    }
+    println!("guest virtual libraries:");
+    for (lib, syms) in &table.libraries {
+        let rows: Vec<_> = table.rows.iter().filter(|r| &r.library == lib).collect();
+        let stops = rows.iter().filter(|r| r.answer == Answer::Stop).count();
+        println!("  {lib:<26} {:>4} symbols, {stops} stop when called", syms.len());
+    }
+    for r in &table.rows {
+        let loud = matches!(r.answer, Answer::Unanswered | Answer::WeakNull | Answer::Data);
+        if opt.verbose || loud {
+            let addr = table.libraries.get(&r.library)
+                .and_then(|syms| syms.iter().find(|(n, _)| n == &r.symbol))
+                .map_or(String::from("-"), |(_, a)| format!("{:p}", *a));
+            println!("  {:<44} {:<12} {:<24} {:<16} {}", r.symbol, r.answer.label(), r.library, addr, r.note);
+        }
+    }
+
+    println!("\ninitialising bionic linker for arm64 guests...");
+    linker::init();
+    if let Err(e) = linker::set_guest_machine(linker::EM_AARCH64) {
+        eprintln!("guest: {e}");
+        return Err(ExitCode::FAILURE);
+    }
+    for (name, syms) in &table.libraries {
+        if let Err(e) = linker::register_guest(name, linker::EM_AARCH64, syms) {
+            eprintln!("failed to register guest {name}: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    }
+    println!("registered {} guest virtual libraries", table.libraries.len());
+    if let Err(e) = linker::set_library_path(&opt.lib_dir) {
+        eprintln!("bad --lib-dir: {e}");
+        return Err(ExitCode::FAILURE);
+    }
+
+    println!("\nlinking {} ...", opt.library);
+    let start = Instant::now();
+    let lib = match linker::dlopen(&opt.library, linker::RTLD_NOW) {
+        Ok(lib) => lib,
+        Err(e) => {
+            eprintln!("\nGUEST LINK FAILED after {:.0?}: {e}", start.elapsed());
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    println!("\nLINKED in {:.0?}", start.elapsed());
+    let (code_base, code_size) = lib.code_region();
+    println!("  base       {:#x}", lib.base());
+    println!("  code       {code_base:#x} + {code_size} bytes, mapped without PROT_EXEC");
+    let Some(ctors) = linker::guest_ctors(lib) else {
+        eprintln!("guest: the loader cannot say what the constructors are (patches/0006 absent)");
+        return Err(ExitCode::FAILURE);
+    };
+    println!(
+        "  machine    {} ; DT_INIT {}, DT_INIT_ARRAY {} entries at {:p}",
+        ctors.machine,
+        if ctors.init_func.is_null() { "absent" } else { "present" },
+        ctors.init_array_count,
+        ctors.init_array
+    );
+    let code = guest_arm64_run(opt, &rt, lib, &ctors);
+    if code.is_none() && opt.app_bridge {
+        let apk = std::path::PathBuf::from(opt.apk.clone().unwrap_or_default());
+        match cordial_runtime::guest_jni::install_symbol_filter(&rt, lib, &apk) {
+            Ok(n) => println!("guest: {n} native method names declared in the APK's dex; host entries made on lookup"),
+            Err(e) => {
+                eprintln!("guest: cannot read the natives' descriptors: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+        guest_stats_reporter(rt.clone());
+    }
+    // The stub page belongs to `rt`, and the linked library now points into
+    // it for the rest of the process.
+    std::mem::forget(rt);
+    match code {
+        None if opt.app_bridge => Ok(lib),
+        None => Err(ExitCode::SUCCESS),
+        Some(c) => Err(c),
+    }
+}
+
+/// `--guest-arm64 --app-bridge`: every ten seconds, the translator's state --
+/// Jits, resident code cache, guest-to-host calls and their rate, and the CPU
+/// time of each thread that has run guest code -- so a long run records its
+/// own steady state (M4).
+#[cfg(target_arch = "x86_64")]
+fn guest_stats_reporter(rt: std::sync::Arc<cordial_guest::Runtime>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // utime + stime of one task of this process, in clock ticks, and its name.
+    fn task_cpu(tid: i32) -> Option<(u64, String)> {
+        let s = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+        let (l, r) = (s.find('(')?, s.rfind(')')?);
+        let f: Vec<&str> = s[r + 2..].split(' ').collect();
+        Some((f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?, s[l + 1..r].to_string()))
+    }
+    let _ = std::thread::Builder::new().name("guest-stats".into()).spawn(move || {
+        let t0 = Instant::now();
+        let mut last = (Instant::now(), 0u64);
+        let mut ticks: std::collections::HashMap<i32, u64> = std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut last_ns = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let s = rt.stats();
+            let calls = rt.svc_calls();
+            let window = last.0.elapsed().as_secs_f64();
+            let rate = (calls - last.1) as f64 / window;
+            last = (Instant::now(), calls);
+            // Per guest thread, CPU over the window as a percentage of one
+            // core (CLK_TCK is 100 on Linux).
+            let mut cpu: Vec<(f64, i32, String)> = Vec::new();
+            let mut total = 0.0;
+            for t in cordial_guest::guest_threads() {
+                if let Some((now, name)) = task_cpu(t.tid) {
+                    let was = ticks.insert(t.tid, now).unwrap_or(now);
+                    let pct = (now - was) as f64 / window;
+                    total += pct;
+                    cpu.push((pct, t.tid, name));
+                }
+            }
+            cpu.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let top: Vec<String> = cpu.iter().take(8).map(|(p, t, n)| format!("{n}/{t}={p:.1}%")).collect();
+            println!(
+                "[guest] t={:.0}s jits={} guest-threads={} code-cache-resident={} KiB translated-insns={} \
+                 svc-calls={} ({:.0}/s) host-entries={} emulated={} icache-ops={}",
+                t0.elapsed().as_secs_f64(),
+                s.jits_created.load(Relaxed),
+                cordial_guest::guest_threads().len(),
+                code_cache_resident_kib(),
+                cordial_guest::translated_instructions(),
+                calls,
+                rate,
+                cordial_guest::host_entry_count(),
+                s.emulated.load(Relaxed),
+                s.icache_ops.load(Relaxed),
+            );
+            println!("[guest] cpu over {window:.1}s: guest threads {total:.1}% of a core; busiest {}", top.join(" "));
+            // Stub calls per second in the window, busiest first. The counts
+            // are kept whether or not CORDIAL_GUEST_PROFILE is set; profiling
+            // adds the host-side time.
+            let mut first: Vec<String> = Vec::new();
+            let mut per: Vec<(String, f64)> = rt.call_counts().into_iter().map(|(n, k)| {
+                let was = counts.insert(n.clone(), k);
+                if was.is_none() {
+                    first.push(n.clone());
+                }
+                (n, (k - was.unwrap_or(0)) as f64 / window)
+            }).collect();
+            // Every import the guest reaches is named once, when first seen,
+            // so a run records which of its answers were ever exercised --
+            // an OpenXR honest failure or a Meta platform stop included.
+            first.sort();
+            println!("[guest] first called in this window ({}): {}", first.len(), first.join(" "));
+            if (t0.elapsed().as_secs() / 10) % 6 == 0 {
+                cordial_runtime::guest_libc::report();
+            }
+            per.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let top: Vec<String> = per.iter().take(8).map(|(n, r)| format!("{n}={r:.0}/s")).collect();
+            println!("[guest] most called: {}", top.join(" "));
+            if rt.options().profile {
+                let ns = s.svc_nanos.load(Relaxed);
+                println!("[guest] host side of stub calls: {:.1}% of a core in the window",
+                         (ns - last_ns) as f64 / 1e9 / window * 100.0);
+                last_ns = ns;
+            }
+        }
+    });
+}
+
+/// `--guest-arm64`, after the link: the engine's constructors in linker
+/// order, then `JNI_OnLoad` with `--jni-onload` (docs/vr/dynarmic-design.md
+/// M3), all on this thread's guest Jit.
+#[cfg(target_arch = "x86_64")]
+fn guest_arm64_run(
+    opt: &Options,
+    rt: &std::sync::Arc<cordial_guest::Runtime>,
+    lib: linker::Library,
+    ctors: &linker::GuestCtors,
+) -> Option<ExitCode> {
+    use cordial_runtime::guest_jni;
+
+    let base = lib.base() as u64;
+    let report = |what: &str, f: &cordial_guest::Fault| {
+        eprintln!("\nGUEST STOPPED in {what}: {f:?}");
+        for c in cordial_guest::last_fault_context() {
+            let off = |a: u64| {
+                if a >= base && a < base + lib.code_region().1 as u64 + (lib.code_region().0 as u64 - base) {
+                    format!("{a:#x} (libroblox+{:#x})", a - base)
+                } else if let Some(n) = rt.stub_name(a & !15) {
+                    format!("{a:#x} (stub {n})")
+                } else {
+                    format!("{a:#x}")
+                }
+            };
+            eprintln!("  pc {}  lr {}  sp {:#x}", off(c.pc), off(c.lr), c.sp);
+            for (i, r) in c.frames.iter().enumerate() {
+                eprintln!("    #{i} {}", off(*r));
+            }
+        }
+        cordial_runtime::guest_libc::report();
+    };
+
+    // bionic's call_array: DT_INIT first, then each DT_INIT_ARRAY entry in
+    // order, skipping 0 and -1, each called as f(argc, argv, envp). This
+    // linker's g_argc/g_argv/g_envp are never set, so those are 0 and null
+    // for the native path too.
+    let mut list: Vec<u64> = Vec::new();
+    if !ctors.init_func.is_null() {
+        list.push(ctors.init_func as u64);
+    }
+    for i in 0..ctors.init_array_count {
+        // SAFETY: the linker's own init_array pointer and count for `lib`.
+        list.push(unsafe { *ctors.init_array.add(i) } as u64);
+    }
+    let skipped = list.iter().filter(|&&f| f == 0 || f == u64::MAX).count();
+    println!("\nrunning {} guest constructors ({skipped} null or -1, skipped as bionic does)...",
+             list.len() - skipped);
+    let t0 = Instant::now();
+    for (i, &f) in list.iter().enumerate() {
+        if f == 0 || f == u64::MAX {
+            continue;
+        }
+        if let Err(e) = cordial_guest::guest_call(rt, f, &[0, 0, 0], &[]) {
+            report(&format!("constructor {i} of {} at libroblox+{:#x}", list.len(), f - base), &e);
+            return Some(ExitCode::FAILURE);
+        }
+    }
+    let t_ctors = t0.elapsed();
+    println!("CONSTRUCTORS DONE: {} run in {:.3?}", list.len() - skipped, t_ctors);
+
+    // With `--app-bridge` the bring-up calls `JNI_OnLoad` itself, through the
+    // same host entry as every other native.
+    if opt.app_bridge {
+        return None;
+    }
+    if opt.jni_onload {
+        let Some(onload) = lib.symbol("JNI_OnLoad") else {
+            eprintln!("JNI_OnLoad not found");
+            return Some(ExitCode::FAILURE);
+        };
+        let Some(host_vm) = linker::jni::create_vm() else {
+            eprintln!("could not create a JavaVM");
+            return Some(ExitCode::FAILURE);
+        };
+        let vm = match guest_jni::guest_vm(rt, host_vm as u64) {
+            Ok(vm) => vm,
+            Err(e) => {
+                eprintln!("guest JNI: {e}");
+                return Some(ExitCode::FAILURE);
+            }
+        };
+        println!("\nguest JavaVM at {vm:#x}; calling JNI_OnLoad at libroblox+{:#x}", onload as u64 - base);
+        let t1 = Instant::now();
+        // `CORDIAL_GUEST_TRACE_SVC=1`: every stub call from JNI_OnLoad on.
+        if std::env::var_os("CORDIAL_GUEST_TRACE_SVC").is_some() {
+            cordial_guest::set_trace(true);
+        }
+        let r = cordial_guest::guest_call(rt, onload as u64, &[vm, 0], &[]);
+        let t_onload = t1.elapsed();
+        match r {
+            Ok(r) => {
+                let rc = r.x0 as u32;
+                println!("JNI_OnLoad returned {rc:#x} = JNI {}.{}", rc >> 16, rc & 0xffff);
+            }
+            Err(e) => {
+                report("JNI_OnLoad", &e);
+                return Some(ExitCode::FAILURE);
+            }
+        }
+        println!("guest natives registered: {}", guest_jni::registered_natives());
+        println!(
+            "TIMING first constructor to JNI_OnLoad returning: {:.3?} (constructors {:.3?}, JNI_OnLoad {:.3?})",
+            t0.elapsed(), t_ctors, t_onload
+        );
+        if let Some(path) = &opt.dump_classes {
+            match linker::jni::dump_classes(path) {
+                Ok(()) => println!("  Java classes Roblox reached for -> {path}"),
+                Err(e) => eprintln!("  class dump failed: {e}"),
+            }
+        }
+    }
+
+    let s = rt.stats();
+    println!(
+        "guest: {} Jits created ({} on this thread), {} guest instructions translated, {} guest-to-host \
+         calls, {} host entries, anonymous executable memory resident {} KiB (code caches of {} MiB \
+         reserved per Jit)",
+        s.jits_created.load(std::sync::atomic::Ordering::Relaxed),
+        cordial_guest::thread_jit_count(),
+        cordial_guest::translated_instructions(),
+        rt.svc_calls(),
+        cordial_guest::host_entry_count(),
+        code_cache_resident_kib(),
+        rt.options().code_cache >> 20
+    );
+    if rt.options().profile {
+        println!(
+            "guest profile: {:.3?} on the host side of stub calls, exclusive of guest code they ran",
+            std::time::Duration::from_nanos(s.svc_nanos.load(std::sync::atomic::Ordering::Relaxed))
+        );
+    }
+    let counts = rt.call_counts();
+    let jni: Vec<String> = counts.iter().filter(|(n, _)| n.starts_with("JNIEnv::") || n.starts_with("JavaVM::"))
+        .map(|(n, k)| format!("{n}={k}")).collect();
+    let top: Vec<String> = counts.iter().take(12).map(|(n, k)| format!("{n}={k}")).collect();
+    println!("guest stubs called: {} distinct; most called: {}", counts.len(), top.join(" "));
+    if opt.verbose {
+        let all: Vec<String> = counts.iter().map(|(n, k)| format!("{n}={k}")).collect();
+        println!("guest stubs called, all: {}", all.join(" "));
+    }
+    println!("guest JNI calls: {}", if jni.is_empty() { "none".into() } else { jni.join(" ") });
+    cordial_runtime::guest_libc::report();
+    None
+}
+
+/// Resident KiB in the process's anonymous executable mappings: dynarmic's
+/// code caches, which it commits lazily so that what is resident is what was
+/// emitted (to the page), plus the one host-entry page. Read from /proc
+/// rather than from dynarmic, which has no public accessor for it.
+#[cfg(target_arch = "x86_64")]
+fn code_cache_resident_kib() -> u64 {
+    let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") else { return 0 };
+    let mut total = 0;
+    let mut in_cache = false;
+    for line in smaps.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let Some(first) = f.first() else { continue };
+        if let Some((a, b)) = first.split_once('-') {
+            if u64::from_str_radix(a, 16).is_ok() && u64::from_str_radix(b, 16).is_ok() {
+                in_cache = f.get(1).is_some_and(|p| p.contains('x')) && f.len() == 5;
+                continue;
+            }
+        }
+        if in_cache && *first == "Rss:" {
+            total += f.get(1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        }
+    }
+    total
 }

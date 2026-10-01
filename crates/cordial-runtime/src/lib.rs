@@ -32,6 +32,7 @@ pub mod browser_tracker;
 pub mod client_settings;
 pub mod cookies;
 pub mod deeplink;
+pub mod game_launch;
 pub mod devctl;
 pub mod elf;
 // Not `pub`: its two functions are the raw-pointer half of this crate's
@@ -41,6 +42,25 @@ mod ffi_util;
 pub mod flag_reapply;
 pub mod flags;
 pub mod graphics;
+pub mod guest_dex;
+#[cfg(target_arch = "x86_64")]
+pub mod guest_audio;
+#[cfg(target_arch = "x86_64")]
+pub mod guest_jni;
+#[cfg(target_arch = "x86_64")]
+pub mod guest_libc;
+#[cfg(target_arch = "x86_64")]
+pub mod guest_link;
+#[cfg(target_arch = "x86_64")]
+pub mod guest_ovr;
+#[cfg(target_arch = "x86_64")]
+pub mod guest_sys;
+#[cfg(target_arch = "x86_64")]
+pub mod guest_vk;
+#[cfg(target_arch = "x86_64")]
+pub mod guest_xr;
+#[cfg(target_arch = "x86_64")]
+mod xr_runtime_pin;
 pub mod headless;
 pub mod identity;
 pub mod linking;

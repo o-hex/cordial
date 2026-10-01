@@ -1,0 +1,154 @@
+# Playing in VR
+
+**Experimental.** Play in VR runs Roblox's Meta Quest build on your PC and
+shows it in your headset through an OpenXR runtime. Your headset is a display;
+the game runs on the computer. The decisions behind it are in
+[ADR-053](adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md).
+
+**Use an alt account.** This is new, and an account you care about is not
+something to test it with.
+
+## What you need
+
+- An **x86-64 PC**. The button does not appear on other computers.
+- **Your own Quest with Roblox installed** from the Meta Horizon Store. Cordial
+  copies Roblox from it. It never downloads a Quest build from anywhere, and it
+  refuses an APK that Roblox did not sign.
+- An **OpenXR runtime**: [WiVRn](https://github.com/WiVRn/WiVRn) streams to a
+  Quest over Wi-Fi or USB. SteamVR and Monado also work as runtimes. Cordial
+  only uses one; it does not install one.
+
+## Getting Roblox off your Quest
+
+Settings → VR → **Get It from Your Quest** walks through this, checking each
+step before the next:
+
+1. **What you need.** A USB-C cable that carries data (a charge-only cable is
+   the commonest reason nothing shows up), and `adb`, Android's tool for
+   talking to the headset. If it is missing, the page names the command for
+   your distribution: `sudo dnf install android-tools` on Fedora,
+   `sudo apt install adb` on Debian and Ubuntu, `sudo pacman -S android-tools`
+   on Arch. Cordial's Flatpak cannot run `adb`; see "In Cordial's Flatpak"
+   below.
+2. **Developer mode.** In the Meta Horizon app on your phone: Devices, your
+   headset, Headset settings, Developer mode, on. Meta only shows that switch
+   to accounts in a developer organisation, which is free to create; see
+   [Meta's guide](https://developers.meta.com/horizon/documentation/native/android/mobile-device-setup/).
+   Restart the headset if the setting does not seem to take.
+3. **Connect.** Plug the headset in and put it on. Choose **Allow** on
+   "Allow USB debugging?" and tick **Always allow from this computer**. The
+   page updates by itself. If no prompt appears: press **Restart adb**,
+   unplug and replug, revoke USB debugging authorisations in the headset
+   (Settings, System, Developer) and replug, check developer mode is still on,
+   and use a port on the computer itself rather than a hub.
+4. **Roblox on your Quest.** Cordial shows the version on the headset and
+   compares it with the one it already has.
+5. **Copy.** About 150 MB. Cordial checks Roblox's signature and keeps the
+   build with its other Roblox builds.
+6. **Done.** You can unplug the headset.
+
+Nothing on the headset is changed: Cordial only lists packages and copies the
+installed APK.
+
+**I Have the APK File** takes a Quest build of Roblox you copied off your own
+headset yourself. `cordial --import-quest-apk FILE` does the same from a
+terminal.
+
+## When Roblox updates
+
+Roblox stops accepting old versions after an update, and this happens with
+every Roblox update. When it does:
+
+1. Update Roblox on your Quest from the Meta Horizon Store.
+2. Open Settings → VR → **Get It from Your Quest** again. Once your computer is
+   allowed, it goes straight to the Roblox step, and copying is one click.
+
+If the headset still has the version Cordial already has, the page says so
+and asks you to update it on the headset first. The old build stays until the
+new one is in, so a failed copy loses nothing.
+
+Cordial cannot tell you in advance that your build is too old: Roblox
+publishes no version check for the Quest build that Cordial could ask, and no
+"too old" signal from the Quest build has been seen yet. A VR session that
+stops working after a Roblox update gets a note on the crash page pointing
+here.
+
+## Choosing the OpenXR runtime
+
+Settings → VR → **Runtime** lists your system's active runtime, WiVRn's
+Flatpak, SteamVR and anything in `share/openxr/1/`, or **Another runtime**
+for a manifest file. The choice is given to the game for that launch only.
+Cordial never changes your system's active runtime.
+
+With WiVRn, its server must be running before you press Play in VR. Settings
+says when it is not. To run it without WiVRn changing your system's active
+runtime:
+
+    flatpak run --command=wivrn-server io.github.wivrn.wivrn --no-manage-active-runtime
+
+## In Cordial's Flatpak
+
+In the Flatpak, VR is meant for **WiVRn installed as a Flatpak**, and needs
+nothing from you: Cordial's Flatpak can read WiVRn's install and reach its
+server, and brings its own OpenXR loader. That is the combination WiVRn
+documents for Flatpak apps. Checked so far: the Flatpak finds WiVRn, sees
+its server running and loads its runtime library. A whole VR session from
+the Flatpak has not been run yet.
+
+Two things are different:
+
+- **Getting Roblox off your Quest.** The Flatpak has no `adb`. With the
+  headset connected and allowed, run these in a terminal and then choose
+  **I Have the APK File** with the file it copied:
+
+      adb shell pm path com.roblox.client
+      adb pull /data/app/…/base.apk quest-roblox.apk
+
+  (use the path the first command printed).
+- **Other runtimes.** A Monado installed on your system does not load
+  inside a Flatpak: its library is built against your system's libraries,
+  not the Flatpak's. Use Cordial installed another way for Monado.
+  SteamVR's runtime needs SteamVR already running and shared memory; if you
+  want to try it, grant it yourself:
+
+      flatpak override --user io.github.luohoa97.Cordial \
+        --filesystem=~/.local/share/Steam/steamapps/common/SteamVR:ro \
+        --filesystem=xdg-config/openvr:ro --device=shm --share=ipc
+
+  That has not been tested.
+
+## Your profile
+
+A profile is shared between the normal game and VR: you sign in once, and the
+same profile lock stops both running at once. Each keeps its own game
+settings and caches, because the two Roblox versions store different things
+there (the VR one records VR settings and its own frame-rate cap).
+
+## Known issues
+
+- **Sound** goes to the same audio output as the normal game. It has been
+  checked with Cordial's own counters, not yet by ear in a game, and the
+  microphone in VR has not been tried.
+- **Typing** into a text box reaches it, checked through Cordial's own
+  control socket; typing on a real keyboard while in VR has not been checked.
+- **Controller vibration** can buzz on and on with WiVRn 26.9. That is a bug
+  in WiVRn's headset app, fixed in WiVRn's pull request #1131, which no
+  release carries yet.
+- **Leaving a game** from the Roblox menu brings the menu back on Monado. The
+  in-game Leave button has been exercised only partly.
+- **Joining a second game** after leaving one crashes when the runtime is
+  Monado with its default in-process compositor, inside the graphics driver.
+  It has not been tried on WiVRn, whose compositor runs in its own process.
+- **Pressing Play in the headset** has been checked only by a deep link, not
+  by pressing the button in a headset.
+- **Frame rate in game** is below the headset's refresh rate: 44 to 65 frames
+  a second measured on Monado's simulated headset. On a Quest 3 over WiVRn,
+  in a game made for VR, it looked mostly above 60 with occasional slight
+  stutters; that was watched, not measured.
+- **No warning when your Quest build is too old.** See "When Roblox updates".
+- A session that stopped with MangoHud's overlay loaded into Monado was seen
+  once. If VR crashes with `MANGOHUD=1` set, try without it.
+
+`cordial --diagnostics` has a VR line and `cordial --doctor` VR checks; paste
+both into a report. The switches for investigating a VR run are listed in
+[`vr/env.md`](vr/env.md).

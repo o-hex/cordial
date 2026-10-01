@@ -19,6 +19,16 @@ of disk free), and it was not retried another way. The section "What remains to
 measure" says exactly what is missing. No FPS, CPU or landing-UI figure for a
 translated build exists in this document, and none should be quoted from it.
 
+*Corrected 2026-10-01:* the short answer's "needs a second copy of `cordial-run`" and
+section 2's "There is no (c)" were wrong, and section 4's verdict on Quest with them.
+A third shape exists and has been built: the x86-64 `cordial-run` links an arm64
+engine in-process, runs it under dynarmic, and answers its imports through generated
+thunks, so its Vulkan reaches the host GPU
+([ADR-053](../adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md),
+[`vr/dynarmic-design.md`](../vr/dynarmic-design.md)). It is used only for the Meta
+Quest build. Nothing here was re-measured for the arm64 phone build, which Settings
+still does not offer.
+
 ## 1. How the architecture is chosen today
 
 It is a compile-time property of the binary. Nothing at run time chooses it and
@@ -70,7 +80,10 @@ describe whichever landed last. The single-slot symlinks (`build/<abi>`,
 ## 2. The coupling: the other architecture's engine needs the other architecture's `cordial-run`
 
 **Confirmed.** No thunk layer sits between them, and building one is not a
-reasonable option.
+reasonable option. *(Corrected 2026-10-01: one has been built, for the Quest build:
+signatures generated from Khronos's `vk.xml` and `xr.xml` and hand-written stubs for
+the rest, with layout gates finding 0 differences between the arm64 and x86-64
+structs it carries. See the note at the top.)*
 
 - The bionic linker loads `libroblox.so` **into `cordial-run`'s own address
   space** and refuses a mismatched ELF: `GetTargetElfMachine()` in
@@ -207,6 +220,20 @@ about, which is a difference worth remembering rather than borrowing.
 
 **Not viable, on evidence that is partly measured and partly inferred.**
 
+*Superseded 2026-10-01:* the Quest build runs in VR mode under the in-process
+translator ([ADR-053](../adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md)). What
+this section did not know is now known from a copy pulled off a Quest 3: the package
+is `com.roblox.client`, the same name as the phone build; versionName 2.740.0.927
+(2.740.927 in the design document); `lib/arm64-v8a/` only; signed by a certificate of its own
+(`6d13fc84…`, self-signed, O=Roblox Corporation), pinned separately in
+`packaging/trust/roblox-signing-certificates.json`. The mirror probe below is still
+the only one made, and no mirror is known to serve the Quest build; Cordial
+downloads none and takes it only from the user's own headset or an APK file they
+supply. The Platform SDK it brings is answered as a host without Meta services,
+every request failing ([`guest_ovr.rs`](../../crates/cordial-runtime/src/guest_ovr.rs)),
+and no other Horizon OS service has stopped a recorded run. The "Dependencies" bullet's VR
+finding is about the phone build.
+
 - **What it is.** Roblox on Meta Quest is an app distributed through the Meta
   Horizon Store (Roblox Help "Meta Quest FAQ" and the Meta store listing exist;
   the store page carries no package name, version or technical requirements). A
@@ -250,7 +277,8 @@ Cordial cannot run. Specifically:
    request to a tester on an arm64 machine, not a feature. A tester's `fex`
    result on the landing screen (fps with input driven, per AGENTS.md, CPU) is
    the bar.
-3. **Quest.** Not viable; no option.
+3. **Quest.** Not viable; no option. *(Superseded 2026-10-01: it runs, and is
+   offered as "Play in VR" rather than as an option in this row; ADR-053.)*
 4. **Auto.** Must mean "the architecture of the running binary" and nothing
    else: `HOST_ABI`, resolved once, never re-derived from what a mirror lists,
    never changed because a newer release exists elsewhere. That is already
@@ -344,6 +372,10 @@ Each needs a machine state this one was not in (memory 5 GB available, disk
    article or the store listing's package metadata) would let the mirror probe be
    repeated with the right name. Even then a download would fail the signature
    pin unless Meta's build is signed by the same certificate, which is unknown.
+   *(Answered 2026-10-01 from the headset: `com.roblox.client`, signed by a
+   different certificate from the phone build's. So a mirror listing under that
+   name is the phone build's, and a Quest copy from one would fail the phone pin.
+   Cordial does not look; see section 4.)*
 
 ## Rules and caveats for this spike
 

@@ -44,10 +44,14 @@ use std::path::{Component, Path, PathBuf};
 /// The Android ABI this build of Cordial can execute, spelled the way an APK
 /// spells it.
 ///
-/// **Cordial never translates machine code** -- `docs/multiarch.md` decided
-/// that -- so the only library it can load is the one built for the host's own
-/// architecture. Which means the ABI is a property of *this binary*, fixed at
-/// compile time, and not something to detect at run time or ask the user for.
+/// **Cordial never translates the phone build's machine code** --
+/// `docs/multiarch.md` decided that -- so the only phone library it can load
+/// is the one built for the host's own architecture. Which means the ABI is a
+/// property of *this binary*, fixed at compile time, and not something to
+/// detect at run time or ask the user for. This used to say Cordial never
+/// translates machine code at all; the VR mode runs the Quest build's arm64
+/// engine under a translator (ADR-053), but that build is imported by the user
+/// and stored apart, and never passes through this constant.
 ///
 /// Two spellings, and confusing them is the trap worth naming: the directory
 /// inside the APK is `lib/arm64-v8a/` with a hyphen, and Play's split archive

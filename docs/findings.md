@@ -75,6 +75,15 @@ resort with ARM64 to x86 translation, which is slow and problematic." The subord
 clause is the answer to Task A — the Android build *does* ship x86 code — and the main
 clause states that translation is a path they have deliberately not taken.
 
+*Corrected 2026-10-01:* the quotation is accurate and the Quest build does ship only
+arm64 code, but "slow and problematic" was taken here, and in `multiarch.md`, as
+reason enough to rule the Quest build out. Measured since, it is not: under an
+in-process translator the Quest build runs at 90 frames/s at 90 Hz on its landing
+panel and 44 to 65 in game on Monado's simulated HMD
+([ADR-053](adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md)): below the
+headset's refresh in game, but running. Task A's verdict for the phone build is
+unaffected.
+
 **(d) Sober's stated CPU requirement is an application baseline, not a translator's.**
 The FAQ requires SSE4.1 and SSE4.2. A translator would impose the requirements of *its
 own* code generator and would run on essentially any x86-64 CPU. A hard floor at
@@ -127,6 +136,8 @@ it exactly — the reasoning is sound and can be trusted on the next question of
 Decision recorded in [`multiarch.md`](multiarch.md). Summary: execute natively when the
 host ABI matches an ABI the APK ships; do not build a translation layer. x86-64 is the
 only supported target for Phases 1–2. ARM64 hosts are a later build-flag concern.
+*2026-10-01:* the phone build still follows this; the Quest build is translated, for
+VR ([ADR-053](adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md)).
 
 ---
 

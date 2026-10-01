@@ -11,6 +11,11 @@ Task A established that Roblox ships a complete x86-64 Android build (see
 [`findings.md`](findings.md) §1). Cordial therefore never translates machine code. This
 is a build-flag and runtime-dispatch concern, not an architectural one.
 
+*Corrected 2026-10-01:* "never translates machine code" is now true of the phone build
+only. The VR mode runs the Meta Quest build's arm64 engine under dynarmic inside the
+x86-64 `cordial-run` ([ADR-053](adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md)).
+The table below still describes how the phone build is chosen and run.
+
 | Host | APK ships a matching ABI | Strategy | Phase |
 |---|---|---|---|
 | x86-64 | `lib/x86_64/` — yes | Native execution + CPU *feature* emulation (`libbadcpu`) | 1 |
@@ -68,6 +73,11 @@ floor. That closes a real slice of the unknown for the price of one APK.
 **No translation layer will be designed.** If a future host has no matching ABI, the
 answer is "unsupported", not "write a JIT".
 
+*Superseded for one build, 2026-10-01:* the Meta Quest build, which ships only
+`arm64-v8a`, runs on x86-64 under an in-process translator for the VR mode
+([ADR-053](adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md)). The phone build is
+still executed natively and never translated.
+
 **Reopened and re-measured, 2026-09-30.** The last sentence here used to say reopening
 this required reopening Task A. The spike in
 [`analysis/roblox-build-architecture.md`](analysis/roblox-build-architecture.md) is that
@@ -80,8 +90,22 @@ CPU device; FEX and box64 need arm64 hardware nobody here has). Settings therefo
 no dropdown; [ADR-043](adr/ADR-043-the-roblox-build-is-the-binarys-architecture.md)
 records the decision and what would reopen it.
 
+*Corrected 2026-10-01:* "needs a second `cordial-run`" was wrong as a general claim. The
+in-process load does not force it: the x86-64 `cordial-run` links the Quest build's arm64
+engine and answers its imports through generated thunks, so the engine reaches the host's
+own Vulkan driver (an RTX 4070 Ti, not llvmpipe) and OpenXR runtime
+([`vr/dynarmic-design.md`](vr/dynarmic-design.md) §9.4, §9.5). What the spike measured
+about qemu-user is unaffected.
+
 **No Quest/VR target.** The Quest build ships no x86 code, so supporting it would mandate
 exactly the translation path this decision exists to avoid. Linux desktop only.
+
+*Superseded 2026-10-01:* the first sentence was right and the conclusion was not. The
+Quest build does ship only `arm64-v8a`, and it is now a VR target on x86-64 Linux, through
+that translation path, with the headset as a display over an OpenXR runtime
+([ADR-053](adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md),
+[`vr.md`](vr.md)). Measured on Monado's simulated HMD only: 90 frames/s at 90 Hz on the
+landing panel, 44 to 65 in game. Nothing has been measured on WiVRn or a real headset.
 
 ## Status, 2026-09-23
 
@@ -154,8 +178,10 @@ for that test) — still open, and still cheap: needs one more fetch, not a devi
 - Host ABI is fixed at **compile time**, not resolved at launch. `cordial_update::apk::
   HOST_ABI` is a `#[cfg(target_arch)]` constant, and `LIBRARY_IN_APK` and `SPLIT_APK` are
   spelled per-architecture beside it; an unsupported target fails with a `compile_error!`
-  naming this document. Cordial never translates machine code, so the only library it can
-  load is the one for its own architecture — which makes the ABI a property of the binary
+  naming this document. Cordial never translates the phone build's machine code, so the
+  only phone library it can load is the one for its own architecture (*corrected
+  2026-10-01:* this said "never translates machine code"; the Quest build is translated,
+  ADR-053, and is stored apart under `builds/arm64-v8a/`) — which makes the ABI a property of the binary
   rather than something to detect. This paragraph previously described a run-time
   resolution that did not exist; the constants were two hardcoded literals in two crates.
 - Watch the two spellings. The directory inside the APK is `lib/arm64-v8a/` with a hyphen;

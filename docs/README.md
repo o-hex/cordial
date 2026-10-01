@@ -13,6 +13,7 @@ order a newcomer would want it.
 | [`rich-presence.md`](rich-presence.md) | The bundled Discord Rich Presence plugin: what it does, and what is not wired up yet |
 | [`shaders.md`](shaders.md) | The vkBasalt switch: sharpening and anti-aliasing over the game, and its config file |
 | [`mangohud.md`](mangohud.md) | The MangoHUD switch: what it shows, and how to install the layer |
+| [`vr.md`](vr.md) | Play in VR: getting Roblox off your own Quest, choosing the OpenXR runtime, updating after Roblox updates, and what is still broken |
 | [`nvidia.md`](nvidia.md) | NVIDIA graphics: what is known, what Cordial does, the Flatpak driver extension, and how to report a problem. Untested on NVIDIA hardware |
 | [`plugins.md`](plugins.md) | Installing a plugin from an archive, and why Cordial fetches Deno |
 | [`runtime-spec.md`](runtime-spec.md) | Draft `cordial.runtime/1`: what a runtime implements for Cordial's launcher features. Nothing implements it yet |
@@ -25,7 +26,7 @@ order a newcomer would want it.
 
 ## ADRs
 
-All 52. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDOVER.md#the-adr-index) carries every record's own status line.
+All 53. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDOVER.md#the-adr-index) carries every record's own status line.
 
 | | |
 |---|---|
@@ -67,11 +68,11 @@ All 52. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDO
 | [ADR-036](adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md) | The unsafe/safe boundary is a lint, not a convention |
 | [ADR-037](adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md) | The build store's three writers share one lock, and an entry now proves its own bytes |
 | [ADR-038](adr/ADR-038-plugin-hot-swap.md) | A running client reconciles its plugin set; nothing pushes to it |
-| [ADR-039](adr/ADR-039-a-runtime-backend-seam-and-why-macos-waits.md) | A runtime-backend seam is cheap to describe and not worth building yet. Corrected 2026-10-01 on Metal, Darling and the loader |
+| [ADR-039](adr/ADR-039-a-runtime-backend-seam-and-why-macos-waits.md) | A runtime-backend seam is cheap to describe and not worth building yet. Corrected 2026-10-01 on Metal, Darling and the loader, and on its quotation of "do not build a translation layer", which ADR-053 no longer follows for the Quest build |
 | [ADR-040](adr/ADR-040-the-engine-already-runs-mimalloc.md) | The engine already runs mimalloc, so there is no allocator to switch |
 | [ADR-041](adr/ADR-041-vkbasalt-post-processing.md) | vkBasalt post-processing is a driver-stack layer, not in-process hooking |
 | [ADR-042](adr/ADR-042-texture-format-query-observability.md) | Vulkan texture-format queries are counted and, test-only, maskable — nothing is translated |
-| [ADR-043](adr/ADR-043-the-roblox-build-is-the-binarys-architecture.md) | The Roblox build's architecture is the binary's; choosing another needs a second runtime, so Settings shows it read-only |
+| [ADR-043](adr/ADR-043-the-roblox-build-is-the-binarys-architecture.md) | The Roblox build's architecture is the binary's; choosing another needs a second runtime, so Settings shows it read-only. Its "Quest is rejected" and the premise of its decision 3 (a second `cordial-run`) superseded by ADR-053 |
 | [ADR-044](adr/ADR-044-settings-reach-a-running-game.md) | Settings that can change reach a running game over a small socket; the rest say "Applies at next launch" |
 | [ADR-045](adr/ADR-045-one-report-screen-outside-settings.md) | One Report a Problem screen, outside Settings; the launcher says so when the game will open on X11 |
 | [ADR-046](adr/ADR-046-nvidia-is-gated-on-the-vendor-id.md) | NVIDIA behaviour is gated on the device's vendor id, advisory unless the evidence is strong, and says what is inferred |
@@ -81,6 +82,7 @@ All 52. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDO
 | [ADR-050](adr/ADR-050-other-runtimes-are-launched-not-built.md) | Other runtimes (Mac O' Blox) are detected and launched, never built into Cordial; parked until after 1.0. Launching design superseded in part by ADR-052 |
 | [ADR-051](adr/ADR-051-overrides-are-reapplied-after-the-engines-refresh.md) | The profile's flag overrides are handed to the engine again after each of its own settings refreshes, triggered by its log |
 | [ADR-052](adr/ADR-052-the-runtime-spec.md) | Launcher features reach runtimes through a published spec, `cordial.runtime/1`; Cordial lists only its own runtime for now; supersedes ADR-050's launching design in part |
+| [ADR-053](adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md) | VR is a launch mode of the Android runtime: the Quest build, user-supplied and keyed by ABI in the store, run under an in-process translator; the OpenXR runtime is passed per launch; a profile shares its sign-in and lock across both builds and keeps their engine storage apart. Supersedes ADR-043's "Quest is rejected" |
 
 ## Design notes
 

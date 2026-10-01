@@ -164,7 +164,7 @@ started. None of those can be re-read by something already running.
 **`present_mode` was expected to be live by making Cordial rebuild the swapchain
 the way it does on a resize, and Cordial does not do that.** Cordial only
 substitutes the mode in `vkCreateSwapchainKHR` (`vk_create_swapchain_inner`) and
-debounces the extent it reports (`settle_resize_extent`). The *engine* rebuilds
+rate-limits the extent it reports (`settle_resize_extent`). The *engine* rebuilds
 its swapchain, and it does so when the `currentExtent` it reads from
 `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` changes (how a fullscreen toggle has
 been seen to cause one; that it is the only trigger is INFERRED);

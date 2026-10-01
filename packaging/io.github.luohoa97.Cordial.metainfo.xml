@@ -78,6 +78,15 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.23.2" date="2026-10-01">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.23.2</url>
+      <description>
+        <p>
+          The game now follows the window while you drag to resize it, instead
+          of waiting until you stop.
+        </p>
+      </description>
+    </release>
     <release version="0.23.1" date="2026-10-01">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.23.1</url>
       <description>

@@ -661,25 +661,102 @@ pub fn in_flatpak() -> bool {
 /// test ties this to the manifest's runtime-version.
 pub const VULKAN_LAYER_BRANCH: &str = "25.08";
 
-pub fn mangohud_install_hint() -> &'static str {
+/// Which Vulkan layer a host install hint is for.
+#[derive(Clone, Copy)]
+enum Layer {
+    MangoHud,
+    VkBasalt,
+}
+
+/// The host distribution, as far as an install hint needs it: `/etc/os-release`'s
+/// `ID`, `ID_LIKE` and `VARIANT_ID`. Only read for a host (non-Flatpak) build,
+/// where the layer has to come from the host's own packages.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Distro {
+    id: String,
+    like: Vec<String>,
+    variant: String,
+}
+
+impl Distro {
+    fn here() -> Distro {
+        std::fs::read_to_string("/etc/os-release")
+            .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))
+            .map(|t| Distro::parse(&t))
+            .unwrap_or_default()
+    }
+
+    fn parse(text: &str) -> Distro {
+        let mut d = Distro::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else { continue };
+            let value = value.trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase();
+            match key.trim() {
+                "ID" => d.id = value,
+                "ID_LIKE" => d.like = value.split_whitespace().map(str::to_owned).collect(),
+                "VARIANT_ID" => d.variant = value,
+                _ => {}
+            }
+        }
+        d
+    }
+
+    fn is(&self, family: &str) -> bool {
+        self.id == family || self.like.iter().any(|l| l == family)
+    }
+
+    /// An image-based Fedora (Silverblue, Kinoite, Bluefin, Bazzite, Aurora
+    /// and friends), where `dnf install` does not work on the host and packages
+    /// are layered with rpm-ostree instead.
+    fn is_atomic_fedora(&self) -> bool {
+        const ATOMIC: [&str; 8] =
+            ["silverblue", "kinoite", "sericea", "onyx", "bluefin", "bazzite", "aurora", "ublue"];
+        ATOMIC.iter().any(|a| self.id.contains(a) || self.variant.contains(a))
+            || std::path::Path::new("/run/ostree-booted").exists() && self.is("fedora")
+    }
+}
+
+/// One line naming the command for this distribution, falling back to a plain
+/// sentence where the package name is not known for certain. Only package
+/// names confirmed in each distribution's main repositories are named.
+fn host_install_hint(d: &Distro, layer: Layer) -> String {
+    let (fedora, arch, debian, suse, nix) = match layer {
+        Layer::MangoHud => ("mangohud", "mangohud", "mangohud", "mangohud", "mangohud"),
+        Layer::VkBasalt => ("vkBasalt", "vkbasalt", "vkbasalt", "vkbasalt", "vkbasalt"),
+    };
+    let generic = match layer {
+        Layer::MangoHud => "Install MangoHud from your distribution's packages.",
+        Layer::VkBasalt => "Install vkBasalt from your distribution's packages.",
+    };
+    if d.is("fedora") && d.is_atomic_fedora() {
+        format!("Install it with: rpm-ostree install {fedora} (then reboot)")
+    } else if d.is("fedora") {
+        format!("Install it with: sudo dnf install {fedora}")
+    } else if d.is("arch") {
+        format!("Install it with: sudo pacman -S {arch}")
+    } else if d.is("debian") || d.is("ubuntu") {
+        format!("Install it with: sudo apt install {debian}")
+    } else if d.is("suse") || d.is("opensuse") || d.id.starts_with("opensuse") {
+        format!("Install it with: sudo zypper install {suse}")
+    } else if d.is("nixos") {
+        format!("Add pkgs.{nix} to your configuration")
+    } else {
+        generic.to_owned()
+    }
+}
+
+pub fn mangohud_install_hint() -> String {
     mangohud_install_hint_for(in_flatpak())
 }
 
-fn mangohud_install_hint_for(flatpak: bool) -> &'static str {
-    // **Kept to one line each, because this is shown in a settings row that
-    // cannot be clicked.** It used to spell out why the *other* route fails --
-    // a host package is invisible to a sandboxed build, and the Flatpak
-    // extension's library path exists only inside one -- which is true, useful,
-    // and was reported rendering as five lines ending in an ellipsis. A
-    // paragraph nobody can read is worth less than the one sentence that names
-    // the right command. The reasoning lives in this function's doc instead.
+fn mangohud_install_hint_for(flatpak: bool) -> String {
     if flatpak {
-        "Install the Flatpak extension: flatpak install flathub \
-         org.freedesktop.Platform.VulkanLayer.MangoHud//25.08"
-    } else {
-        "Install it from your distribution (Fedora: dnf install mangohud, Arch: pacman -S \
-         mangohud)."
+        return format!(
+            "Install the Flatpak extension: flatpak install flathub \
+             org.freedesktop.Platform.VulkanLayer.MangoHud//{VULKAN_LAYER_BRANCH}"
+        );
     }
+    host_install_hint(&Distro::here(), Layer::MangoHud)
 }
 
 /// Where MangoHUD's implicit layer manifest is, or `None` if it is not
@@ -739,18 +816,18 @@ fn find_mangohud_layer_in(dirs: &[PathBuf]) -> Option<PathBuf> {
 /// Same reasoning as [`mangohud_install_hint`], and the same trap: the Flatpak
 /// extension and the host package are not interchangeable, and which one is
 /// right is decided by how Cordial was installed, not by preference.
-pub fn vkbasalt_install_hint() -> &'static str {
+pub fn vkbasalt_install_hint() -> String {
     vkbasalt_install_hint_for(in_flatpak())
 }
 
-fn vkbasalt_install_hint_for(flatpak: bool) -> &'static str {
+fn vkbasalt_install_hint_for(flatpak: bool) -> String {
     if flatpak {
-        "Install the Flatpak extension: flatpak install flathub \
-         org.freedesktop.Platform.VulkanLayer.vkBasalt//25.08"
-    } else {
-        "Install it from your distribution (Fedora: dnf install vkBasalt, Arch: pacman -S \
-         vkbasalt)."
+        return format!(
+            "Install the Flatpak extension: flatpak install flathub \
+             org.freedesktop.Platform.VulkanLayer.vkBasalt//{VULKAN_LAYER_BRANCH}"
+        );
     }
+    host_install_hint(&Distro::here(), Layer::VkBasalt)
 }
 
 /// Where vkBasalt's implicit layer manifest is, or `None` if it is not
@@ -1211,11 +1288,12 @@ mod tests {
         // while running a host build -- twice -- and got silence, because that
         // layer's manifest names a library under /usr/lib/extensions which only
         // exists inside a sandbox.
-        let hint = mangohud_install_hint();
-        if in_flatpak() {
-            assert!(hint.contains("flatpak install"), "{hint}");
-            assert!(!hint.contains("dnf install"), "{hint}");
-        } else {
+        let hint = mangohud_install_hint_for(true);
+        assert!(hint.contains("flatpak install"), "{hint}");
+        assert!(!hint.contains("dnf install"), "{hint}");
+        let fedora = Distro::parse("ID=fedora\nVARIANT_ID=workstation\n");
+        let hint = host_install_hint(&fedora, Layer::MangoHud);
+        {
             assert!(hint.contains("dnf install"), "{hint}");
             // It used to name the Flatpak extension in order to rule it out,
             // and that clause was most of what made this string too long to
@@ -1260,13 +1338,32 @@ mod tests {
     fn the_vkbasalt_hint_names_one_package_and_it_matches_how_cordial_was_installed() {
         // Same failure mode `the_mangohud_hint_names_one_package...` guards
         // against, for the same two packages that cannot see each other.
-        let hint = vkbasalt_install_hint();
-        if in_flatpak() {
-            assert!(hint.contains("flatpak install"), "{hint}");
-            assert!(!hint.contains("dnf install"), "{hint}");
-        } else {
-            assert!(hint.contains("dnf install"), "{hint}");
-            assert!(!hint.contains("flatpak install"), "{hint}");
+        let hint = vkbasalt_install_hint_for(true);
+        assert!(hint.contains("flatpak install"), "{hint}");
+        assert!(!hint.contains("dnf install"), "{hint}");
+        let fedora = Distro::parse("ID=fedora\nVARIANT_ID=workstation\n");
+        let hint = host_install_hint(&fedora, Layer::VkBasalt);
+        assert!(hint.contains("dnf install vkBasalt"), "{hint}");
+        assert!(!hint.contains("flatpak install"), "{hint}");
+    }
+
+    #[test]
+    fn the_host_hint_follows_the_distribution() {
+        let cases = [
+            ("ID=arch\n", "pacman -S vkbasalt"),
+            ("ID=cachyos\nID_LIKE=arch\n", "pacman -S vkbasalt"),
+            ("ID=ubuntu\nID_LIKE=debian\n", "apt install vkbasalt"),
+            ("ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n", "apt install vkbasalt"),
+            ("ID=\"opensuse-tumbleweed\"\nID_LIKE=\"opensuse suse\"\n", "zypper install vkbasalt"),
+            ("ID=nixos\n", "pkgs.vkbasalt"),
+            ("ID=bluefin\nID_LIKE=\"fedora\"\nVARIANT_ID=bluefin-dx\n", "rpm-ostree install vkBasalt"),
+            ("ID=fedora\nVARIANT_ID=silverblue\n", "rpm-ostree install vkBasalt"),
+            ("ID=gentoo\n", "from your distribution"),
+            ("", "from your distribution"),
+        ];
+        for (os_release, want) in cases {
+            let hint = host_install_hint(&Distro::parse(os_release), Layer::VkBasalt);
+            assert!(hint.contains(want), "{os_release:?} gave {hint:?}, wanted {want:?}");
         }
     }
 

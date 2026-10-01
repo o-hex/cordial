@@ -31,6 +31,7 @@
 
 use crate::nvidia::{self, FlatpakGl};
 use crate::profile;
+use crate::gtk_renderer;
 use crate::vulkan_probe::{self, Device, Failure, Kind};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -350,6 +351,24 @@ pub fn gpu(env: &Env, inputs: &Inputs) -> Vec<Check> {
     let kernel_gpus = kernel_gpu_vendors();
     let nvidia_host = NvidiaHost::read(env);
     out.extend(vulkan_devices(probed.as_ref(), &kernel_gpus, env.in_flatpak, &nvidia_host.flatpak_gl()));
+    // What Cordial will do about its own window on this machine, which is
+    // otherwise a line in a client log nobody reads: no hardware Vulkan means
+    // GTK's renderer is switched to cairo so a focused text box can be drawn.
+    // Not asked at all when the probe was not requested.
+    if inputs.probe_vulkan {
+        let answer = match &probed {
+            Some(answer) => answer.clone(),
+            None => Err(Failure::NoLoader),
+        };
+        if let gtk_renderer::Decision::Cairo(why) = gtk_renderer::decide(std::env::var(gtk_renderer::ENV).ok().as_deref(), &answer) {
+            out.push(check(
+                Level::Info,
+                format!("Cordial will draw its window with GTK's cairo renderer, because {why}"),
+                "GTK's GL renderer stops presenting beside the engine's OpenGL ES, which would leave a focused text \
+                 box with no editor. Set GSK_RENDERER yourself to choose another.",
+            ));
+        }
+    }
     if let Some(Ok(devices)) = &probed {
         out.extend(nvidia_checks(devices, &nvidia_host));
     }

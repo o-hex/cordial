@@ -30,6 +30,15 @@ Sources, and how far each can be trusted:
   Sober's maintainers point at (mesa/mesa#12316) and NVIDIA's own Pascal
   support-plan page could not be fetched, so nothing here depends on either.
 
+## Reports from NVIDIA users of Cordial itself
+
+- 2026-10-01, on [#39](https://github.com/luohoa97/cordial/issues/39): Flatpak
+  0.22.0, Debian forky, GNOME on Wayland, NVIDIA's own 610.57 driver, default
+  settings. Entering and leaving fullscreen (F11), maximise, snap and restore,
+  in the menus and in a game, all without a crash; the same user crashed on
+  entering fullscreen with earlier builds. The first report of Cordial on an
+  NVIDIA driver outside the 535/550 series, and it is clean for this path.
+
 ## What the data contradicts
 
 Worth putting first, because each was in the brief that started this work.

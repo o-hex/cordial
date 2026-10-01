@@ -1803,7 +1803,7 @@ mod tests {
         let mut f2 = vec![0u64; 30];
         word(&mut f2, 0, ST_PHYSICAL_DEVICE_FEATURES_2);
         word(&mut f2, 16 + FEATURE_ETC2 * 4, 1);
-        let mut info = vec![0u64; 9];
+        let mut info = [0u64; 9];
         info[1] = f2.as_ptr() as u64;
         let original = info.as_ptr() as *const c_void;
         let stripped = strip_with(true, original).expect("stripped");
@@ -1828,7 +1828,7 @@ mod tests {
     #[test]
     fn an_etc_image_on_an_emulating_device_without_state_is_refused_not_forwarded() {
         let _turn = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        H_CREATE_IMAGE.store(fake_create_image as usize, Relaxed);
+        H_CREATE_IMAGE.store(fake_create_image as *const () as usize, Relaxed);
         let mut create = [0u64; 11];
         word(&mut create, 24, 147);
         word(&mut create, 40, 1);

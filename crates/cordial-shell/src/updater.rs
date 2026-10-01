@@ -1370,7 +1370,9 @@ pub fn build_update_page(
         // found in AdwViewStack" and shows the first page instead, which is a
         // screenshot captioned as something it is not.
         .name("updates")
-        .icon_name("system-software-install-symbolic")
+        // The header bar's update button wears PACKAGE_ICON; the tab that
+        // configures the same thing wears it too, so the two read as one.
+        .icon_name(PACKAGE_ICON)
         .build();
     page.add(&build_update_group(config.clone(), config_path));
     page.add(&build_source_group(config));

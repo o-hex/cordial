@@ -1,6 +1,6 @@
 # ADR-050: Other runtimes are launched, not built
 
-**Status:** accepted, implementation parked until after 1.0.
+**Status:** accepted, implementation parked until after 1.0. Superseded in part by [ADR-052](ADR-052-the-runtime-spec.md) for the launching design: features now reach a runtime through a published spec, and Cordial lists only its own runtime for now. The decision that Cordial builds no macOS runtime stands, and so does the reasoning below.
 **Date:** 2026-10-01
 
 ## Context
@@ -21,7 +21,18 @@ asked whether Cordial should run the macOS client too.
 Cordial does not build a macOS runtime. Every part of Cordial below the launcher
 exists to load the Android engine: the bionic linker, the JNI layer, the Android
 framework answers and the AGDK input path. A macOS client needs Darling's
-frameworks and its own graphics translation, and would reuse none of that.
+frameworks and would reuse none of that.
+
+*Correction, 2026-10-01 ([spike](../analysis/macos-runtime.md)):* this paragraph
+said a macOS client would need "its own graphics translation". The spike found
+Mac O' Blox draws with Roblox's own OpenGL renderer through Darling's
+OpenGL-over-EGL, so none is needed today (read from source, not run; whether
+the client picks GL because Metal is absent is **INFERRED**). It also found
+that Mac O' Blox injects code into the Roblox process
+(`DYLD_INSERT_LIBRARIES` and method swizzling), which ADR-001 rules out for
+Cordial, and which [ADR-052](ADR-052-the-runtime-spec.md) makes a reason not to
+list a runtime. The conclusion is unchanged: nothing of Cordial's Android
+layers carries over.
 
 What Cordial may do instead is **launch another runtime the user already has
 installed**. A **Runtime** choice in Settings would list Cordial (the Android
@@ -33,7 +44,10 @@ command.
   and the command it installs. Offer it only when present, and say "not
   installed" with a link to its install instructions otherwise, the way the
   MangoHUD and shaders rows already work.
-- **What carries over.** Only starting it. Cordial's profiles, plugins,
+- **What carries over.** Only starting it. *(Superseded by ADR-052: a runtime
+  that implements the spec can receive flags, profile data and plugin events
+  through it. Cordial lists only its own runtime for now, so nothing changes
+  for a user today.)* Cordial's profiles, plugins,
   FastFlags, live settings, doctor checks and report screen apply to the
   Android runtime only. The Settings row has to say so, rather than letting a
   user believe their flags reach a client Cordial is not running.

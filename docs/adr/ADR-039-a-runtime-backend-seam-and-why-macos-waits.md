@@ -389,3 +389,31 @@ a disabled-when-unsupported row is not the hard part once there is a second
 backend to gate on — it is idiomatically free. The reason to wait is not
 implementation cost; it is that there is nothing today for the picker to
 pick between.
+
+## Correction, 2026-10-01: Metal on Vulkan, Darling, and the loader
+
+The [macOS spike](../analysis/macos-runtime.md) read the public repositories
+and found three statements above wrong or stale. None of it was run.
+
+- **"No Metal-to-Vulkan project was found" is wrong.** Darling's
+  [indium](https://github.com/darlinghq/indium) (0BSD) implements Metal on
+  Vulkan 1.3, and [darling-metal](https://github.com/darlinghq/darling-metal)
+  (MPL-2.0) provides ABI-compatible Metal frameworks over it. Both are stale:
+  indium's last commit is April 2023, it calls itself "NOT a drop-in
+  replacement", and no real app was found rendering through either. Two 2026
+  projects (`steelbrain/metal2vulkan`, `Hi-Jiajun/metal-api-emulator`) are
+  alpha. So the translation exists in outline and is not shown to work, which
+  is a different state from "does not exist".
+- **"A macOS backend needs its own loader from nothing" is superseded by
+  Darling.** It provides the Mach-O loader, a Darwin syscall layer and an
+  Objective-C runtime. The Linux-kernel-shortcut argument is answered by
+  Darling's existence, not by a Cordial component.
+- **The graphics gate may not apply today.** Mac O' Blox's source shows the
+  client rendering through Roblox's own OpenGL 3.2 path, so Metal is not
+  needed to get a frame (**INFERRED**; not run). That path is a fallback
+  Roblox may remove.
+
+Unchanged: Darling is x86-64 only, no Roblox macOS arm64 route works, and the
+section "Settings picker and issue templates" still holds. Cordial builds no
+macOS runtime ([ADR-050](ADR-050-other-runtimes-are-launched-not-built.md));
+the launcher half is [ADR-052](ADR-052-the-runtime-spec.md).

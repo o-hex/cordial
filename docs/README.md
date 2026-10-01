@@ -15,6 +15,7 @@ order a newcomer would want it.
 | [`mangohud.md`](mangohud.md) | The MangoHUD switch: what it shows, and how to install the layer |
 | [`nvidia.md`](nvidia.md) | NVIDIA graphics: what is known, what Cordial does, the Flatpak driver extension, and how to report a problem. Untested on NVIDIA hardware |
 | [`plugins.md`](plugins.md) | Installing a plugin from an archive, and why Cordial fetches Deno |
+| [`runtime-spec.md`](runtime-spec.md) | Draft `cordial.runtime/1`: what a runtime implements for Cordial's launcher features. Nothing implements it yet |
 | [`architecture.md`](architecture.md) | How the pieces fit, as a diagram: shell, linker, symbol table, JNI, framework, plugins |
 | [`HANDOVER.md`](HANDOVER.md) | Written for whoever takes this on: every open thread, which claims are `INFERRED`, and the traps |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | What changed between releases, retractions included. [Releases](https://github.com/luohoa97/cordial/releases) |
@@ -24,7 +25,7 @@ order a newcomer would want it.
 
 ## ADRs
 
-All 47. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDOVER.md#the-adr-index) carries every record's own status line.
+All 52. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDOVER.md#the-adr-index) carries every record's own status line.
 
 | | |
 |---|---|
@@ -66,7 +67,7 @@ All 47. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDO
 | [ADR-036](adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md) | The unsafe/safe boundary is a lint, not a convention |
 | [ADR-037](adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md) | The build store's three writers share one lock, and an entry now proves its own bytes |
 | [ADR-038](adr/ADR-038-plugin-hot-swap.md) | A running client reconciles its plugin set; nothing pushes to it |
-| [ADR-039](adr/ADR-039-a-runtime-backend-seam-and-why-macos-waits.md) | A runtime-backend seam is cheap to describe and not worth building yet |
+| [ADR-039](adr/ADR-039-a-runtime-backend-seam-and-why-macos-waits.md) | A runtime-backend seam is cheap to describe and not worth building yet. Corrected 2026-10-01 on Metal, Darling and the loader |
 | [ADR-040](adr/ADR-040-the-engine-already-runs-mimalloc.md) | The engine already runs mimalloc, so there is no allocator to switch |
 | [ADR-041](adr/ADR-041-vkbasalt-post-processing.md) | vkBasalt post-processing is a driver-stack layer, not in-process hooking |
 | [ADR-042](adr/ADR-042-texture-format-query-observability.md) | Vulkan texture-format queries are counted and, test-only, maskable — nothing is translated |
@@ -77,8 +78,9 @@ All 47. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDO
 | [ADR-047](adr/ADR-047-the-canvas-is-lowered-only-under-a-presented-frame.md) | The canvas is lowered under GTK only once GTK has presented a frame, so a stalled GTK never leaves a grey screen |
 | [ADR-048](adr/ADR-048-labels-and-edits-from-discord.md) | Labels and edits from Discord are allowlisted, attributed and logged before they happen |
 | [ADR-049](adr/ADR-049-etc2-is-emulated-where-the-driver-lacks-it.md) | ETC2/EAC is decoded on the CPU where the driver lacks the feature, gated on the feature and not the vendor id; supersedes the "nothing is translated" half of ADR-042 |
-| [ADR-050](adr/ADR-050-other-runtimes-are-launched-not-built.md) | Other runtimes (Mac O' Blox) are detected and launched, never built into Cordial; parked until after 1.0 |
+| [ADR-050](adr/ADR-050-other-runtimes-are-launched-not-built.md) | Other runtimes (Mac O' Blox) are detected and launched, never built into Cordial; parked until after 1.0. Launching design superseded in part by ADR-052 |
 | [ADR-051](adr/ADR-051-overrides-are-reapplied-after-the-engines-refresh.md) | The profile's flag overrides are handed to the engine again after each of its own settings refreshes, triggered by its log |
+| [ADR-052](adr/ADR-052-the-runtime-spec.md) | Launcher features reach runtimes through a published spec, `cordial.runtime/1`; Cordial lists only its own runtime for now; supersedes ADR-050's launching design in part |
 
 ## Design notes
 
@@ -93,6 +95,7 @@ All 47. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDO
 | [`design/apt-repository.md`](design/apt-repository.md) | The APT repository: the key, how it is published, and why official Debian is a different question |
 | [`design/rpm-repository.md`](design/rpm-repository.md) | The dnf repository: `$releasever` layout, the key, and why official Fedora is a different question |
 | [`design/pacman-repository.md`](design/pacman-repository.md) | The pacman repository: the key, Chaotic-AUR and the AUR as separate routes |
+| [`analysis/macos-runtime.md`](analysis/macos-runtime.md) | Spike: how Mac O' Blox runs the macOS client, what Metal on Vulkan would cost, and the draft runtime spec. Read-only, nothing run |
 | [`analysis/desktop-integration-audit.md`](analysis/desktop-integration-audit.md) | What is already native-feeling about the `.desktop` entry, icons and deep links, and what is not |
 
 Writing a plugin rather than installing one: [`plugins/README.md`](../plugins/README.md).

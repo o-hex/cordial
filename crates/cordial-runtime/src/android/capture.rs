@@ -53,6 +53,9 @@ const LAYOUT_TRANSFER_SRC_OPTIMAL: i32 = 6;
 const ACCESS_TRANSFER_READ: u32 = 0x0000_0800;
 const ACCESS_MEMORY_READ: u32 = 0x0000_8000;
 const STAGE_TRANSFER: u32 = 0x0000_1000;
+const STAGE_ALL_COMMANDS: u32 = 0x0001_0000;
+pub const LAYOUT_COLOR_ATTACHMENT_OPTIMAL: i32 = 2;
+pub const ACCESS_COLOR_ATTACHMENT_WRITE: u32 = 0x0000_0100;
 const ASPECT_COLOR: u32 = 0x0000_0001;
 const QUEUE_FAMILY_IGNORED: u32 = u32::MAX;
 
@@ -277,7 +280,6 @@ pub fn pending() -> bool {
 /// Device-level entry points, resolved through the host's
 /// `vkGetDeviceProcAddr` once per capture.
 struct DeviceFns {
-    get_swapchain_images: extern "C" fn(u64, u64, *mut u32, *mut u64) -> i32,
     create_buffer: extern "C" fn(u64, *const BufferCreateInfo, *const c_void, *mut u64) -> i32,
     get_buffer_memory_requirements: extern "C" fn(u64, u64, *mut MemoryRequirements),
     allocate_memory: extern "C" fn(u64, *const MemoryAllocateInfo, *const c_void, *mut u64) -> i32,
@@ -371,8 +373,86 @@ fn do_capture(
         return Err("no swapchain has been created yet".into());
     }
 
+    let get_swapchain_images: extern "C" fn(u64, u64, *mut u32, *mut u64) -> i32 =
+        load!(gdpa, device, "vkGetSwapchainImagesKHR");
+
+    // The image being presented, by index into the swapchain's own list.
+    let mut count = 0u32;
+    if get_swapchain_images(device, swapchain, &mut count, std::ptr::null_mut()) != VK_SUCCESS {
+        return Err("vkGetSwapchainImagesKHR failed to count".into());
+    }
+    let mut images = vec![0u64; count as usize];
+    if get_swapchain_images(device, swapchain, &mut count, images.as_mut_ptr()) != VK_SUCCESS {
+        return Err("vkGetSwapchainImagesKHR failed".into());
+    }
+    let image = *images
+        .get(image_index as usize)
+        .ok_or_else(|| format!("image index {image_index} is outside {count} swapchain images"))?;
+    let target = Target {
+        device,
+        queue,
+        queue_family: QUEUE_FAMILY.load(Ordering::Relaxed) as u32,
+        image,
+        layout: LAYOUT_PRESENT_SRC_KHR,
+        src_access: ACCESS_MEMORY_READ,
+        layer: 0,
+        rect: (0, 0, width, height),
+        format: FORMAT.load(Ordering::Relaxed) as u32,
+    };
+    copy_to_png(&target, gdpa, gpdmp, physical_device, path)
+}
+
+/// One image to read back: where it is, the layout it is in and must be
+/// left in, and which layer and rectangle of it.
+pub struct Target {
+    pub device: u64,
+    pub queue: u64,
+    pub queue_family: u32,
+    pub image: u64,
+    /// The layout the image is in now, and is put back into after the copy.
+    pub layout: i32,
+    /// What last touched it, for the barrier into the copy.
+    pub src_access: u32,
+    pub layer: u32,
+    /// x, y, width, height.
+    pub rect: (i32, i32, u32, u32),
+    pub format: u32,
+}
+
+/// The capture an OpenXR frame takes (`guest_xr`): an image the engine has
+/// just finished rendering into, read before it is released to the runtime.
+/// Same one-at-a-time request as the present path's.
+pub fn capture_target(
+    target: &Target,
+    gdpa: extern "C" fn(u64, *const std::ffi::c_char) -> *mut c_void,
+    gpdmp: extern "C" fn(*mut c_void, *mut PhysicalDeviceMemoryProperties),
+    physical_device: *mut c_void,
+) {
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let path = pending.take();
+    PENDING_FAST.store(false, Ordering::Release);
+    drop(pending);
+    let Some(path) = path else { return };
+    let r = copy_to_png(target, gdpa, gpdmp, physical_device, &path);
+    if let Err(ref e) = r {
+        println!("[android] vulkan: capture failed: {e}");
+    }
+    finish(r);
+}
+
+fn copy_to_png(
+    t: &Target,
+    gdpa: extern "C" fn(u64, *const std::ffi::c_char) -> *mut c_void,
+    gpdmp: extern "C" fn(*mut c_void, *mut PhysicalDeviceMemoryProperties),
+    physical_device: *mut c_void,
+    path: &str,
+) -> Result<String, String> {
+    let (device, queue, image) = (t.device, t.queue, t.image);
+    let (x, y, width, height) = t.rect;
+    if device == 0 || image == 0 || width == 0 || height == 0 {
+        return Err("no image to read".into());
+    }
     let f = DeviceFns {
-        get_swapchain_images: load!(gdpa, device, "vkGetSwapchainImagesKHR"),
         create_buffer: load!(gdpa, device, "vkCreateBuffer"),
         get_buffer_memory_requirements: load!(gdpa, device, "vkGetBufferMemoryRequirements"),
         allocate_memory: load!(gdpa, device, "vkAllocateMemory"),
@@ -391,19 +471,6 @@ fn do_capture(
         free_memory: load!(gdpa, device, "vkFreeMemory"),
         destroy_command_pool: load!(gdpa, device, "vkDestroyCommandPool"),
     };
-
-    // The image being presented, by index into the swapchain's own list.
-    let mut count = 0u32;
-    if (f.get_swapchain_images)(device, swapchain, &mut count, std::ptr::null_mut()) != VK_SUCCESS {
-        return Err("vkGetSwapchainImagesKHR failed to count".into());
-    }
-    let mut images = vec![0u64; count as usize];
-    if (f.get_swapchain_images)(device, swapchain, &mut count, images.as_mut_ptr()) != VK_SUCCESS {
-        return Err("vkGetSwapchainImagesKHR failed".into());
-    }
-    let image = *images
-        .get(image_index as usize)
-        .ok_or_else(|| format!("image index {image_index} is outside {count} swapchain images"))?;
 
     // Four bytes a pixel: every format a swapchain is created with on this
     // path is a 32-bit BGRA or RGBA, and `FORMAT` records which so the channel
@@ -461,7 +528,7 @@ fn do_capture(
         _pad: 0,
         next: std::ptr::null(),
         flags: POOL_TRANSIENT,
-        queue_family_index: QUEUE_FAMILY.load(Ordering::Relaxed) as u32,
+        queue_family_index: t.queue_family,
     };
     let mut pool = 0u64;
     if (f.create_command_pool)(device, &pool_ci, std::ptr::null(), &mut pool) != VK_SUCCESS {
@@ -504,9 +571,9 @@ fn do_capture(
         s_type: ST_IMAGE_MEMORY_BARRIER,
         _pad: 0,
         next: std::ptr::null(),
-        src_access_mask: ACCESS_MEMORY_READ,
+        src_access_mask: t.src_access,
         dst_access_mask: ACCESS_TRANSFER_READ,
-        old_layout: LAYOUT_PRESENT_SRC_KHR,
+        old_layout: t.layout,
         new_layout: LAYOUT_TRANSFER_SRC_OPTIMAL,
         src_queue_family_index: QUEUE_FAMILY_IGNORED,
         dst_queue_family_index: QUEUE_FAMILY_IGNORED,
@@ -515,14 +582,16 @@ fn do_capture(
             aspect_mask: ASPECT_COLOR,
             base_mip_level: 0,
             level_count: 1,
-            base_array_layer: 0,
+            base_array_layer: t.layer,
             layer_count: 1,
         },
         _pad2: 0,
     };
     (f.cmd_pipeline_barrier)(
         cb,
-        STAGE_TRANSFER,
+        // All commands rather than transfer: on the OpenXR path the last
+        // writer is the engine's colour attachment output, not a transfer.
+        STAGE_ALL_COMMANDS,
         STAGE_TRANSFER,
         0,
         0,
@@ -540,10 +609,10 @@ fn do_capture(
         image_subresource: ImageSubresourceLayers {
             aspect_mask: ASPECT_COLOR,
             mip_level: 0,
-            base_array_layer: 0,
+            base_array_layer: t.layer,
             layer_count: 1,
         },
-        image_offset: [0, 0, 0],
+        image_offset: [x, y, 0],
         image_extent: [width, height, 1],
     };
     (f.cmd_copy_image_to_buffer)(cb, image, LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
@@ -552,7 +621,7 @@ fn do_capture(
         src_access_mask: ACCESS_TRANSFER_READ,
         dst_access_mask: ACCESS_MEMORY_READ,
         old_layout: LAYOUT_TRANSFER_SRC_OPTIMAL,
-        new_layout: LAYOUT_PRESENT_SRC_KHR,
+        new_layout: t.layout,
         ..to_src
     };
     (f.cmd_pipeline_barrier)(
@@ -596,7 +665,7 @@ fn do_capture(
             // SAFETY: the driver mapped exactly `size` bytes at `ptr`, and the
             // copy above has completed because the queue was waited on.
             let pixels = unsafe { std::slice::from_raw_parts(ptr as *const u8, size as usize) };
-            out = write_png(path, width, height, pixels, FORMAT.load(Ordering::Relaxed) as u32)
+            out = write_png(path, width, height, pixels, t.format)
                 .map(|_| format!("{path} {width}x{height}"));
             (f.unmap_memory)(device, memory);
         } else {

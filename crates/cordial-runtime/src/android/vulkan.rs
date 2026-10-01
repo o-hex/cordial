@@ -493,6 +493,10 @@ extern "C" fn vk_get_instance_proc_addr(instance: *mut c_void, name: *const c_ch
             );
             vk_create_swapchain_khr as *const () as *mut c_void
         }
+        b"vkDestroySwapchainKHR" => {
+            let p = unsafe { (h.get_instance_proc_addr)(instance, name) };
+            destroy_swapchain_entry(p)
+        }
         // Roblox compatibility wrapper; see [`vk_acquire_next_image_khr`].
         b"vkAcquireNextImageKHR" => {
             HOST_ACQUIRE_NEXT_IMAGE.store(
@@ -589,6 +593,7 @@ extern "C" fn vk_get_device_proc_addr(device: *mut c_void, name: *const c_char) 
                 .store(host(device, name) as usize, std::sync::atomic::Ordering::Relaxed);
             vk_create_swapchain_khr as *const () as *mut c_void
         }
+        b"vkDestroySwapchainKHR" => destroy_swapchain_entry(host(device, name)),
         b"vkAcquireNextImageKHR" => {
             HOST_ACQUIRE_NEXT_IMAGE
                 .store(host(device, name) as usize, std::sync::atomic::Ordering::Relaxed);
@@ -803,6 +808,64 @@ fn take_capture(queue: *mut c_void, info: *const c_void) {
     }
 }
 
+/// The capture for a frame that is never presented: an OpenXR engine hands
+/// its images to the runtime instead (`guest_xr`). The caller names the image,
+/// its layout and the queue family and index the session was created with;
+/// the queue itself, the device-level entry points and the memory properties
+/// come from the host loader here, with the same instance the engine uses.
+/// The copy is submitted on the engine's own queue, from the thread that is
+/// releasing the image, which is the moment it is complete.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn capture_image(instance: u64, physical_device: u64, queue_index: u32, mut target: super::capture::Target) {
+    let Some(h) = host() else {
+        super::capture::abandon("no host Vulkan");
+        return;
+    };
+    let inst = instance as *mut c_void;
+    let mut gdpa = HOST_GET_DEVICE_PROC_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    if gdpa == 0 {
+        // SAFETY: the host getter, with the engine's instance, for a core command.
+        gdpa = unsafe { (h.get_instance_proc_addr)(inst, c"vkGetDeviceProcAddr".as_ptr()) } as usize;
+    }
+    // SAFETY: as above.
+    let gpdmp = unsafe { (h.get_instance_proc_addr)(inst, c"vkGetPhysicalDeviceMemoryProperties".as_ptr()) };
+    if gdpa == 0 || gpdmp.is_null() {
+        super::capture::abandon("vkGetDeviceProcAddr or vkGetPhysicalDeviceMemoryProperties is unavailable");
+        return;
+    }
+    // SAFETY: resolved from the host loader for exactly these names.
+    let gdpa: extern "C" fn(u64, *const c_char) -> *mut c_void = unsafe { std::mem::transmute(gdpa) };
+    let gdq = gdpa(target.device, c"vkGetDeviceQueue".as_ptr());
+    if gdq.is_null() {
+        super::capture::abandon("vkGetDeviceQueue is unavailable");
+        return;
+    }
+    // SAFETY: as above; the family and index are the ones the session was
+    // created with, which the device was created to have.
+    let gdq: extern "C" fn(u64, u32, u32, *mut u64) = unsafe { std::mem::transmute(gdq) };
+    let mut queue = 0u64;
+    gdq(target.device, target.queue_family, queue_index, &mut queue);
+    target.queue = queue;
+    super::capture::capture_target(
+        &target,
+        gdpa,
+        // SAFETY: as above.
+        unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(*mut c_void, *mut super::capture::PhysicalDeviceMemoryProperties)>(gpdmp) },
+        physical_device as *mut c_void,
+    );
+}
+
+/// The physical device `vkCreateDevice` was last called with, and the device
+/// the engine's own path recorded, for the OpenXR bridge to check that the
+/// handles the runtime hands back are the ones this layer saw created.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn created_device() -> (u64, u64) {
+    (
+        PHYSICAL_DEVICE.load(std::sync::atomic::Ordering::Relaxed) as u64,
+        CREATED_DEVICE.load(std::sync::atomic::Ordering::Relaxed) as u64,
+    )
+}
+
 /// Ask for the next presented frame to be written to `path`, and wait for it.
 ///
 /// Blocking, with a bound, because the caller is a socket handler answering a
@@ -961,10 +1024,15 @@ extern "C" fn vk_create_device(
     // Puts back anything cleared in the caller's own structures for the call.
     drop(stripped);
     if rc == VK_SUCCESS && !device_out.is_null() {
+        // SAFETY: the driver just wrote the handle there.
+        CREATED_DEVICE.store(unsafe { *device_out } as usize, std::sync::atomic::Ordering::Relaxed);
         super::vulkan_etc::device_created(physical_device, unsafe { *device_out });
     }
     rc
 }
+
+/// The last device `vkCreateDevice` returned through this layer.
+static CREATED_DEVICE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// What the present-mode setting asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1180,6 +1248,51 @@ fn supported_present_modes(surface: u64) -> Option<Vec<i32>> {
 /// `None` on the same terms as [`supported_present_modes`]: the question could
 /// not be asked, so the caller changes nothing rather than guessing.
 fn surface_image_count_limits(surface: u64) -> Option<(u32, u32)> {
+    surface_capabilities(surface).map(|c| (c.min_image_count, c.max_image_count))
+}
+
+/// The sRGB format with the same layout as a UNORM one, for the two the
+/// engine has asked for a window swapchain in.
+fn srgb_twin(format: i32) -> Option<i32> {
+    match format {
+        37 => Some(43), // R8G8B8A8_UNORM -> R8G8B8A8_SRGB
+        44 => Some(50), // B8G8R8A8_UNORM -> B8G8R8A8_SRGB
+        _ => None,
+    }
+}
+
+/// Whether the host offers `format` in `color_space` for `surface`.
+fn surface_supports(surface: u64, format: i32, color_space: i32) -> bool {
+    let Some(h) = host() else { return false };
+    let instance = HOST_INSTANCE.load(std::sync::atomic::Ordering::Relaxed);
+    let physical_device = PHYSICAL_DEVICE.load(std::sync::atomic::Ordering::Relaxed);
+    if instance == 0 || physical_device == 0 {
+        return false;
+    }
+    // SAFETY: `instance` is the real host `VkInstance` this shim created, and
+    // the name is the WSI extension's own documented export.
+    let f = unsafe {
+        (h.get_instance_proc_addr)(instance as *mut c_void, c"vkGetPhysicalDeviceSurfaceFormatsKHR".as_ptr())
+    };
+    if f.is_null() {
+        return false;
+    }
+    type Fn_ = extern "C" fn(*mut c_void, u64, *mut u32, *mut [i32; 2]) -> i32;
+    // SAFETY: resolved from the host loader for exactly this name.
+    let f: Fn_ = unsafe { std::mem::transmute(f) };
+    let mut n = 0u32;
+    if f(physical_device as *mut c_void, surface, &mut n, std::ptr::null_mut()) != VK_SUCCESS {
+        return false;
+    }
+    let mut formats = vec![[0i32; 2]; n as usize];
+    if f(physical_device as *mut c_void, surface, &mut n, formats.as_mut_ptr()) != VK_SUCCESS {
+        return false;
+    }
+    formats.iter().take(n as usize).any(|&[fmt, cs]| fmt == format && cs == color_space)
+}
+
+/// The host's own answer for `surface`, unpatched.
+fn surface_capabilities(surface: u64) -> Option<VkSurfaceCapabilitiesKHR> {
     let h = host()?;
     let instance = HOST_INSTANCE.load(std::sync::atomic::Ordering::Relaxed);
     let physical_device = PHYSICAL_DEVICE.load(std::sync::atomic::Ordering::Relaxed);
@@ -1215,7 +1328,7 @@ fn surface_image_count_limits(surface: u64) -> Option<(u32, u32)> {
     if f(physical_device as *mut c_void, surface, &mut caps) != VK_SUCCESS {
         return None;
     }
-    Some((caps.min_image_count, caps.max_image_count))
+    Some(caps)
 }
 
 static HOST_CREATE_SWAPCHAIN: std::sync::atomic::AtomicUsize =
@@ -1257,7 +1370,8 @@ static HOST_CREATE_SWAPCHAIN: std::sync::atomic::AtomicUsize =
 ///
 /// Issue #39 was isolated to `vkAcquireNextImageKHR` status handling rather
 /// than this create wrapper; see [`vk_acquire_next_image_khr`].
-/// `vkDestroySwapchainKHR` remains uninterposed, and `oldSwapchain` is still
+/// `vkDestroySwapchainKHR` is interposed only for the XR mirror, to take its
+/// lock before forwarding the call unchanged, and `oldSwapchain` is still
 /// forwarded unchanged here.
 ///
 /// `tools/sober-corpus`'s issue #2180 (`Crashes after SceneManager first
@@ -1287,7 +1401,77 @@ extern "C" fn vk_create_swapchain_khr(
     allocator: *const c_void,
     swapchain_out: *mut u64,
 ) -> i32 {
+    // In an OpenXR session the engine never presents to this swapchain, and
+    // the window mirror (`xr_mirror`) blits the left eye into it, which needs
+    // `TRANSFER_DST` in its usage. Added only when an XR session exists --
+    // `xrCreateSession` precedes this call in every run logged -- only when
+    // the surface allows it, and never for the flat client.
+    let mut widened;
+    let mut create_info = create_info;
+    // SAFETY: the caller's struct, read only; a null one is forwarded as is.
+    if let Some(info) = unsafe { create_info.as_ref() } {
+        let want = super::xr_mirror::USAGE_TRANSFER_DST;
+        if super::xr_mirror::SESSION.load(std::sync::atomic::Ordering::Relaxed) && super::xr_mirror::enabled() && info.image_usage & want == 0 {
+            match surface_capabilities(info.surface) {
+                Some(c) if c.supported_usage_flags & want != 0 => {
+                    println!(
+                        "[android] vulkan: window swapchain usage {:#x} -> {:#x} for the XR mirror",
+                        info.image_usage,
+                        info.image_usage | want
+                    );
+                    widened = *info;
+                    widened.image_usage |= want;
+                    // The left eye is made as the sRGB twin of the engine's
+                    // UNORM request (`guest_xr::create_swapchain`), so a blit
+                    // decodes it to linear on the read. Into a UNORM window
+                    // image those linear values landed as they were, and the
+                    // mirror showed crushed shadows and too much contrast
+                    // while Monado, reading the same image as sRGB, looked
+                    // right. An sRGB window image encodes them again on the
+                    // write, so the bytes arrive as the engine drew them.
+                    if let Some(t) = srgb_twin(info.image_format)
+                        .filter(|&t| surface_supports(info.surface, t, info.image_color_space))
+                    {
+                        println!(
+                            "[android] vulkan: window swapchain format {} -> {t} for the XR mirror, to match \
+                             the sRGB left eye",
+                            info.image_format
+                        );
+                        widened.image_format = t;
+                    }
+                    create_info = &widened;
+                }
+                _ => println!(
+                    "[android] vulkan: window swapchain usage {:#x} left alone: the surface does not \
+                     allow a transfer into it, so the XR mirror cannot write it",
+                    info.image_usage
+                ),
+            }
+        }
+    }
+    // The XR mirror may have retired the engine's window swapchain by
+    // recreating it at the window's new size; the engine still holds the old
+    // handle, and a retired swapchain may not be passed as `oldSwapchain`
+    // again. The mirror's current one stands in for it and is destroyed once
+    // the engine's new one replaces it.
+    let mut relinked;
+    let mut replaced_mirror = 0;
+    // SAFETY: the caller's struct, read only.
+    if let Some(info) = unsafe { create_info.as_ref() } {
+        if info.old_swapchain != 0 {
+            if let Some(current) = mirror_swapchain_for_retired(info.old_swapchain) {
+                relinked = *info;
+                relinked.old_swapchain = current;
+                replaced_mirror = current;
+                create_info = &relinked;
+            }
+        }
+    }
     let rc = vk_create_swapchain_inner(device, create_info, allocator, swapchain_out);
+    if rc == VK_SUCCESS && replaced_mirror != 0 {
+        vk_destroy_swapchain_khr(device, replaced_mirror, std::ptr::null());
+        MIRROR_RESIZE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
     if rc == VK_SUCCESS && !create_info.is_null() && !swapchain_out.is_null() {
         // SAFETY: both pointers are the caller's, checked for null, and the
         // driver has just reported success so `swapchain_out` is written.
@@ -1300,9 +1484,139 @@ extern "C" fn vk_create_swapchain_khr(
                 info.image_extent.height,
                 info.image_format as u32,
             );
+            if super::xr_mirror::SESSION.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut kept = *info;
+                kept.p_next = std::ptr::null();
+                kept.old_swapchain = 0;
+                if kept.image_sharing_mode != 0 {
+                    // Concurrent sharing names queue families through a
+                    // pointer the caller owns; the mirror does not recreate
+                    // a swapchain it cannot describe.
+                    kept.queue_family_index_count = 0;
+                }
+                kept.p_queue_family_indices = std::ptr::null();
+                *WINDOW_SHAPE.lock().unwrap_or_else(|e| e.into_inner()) = Some(SendShape(kept));
+            }
+            super::xr_mirror::note_window_swapchain(
+                device as u64,
+                info.surface,
+                *swapchain_out,
+                info.image_extent.width,
+                info.image_extent.height,
+                info.image_format as u32,
+                info.image_usage,
+            );
         }
     }
     rc
+}
+
+static HOST_DESTROY_SWAPCHAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What to hand back for `vkDestroySwapchainKHR`. Only the VR mode's XR
+/// mirror needs to hear about a destroy, so the phone build gets the driver's
+/// own entry point, exactly as before the mirror existed, and a null stays
+/// null rather than becoming a wrapper that silently does nothing.
+fn destroy_swapchain_entry(host: *mut c_void) -> *mut c_void {
+    if host.is_null() || crate::profile::build() != crate::profile::Build::Quest {
+        return host;
+    }
+    HOST_DESTROY_SWAPCHAIN.store(host as usize, std::sync::atomic::Ordering::Relaxed);
+    vk_destroy_swapchain_khr as *const () as *mut c_void
+}
+
+/// `vkDestroySwapchainKHR`, unchanged, after the XR mirror has let go of the
+/// swapchain: the mirror presents to the engine's swapchain from the XR
+/// thread, and the engine may destroy it from another.
+extern "C" fn vk_destroy_swapchain_khr(device: *mut c_void, swapchain: u64, allocator: *const c_void) {
+    super::xr_mirror::forget_swapchain(swapchain);
+    let f = HOST_DESTROY_SWAPCHAIN.load(std::sync::atomic::Ordering::Relaxed);
+    if f != 0 {
+        // SAFETY: resolved from the host loader for exactly this name.
+        let f: extern "C" fn(*mut c_void, u64, *const c_void) = unsafe { std::mem::transmute(f) };
+        f(device, swapchain, allocator);
+    }
+}
+
+/// The engine's window swapchain create info, as last created in an XR
+/// session: what the mirror recreates from when the window is resized.
+struct SendShape(VkSwapchainCreateInfoKHR);
+// SAFETY: its pointers are nulled before it is stored.
+unsafe impl Send for SendShape {}
+static WINDOW_SHAPE: std::sync::Mutex<Option<SendShape>> = std::sync::Mutex::new(None);
+
+/// `(the engine's retired handle, the mirror's current swapchain)` once the
+/// mirror has resized the window swapchain under the engine.
+static MIRROR_RESIZE: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+
+fn mirror_swapchain_for_retired(old: u64) -> Option<u64> {
+    let g = MIRROR_RESIZE.lock().unwrap_or_else(|e| e.into_inner());
+    g.filter(|&(retired, _)| retired == old).map(|(_, current)| current)
+}
+
+/// Recreate the window swapchain at `width`x`height` for the XR mirror.
+///
+/// An engine rendering to OpenXR never presents to its window, so it never
+/// sees the out-of-date result that would make it rebuild the swapchain when
+/// the window is resized; the picture stayed at the size the window had when
+/// the session began. The engine's own create info is reused with only the
+/// extent changed, so format, usage and present mode are what the engine and
+/// this layer already chose. Must be called without the mirror's lock held:
+/// the create goes through [`vk_create_swapchain_khr`], which reports the new
+/// swapchain back to the mirror.
+pub(super) fn recreate_mirror_swapchain(device: u64, old: u64, width: u32, height: u32) -> Result<u64, String> {
+    let Some(SendShape(mut info)) = WINDOW_SHAPE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| SendShape(s.0))
+    else {
+        return Err("no window swapchain create info to recreate from".into());
+    };
+    if info.image_sharing_mode != 0 {
+        return Err("the window swapchain uses concurrent sharing".into());
+    }
+    if let Some(c) = surface_capabilities(info.surface) {
+        info.image_extent = VkExtent2D {
+            width: width.clamp(c.min_image_extent.width.max(1), c.max_image_extent.width.max(1)),
+            height: height.clamp(c.min_image_extent.height.max(1), c.max_image_extent.height.max(1)),
+        };
+    } else {
+        info.image_extent = VkExtent2D { width: width.max(1), height: height.max(1) };
+    }
+    info.old_swapchain = old;
+    let mut out = 0u64;
+    let rc = vk_create_swapchain_khr(device as *mut c_void, &info, std::ptr::null(), &mut out);
+    if rc != VK_SUCCESS {
+        return Err(format!("vkCreateSwapchainKHR returned {rc}"));
+    }
+    let mut g = MIRROR_RESIZE.lock().unwrap_or_else(|e| e.into_inner());
+    match *g {
+        // A second resize: the previous one was the mirror's own, retired now.
+        Some((retired, previous)) if previous == old => {
+            *g = Some((retired, out));
+            drop(g);
+            vk_destroy_swapchain_khr(device as *mut c_void, old, std::ptr::null());
+        }
+        _ => *g = Some((old, out)),
+    }
+    Ok(out)
+}
+
+/// The host's `vkGetDeviceProcAddr`, once anything has asked for it.
+pub(crate) fn device_proc_getter() -> Option<extern "C" fn(u64, *const c_char) -> *mut c_void> {
+    let f = HOST_GET_DEVICE_PROC_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: resolved from the host loader for exactly this name.
+    (f != 0).then(|| unsafe { std::mem::transmute::<usize, extern "C" fn(u64, *const c_char) -> *mut c_void>(f) })
+}
+
+/// An instance-level command from the host loader, against the real host
+/// instance.
+pub(crate) fn instance_fn(name: &CStr) -> Option<*mut c_void> {
+    let h = host()?;
+    let mut inst = HOST_INSTANCE.load(std::sync::atomic::Ordering::Relaxed);
+    if inst == 0 {
+        inst = INSTANCE.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    // SAFETY: the host getter, with a host instance, for a documented name.
+    let p = unsafe { (h.get_instance_proc_addr)(inst as *mut c_void, name.as_ptr()) };
+    (!p.is_null()).then_some(p)
 }
 
 extern "C" fn vk_create_swapchain_inner(

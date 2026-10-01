@@ -5434,12 +5434,20 @@ impl WaylandWindow {
                         true
                     }
                 };
+                //
+                // **"Dropped before reaching the engine" was only half true.**
+                // It is AGDK's `onKeyDownNative` that has nowhere to go;
+                // `pass_key_event` below runs either way, and under
+                // `--app-bridge`, which never has a handle, it is the only key
+                // path there is. A user on that path read the old line as the
+                // reason typing failed, when the key had in fact reached the
+                // engine and been withheld from a focused box by design.
                 if first {
                     eprintln!(
-                        "[android] wayland: key {evdev_key} (Android {keycode}) mapped but the \
-                         activity handle is 0, so it was dropped before reaching the engine. \
-                         Every later press of this key is dropped the same way and will not be \
-                         reported again."
+                        "[android] wayland: key {evdev_key} (Android {keycode}) has no activity \
+                         handle, so AGDK's onKey{}Native did not see it; it still goes to \
+                         nativePassKeyEvent. Not reported again for this key.",
+                        if down { "Down" } else { "Up" }
                     );
                 }
             }
@@ -6127,6 +6135,37 @@ impl WaylandWindow {
             let (gw, gh, _) = self.geometry();
             super::input::report_keyboard_state((gw, gh));
         }
+        self.pump_window(true);
+    }
+
+    /// Run GTK and the display connection with no GameActivity to deliver to.
+    ///
+    /// `--app-bridge` starts the engine without one, and GTK's main loop was
+    /// only ever iterated from [`Self::pump`], which needs a handle, so under
+    /// it the window never ran at all: no header-bar clicks, no move or resize,
+    /// and the canvas left at its first guessed rectangle, overlapping the
+    /// title bar.
+    ///
+    /// **The text editor runs here too, because nothing it needs is
+    /// GameActivity's.** This used to skip the IME and text-overlay syncs on
+    /// the belief that they asked GameActivity natives. They do not: focus is
+    /// `NativeGLJavaInterface.showKeyboard`, geometry is `nativeGetTextBoxInfo`
+    /// and the typed text goes back through `syncTextboxTextAndCursorPosition2`,
+    /// all plain JNI. Skipping them is what made a focused box untypeable under
+    /// `--app-bridge`: `pass_key_event` withholds character keys from a focused
+    /// box because the editor is meant to own them, and the editor was never
+    /// placed, so every letter went nowhere. Only pointer lock stays off, as a
+    /// decision about the headset rather than a dependency -- see
+    /// [`Self::pump_window`].
+    fn pump_without_engine(&self) {
+        self.pump_window(false);
+    }
+
+    /// `engine` is whether a GameActivity is driving this pump. It gates only
+    /// pointer lock: under `--app-bridge` the window shows a mirror of the
+    /// left eye, and capturing the desktop pointer into it on the engine's say
+    /// is untested against a headset session, so it is left as it was.
+    fn pump_window(&self, engine: bool) {
 
         // GTK's main loop does not get a thread of its own. It is iterated
         // here, on the thread that ran `gtk_init`, from inside the engine's
@@ -6161,6 +6200,10 @@ impl WaylandWindow {
         // Every tick, not only on the edges: a lowering waits for GTK to commit
         // a frame and is decided here, and one that timed out is retried here.
         self.reconcile_stacking();
+        if !engine {
+            self.read_display();
+            return;
+        }
         // Polled rather than driven by an event, because the engine's own
         // request for a locked centre is a *getter* — `nativeGetMainWindow
         // IsMouseLockedCenter` — with nothing that calls out when it changes.
@@ -6168,7 +6211,10 @@ impl WaylandWindow {
         // an atomic load against a decision a person makes a few times a
         // minute.
         self.sync_pointer_lock();
+        self.read_display();
+    }
 
+    fn read_display(&self) {
         // The documented thread-safe idiom for a `wl_display` connection that
         // more than one thread touches — and more than one does: Mesa's own
         // Wayland EGL winsys reads and writes this exact connection from
@@ -6277,6 +6323,13 @@ static DISPLAY_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 pub fn pump_input_events(handle: i64) {
     if let Some(w) = current() {
         w.pump(handle);
+    }
+}
+
+/// [`WaylandWindow::pump_without_engine`], for a run with no GameActivity.
+pub fn pump_window_only() {
+    if let Some(w) = current() {
+        w.pump_without_engine();
     }
 }
 

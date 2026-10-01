@@ -98,7 +98,7 @@ export async function openEditor(
     return refusal("That button has lost its issue number.");
   }
 
-  const labelsPending = part === 0 && context.labels
+  const labelsPending = part === 0 && context.labelPicker && context.labels
     ? context.labels.get(700).catch(() => null)
     : Promise.resolve(null);
   let issue;
@@ -253,7 +253,7 @@ export async function submitEdit(
   // list the picker could have been built from.
   let labelChange: { next: string[]; added: string[]; removed: string[] } | undefined;
   let labelNote = "";
-  if (custom.withLabels && part === 0) {
+  if (custom.withLabels && part === 0 && context.labelPicker) {
     const known = context.labels ? await context.labels.get(2000) : null;
     if (!known) {
       labelNote = " Labels were left as they were, because the label list could not be read.";

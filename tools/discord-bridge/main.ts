@@ -93,6 +93,8 @@ export async function build(source: Env) {
     threadChannelId: required("DISCORD_THREAD_CHANNEL_ID"),
     repoUrl,
     labels,
+    // Off unless exactly "1": see `Context.labelPicker`.
+    labelPicker: source.DISCORD_LABEL_PICKER === "1",
     reporterLabels: parseAllowlist(source.GITHUB_REPORTER_LABELS),
     moderatorRoleIds: roles.ids,
   };

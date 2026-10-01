@@ -1,6 +1,6 @@
 # ADR-048: Labels and edits from Discord are allowlisted, attributed and logged before they happen
 
-**Status:** accepted, **unverified against a live Discord server and GitHub App**
+**Status:** accepted; the label picker ships off, and nothing is verified against a live Discord server or GitHub App
 **Date:** 2026-10-01
 **Related:** [ADR-030](ADR-030-reports-arrive-from-discord.md)
 
@@ -21,6 +21,19 @@ meaning the project has to be able to trust, and for edits, which can destroy
 what a reporter wrote.
 
 ## Decision
+
+### The picker is off by default
+
+**`DISCORD_LABEL_PICKER=1` turns it on; anything else leaves it off.** A string
+select inside a modal is documented but has not been observed, and a modal
+Discord rejects fails every report dialog, not only the one with the picker.
+That is too large a blast radius to ship unverified. **Turn it on after
+confirming in a test server that the modal renders.** Off, the report dialog is
+the pre-label dialog exactly (same fields, same slots, nothing moved to the
+follow-up), the Edit dialog edits title and text only, no labels are fetched,
+and label picks arriving from a dialog opened earlier are ignored. There is no
+cheap label path that avoids a modal select, so with it off labels cannot be set
+from Discord; moderators use GitHub. Everything below describes the picker on.
 
 ### Labels
 

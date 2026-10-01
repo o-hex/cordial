@@ -59,6 +59,13 @@ export interface Context {
    * waits on a classification.
    */
   labels?: { get(timeoutMs?: number): Promise<Label[] | null> };
+  /**
+   * `DISCORD_LABEL_PICKER=1`. **Off unless set**, because whether Discord accepts
+   * a string select inside a modal is unverified, and if it does not, *every*
+   * report dialog fails with "interaction failed" and nobody can file anything.
+   * Off, the dialogs are text-only and exactly what they were before labels.
+   */
+  labelPicker?: boolean;
   /** What a reporter may pick; patterns, `*` the only wildcard. See `labels.ts`. */
   reporterLabels?: string[];
   /** Roles that count as moderators in addition to Discord's own permissions. */
@@ -415,7 +422,7 @@ async function labelPicker(
   form: IssueForm,
   interaction: Interaction,
 ): Promise<unknown | undefined> {
-  if (!context.labels) return undefined;
+  if (!context.labelPicker || !context.labels) return undefined;
   const known = await context.labels.get(1200).catch(() => null);
   if (!known) return undefined;
   const who = whoIs(context, interaction);
@@ -472,7 +479,9 @@ async function fileIssue(
   // and says what it left off.
   let labels = [...form.labels];
   let labelNote = "";
-  if (chosen.picks.length) {
+  // A dialog opened while the picker was on can still be submitted after it is
+  // turned off; its picks are ignored rather than applied behind the flag.
+  if (chosen.picks.length && context.labelPicker) {
     const known = context.labels ? await context.labels.get(2000).catch(() => null) : null;
     if (!known) {
       labelNote = "\n\nThe label list could not be read, so no labels were added. A maintainer " +

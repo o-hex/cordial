@@ -2,7 +2,7 @@ import { TEMPLATE_DIR } from "./repo.ts";
 import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.8";
 import { InteractionType, ResponseType } from "./discord.ts";
 import { type Context, handle } from "./interactions.ts";
-import { parseForm } from "./issue_forms.ts";
+import { modalFor, parseForm } from "./issue_forms.ts";
 import { threadFromBody } from "./issue_body.ts";
 
 const forms = [...Deno.readDirSync(TEMPLATE_DIR)]
@@ -458,6 +458,7 @@ function tracker(
     labelsOnIssue?: string[];
     roles?: string[];
     body?: string;
+    picker?: boolean;
   } = {},
 ) {
   const f = fakes();
@@ -504,6 +505,7 @@ function tracker(
   };
   const known = options.known === undefined ? repoLabels : options.known;
   f.context.labels = { get: () => Promise.resolve(known) };
+  f.context.labelPicker = options.picker ?? true;
   f.context.reporterLabels = ALLOW;
   f.context.moderatorRoleIds = options.roles ?? [];
   return { ...f, issue };
@@ -1045,4 +1047,76 @@ Deno.test("an issue whose body was reflowed on GitHub can still have its title a
   const { response } = await handle(t.context, pressAs("cordial-edit-open:12"));
   assertEquals(inputs(modalOf(response)), ["cordial-title", "cordial-labels"]);
   assertEquals(modalOf(response).title, "Edit #12", "one part only");
+});
+
+// ---- the picker is off unless asked for -----------------------------------------
+
+Deno.test("with the picker off, every report dialog is exactly what it was before labels", async () => {
+  for (const form of forms) {
+    const t = tracker({ picker: false });
+    let fetched = 0;
+    t.context.labels = { get: () => (fetched++, Promise.resolve(repoLabels)) };
+    const { response } = await handle(t.context, press(`cordial-issue-open:${form.slug}`, MOD));
+    const modal = modalOf(response);
+    // Same dialog as the plain generator: same id (no `:l`), same fields in
+    // the same slots, and the optional fields that did not fit are the ones
+    // that never did.
+    assertEquals(modal, modalFor(form, "main") as Modal, form.slug);
+    assertEquals(inputs(modal), form.placed.map((b) => b.id), form.slug);
+    assertEquals(modal.custom_id, `cordial-issue:${form.slug}:main`);
+    assertEquals(fetched, 0, "no label fetch is made for a dialog that has no picker");
+  }
+});
+
+Deno.test("with the picker off, bug_report keeps its original five fields and four leftovers", async () => {
+  const t = tracker({ picker: false });
+  const { response } = await handle(t.context, press("cordial-issue-open:bug_report"));
+  assertEquals(inputs(modalOf(response)), [
+    "what-happened",
+    "what-expected",
+    "repro",
+    "diagnostics",
+    "engine-log",
+  ]);
+  const { after } = await handle(
+    t.context,
+    submission(
+      { custom_id: "cordial-issue:bug_report:main" },
+      { "what-happened": "x", "what-expected": "y", "repro": "z", "diagnostics": "d" },
+    ),
+  );
+  await after!();
+  const reply = t.of("editOriginal")[0].args[1] as {
+    components: { components: { custom_id: string }[] }[];
+  };
+  assertEquals(reply.components[0].components[0].custom_id, "cordial-issue-extra:bug_report:12");
+  assertEquals(t.of("createIssue")[0].args[2], ["bug"]);
+});
+
+Deno.test("picks submitted while the picker is off are ignored, not applied", async () => {
+  // A dialog opened before the flag was turned off can still arrive.
+  const t = tracker({ picker: false });
+  const { after } = await handle(t.context, fileWithPicks(["gpu:nvidia"]));
+  await after!();
+  assertEquals(t.of("createIssue")[0].args[2], ["bug"]);
+});
+
+Deno.test("with the picker off, Edit changes title and text only", async () => {
+  const t = tracker({ picker: false, labelsOnIssue: ["bug", "area:input"] });
+  let fetched = 0;
+  t.context.labels = { get: () => (fetched++, Promise.resolve(repoLabels)) };
+  const { response } = await handle(t.context, pressAs("cordial-edit-open:12"));
+  const modal = modalOf(response);
+  assertEquals(inputs(modal), ["cordial-title", "what-happened", "what-expected", "repro"]);
+  assert(!modal.custom_id.endsWith(":l"));
+  assertEquals(fetched, 0);
+
+  // A forged label selection on that dialog changes no labels.
+  const { after } = await handle(
+    t.context,
+    submission(modal, { "cordial-title": "[Bug]: retitled" }, { "cordial-labels": ["gpu:nvidia"] }),
+  );
+  await after!();
+  const [update] = t.of("updateIssue");
+  assertEquals(update.args[1], { title: "[Bug]: retitled" });
 });

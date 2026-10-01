@@ -38,23 +38,32 @@ from Discord at all.
 Both are recorded in [ADR-048](../../docs/adr/ADR-048-labels-and-edits-from-discord.md); this is
 what they do and what to set.
 
-**Labels in the form.** The report dialog has an optional multi-select of the repository's GitHub
-labels, and what is chosen is applied when the issue is created. A reporter may pick only labels
-matching an allowlist, by default `area:*`, `platform:*`, `compositor:*` and `gpu:*`. A moderator
-may pick any label. A few triage labels (`confirmed`, `wontfix`, `invalid`, `duplicate`,
-`priority*`, `severity*`, `security*`, `triage*`, `good first issue`, `help wanted`) are never a
-reporter's to pick, even if the allowlist is widened to `*`; that list is in `labels.ts`, on purpose
-not in configuration. The labels a template applies by itself (`bug`) are applied as before.
+**The label picker is off by default and must be turned on** with `DISCORD_LABEL_PICKER=1`. Whether
+Discord accepts a string select inside a modal has not been observed, and if it refuses, every
+report dialog fails with "interaction failed" and nobody can file anything. **Turn it on after
+confirming in a test server that the modal renders.** Off, the report dialog is exactly what it was
+before labels (same fields, same slots, no field moved to the follow-up), the Edit dialog edits
+title and text only, and no labels are fetched. There is no label path that avoids a modal select,
+so with it off nobody can set labels from Discord.
+
+**Labels in the form (with the picker on).** The report dialog has an optional multi-select of the
+repository's GitHub labels, and what is chosen is applied when the issue is created. A reporter may
+pick only labels matching an allowlist, by default `area:*`, `platform:*`, `compositor:*` and
+`gpu:*`. A moderator may pick any label. A few triage labels (`confirmed`, `wontfix`, `invalid`,
+`duplicate`, `priority*`, `severity*`, `security*`, `triage*`, `good first issue`, `help wanted`)
+are never a reporter's to pick, even if the allowlist is widened to `*`; that list is in
+`labels.ts`, on purpose not in configuration. The labels a template applies by itself (`bug`) are
+applied as before.
 
 **Today the repository has only GitHub's default labels, so reporters see no menu** until labels
 matching the allowlist exist. Create them (`area:graphics`, `compositor:sway`, `gpu:nvidia`, ...)
 and it appears within ten minutes, the cache lifetime.
 
-The menu takes one of the dialog's five slots, so on `bug_report`, `broken_feature`, `finding` and
-`roblox_update` one optional field moves to the "Add the rest" follow-up. If the label list cannot
-be read, the dialog opens without the menu and the report files without labels. Past 25 eligible
-labels the ones already on the issue come first, then the form's own groups (`FORM_LABEL_ORDER`),
-then name order, and the menu says how many did not fit.
+With the picker on, the menu takes one of the dialog's five slots, so on `bug_report`,
+`broken_feature`, `finding` and `roblox_update` one optional field moves to the "Add the rest"
+follow-up. If the label list cannot be read, the dialog opens without the menu and the report files
+without labels. Past 25 eligible labels the ones already on the issue come first, then the form's
+own groups (`FORM_LABEL_ORDER`), then name order, and the menu says how many did not fit.
 
 **Editing.** **Edit** is the last button on a thread's first message. It opens a dialog filled with
 the issue's title, the form's free-text answers and, if there are labels to choose, a label menu. A
@@ -197,12 +206,13 @@ Then:
 | `GITHUB_READ_TOKEN`           | Optional. Only raises the rate limit for reading templates |
 | `GITHUB_REF_NAME`             | Optional, defaults to `main`                               |
 
-Two more, both optional and neither a secret:
+Three more, all optional and none a secret:
 
-| Variable                     | What                                                                                                                                                     |
-| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GITHUB_REPORTER_LABELS`     | Labels a reporter may pick, comma-separated, `*` as a wildcard. Unset: `area:*,platform:*,compositor:*,gpu:*`. `none`: no reporter labels                |
-| `DISCORD_MODERATOR_ROLE_IDS` | Role ids, comma-separated, that count as moderators besides Manage Messages / Manage Threads / Administrator. A malformed id stops the bridge at startup |
+| Variable                     | What                                                                                                                                                              |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GITHUB_REPORTER_LABELS`     | Labels a reporter may pick, comma-separated, `*` as a wildcard. Unset: `area:*,platform:*,compositor:*,gpu:*`. `none`: no reporter labels                         |
+| `DISCORD_LABEL_PICKER`       | `1` turns the label picker on in the report and Edit dialogs. Anything else, or unset, leaves it off. Turn it on only after a test server shows the modal renders |
+| `DISCORD_MODERATOR_ROLE_IDS` | Role ids, comma-separated, that count as moderators besides Manage Messages / Manage Threads / Administrator. A malformed id stops the bridge at startup          |
 
 No new GitHub App permission is needed: Issues read and write already covers labels and comments. No
 slash command or context-menu command was added, so `register-commands` is unchanged. Add the two

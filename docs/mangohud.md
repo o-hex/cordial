@@ -19,7 +19,7 @@ extension's library path exists only inside a sandbox.
 
 - **Fedora:** `dnf install mangohud`.
 - **Arch:** `pacman -S mangohud`.
-- **Flatpak:** `flatpak install org.freedesktop.Platform.VulkanLayer.MangoHud`.
+- **Flatpak:** `flatpak install flathub org.freedesktop.Platform.VulkanLayer.MangoHud//25.08`. Name the `25.08` branch: if `flatpak` asks which one, the `stable` branch is end-of-life and Cordial never loads it.
   A runtime extension, not a Cordial package: it mounts under
   `org.freedesktop.Platform`'s `VulkanLayer` extension point, so Cordial's
   manifest needs nothing added for it to be seen

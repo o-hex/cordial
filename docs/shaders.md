@@ -14,7 +14,7 @@ that turns on and does nothing is worse than no row at all.
 - **Fedora / rpm-ostree layering:** `dnf install vkBasalt` (`sudo dnf install
   -y vkBasalt` in a `distrobox` if the host is immutable).
 - **Arch:** `pacman -S vkbasalt` (multilib for a 32-bit game).
-- **Flatpak:** `flatpak install org.freedesktop.Platform.VulkanLayer.vkBasalt`.
+- **Flatpak:** `flatpak install flathub org.freedesktop.Platform.VulkanLayer.vkBasalt//25.08`. Name the `25.08` branch: if `flatpak` asks which one, the `stable` branch is end-of-life and Cordial never loads it.
   This is a runtime extension, not a Cordial package change — it mounts under
   `org.freedesktop.Platform`'s own `VulkanLayer` extension point, the same one
   MangoHUD uses, so Cordial's manifest needs nothing added for it to be seen.

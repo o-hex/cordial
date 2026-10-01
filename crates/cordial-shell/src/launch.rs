@@ -652,7 +652,20 @@ pub fn in_flatpak() -> bool {
 /// two ways to accomplish one thing.
 ///
 /// So the hint names one, and it is chosen rather than guessed.
+/// The branch of `org.freedesktop.Platform.VulkanLayer.*` that Cordial's
+/// Flatpak runtime loads: org.gnome.Platform 50 declares the extension point at
+/// version 25.08 (`flatpak info --show-metadata org.gnome.Platform//50`). The
+/// hints name it because a bare `flatpak install` asks which branch to use, and
+/// picking the end-of-life `stable` one installs an extension the runtime never
+/// loads, so the switch stays "Not available" after a successful install. A
+/// test ties this to the manifest's runtime-version.
+pub const VULKAN_LAYER_BRANCH: &str = "25.08";
+
 pub fn mangohud_install_hint() -> &'static str {
+    mangohud_install_hint_for(in_flatpak())
+}
+
+fn mangohud_install_hint_for(flatpak: bool) -> &'static str {
     // **Kept to one line each, because this is shown in a settings row that
     // cannot be clicked.** It used to spell out why the *other* route fails --
     // a host package is invisible to a sandboxed build, and the Flatpak
@@ -660,9 +673,9 @@ pub fn mangohud_install_hint() -> &'static str {
     // and was reported rendering as five lines ending in an ellipsis. A
     // paragraph nobody can read is worth less than the one sentence that names
     // the right command. The reasoning lives in this function's doc instead.
-    if in_flatpak() {
-        "Install the Flatpak extension: flatpak install \
-         org.freedesktop.Platform.VulkanLayer.MangoHud"
+    if flatpak {
+        "Install the Flatpak extension: flatpak install flathub \
+         org.freedesktop.Platform.VulkanLayer.MangoHud//25.08"
     } else {
         "Install it from your distribution (Fedora: dnf install mangohud, Arch: pacman -S \
          mangohud)."
@@ -727,9 +740,13 @@ fn find_mangohud_layer_in(dirs: &[PathBuf]) -> Option<PathBuf> {
 /// extension and the host package are not interchangeable, and which one is
 /// right is decided by how Cordial was installed, not by preference.
 pub fn vkbasalt_install_hint() -> &'static str {
-    if in_flatpak() {
-        "Install the Flatpak extension: flatpak install \
-         org.freedesktop.Platform.VulkanLayer.vkBasalt"
+    vkbasalt_install_hint_for(in_flatpak())
+}
+
+fn vkbasalt_install_hint_for(flatpak: bool) -> &'static str {
+    if flatpak {
+        "Install the Flatpak extension: flatpak install flathub \
+         org.freedesktop.Platform.VulkanLayer.vkBasalt//25.08"
     } else {
         "Install it from your distribution (Fedora: dnf install vkBasalt, Arch: pacman -S \
          vkbasalt)."
@@ -916,6 +933,21 @@ fn describe(loader: &Path, lib_dir: &Path, apk: &Path, run: &str, join_url: Opti
 
 #[cfg(test)]
 mod tests {
+
+    /// The layer branch in the install hints has to follow the Flatpak runtime.
+    /// GNOME 50 loads VulkanLayer 25.08; a runtime bump must revisit both.
+    #[test]
+    fn the_vulkan_layer_branch_follows_the_flatpak_runtime() {
+        let manifest = include_str!("../../../packaging/io.github.luohoa97.Cordial.yml");
+        assert!(
+            manifest.lines().any(|l| l.trim() == "runtime-version: '50'"),
+            "the Flatpak runtime changed; update VULKAN_LAYER_BRANCH to the VulkanLayer \
+             version it declares (flatpak info --show-metadata org.gnome.Platform//N)"
+        );
+        assert_eq!(VULKAN_LAYER_BRANCH, "25.08");
+        assert!(vkbasalt_install_hint_for(true).ends_with(&format!("//{VULKAN_LAYER_BRANCH}")));
+        assert!(mangohud_install_hint_for(true).ends_with(&format!("//{VULKAN_LAYER_BRANCH}")));
+    }
 
     #[test]
     fn a_session_line_is_replaced_rather_than_kept_or_dropped() {

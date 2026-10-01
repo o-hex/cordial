@@ -88,6 +88,10 @@ void cordial_linker_defer_next_ctors(int defer) {
     fprintf(stderr, "[linker] constructor deferral unavailable: patches/0003 is not applied\n");
 }
 
+int cordial_linker_defer_available() {
+    return mcpelauncher_defer_next_ctors != nullptr;
+}
+
 void cordial_linker_run_deferred_ctors(void* handle) {
     if (mcpelauncher_run_deferred_ctors) {
         mcpelauncher_run_deferred_ctors(handle);
@@ -106,6 +110,42 @@ void cordial_linker_set_realpath(void* handle, const char* path) {
         return;
     }
     fprintf(stderr, "[linker] realpath override unavailable: patches/0004 is not applied\n");
+}
+
+// docs/vr/dynarmic-design.md §2: linking the Quest build's arm64 objects into
+// an x86-64 process for the translator to run. `patches/0006`, which
+// crates/cordial-linker-sys/build.rs applies (patches/apply.rs); weak for the
+// reason the block above gives, so a loader built without it links and
+// `--guest-arm64` says why it cannot run rather than failing to build.
+extern "C" __attribute__((weak)) void mcpelauncher_set_guest_machine(int machine);
+extern "C" __attribute__((weak)) void mcpelauncher_mark_guest(void* handle, int machine);
+extern "C" __attribute__((weak)) size_t mcpelauncher_guest_ctors(void* handle, int* machine,
+                                                                 void** init_func,
+                                                                 void*** init_array);
+
+int cordial_linker_set_guest_machine(int machine) {
+    if (!mcpelauncher_set_guest_machine) {
+        return 0;
+    }
+    mcpelauncher_set_guest_machine(machine);
+    return 1;
+}
+
+int cordial_linker_mark_guest(void* handle, int machine) {
+    if (!mcpelauncher_mark_guest) {
+        return 0;
+    }
+    mcpelauncher_mark_guest(handle, machine);
+    return 1;
+}
+
+// Returns the DT_INIT_ARRAY length, or (size_t)-1 when the patch is absent.
+size_t cordial_linker_guest_ctors(void* handle, int* machine, void** init_func,
+                                  void*** init_array) {
+    if (!mcpelauncher_guest_ctors) {
+        return static_cast<size_t>(-1);
+    }
+    return mcpelauncher_guest_ctors(handle, machine, init_func, init_array);
 }
 
 void* cordial_linker_dlsym(void* handle, const char* symbol) {

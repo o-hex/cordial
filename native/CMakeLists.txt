@@ -15,7 +15,13 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 # The AOSP bionic linker, via minecraft-linux's host wrapper. Target: `linker`.
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mcpelauncher-linker
+# crates/cordial-linker-sys/build.rs passes a patched overlay of the
+# submodule here (patches/apply.rs); the submodule itself is the default for
+# a configure run by hand.
+if(NOT CORDIAL_LINKER_DIR)
+  set(CORDIAL_LINKER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mcpelauncher-linker)
+endif()
+add_subdirectory(${CORDIAL_LINKER_DIR}
                  ${CMAKE_CURRENT_BINARY_DIR}/mcpelauncher-linker)
 
 # Undo the upstream `-DPATH_MAX=256`, which is a stack overflow waiting for a

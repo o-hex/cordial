@@ -1,0 +1,315 @@
+--- a/linker/linker_phdr.cpp
++++ b/linker/linker_phdr.cpp
+@@ -64,6 +64,8 @@
+ #endif
+ }
+ 
++int g_cordial_guest_machine = 0;
++
+ /**
+   TECHNICAL NOTE ON ELF LOADING.
+ 
+@@ -260,7 +262,8 @@
+     return false;
+   }
+ 
+-  if (header_.e_machine != GetTargetElfMachine()) {
++  if (header_.e_machine != GetTargetElfMachine() &&
++      (g_cordial_guest_machine == 0 || header_.e_machine != g_cordial_guest_machine)) {
+     DL_ERR("\"%s\" is for %s (%d) instead of %s (%d)",
+            name_.c_str(),
+            EM_to_string(header_.e_machine), header_.e_machine,
+@@ -725,6 +728,12 @@
+       return false;
+     }
+     int prot = PFLAGS_TO_PROT(phdr->p_flags);
++    // Cordial, patches/0006: guest text is only ever read, by the
++    // translator, so it is not mapped executable. A stray host jump into it
++    // then faults at once instead of running arm64 bytes as x86.
++    if (guest_machine() != 0) {
++      prot &= ~PROT_EXEC;
++    }
+ #if defined(__APPLE__) && defined(__aarch64__)
+     void* seg_addr = reinterpret_cast<void*>(seg_page_start);
+ 
+@@ -1289,3 +1298,7 @@
+          name_.c_str(), reinterpret_cast<void*>(loaded));
+   return false;
+ }
++
++uint16_t ElfReader::guest_machine() const {
++  return header_.e_machine == GetTargetElfMachine() ? 0 : header_.e_machine;
++}
+--- a/linker/linker_phdr.h
++++ b/linker/linker_phdr.h
+@@ -55,6 +55,8 @@
+   const char* get_string(ElfW(Word) index) const;
+   bool is_mapped_by_caller() const { return mapped_by_caller_; }
+   ElfW(Addr) entry_point() const { return header_.e_entry + load_bias_; }
++  // Cordial, patches/0006: the object's e_machine if it is not the host's.
++  uint16_t guest_machine() const;
+ 
+  private:
+   bool ReadElfHeader();
+--- a/linker/linker_relocate.cpp
++++ b/linker/linker_relocate.cpp
+@@ -33,6 +33,8 @@
+ 
+ #include <type_traits>
+ 
++#include <stdio.h>
++
+ #include "linker.h"
+ #include "linker_debug.h"
+ #include "linker_globals.h"
+@@ -76,6 +78,10 @@
+   const ElfW(Sym)* cache_sym = nullptr;
+   soinfo* cache_si = nullptr;
+ 
++  // Cordial, patches/0006: a guest object's relocations counted by their own
++  // type, before translation (see `guest_reloc_types`).
++  size_t guest_counts[5] = {};
++
+   std::vector<TlsDynamicResolverArg>* tlsdesc_args;
+   std::vector<std::pair<TlsDescriptor*, size_t>> deferred_tlsdesc_relocs;
+   size_t tls_tp_base = 0;
+@@ -529,9 +535,70 @@
+   return process_relocation_impl<RelocMode::General>(relocator, reloc);
+ }
+ 
++// Cordial, patches/0006: the relocation types a guest object may carry, and
++// the host's generic type each one means. Only the four that write a 64-bit
++// address (plus NONE) are accepted. They are the same operation on either
++// instruction set, which is why the host's own code path can apply them once
++// the number is translated. Everything else is refused by name rather than
++// guessed at: IRELATIVE would have the host call a guest resolver, TLS types
++// need a guest TLS layout, and COPY is refused for host objects too.
++#if defined(__LP64__)
++static constexpr struct {
++  uint32_t guest;
++  uint32_t host;
++  const char* name;
++} guest_reloc_types[] = {
++  {R_AARCH64_NONE, R_GENERIC_NONE, "R_AARCH64_NONE"},
++  {R_AARCH64_ABS64, R_GENERIC_ABSOLUTE, "R_AARCH64_ABS64"},
++  {R_AARCH64_GLOB_DAT, R_GENERIC_GLOB_DAT, "R_AARCH64_GLOB_DAT"},
++  {R_AARCH64_JUMP_SLOT, R_GENERIC_JUMP_SLOT, "R_AARCH64_JUMP_SLOT"},
++  {R_AARCH64_RELATIVE, R_GENERIC_RELATIVE, "R_AARCH64_RELATIVE"},
++};
++
++template <RelocMode Mode>
++__attribute__((noinline))
++static bool process_guest_relocation(Relocator& relocator, const rel_t& reloc) {
++  const uint32_t r_type = ELFW(R_TYPE)(reloc.r_info);
++  if (relocator.si->guest_machine_ != EM_AARCH64) {
++    DL_ERR("\"%s\" is a guest object for machine %d, and only EM_AARCH64 guests are supported",
++           relocator.si->get_realpath(), relocator.si->guest_machine_);
++    return false;
++  }
++  for (size_t i = 0; i < sizeof(guest_reloc_types) / sizeof(guest_reloc_types[0]); ++i) {
++    if (guest_reloc_types[i].guest == r_type) {
++      ++relocator.guest_counts[i];
++      rel_t host = reloc;
++      host.r_info = ELFW(R_INFO)(ELFW(R_SYM)(reloc.r_info), guest_reloc_types[i].host);
++      return Mode == RelocMode::General ?
++          process_relocation_general(relocator, host) :
++          process_relocation_impl<Mode>(relocator, host);
++    }
++  }
++  DL_ERR("unsupported guest relocation type %u in \"%s\": only NONE, ABS64, GLOB_DAT, "
++         "JUMP_SLOT and RELATIVE can be applied without running guest code",
++         r_type, relocator.si->get_realpath());
++  return false;
++}
++
++// Relative relocations RELR encodes, counted the way `relocate_relr` applies
++// them: one per even word, one per set bit above bit 0 of an odd one.
++static size_t count_relr(const ElfW(Relr)* relr, size_t n) {
++  size_t count = 0;
++  for (size_t i = 0; i < n; ++i) {
++    count += (relr[i] & 1) == 0 ? 1 : __builtin_popcountll(relr[i] >> 1);
++  }
++  return count;
++}
++#endif
++
+ template <RelocMode Mode>
+ __attribute__((always_inline))
+ static inline bool process_relocation(Relocator& relocator, const rel_t& reloc) {
++#if defined(__LP64__)
++  if (__predict_false(relocator.si->is_guest())) {
++    return process_guest_relocation<Mode>(relocator, reloc);
++  }
++#endif
+   return Mode == RelocMode::General ?
+       process_relocation_general(relocator, reloc) :
+       process_relocation_impl<Mode>(relocator, reloc);
+@@ -585,7 +652,17 @@
+       packed_relocate_impl<OptMode>(relocator, args...);
+ }
+ 
+-bool soinfo::relocate(const SymbolLookupList& lookup_list) {
++bool soinfo::relocate(const SymbolLookupList& lookup_list_all) {
++  // Cordial, patches/0006: once guest objects exist, each object binds only
++  // to definitions of its own instruction set. A guest import that found a
++  // host function would be the guest jumping into x86 code; one that finds
++  // nothing fails by name instead. With no guest machine set this is the
++  // original list, untouched.
++  std::unique_ptr<SymbolLookupList> same_isa;
++  if (g_cordial_guest_machine != 0) {
++    same_isa = std::make_unique<SymbolLookupList>(lookup_list_all, is_guest());
++  }
++  const SymbolLookupList& lookup_list = same_isa ? *same_isa : lookup_list_all;
+ 
+   VersionTracker version_tracker;
+ 
+@@ -666,6 +743,18 @@
+   }
+ #endif
+ 
++#if defined(__LP64__)
++  if (is_guest()) {
++    // The whole point of logging this: it is checked against `llvm-readelf
++    // -r` of the same file, type by type, to show nothing was skipped.
++    fprintf(stderr, "[linker] guest relocations applied in %s:", get_realpath());
++    for (size_t i = 0; i < sizeof(guest_reloc_types) / sizeof(guest_reloc_types[0]); ++i) {
++      fprintf(stderr, " %s=%zu", guest_reloc_types[i].name, relocator.guest_counts[i]);
++    }
++    fprintf(stderr, " RELR=%zu\n", relr_ != nullptr ? count_relr(relr_, relr_count_) : 0);
++  }
++#endif
++
+   // Once the tlsdesc_args_ vector's size is finalized, we can write the addresses of its elements
+   // into the TLSDESC relocations.
+ #if 0 && defined(__aarch64__)
+--- a/linker/linker_soinfo.cpp
++++ b/linker/linker_soinfo.cpp
+@@ -30,6 +30,7 @@
+ 
+ #include <dlfcn.h>
+ #include <elf.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+@@ -78,6 +79,20 @@
+   end_ = &libs_[0] + libs_.size();
+ }
+ 
++SymbolLookupList::SymbolLookupList(const SymbolLookupList& from, bool guest) {
++  slow_path_count_ += is_lookup_tracing_enabled();
++  // The DT_SYMBOLIC slot stays empty: if `from` had one in use it is the
++  // first entry of its range and is copied in order like the rest.
++  libs_.push_back(SymbolLookupLib {});
++  for (const SymbolLookupLib* it = from.begin(); it != from.end(); ++it) {
++    if (it->si_ == nullptr || it->si_->is_guest() != guest) continue;
++    libs_.push_back(*it);
++    slow_path_count_ += libs_.back().needs_sysv_lookup();
++  }
++  begin_ = &libs_[1];
++  end_ = &libs_[0] + libs_.size();
++}
++
+ /* "This element's presence in a shared object library alters the dynamic linker's
+  * symbol resolution algorithm for references within the library. Instead of starting
+  * a symbol search with the executable file, the dynamic linker starts from the shared
+@@ -563,6 +578,18 @@
+   // 4. The debug .so depends on libc, so CallConstructors is
+   //    called again with the libc soinfo. If it doesn't trigger the early-
+   //    out above, the libc constructor will be called again (recursively!).
++  // Cordial, patches/0006: a guest object's constructors are guest code, and
++  // calling one from here would jump the host CPU into another instruction
++  // set. They are left pending, `constructors_called` stays false, and the
++  // translator runs them itself (mcpelauncher_guest_ctors).
++  if (is_guest()) {
++    fprintf(stderr, "[linker] %s: %zu DT_INIT_ARRAY entries%s left for the translator; "
++            "a guest object's constructors are never called by the host\n",
++            get_realpath(), init_array_ ? init_array_count_ : 0,
++            init_func_ ? " and DT_INIT" : "");
++    return;
++  }
++
+   constructors_called = true;
+ 
+   if (!is_main_executable() && preinit_array_ != nullptr) {
+--- a/linker/linker_soinfo.h
++++ b/linker/linker_soinfo.h
+@@ -105,6 +105,9 @@
+  public:
+   explicit SymbolLookupList(soinfo* si);
+   SymbolLookupList(const soinfo_list_t& global_group, const soinfo_list_t& local_group);
++  // Cordial, patches/0006: `from`, keeping only guest libraries or only host
++  // ones, in the same order.
++  SymbolLookupList(const SymbolLookupList& from, bool guest);
+   void set_dt_symbolic_lib(soinfo* symbolic_lib);
+ 
+   const SymbolLookupLib* begin() const { return begin_; }
+@@ -448,8 +451,23 @@
+     void** orig;
+   };
+   std::unordered_map<std::string, std::shared_ptr<HookEntry>> symbols;
++
++  // Cordial, patches/0006: the ELF machine of an object built for another
++  // instruction set and loaded here to be run by a translator (the Quest
++  // build's arm64 libroblox.so inside an x86-64 process), or 0 for an object
++  // the host CPU runs. A virtual library is marked the same way when the
++  // addresses it holds are guest stubs. Relocation only ever binds an object
++  // to definitions of its own kind, and the host never calls a guest
++  // object's constructors: either would hand one instruction set the other's
++  // code, which does not fault cleanly, it runs garbage.
++  uint16_t guest_machine_ = 0;
++  bool is_guest() const { return guest_machine_ != 0; }
+ };
+ 
++// Cordial, patches/0006: the foreign ELF machine the loader accepts besides
++// the host's own, or 0 (the default) to accept only the host's.
++extern int g_cordial_guest_machine;
++
+ // This function is used by dlvsym() to calculate hash of sym_ver
+ uint32_t calculate_elf_hash(const char* name);
+ 
+--- a/linker/linker.cpp
++++ b/linker/linker.cpp
+@@ -662,6 +662,7 @@
+     si_->load_bias = elf_reader.load_bias();
+     si_->phnum = elf_reader.phdr_count();
+     si_->phdr = elf_reader.loaded_phdr();
++    si_->guest_machine_ = elf_reader.guest_machine();
+ 
+     // Apply hooks before loading the library
+     auto extinfo = this->get_extinfo();
+@@ -3797,3 +3798,34 @@
+   // it is not worth munmap()'ing those pages.
+   TypeBasedAllocator<LoadTask>::purge();
+ }
++
++// Cordial, patches/0006: linking objects built for another instruction set.
++// See `soinfo::guest_machine_`. Inert until something calls the first of
++// these with a non-zero machine.
++extern "C" void mcpelauncher_set_guest_machine(int machine) {
++  g_cordial_guest_machine = machine;
++}
++
++// Marks a library registered through `linker::load_library` as holding guest
++// addresses, so only guest objects bind to it.
++extern "C" void mcpelauncher_mark_guest(void* handle, int machine) {
++  soinfo* si = soinfo_from_handle(handle);
++  if (si != nullptr) {
++    si->guest_machine_ = static_cast<uint16_t>(machine);
++  }
++}
++
++// What a guest object's constructors are, for the translator that has to run
++// them: the machine (0 for a host object), DT_INIT and DT_INIT_ARRAY. Returns
++// the array's length.
++extern "C" size_t mcpelauncher_guest_ctors(void* handle, int* machine, void** init_func,
++                                           void*** init_array) {
++  soinfo* si = soinfo_from_handle(handle);
++  if (si == nullptr) {
++    return 0;
++  }
++  *machine = si->guest_machine_;
++  *init_func = reinterpret_cast<void*>(si->init_func_);
++  *init_array = reinterpret_cast<void**>(si->init_array_);
++  return si->init_array_ != nullptr ? si->init_array_count_ : 0;
++}

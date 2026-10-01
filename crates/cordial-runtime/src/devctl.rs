@@ -651,12 +651,19 @@ fn report_replace(verb: &str, text: &str, result: Result<usize, String>) {
 mod tests {
     use super::*;
 
+    // The two tests below share the process-global `QUEUE`, and the test
+    // harness runs them on parallel threads: one test's `drain()` could take
+    // the other's queued command, and both then failed, seen in 2 of 6
+    // `cargo test --workspace` invocations in a Fedora 44 container. The comment
+    // here used to say this was the only test that touched the queue, which
+    // stopped being true when the second was added beside it.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // `QUEUE` is process-global, so this drains it first rather than assuming
-    // it starts empty -- this is the only test in the file that touches it,
-    // but a test that assumes a shared static's initial state is a test that
-    // breaks the day a second one is added next to it.
+    // it starts empty.
     #[test]
     fn redraw_verb_queues_exactly_one_redraw_command() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         drain();
         assert_eq!(handle("redraw"), "ok");
         let queued = drain();
@@ -669,6 +676,7 @@ mod tests {
     // input would be indistinguishable from the command actually asked for.
     #[test]
     fn unknown_verb_is_rejected_not_queued() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         drain();
         let reply = handle("redrew");
         assert!(reply.starts_with("err"), "expected an error reply, got {reply:?}");

@@ -51,6 +51,23 @@ pub fn disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("CORDIAL_NO_ETC_EMULATION").is_some_and(|v| v != "0"))
 }
 
+/// `CORDIAL_FORCE_ETC_EMULATION=1`: emulate on a driver that has native ETC2
+/// too. A test switch, in the family of `CORDIAL_FORCE_GPU_VENDOR`
+/// (ADR-046), so that native and decoded output can be compared on one machine
+/// without NVIDIA hardware. `CORDIAL_NO_ETC_EMULATION` wins if both are set.
+pub fn forced() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CORDIAL_FORCE_ETC_EMULATION").is_some_and(|v| v != "0"))
+}
+
+/// Whether to emulate on a device whose `textureCompressionETC2` is `native`.
+/// The gate is the driver lacking the feature -- not the vendor id, which is
+/// what ADR-046 gates everything else NVIDIA on -- because the feature bit is
+/// the thing the engine reads and the thing that is wrong; see ADR-049.
+fn should_emulate(native: bool, forced: bool) -> bool {
+    !native || forced
+}
+
 fn trace(args: std::fmt::Arguments<'_>) {
     crate::android::trace(format_args!("vulkan-etc: {args}"));
 }
@@ -118,6 +135,8 @@ slots!(
     H_IMAGE_FORMAT_PROPS,
     H_IMAGE_FORMAT_PROPS2,
     H_CREATE_IMAGE,
+    H_DEVICE_IMAGE_REQS,
+    H_DEVICE_IMAGE_SPARSE_REQS,
     H_DESTROY_IMAGE,
     H_CREATE_IMAGE_VIEW,
     H_CMD_COPY_BUFFER_TO_IMAGE,
@@ -146,8 +165,31 @@ slots!(
     H_DESTROY_DEVICE,
 );
 
-pub fn hook(name: &[u8], host: *mut c_void) -> Option<*mut c_void> {
+/// Devices whose `vkCreateDevice` was made on an emulating physical device, by
+/// handle. Recorded whether or not the staging calls could then be resolved:
+/// the engine was told ETC2 works on these, so a call on one that cannot be
+/// served has to fail rather than reach the driver with a raw ETC format.
+static EMULATING: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn emulating() -> MutexGuard<'static, Vec<usize>> {
+    EMULATING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn device_emulates(device: *mut c_void) -> bool {
+    !device.is_null() && emulating().contains(&(device as usize))
+}
+
+/// `device` is the handle the name was resolved against, null from
+/// `vkGetInstanceProcAddr`. A device that is not emulating is not routed
+/// through this module: Intel and AMD, and NVIDIA's own native path, get the
+/// driver's function directly. The instance-level lookup cannot know which
+/// device a pointer will be used on, so it stays hooked, and each hook
+/// forwards straight through for a device that is not emulating.
+pub fn hook(name: &[u8], host: *mut c_void, device: *mut c_void) -> Option<*mut c_void> {
     if host.is_null() || (disabled() && !crate::android::tracing()) {
+        return None;
+    }
+    if !device.is_null() && !device_emulates(device) && !crate::android::tracing() {
         return None;
     }
     let (slot, ours): (&AtomicUsize, *const ()) = match name {
@@ -163,6 +205,12 @@ pub fn hook(name: &[u8], host: *mut c_void) -> Option<*mut c_void> {
         }
         b"vkGetPhysicalDeviceImageFormatProperties2" | b"vkGetPhysicalDeviceImageFormatProperties2KHR" => {
             (&H_IMAGE_FORMAT_PROPS2, get_image_format_props2 as *const ())
+        }
+        b"vkGetDeviceImageMemoryRequirements" | b"vkGetDeviceImageMemoryRequirementsKHR" => {
+            (&H_DEVICE_IMAGE_REQS, get_device_image_requirements as *const ())
+        }
+        b"vkGetDeviceImageSparseMemoryRequirements" | b"vkGetDeviceImageSparseMemoryRequirementsKHR" => {
+            (&H_DEVICE_IMAGE_SPARSE_REQS, get_device_image_sparse_requirements as *const ())
         }
         b"vkCreateImage" => (&H_CREATE_IMAGE, create_image as *const ()),
         b"vkDestroyImage" => (&H_DESTROY_IMAGE, destroy_image as *const ()),
@@ -222,14 +270,24 @@ pub fn emulate_for(pd: *mut c_void) -> bool {
     }
     let emulate = match host_features(pd) {
         Some(f) => {
-            let e = f[FEATURE_ETC2] == 0;
+            let e = should_emulate(f[FEATURE_ETC2] != 0, forced());
             trace(format_args!(
                 "physical device {pd:p}: host textureCompressionETC2={} ASTC_LDR={} BC={}; {}",
                 f[FEATURE_ETC2],
                 f[FEATURE_ASTC_LDR],
                 f[FEATURE_BC],
-                if e { "ETC2/EAC will be emulated" } else { "native ETC2, emulation off" }
+                match (e, f[FEATURE_ETC2] != 0) {
+                    (true, true) => "native ETC2 present, emulation FORCED (CORDIAL_FORCE_ETC_EMULATION)",
+                    (true, false) => "ETC2/EAC will be emulated",
+                    _ => "native ETC2, emulation off",
+                }
             ));
+            if e && f[FEATURE_ETC2] != 0 {
+                println!(
+                    "[android] vulkan-etc: CORDIAL_FORCE_ETC_EMULATION is set; decoding ETC2/EAC on the CPU \
+                     although this driver has it natively"
+                );
+            }
             e
         }
         None => {
@@ -416,29 +474,55 @@ extern "C" fn get_image_format_props2(pd: *mut c_void, info: *const c_void, out:
     rc
 }
 
-#[repr(C)]
-pub struct StrippedDeviceInfo {
+#[repr(C, align(8))]
+struct StrippedDeviceInfo {
     info: [u8; 72],
     features: [u32; FEATURE_COUNT],
     features2: [u8; 240],
 }
 
-impl StrippedDeviceInfo {
-    pub fn as_ptr(&self) -> *const c_void {
-        self.info.as_ptr() as *const c_void
+/// What [`strip_device_features`] built for one `vkCreateDevice`: usually a copy
+/// of the create info with `textureCompressionETC2` cleared, and, for a
+/// `VkPhysicalDeviceFeatures2` that is not first in the chain, the caller's own
+/// field cleared for the duration of the call and put back on drop.
+pub struct Stripped {
+    copy: Option<Box<StrippedDeviceInfo>>,
+    restore: Vec<usize>,
+}
+
+impl Stripped {
+    /// The create info the host driver should be given.
+    pub fn as_ptr(&self, original: *const c_void) -> *const c_void {
+        self.copy.as_ref().map_or(original, |c| c.info.as_ptr() as *const c_void)
     }
 }
 
-pub fn strip_device_features(pd: *mut c_void, info: *const c_void) -> Option<Box<StrippedDeviceInfo>> {
+impl Drop for Stripped {
+    fn drop(&mut self) {
+        for &at in &self.restore {
+            // SAFETY: `at` is the address of the ETC2 feature word inside the
+            // caller's `VkPhysicalDeviceFeatures2`, which outlives the
+            // `vkCreateDevice` call this guard lives within.
+            unsafe { std::ptr::write_unaligned(at as *mut u32, 1) };
+        }
+    }
+}
+
+pub fn strip_device_features(pd: *mut c_void, info: *const c_void) -> Option<Stripped> {
     if info.is_null() {
         return None;
     }
+    strip_with(emulate_for(pd), info)
+}
+
+/// The decision and the rewrite, without the physical-device query, so the
+/// chain handling can be tested.
+fn strip_with(emulate: bool, info: *const c_void) -> Option<Stripped> {
     let enabled: *const c_void = rd(info, 64);
     let head: *const c_void = rd(info, 8);
     let f2 = chain_find(head, ST_PHYSICAL_DEVICE_FEATURES_2);
     let via_features = !enabled.is_null() && rd::<u32>(enabled, FEATURE_ETC2 * 4) != 0;
     let via_features2 = !f2.is_null() && rd::<u32>(f2, 16 + FEATURE_ETC2 * 4) != 0;
-    let emulate = emulate_for(pd);
     trace(format_args!(
         "vkCreateDevice: pEnabledFeatures={} textureCompressionETC2 via pEnabledFeatures={} via Features2={} (Features2 in chain: {}, first node: {}); emulation {}",
         if enabled.is_null() { "null" } else { "set" },
@@ -451,24 +535,39 @@ pub fn strip_device_features(pd: *mut c_void, info: *const c_void) -> Option<Box
     if !emulate || !(via_features || via_features2) {
         return None;
     }
-    let mut s = Box::new(StrippedDeviceInfo { info: rd(info, 0), features: [0; FEATURE_COUNT], features2: [0; 240] });
-    if via_features {
-        s.features = rd(enabled, 0);
-        s.features[FEATURE_ETC2] = 0;
-        let p = s.features.as_ptr() as usize;
-        s.info[64..72].copy_from_slice(&p.to_ne_bytes());
-    }
-    if via_features2 {
-        if f2 != head {
-            unhandled(format_args!(
-                "vkCreateDevice: VkPhysicalDeviceFeatures2 is not the first pNext node; textureCompressionETC2 left enabled"
-            ));
-        } else {
-            s.features2 = rd(f2, 0);
-            s.features2[16 + FEATURE_ETC2 * 4..16 + FEATURE_ETC2 * 4 + 4].copy_from_slice(&0u32.to_ne_bytes());
-            let p = s.features2.as_ptr() as usize;
-            s.info[8..16].copy_from_slice(&p.to_ne_bytes());
+    let mut s = Stripped { copy: None, restore: Vec::new() };
+    if via_features || (via_features2 && f2 == head) {
+        let mut c = Box::new(StrippedDeviceInfo { info: rd(info, 0), features: [0; FEATURE_COUNT], features2: [0; 240] });
+        if via_features {
+            c.features = rd(enabled, 0);
+            c.features[FEATURE_ETC2] = 0;
+            let p = c.features.as_ptr() as usize;
+            c.info[64..72].copy_from_slice(&p.to_ne_bytes());
         }
+        if via_features2 && f2 == head {
+            c.features2 = rd(f2, 0);
+            let at = 16 + FEATURE_ETC2 * 4;
+            c.features2[at..at + 4].copy_from_slice(&0u32.to_ne_bytes());
+            let p = c.features2.as_ptr() as usize;
+            c.info[8..16].copy_from_slice(&p.to_ne_bytes());
+        }
+        s.copy = Some(c);
+    }
+    if via_features2 && f2 != head {
+        // **Not first in the chain, so the chain cannot be copied.** The nodes
+        // ahead of it are structures this module has no reason to know the size
+        // of, and relinking around them needs their memory. Handing the driver
+        // the feature switched on instead is `VK_ERROR_FEATURE_NOT_PRESENT` from
+        // a driver that lacks it, and a client that never starts. So the one
+        // word is cleared in place for the length of the call and restored by
+        // `Stripped`'s drop; the engine's create info is read by nothing else
+        // while the engine is inside this call.
+        let at = (f2 as usize) + 16 + FEATURE_ETC2 * 4;
+        // SAFETY: `f2` is a live `VkPhysicalDeviceFeatures2` in the caller's
+        // chain, and the word is restored before `vkCreateDevice` returns.
+        unsafe { std::ptr::write_unaligned(at as *mut u32, 0) };
+        s.restore.push(at);
+        trace(format_args!("vkCreateDevice: Features2 is not the first pNext node; its ETC2 bit is cleared in place for the call"));
     }
     trace(format_args!("vkCreateDevice: textureCompressionETC2 stripped before the host driver sees it"));
     Some(s)
@@ -492,6 +591,9 @@ static DEV: AtomicPtr<Dev> = AtomicPtr::new(std::ptr::null_mut());
 pub fn device_created(pd: *mut c_void, device: *mut c_void) {
     if !emulate_for(pd) {
         return;
+    }
+    if !device_emulates(device) {
+        emulating().push(device as usize);
     }
     let gdpa = super::vulkan::host_instance_proc(c"vkGetDeviceProcAddr");
     let Some(gdpa) = as_fn::<extern "C" fn(*mut c_void, *const c_char) -> *mut c_void>(gdpa as usize) else {
@@ -569,6 +671,7 @@ extern "C" fn destroy_device(device: *mut c_void, alloc: *const c_void) {
     if active_device(device as usize).is_some() {
         forget_device();
     }
+    emulating().retain(|&d| d != device as usize);
     if let Some(f) = as_fn::<extern "C" fn(*mut c_void, *const c_void)>(H_DESTROY_DEVICE.load(Relaxed)) {
         f(device, alloc);
     }
@@ -644,6 +747,64 @@ fn is_emulated(image: u64) -> Option<EmuImage> {
     state().images.get(&image).copied()
 }
 
+/// A `VkDeviceImageMemoryRequirements` and the `VkImageCreateInfo` it points at,
+/// copied with the format swapped for its substitute.
+#[repr(C, align(8))]
+struct SubstitutedImageInfo {
+    info: [u8; 32],
+    create: [u8; 88],
+}
+
+/// The copy, if `info` asks about an ETC2/EAC image. The memory requirements of
+/// the image the driver will actually be given are the substitute's, and the
+/// raw format would have the driver sizing a format it does not support.
+fn substitute_image_info(info: *const c_void) -> Option<Box<SubstitutedImageInfo>> {
+    if info.is_null() {
+        return None;
+    }
+    let create: *const c_void = rd(info, 16);
+    if create.is_null() {
+        return None;
+    }
+    let (_, sub, _) = etc_format(rd(create, 24))?;
+    let mut c = Box::new(SubstitutedImageInfo { info: rd(info, 0), create: rd(create, 0) });
+    c.create[24..28].copy_from_slice(&sub.to_ne_bytes());
+    let p = c.create.as_ptr() as usize;
+    c.info[16..24].copy_from_slice(&p.to_ne_bytes());
+    Some(c)
+}
+
+extern "C" fn get_device_image_requirements(device: *mut c_void, info: *const c_void, out: *mut c_void) {
+    let Some(f) = as_fn::<extern "C" fn(*mut c_void, *const c_void, *mut c_void)>(H_DEVICE_IMAGE_REQS.load(Relaxed))
+    else {
+        return;
+    };
+    match device_emulates(device).then(|| substitute_image_info(info)).flatten() {
+        Some(c) => {
+            trace(format_args!("vkGetDeviceImageMemoryRequirements: ETC2/EAC image sized as its substitute"));
+            f(device, c.info.as_ptr() as *const c_void, out)
+        }
+        None => f(device, info, out),
+    }
+}
+
+extern "C" fn get_device_image_sparse_requirements(
+    device: *mut c_void,
+    info: *const c_void,
+    count: *mut u32,
+    out: *mut c_void,
+) {
+    let Some(f) = as_fn::<extern "C" fn(*mut c_void, *const c_void, *mut u32, *mut c_void)>(
+        H_DEVICE_IMAGE_SPARSE_REQS.load(Relaxed),
+    ) else {
+        return;
+    };
+    match device_emulates(device).then(|| substitute_image_info(info)).flatten() {
+        Some(c) => f(device, c.info.as_ptr() as *const c_void, count, out),
+        None => f(device, info, count, out),
+    }
+}
+
 extern "C" fn create_image(device: *mut c_void, info: *const c_void, alloc: *const c_void, out: *mut u64) -> i32 {
     let Some(f) =
         as_fn::<extern "C" fn(*mut c_void, *const c_void, *const c_void, *mut u64) -> i32>(H_CREATE_IMAGE.load(Relaxed))
@@ -667,6 +828,17 @@ extern "C" fn create_image(device: *mut c_void, info: *const c_void, alloc: *con
         extent[0], extent[1], extent[2]
     );
     if active_device(device as usize).is_none() {
+        if device_emulates(device) {
+            // The engine was told ETC2 works on this device and the state to
+            // serve it is gone or never came up (`device_created` could not
+            // resolve the staging calls, or a second emulating device replaced
+            // this one's). Passing the raw format on is a driver that lacks it
+            // being asked to create the image; failing here says so by name.
+            unhandled(format_args!(
+                "vkCreateImage({describe}): device {device:p} is emulating ETC2/EAC but has no emulation state; refused"
+            ));
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        }
         let rc = f(device, info, alloc, out);
         trace(format_args!("vkCreateImage({describe}): passthrough rc={rc}"));
         return rc;
@@ -1560,6 +1732,141 @@ mod tests {
         for len in 0..data.len() {
             assert_eq!(hash(&data[..len]), reference_hash(&data[..len]), "length {len}");
         }
+    }
+
+    #[test]
+    fn emulation_is_decided_by_the_missing_feature_or_the_test_switch() {
+        assert!(should_emulate(false, false));
+        assert!(!should_emulate(true, false));
+        assert!(should_emulate(true, true));
+        assert!(should_emulate(false, true));
+    }
+
+    fn word(buf: &mut [u64], byte: usize, v: u32) {
+        let at = byte / 8;
+        let shift = (byte % 8) * 8;
+        buf[at] = (buf[at] & !(0xffff_ffffu64 << shift)) | (u64::from(v) << shift);
+    }
+
+    fn word_at(buf: &[u64], byte: usize) -> u32 {
+        (buf[byte / 8] >> ((byte % 8) * 8)) as u32
+    }
+
+    #[test]
+    fn a_device_image_query_for_an_etc_image_is_sized_as_the_substitute() {
+        let mut create = [0u64; 11];
+        word(&mut create, 0, 14);
+        word(&mut create, 24, 147);
+        let mut info = [0u64; 4];
+        info[2] = create.as_ptr() as u64;
+
+        let sub = substitute_image_info(info.as_ptr() as *const c_void).expect("an ETC2 format is substituted");
+        assert_eq!(rd::<u32>(sub.create.as_ptr() as *const c_void, 24), 37);
+        assert_eq!(rd::<usize>(sub.info.as_ptr() as *const c_void, 16), sub.create.as_ptr() as usize);
+        assert_eq!(word_at(&create, 24), 147, "the engine's own create info is not modified");
+
+        word(&mut create, 24, 37);
+        assert!(substitute_image_info(info.as_ptr() as *const c_void).is_none());
+        info[2] = 0;
+        assert!(substitute_image_info(info.as_ptr() as *const c_void).is_none());
+        assert!(substitute_image_info(std::ptr::null()).is_none());
+    }
+
+    /// A `VkDeviceCreateInfo` whose chain is `[other node] -> Features2`, with
+    /// the ETC2 feature enabled in the Features2.
+    fn chain_with_features2_second() -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+        let mut other = vec![0u64; 2];
+        word(&mut other, 0, 1_000_000_001);
+        let mut f2 = vec![0u64; 30];
+        word(&mut f2, 0, ST_PHYSICAL_DEVICE_FEATURES_2);
+        word(&mut f2, 16 + FEATURE_ETC2 * 4, 1);
+        other[1] = f2.as_ptr() as u64;
+        let mut info = vec![0u64; 9];
+        word(&mut info, 0, 3);
+        info[1] = other.as_ptr() as u64;
+        (info, other, f2)
+    }
+
+    #[test]
+    fn features2_behind_another_node_is_cleared_for_the_call_and_put_back() {
+        let (info, _other, f2) = chain_with_features2_second();
+        let at = 16 + FEATURE_ETC2 * 4;
+        let stripped = strip_with(true, info.as_ptr() as *const c_void).expect("an ETC2 feature in the chain is stripped");
+        assert_eq!(word_at(&f2, at), 0, "the driver must not see the feature enabled");
+        assert_eq!(stripped.as_ptr(info.as_ptr() as *const c_void), info.as_ptr() as *const c_void);
+        drop(stripped);
+        assert_eq!(word_at(&f2, at), 1, "the engine's structure is restored");
+    }
+
+    #[test]
+    fn features2_first_in_the_chain_is_copied_and_the_original_left_alone() {
+        let mut f2 = vec![0u64; 30];
+        word(&mut f2, 0, ST_PHYSICAL_DEVICE_FEATURES_2);
+        word(&mut f2, 16 + FEATURE_ETC2 * 4, 1);
+        let mut info = vec![0u64; 9];
+        info[1] = f2.as_ptr() as u64;
+        let original = info.as_ptr() as *const c_void;
+        let stripped = strip_with(true, original).expect("stripped");
+        assert_eq!(word_at(&f2, 16 + FEATURE_ETC2 * 4), 1, "no write to the caller's structure");
+        let given = stripped.as_ptr(original);
+        assert_ne!(given, original);
+        let copied_head: *const c_void = rd(given, 8);
+        assert_eq!(rd::<u32>(copied_head, 16 + FEATURE_ETC2 * 4), 0);
+        assert!(strip_with(false, original).is_none(), "nothing is stripped when not emulating");
+    }
+
+    // The hooks keep their host function in process-wide statics, so the tests
+    // that install one take turns.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    static FAKE_CREATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn fake_create_image(_: *mut c_void, _: *const c_void, _: *const c_void, _: *mut u64) -> i32 {
+        FAKE_CREATE_CALLS.fetch_add(1, Relaxed);
+        VK_SUCCESS
+    }
+
+    #[test]
+    fn an_etc_image_on_an_emulating_device_without_state_is_refused_not_forwarded() {
+        let _turn = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        H_CREATE_IMAGE.store(fake_create_image as usize, Relaxed);
+        let mut create = [0u64; 11];
+        word(&mut create, 24, 147);
+        word(&mut create, 40, 1);
+        let info = create.as_ptr() as *const c_void;
+        let (emulating_device, native_device) = (0x6001usize as *mut c_void, 0x6002usize as *mut c_void);
+        emulating().push(emulating_device as usize);
+        let unhandled_before = glcount::ETC_UNHANDLED.load(Relaxed);
+        let calls_before = FAKE_CREATE_CALLS.load(Relaxed);
+
+        let mut out = 0u64;
+        let rc = create_image(emulating_device, info, std::ptr::null(), &mut out);
+        assert_eq!(rc, VK_ERROR_FORMAT_NOT_SUPPORTED);
+        assert_eq!(FAKE_CREATE_CALLS.load(Relaxed), calls_before, "the driver was never asked");
+        assert_eq!(glcount::ETC_UNHANDLED.load(Relaxed), unhandled_before + 1);
+
+        let rc = create_image(native_device, info, std::ptr::null(), &mut out);
+        assert_eq!(rc, VK_SUCCESS);
+        assert_eq!(FAKE_CREATE_CALLS.load(Relaxed), calls_before + 1, "a native device is passed straight through");
+        emulating().retain(|&d| d != emulating_device as usize);
+    }
+
+    #[test]
+    fn device_level_hooks_are_installed_only_on_an_emulating_device() {
+        let host = 0x10usize as *mut c_void;
+        let (emulating_device, native_device) = (0x7001usize as *mut c_void, 0x7002usize as *mut c_void);
+        emulating().push(emulating_device as usize);
+        for name in [
+            &b"vkGetDeviceImageMemoryRequirements"[..],
+            b"vkGetDeviceImageMemoryRequirementsKHR",
+            b"vkGetDeviceImageSparseMemoryRequirements",
+            b"vkResetCommandPool",
+        ] {
+            assert!(hook(name, host, native_device).is_none(), "{}", String::from_utf8_lossy(name));
+            assert!(hook(name, host, emulating_device).is_some(), "{}", String::from_utf8_lossy(name));
+            assert!(hook(name, host, std::ptr::null_mut()).is_some(), "instance-level lookups stay hooked");
+        }
+        assert!(hook(b"vkNotAnEtcCall", host, emulating_device).is_none());
+        emulating().retain(|&d| d != emulating_device as usize);
     }
 
     #[test]

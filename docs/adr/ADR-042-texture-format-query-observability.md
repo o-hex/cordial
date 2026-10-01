@@ -1,6 +1,6 @@
 # ADR-042: Vulkan texture-format queries are counted and, test-only, maskable — nothing is translated
 
-**Status:** accepted
+**Status:** accepted; the "nothing is translated" decision was reversed by [ADR-049](ADR-049-etc2-is-emulated-where-the-driver-lacks-it.md). The counters and the test-only mask below stand.
 **Supersedes:** nothing
 **Related:** [ADR-001](ADR-001-in-process-hooking.md), [ADR-003](ADR-003-plugin-isolation.md), [ADR-034](ADR-034-symbol-resolution-asks-the-library.md), [ADR-040](ADR-040-the-engine-already-runs-mimalloc.md)
 
@@ -20,6 +20,13 @@ A third behaviour, `CORDIAL_MASK_MOBILE_TEXTURE_FORMATS=1`, makes the format
 query above report ETC2 and ASTC as **fully unsupported** regardless of the
 real driver's answer. It is off by default, documented in `--help`, and no
 build, packaging script, or default configuration sets it.
+
+**Correction (ADR-049).** *The paragraph below is what was decided at the time
+and it was wrong in one respect.* The mask only touched the per-format query,
+never the `textureCompressionETC2` feature the engine reads, so an unchanged
+caps line on Intel did not show the premise to be false. A real NVIDIA driver
+reports the feature false and the engine's ETC1 built-ins go missing; ADR-049
+emulates ETC2 and EAC where the driver lacks the feature.
 
 **No transcoder, no format translation, and no change to what any shipped
 client tells the engine was built.** See

@@ -551,7 +551,7 @@ extern "C" fn vk_get_instance_proc_addr(instance: *mut c_void, name: *const c_ch
         // `VkInstance`: see `vk_create_instance`.
         _ => {
             let p = unsafe { (h.get_instance_proc_addr)(instance, name) };
-            super::vulkan_etc::hook(bytes, p).unwrap_or(p)
+            super::vulkan_etc::hook(bytes, p, std::ptr::null_mut()).unwrap_or(p)
         }
     }
 }
@@ -601,7 +601,7 @@ extern "C" fn vk_get_device_proc_addr(device: *mut c_void, name: *const c_char) 
         }
         _ => {
             let p = host(device, name);
-            super::vulkan_etc::hook(bytes, p).unwrap_or(p)
+            super::vulkan_etc::hook(bytes, p, device).unwrap_or(p)
         }
     }
 }
@@ -956,8 +956,10 @@ extern "C" fn vk_create_device(
     // with the caller's own arguments unchanged.
     let f: Fn_ = unsafe { std::mem::transmute(f) };
     let stripped = super::vulkan_etc::strip_device_features(physical_device, create_info);
-    let info = stripped.as_ref().map_or(create_info, |s| s.as_ptr());
+    let info = stripped.as_ref().map_or(create_info, |s| s.as_ptr(create_info));
     let rc = f(physical_device, info, allocator, device_out);
+    // Puts back anything cleared in the caller's own structures for the call.
+    drop(stripped);
     if rc == VK_SUCCESS && !device_out.is_null() {
         super::vulkan_etc::device_created(physical_device, unsafe { *device_out });
     }

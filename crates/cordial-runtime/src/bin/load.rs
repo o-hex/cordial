@@ -184,8 +184,13 @@ env:
   CORDIAL_NO_ETC_EMULATION=1         on a GPU without native ETC2 (NVIDIA), stop
                                      reporting ETC2/EAC and decoding it on the
                                      CPU; the engine then sees ETC1 0 ETC2 0.
-                                     The control for docs/adr/ADR-048-etc2-is-
+                                     The control for docs/adr/ADR-049-etc2-is-
                                      emulated-where-the-driver-lacks-it.md
+  CORDIAL_FORCE_ETC_EMULATION=1      decode ETC2/EAC on the CPU even where the
+                                     driver has it natively, to compare native
+                                     against decoded output on a machine without
+                                     NVIDIA hardware. CORDIAL_NO_ETC_EMULATION
+                                     wins if both are set. Same ADR
   CORDIAL_FORCE_GPU_VENDOR=0x10de[@550.163.01]
                                      behave as though the GPU were NVIDIA's (or
                                      as another vendor id) for the code that is

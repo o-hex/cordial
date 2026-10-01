@@ -740,11 +740,14 @@ extern "C" fn create_image_view(device: *mut c_void, info: *const c_void, alloc:
 
 fn hash(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ data.len() as u64;
-    let (words, rest) = data.as_chunks::<8>();
-    for c in words {
-        h = (h ^ u64::from_le_bytes(*c)).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
+    // `chunks_exact`, not `slice::as_chunks`, which needs Rust 1.88 where this
+    // workspace declares 1.75. Same words, same remainder, same hash.
+    let mut words = data.chunks_exact(8);
+    for c in &mut words {
+        let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+        h = (h ^ w).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
     }
-    for &b in rest {
+    for &b in words.remainder() {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     }
     h
@@ -1528,6 +1531,35 @@ mod tests {
             .unwrap();
         }
         assert!(banded == single);
+    }
+
+    /// The hash as `as_chunks::<8>` computed it, written out by hand, so that
+    /// replacing that call could not have changed what a recorded region hashes
+    /// to between record and submit.
+    fn reference_hash(data: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ data.len() as u64;
+        let whole = data.len() / 8 * 8;
+        let mut i = 0;
+        while i < whole {
+            let mut w = 0u64;
+            for k in 0..8 {
+                w |= u64::from(data[i + k]) << (8 * k);
+            }
+            h = (h ^ w).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
+            i += 8;
+        }
+        for &b in &data[whole..] {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
+
+    #[test]
+    fn the_hash_is_unchanged_across_every_remainder_length() {
+        let data: Vec<u8> = (0..70u32).map(|i| (i * 37 + 11) as u8).collect();
+        for len in 0..data.len() {
+            assert_eq!(hash(&data[..len]), reference_hash(&data[..len]), "length {len}");
+        }
     }
 
     #[test]

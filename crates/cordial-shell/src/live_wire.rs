@@ -106,6 +106,11 @@ pub enum Update {
     Gamepad(bool),
     /// The game window's header bar.
     TitleBar(crate::title_bar::TitleBar),
+    /// What `DFIntTaskSchedulerTargetFps` is held at, in the words
+    /// `CORDIAL_FRAME_RATE_LIMIT` uses. The client stores it and tells the
+    /// engine, through the same re-apply that keeps a flag in force after the
+    /// engine's own settings refresh (ADR-051).
+    FrameRateLimit(crate::frame_rate_limit::FrameRateLimit),
 }
 
 /// A title-bar choice in the words `CORDIAL_TITLE_BAR` and `shell.json` use.
@@ -129,7 +134,7 @@ pub fn parse_title_bar(word: &str) -> Option<crate::title_bar::TitleBar> {
 }
 
 /// The keys [`Update`] can carry, which are also the `shell.json` field names.
-pub const KEYS: [&str; 8] = [
+pub const KEYS: [&str; 9] = [
     "pointer_acceleration",
     "throttle",
     "close_on_leave",
@@ -138,6 +143,7 @@ pub const KEYS: [&str; 8] = [
     "gamemode",
     "gamepad",
     "title_bar",
+    "frame_rate_limit",
 ];
 
 /// Longest sink name accepted. PipeWire node names are short; the bound is
@@ -162,6 +168,7 @@ impl Update {
             Update::Gamemode(_) => "gamemode",
             Update::Gamepad(_) => "gamepad",
             Update::TitleBar(_) => "title_bar",
+            Update::FrameRateLimit(_) => "frame_rate_limit",
         }
     }
 
@@ -174,6 +181,7 @@ impl Update {
             }
             Update::AudioOutput(name) => Value::from(name.as_str()),
             Update::TitleBar(t) => Value::from(title_bar_word(*t)),
+            Update::FrameRateLimit(l) => Value::from(l.as_env()),
         }
     }
 
@@ -197,6 +205,11 @@ impl Update {
             "title_bar" => {
                 value.as_str().and_then(parse_title_bar).map(Update::TitleBar).ok_or_else(bad)
             }
+            "frame_rate_limit" => value
+                .as_str()
+                .and_then(crate::frame_rate_limit::FrameRateLimit::parse)
+                .map(Update::FrameRateLimit)
+                .ok_or_else(bad),
             "audio_output" => value
                 .as_str()
                 .filter(|n| valid_sink_name(n))
@@ -314,6 +327,7 @@ mod tests {
             Update::Gamemode(false),
             Update::Gamepad(false),
             Update::TitleBar(crate::title_bar::TitleBar::Hidden),
+            Update::FrameRateLimit(crate::frame_rate_limit::FrameRateLimit::Cap144),
         ]
     }
 
@@ -385,6 +399,9 @@ mod tests {
             r#"{"set":{"gamepad":0}}"#,
             r#"{"set":{"title_bar":"tiny"}}"#,
             r#"{"set":{"title_bar":true}}"#,
+            r#"{"set":{"frame_rate_limit":"unlimited"}}"#,
+            r#"{"set":{"frame_rate_limit":"9999"}}"#,
+            r#"{"set":{"frame_rate_limit":144}}"#,
             r#"{"set":{"audio_output":"a\u0000b"}}"#,
         ] {
             assert!(decode(bad).is_err(), "{bad} should be refused");

@@ -170,6 +170,10 @@ fn apply(update: &Update) -> Option<String> {
             crate::android::wayland::set_title_bar(*t);
             None
         }
+        // Stored here, and the engine told by the re-apply worker, which owns
+        // the one thread the settings document is built and handed over on. A
+        // choice that is already in force asks for nothing.
+        Update::FrameRateLimit(l) => set_frame_rate_limit(*l),
     };
     // Narrated because this project debugs by reading the client's output, and
     // "the setting reached the process" is the fact worth being able to see.
@@ -185,9 +189,37 @@ fn value_word(update: &Update) -> String {
             b.to_string()
         }
         Update::TitleBar(t) => live_wire::title_bar_word(*t).to_string(),
+        Update::FrameRateLimit(l) => l.as_env().to_string(),
         Update::AudioOutput(name) if name.is_empty() => "the system default".to_string(),
         Update::AudioOutput(name) => name.clone(),
     }
+}
+
+/// The frame-rate choice, stored and handed on. The `Some` is what the shell
+/// should be told when the choice cannot reach the engine.
+fn set_frame_rate_limit(choice: cordial_shell::frame_rate_limit::FrameRateLimit) -> Option<String> {
+    use crate::flags::FrameRateLimit as Limit;
+    // The shell's word, parsed by the runtime's own parser, so the two crates
+    // cannot disagree about what a word means.
+    let parsed = Limit::parse(choice.as_env()).unwrap_or_default();
+    let before = crate::flags::frame_rate_limit();
+    if !crate::flags::set_live_frame_rate_limit(Some(parsed)) {
+        return None;
+    }
+    if !crate::flag_reapply::enabled() {
+        return Some("CORDIAL_NO_FLAG_REDELIVERY is set, so the engine was not told".to_string());
+    }
+    crate::flag_reapply::request_apply();
+    // Measured 2026-10-01 (ADR-051): the engine takes a new value for a flag the
+    // document carries, and does not unset one that the document stops
+    // carrying. Display refresh is the absence of the flag, so the engine keeps
+    // the old cap until its own settings refresh resets it, about every two
+    // minutes. Said in the reply because "applied" would otherwise be read as
+    // "now".
+    (parsed == Limit::Display && before != Limit::Display).then(|| {
+        "the engine keeps the previous cap until its next settings refresh, within about two minutes"
+            .to_string()
+    })
 }
 
 /// The audio backend's end of `audio_output`. Declared rather than wrapped in a
@@ -234,6 +266,15 @@ mod audio {
     }
 }
 
+/// The choice in force, in the wire's words. A number the shell has no row for
+/// (set by hand through the environment or a plugin) reads as its own digits.
+fn frame_rate_limit_word() -> String {
+    match crate::flags::frame_rate_limit() {
+        crate::flags::FrameRateLimit::Display => "display".to_string(),
+        crate::flags::FrameRateLimit::Cap(n) => n.to_string(),
+    }
+}
+
 /// What is in force now, in the wire's own words.
 fn current() -> BTreeMap<String, Value> {
     use crate::android::input::{throttle_policy, ThrottleWhen};
@@ -269,6 +310,7 @@ fn current() -> BTreeMap<String, Value> {
         "title_bar".into(),
         Value::from(live_wire::title_bar_word(crate::android::wayland::current_title_bar())),
     );
+    m.insert("frame_rate_limit".into(), Value::from(frame_rate_limit_word()));
     m
 }
 
@@ -360,6 +402,9 @@ mod tests {
         // the requests did.
         let _gm = crate::gamemode::TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _gp = crate::android::gamepad::TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // `current()` also reads the frame-rate choice, which depends on the
+        // environment and the flag files other tests rewrite.
+        let _env = crate::flags::tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
         let before = current();
         for bad in [
             "not json\n",
@@ -369,6 +414,8 @@ mod tests {
             "{\"set\":{\"gamemode\":\"yes\"}}\n",
             "{\"set\":{\"gamepad\":1}}\n",
             "{\"set\":{\"title_bar\":\"tiny\"}}\n",
+            "{\"set\":{\"frame_rate_limit\":\"unlimited\"}}\n",
+            "{\"set\":{\"frame_rate_limit\":\"9999\"}}\n",
             "{\"set\":{\"audio_output\":\"a\\u0000b\"}}\n",
         ] {
             let r = handle(bad);
@@ -460,6 +507,42 @@ mod tests {
         // Control: the opposite message is a different change, not a repeat.
         assert_eq!(set(TitleBar::Default).values["title_bar"], "default");
         assert_eq!(crate::android::wayland::take_pending_title_bar(), Some(TitleBar::Default));
+    }
+
+    #[test]
+    fn a_frame_rate_change_is_stored_for_the_flag_layer_and_get_reports_it() {
+        use cordial_shell::frame_rate_limit::FrameRateLimit as Choice;
+        let _g = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        let (_root, _env) = crate::flags::tests::scratch("live-frame-rate");
+        std::env::set_var(crate::flags::FRAME_RATE_LIMIT_ENV, "display");
+        crate::flags::set_live_frame_rate_limit(None);
+        let set = |c: Choice| handle(&live_wire::encode_set(&[Update::FrameRateLimit(c)]));
+
+        let r = set(Choice::Cap240);
+        assert!(r.ok && r.applied == vec!["frame_rate_limit".to_string()], "{r:?}");
+        assert_eq!(r.values["frame_rate_limit"], "240");
+        assert!(!r.notes.contains_key("frame_rate_limit"), "a change between caps is applied now: {r:?}");
+        assert_eq!(
+            crate::flags::frame_rate_limit_flags(crate::flags::frame_rate_limit()),
+            vec![("DFIntTaskSchedulerTargetFps".to_string(), "240".to_string())],
+            "the flag layer must now ask for the new value"
+        );
+        assert_eq!(handle(&live_wire::encode_get()).values["frame_rate_limit"], "240");
+
+        // Control: the opposite message is a different choice, and Display asks
+        // for no flag at all, which is how the engine gets Roblox's own back.
+        let back = set(Choice::Display);
+        assert_eq!(back.values["frame_rate_limit"], "display");
+        assert!(
+            back.notes["frame_rate_limit"].contains("next settings refresh"),
+            "going back to the default is not immediate, and the reply says so: {back:?}"
+        );
+        // Control: the same message again is not a change, so it says nothing.
+        assert!(!set(Choice::Display).notes.contains_key("frame_rate_limit"));
+        assert!(crate::flags::frame_rate_limit_flags(crate::flags::frame_rate_limit()).is_empty());
+
+        crate::flags::set_live_frame_rate_limit(None);
+        std::env::remove_var(crate::flags::FRAME_RATE_LIMIT_ENV);
     }
 
     #[test]

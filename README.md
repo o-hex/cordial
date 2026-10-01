@@ -188,10 +188,9 @@ driver-extension trap: [`docs/nvidia.md`](docs/nvidia.md).
 **Profiles** are picked and created above the Launch button, and the trash button beside them deletes the
 shown one, its keyring sign-in included, after a confirmation.
 
-**Frame rate limit**, under Settings → Graphics, raises the engine's own frame
-cap past your display's refresh and keeps it there against Roblox's own
-periodic settings refresh; off by default. Details and the present-mode lever
-beside it: [`docs/fastflags.md`](docs/fastflags.md).
+**Frame rate limit**, under Settings → Graphics, holds the engine's own frame cap at 90 to 240 fps in a running
+game; Display refresh (the default) sets nothing. Any FastFlag you set now also stays set across Roblox's
+two-minute settings refresh. Details: [`docs/fastflags.md`](docs/fastflags.md).
 
 **Separate data roots** per instance come from `XDG_DATA_HOME`, which moves both
 the profile root and the client's data directory. `CORDIAL_PROFILE_ROOT` moves

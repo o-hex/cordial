@@ -78,6 +78,7 @@ All 47. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDO
 | [ADR-048](adr/ADR-048-labels-and-edits-from-discord.md) | Labels and edits from Discord are allowlisted, attributed and logged before they happen |
 | [ADR-049](adr/ADR-049-etc2-is-emulated-where-the-driver-lacks-it.md) | ETC2/EAC is decoded on the CPU where the driver lacks the feature, gated on the feature and not the vendor id; supersedes the "nothing is translated" half of ADR-042 |
 | [ADR-050](adr/ADR-050-other-runtimes-are-launched-not-built.md) | Other runtimes (Mac O' Blox) are detected and launched, never built into Cordial; parked until after 1.0 |
+| [ADR-051](adr/ADR-051-overrides-are-reapplied-after-the-engines-refresh.md) | The profile's flag overrides are handed to the engine again after each of its own settings refreshes, triggered by its log |
 
 ## Design notes
 

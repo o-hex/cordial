@@ -59,25 +59,42 @@ frame waits for the next refresh, and Frame rate limit is what the engine's own
 scheduler aims at. Leaving Frame pacing on FIFO caps you at your panel's rate
 whatever Frame rate limit says.
 
-**Setting `DFIntTaskSchedulerTargetFps` by hand in `flags.json` still works, and
-now has a documented reason it can stop holding.** The flag is in the `DF*`
-family, which Roblox's own client re-reads from its servers a few seconds into
-a run and again roughly every two minutes — a game refreshing its FastFlags is
-not a Cordial bug, but it does mean a flag written once at launch can be reverted
-to Roblox's own value mid-session. This is what the report below was hitting.
-**Settings → Frame rate limit does not have this problem**: it re-applies its
-chosen value on a timer for the life of the client rather than writing it once,
-specifically to survive the engine's own refresh. Reaching for `flags.json`
-directly still works for a value the Settings row does not offer, but it gets
-none of that protection.
+**Flags you set stay set.** Roblox's own client refetches its settings about
+every two minutes and applies them over the top, which used to put any `DF*`
+flag Roblox also ships back to Roblox's value — `DFIntTaskSchedulerTargetFps`
+fell back to 60 a couple of minutes into a session that way. Cordial now watches
+the engine's own log for the end of each refresh and hands the engine your
+overrides again straight after it. That covers everything in your `flags.json`,
+every plugin's flags, and the Performance and Frame rate limit rows, and it does
+nothing at all if the profile has no overrides. The client prints one
+`[reapply]` line each time, with what it cost; a flag you want to check is
+still in force can be read against that.
 
-**One report of the flag not holding**, on a machine that reached 240 and fell
-back to 60 after a few minutes — this is the mechanism above: the engine's own
-settings refresh reverted a `flags.json` entry that was only ever written once.
-If you see the same *with Frame rate limit set in Settings* rather than a hand
-edited flag, that is a different report and [worth filing on the
-tracker](https://github.com/luohoa97/cordial/issues) — the reassertion interval
-itself has not been measured against a live, signed-in session.
+Two things it does not do. It does not touch the first couple of seconds, before
+the engine's first fetch, and it hands over the cached copy of Roblox's document
+rather than the one the engine just fetched, so a flag Roblox changed during
+your session goes back to its older value, the same as at launch. And
+`CORDIAL_NO_FLAG_REDELIVERY=1` in the client's environment turns it off, which is only
+useful for confirming that a flag reverts without it.
+
+**Frame rate limit** (Settings → General → Graphics) sets
+`DFIntTaskSchedulerTargetFps` for you: Display refresh sets nothing, or pick 90,
+120, 144, 165 or 240. It applies to a game that is already running: a new cap
+takes effect at once, and going back to Display refresh takes up to two minutes,
+because the engine does not unset a flag Roblox's settings leave out and only its
+own next refresh resets it. The row beats a plugin that sets the same flag (FPS
+Flex does), and a flag you set in `flags.json` beats the row.
+
+Three limits on what it can do. A value above your display's refresh needs a
+monitor that fast, and Frame pacing on FIFO still holds you to your panel's rate.
+There is nothing above 240, because a contributor found the engine stops there
+(raising its own frame-rate settings to 1000 on a 144 Hz monitor still held at
+240); this project has no monitor that fast to check. And on a 60 Hz output, a
+cap above 60 measured *worse* than leaving it alone: 90 presented about 31 a
+second and 240 about 36, against 57 to 60 with nothing set (a headless 60 Hz
+compositor, driven with input throughout). That is one environment, and users on
+fast monitors report the opposite, so the caps stay, but do not pick one higher
+than your display runs.
 
 Values may be written as booleans, numbers or strings — Roblox stores them all
 as strings and Cordial converts. The overrides are merged into the settings
@@ -86,9 +103,10 @@ were applied.
 
 **`FFlag`, `FInt` and `FString` are read once at startup**, so changing them
 needs a relaunch. Only the `DFFlag`/`DFInt`/`DFString` family is re-read while
-the client is running. That distinction matters if you are building anything
-that changes flags dynamically — a plugin loaded part-way through a session
-cannot change a startup flag, whatever it writes.
+the client is running, and edits to `flags.json` made while the client runs are
+picked up at the next refresh for that family. That distinction matters if you
+are building anything that changes flags dynamically — a plugin loaded part-way
+through a session cannot change a startup flag, whatever it writes.
 
 ## Importing a list from another launcher
 

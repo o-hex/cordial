@@ -1255,49 +1255,42 @@ fn build_general_page(
     }
     group.add(&present);
 
-    // Order has to match FrameRateLimit::index/from_index.
+    // Order has to match FrameRateLimit::index/from_index, so the model is
+    // built from `ALL` rather than listed a second time.
     //
-    // Off by default -- "Display refresh" is first and is what a fresh install
-    // already does, matching Frame pacing's own row just above rather than the
-    // Renderer row's "recommended value first" framing, because there is no
-    // recommendation here yet: nothing on this project's hardware has measured
-    // a cap above the display's own refresh, only that the mechanism holding
-    // one in place against the engine's own reset works (see
-    // `cordial_runtime::flags::FrameRateLimit`'s doc).
-    let frame_rate_model = gtk::StringList::new(&[
-        crate::shell_config::FrameRateLimit::Display.row_label(),
-        crate::shell_config::FrameRateLimit::Cap90.row_label(),
-        crate::shell_config::FrameRateLimit::Cap120.row_label(),
-        crate::shell_config::FrameRateLimit::Cap144.row_label(),
-        crate::shell_config::FrameRateLimit::Cap240.row_label(),
-        crate::shell_config::FrameRateLimit::Unlimited.row_label(),
-    ]);
+    // Display refresh first and the default: it sets nothing, which is what
+    // every earlier Cordial did, and there is no recommendation to put first --
+    // nothing on this project's hardware has measured a cap above 60, because
+    // the only output it has measured on is a 60 Hz one.
+    let frame_rate_labels: Vec<&str> =
+        crate::shell_config::FrameRateLimit::ALL.iter().map(|c| c.row_label()).collect();
+    let frame_rate_model = gtk::StringList::new(&frame_rate_labels);
     let frame_rate = adw::ComboRow::builder()
         .title("Frame rate limit")
-        // What a user can act on: what changing it does, and the caveat that
-        // would otherwise read as the setting not working -- the same shape
-        // Frame pacing's own subtitle takes just above. The mechanics -- that
-        // this sets `DFIntTaskSchedulerTargetFps` and keeps re-setting it
-        // against Roblox's own periodic settings refresh -- are in
-        // `shell_config::FrameRateLimit` and `cordial_runtime::flags::FrameRateLimit`
-        // beside the code.
+        // What a user can act on: what it does and the caveat that would
+        // otherwise read as the setting not working. Applies to a running game
+        // (ADR-044), so it carries no "next launch" note. The mechanics -- the
+        // flag, and putting it back after the engine's own settings refresh --
+        // are in `cordial_runtime::flag_reapply`.
         .subtitle(
-            "Raises the engine's own frame cap above your display's refresh. \
-             Unlimited is not measured to be free of side effects.",
+            "Holds the engine's frame cap at this value. A value above your display's refresh \
+             needs a monitor that fast. Going back to Display refresh takes up to two minutes.",
         )
         .model(&frame_rate_model)
         .selected(config.borrow().frame_rate_limit.index())
         .build();
-    frame_rate.set_subtitle_lines(2);
+    frame_rate.set_subtitle_lines(3);
     frame_rate.add_suffix(&detail(
         "This is a different lever from Frame pacing above: Frame pacing decides whether a \
          finished frame waits for your display's refresh, and this decides how fast the engine \
-         tries to produce one in the first place. Raising this without also leaving Frame \
-         pacing off FIFO will not uncap anything, because FIFO still queues each present \
-         against the display clock.\n\n\
-         A game can reset FastFlags it fetches from Roblox mid-session; Cordial now \
-         re-applies this choice on a timer rather than setting it once, but the interval between \
-         reassertions has not itself been measured against a live session.",
+         tries to produce one in the first place. Frame pacing on FIFO still queues each present \
+         against the display clock, so raising this alone will not get past your panel's rate.\n\n\
+         Roblox's own client refetches its settings about every two minutes and puts its own \
+         value back. Cordial hands the engine your choice again right after each refresh, so \
+         the limit holds for the whole session. Changing the row applies to a game that is \
+         already running. Picking another cap takes effect at once; going back to Display \
+         refresh waits for the next of those refreshes, because the engine does not unset a \
+         flag that Roblox's settings leave out.",
     ));
     {
         let config = config.clone();

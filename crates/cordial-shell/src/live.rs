@@ -71,6 +71,7 @@ pub const CLASSIFICATION: &[(&str, Applies, &str)] = &[
     ("graphics", Applies::NextLaunch, "the backend is settled before the engine's first dlopen of libvulkan"),
     ("graphics_optimization_mode", Applies::NextLaunch, "device profile and core count are read during engine initialisation"),
     ("present_mode", Applies::NextLaunch, "a field of the swapchain, and Cordial never rebuilds a swapchain: the engine does, when the extent it reads changes, and nothing in Cordial can ask for one at the same size"),
+    ("frame_rate_limit", Applies::Live, "the client stores the choice and hands the engine the settings document again with the new DFIntTaskSchedulerTargetFps in it; the engine takes the new value at once; back to Display refresh waits for the engine's own next settings refresh, because it does not unset a flag the document stops carrying (ADR-051)"),
     ("gamepad", Applies::Live, "the pump polls it each tick; switching off sends the engine a disconnect for every announced pad, the same call an unplugged one gets"),
     ("close_on_leave", Applies::Live, "consulted when the engine's log reports leaving a game"),
     ("unpacked_plugins", Applies::NextLaunch, "the folder list is an environment variable of the client, and the hot-swap reconciler is built never to see unpacked plugins (ADR-038); edits inside a listed folder already reload"),
@@ -111,6 +112,7 @@ pub fn live_updates(config: &ShellConfig) -> Vec<Update> {
         Update::Gamemode(config.gamemode),
         Update::Gamepad(config.gamepad),
         Update::TitleBar(config.title_bar),
+        Update::FrameRateLimit(config.frame_rate_limit),
     ]
 }
 

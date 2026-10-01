@@ -441,25 +441,13 @@ pub fn spawn(
 
     // The Frame rate limit row. Sent unconditionally, unlike the present-mode
     // row just above -- there is no flag-layer entry a plugin contributes this
-    // key through that an absent variable would leave room for (see
-    // `shell_config::FrameRateLimit::as_env`'s own doc for why), so there is no
+    // key through that an absent variable would leave room for, so there is no
     // "leave a plugin the floor" state to preserve the way `CORDIAL_GRAPHICS`
-    // and `CORDIAL_PRESENT_MODE` have to.
-    //
-    // The reassertion loop is the fix for the reset a user reported --
-    // `DFIntTaskSchedulerTargetFps` reverting to 60 -- and it only runs when
-    // asked for something other than the display's own refresh: see
-    // `bin/load.rs`'s `CORDIAL_REASSERT_FLAGS_MS` doc for the mechanism and
-    // why a single flag written at startup is not enough on its own. 30
-    // seconds was chosen to comfortably outpace the engine's own reload,
-    // measured landing at t≈1.6-2.3 s and again near t≈120 s
-    // (`docs/analysis/flag-init.md` §47) -- not itself re-measured at this
-    // interval, so treat the exact number as a reasoned default rather than
-    // one this change re-verified.
+    // and `CORDIAL_PRESENT_MODE` have to. This is the launch value: the row is
+    // live (ADR-044), and the settings socket changes it afterwards. Keeping
+    // the flag in force against the engine's own settings refresh is the
+    // client's job, not something to ask for here (ADR-051).
     command.env("CORDIAL_FRAME_RATE_LIMIT", config.frame_rate_limit.as_env());
-    if config.frame_rate_limit != crate::shell_config::FrameRateLimit::Display {
-        command.env("CORDIAL_REASSERT_FLAGS_MS", "30000");
-    }
 
     // The Controllers switch, and **only when it is off**. `CORDIAL_GAMEPAD`
     // is an off switch on the client side -- absent means on, and only the

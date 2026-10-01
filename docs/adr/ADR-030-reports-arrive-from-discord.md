@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-09-03
-**Related:** [ADR-017](ADR-017-sober-issue-corpus.md)
+**Related:** [ADR-017](ADR-017-sober-issue-corpus.md), [ADR-048](ADR-048-labels-and-edits-from-discord.md)
 
 ## Context
 
@@ -156,3 +156,10 @@ separator, which an embed's single description could not do.
 sees message content in a message-command payload. Discord's documentation does
 not say, so an empty body is refused with an explanation rather than posted as
 a blank comment.
+
+## Later: labels and editing
+
+Labels in the report form, and an Edit button that updates the issue, are
+recorded in [ADR-048](ADR-048-labels-and-edits-from-discord.md), including the
+permission model. The rule above -- who may act is read from the issue and from
+Discord, never from the button -- is the one both of them follow.

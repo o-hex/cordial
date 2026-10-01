@@ -10,13 +10,14 @@ the issue, opens a thread, and links the two.
 
 From then on the thread is the issue's other face:
 
-| In Discord                                          | What happens                                           |
-| --------------------------------------------------- | ------------------------------------------------------ |
-| **Comment on the issue**                            | A modal; the text becomes a comment, attributed to you |
-| Right-click a message → Apps → **Add to the issue** | That one message becomes a comment                     |
-| **Close it**                                        | Closes as _not planned_, and archives the thread       |
-| **Reopen it**                                       | Reopens, and brings the thread back                    |
-| **Mark as completed**                               | Closes as _completed_. Maintainers only                |
+| In Discord                                          | What happens                                                                       |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| **Comment on the issue**                            | A modal; the text becomes a comment, attributed to you                             |
+| Right-click a message → Apps → **Add to the issue** | That one message becomes a comment                                                 |
+| **Close it**                                        | Closes as _not planned_, and archives the thread                                   |
+| **Reopen it**                                       | Reopens, and brings the thread back                                                |
+| **Mark as completed**                               | Closes as _completed_. Maintainers only                                            |
+| **Edit**                                            | Changes the title, text and labels. The filer or a moderator; every edit is logged |
 
 And in the other direction: a comment on the issue appears in the thread, and closing or reopening
 it on GitHub moves the thread to match.
@@ -31,6 +32,57 @@ Who may close is read from **the issue**, never from the button. A `custom_id` i
 and anyone who can see the message can press it, so the reporter's id lives in the issue body where
 only the App can write it. An issue filed on the web has no reporter recorded and cannot be closed
 from Discord at all.
+
+## Labels, and editing a report
+
+Both are recorded in [ADR-048](../../docs/adr/ADR-048-labels-and-edits-from-discord.md); this is
+what they do and what to set.
+
+**Labels in the form.** The report dialog has an optional multi-select of the repository's GitHub
+labels, and what is chosen is applied when the issue is created. A reporter may pick only labels
+matching an allowlist, by default `area:*`, `platform:*`, `compositor:*` and `gpu:*`. A moderator
+may pick any label. A few triage labels (`confirmed`, `wontfix`, `invalid`, `duplicate`,
+`priority*`, `severity*`, `security*`, `triage*`, `good first issue`, `help wanted`) are never a
+reporter's to pick, even if the allowlist is widened to `*`; that list is in `labels.ts`, on purpose
+not in configuration. The labels a template applies by itself (`bug`) are applied as before.
+
+**Today the repository has only GitHub's default labels, so reporters see no menu** until labels
+matching the allowlist exist. Create them (`area:graphics`, `compositor:sway`, `gpu:nvidia`, ...)
+and it appears within ten minutes, the cache lifetime.
+
+The menu takes one of the dialog's five slots, so on `bug_report`, `broken_feature`, `finding` and
+`roblox_update` one optional field moves to the "Add the rest" follow-up. If the label list cannot
+be read, the dialog opens without the menu and the report files without labels. Past 25 eligible
+labels the ones already on the issue come first, then the form's own groups (`FORM_LABEL_ORDER`),
+then name order, and the menu says how many did not fit.
+
+**Editing.** **Edit** is the last button on a thread's first message. It opens a dialog filled with
+the issue's title, the form's free-text answers and, if there are labels to choose, a label menu. A
+form with more answers than a dialog holds is edited in parts: title, labels and three answers
+first, then five at a time behind an **Edit more fields** button.
+
+| Who                                                 | May                                                  |
+| --------------------------------------------------- | ---------------------------------------------------- |
+| The Discord user recorded in the issue as its filer | Edit title, answers, and the labels in the allowlist |
+| A moderator                                         | The same, on any report, with any label              |
+| Anyone else                                         | Gets an ephemeral refusal                            |
+
+A **moderator** is a member with Manage Messages, Manage Threads or Administrator in the channel, or
+with a role in `DISCORD_MODERATOR_ROLE_IDS`. The same rule gates **Mark as completed**. An issue
+with no recorded filer (filed on the web) can be edited by moderators only.
+
+What an edit cannot touch: the Diagnostics block, the "Reported from Discord" line and the hidden
+marker. Dropdown answers, and any answer too long for a dialog box, stay as they are and are changed
+on GitHub. If the body was reflowed on GitHub so that the bridge cannot rebuild it exactly, only the
+title and labels can be edited from Discord.
+
+**Every edit is logged before it happens.** The bridge first comments on the issue: who (display
+name and id, and whether as the reporter or a moderator), when (UTC), what changed, and the previous
+text of whatever changed, in a `<details>`. If that comment cannot be written the edit does not
+happen; if the edit then fails, the comment is amended to say so. A one-line copy goes in the
+thread, which is renamed if the title changed. The dialog also carries a fingerprint of what it
+showed, so submitting one that went stale (somebody else edited in between) saves nothing. Threads
+opened before this was added have no Edit button.
 
 **The forms are generated from `.github/ISSUE_TEMPLATE/`, never hand-copied.** That is the whole
 design constraint: `config.yml` sets `blank_issues_enabled: false` on purpose, because the required
@@ -65,7 +117,7 @@ no state to lose or migrate.
 cd tools/discord-bridge
 npm ci             # the Worker's one dependency; Deno resolves it from here too
 deno task check    # do the templates still fit a five-component modal?
-deno task test     # 79 tests, no network, no credentials
+deno task test     # about 180 tests, no network, no credentials
 ```
 
 `npm ci` comes first: `yaml` is an npm dependency so the same import resolves under Cloudflare
@@ -145,6 +197,20 @@ Then:
 | `GITHUB_READ_TOKEN`           | Optional. Only raises the rate limit for reading templates |
 | `GITHUB_REF_NAME`             | Optional, defaults to `main`                               |
 
+Two more, both optional and neither a secret:
+
+| Variable                     | What                                                                                                                                                     |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GITHUB_REPORTER_LABELS`     | Labels a reporter may pick, comma-separated, `*` as a wildcard. Unset: `area:*,platform:*,compositor:*,gpu:*`. `none`: no reporter labels                |
+| `DISCORD_MODERATOR_ROLE_IDS` | Role ids, comma-separated, that count as moderators besides Manage Messages / Manage Threads / Administrator. A malformed id stops the bridge at startup |
+
+No new GitHub App permission is needed: Issues read and write already covers labels and comments. No
+slash command or context-menu command was added, so `register-commands` is unchanged. Add the two
+variables to `.env` and upload them as the others were; the Worker has no `vars` block.
+
+`/health` now also reports the label cache (`count`, `ageSeconds`, `failure`). It never turns `ok`
+false, because a form without a label menu still files reports.
+
 **`GITHUB_APP_LOGIN` is the one that fails quietly if it is wrong.** It is how the bridge recognises
 its own comments; set it wrong and a comment filed from Discord is relayed back into the thread it
 came from.
@@ -178,3 +244,8 @@ signature checks are tested against keys generated in the test and against `open
 independent oracle, and the whole interaction flow is exercised with fakes. That is a long way from
 watching somebody file an issue from Discord, and the first real run should be treated as the first
 real run.
+
+Unverified in particular for labels and editing: that Discord accepts a multi-select with
+`min_values: 0` and pre-selected options inside a modal, and what it submits for an empty one; and
+that the Edit dialog can open inside Discord's three seconds on a cold Worker, since it must read
+the issue before it can answer. If it cannot, the reply says to press **Edit** again.

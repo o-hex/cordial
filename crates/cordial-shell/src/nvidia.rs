@@ -359,6 +359,21 @@ pub fn host_driver_version() -> Option<String> {
     parse_kernel_module_version(text.trim())
 }
 
+/// Where the kernel exposes whether `nvidia-drm` was loaded with `modeset=1`.
+/// `Y` or `N` on current kernels; `1` and `0` are accepted too, since the
+/// parameter is a boolean and older text has been seen written either way.
+pub const MODESET_PATH: &str = "/sys/module/nvidia_drm/parameters/modeset";
+
+/// Reads a boolean module parameter's text. `None` for anything else, so an
+/// unfamiliar value is reported as unfamiliar and not as "off".
+pub fn parse_modeset(text: &str) -> Option<bool> {
+    match text.trim() {
+        "Y" | "y" | "1" => Some(true),
+        "N" | "n" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 /// `550.163.01` becomes `550-163-01`, which is how Flatpak names the extension.
 pub fn dashed(version: &str) -> String {
     version.replace('.', "-")
@@ -695,6 +710,16 @@ mod tests {
         assert_eq!(parse_kernel_module_version(two).as_deref(), Some("550.120"));
         assert_eq!(parse_kernel_module_version("garbage"), None);
         assert_eq!(parse_kernel_module_version(""), None);
+    }
+
+    #[test]
+    fn a_boolean_module_parameter_is_read_and_anything_else_is_not_guessed() {
+        assert_eq!(parse_modeset("Y\n"), Some(true));
+        assert_eq!(parse_modeset("1"), Some(true));
+        assert_eq!(parse_modeset("N\n"), Some(false));
+        assert_eq!(parse_modeset(" 0 "), Some(false));
+        assert_eq!(parse_modeset(""), None);
+        assert_eq!(parse_modeset("-1"), None);
     }
 
     #[test]

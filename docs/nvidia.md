@@ -25,6 +25,12 @@ alone.
 - **Says so, in a Flatpak, if the NVIDIA driver inside the sandbox does not match
   the one on your machine**, on the crash page and in `cordial --diagnostics`
   (the `Graphics` line).
+- **Checks the same things in `cordial --doctor`** and the report screen, when
+  the GPU Vulkan lists is NVIDIA's: the driver series, whether a Flatpak's GL
+  extension matches your driver, and whether `nvidia-drm` has `modeset` on. Each
+  says plainly when it could not read something, which is usual for `modeset`
+  inside a Flatpak. If Vulkan lists only the CPU renderer while the kernel sees
+  an NVIDIA GPU, the first of those lines carries the extension finding.
 - **Adds a hint to the crash page** when the game stops after any of the above,
   or after `RBXCRASH: OutOfMemory`, on an NVIDIA GPU.
 

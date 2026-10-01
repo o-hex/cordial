@@ -5,7 +5,7 @@
 //! status from failures only, output safe to paste -- and most of the file,
 //! desktop, audio, keyring and GameMode checks. What was added here: the GPU
 //! and a Vulkan device probe, the display backend, Deno, every profile's lock,
-//! and the seam for the NVIDIA checks ([`nvidia_checks`]).
+//! and the NVIDIA checks ([`nvidia_checks`]).
 //!
 //! `diagnostics.rs` is the block a bug report needs, deliberately free of
 //! judgement. This is the other half: the same machine read for the things
@@ -29,6 +29,7 @@
 //! for the Vulkan question, which a broken driver can hang and so is never
 //! asked in this process. Nothing here touches the network.
 
+use crate::nvidia::{self, FlatpakGl};
 use crate::profile;
 use crate::vulkan_probe::{self, Device, Failure, Kind};
 use std::path::{Path, PathBuf};
@@ -347,9 +348,10 @@ pub fn gpu(env: &Env, inputs: &Inputs) -> Vec<Check> {
         Some(vulkan_probe::probe(VULKAN_PROBE_LIMIT))
     };
     let kernel_gpus = kernel_gpu_vendors();
-    out.extend(vulkan_devices(probed.as_ref(), &kernel_gpus, env.in_flatpak));
+    let nvidia_host = NvidiaHost::read(env);
+    out.extend(vulkan_devices(probed.as_ref(), &kernel_gpus, env.in_flatpak, &nvidia_host.flatpak_gl()));
     if let Some(Ok(devices)) = &probed {
-        out.extend(nvidia_checks(devices));
+        out.extend(nvidia_checks(devices, &nvidia_host));
     }
     out
 }
@@ -395,10 +397,15 @@ fn vulkan_files(loader: bool, drivers: &[String], in_flatpak: bool) -> Check {
 /// not want a child process). `kernel_gpus` are the PCI vendor ids of the
 /// display controllers the kernel sees, so a machine whose GPU is present and
 /// unused can say so instead of only showing the CPU renderer that took over.
+/// `nvidia_gl` is only read for that case, when the kernel sees an NVIDIA GPU
+/// and Vulkan found none: a Flatpak whose GL extension does not match the
+/// host's driver is the usual reason, and is worth saying here, where the
+/// symptom is, because [`nvidia_checks`] never sees a device to run on.
 pub fn vulkan_devices(
     probed: Option<&Result<Vec<Device>, Failure>>,
     kernel_gpus: &[u32],
     in_flatpak: bool,
+    nvidia_gl: &FlatpakGl,
 ) -> Vec<Check> {
     let Some(probed) = probed else {
         return vec![check(Level::Info, "Vulkan devices were not listed (no loader to ask)", "")];
@@ -428,6 +435,17 @@ pub fn vulkan_devices(
                     fix.push_str(&format!(
                         "The kernel reports {kernel}, so the GPU is there and its Vulkan driver is not being used. {hint}"
                     ));
+                    if kernel_gpus.contains(&nvidia::VENDOR_ID) {
+                        // Only a mismatch is said; a matching or unreadable extension
+                        // is not a cause, and the doc covers the rest.
+                        match nvidia_gl.advice() {
+                            Some(advice) => fix.push_str(&format!(" {advice}")),
+                            None => fix.push_str(&format!(
+                                " The Flatpak and two-GPU cases are written up in {}",
+                                nvidia::DOC_URL
+                            )),
+                        }
+                    }
                 }
                 out.push(check(Level::Warn, format!("the only Vulkan device is a CPU renderer: {names}"), fix));
             } else {
@@ -473,30 +491,192 @@ pub fn vulkan_devices(
     }
 }
 
-/// **The hook for the NVIDIA checks.** Called with the Vulkan devices that
-/// answered, and it should return one [`Check`] per finding.
-///
-/// Not written: the NVIDIA-specific questions -- whether `nvidia-drm` has
-/// `modeset=1`, and whether the Flatpak's `org.freedesktop.Platform.GL.nvidia`
-/// extension matches the host driver's version -- are being researched
-/// separately, and guessing them here would be the failure this file is written
-/// against. Until they land it says plainly that they were not checked, and
-/// only for a machine that has an NVIDIA device, so nobody else is shown a line
-/// about hardware they do not own.
-///
-/// `nvidia.rs` (the gate, the driver-version parsing and `flatpak_gl_here`)
-/// landed alongside this and is the natural source for them; nothing here calls
-/// it, because which of its answers deserve a line, and at what level, is that
-/// research's call and not this file's.
-pub fn nvidia_checks(devices: &[Device]) -> Vec<Check> {
-    if !devices.iter().any(|d| d.vendor_id == 0x10de) {
-        return Vec::new();
+/// What the NVIDIA checks read off this machine, taken once so a test can hand
+/// in a machine it made up. Each field is `None` or empty where the machine
+/// would not say, and the checks report that as "not visible from here" rather
+/// than as a fault.
+#[derive(Debug, Clone, Default)]
+pub struct NvidiaHost {
+    pub in_flatpak: bool,
+    /// Whether the game opens on X11, by the loader's rule ([`uses_x11`]).
+    pub uses_x11: bool,
+    /// The kernel module's version, from `/proc/driver/nvidia/version` or
+    /// `/sys/module/nvidia/version` ([`nvidia::host_driver_version`]).
+    pub kernel_module: Option<String>,
+    /// The driver versions the Flatpak sandbox carries a GL extension for.
+    pub sandbox_extensions: Vec<String>,
+    /// The text of `/sys/module/nvidia_drm/parameters/modeset`, `None` when it
+    /// could not be read. Common inside a Flatpak, and when `nvidia_drm` is not
+    /// loaded; the two look the same from here.
+    pub modeset: Option<String>,
+    /// `CORDIAL_FORCE_GPU_VENDOR`, test only: gate as though the device were
+    /// this vendor, so the checks can be watched on a machine without one.
+    pub forced: Option<nvidia::VendorOverride>,
+}
+
+impl NvidiaHost {
+    pub fn read(env: &Env) -> NvidiaHost {
+        NvidiaHost::read_with(env, Path::new(nvidia::SANDBOX_GL_DIR), Path::new(nvidia::MODESET_PATH))
     }
-    vec![check(
-        Level::Info,
-        "NVIDIA-specific checks (nvidia-drm modeset, the Flatpak GL extension against the host driver) were not run",
+
+    /// [`read`](NvidiaHost::read) with the two places a test needs to point
+    /// elsewhere. The kernel module's version still comes from
+    /// [`nvidia::host_driver_version`], whose parsing has its own tests.
+    pub fn read_with(env: &Env, gl_dir: &Path, modeset_path: &Path) -> NvidiaHost {
+        NvidiaHost {
+            in_flatpak: env.in_flatpak,
+            uses_x11: uses_x11(env.cordial_x11, env.wayland_display.is_some()),
+            kernel_module: nvidia::host_driver_version(),
+            sandbox_extensions: nvidia::sandbox_extension_versions(gl_dir),
+            modeset: std::fs::read_to_string(modeset_path).ok(),
+            forced: nvidia::override_from_env(),
+        }
+    }
+
+    fn flatpak_gl(&self) -> FlatpakGl {
+        nvidia::flatpak_gl(self.in_flatpak, self.kernel_module.as_deref(), &self.sandbox_extensions)
+    }
+}
+
+/// The checks that only mean something for an NVIDIA GPU, one line each.
+///
+/// **Gated on the device the Vulkan probe listed, not on a kernel module being
+/// loaded** ([ADR-046](../../../docs/adr/ADR-046-nvidia-is-gated-on-the-vendor-id.md)):
+/// a hybrid laptop has the module loaded and may render on the other GPU, and a
+/// line about NVIDIA there would be about hardware the game is not using. A
+/// machine whose NVIDIA GPU Vulkan cannot see at all gets no line from here;
+/// [`vulkan_devices`] names that case, and adds the Flatpak extension finding to
+/// it, since a missing extension is the usual reason.
+///
+/// **Nothing here has run against a real NVIDIA driver.** What each line claims
+/// is what `docs/nvidia.md` and `docs/analysis/nvidia-support.md` already say,
+/// and each says plainly what it could not read. The driver-series line is a
+/// report from other people's machines (`INFERRED` that it applies to Cordial's
+/// own renderer).
+pub fn nvidia_checks(devices: &[Device], host: &NvidiaHost) -> Vec<Check> {
+    let Some((device, gate)) = devices
+        .iter()
+        .filter(|d| d.kind != Kind::Cpu)
+        .map(|d| (d, nvidia::gate(d.vendor_id, d.driver_version, host.forced)))
+        .find(|(_, g)| g.nvidia())
+    else {
+        return Vec::new();
+    };
+    let forced = if gate.overridden {
+        format!(" ({}, test only)", nvidia::FORCE_VENDOR_ENV)
+    } else {
+        String::new()
+    };
+    vec![driver_series(device, &gate, host, &forced), flatpak_extension(host), modeset(host)]
+}
+
+/// Whether the driver is one of the series reported to crash Roblox's Vulkan
+/// renderer. Keyed on the major alone, because NVIDIA packs the minor into
+/// eight bits and a version such as 535.309.01 wraps it
+/// ([`nvidia::DriverVersion`]).
+fn driver_series(device: &Device, gate: &nvidia::Gate, host: &NvidiaHost, forced: &str) -> Check {
+    let major = gate.driver.major;
+    let module = host.kernel_module.as_deref().map(|v| format!(", kernel module {v}")).unwrap_or_default();
+    if major == 0 {
+        return check(
+            Level::Info,
+            format!("the NVIDIA driver version was not reported by {}{forced}", device.name),
+            "",
+        );
+    }
+    if nvidia::driver_advisory(major).is_some() {
+        return check(
+            Level::Warn,
+            format!(
+                "NVIDIA driver series {major}{module} is one reported to crash Roblox's Vulkan renderer \
+                 when the window is first resized{forced}"
+            ),
+            format!(
+                "Update to driver 580 or newer, or set Settings > Graphics > Renderer to OpenGL ES and \
+                 relaunch. This is what people running the same engine reported; it has not been tried on \
+                 NVIDIA hardware here. {}",
+                nvidia::DOC_URL
+            ),
+        );
+    }
+    check(
+        Level::Ok,
+        format!("NVIDIA driver series {major}{module} is not one of those reported to crash (535, 550){forced}"),
         "",
-    )]
+    )
+}
+
+/// Whether a Flatpak carries the NVIDIA GL extension the host's kernel module
+/// needs. The comparison and the advice are [`nvidia::flatpak_gl`] and
+/// [`nvidia::FlatpakGl::advice`], the same ones `cordial --diagnostics` prints.
+fn flatpak_extension(host: &NvidiaHost) -> Check {
+    let gl = host.flatpak_gl();
+    match &gl {
+        FlatpakGl::NotFlatpak => check(
+            Level::Info,
+            "not a Flatpak, so the machine's own NVIDIA libraries are used and there is no GL extension to match",
+            "",
+        ),
+        FlatpakGl::NoNvidiaModule => check(
+            Level::Info,
+            "the host's NVIDIA kernel module version is not visible from inside the sandbox, so the Flatpak GL \
+             extension could not be compared with it",
+            "On the machine itself, compare `cat /proc/driver/nvidia/version` with `flatpak list | grep GL.nvidia`; \
+             the two versions have to match exactly.",
+        ),
+        FlatpakGl::Matches(v) => {
+            check(Level::Ok, format!("the Flatpak GL extension matches the host's NVIDIA driver ({v})"), "")
+        }
+        FlatpakGl::Missing { host } => check(
+            Level::Warn,
+            format!("the host's NVIDIA driver is {host} and the Flatpak has no NVIDIA GL extension"),
+            gl.advice().unwrap_or_default(),
+        ),
+        FlatpakGl::Different { host, found } => check(
+            Level::Warn,
+            format!(
+                "the host's NVIDIA driver is {host} and the Flatpak's GL extension is {}",
+                found.join(", ")
+            ),
+            gl.advice().unwrap_or_default(),
+        ),
+    }
+}
+
+/// Whether `nvidia-drm` runs with modesetting, which Wayland needs on drivers
+/// before 595 (`docs/nvidia.md`; 595 turns it on itself).
+fn modeset(host: &NvidiaHost) -> Check {
+    let Some(text) = &host.modeset else {
+        return check(
+            Level::Info,
+            format!(
+                "nvidia-drm modeset is not visible from here ({} could not be read)",
+                nvidia::MODESET_PATH
+            ),
+            "That is usual inside a Flatpak, and is also what it looks like when nvidia_drm is not loaded. On the \
+             machine itself, `cat /sys/module/nvidia_drm/parameters/modeset` should print Y if you use Wayland.",
+        );
+    };
+    match nvidia::parse_modeset(text) {
+        Some(true) => check(Level::Ok, "nvidia-drm modeset is on", ""),
+        Some(false) if host.uses_x11 => check(
+            Level::Info,
+            "nvidia-drm modeset is off, which only matters on Wayland, and the game opens on X11 here",
+            "",
+        ),
+        Some(false) => check(
+            Level::Warn,
+            "nvidia-drm modeset is off, and the game opens on Wayland",
+            "Add nvidia-drm.modeset=1 to the kernel command line and reboot; drivers before 595 need it for \
+             Wayland, and 595 and later turn it on themselves. If the game window will not appear, CORDIAL_X11=1 \
+             opens it on X11 instead, at the cost of the embedded web windows. docs/nvidia.md has the detail.",
+        ),
+        None => check(
+            Level::Info,
+            format!("nvidia-drm modeset has a value this check does not recognise: {:?}", text.trim()),
+            "",
+        ),
+    }
 }
 
 fn loadable(soname: &str) -> bool {
@@ -956,7 +1136,7 @@ mod tests {
     #[test]
     fn a_working_gpu_is_named_with_its_vendor_and_driver() {
         let devices = Ok(vec![device(Kind::Discrete, 0x10de, "RTX")]);
-        let checks = vulkan_devices(Some(&devices), &[0x10de], false);
+        let checks = vulkan_devices(Some(&devices), &[0x10de], false, &FlatpakGl::NotFlatpak);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].level, Level::Ok);
         assert!(checks[0].what.contains("RTX") && checks[0].what.contains("NVIDIA"), "{:?}", checks[0]);
@@ -966,14 +1146,14 @@ mod tests {
     #[test]
     fn a_cpu_only_vulkan_is_a_warning_that_says_the_gpu_is_unused() {
         let devices = Ok(vec![device(Kind::Cpu, 0x10005, "llvmpipe (LLVM 19.1, 256 bits)")]);
-        let with_gpu = vulkan_devices(Some(&devices), &[0x10de], false);
+        let with_gpu = vulkan_devices(Some(&devices), &[0x10de], false, &FlatpakGl::NotFlatpak);
         assert_eq!(with_gpu.len(), 1);
         assert_eq!(with_gpu[0].level, Level::Warn);
         assert!(with_gpu[0].what.contains("llvmpipe"), "{:?}", with_gpu[0]);
         assert!(with_gpu[0].fix.contains("NVIDIA GPU") && with_gpu[0].fix.contains("not being used"), "{:?}", with_gpu[0]);
 
         // With no GPU seen by the kernel, it does not claim one.
-        let without = vulkan_devices(Some(&devices), &[], false);
+        let without = vulkan_devices(Some(&devices), &[], false, &FlatpakGl::NotFlatpak);
         assert!(!without[0].fix.contains("kernel reports"), "{:?}", without[0]);
     }
 
@@ -983,7 +1163,7 @@ mod tests {
             device(Kind::Integrated, 0x8086, "Intel(R) Graphics"),
             device(Kind::Cpu, 0x10005, "llvmpipe"),
         ]);
-        let checks = vulkan_devices(Some(&devices), &[0x8086], false);
+        let checks = vulkan_devices(Some(&devices), &[0x8086], false, &FlatpakGl::NotFlatpak);
         assert!(checks.iter().all(|c| c.level != Level::Warn), "{checks:?}");
         assert!(checks.iter().any(|c| c.what.contains("Intel")));
     }
@@ -997,33 +1177,213 @@ mod tests {
             Failure::TimedOut,
             Failure::Crashed("the probe ended with signal: 11 (SIGSEGV)".into()),
         ] {
-            let checks = vulkan_devices(Some(&Err(failure.clone())), &[], false);
+            let checks = vulkan_devices(Some(&Err(failure.clone())), &[], false, &FlatpakGl::NotFlatpak);
             assert_eq!(checks.len(), 1);
             assert_eq!(checks[0].level, Level::Warn, "{failure:?}");
             assert!(!checks[0].fix.trim().is_empty(), "{failure:?} has no fix");
         }
         // No loader was already reported by the file check; here it is a note.
-        let none = vulkan_devices(Some(&Err(Failure::NoLoader)), &[], false);
+        let none = vulkan_devices(Some(&Err(Failure::NoLoader)), &[], false, &FlatpakGl::NotFlatpak);
         assert_eq!(none[0].level, Level::Info);
     }
 
     #[test]
     fn a_flatpak_is_told_about_the_gl_extension_and_not_a_distro_package() {
-        let checks = vulkan_devices(Some(&Err(Failure::Instance(-9))), &[], true);
+        let checks = vulkan_devices(Some(&Err(Failure::Instance(-9))), &[], true, &FlatpakGl::NotFlatpak);
         assert!(checks[0].fix.contains("org.freedesktop.Platform.GL"), "{:?}", checks[0]);
         assert!(!checks[0].fix.contains("apt"), "{:?}", checks[0]);
     }
 
-    /// The seam: reports "not checked" for NVIDIA hardware and says nothing
-    /// for anybody else. The other agent's checks replace the body.
+    fn nvidia_device(major: u32, minor: u32) -> Device {
+        Device { driver_version: (major << 22) | (minor << 14), ..device(Kind::Discrete, 0x10de, "RTX") }
+    }
+
+    /// A Wayland session on a machine whose module is 580.82.09, in a Flatpak
+    /// that carries the matching extension and has modeset on: everything
+    /// passes. Each test spoils one thing.
+    fn good_host() -> NvidiaHost {
+        NvidiaHost {
+            in_flatpak: true,
+            uses_x11: false,
+            kernel_module: Some("580.82.09".into()),
+            sandbox_extensions: vec!["580.82.09".into()],
+            modeset: Some("Y\n".into()),
+            forced: None,
+        }
+    }
+
+    fn run(host: &NvidiaHost) -> Vec<Check> {
+        nvidia_checks(&[nvidia_device(580, 82)], host)
+    }
+
     #[test]
-    fn the_nvidia_hook_reports_not_checked_only_for_nvidia_hardware() {
-        let nvidia = [device(Kind::Discrete, 0x10de, "RTX")];
-        let checks = nvidia_checks(&nvidia);
-        assert_eq!(checks.len(), 1);
-        assert_eq!(checks[0].level, Level::Info);
-        assert!(checks[0].what.contains("were not run"), "{:?}", checks[0]);
-        assert!(nvidia_checks(&[device(Kind::Discrete, 0x1002, "Radeon")]).is_empty());
+    fn a_healthy_nvidia_machine_passes_every_line() {
+        let checks = run(&good_host());
+        assert_eq!(checks.len(), 3, "{checks:?}");
+        assert!(checks.iter().all(|c| c.level == Level::Ok && c.fix.is_empty()), "{checks:?}");
+    }
+
+    #[test]
+    fn nothing_is_said_unless_a_device_is_nvidia() {
+        let mut host = good_host();
+        host.modeset = Some("N".into());
+        host.sandbox_extensions.clear();
+        assert!(nvidia_checks(&[device(Kind::Discrete, 0x1002, "Radeon")], &host).is_empty());
+        assert!(nvidia_checks(&[device(Kind::Integrated, 0x8086, "Intel")], &host).is_empty());
+        assert!(nvidia_checks(&[], &host).is_empty());
+        // A CPU renderer carrying NVIDIA's vendor id is not an NVIDIA GPU.
+        assert!(nvidia_checks(&[device(Kind::Cpu, 0x10de, "llvmpipe")], &host).is_empty());
+        // The module being loaded is not the gate: a hybrid laptop on Intel.
+        assert!(host.kernel_module.is_some());
+        assert!(nvidia_checks(&[device(Kind::Integrated, 0x8086, "Intel")], &host).is_empty());
+    }
+
+    #[test]
+    fn the_reported_driver_series_warn_and_the_others_do_not() {
+        for major in [535, 550] {
+            let checks = nvidia_checks(&[nvidia_device(major, 1)], &good_host());
+            assert_eq!(checks[0].level, Level::Warn, "{major}");
+            assert!(checks[0].what.contains(&format!("series {major}")), "{:?}", checks[0]);
+            assert!(checks[0].fix.contains("580") && checks[0].fix.contains("OpenGL ES"), "{:?}", checks[0]);
+            assert!(checks[0].fix.contains("not been tried"), "must say it is untested: {:?}", checks[0]);
+        }
+        for major in [470, 545, 555, 570, 580, 595] {
+            let checks = nvidia_checks(&[nvidia_device(major, 1)], &good_host());
+            assert_eq!(checks[0].level, Level::Ok, "{major}: {:?}", checks[0]);
+        }
+        // A driver that reports no version is not read as a series.
+        let none = nvidia_checks(&[nvidia_device(0, 0)], &good_host());
+        assert_eq!(none[0].level, Level::Info, "{:?}", none[0]);
+    }
+
+    /// The minor wraps at 256 (535.309.01), so the line keys on the major and
+    /// never prints a packed minor it cannot trust.
+    #[test]
+    fn the_series_line_does_not_print_the_untrustworthy_packed_minor() {
+        let checks = nvidia_checks(&[nvidia_device(535, 309 & 0xff)], &good_host());
+        assert!(!checks[0].what.contains(&format!("535.{}", 309 & 0xff)), "{:?}", checks[0]);
+    }
+
+    #[test]
+    fn the_test_override_gates_any_gpu_as_nvidia_and_says_so() {
+        let mut host = good_host();
+        host.forced = nvidia::parse_override("0x10de@550.163.01");
+        let intel = [Device { driver_version: 0, ..device(Kind::Integrated, 0x8086, "Intel") }];
+        let checks = nvidia_checks(&intel, &host);
+        assert_eq!(checks.len(), 3, "{checks:?}");
+        assert_eq!(checks[0].level, Level::Warn, "{:?}", checks[0]);
+        assert!(checks[0].what.contains("series 550") && checks[0].what.contains("test only"), "{:?}", checks[0]);
+        // A CPU renderer is still not an NVIDIA GPU, forced or not.
+        assert!(nvidia_checks(&[device(Kind::Cpu, 0x10005, "llvmpipe")], &host).is_empty());
+    }
+
+    #[test]
+    fn the_flatpak_extension_is_compared_with_the_host_and_says_what_it_could_not_see() {
+        let line = |host: &NvidiaHost| run(host).remove(1);
+
+        let mut host = good_host();
+        host.sandbox_extensions = vec![];
+        let c = line(&host);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.what.contains("580.82.09") && c.what.contains("no NVIDIA GL extension"), "{c:?}");
+        assert!(c.fix.contains("flatpak update") && c.fix.contains("GL.nvidia-580-82-09"), "{c:?}");
+
+        host.sandbox_extensions = vec!["550.163.01".into(), "535.183.01".into()];
+        let c = line(&host);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.what.contains("550.163.01, 535.183.01"), "{c:?}");
+        assert!(c.fix.contains("flatpak update"), "{c:?}");
+
+        // Dashes or dots, it is the same version.
+        host.sandbox_extensions = vec!["580.82.09".into()];
+        assert_eq!(line(&host).level, Level::Ok);
+
+        // In a sandbox that cannot see the module: unknown, not a mismatch.
+        host.kernel_module = None;
+        host.sandbox_extensions = vec![];
+        let c = line(&host);
+        assert_eq!(c.level, Level::Info);
+        assert!(c.what.contains("not visible"), "{c:?}");
+
+        // Outside a Flatpak there is no second copy to disagree.
+        host.in_flatpak = false;
+        let c = line(&host);
+        assert_eq!(c.level, Level::Info);
+        assert!(c.what.contains("not a Flatpak"), "{c:?}");
+    }
+
+    #[test]
+    fn modeset_warns_only_when_it_is_off_on_wayland_and_says_when_it_cannot_see() {
+        let line = |host: &NvidiaHost| run(host).remove(2);
+        let mut host = good_host();
+
+        for off in ["N\n", "0"] {
+            host.modeset = Some(off.into());
+            let c = line(&host);
+            assert_eq!(c.level, Level::Warn, "{off:?}");
+            assert!(c.fix.contains("nvidia-drm.modeset=1") && c.fix.contains("595"), "{c:?}");
+        }
+
+        // On X11 it does not matter, so it is a note.
+        host.uses_x11 = true;
+        let c = line(&host);
+        assert_eq!(c.level, Level::Info);
+        assert!(c.fix.is_empty(), "{c:?}");
+        host.uses_x11 = false;
+
+        for on in ["Y\n", "1"] {
+            host.modeset = Some(on.into());
+            assert_eq!(line(&host).level, Level::Ok, "{on:?}");
+        }
+
+        // Unreadable (a Flatpak sandbox, or no nvidia_drm): not guessed at.
+        host.modeset = None;
+        let c = line(&host);
+        assert_eq!(c.level, Level::Info);
+        assert!(c.what.contains("not visible from here"), "{c:?}");
+
+        host.modeset = Some("maybe".into());
+        assert_eq!(line(&host).level, Level::Info);
+    }
+
+    /// The sysfs and sandbox reads, against directories a test made.
+    #[test]
+    fn the_host_is_read_from_the_paths_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let gl = dir.path().join("GL");
+        for name in ["default", "nvidia-580-82-09"] {
+            std::fs::create_dir_all(gl.join(name)).unwrap();
+        }
+        let modeset = dir.path().join("modeset");
+        std::fs::write(&modeset, "N\n").unwrap();
+        let env = Env { in_flatpak: true, wayland_display: Some("wayland-0".into()), ..Env::default() };
+        let host = NvidiaHost::read_with(&env, &gl, &modeset);
+        assert_eq!(host.sandbox_extensions, vec!["580.82.09".to_string()]);
+        assert_eq!(host.modeset.as_deref(), Some("N\n"));
+        assert!(host.in_flatpak && !host.uses_x11);
+
+        let gone = NvidiaHost::read_with(&env, &dir.path().join("none"), &dir.path().join("nope"));
+        assert!(gone.sandbox_extensions.is_empty() && gone.modeset.is_none());
+    }
+
+    /// An NVIDIA GPU the kernel sees and Vulkan does not is where a Flatpak's
+    /// missing extension shows up, and no NVIDIA device exists to run the
+    /// NVIDIA checks on, so the CPU-only line carries the finding.
+    #[test]
+    fn a_cpu_only_vulkan_beside_an_nvidia_gpu_carries_the_extension_finding() {
+        let devices = Ok(vec![device(Kind::Cpu, 0x10005, "llvmpipe")]);
+        let mismatch = FlatpakGl::Missing { host: "580.82.09".into() };
+        let c = vulkan_devices(Some(&devices), &[0x10de], true, &mismatch);
+        assert!(c[0].fix.contains("flatpak update") && c[0].fix.contains("580.82.09"), "{:?}", c[0]);
+
+        // A matching extension is not a cause, so it is not offered as one.
+        let c = vulkan_devices(Some(&devices), &[0x10de], true, &FlatpakGl::Matches("580.82.09".into()));
+        assert!(!c[0].fix.contains("flatpak update"), "{:?}", c[0]);
+        assert!(c[0].fix.contains("docs/nvidia.md"), "{:?}", c[0]);
+
+        // And nothing NVIDIA-shaped for a machine whose kernel GPU is not.
+        let c = vulkan_devices(Some(&devices), &[0x8086], true, &mismatch);
+        assert!(!c[0].fix.contains("flatpak update") && !c[0].fix.contains("nvidia.md"), "{:?}", c[0]);
     }
 
     #[test]

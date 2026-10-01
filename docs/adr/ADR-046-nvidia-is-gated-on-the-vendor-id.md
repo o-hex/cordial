@@ -26,7 +26,10 @@ What is built on that gate:
   device;
 - a `Graphics` row in `cordial --diagnostics` and, in a Flatpak, a sentence when
   the sandbox lacks the `GL.nvidia` extension the host driver needs;
-- hints on the crash page.
+- hints on the crash page;
+- three lines in `cordial --doctor` (`doctor::nvidia_checks`): the driver series,
+  the Flatpak extension against the host module, and `nvidia-drm` modeset, each
+  run only for a Vulkan device whose vendor id is `0x10DE`.
 
 `CORDIAL_FORCE_GPU_VENDOR` and `CORDIAL_TEST_FAIL_PRESENT_MODES` exist so that
 path can be run on a machine without NVIDIA hardware. They change what Cordial

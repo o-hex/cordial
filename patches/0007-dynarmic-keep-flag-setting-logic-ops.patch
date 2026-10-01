@@ -1,0 +1,64 @@
+diff --git a/src/dynarmic/ir/opt/constant_propagation_pass.cpp b/src/dynarmic/ir/opt/constant_propagation_pass.cpp
+index 83ed8499..53948d9e 100644
+--- a/src/dynarmic/ir/opt/constant_propagation_pass.cpp
++++ b/src/dynarmic/ir/opt/constant_propagation_pass.cpp
+@@ -126,6 +126,14 @@ void FoldAdd(IR::Inst& inst, bool is_32_bit) {
+ // 5. x & y -> x (where y has all bits set to 1)
+ //
+ void FoldAND(IR::Inst& inst, bool is_32_bit) {
++    // Cordial (patches/0007): a flag-setting logical op (ANDS, TST) carries
++    // a GetNZCVFromOp pseudo-op, which only accepts an And/Eor/Or/Not as its
++    // argument. Folding the op away re-points the
++    // pseudo-op at whatever replaced it and trips its assertion, so an op
++    // with a pseudo-op is left alone, as FoldAdd and FoldSub already do.
++    if (inst.HasAssociatedPseudoOperation()) {
++        return;
++    }
+     if (FoldCommutative(inst, is_32_bit, [](u64 a, u64 b) { return a & b; })) {
+         const auto rhs = inst.GetArg(1);
+         if (rhs.IsZero()) {
+@@ -194,6 +202,14 @@ void FoldDivide(IR::Inst& inst, bool is_32_bit, bool is_signed) {
+ // 3. 0 ^ y -> y
+ //
+ void FoldEOR(IR::Inst& inst, bool is_32_bit) {
++    // Cordial (patches/0007): a flag-setting logical op (ANDS, TST) carries
++    // a GetNZCVFromOp pseudo-op, which only accepts an And/Eor/Or/Not as its
++    // argument. Folding the op away re-points the
++    // pseudo-op at whatever replaced it and trips its assertion, so an op
++    // with a pseudo-op is left alone, as FoldAdd and FoldSub already do.
++    if (inst.HasAssociatedPseudoOperation()) {
++        return;
++    }
+     if (FoldCommutative(inst, is_32_bit, [](u64 a, u64 b) { return a ^ b; })) {
+         const auto rhs = inst.GetArg(1);
+         if (rhs.IsZero()) {
+@@ -273,6 +289,14 @@ void FoldMultiply(IR::Inst& inst, bool is_32_bit) {
+ 
+ // Folds NOT operations if the contained value is an immediate.
+ void FoldNOT(IR::Inst& inst, bool is_32_bit) {
++    // Cordial (patches/0007): a flag-setting logical op (ANDS, TST) carries
++    // a GetNZCVFromOp pseudo-op, which only accepts an And/Eor/Or/Not as its
++    // argument. Folding the op away re-points the
++    // pseudo-op at whatever replaced it and trips its assertion, so an op
++    // with a pseudo-op is left alone, as FoldAdd and FoldSub already do.
++    if (inst.HasAssociatedPseudoOperation()) {
++        return;
++    }
+     const auto operand = inst.GetArg(0);
+ 
+     if (!operand.IsImmediate()) {
+@@ -290,6 +314,14 @@ void FoldNOT(IR::Inst& inst, bool is_32_bit) {
+ // 3. 0 | y -> y
+ //
+ void FoldOR(IR::Inst& inst, bool is_32_bit) {
++    // Cordial (patches/0007): a flag-setting logical op (ANDS, TST) carries
++    // a GetNZCVFromOp pseudo-op, which only accepts an And/Eor/Or/Not as its
++    // argument. Folding the op away re-points the
++    // pseudo-op at whatever replaced it and trips its assertion, so an op
++    // with a pseudo-op is left alone, as FoldAdd and FoldSub already do.
++    if (inst.HasAssociatedPseudoOperation()) {
++        return;
++    }
+     if (FoldCommutative(inst, is_32_bit, [](u64 a, u64 b) { return a | b; })) {
+         const auto rhs = inst.GetArg(1);
+         if (rhs.IsZero()) {

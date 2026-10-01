@@ -156,14 +156,32 @@ if (wanted && MODES.includes(wanted)) {
 // it refuses anything else with "flags.set needs a values object", and this
 // file spent its entire shipped life collecting that refusal without reporting
 // it, because it never checked.
-const set = await call("flags.set", {
-  values: { CordialPresentMode: mode },
-});
+const CAPS = ["240", "165", "144", "120", "60", "default"];
+const DEFAULT_CAP = "default";
+
+let cap = DEFAULT_CAP;
+const wantedCap = typeof answers.cap === "string" ? answers.cap.trim().toLowerCase() : "";
+
+if (wantedCap && CAPS.includes(wantedCap)) {
+  cap = wantedCap;
+} else if (wantedCap) {
+  await log(
+    `cap is "${answers.cap}", which is not one of ${CAPS.join(", ")}. ` +
+      `Using ${DEFAULT_CAP}.`,
+  );
+}
+
+const values: Record<string, string> = { CordialPresentMode: mode };
+if (cap !== "default") {
+  values.DFIntTaskSchedulerTargetFps = cap;
+}
+
+const set = await call("flags.set", { values });
 
 if (set.status === "ok") {
   await log(
-    `present mode set to ${mode}. The engine asks for FIFO; this asks Cordial ` +
-      `for something else when the driver has it. Takes effect at the next launch.`,
+    `present mode set to ${mode}, frame rate cap ${cap}. ` +
+      `Takes effect at the next launch.`,
   );
 } else {
   // Including the capability, because "denied" without saying what was needed

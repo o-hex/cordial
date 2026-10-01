@@ -156,10 +156,16 @@ fn discover_tiers(system_root: &Path, user_root: &Path) -> (Vec<Plugin>, Vec<Plu
 /// and not the user's to delete, and it cannot be replaced by a same-id user
 /// directory. It can be switched off exactly like any other, which is the whole
 /// reason enablement is a separate file from grants.
+///
+/// A third kind is a folder somebody is writing a plugin in, loaded from where
+/// it lives (`unpacked_plugins`). It is listed with the installed ones and
+/// marked, but it is not *in* either directory: nothing can be uninstalled from
+/// an archive, there is no update, and "remove" means forgetting the folder.
 #[derive(Clone, Copy, PartialEq)]
 enum Tier {
     BuiltIn,
     User,
+    Development,
 }
 
 /// "Appearance" — Cordial's own theme preference, independent of anything
@@ -1414,9 +1420,27 @@ fn capability_row_subtitle(cap: Capability, refused: bool) -> String {
 /// after they write, so the summary line never lags behind the file it
 /// describes — the same reasoning the single switch this replaced already
 /// had, extended to cover more than one control changing the same plugin.
-fn refresh_plugin_subtitle(expander: &adw::ExpanderRow, plugin: &Plugin, profile_dir: Option<&PathBuf>, enabled: bool) {
+fn refresh_plugin_subtitle(
+    expander: &adw::ExpanderRow,
+    plugin: &Plugin,
+    profile_dir: Option<&PathBuf>,
+    enabled: bool,
+    tier: Tier,
+) {
+    expander.set_subtitle(&plugin_row_subtitle(plugin, profile_dir, enabled, tier));
+}
+
+/// The summary line under a plugin's name. A development plugin leads with the
+/// folder it is loaded from, because that is the one thing that tells two
+/// working copies of the same plugin apart.
+fn plugin_row_subtitle(plugin: &Plugin, profile_dir: Option<&PathBuf>, enabled: bool, tier: Tier) -> String {
     let granted = profile_dir.map(|dir| grants::load(&grants::path_in(dir))).unwrap_or_default();
-    expander.set_subtitle(&capability_summary(plugin, granted.get(&plugin.manifest.id), enabled));
+    let status = capability_summary(plugin, granted.get(&plugin.manifest.id), enabled);
+    if tier == Tier::Development {
+        cordial_shell::plugin_listing::dev_subtitle(&plugin.dir.display().to_string(), &status)
+    } else {
+        status
+    }
 }
 
 /// One installed plugin's row: enable switch, one capability switch per
@@ -1443,9 +1467,9 @@ fn build_plugin_row(
 
     let expander = adw::ExpanderRow::builder()
         .title(title.clone())
-        .subtitle(capability_summary(plugin, profile_dir.map(|dir| grants::load(&grants::path_in(dir))).unwrap_or_default().get(&id), enabled))
+        .subtitle(plugin_row_subtitle(plugin, profile_dir, enabled, tier))
         .build();
-    expander.set_subtitle_lines(2);
+    expander.set_subtitle_lines(if tier == Tier::Development { 3 } else { 2 });
 
     // **A plugin that failed says so on its own row.**
     //
@@ -1499,6 +1523,16 @@ fn build_plugin_row(
     if tier == Tier::BuiltIn {
         let tag = gtk::Label::new(Some("Built-in"));
         tag.add_css_class("dim-label");
+        tag.add_css_class("caption");
+        tag.set_valign(gtk::Align::Center);
+        expander.add_suffix(&tag);
+    }
+    // Marked as what it is, in words: a development folder is not installed
+    // anywhere, and a row that looked like the installed ones beside it would
+    // suggest an uninstall and an update that do not exist.
+    if tier == Tier::Development {
+        let tag = gtk::Label::new(Some("Development"));
+        tag.add_css_class("accent");
         tag.add_css_class("caption");
         tag.set_valign(gtk::Align::Center);
         expander.add_suffix(&tag);
@@ -1662,7 +1696,7 @@ fn build_plugin_row(
                     return;
                 }
             }
-            refresh_plugin_subtitle(&expander, &plugin, dir.as_ref(), on);
+            refresh_plugin_subtitle(&expander, &plugin, dir.as_ref(), on, tier);
         });
     }
     expander.add_row(&enable_row);
@@ -1718,7 +1752,7 @@ fn build_plugin_row(
                     }
                     row.set_subtitle(&capability_row_subtitle(cap, false));
                 }
-                refresh_plugin_subtitle(&expander, &plugin, Some(&dir), enable_row.is_active());
+                refresh_plugin_subtitle(&expander, &plugin, Some(&dir), enable_row.is_active(), tier);
             });
         }
     } else {
@@ -1816,7 +1850,7 @@ fn maybe_prompt_builtin_consent(
             for (_, row) in &cap_rows {
                 row.set_active(true);
             }
-            refresh_plugin_subtitle(&expander, &plugin, Some(&dir), enable_row.is_active());
+            refresh_plugin_subtitle(&expander, &plugin, Some(&dir), enable_row.is_active(), Tier::BuiltIn);
         }
         dialog.close();
     });
@@ -2460,15 +2494,39 @@ fn build_marketplace_groups(
 /// installed, or to find the one plugin they wanted to check on, without first
 /// turning plugins back on — and the state they are trying to reason about is
 /// exactly the one where plugins are off.
-/// Returns the page and the Installed group, because "Get Plugins" has to add
-/// a row to that exact group the moment an install succeeds. Handing the group
+/// Returns the page, the Installed group and the master switch, because "Get
+/// Plugins" has to add a row to that exact group the moment an install
+/// succeeds, and every group added to the page afterwards has to be governed
+/// by that switch too. Handing the group
 /// back is what keeps one `build_plugin_row` serving both — the alternative
 /// this project has already been bitten by is a second, similar-looking row
 /// built in the installer's callback that drifts from this one.
+struct PluginsPage {
+    page: adw::PreferencesPage,
+    /// Holds installed and development plugins alike.
+    installed: adw::PreferencesGroup,
+    master: adw::SwitchRow,
+}
+
+/// Make `group` follow the "Use Plugins" switch: insensitive whenever it is
+/// off, now and for any row added to the group later.
+///
+/// **A binding, not a closure that walks a list.** The switch used to grey two
+/// groups by calling `set_sensitive` on them from its own handler, and every
+/// group added to the page afterwards (installing from a file, the
+/// marketplace, the development folders, the runtime download) was left out
+/// because nobody remembered to extend the list: with plugins off, the page
+/// still offered to install one. Sensitivity is inherited by a group's rows,
+/// so governing the group covers a row added after the page is built.
+fn govern(master: &adw::SwitchRow, group: &impl IsA<gtk::Widget>) {
+    master.bind_property("active", group, "sensitive").sync_create().build();
+}
+
 fn build_plugins_page(
     parent: &adw::PreferencesDialog,
     config: Rc<RefCell<ShellConfig>>,
-) -> (adw::PreferencesPage, adw::PreferencesGroup) {
+    config_path: Rc<PathBuf>,
+) -> PluginsPage {
     let page = adw::PreferencesPage::builder()
         .title("Plugins")
         .name("plugins")
@@ -2528,6 +2586,7 @@ fn build_plugins_page(
         button.set_valign(gtk::Align::Center);
         row.add_suffix(&button);
         group.add(&row);
+        govern(&master, &group);
         page.add(&group);
 
         let row_for_click = row.clone();
@@ -2602,15 +2661,45 @@ fn build_plugins_page(
         }
     }
 
-    // ---- user-installed ---------------------------------------------------
+    // ---- user-installed, and the folders being developed ------------------
+    //
+    // One list. A plugin loaded from a working folder has a switch, permissions
+    // and a health line like any other, and a person looking for it does not
+    // know it is kept somewhere different. It sits after the installed ones and
+    // says "Development" on its row.
     let user_group = adw::PreferencesGroup::builder().title("Installed").build();
-    if user.is_empty() {
+    let taken: BTreeSet<String> =
+        system.iter().chain(user.iter()).map(|p| p.manifest.id.clone()).collect();
+    let development =
+        cordial_shell::plugin_listing::dev_entries(&config.borrow().unpacked_plugins, &taken);
+    let listing = cordial_shell::plugin_listing::merge(user, development);
+    if listing.is_empty() {
         user_group.add(&adw::ActionRow::builder().title("None yet").build());
-    } else {
-        for plugin in &user {
-            let row =
-                build_plugin_row(parent, plugin, profile_dir.as_ref(), &root, &user_group, Tier::User);
-            user_group.add(&row);
+    }
+    for item in &listing {
+        match item {
+            cordial_shell::plugin_listing::Listed::Installed(plugin) => {
+                let row = build_plugin_row(
+                    parent,
+                    plugin,
+                    profile_dir.as_ref(),
+                    &root,
+                    &user_group,
+                    Tier::User,
+                );
+                user_group.add(&row);
+            }
+            cordial_shell::plugin_listing::Listed::Development(entry) => {
+                let row = build_development_row(
+                    parent,
+                    &config,
+                    &config_path,
+                    profile_dir.as_ref(),
+                    entry,
+                    &user_group,
+                );
+                user_group.add(&row);
+            }
         }
     }
 
@@ -2632,13 +2721,8 @@ fn build_plugins_page(
     page.add(&user_group);
 
     // ---- what the master switch governs -----------------------------------
-    let governed = [builtin_group.clone(), user_group.clone()];
-    let apply = move |groups: &[adw::PreferencesGroup], on: bool| {
-        for g in groups {
-            g.set_sensitive(on);
-        }
-    };
-    apply(&governed, master.is_active());
+    govern(&master, &builtin_group);
+    govern(&master, &user_group);
     {
         let dir = profile_dir.clone();
         master.connect_active_notify(move |row| {
@@ -2647,13 +2731,12 @@ fn build_plugins_page(
                 if let Err(e) = enablement::set_plugins_allowed(dir, on) {
                     // Put back to what is on disk, the same posture the
                     // per-plugin switch takes: a switch resting somewhere the
-                    // file disagrees with is a lie the user cannot see.
+                    // file disagrees with is a lie the user cannot see. The
+                    // groups follow the switch, so they are put back with it.
                     eprintln!("shell: could not record that plugins are {}: {e}", if on { "on" } else { "off" });
                     row.set_active(!on);
-                    return;
                 }
             }
-            apply(&governed, on);
         });
     }
     if profile_dir.is_none() {
@@ -2661,7 +2744,7 @@ fn build_plugins_page(
         master.set_subtitle("This profile's directory could not be read, so nothing can be saved.");
     }
 
-    (page, user_group)
+    PluginsPage { page, installed: user_group, master }
 }
 
 /// "Get Plugins" — installing from a file, and the marketplace.
@@ -2694,62 +2777,46 @@ fn build_plugins_page(
 /// packaging step this removes.
 fn add_developer_group(
     parent: &impl IsA<gtk::Window>,
+    dialog: &adw::PreferencesDialog,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
     page: &adw::PreferencesPage,
+    installed_group: &adw::PreferencesGroup,
+    master: &adw::SwitchRow,
 ) {
     let group = adw::PreferencesGroup::builder()
         .title("Developing a plugin")
         .description(
-            "Load a plugin from the folder you are writing it in. It reloads as you edit, \
-             and is granted nothing until you grant it, like any other.",
+            "Load a plugin from the folder you are writing it in. It is listed under Installed, \
+             marked Development, and reloads as you edit. It is granted nothing until you \
+             grant it, like any other. Adding or removing a folder takes effect the next time \
+             you press Roblox.",
         )
         .build();
+    govern(master, &group);
 
-    for dir in config.borrow().unpacked_plugins.clone() {
-        let row = adw::ActionRow::builder().title(&dir).build();
-        row.set_subtitle_lines(2);
-        let remove = gtk::Button::from_icon_name("list-remove-symbolic");
-        remove.set_tooltip_text(Some("Stop loading this folder"));
-        remove.set_valign(gtk::Align::Center);
-        remove.add_css_class("flat");
-        {
-            let config = config.clone();
-            let config_path = config_path.clone();
-            let dir = dir.clone();
-            let row = row.clone();
-            remove.connect_clicked(move |_| {
-                config.borrow_mut().unpacked_plugins.retain(|d| *d != dir);
-                persist(&config, &config_path);
-                // Insensitive rather than removed from the list: rebuilding
-                // the page from here would mean rebuilding the whole dialog,
-                // and a row that visibly stops applying says the same thing.
-                row.set_sensitive(false);
-                row.set_subtitle("Removed. Takes effect the next time you press Roblox.");
-            });
-        }
-        row.add_suffix(&remove);
-        group.add(&row);
-    }
-
+    const PROMPT: &str = "Choose the folder containing that plugin's plugin.json";
     let add = adw::ActionRow::builder()
         .title("Add a plugin folder…")
-        .subtitle("Choose the folder containing that plugin's plugin.json")
+        .subtitle(PROMPT)
         .activatable(true)
         .build();
     {
         let config = config.clone();
         let config_path = config_path.clone();
         let parent = parent.as_ref().clone();
-        let group = group.clone();
+        let dialog = dialog.clone();
+        let installed_group = installed_group.clone();
         let add_row = add.clone();
         add.connect_activated(move |_| {
-            let dialog = gtk::FileDialog::builder().title("Plugin folder").build();
+            add_row.set_subtitle(PROMPT);
+            let picker = gtk::FileDialog::builder().title("Plugin folder").build();
             let config = config.clone();
             let config_path = config_path.clone();
-            let group = group.clone();
+            let dialog = dialog.clone();
+            let installed_group = installed_group.clone();
             let add_row = add_row.clone();
-            dialog.select_folder(Some(&parent), gtk::gio::Cancellable::NONE, move |result| {
+            picker.select_folder(Some(&parent), gtk::gio::Cancellable::NONE, move |result| {
                 let Ok(file) = result else { return };
                 let Some(path) = file.path() else { return };
                 // Refused here rather than at launch, because a folder with no
@@ -2768,23 +2835,199 @@ fn add_developer_group(
                 {
                     let mut cfg = config.borrow_mut();
                     if cfg.unpacked_plugins.contains(&text) {
+                        add_row.set_subtitle(&format!("{text} is already in the list."));
+                        add_row.set_subtitle_lines(3);
                         return;
                     }
                     cfg.unpacked_plugins.push(text.clone());
                 }
                 persist(&config, &config_path);
-                let row = adw::ActionRow::builder()
-                    .title(&text)
-                    .subtitle("Loads the next time you press Roblox.")
-                    .build();
-                row.set_subtitle_lines(2);
-                group.add(&row);
-                add_row.set_subtitle("Choose the folder containing that plugin's plugin.json");
+
+                // The same row the page builds for it at startup, so a folder
+                // added now can be switched, granted and removed without
+                // closing the window. The first version of this added a bare
+                // row with no way to remove it until the next time Settings
+                // was opened.
+                let profile_dir = cordial_shell::profile::dir(&config.borrow().profile).ok();
+                let entries = cordial_shell::plugin_listing::dev_entries(
+                    &config.borrow().unpacked_plugins,
+                    &installed_ids(),
+                );
+                if let Some(entry) = entries.iter().find(|e| e.dir == text) {
+                    let row = build_development_row(
+                        &dialog,
+                        &config,
+                        &config_path,
+                        profile_dir.as_ref(),
+                        entry,
+                        &installed_group,
+                    );
+                    installed_group.add(&row);
+                }
+                add_row.set_subtitle(&format!(
+                    "Added {text}. It is under Installed now and loads the next time you press Roblox."
+                ));
+                add_row.set_subtitle_lines(3);
             });
         });
     }
     group.add(&add);
     page.add(&group);
+}
+
+/// The ids the built-in and installed plugins hold, which a development folder
+/// cannot share.
+fn installed_ids() -> BTreeSet<String> {
+    let (system, user, _) = discover_tiers(&manifest::system_plugin_root(), &manifest::plugin_root());
+    system.iter().chain(user.iter()).map(|p| p.manifest.id.clone()).collect()
+}
+
+/// One development folder's row on the Installed list.
+///
+/// A folder that loads gets the full plugin row, marked Development. One that
+/// does not -- deleted since it was added, a manifest that no longer parses,
+/// an id somebody else already holds -- still gets a row, with the reason,
+/// because the alternative is a list entry that vanishes from the page while
+/// staying in `shell.json`, which is a thing nobody can remove. Either way it
+/// carries the remove control, and no update or uninstall, because neither
+/// exists for a folder.
+fn build_development_row(
+    dialog: &adw::PreferencesDialog,
+    config: &Rc<RefCell<ShellConfig>>,
+    config_path: &Rc<PathBuf>,
+    profile_dir: Option<&PathBuf>,
+    entry: &cordial_shell::plugin_listing::DevEntry,
+    group: &adw::PreferencesGroup,
+) -> adw::PreferencesRow {
+    use cordial_shell::plugin_listing::{DevState, Shadowing};
+
+    let (row, name): (adw::PreferencesRow, String) = match &entry.state {
+        DevState::Loaded(plugin) => {
+            let expander =
+                build_plugin_row(dialog, plugin, profile_dir, &plugin.dir, group, Tier::Development);
+            let name = display_name(plugin);
+            (expander.clone().upcast(), name)
+        }
+        DevState::Unusable(_) | DevState::Shadowed { .. } => {
+            let reason = match &entry.state {
+                DevState::Unusable(why) => format!("Not loaded: {why}"),
+                DevState::Shadowed { id, by: Shadowing::Installed } => format!(
+                    "Not used: a built-in or installed plugin already has the id {id}. Remove \
+                     that one, or change the id here."
+                ),
+                DevState::Shadowed { id, by: Shadowing::EarlierFolder } => format!(
+                    "Not used: an earlier folder in this list already has the id {id}."
+                ),
+                DevState::Loaded(_) => unreachable!(),
+            };
+            let name = Path::new(&entry.dir)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.dir.clone());
+            let action = adw::ActionRow::builder()
+                .title(&name)
+                .subtitle(cordial_shell::plugin_listing::dev_subtitle(&entry.dir, &reason))
+                .build();
+            action.set_subtitle_lines(4);
+            let tag = gtk::Label::new(Some("Development"));
+            tag.add_css_class("accent");
+            tag.add_css_class("caption");
+            tag.set_valign(gtk::Align::Center);
+            action.add_suffix(&tag);
+            (action.clone().upcast(), name)
+        }
+    };
+
+    let remove = gtk::Button::from_icon_name("list-remove-symbolic");
+    remove.set_valign(gtk::Align::Center);
+    remove.add_css_class("flat");
+    remove.set_tooltip_text(Some("Stop loading this folder. The folder is kept."));
+    remove.update_property(&[gtk::accessible::Property::Label("Stop loading this plugin folder")]);
+    if let Some(expander) = row.downcast_ref::<adw::ExpanderRow>() {
+        expander.add_suffix(&remove);
+    } else if let Some(action) = row.downcast_ref::<adw::ActionRow>() {
+        action.add_suffix(&remove);
+    }
+    {
+        let dialog = dialog.clone();
+        let config = config.clone();
+        let config_path = config_path.clone();
+        let group = group.clone();
+        let row = row.clone();
+        let dir = entry.dir.clone();
+        remove.connect_clicked(move |_| {
+            confirm_remove_dev_folder(&dialog, &config, &config_path, &group, &row, &name, &dir);
+        });
+    }
+    row
+}
+
+/// Ask, then take the folder out of Cordial's list. Never touches the folder.
+///
+/// **Applies at the next launch, and the dialog says so.** `unpacked_plugins`
+/// is classified next-launch in `live.rs` (ADR-044): the folder list is an
+/// environment variable of the client, and the hot-swap reconciler is built
+/// never to see unpacked plugins (ADR-038). A client already running keeps the
+/// plugin until it exits; saying "removed" without that would be the stub that
+/// reports success.
+fn confirm_remove_dev_folder(
+    window: &adw::PreferencesDialog,
+    config: &Rc<RefCell<ShellConfig>>,
+    config_path: &Rc<PathBuf>,
+    group: &adw::PreferencesGroup,
+    row: &adw::PreferencesRow,
+    name: &str,
+    dir: &str,
+) {
+    let alert = adw::AlertDialog::builder()
+        .heading(format!("Stop loading {name}?"))
+        .body(format!(
+            "Cordial forgets this folder. The folder itself and everything in it is kept:\n\n{dir}\n\n\
+             What you allowed the plugin to do stays on this profile. A game that is already \
+             running keeps the plugin until you quit it; it is gone the next time you press Roblox."
+        ))
+        .build();
+    alert.add_response("cancel", "Cancel");
+    alert.add_response("remove", "Stop Loading");
+    alert.set_default_response(Some("cancel"));
+    alert.set_close_response("cancel");
+
+    let window_for_error = window.clone();
+    let config = config.clone();
+    let config_path = config_path.clone();
+    let group = group.clone();
+    let row = row.clone();
+    let dir = dir.to_string();
+    alert.connect_response(None, move |alert, response| {
+        if response == "remove" {
+            let mut next = config.borrow().unpacked_plugins.clone();
+            // Already gone from the list (removed from a second window, or the
+            // file edited by hand): the row has nothing left to represent.
+            if !cordial_shell::plugin_listing::remove_folder(&mut next, &dir) {
+                group.remove(&row);
+            } else {
+                let previous = std::mem::replace(&mut config.borrow_mut().unpacked_plugins, next);
+                match shell_config::save(&config_path, &config.borrow()) {
+                    Ok(()) => group.remove(&row),
+                    Err(e) => {
+                        // Put back what is on disk, and say so: a row that
+                        // disappears while `shell.json` still lists the folder
+                        // would come back next launch with no explanation.
+                        config.borrow_mut().unpacked_plugins = previous;
+                        eprintln!("shell: could not save {}: {e}", config_path.display());
+                        let failed = adw::AlertDialog::builder()
+                            .heading("Could not remove it")
+                            .body(format!("Cordial could not save its settings: {e}"))
+                            .build();
+                        failed.add_response("ok", "OK");
+                        failed.present(Some(&window_for_error));
+                    }
+                }
+            }
+        }
+        alert.close();
+    });
+    alert.present(Some(window));
 }
 
 fn add_get_plugins_groups(
@@ -2794,15 +3037,23 @@ fn add_get_plugins_groups(
     config_path: Rc<PathBuf>,
     installed_group: &adw::PreferencesGroup,
     page: &adw::PreferencesPage,
+    master: &adw::SwitchRow,
 ) {
 
     let root = manifest::plugin_root();
     let profile_name = config.borrow().profile.clone();
     let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
 
-    page.add(&build_install_group(parent, dialog, &root, profile_dir.clone(), installed_group));
+    let install = build_install_group(parent, dialog, &root, profile_dir.clone(), installed_group);
     let (marketplace_config, marketplace_listing) =
         build_marketplace_groups(parent, dialog, config, config_path, &root, profile_dir, installed_group);
+    // Every one of these is a plugin control, so every one follows "Use
+    // Plugins". Marketplace rows are added to `marketplace_listing` after the
+    // fact; the group's sensitivity covers them.
+    for group in [&install, &marketplace_config, &marketplace_listing] {
+        govern(master, group);
+    }
+    page.add(&install);
     page.add(&marketplace_config);
     page.add(&marketplace_listing);
 }
@@ -2865,9 +3116,10 @@ pub fn build_preferences_window(
     add_appearance_groups(&general, config.clone(), config_path.clone());
     window.add(&general);
     let config_for_flags = config.clone();
-    let (plugins, installed) = build_plugins_page(&window, config.clone());
-    add_get_plugins_groups(parent, &window, config.clone(), config_path.clone(), &installed, &plugins);
-    add_developer_group(parent, config, config_path, &plugins);
+    let PluginsPage { page: plugins, installed, master } =
+        build_plugins_page(&window, config.clone(), config_path.clone());
+    add_get_plugins_groups(parent, &window, config.clone(), config_path.clone(), &installed, &plugins, &master);
+    add_developer_group(parent, &window, config, config_path, &plugins, &installed, &master);
     window.add(&plugins);
     window.add(&build_fastflags_page(config_for_flags, &window));
 

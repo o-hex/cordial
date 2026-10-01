@@ -50,6 +50,7 @@ pub mod network;
 // is: `cordial-runtime` already depends on this crate and needs the same
 // vendor gate and driver decode the launcher's diagnostics and crash page use.
 pub mod nvidia;
+pub mod plugin_listing;
 pub mod plugin_preferences;
 pub mod profile;
 pub mod stacking_gate;

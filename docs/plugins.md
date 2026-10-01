@@ -49,6 +49,24 @@ its `plugin.json` is at `…/<plugin-id>/plugin.json`. Under Flatpak that path i
 `~/.var/app/io.github.luohoa97.Cordial/data/plugins/` instead, since that is
 where the sandbox keeps its data.
 
+**Or load the folder where it is.** Settings → Plugins → Developing a plugin →
+Add a plugin folder, and choose the plugin's own folder, the one with
+`plugin.json` in it. It is listed under Installed with a Development tag and
+its folder path, with the same switch, permissions and health line as any other
+plugin, and no update or uninstall, because there is no archive to replace. The
+minus button on its row stops Cordial loading the folder; it asks first, and it
+never deletes the folder or what is in it. What you allowed the plugin stays on
+the profile. Adding or removing a folder takes effect the next time you press
+Roblox, since development folders are deliberately outside the hot-swap
+reconciler ([ADR-038](adr/ADR-038-plugin-hot-swap.md)); edits inside a listed
+folder reload as you save. A folder whose id an installed or built-in plugin
+already has, and one that has gone missing, are listed with the reason they did not load.
+Folders you put in `CORDIAL_UNPACKED_PLUGINS` yourself, outside Settings, are
+not shown on this page and cannot be removed from it.
+
+Switching **Use Plugins** off greys out everything on this page, development
+folders and installing included.
+
 **No restart needed, since [ADR-038](adr/ADR-038-plugin-hot-swap.md).** A
 client already running notices the new directory, the grant you add for it,
 and Settings' own switch within a second or two, and starts, stops or

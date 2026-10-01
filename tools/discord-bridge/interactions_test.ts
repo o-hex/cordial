@@ -423,6 +423,7 @@ Deno.test("the thread's first message carries every control", async () => {
     "cordial-fixed:12",
     "cordial-close:12",
     "cordial-reopen:12",
+    "cordial-edit-open:12",
   ]);
 });
 
@@ -704,4 +705,344 @@ Deno.test("Mark as completed also accepts a configured moderator role", async ()
   );
   await after!();
   assertEquals(t.of("setIssueOpen")[0].args, [12, false, true]);
+});
+
+// ---- Edit ---------------------------------------------------------------
+
+const openEditor = async (t: ReturnType<typeof tracker>, who: Json = asUser("9"), id = "12") => {
+  const { response, after } = await handle(t.context, pressAs(`cordial-edit-open:${id}`, who));
+  return { response, after };
+};
+
+Deno.test("the original poster gets a dialog pre-filled with the report", async () => {
+  const t = tracker();
+  const { response, after } = await openEditor(t);
+  assertEquals((response as { type: number }).type, ResponseType.MODAL);
+  assertEquals(after, undefined, "a modal cannot follow a deferral");
+  const modal = modalOf(response);
+  assertEquals(modal.title, "Edit #12 (1 of 2)");
+  assert(modal.components.length <= 5);
+  assertEquals(inputs(modal), [
+    "cordial-title",
+    "what-happened",
+    "what-expected",
+    "repro",
+    "cordial-labels",
+  ]);
+  const title = modal.components[0].component as Json;
+  assertEquals(title.value, "[Bug]: The window opens and stays black.");
+  const first = modal.components[1].component as Json;
+  assertEquals(first.value, "The window opens and stays black.");
+  assert(!inputs(modal).includes("diagnostics"), "the diagnostics block is not editable");
+  // What is on the issue is shown as chosen -- but `bug` is not the reporter's.
+  const options = (modal.components[4].component as { options: { value: string }[] }).options;
+  assert(!options.some((o) => o.value === "bug"));
+});
+
+Deno.test("a moderator can open the editor on somebody else's report, by permission or by role", async () => {
+  for (const [who, roles] of [[MOD, []], [asUser("r", { roles: ["555"] }), ["555"]]] as const) {
+    const t = tracker({ roles: [...roles] });
+    const { response } = await openEditor(t, who as Json);
+    assertEquals((response as { type: number }).type, ResponseType.MODAL);
+  }
+});
+
+Deno.test("anybody else is refused, ephemerally, and nothing is fetched beyond the issue", async () => {
+  const t = tracker();
+  const { response, after } = await openEditor(t, asUser("1234"));
+  const body = response as { type: number; data: { content: string; flags: number } };
+  assertEquals(body.type, ResponseType.MESSAGE);
+  assertEquals(body.data.flags, 1 << 6, "only the presser sees it");
+  assertStringIncludes(body.data.content, "Only the person who filed this report");
+  assertEquals(after, undefined);
+});
+
+Deno.test("an issue with no recorded filer can be edited by a moderator and nobody else", async () => {
+  const stranger = tracker({ filer: null });
+  assertEquals(
+    ((await openEditor(stranger, asUser("9"))).response as { type: number }).type,
+    ResponseType.MESSAGE,
+  );
+  const mod = tracker({ filer: null });
+  const { response } = await openEditor(mod, MOD);
+  assertEquals((response as { type: number }).type, ResponseType.MODAL);
+});
+
+Deno.test("a field the issue never had is not made mandatory by editing it", async () => {
+  // Filed on the web with only one answer. The template's other required
+  // fields are absent, and a moderator fixing a typo must not be forced to
+  // invent them.
+  const t = tracker({ filer: null });
+  const { response } = await openEditor(t, MOD);
+  const modal = modalOf(response);
+  const byId = Object.fromEntries(
+    modal.components.map((c) => [(c.component as Json).custom_id, c.component as Json]),
+  );
+  assertEquals(byId["what-happened"].required, true, "it is there, so it stays required");
+  assertEquals(byId["what-expected"].required, false);
+  assertEquals(byId["repro"].required, false);
+});
+
+Deno.test("text the bridge cannot make sense of offers title and labels only", async () => {
+  const t = tracker({
+    filer: "9",
+    body: "just some words, no headings\n\n<!-- cordial-bridge thread=777 reporter=9 -->",
+  });
+  const { response } = await openEditor(t);
+  assertEquals(inputs(modalOf(response)), ["cordial-title", "cordial-labels"]);
+});
+
+Deno.test("the dialog opens without labels if the label list is not there in time", async () => {
+  const t = tracker({ known: null });
+  const { response } = await openEditor(t);
+  assert(!inputs(modalOf(response)).includes("cordial-labels"));
+  assert(!modalOf(response).custom_id.endsWith(":l"));
+});
+
+async function openAndSubmit(
+  t: ReturnType<typeof tracker>,
+  values: Record<string, string>,
+  selections?: Record<string, string[]>,
+  who: Json = asUser("9"),
+  part = 0,
+) {
+  const { response } = await handle(
+    t.context,
+    pressAs(`cordial-edit-open:12${part ? `:${part}` : ""}`, who),
+  );
+  const modal = modalOf(response);
+  const { response: ack, after } = await handle(
+    t.context,
+    submission(modal, values, selections, who),
+  );
+  assertEquals((ack as { type: number }).type, ResponseType.DEFERRED_MESSAGE);
+  await after!();
+  return modal;
+}
+
+Deno.test("an edit is logged on the issue first, then applied, then logged in the thread", async () => {
+  const t = tracker();
+  await openAndSubmit(
+    t,
+    {
+      "cordial-title": "[Bug]: Black window on Sway",
+      "what-happened": "The window is black on Sway 1.10.",
+      "what-expected": "The Roblox home screen.",
+      "repro": "Launch it.",
+    },
+    { "cordial-labels": [] },
+  );
+
+  const order = t.calls.map((c) => c.what).filter((w) =>
+    ["comment", "updateIssue", "post", "renameThread"].includes(w)
+  );
+  assertEquals(order, ["comment", "updateIssue", "post", "renameThread"]);
+
+  const audit = t.of("comment")[0].args[1] as string;
+  assertStringIncludes(audit, "**Edited from Discord** by `User 9` (`9`, the reporter)");
+  assertStringIncludes(
+    audit,
+    "`[Bug]: The window opens and stays black.` → `[Bug]: Black window on Sway`",
+  );
+  assertStringIncludes(audit, "<details>");
+  assertStringIncludes(audit, "The window opens and stays black.");
+
+  const [update] = t.of("updateIssue");
+  const fields = update.args[1] as { title: string; body: string; labels?: string[] };
+  assertEquals(fields.title, "[Bug]: Black window on Sway");
+  assertStringIncludes(fields.body, "The window is black on Sway 1.10.");
+  // The reporter's other words, the diagnostics, the credit and the pairing are intact.
+  assertStringIncludes(fields.body, "The Roblox home screen.");
+  assertStringIncludes(fields.body, "Cordial 0.13.2 (91f8ee9)\nInstall rpm");
+  assertStringIncludes(fields.body, "Filed by **Someone** (`9`)");
+  assertStringIncludes(
+    fields.body,
+    "<!-- cordial-bridge thread=777 reporter=9 form=bug_report -->",
+  );
+  assertEquals(fields.labels, undefined, "labels were not touched, so they are not sent");
+
+  const [thread] = t.of("post");
+  assertEquals(thread.args[0], "777");
+  assertStringIncludes(thread.args[1] as string, "User 9 (9)");
+  assertStringIncludes(thread.args[1] as string, "title changed");
+  assertStringIncludes(thread.args[1] as string, "issuecomment-55");
+  assertEquals(t.of("renameThread")[0].args, ["777", "#12 [Bug]: Black window on Sway"]);
+  assertStringIncludes(said(t.calls), "Updated the title, 1 field");
+});
+
+Deno.test("a moderator's edit of somebody else's report says so in the audit comment", async () => {
+  const t = tracker();
+  await openAndSubmit(
+    t,
+    { "cordial-title": "[Bug]: tidied", "what-happened": "The window opens and stays black." },
+    { "cordial-labels": ["bug"] },
+    MOD,
+  );
+  assertStringIncludes(t.of("comment")[0].args[1] as string, "(`mod`, as a moderator)");
+  assertEquals(t.of("updateIssue").length, 1);
+});
+
+Deno.test("a stranger who forges the submit changes nothing", async () => {
+  const t = tracker();
+  // The dialog as the reporter was shown it, submitted by somebody who was not.
+  const { response } = await handle(t.context, pressAs("cordial-edit-open:12"));
+  const { after } = await handle(
+    t.context,
+    submission(modalOf(response), { "cordial-title": "[Bug]: vandalised" }, {}, asUser("666")),
+  );
+  await after!();
+  assertEquals(t.of("comment").length, 0);
+  assertEquals(t.of("updateIssue").length, 0);
+  assertStringIncludes(said(t.calls), "Only the person who filed this report");
+});
+
+Deno.test("an edit from a dialog that has gone stale is refused and nothing is overwritten", async () => {
+  const t = tracker();
+  const { response } = await handle(t.context, pressAs("cordial-edit-open:12"));
+  const modal = modalOf(response);
+  // A maintainer retitles it while the dialog is open.
+  t.issue.title = "[Bug]: a maintainer's better title";
+  const { after } = await handle(
+    t.context,
+    submission(modal, { "cordial-title": "[Bug]: mine" }, { "cordial-labels": [] }),
+  );
+  await after!();
+  assertEquals(t.of("updateIssue").length, 0);
+  assertEquals(t.of("comment").length, 0);
+  assertStringIncludes(said(t.calls), "changed after you opened the editor");
+  assertStringIncludes(said(t.calls), "Nothing was saved");
+});
+
+Deno.test("if the audit comment cannot be written the edit does not happen", async () => {
+  const t = tracker();
+  (t.context.github as unknown as Json).comment = () =>
+    Promise.reject(new Error("comment refused"));
+  await openAndSubmit(t, { "cordial-title": "[Bug]: silent?" }, { "cordial-labels": [] });
+  assertEquals(t.of("updateIssue").length, 0, "never silently overwrite");
+  assertStringIncludes(said(t.calls), "nothing was changed");
+  assertStringIncludes(said(t.calls), "comment refused");
+});
+
+Deno.test("if GitHub refuses the edit, the audit comment is amended to say it did not happen", async () => {
+  const t = tracker();
+  (t.context.github as unknown as Json).updateIssue = () => Promise.reject(new Error("422"));
+  await openAndSubmit(t, { "cordial-title": "[Bug]: refused" }, { "cordial-labels": [] });
+  const [amended] = t.of("editComment");
+  assertEquals(amended.args[0], 55);
+  assertStringIncludes(amended.args[1] as string, "This edit was not applied");
+  assertEquals(t.of("post").length, 0, "nothing is announced in the thread");
+  assertStringIncludes(said(t.calls), "nothing was changed");
+});
+
+Deno.test("saving without changing anything writes nothing at all", async () => {
+  const t = tracker();
+  await openAndSubmit(
+    t,
+    {
+      "cordial-title": "[Bug]: The window opens and stays black.",
+      "what-happened": "The window opens and stays black.",
+      "what-expected": "The Roblox home screen.",
+      "repro": "Launch it.",
+    },
+    { "cordial-labels": [] },
+  );
+  assertEquals(t.of("comment").length, 0);
+  assertEquals(t.of("updateIssue").length, 0);
+  assertStringIncludes(said(t.calls), "Nothing changed");
+});
+
+Deno.test("a required field cannot be emptied by an edit", async () => {
+  const t = tracker();
+  await openAndSubmit(t, { "cordial-title": "[Bug]: x", "repro": "   " }, { "cordial-labels": [] });
+  assertEquals(t.of("updateIssue").length, 0);
+  assertStringIncludes(said(t.calls), "How to reproduce");
+  assertStringIncludes(said(t.calls), "required");
+});
+
+Deno.test("a field the submission leaves out is left alone, not emptied", async () => {
+  const t = tracker();
+  await openAndSubmit(t, { "cordial-title": "[Bug]: retitled" }, { "cordial-labels": [] });
+  const body = (t.of("updateIssue")[0].args[1] as { body?: string }).body;
+  assertEquals(body, undefined, "the body was not rewritten at all");
+});
+
+Deno.test("the reply offers the next part, and that dialog edits the later fields", async () => {
+  const t = tracker();
+  await openAndSubmit(t, { "cordial-title": "[Bug]: retitled" }, { "cordial-labels": [] });
+  const reply = t.of("editOriginal").at(-1)!.args[1] as {
+    components: { components: { custom_id: string }[] }[];
+  };
+  assertEquals(reply.components[0].components[0].custom_id, "cordial-edit-open:12:1");
+
+  const modal = await openAndSubmit(
+    t,
+    { "engine-log": "Segfault in libroblox at frame 3." },
+    undefined,
+    asUser("9"),
+    1,
+  );
+  assert(modal.components.length <= 5);
+  assert(!inputs(modal).includes("cordial-title"), "later parts carry no title");
+  const second = t.of("updateIssue").at(-1)!.args[1] as { body: string };
+  assertStringIncludes(
+    second.body,
+    "### The engine's own log\n\nSegfault in libroblox at frame 3.",
+  );
+  assertStringIncludes(second.body, "Filed by **Someone** (`9`)");
+  // One audit entry per part.
+  assertEquals(t.of("comment").length, 2);
+});
+
+Deno.test("a reporter editing labels cannot add a triage label or strip the project's own", async () => {
+  const t = tracker({ labelsOnIssue: ["bug", "confirmed", "area:input"] });
+  await openAndSubmit(
+    t,
+    {},
+    // area:input deselected, gpu:nvidia added, and a forged `wontfix` and `confirmed`.
+    { "cordial-labels": ["gpu:nvidia", "wontfix", "priority: high"] },
+  );
+  const [update] = t.of("updateIssue");
+  assertEquals((update.args[1] as { labels: string[] }).labels, ["bug", "confirmed", "gpu:nvidia"]);
+  const audit = t.of("comment")[0].args[1] as string;
+  assertStringIncludes(audit, "**Labels:** added `gpu:nvidia`; removed `area:input`");
+});
+
+Deno.test("a moderator editing labels may add any label, and it is logged the same way", async () => {
+  const t = tracker({ labelsOnIssue: ["bug"] });
+  await openAndSubmit(t, {}, { "cordial-labels": ["bug", "confirmed", "priority: high"] }, MOD);
+  const [update] = t.of("updateIssue");
+  assertEquals((update.args[1] as { labels: string[] }).labels, [
+    "bug",
+    "confirmed",
+    "priority: high",
+  ]);
+  assertStringIncludes(
+    t.of("comment")[0].args[1] as string,
+    "added `confirmed`, `priority: high`",
+  );
+});
+
+Deno.test("a label change when the list has gone is skipped, not guessed", async () => {
+  const t = tracker();
+  const { response } = await handle(t.context, pressAs("cordial-edit-open:12"));
+  // The list vanishes between the dialog opening and being submitted.
+  t.context.labels = { get: () => Promise.resolve(null) };
+  const { after } = await handle(
+    t.context,
+    submission(modalOf(response), { "cordial-title": "[Bug]: kept" }, {
+      "cordial-labels": ["gpu:nvidia"],
+    }),
+  );
+  await after!();
+  const [update] = t.of("updateIssue");
+  assertEquals((update.args[1] as { labels?: string[] }).labels, undefined);
+  assertStringIncludes(said(t.calls), "Labels were left as they were");
+});
+
+Deno.test("an issue whose body was reflowed on GitHub can still have its title and labels edited", async () => {
+  const t = tracker();
+  t.issue.body = t.issue.body.replace("\n\n### What you expected", "\n### What you expected");
+  const { response } = await handle(t.context, pressAs("cordial-edit-open:12"));
+  assertEquals(inputs(modalOf(response)), ["cordial-title", "cordial-labels"]);
+  assertEquals(modalOf(response).title, "Edit #12", "one part only");
 });

@@ -45,6 +45,7 @@ import {
 } from "./issue_body.ts";
 import { type Label, offerLabels, resolveSelection, type Who } from "./labels.ts";
 import { isModerator, type Member } from "./permissions.ts";
+import { openEditor, submitEdit } from "./edit_flow.ts";
 
 export interface Context {
   forms: () => Promise<IssueForm[]>;
@@ -96,6 +97,11 @@ function reporter(interaction: Interaction): Submission["reporter"] {
   };
 }
 
+/** Who is pressing, with what Discord says about their standing in this channel. */
+function editorOf(interaction: Interaction) {
+  return { ...reporter(interaction), member: interaction.member };
+}
+
 function whoIs(context: Context, interaction: Interaction): Who {
   return isModerator(interaction.member, context.moderatorRoleIds) ? "moderator" : "reporter";
 }
@@ -123,6 +129,7 @@ function reporting(
   context: Context,
   token: string,
   work: () => Promise<void>,
+  outcome = "nothing was filed",
 ): () => Promise<void> {
   return async () => {
     try {
@@ -132,7 +139,7 @@ function reporting(
       console.error(`follow-up: ${why}`);
       try {
         await context.discord.editOriginal(token, {
-          content: "That did not work, and nothing was filed. You can try again — " +
+          content: `That did not work, and ${outcome}. You can try again — ` +
             "and if it keeps happening, this is worth reporting on GitHub directly:\n" +
             `\`\`\`\n${why.slice(0, 600)}\n\`\`\``,
           components: [],
@@ -210,6 +217,16 @@ export async function handle(
       // there is deliberately nowhere to keep it.
       modal.custom_id = `cordial-issue:${form.slug}:extra:${rest[1]}`;
       return { response: { type: ResponseType.MODAL, data: modal } };
+    }
+    if (verb === "cordial-edit-open") {
+      return {
+        response: await openEditor(
+          context,
+          editorOf(interaction),
+          Number(rest[0]),
+          rest[1] === undefined ? 0 : Number(rest[1]),
+        ),
+      };
     }
     if (verb === "cordial-close" || verb === "cordial-reopen" || verb === "cordial-fixed") {
       const open = verb === "cordial-reopen";
@@ -296,6 +313,30 @@ export async function handle(
       };
     }
 
+    if (verb === "cordial-edit") {
+      return {
+        response: deferred(),
+        after: reporting(
+          context,
+          interaction.token,
+          () =>
+            submitEdit(
+              context,
+              interaction,
+              editorOf(interaction),
+              {
+                number: Number(rest[0]),
+                part: Number(rest[1]),
+                hash: rest[2] ?? "",
+                withLabels: rest[3] === "l",
+              },
+              { values, selections: modalSelections(interaction.data) },
+            ),
+          "nothing was changed",
+        ),
+      };
+    }
+
     if (verb === "cordial-issue" && rest[1] === "extra") {
       const form = find(rest[0]);
       const number = Number(rest[2]);
@@ -356,6 +397,7 @@ function threadControls(number: number): unknown[] {
       { type: BUTTON, style: 3, label: "Mark as completed", custom_id: `cordial-fixed:${number}` },
       { type: BUTTON, style: 4, label: "Close it", custom_id: `cordial-close:${number}` },
       { type: BUTTON, style: 2, label: "Reopen it", custom_id: `cordial-reopen:${number}` },
+      { type: BUTTON, style: 2, label: "Edit", custom_id: `cordial-edit-open:${number}` },
     ],
   }];
 }

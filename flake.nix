@@ -17,9 +17,13 @@
   #
   # `packages.default` / `packages.cordial` below is a separate concern: an
   # actual installable Cordial for anyone on Nix, alongside the Flatpak,
-  # AppImage, deb, rpm and AUR builds. It is INFERRED, not verified — see the
-  # comment on `cordial` below for exactly what could and could not be checked
-  # and why.
+  # AppImage, deb, rpm and AUR builds. Verified on 2026-10-01: it builds from a
+  # local checkout (`nix build '.?submodules=1#cordial'`, x86_64-linux,
+  # nixpkgs b4fd65b as pinned in flake.lock), `cordial --help` and
+  # `--diagnostics` run from the output, `ldd` finds nothing missing, and
+  # `cordial-run` links WebKitGTK. NOT verified: launching it into a game,
+  # `cargo test` (skipped, see `doCheck`), the devShell end to end, and the
+  # remote `github:...?submodules=1` form against a pushed commit.
   #
   # Deliberately out of scope:
   #
@@ -33,7 +37,12 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+    # Linux only. `eachDefaultSystem` also evaluates x86_64-darwin, and
+    # nixpkgs 26.11 throws on that outright ("has dropped support for
+    # x86_64-darwin"), which failed every `nix build` and `nix develop` here
+    # at evaluation time, before any package was looked at. Cordial loads a
+    # Linux ELF and has no Darwin build, so those systems were never useful.
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
         lib = pkgs.lib;
@@ -42,8 +51,8 @@
         # no emulation, no CPU translation (see docs/multiarch.md and the
         # rpm spec's `ExclusiveArch: x86_64`). A package for any other system
         # cannot run the one thing this project exists to run, so rather than
-        # `eachDefaultSystem` quietly producing an aarch64-linux or a Darwin
-        # `packages.default` that builds and then cannot load anything, the
+        # quietly producing an aarch64-linux `packages.default` that builds
+        # and then cannot load anything, the
         # package and app outputs below are gated to this one system and
         # everything else gets `{}`. The devShell is NOT gated — it only
         # builds the tree, which is architecture-general even though the
@@ -74,8 +83,9 @@
           # the `preConfigure` check below with a clear message rather than
           # the build.rs panic's `git submodule update --init --recursive`,
           # which cannot be run inside the sandbox (no network, no `.git`).
-          # See the README snippet in this change's report for the exact
-          # invocation a user needs.
+          # The local form with `?submodules=1` was built successfully on
+          # 2026-10-01, nested bionic and core submodules included; the
+          # missing-`?submodules=1` message was not exercised.
           src = self;
 
           preConfigure = ''
@@ -92,7 +102,10 @@
             fi
           '';
 
-          # The committed lockfile, not a `cargoHash`. Checked: nothing in
+          # The committed lockfile, not a `cargoHash`. Worked on the first
+          # build (2026-10-01); a nixpkgs submission has to use `cargoHash`
+          # instead, since that tree does not accept `cargoLock.lockFile`.
+          # Checked: nothing in
           # `Cargo.lock` is a `source = "git+...` dependency (`grep -c
           # 'source = "git' Cargo.lock` is 0), so there is no
           # `outputHashes` entry to keep in sync with it either — the two-line
@@ -140,21 +153,10 @@
             # feature `v4_20` and `libadwaita 0.9` with `v1_8` — i.e. GTK
             # 4.20+ and libadwaita 1.8+ at the C library level, not just the
             # Rust binding version. This project's own floor, not one raised
-            # here. **Not verified
-            # against this flake's actual pinned nixpkgs revision** — there is
-            # no committed `flake.lock`, `/nix/store` on this machine is
-            # read-only, and no substituter is reachable from here, so
-            # `nix eval nixpkgs#gtk4.version` could not be run. Reasoned
-            # instead from released-software history: GTK 4.20 and
-            # libadwaita 1.8 both shipped with GNOME 48 in March 2025, and
-            # nixos-unstable has tracked GNOME's stable releases within weeks
-            # of each one since long before that — so nixos-unstable resolved
-            # today (2026-09) should clear both floors comfortably, likely by
-            # more than one full GNOME cycle. That is INFERRED, not measured;
-            # run `nix flake lock` (needs network) and then
-            # `nix eval .#packages.x86_64-linux.default.buildInputs` /
-            # `pkg-config --modversion gtk4-4.0` inside `nix develop` to
-            # check it against the revision this flake actually resolves to.
+            # here. Measured on 2026-10-01 against the nixpkgs in flake.lock:
+            # gtk4 4.22.4, libadwaita 1.9.3, webkitgtk 2.54.0 (abi 6.0),
+            # pipewire 1.6.9, all above the floor. A later `nix flake update`
+            # can change that; the build, not this comment, is the check.
             gtk4
             libadwaita
             glib
@@ -216,7 +218,14 @@
           # packaging script here makes: build the full client, not the
           # host-only default a bare `cargo build` on a headers-less machine
           # would silently fall back to.
-          cargoBuildFeatures = [ "cordial-shell/webview" "cordial-runtime/webview" ];
+          #
+          # **`buildFeatures`, not `cargoBuildFeatures`.** nixpkgs' own
+          # `buildRustPackage` assigns `cargoBuildFeatures = buildFeatures`
+          # internally, so passing the old name is silently overwritten: the
+          # first build of this flake (2026-10-01) succeeded and linked no
+          # WebKitGTK -- the exact failure described above. The `readelf`
+          # tripwire in `postInstall` below now fails the build instead.
+          buildFeatures = [ "cordial-shell/webview" "cordial-runtime/webview" ];
 
           # `cargo test --workspace` is not run as part of this build.
           # `packaging/rpm/cordial.spec`'s own `%check` already had to skip
@@ -304,6 +313,13 @@
             # shell launches, found as `current_exe`'s sibling, and is not
             # what anyone should run by hand.
             ln -sf cordial-shell "$out/bin/cordial"
+
+            # Tripwire, the same one packaging/aur/cordial/PKGBUILD has: the
+            # failure it guards against builds cleanly and links nothing.
+            readelf -d "$out/bin/cordial-run" | grep -qi webkit || {
+              echo "error: cordial-run linked no WebKitGTK; the webview features did not take" >&2
+              exit 1
+            }
 
             # First-party plugins, read-only beside the binary — the same
             # install performed by every other packaging script here.

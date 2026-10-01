@@ -251,26 +251,48 @@ Users install the Flatpak; this is a contributor's shell.
 The per-distro lists above stay first-class. Most contributors do not have Nix
 and should not need it.
 
-**The flake has still not been built successfully by anyone, and this is now
-measured rather than `INFERRED`.** Run on the developer's Fedora Atomic host on
-2026-08-06, `nix develop` fails before evaluating anything:
+**What has been run, as of 2026-10-01.** `packages.default` was built from this
+tree on the developer's Fedora Atomic host and the result inspected, but not
+launched into a game. `cordial --help` and `cordial --diagnostics` ran from the
+built output, `ldd` on both binaries reports nothing `not found`, and
+`readelf -d` shows `cordial-run` linked WebKitGTK. The PipeWire, ALSA and
+PulseAudio backends are compiled in. `cargo test` is not run by the Nix build.
+Nobody has run the `devShells.default` shell end to end, and the remote form,
+`nix run "github:luohoa97/cordial?submodules=1"`, is `INFERRED` from the local
+build and has not been tried against a pushed commit.
+
+Two things the first build found. `eachDefaultSystem` evaluates x86_64-darwin,
+which current nixpkgs refuses to evaluate, so the flake lists Linux systems
+only. And `cargoBuildFeatures` is overwritten by nixpkgs' `buildFeatures`, so
+the first package built cleanly with no web view; the flake now sets
+`buildFeatures` and fails the build if `cordial-run` links no WebKitGTK.
+
+**The submodules need `?submodules=1`.** Flakes do not fetch them otherwise;
+from a checkout use `nix build '.?submodules=1#cordial'`. The package installs
+the same files as the AUR package, puts `deno` on the wrapper's `PATH`, and
+reports `Install unknown` in `cordial --diagnostics`, because nothing there
+recognises a `/nix/store` path yet.
+
+On an ostree host `nix` has no writable store to start with, and a bare
+`nix develop` fails with
 
 ```text
 error: creating directory "/nix/store/.links": Read-only file system
 ```
 
-`findmnt /nix` reports no mount at all — `/nix` is inside the read-only
-composefs image, `/nix/store` is not writable, and `nix-daemon` is inactive.
-Nix itself is present and working (`nix-core-2.34.8-1.fc44`); it has nowhere to
-put a store.
+`/nix` is inside the read-only composefs image and `nix-daemon` is inactive. The
+Determinate Systems installer handles ostree, or a systemd mount unit can bind a
+writable directory over `/nix`. **Neither is needed to build**: a store under
+your home directory works with no change to the host, and is how the build above
+was done:
 
-So on an ostree host the store must be made writable first — the Determinate
-Systems installer handles ostree, or a systemd mount unit can bind a writable
-directory over `/nix`. **That is a larger change to the host than installing the
-one devel package Nix was reached for in order to avoid**, which is worth
-weighing before going down this road.
+```bash
+nix --store "local?root=$HOME/.cache/cordial-nix" build '.?submodules=1#cordial' -L
+```
 
-If you are the first to build the flake successfully, say so and replace this.
+The binaries it produces point at `/nix/store`, which only exists inside that
+store's namespace, so run them with `nix --store ... shell <store path>` rather
+than directly.
 
 `webkitgtk6.0-devel` (`libwebkitgtk-6.0-dev` on Debian/Ubuntu) will be needed by
 whoever picks up the web view — Marketplace, Profile, Communities and most

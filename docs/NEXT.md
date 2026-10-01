@@ -1105,8 +1105,9 @@ ADR-032 for the full account.
 there because there is no FHS -- no `/lib64/ld-linux-x86-64.so.2` for the
 interpreter to land on -- regardless of how new the host glibc is. The fix is
 the user's: `programs.appimage.enable = true` with binfmt. That belongs in the
-install documentation and is not written down yet. `flake.nix` now builds
-Cordial for them, and **has never been built**; it needs
+install documentation and is not written down yet. `flake.nix` builds
+Cordial for them (built and `--help` run on 2026-10-01, never launched into a
+game; see CONTRIBUTING.md), and it needs
 `nix run "github:luohoa97/cordial?submodules=1"`.
 
 ## Open: the gamepad-ordinal probe ran; the pre-login shell is not a readout of `gamepadType`, 2026-08-30

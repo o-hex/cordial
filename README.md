@@ -154,8 +154,10 @@ cargo build --release
 Needs Clang — AOSP bionic uses C11 `_Atomic` in C++ headers and GCC rejects it
 — plus GTK4 >= 4.12 and libadwaita >= 1.5 development packages. PipeWire and
 WebKitGTK-6.0 headers are optional and probed at build time; without them the
-binary is quietly less capable. The Nix flake has not been built successfully
-by anyone. Full list: [`docs/install.md`](docs/install.md#building-from-source).
+binary is quietly less capable. The Nix flake's package builds and runs
+`--help` and `--diagnostics`, but has never run a game
+([CONTRIBUTING.md](CONTRIBUTING.md#or-use-the-flake)). Full list:
+[`docs/install.md`](docs/install.md#building-from-source).
 
 ## Configuration
 

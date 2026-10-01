@@ -83,6 +83,12 @@ makedepends=(
   'libpipewire'
   'libpulse'
   'alsa-lib'
+  # dynarmic, the VR mode's translator (crates/cordial-guest): Boost's headers,
+  # which it find_package()s, and lld and llvm for that crate's arm64 test
+  # image, which check() builds.
+  'boost'
+  'lld'
+  'llvm'
 )
 optdepends=(
   # `bwrap` is genuinely optional: sandbox.rs only ever *subtracts* from what
@@ -114,8 +120,18 @@ source=(
   "android_bionic::git+https://github.com/minecraft-linux/android_bionic.git"
   "android_core::git+https://github.com/minecraft-linux/android_core.git"
   "libjnivm::git+https://github.com/ChristopherHX/libjnivm.git"
+  # dynarmic and the six of its externals that are compiled; biscuit, catch,
+  # oaknut and zydis's own copy of zycore are not, and are never fetched.
+  "dynarmic::git+https://github.com/azahar-emu/dynarmic.git"
+  "dynarmic-fmt::git+https://github.com/fmtlib/fmt.git"
+  "dynarmic-mcl::git+https://github.com/azahar-emu/mcl.git"
+  "dynarmic-robin-map::git+https://github.com/Tessil/robin-map.git"
+  "dynarmic-xbyak::git+https://github.com/herumi/xbyak.git"
+  "dynarmic-zydis::git+https://github.com/zyantific/zydis.git"
+  "dynarmic-zycore::git+https://github.com/zyantific/zycore-c.git"
 )
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
+            'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 prepare() {
   cd "$srcdir/$_pkgname"
@@ -128,12 +144,24 @@ prepare() {
   git submodule init
   git config submodule."third_party/mcpelauncher-linker".url "$srcdir/mcpelauncher-linker"
   git config submodule."third_party/libjnivm".url "$srcdir/libjnivm"
+  git config submodule."third_party/dynarmic".url "$srcdir/dynarmic"
   git -c protocol.file.allow=always submodule update
 
   cd third_party/mcpelauncher-linker
   git submodule init
   git config submodule.bionic.url "$srcdir/android_bionic"
   git config submodule.core.url "$srcdir/android_core"
+  git -c protocol.file.allow=always submodule update
+
+  cd "$srcdir/$_pkgname/third_party/dynarmic"
+  git submodule init externals/fmt externals/mcl externals/robin-map \
+    externals/xbyak externals/zydis externals/zycore
+  git config submodule.fmt.url "$srcdir/dynarmic-fmt"
+  git config submodule.mcl.url "$srcdir/dynarmic-mcl"
+  git config submodule.robin-map.url "$srcdir/dynarmic-robin-map"
+  git config submodule.xbyak.url "$srcdir/dynarmic-xbyak"
+  git config submodule.zydis.url "$srcdir/dynarmic-zydis"
+  git config submodule.zycore.url "$srcdir/dynarmic-zycore"
   git -c protocol.file.allow=always submodule update
 
   cd "$srcdir/$_pkgname"
@@ -297,4 +325,19 @@ package() {
   install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
   install -Dm644 third_party/mocktail-webview/LICENSE \
     "$pkgdir/usr/share/licenses/$pkgname/mocktail-webview-Apache-2.0.txt"
+  # dynarmic and its compiled-in externals, the VR mode's translator.
+  install -Dm644 third_party/dynarmic/LICENSE.txt \
+    "$pkgdir/usr/share/licenses/$pkgname/dynarmic-0BSD.txt"
+  install -Dm644 third_party/dynarmic/externals/fmt/LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/fmt-MIT.txt"
+  install -Dm644 third_party/dynarmic/externals/mcl/LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/mcl-MIT.txt"
+  install -Dm644 third_party/dynarmic/externals/robin-map/LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/robin-map-MIT.txt"
+  install -Dm644 third_party/dynarmic/externals/xbyak/COPYRIGHT \
+    "$pkgdir/usr/share/licenses/$pkgname/xbyak-BSD-3-Clause.txt"
+  install -Dm644 third_party/dynarmic/externals/zydis/LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/zydis-MIT.txt"
+  install -Dm644 third_party/dynarmic/externals/zycore/LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/zycore-MIT.txt"
 }

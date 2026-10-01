@@ -283,6 +283,14 @@ install -Dm644 third_party/mcpelauncher-linker/LICENSE "$licdir/mcpelauncher-lin
 install -Dm644 third_party/mcpelauncher-linker/core/NOTICE "$licdir/aosp-NOTICE.txt"
 install -Dm644 third_party/libjnivm/LICENSE "$licdir/libjnivm-MIT.txt"
 install -Dm644 third_party/mocktail-webview/LICENSE "$licdir/mocktail-webview-Apache-2.0.txt"
+# dynarmic and its compiled-in externals, the VR mode's translator (x86-64).
+install -Dm644 third_party/dynarmic/LICENSE.txt "$licdir/dynarmic-0BSD.txt"
+install -Dm644 third_party/dynarmic/externals/fmt/LICENSE "$licdir/fmt-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/mcl/LICENSE "$licdir/mcl-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/robin-map/LICENSE "$licdir/robin-map-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/xbyak/COPYRIGHT "$licdir/xbyak-BSD-3-Clause.txt"
+install -Dm644 third_party/dynarmic/externals/zydis/LICENSE "$licdir/zydis-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/zycore/LICENSE "$licdir/zycore-MIT.txt"
 # bwrap and xdg-dbus-proxy are whole programs this AppImage now redistributes,
 # not libraries swept up by a dependency walk, so their licences travel with
 # them. Both are LGPL and both ship a COPYING under /usr/share/licenses.

@@ -387,6 +387,9 @@ Building needs rather more than running does:
   `libadwaita-sys` link against them via `pkg-config` at build time. Fedora:
   `dnf install gtk4-devel libadwaita-devel`. Debian/Ubuntu:
   `apt install libgtk-4-dev libadwaita-1-dev`. Arch: `pacman -S gtk4 libadwaita`
+- **Boost's headers** on x86-64 (`boost-devel` / `libboost-dev` / `boost`), for
+  dynarmic, the VR mode's translator. `git clone --recursive` fetches it and
+  its own submodules.
 - **PipeWire's development headers** (`pipewire-devel` / `libpipewire-0.3-dev`),
   optional — for OpenSL ES audio. `native/CMakeLists.txt` detects them via
   `pkg-config` and compiles the real audio backend if found, or the previous

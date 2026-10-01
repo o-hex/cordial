@@ -223,9 +223,9 @@ jobs:
     # publishes nothing while a hung one blocks everything.
     timeout-minutes: 45
     steps:
-      # No submodules. The manifest pins third_party/libjnivm and
-      # third_party/mcpelauncher-linker as `git` sources by commit and skips
-      # them out of the `dir` source, so a recursive checkout would only be
+      # No submodules. The manifest pins third_party/libjnivm,
+      # third_party/mcpelauncher-linker and third_party/dynarmic as `git`
+      # sources by commit and skips them out of the `dir` source, so a recursive checkout would only be
       # copied in and then thrown away.
       #
       # fetch-tags: true is for "Check whether this commit carries a release

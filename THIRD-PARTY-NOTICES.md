@@ -147,6 +147,96 @@ signatures are correct.
 
 ---
 
+## dynarmic — 0BSD, and what it bundles
+
+The arm64 dynamic recompiler behind `crates/cordial-guest`, compiled only into
+x86-64 builds. Submodule at [`third_party/dynarmic/`](third_party/dynarmic), from
+[`azahar-emu/dynarmic`](https://github.com/azahar-emu/dynarmic) at commit
+`a46601580d5512d324104f985b5f0209dc980ddc`.
+
+```
+Copyright (C) 2017 merryhime <git@mary.rs>
+
+Permission to use, copy, modify, and/or distribute this software for
+any purpose with or without fee is hereby granted.
+```
+
+Full text: `third_party/dynarmic/LICENSE.txt`. 0BSD asks for no notice; it is
+listed so the libraries below have a place to hang from.
+
+dynarmic's own submodules under `third_party/dynarmic/externals/` are compiled
+into the same binary, each at the commit its submodule pins:
+
+| Library | Licence | Full text |
+|---|---|---|
+| fmt | MIT, with an exception for object code | `externals/fmt/LICENSE` |
+| mcl | MIT | `externals/mcl/LICENSE` |
+| tsl-robin-map (header-only) | MIT | `externals/robin-map/LICENSE` |
+| xbyak (header-only) | BSD-3-Clause | `externals/xbyak/COPYRIGHT` |
+| Zydis | MIT | `externals/zydis/LICENSE` |
+| Zycore | MIT | `externals/zycore/LICENSE` |
+
+```
+fmt:     Copyright (c) 2012 - present, Victor Zverovich and {fmt} contributors
+mcl:     Copyright (c) 2022 merryhime
+robin-map: Copyright (c) 2017 Thibaut Goetghebuer-Planchon <tessil@gmx.com>
+xbyak:   Copyright (c) 2007 MITSUNARI Shigeo. All rights reserved.
+Zydis:   Copyright (c) 2014-2024 Florian Bernd
+Zycore:  Copyright (c) 2018-2024 Florian Bernd
+```
+
+The other three of dynarmic's submodules (biscuit, Catch2, oaknut) and Zydis's
+own copy of Zycore are not compiled into Cordial.
+
+Boost's headers (`boost::icl`, `boost::variant`) are also compiled in, under
+the Boost Software License 1.0. They are not vendored: they come from the build
+environment (`boost-devel`, `libboost-dev`, Arch's `boost`, Nix's `boost`; the
+Flatpak copies Boost 1.83.0's headers in a module that ships nothing). BSL-1.0
+does not require the notice to accompany object code.
+
+Each package installs the seven licence files above beside Cordial's own, as
+`dynarmic-0BSD.txt`, `fmt-MIT.txt`, `mcl-MIT.txt`, `robin-map-MIT.txt`,
+`xbyak-BSD-3-Clause.txt`, `zydis-MIT.txt` and `zycore-MIT.txt`.
+
+---
+
+## Khronos registries and headers — Apache-2.0, or Apache-2.0 OR MIT
+
+The guest's Vulkan, OpenXR and GL/EGL call tables are generated from Khronos's
+machine-readable registries by `tools/vr/gen-guest-{vk,xr,gl}.py`, and the
+output is committed and compiled into x86-64 builds. The registries themselves
+are not vendored; each generated file names the release and commit it came
+from.
+
+| Generated file | From | Licence of the source |
+|---|---|---|
+| `crates/cordial-runtime/src/guest_vk_table.rs`, `guest_vk_probe.c` | `vk.xml`, Vulkan-Headers v1.4.341 | Apache-2.0 OR MIT |
+| `crates/cordial-runtime/src/guest_xr_table.rs`, `guest_xr_probe.c` | `xr.xml`, OpenXR-SDK-Source release-1.1.47 | Apache-2.0 OR MIT |
+| `crates/cordial-runtime/src/guest_gl_table.rs` | `gl.xml` (OpenGL-Registry) and `egl.xml` (EGL-Registry) | Apache-2.0 |
+
+```
+Copyright 2013-2026 The Khronos Group Inc.
+SPDX-License-Identifier: Apache-2.0              (gl.xml, egl.xml)
+SPDX-License-Identifier: Apache-2.0 OR MIT       (vk.xml, xr.xml)
+```
+
+Read from each file's own header at the commit named in the generated file.
+The two `*_probe.c` files are compiled only by tests. The Apache-2.0 text
+travels with every package as `mocktail-webview-Apache-2.0.txt`.
+
+The Flatpak also bundles the OpenXR loader, built from OpenXR-SDK
+release-1.1.47 (`libopenxr_loader.so.1`; loader sources Apache-2.0 OR MIT,
+with its vendored jsoncpp, MIT), because neither of its runtimes ships one.
+It installs `openxr-loader-Apache-2.0.txt` and `jsoncpp-MIT.txt` beside the
+others. The other packages use the distribution's loader.
+
+`third_party/openxr/include/openxr/` holds `openxr.h`, `openxr_platform.h` and
+`openxr_platform_defines.h` from OpenXR-SDK release-1.1.47, unmodified,
+Apache-2.0 OR MIT (each carries its SPDX line; `NOTICE` has the entry). They are
+compiled only by the OpenXR layout test, not into any binary.
+
+---
+
 ## What is *not* here
 
 **Roblox.** Cordial contains no Roblox code, APK, asset or decompiled material,

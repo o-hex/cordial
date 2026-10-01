@@ -222,10 +222,111 @@ finish-args:
   # --talk-name entry. Reaching for org.freedesktop.Notifications directly
   # would need one; going through the portal keeps this manifest not needing
   # to grow for either capability.
+  #
+  # Play in VR (ADR-053, docs/vr.md), with WiVRn installed as a Flatpak --
+  # the one runtime that works from inside this sandbox. These are the
+  # grants WiVRn's own README gives for a Flatpak'd OpenXR application
+  # ("Steam Flatpak", https://github.com/WiVRn/WiVRn), less its openvr
+  # line, which is for SteamVR's OpenVR games and nothing here reads.
+  #
+  # WiVRn's install, read-only, system and user. Its runtime manifest names
+  # its library by a relative path, which the loader resolves against the
+  # real manifest file, so these two paths are where `libopenxr_wivrn.so` is
+  # loaded from. Observed: with the system grant, a GNOME 50 sandbox lists
+  # `/var/lib/flatpak/app/io.github.wivrn.wivrn/current/active/files/lib/wivrn/`
+  # at that same path and `dlopen`s the library; its newest glibc symbol is
+  # 2.34. `flatpak` cannot run in here, so `vr::flatpak_install_on_disk`
+  # finds the install through these same two paths.
+  - --filesystem=/var/lib/flatpak/app/io.github.wivrn.wivrn:ro
+  - --filesystem=xdg-data/flatpak/app/io.github.wivrn.wivrn:ro
+  # WiVRn's server socket, `$XDG_RUNTIME_DIR/wivrn/comp_ipc`. `:create`
+  # rather than the README's `:ro`, and this is the one write this block
+  # asks for: Flatpak exports only paths that exist when the app starts, and
+  # `$XDG_RUNTIME_DIR` is emptied at every login, so with `:ro` a launcher
+  # opened before WiVRn's server had ever run would never see the socket
+  # until it was restarted. With `:create` the directory is made empty, and
+  # WiVRn's server, which binds its socket inside it and never removes the
+  # directory (WiVRn's own manifest grants itself `xdg-run/wivrn:create` for
+  # the same reason), is found whenever it starts. The directory holds
+  # nothing but that socket.
+  - --filesystem=xdg-run/wivrn:create
+  # The user's active OpenXR runtime, read-only, for Settings -> VR ->
+  # Runtime's "system" choice; Cordial never writes it, and passes the
+  # manifest to the client in XR_RUNTIME_JSON because the loader in here
+  # would read the app's own config instead.
+  - --filesystem=xdg-config/openxr:ro
+  #
+  # Deliberately absent, and docs/vr.md says so:
+  #
+  #   * Monado installed natively. Its client library lives in the host's
+  #     /usr, which a sandbox only reaches through `host-os` at /run/host/usr,
+  #     and a library built against the host's glibc does not load against
+  #     this runtime's; the Linux VR community wiki documents exactly that
+  #     failure for Flatpak'd games with no workaround.
+  #   * SteamVR. Its OpenXR library loads read-only, but it then needs shared
+  #     memory and a SteamVR already running on the host (`--device=shm`,
+  #     `--share=ipc`), which is a user's `flatpak override` to make, not a
+  #     default.
+  #   * adb, for pulling the Quest build off a headset. Bundling one would need
+  #     raw USB access (`--device=usb`), and like the passkey grant above it
+  #     belongs in the change that shows it working in here against a headset,
+  #     which has not been done. The Flatpak imports an APK the user pulled
+  #     with the host's adb instead, through the file portal.
 
 modules:
+  # Boost's headers, for dynarmic (crates/cordial-guest), which find_package()s
+  # Boost and includes boost::icl and boost::variant. Neither SDK carries Boost
+  # (freedesktop-sdk 25.08 has no boost element), and only the headers are
+  # needed, so this copies them and builds nothing. 1.83.0 is the version the
+  # AppImage base (Ubuntu 24.04) and the VR work's measurements used. `cleanup`
+  # keeps every file out of the exported app: headers are a build input only.
+  # Found by the `cordial` module through BOOST_ROOT below; checked with
+  # CMake 4.3 configuring dynarmic against exactly this layout.
+  - name: boost-headers
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/include
+      - cp -r boost /app/include/
+    cleanup:
+      - '*'
+    sources:
+      - type: archive
+        url: https://archives.boost.io/release/1.83.0/source/boost_1_83_0.tar.bz2
+        sha256: 6478edfe2f3305127cffe8caf73ea0176c53769f4bf1585be237eb30798c3b8e
+  # The OpenXR loader, which the VR mode's client dlopens
+  # (`libopenxr_loader.so.1`) and neither runtime ships: no freedesktop-sdk
+  # element and no file in org.gnome.Platform//50 or org.freedesktop.Platform
+  # //25.08 matches "openxr". The loader only -- no API layers, tests or
+  # conformance suite -- with its bundled jsoncpp, since the platform runtime
+  # has no libjsoncpp to link at run time. release-1.1.47 is the version the
+  # vendored headers and the generated call tables come from. Apache-2.0 OR
+  # MIT (loader) and MIT (jsoncpp); THIRD-PARTY-NOTICES.md lists both.
+  - name: openxr-loader
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_INSTALL_LIBDIR=lib
+      - -DBUILD_TESTS=OFF
+      - -DBUILD_CONFORMANCE_TESTS=OFF
+      - -DBUILD_API_LAYERS=OFF
+      - -DBUILD_WITH_SYSTEM_JSONCPP=OFF
+      - -DDYNAMIC_LOADER=ON
+    post-install:
+      - install -Dm644 LICENSE /app/share/licenses/cordial/openxr-loader-Apache-2.0.txt
+      - install -Dm644 src/external/jsoncpp/LICENSE /app/share/licenses/cordial/jsoncpp-MIT.txt
+    cleanup:
+      - /include
+      - /lib/cmake
+      - /lib/pkgconfig
+    sources:
+      - type: archive
+        url: https://github.com/KhronosGroup/OpenXR-SDK/archive/refs/tags/release-1.1.47.tar.gz
+        sha256: 82c7f4e3658578a22e438b5f005ecaf22c3f724b09fe031fa0f8ffc97c30c9ba
   - name: cordial
     buildsystem: simple
+    build-options:
+      env:
+        BOOST_ROOT: /app
     # There is deliberately no `build-args: [--share=network]` here, and this is
     # the whole of issue #3. The build step runs with the network unshared, so
     # anything it needs has to arrive through `sources` below, where every entry
@@ -342,11 +443,27 @@ modules:
       - install -Dm644 NOTICE /app/share/licenses/cordial/NOTICE
       - install -Dm644 third_party/mocktail-webview/LICENSE
           /app/share/licenses/cordial/mocktail-webview-Apache-2.0.txt
+      # dynarmic and the externals of it that are compiled in, for the VR mode's
+      # translator (THIRD-PARTY-NOTICES.md has the list and why these six).
+      - install -Dm644 third_party/dynarmic/LICENSE.txt
+          /app/share/licenses/cordial/dynarmic-0BSD.txt
+      - install -Dm644 third_party/dynarmic/externals/fmt/LICENSE
+          /app/share/licenses/cordial/fmt-MIT.txt
+      - install -Dm644 third_party/dynarmic/externals/mcl/LICENSE
+          /app/share/licenses/cordial/mcl-MIT.txt
+      - install -Dm644 third_party/dynarmic/externals/robin-map/LICENSE
+          /app/share/licenses/cordial/robin-map-MIT.txt
+      - install -Dm644 third_party/dynarmic/externals/xbyak/COPYRIGHT
+          /app/share/licenses/cordial/xbyak-BSD-3-Clause.txt
+      - install -Dm644 third_party/dynarmic/externals/zydis/LICENSE
+          /app/share/licenses/cordial/zydis-MIT.txt
+      - install -Dm644 third_party/dynarmic/externals/zycore/LICENSE
+          /app/share/licenses/cordial/zycore-MIT.txt
     sources:
-      # The working tree, minus the three directories that must not come from
+      # The working tree, minus the four directories that must not come from
       # it. `target` is tens of gigabytes on a developer's machine and every
       # byte of it gets copied into the build before anything is compiled; the
-      # two submodule paths are skipped so the `git` sources below own them
+      # three submodule paths are skipped so the `git` sources below own them
       # instead of whatever happens to be checked out locally.
       - type: dir
         path: ..
@@ -354,6 +471,7 @@ modules:
           - target
           - third_party/libjnivm
           - third_party/mcpelauncher-linker
+          - third_party/dynarmic
       # Pinned by commit rather than pulled by the build (issue #3). This is
       # what makes the submodule half of the build reproducible, and it means
       # a CI checkout does not need `--recursive`. Bump these together with
@@ -370,6 +488,14 @@ modules:
         url: https://github.com/minecraft-linux/mcpelauncher-linker
         commit: 1ac3ea6c1cf4f73a84d73f0bff510fba94a7d0f2
         dest: third_party/mcpelauncher-linker
+      # The VR mode's translator. Its own externals (fmt, mcl, robin-map,
+      # xbyak, zydis, zycore and three that are not compiled here) are
+      # submodules that flatpak-builder clones with it. patches/0007 and 0008
+      # are applied to it by crates/cordial-guest/build.rs, as to a checkout.
+      - type: git
+        url: https://github.com/azahar-emu/dynarmic
+        commit: a46601580d5512d324104f985b5f0209dc980ddc
+        dest: third_party/dynarmic
       # The crate graph, one `archive` source per crate with the sha256 that is
       # already in Cargo.lock, plus the `cargo/config.toml` that points
       # crates.io at the unpacked result. 212 crates, 425 sources, generated by

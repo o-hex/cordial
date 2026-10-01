@@ -113,7 +113,7 @@ build where="host":
         #     gtk4-devel libadwaita-devel webkitgtk6.0-devel pipewire-devel \
         #     clang cmake gcc-c++ pkgconf-pkg-config openssl-devel \
         #     wayland-devel vulkan-loader-devel libxkbcommon-devel \
-        #     binutils llvm lld librsvg2-tools patchelf
+        #     binutils llvm lld boost-devel librsvg2-tools patchelf
         #
         # binutils is not optional and not obvious: clang arrives without `ar`,
         # and CMake's static-library step then fails with "Error running link

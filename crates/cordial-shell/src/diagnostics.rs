@@ -87,6 +87,11 @@ fn install_method() -> String {
     if shown.contains("/target/") || shown.contains("/target-") {
         return "cargo (built from a checkout)".into();
     }
+    // The flake's package, or a nixpkgs one. No package manager below owns a
+    // store path, so the first Nix build reported `unknown`.
+    if shown.starts_with("/nix/store/") {
+        return "nix".into();
+    }
 
     // Ask whichever package manager is present who owns the running binary.
     // A subprocess each, bounded by there being at most three and by the first

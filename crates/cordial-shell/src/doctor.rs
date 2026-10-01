@@ -1013,6 +1013,51 @@ pub fn profile_locks(names: &[String], is_held: impl Fn(&str) -> bool) -> Check 
     }
 }
 
+/// "Play in VR" (ADR-053). Optional, so nothing here is worse than `Info`
+/// unless the user chose a runtime that has since gone, which is `Warn`: the
+/// button they set up will not work and the doctor is where they look.
+///
+/// One line when VR was never set up, because a launcher whose doctor lists
+/// three missing VR pieces to somebody who has no headset reads as broken.
+pub fn vr(readiness: &crate::vr::Readiness, runtime_chosen: bool) -> Vec<Check> {
+    use crate::vr::Chosen;
+    if readiness.quest_build.is_none() && !runtime_chosen {
+        return vec![check(
+            Level::Info,
+            "VR: no Quest build imported (optional)",
+            "To play in a headset, import the Quest build in Settings → VR. See docs/vr.md.",
+        )];
+    }
+    let mut out = vec![match &readiness.quest_build {
+        Some(e) => check(Level::Ok, format!("VR: Quest build {} is imported", e.version), ""),
+        None => check(
+            Level::Info,
+            "VR: no Quest build imported",
+            "Import it from your headset in Settings → VR.",
+        ),
+    }];
+    out.push(match &readiness.runtime {
+        Chosen::System(r) => check(Level::Ok, format!("VR: OpenXR runtime {} (the system's active one)", r.name), ""),
+        Chosen::Manifest(r) => check(Level::Ok, format!("VR: OpenXR runtime {} (chosen in Settings)", r.name), ""),
+        Chosen::Missing(why) => check(
+            if runtime_chosen { Level::Warn } else { Level::Info },
+            "VR: no usable OpenXR runtime",
+            why.clone(),
+        ),
+    });
+    match readiness.wivrn_server {
+        Some(true) => out.push(check(Level::Ok, "VR: the WiVRn server is running", "")),
+        Some(false) => out.push(check(
+            Level::Info,
+            "VR: the WiVRn server is not running",
+            "Start WiVRn, or run its server with --no-manage-active-runtime so it leaves the \
+             system's runtime alone.",
+        )),
+        None => {}
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1485,4 +1530,31 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn vr_is_one_info_line_until_somebody_sets_it_up() {
+        use crate::vr::{Chosen, Readiness, Runtime};
+        let never = Readiness { quest_build: None, runtime: Chosen::Missing("none".into()), wivrn_server: None, sandboxed: false };
+        let lines = vr(&never, false);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].level, Level::Info);
+
+        let wivrn = Runtime { id: "io.github.wivrn.wivrn".into(), name: "WiVRn".into(), manifest: "/x.json".into() };
+        let entry = cordial_update::store::Entry {
+            version: "2.740.0.927".into(),
+            dir: "/b".into(),
+            loaded_by: None,
+            bytes: 0,
+            complete: true,
+            content_hash: None,
+        };
+        let set_up = Readiness { quest_build: Some(entry), runtime: Chosen::Manifest(wivrn), wivrn_server: Some(false), sandboxed: false };
+        let lines = vr(&set_up, true);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines.iter().all(|c| c.level <= Level::Info), "VR is optional and must not fail the doctor");
+
+        let gone = Readiness { quest_build: None, runtime: Chosen::Missing("gone".into()), wivrn_server: None, sandboxed: false };
+        assert!(vr(&gone, true).iter().any(|c| c.level == Level::Warn));
+    }
+
 }

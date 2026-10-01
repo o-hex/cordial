@@ -23,6 +23,10 @@ pub fn checks(offline: bool) -> Vec<Check> {
     let mut out = vec![loader()];
     out.extend(roblox(&config.roblox, offline));
     out.extend(doctor::machine(&Inputs { gamemode: config.gamemode, probe_vulkan: true }));
+    if cordial_shell::vr::HOST_SUPPORTED {
+        let setting = config.vr_openxr_runtime.as_deref();
+        out.extend(doctor::vr(&cordial_shell::vr::Readiness::gather(setting), setting.is_some()));
+    }
     out
 }
 

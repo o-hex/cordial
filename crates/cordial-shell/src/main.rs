@@ -47,6 +47,9 @@ mod root_warning;
 mod settings;
 mod shell_config;
 mod updater;
+mod vr_entry;
+mod vr_settings;
+mod quest_wizard;
 mod x11_notice;
 // The window itself needs webkitgtk6.0-devel, which an immutable host does not
 // have; the policy beside it needs nothing and is always compiled, because it is
@@ -124,6 +127,12 @@ fn main() -> libadwaita::glib::ExitCode {
     if flags.iter().any(|a| a == "--import-flags") {
         return libadwaita::glib::ExitCode::from(flag_import::run(&flags));
     }
+    // The Quest build for "Play in VR", from a file, with no window: the same
+    // `quest::import` Settings → VR runs, for a machine where a file picker is
+    // the hard part (ADR-053).
+    if flags.iter().any(|a| a == "--import-quest-apk") {
+        return libadwaita::glib::ExitCode::from(import_quest_apk(&flags));
+    }
     // What `--doctor` runs, in a child of this binary, to ask Vulkan for its
     // devices without loading a driver into the launcher. Not in `--help`: it
     // prints a private line format for the doctor to read.
@@ -159,6 +168,9 @@ fn main() -> libadwaita::glib::ExitCode {
              \x20                Merge a Bloxstrap, Fishstrap or Sober FastFlag list into\n\
              \x20                a profile (--profile NAME, --replace). Skips a bad entry\n\
              \x20                and names it; the rest are kept.\n\
+             \x20 --import-quest-apk FILE\n\
+             \x20                File the Quest build of Roblox, pulled from your own\n\
+             \x20                headset, for Play in VR. Checks Roblox's signature.\n\
              \x20 -h, --help     This.\n\
              \n\
              `cordial-run` is the loader this launches and is not meant to be run\n\
@@ -314,4 +326,28 @@ fn start(app: &libadwaita::Application, shell: &Rc<RefCell<Option<window::Shell>
     std::mem::forget(live_watch);
 
     *shell.borrow_mut() = Some(window::build(app, config, config_path));
+}
+
+/// `cordial --import-quest-apk FILE`. Exit 0 when filed (or already held), 1
+/// when refused, 2 on a bad command line.
+fn import_quest_apk(flags: &[String]) -> u8 {
+    let Some(path) = flags.iter().skip_while(|a| *a != "--import-quest-apk").nth(1) else {
+        eprintln!("cordial: --import-quest-apk needs a FILE");
+        return 2;
+    };
+    let root = cordial_update::quest::root();
+    match cordial_update::quest::import(
+        std::path::Path::new(path),
+        &root,
+        &cordial_update::apk_signature::pinned_quest(),
+    ) {
+        Ok(version) => {
+            println!("Quest build {version} is ready for Play in VR.");
+            0
+        }
+        Err(e) => {
+            eprintln!("cordial: {e}");
+            1
+        }
+    }
 }

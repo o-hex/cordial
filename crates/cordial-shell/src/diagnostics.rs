@@ -207,6 +207,16 @@ fn roblox_in(dir: &std::path::Path) -> String {
     }
 }
 
+/// The Quest build, the OpenXR runtime "Play in VR" would use, and WiVRn's
+/// server when that is the runtime (ADR-053).
+fn vr() -> String {
+    if !cordial_shell::vr::HOST_SUPPORTED {
+        return "not available on this architecture".into();
+    }
+    let config = crate::shell_config::load(&crate::shell_config::path());
+    cordial_shell::vr::Readiness::gather(config.vr_openxr_runtime.as_deref()).summary()
+}
+
 /// The whole block, ready to paste into an issue.
 ///
 /// Fixed-width labels so a reader's eye finds the field rather than the value,
@@ -240,6 +250,10 @@ pub fn report() -> String {
         // best-attested NVIDIA failure this project has a record of, and it
         // looks like "no supported graphics device" until somebody asks.
         ("Graphics", cordial_shell::nvidia::graphics_line()),
+        // Always present, like Graphics: "no Quest build" is itself the
+        // answer to most VR reports. Names, never paths -- a Flatpak manifest
+        // path is fine, a home-directory one is a person's name.
+        ("VR", vr()),
     ];
     for (label, value) in rows {
         out.push_str(&format!("{label:<9} {value}\n"));
@@ -270,8 +284,8 @@ mod tests {
         // literal that have to be remembered together: the literal was 6 when
         // a seventh row was added, and the failure it produced said nothing
         // about which row was new.
-        const LABELS: [&str; 9] =
-            ["Cordial", "Licence", "Install", "Build", "Roblox", "System", "Distro", "Session", "Graphics"];
+        const LABELS: [&str; 10] =
+            ["Cordial", "Licence", "Install", "Build", "Roblox", "System", "Distro", "Session", "Graphics", "VR"];
         let text = report();
         for label in LABELS {
             let line = text

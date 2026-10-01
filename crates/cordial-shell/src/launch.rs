@@ -152,6 +152,19 @@ pub struct LaunchRequest<'a> {
     pub run_seconds: Option<u64>,
     pub join_url: Option<&'a str>,
     pub secret_store: Option<Store>,
+    /// Present for "Play in VR": the Quest build, under the translator, in an
+    /// OpenXR session (ADR-053). `None` is the phone build, as it always was.
+    pub vr: Option<VrLaunch>,
+}
+
+/// What a VR launch adds to an ordinary one.
+pub struct VrLaunch {
+    /// The OpenXR runtime manifest to hand the client in `XR_RUNTIME_JSON`, for
+    /// this launch only. `None` leaves the loader to the system's active
+    /// runtime. Cordial never writes `active_runtime.json`: switching the
+    /// machine's runtime to play one game is a change to every other OpenXR
+    /// application the user has, made by something they did not ask to do it.
+    pub openxr_runtime: Option<PathBuf>,
 }
 
 impl Instance {
@@ -314,10 +327,24 @@ pub fn spawn(
         // this project has recorded as working passed. `--host-libc` is marked
         // diagnostic in cordial-run's usage text and dropping it is a separate
         // experiment, not something to fold into wiring up a button.
-        .arg("--host-libc")
-        .arg("--game-activity")
-        .arg("--run")
-        .arg(&run);
+        .arg("--host-libc");
+    match &request.vr {
+        // The Quest build has no GameActivity: it starts through the app
+        // bridge, the way `ActivityNativeMain` starts it on the headset, and
+        // its arm64 engine runs under the translator. `--guest-arm64` also
+        // selects the profile's `quest/` engine storage and the meta-quest
+        // device identity (ADR-053).
+        Some(vr) => {
+            command.arg("--guest-arm64").arg("--app-bridge");
+            if let Some(manifest) = &vr.openxr_runtime {
+                command.env("XR_RUNTIME_JSON", manifest);
+            }
+        }
+        None => {
+            command.arg("--game-activity");
+        }
+    }
+    command.arg("--run").arg(&run);
 
     // The profile stops being a directory name and starts meaning something
     // here. `--profile` is the whole of it: the client resolves the directory
@@ -495,11 +522,18 @@ pub fn spawn(
     // one choice, and `GraphicsOptimization` owns the mapping from that choice
     // to the two values, so this block cannot drift from what the row says it
     // does without the enum changing first.
-    if let Some(profile) = config.graphics_optimization_mode.device_profile_env() {
-        command.env("CORDIAL_DEVICE_PROFILE", profile);
-    }
-    if let Some(mode) = config.graphics_optimization_mode.performance_env() {
-        command.env("CORDIAL_PERFORMANCE", mode);
+    //
+    // Not for a VR launch: the Quest build has to present as the headset it
+    // was built for, and `cordial-run --guest-arm64` chooses `meta-quest`
+    // itself when nothing overrides it. A phone-build performance preset sent
+    // to it would make games read `VREnabled` false (flags.rs).
+    if request.vr.is_none() {
+        if let Some(profile) = config.graphics_optimization_mode.device_profile_env() {
+            command.env("CORDIAL_DEVICE_PROFILE", profile);
+        }
+        if let Some(mode) = config.graphics_optimization_mode.performance_env() {
+            command.env("CORDIAL_PERFORMANCE", mode);
+        }
     }
 
     // The Audio row's chosen output sink, and **only when one was actually
@@ -599,7 +633,7 @@ pub fn spawn(
 
     claim.hand_to(&mut command);
 
-    let command_line = describe(&loader, &build.lib_dir, &build.apk, &run, request.join_url);
+    let command_line = describe(&loader, &build.lib_dir, &build.apk, &run, request.join_url, request.vr.is_some());
     let mut child = command
         .spawn()
         .map_err(|e| format!("Could not start {}: {e}\n\n{command_line}", loader.display()))?;
@@ -752,6 +786,44 @@ fn host_install_hint(d: &Distro, layer: Layer) -> String {
         format!("Add pkgs.{nix} to your configuration")
     } else {
         generic.to_owned()
+    }
+}
+
+/// How to get `adb` on this distribution, for the Quest set-up pages
+/// (ADR-053). The same `Distro` reading as the layer hints, with the package
+/// each distribution names it: `android-tools` on Fedora, Arch, openSUSE and
+/// Nix, `adb` on Debian and Ubuntu.
+pub fn adb_install_hint() -> String {
+    // The Flatpak carries no adb and cannot run the host's: bundling one
+    // would also need raw USB access (`--device=usb`), which the manifest
+    // does not grant for a path nobody has run in the sandbox against a
+    // headset, and `flatpak-spawn --host` is a sandbox escape it refuses
+    // outright (packaging/io.github.luohoa97.Cordial.yml). So the pull is two
+    // commands on the host, and the import is the file picker's.
+    if in_flatpak() {
+        return "Cordial's Flatpak has no adb and cannot run the one on your computer. In a terminal, with \
+                the headset connected and allowed, run `adb shell pm path com.roblox.client`, then \
+                `adb pull` the path it prints, and choose I Have the APK File in Settings → VR."
+            .into();
+    }
+    adb_install_hint_for(&Distro::here())
+}
+
+fn adb_install_hint_for(d: &Distro) -> String {
+    if d.is("fedora") && d.is_atomic_fedora() {
+        "Install it with: rpm-ostree install android-tools (then reboot)".into()
+    } else if d.is("fedora") {
+        "Install it with: sudo dnf install android-tools".into()
+    } else if d.is("arch") {
+        "Install it with: sudo pacman -S android-tools".into()
+    } else if d.is("debian") || d.is("ubuntu") {
+        "Install it with: sudo apt install adb".into()
+    } else if d.is("suse") || d.is("opensuse") || d.id.starts_with("opensuse") {
+        "Install it with: sudo zypper install android-tools".into()
+    } else if d.is("nixos") {
+        "Add pkgs.android-tools to your configuration".into()
+    } else {
+        "Install Android's platform tools (adb) from your distribution's packages.".into()
     }
 }
 
@@ -1008,10 +1080,11 @@ fn ensure_vkbasalt_config(path: &Path) -> std::io::Result<()> {
 /// It carries `--join-url` when there was one, because a launch that fails only
 /// with a link on it is exactly the launch somebody needs to be able to repeat
 /// in a terminal.
-fn describe(loader: &Path, lib_dir: &Path, apk: &Path, run: &str, join_url: Option<&str>) -> String {
+fn describe(loader: &Path, lib_dir: &Path, apk: &Path, run: &str, join_url: Option<&str>, vr: bool) -> String {
     let join = join_url.map(|u| format!(" --join-url {u}")).unwrap_or_default();
+    let mode = if vr { "--guest-arm64 --app-bridge" } else { "--game-activity" };
     format!(
-        "{} --lib-dir {} --apk {} --host-libc --game-activity --run {run}{join}",
+        "{} --lib-dir {} --apk {} --host-libc {mode} --run {run}{join}",
         loader.display(),
         lib_dir.display(),
         apk.display()
@@ -1097,7 +1170,7 @@ mod tests {
         let result = spawn(
             &build,
             claim,
-            LaunchRequest { run_seconds: Some(1), join_url: None, secret_store: None },
+            LaunchRequest { run_seconds: Some(1), join_url: None, secret_store: None, vr: None },
         );
 
         std::env::remove_var("CORDIAL_PROFILE_ROOT");
@@ -1182,7 +1255,7 @@ mod tests {
         let result = spawn(
             &build,
             claim,
-            LaunchRequest { run_seconds: Some(1), join_url: None, secret_store: None },
+            LaunchRequest { run_seconds: Some(1), join_url: None, secret_store: None, vr: None },
         );
 
         let mut instance = result.expect("the stub loader must be found and spawned");
@@ -1236,6 +1309,7 @@ mod tests {
             Path::new("/home/a/base.apk"),
             "600",
             None,
+            false,
         );
         assert!(line.contains("--lib-dir /home/a/.cache/cordial/lib/x86_64"), "{line}");
         assert!(line.contains("--apk /home/a/base.apk"), "{line}");
@@ -1255,8 +1329,23 @@ mod tests {
             Path::new("/base.apk"),
             "0",
             Some("roblox-player://placeId=1818"),
+            false,
         );
         assert!(line.contains("--join-url roblox-player://placeId=1818"), "{line}");
+    }
+
+    #[test]
+    fn a_vr_launch_quotes_the_translator_and_the_app_bridge_instead_of_game_activity() {
+        let line = describe(
+            Path::new("/app/bin/cordial-run"),
+            Path::new("/c/builds/arm64-v8a/2.740.0.927"),
+            Path::new("/c/builds/arm64-v8a/2.740.0.927/base.apk"),
+            "0",
+            None,
+            true,
+        );
+        assert!(line.contains("--guest-arm64 --app-bridge"), "{line}");
+        assert!(!line.contains("--game-activity"), "{line}");
     }
 
     #[test]
@@ -1494,7 +1583,7 @@ mod tests {
         let mut instance = spawn(
             &build,
             claim,
-            LaunchRequest { run_seconds: Some(40), join_url: None, secret_store: None },
+            LaunchRequest { run_seconds: Some(40), join_url: None, secret_store: None, vr: None },
         )
         .expect("the client starts");
 
@@ -1529,4 +1618,19 @@ mod tests {
         instance.child.wait().ok();
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn the_adb_hint_names_each_distributions_package() {
+        for (release, want) in [
+            ("ID=fedora\n", "dnf install android-tools"),
+            ("ID=kinoite\nID_LIKE=fedora\n", "rpm-ostree install android-tools"),
+            ("ID=arch\n", "pacman -S android-tools"),
+            ("ID=ubuntu\nID_LIKE=debian\n", "apt install adb"),
+            ("ID=\"opensuse-tumbleweed\"\nID_LIKE=\"opensuse suse\"\n", "zypper install android-tools"),
+        ] {
+            let hint = adb_install_hint_for(&Distro::parse(release));
+            assert!(hint.contains(want), "{release:?}: {hint}");
+        }
+    }
+
 }

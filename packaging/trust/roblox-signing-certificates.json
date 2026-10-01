@@ -16,7 +16,12 @@
     "",
     "Adding one is a decision, not a chore: a digest added here is a key Cordial",
     "will accept builds from forever. Take it from an APK you already trust, and",
-    "record where it came from."
+    "record where it came from.",
+    "",
+    "`quest_certificates` is a separate list, read only when importing a Quest build",
+    "the user pulled from their own headset (ADR-053). The Quest build is signed with",
+    "a key the phone build is not, and keeping it out of `certificates` means it",
+    "widens nothing an update or a mirror download will install."
   ],
   "package": "com.roblox.client",
   "certificates": [
@@ -24,6 +29,13 @@
       "sha256": "44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477",
       "seen_in": "2.734.0.917, x86_64, verified 2026-08-26",
       "note": "Read from the base.apk Sober downloaded on this machine, and cross-checked with an independent implementation of the v2 signing-block parse before being written down."
+    }
+  ],
+  "quest_certificates": [
+    {
+      "sha256": "6d13fc84f1fe9d7c94ba5b438b880c60a37788f4ceb4bd52b1222dadd7d26bba",
+      "seen_in": "2.740.0.927, arm64-v8a Meta Quest build, verified 2026-10-01",
+      "note": "Read from the APK Meta's store installed on a Quest 3, pulled with `adb pull`. The v2 signature verifies to this certificate: self-signed, subject and issuer O=Roblox Corporation, CN=Roblox Corporation, valid 2023-03-31 to 2050-08-16. A self-signed subject proves nothing on its own; the provenance is the headset's store install."
     }
   ]
 }

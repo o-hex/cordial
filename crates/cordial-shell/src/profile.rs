@@ -638,26 +638,6 @@ impl std::fmt::Display for Error {
     }
 }
 
-/// Move a pre-ADR-012 layout into place, once.
-///
-/// Storage used to live at `cordial/instances/default`, which named a window
-/// and contained a login, and `cordial-run` still writes there when nobody
-/// tells it otherwise. The launcher does tell it otherwise — it points
-/// `CORDIAL_FILES_DIR` at the profile — so without this the first launch from
-/// the shell starts against an empty directory and presents as being logged out
-/// for no reason. That is precisely the class of failure ADR-012 says the
-/// migration exists to prevent, so the directory is moved rather than
-/// abandoned.
-///
-/// Runs only when the old path exists and the new one does not, so it cannot
-/// clobber a profile someone has already used.
-///
-/// **Deferred while a client is running.** The legacy layout was never locked
-/// by anything, so a rename can land underneath a live engine that is holding
-/// paths inside it — and on this developer's machine that has meant a client
-/// signed in at the time. There is nothing to ask, so the only available check
-/// is whether such a process exists at all; deferring costs one launch against
-/// an empty profile, and getting it wrong costs a session.
 /// Everything the Roblox engine keeps in `<profile>/data`, and what removing it
 /// costs.
 ///
@@ -724,6 +704,77 @@ pub fn clear_engine_data(profile_dir: &Path) -> Result<u64, String> {
     std::fs::rename(&data, &aside).map_err(|e| format!("{}: {e}", data.display()))?;
     std::fs::remove_dir_all(&aside).map_err(|e| format!("{}: {e}", aside.display()))?;
     Ok(freed)
+}
+
+/// Which Roblox build an instance runs, as far as the profile's layout cares.
+///
+/// [ADR-053](../../../docs/adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md):
+/// one profile serves the phone build and the Quest build, and the two share
+/// everything that is the *account* -- the lock, the saved sign-in (keyed in
+/// the secret service by this directory's path, so it carries over with no
+/// copying), flags, plugin grants -- and keep apart what is the *engine's*:
+/// `data/` and `run/`. They are different engine versions (2.737 phone against
+/// 2.740 Quest, measured) and the Quest build writes VR state into
+/// `GlobalBasicSettings_13.xml` (`VREnabled`, `HasEverUsedVR`) that the phone
+/// build reads with other semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Build {
+    Phone,
+    Quest,
+}
+
+/// The subdirectory holding the Quest build's engine storage.
+pub const QUEST_STORAGE: &str = "quest";
+
+/// Where `build`'s engine storage hangs off `profile_dir`: the profile itself
+/// for the phone build, exactly as before, and `quest/` for the Quest build.
+///
+/// The phone build keeps the top level so an existing profile is untouched by
+/// the VR mode existing at all: nothing moves, and a profile that is never
+/// used for VR never gains a `quest/` directory.
+pub fn engine_root(profile_dir: &Path, build: Build) -> PathBuf {
+    match build {
+        Build::Phone => profile_dir.to_path_buf(),
+        Build::Quest => profile_dir.join(QUEST_STORAGE),
+    }
+}
+
+/// Move Quest storage written before [`Build`] existed into `quest/`, once.
+///
+/// Before ADR-053 a VR run wrote its engine storage to `data/` and `run/`
+/// exactly as the phone build does, so a profile used only for VR has the
+/// Quest build's settings where the phone build would now read them. This
+/// moves them, and only on evidence: `data/files/appData/GlobalBasicSettings_13.xml`
+/// recording `HasEverUsedVR` as true, which the Quest build writes and the
+/// phone build was measured not to (Sober's phone 2.737 profile reads false;
+/// every Quest profile on the machine this was written on reads true, or has
+/// no settings file at all because it never signed in, and those hold nothing
+/// worth moving). **INFERRED:** that no phone build ever writes it true.
+///
+/// Leaves a profile alone when `quest/` already exists, so it cannot clobber
+/// Quest storage somebody has used since, and when there is no evidence, so a
+/// phone profile is never touched. Called by the client with the profile lock
+/// held, before anything opens engine storage.
+pub fn migrate_quest_storage(profile_dir: &Path) -> std::io::Result<bool> {
+    let quest = engine_root(profile_dir, Build::Quest);
+    if quest.exists() || !written_by_quest_build(profile_dir) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(&quest)?;
+    for name in ["data", "run"] {
+        let from = profile_dir.join(name);
+        if from.exists() {
+            std::fs::rename(&from, quest.join(name))?;
+        }
+    }
+    Ok(true)
+}
+
+fn written_by_quest_build(profile_dir: &Path) -> bool {
+    let settings = engine_data_dir(profile_dir).join("files/appData/GlobalBasicSettings_13.xml");
+    let Ok(text) = std::fs::read_to_string(settings) else { return false };
+    // `<bool name="HasEverUsedVR">true</bool>`, the engine's own shape.
+    text.split("name=\"HasEverUsedVR\">").nth(1).is_some_and(|rest| rest.starts_with("true<"))
 }
 
 /// The Roblox version this profile is pinned to, if it names one.
@@ -888,6 +939,26 @@ pub fn human_bytes(bytes: u64) -> String {
     format!("{bytes} bytes")
 }
 
+/// Move a pre-ADR-012 layout into place, once.
+///
+/// Storage used to live at `cordial/instances/default`, which named a window
+/// and contained a login, and `cordial-run` still writes there when nobody
+/// tells it otherwise. The launcher does tell it otherwise — it points
+/// `CORDIAL_FILES_DIR` at the profile — so without this the first launch from
+/// the shell starts against an empty directory and presents as being logged out
+/// for no reason. That is precisely the class of failure ADR-012 says the
+/// migration exists to prevent, so the directory is moved rather than
+/// abandoned.
+///
+/// Runs only when the old path exists and the new one does not, so it cannot
+/// clobber a profile someone has already used.
+///
+/// **Deferred while a client is running.** The legacy layout was never locked
+/// by anything, so a rename can land underneath a live engine that is holding
+/// paths inside it — and on this developer's machine that has meant a client
+/// signed in at the time. There is nothing to ask, so the only available check
+/// is whether such a process exists at all; deferring costs one launch against
+/// an empty profile, and getting it wrong costs a session.
 pub fn migrate_legacy_layout() -> Option<PathBuf> {
     let legacy = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -1532,4 +1603,65 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
     }
+
+    fn settings_with(profile: &Path, vr_used: &str) {
+        let app = profile.join("data/files/appData");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("GlobalBasicSettings_13.xml"),
+            format!("<roblox><Item class=\"UserGameSettings\"><Properties><bool name=\"HasEverUsedVR\">{vr_used}</bool></Properties></Item></roblox>"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(profile.join("run/exe")).unwrap();
+    }
+
+    #[test]
+    fn the_phone_build_keeps_the_top_level_and_the_quest_build_its_own() {
+        let p = Path::new("/x/profiles/main");
+        assert_eq!(engine_root(p, Build::Phone), p);
+        assert_eq!(engine_root(p, Build::Quest), p.join("quest"));
+        // The login is keyed by the profile directory, which neither build
+        // changes, so both find the same saved session.
+        assert_eq!(engine_data_dir(&engine_root(p, Build::Phone)), p.join("data"));
+    }
+
+    #[test]
+    fn a_phone_profile_is_never_moved() {
+        let (root, _g) = scratch("quest-migrate-phone");
+        let profile = root.join("phone");
+        settings_with(&profile, "false");
+        assert!(!migrate_quest_storage(&profile).unwrap());
+        assert!(profile.join("data/files/appData/GlobalBasicSettings_13.xml").is_file());
+        assert!(profile.join("run/exe").is_dir());
+        assert!(!profile.join(QUEST_STORAGE).exists(), "a phone profile gained a quest/ directory");
+
+        // Nor one with no settings at all: no evidence, no move.
+        let bare = root.join("bare");
+        std::fs::create_dir_all(bare.join("data/files")).unwrap();
+        assert!(!migrate_quest_storage(&bare).unwrap());
+        assert!(bare.join("data/files").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quest_storage_from_before_the_split_moves_once_and_never_clobbers() {
+        let (root, _g) = scratch("quest-migrate-quest");
+        let profile = root.join("vr");
+        settings_with(&profile, "true");
+        std::fs::write(profile.join("flags.json"), "{}").unwrap();
+        assert!(migrate_quest_storage(&profile).unwrap());
+        let quest = engine_root(&profile, Build::Quest);
+        assert!(quest.join("data/files/appData/GlobalBasicSettings_13.xml").is_file());
+        assert!(quest.join("run/exe").is_dir());
+        assert!(!profile.join("data").exists() && !profile.join("run").exists());
+        assert!(profile.join("flags.json").is_file(), "account state stays at the profile level");
+
+        // Idempotent: a second call does nothing, and a phone build's fresh
+        // data/ written since is not taken for Quest storage.
+        settings_with(&profile, "true");
+        assert!(!migrate_quest_storage(&profile).unwrap());
+        assert!(profile.join("data").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 }

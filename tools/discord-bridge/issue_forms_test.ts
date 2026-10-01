@@ -1,10 +1,14 @@
 import { TEMPLATE_DIR } from "./repo.ts";
 import { assert, assertEquals, assertStringIncludes, assertThrows } from "jsr:@std/assert@^1.0.8";
+import { modalSelections, modalValues } from "./discord.ts";
 import {
   checkShortDescriptions,
+  droppedFor,
   FormError,
   type IssueForm,
   LABEL,
+  labelPickerComponent,
+  layoutWithLabels,
   MODAL_MAX_COMPONENTS,
   modalFor,
   parseForm,
@@ -128,4 +132,108 @@ Deno.test("the follow-up modal carries exactly the fields the first one dropped"
   const extra = modalFor(form, "extra") as { custom_id: string; components: unknown[] };
   assertEquals(extra.components.length, form.dropped.length);
   assertStringIncludes(extra.custom_id, ":extra");
+});
+
+// ---- the label picker's slot -------------------------------------------------
+
+const picker = labelPickerComponent(
+  [{ name: "area:input", description: "Keyboard and mouse" }, { name: "gpu:amd" }],
+  { description: "Optional." },
+);
+
+Deno.test("with the picker, every real form still holds all its required fields in five slots", () => {
+  for (const form of realForms()) {
+    const layout = layoutWithLabels(form);
+    assert(layout, `${form.slug} must be able to spare a slot`);
+    assert(layout.placed.length <= MODAL_MAX_COMPONENTS - 1, form.slug);
+    for (const block of form.fields.filter((b) => b.validations?.required)) {
+      assert(layout.placed.includes(block), `${form.slug}: ${block.id} lost its place`);
+    }
+    // And nothing is dropped without being offered: the follow-up holds five.
+    assert(layout.dropped.length <= MODAL_MAX_COMPONENTS, `${form.slug} overflows the follow-up`);
+    // Every field is somewhere.
+    assertEquals(layout.placed.length + layout.dropped.length, form.fields.length);
+
+    const modal = modalFor(form, "main", picker) as { components: unknown[]; custom_id: string };
+    assert(modal.components.length <= MODAL_MAX_COMPONENTS);
+    assertEquals(modal.custom_id.endsWith(":main:l"), true);
+  }
+});
+
+Deno.test("a required field is never pushed out by the picker, even behind an optional one", () => {
+  // The shape of `broken_feature`: an optional field ahead of the last required.
+  const form = parseForm(
+    "t",
+    `name: t
+body:
+  - { type: input, id: a, attributes: { label: A }, validations: { required: true } }
+  - { type: input, id: opt, attributes: { label: Opt } }
+  - { type: input, id: b, attributes: { label: B }, validations: { required: true } }
+  - { type: input, id: c, attributes: { label: C }, validations: { required: true } }
+  - { type: input, id: d, attributes: { label: D }, validations: { required: true } }
+`,
+  );
+  // Without a picker the optional one holds its slot (and nothing overflows).
+  assertEquals(form.placed.map((b) => b.id), ["a", "opt", "b", "c", "d"]);
+  const layout = layoutWithLabels(form)!;
+  assertEquals(layout.placed.map((b) => b.id), ["a", "b", "c", "d"]);
+  assertEquals(layout.dropped.map((b) => b.id), ["opt"]);
+});
+
+Deno.test("a form with five required fields cannot spare a slot, and opens without the picker", () => {
+  const form = parseForm(
+    "t",
+    "name: t\nbody:\n" +
+      ["a", "b", "c", "d", "e"].map((id) =>
+        `  - { type: input, id: ${id}, attributes: { label: ${id} }, validations: { required: true } }\n`
+      ).join(""),
+  );
+  assertEquals(layoutWithLabels(form), null);
+  const modal = modalFor(form, "main", picker) as { components: unknown[]; custom_id: string };
+  assertEquals(modal.components.length, 5);
+  assertEquals(modal.custom_id, "cordial-issue:t:main", "no `:l`, so nothing expects a picker");
+});
+
+Deno.test("the follow-up's field list agrees with whether the picker took a slot", () => {
+  const bug = realForms().find((f) => f.slug === "bug_report")!;
+  assertEquals(droppedFor(bug, false).length, 4);
+  assertEquals(droppedFor(bug, true).length, 5);
+});
+
+Deno.test("the picker is optional, multi, and marks what is already chosen", () => {
+  const withChosen = labelPickerComponent(
+    [{ name: "area:input", description: "Keyboard and mouse" }, { name: "gpu:amd" }],
+    { description: "Optional.", selected: ["GPU:AMD"] },
+  ) as { type: number; component: Record<string, unknown> };
+  assertEquals(withChosen.type, LABEL);
+  const select = withChosen.component as {
+    type: number;
+    required: boolean;
+    min_values: number;
+    max_values: number;
+    options: { value: string; description?: string; default?: boolean }[];
+  };
+  assertEquals(select.type, STRING_SELECT);
+  assertEquals(select.required, false);
+  assertEquals(select.min_values, 0);
+  assertEquals(select.max_values, 2);
+  assertEquals(select.options[0].description, "Keyboard and mouse");
+  assertEquals("description" in select.options[1], false, "Discord refuses an empty description");
+  assertEquals(select.options.map((o) => o.default ?? false), [false, true]);
+});
+
+Deno.test("multi-select answers keep their separate values, commas and all", () => {
+  const data = {
+    components: [
+      { type: 18, component: { custom_id: "title", value: "x" } },
+      { type: 18, component: { custom_id: "cordial-labels", values: ["area: a, b", "gpu:amd"] } },
+      { type: 18, component: { custom_id: "empty", values: [] } },
+    ],
+  };
+  assertEquals(modalSelections(data), {
+    "cordial-labels": ["area: a, b", "gpu:amd"],
+    "empty": [],
+  });
+  // The single-answer reader is unchanged: it joins, which is right for a dropdown.
+  assertEquals(modalValues(data)["cordial-labels"], "area: a, b, gpu:amd");
 });

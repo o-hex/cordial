@@ -139,3 +139,86 @@ Deno.test("CRLF escapes survive too, since Windows-written env files carry them"
   const jwt = await appJwt("1", await importAppKey(escaped), 1_700_000_000_000);
   assertEquals(jwt.split(".").length, 3);
 });
+
+// ---- labels, and the calls the editor makes -----------------------------------
+
+import { GitHub } from "./github.ts";
+
+/** Run `body` with `fetch` replaced, and hand back what was requested. */
+async function withFetch(
+  respond: (url: string, init: RequestInit) => unknown,
+  body: (requests: { url: string; init: RequestInit }[]) => Promise<void>,
+) {
+  const real = globalThis.fetch;
+  const requests: { url: string; init: RequestInit }[] = [];
+  globalThis.fetch = ((input: string | URL | Request, init: RequestInit = {}) => {
+    const url = String(input);
+    requests.push({ url, init });
+    return Promise.resolve(Response.json(respond(url, init)));
+  }) as typeof fetch;
+  try {
+    await body(requests);
+  } finally {
+    globalThis.fetch = real;
+  }
+}
+
+const client = () => new GitHub({ owner: "o", repo: "r" }, () => Promise.resolve("t"));
+
+Deno.test("labels are read a hundred to a page until a short page ends it", async () => {
+  const page = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ name: `l${i}`, description: i ? null : "first" }));
+  await withFetch(
+    (url) => (url.endsWith("&page=1") ? page(100) : page(7)),
+    async (requests) => {
+      const labels = await client().labels();
+      assertEquals(labels.length, 107);
+      assertEquals(labels[0], { name: "l0", description: "first" });
+      assertEquals(requests.length, 2);
+      assertStringIncludes(requests[0].url, "/repos/o/r/labels?per_page=100&page=1");
+      assertStringIncludes(requests[1].url, "page=2");
+    },
+  );
+});
+
+Deno.test("label paging is bounded, so a misbehaving API cannot hang an interaction", async () => {
+  await withFetch(
+    () => Array.from({ length: 100 }, (_, i) => ({ name: `l${i}` })),
+    async (requests) => {
+      await client().labels();
+      assertEquals(requests.length, 10);
+    },
+  );
+});
+
+Deno.test("an issue's labels come back as names, whichever shape GitHub sent", async () => {
+  await withFetch(
+    () => ({
+      title: "t",
+      state: "open",
+      body: "b",
+      labels: [{ name: "bug" }, "area:input", { name: "" }],
+    }),
+    async () => {
+      assertEquals((await client().issue(3)).labels, ["bug", "area:input"]);
+    },
+  );
+});
+
+Deno.test("an edit is one PATCH carrying only what changed", async () => {
+  await withFetch(() => ({}), async (requests) => {
+    await client().updateIssue(3, { title: "new", labels: ["a"] });
+    assertEquals(requests[0].init.method, "PATCH");
+    assertStringIncludes(requests[0].url, "/repos/o/r/issues/3");
+    assertEquals(JSON.parse(String(requests[0].init.body)), { title: "new", labels: ["a"] });
+  });
+});
+
+Deno.test("a comment returns its id so an audit entry can be amended", async () => {
+  await withFetch(() => ({ id: 55, html_url: "https://x/y" }), async (requests) => {
+    assertEquals(await client().comment(3, "hi"), { id: 55, html_url: "https://x/y" });
+    await client().editComment(55, "amended");
+    assertEquals(requests[1].init.method, "PATCH");
+    assertStringIncludes(requests[1].url, "/repos/o/r/issues/comments/55");
+  });
+});

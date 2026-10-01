@@ -208,6 +208,16 @@ export class Discord {
   }
 
   /**
+   * Rename a thread, so an edited title is not left behind in the sidebar.
+   *
+   * The name must keep its `#<number> ` prefix: `findThreadByNumber` and the
+   * context-menu command both recover the issue from it.
+   */
+  async renameThread(threadId: string, name: string): Promise<void> {
+    await this.#call("PATCH", `/channels/${threadId}`, { name }, true);
+  }
+
+  /**
    * **No `IS_COMPONENTS_V2` flag here, and that is the point.**
    *
    * It was set alongside `content`, and Discord refuses the combination
@@ -281,6 +291,34 @@ export function modalValues(data: unknown): Record<string, string> {
     if (id) {
       if (typeof record.value === "string") found[id] = record.value;
       else if (Array.isArray(record.values)) found[id] = record.values.join(", ");
+    }
+    for (const value of Object.values(record)) {
+      if (value && typeof value === "object") walk(value);
+    }
+  };
+  walk(data);
+  return found;
+}
+
+/**
+ * The values of every multi-select in a modal submission, as arrays.
+ *
+ * `modalValues` flattens a select's choices into one comma-joined string, which
+ * is right for a form's single dropdown and wrong for GitHub labels: a label
+ * name may itself contain a comma, and splitting the joined text would turn one
+ * label into two that do not exist.
+ */
+export function modalSelections(data: unknown): Record<string, string[]> {
+  const found: Record<string, string[]> = {};
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child);
+      return;
+    }
+    if (!node || typeof node !== "object") return;
+    const record = node as Record<string, unknown>;
+    if (typeof record.custom_id === "string" && Array.isArray(record.values)) {
+      found[record.custom_id] = record.values.filter((v): v is string => typeof v === "string");
     }
     for (const value of Object.values(record)) {
       if (value && typeof value === "object") walk(value);

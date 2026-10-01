@@ -25,6 +25,8 @@ import { Templates } from "./templates.ts";
 import { importPublicKey, verifyRequest } from "./verify.ts";
 import { openingFor, relayFor, verifyGitHubSignature } from "./webhook.ts";
 import { container, separator, text } from "./components.ts";
+import { Labels, parseAllowlist } from "./labels.ts";
+import { parseRoleIds } from "./permissions.ts";
 
 /** Whatever the host calls configuration: `Deno.env.toObject()`, or a Worker's `env`. */
 export type Env = Record<string, string | undefined>;
@@ -71,12 +73,28 @@ export async function build(source: Env) {
     token: source.GITHUB_READ_TOKEN,
   });
 
+  const github = new GitHub({ owner, repo }, token);
+
+  // Both optional, and both fail loudly when present and wrong: they widen who
+  // may do something, and a typo that quietly grants nobody anything is the
+  // version of that mistake nobody notices until a moderator is refused.
+  const roles = parseRoleIds(source.DISCORD_MODERATOR_ROLE_IDS);
+  if (roles.invalid.length) {
+    throw new ConfigError(
+      `DISCORD_MODERATOR_ROLE_IDS has entries that are not role ids: ${roles.invalid.join(", ")}`,
+    );
+  }
+  const labels = new Labels(() => github.labels());
+
   const context = {
     forms: () => templates.forms(),
-    github: new GitHub({ owner, repo }, token),
+    github,
     discord: new Discord(required("DISCORD_BOT_TOKEN"), required("DISCORD_APPLICATION_ID")),
     threadChannelId: required("DISCORD_THREAD_CHANNEL_ID"),
     repoUrl,
+    labels,
+    reporterLabels: parseAllowlist(source.GITHUB_REPORTER_LABELS),
+    moderatorRoleIds: roles.ids,
   };
 
   const discordKey = await importPublicKey(required("DISCORD_PUBLIC_KEY"));
@@ -111,7 +129,9 @@ export async function build(source: Env) {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/health") {
-      return Response.json({ ok: true, stale: templates.stale ?? null });
+      // `labels` is reported but never gates `ok`: a form without a label menu
+      // still files reports, so it is not a reason to fail the deploy check.
+      return Response.json({ ok: true, stale: templates.stale ?? null, labels: labels.status });
     }
 
     if (request.method !== "POST") return new Response("not found", { status: 404 });

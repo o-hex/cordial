@@ -17,6 +17,7 @@
  */
 
 import { send } from "./resilient.ts";
+import type { Label } from "./labels.ts";
 
 const API = "https://api.github.com";
 const UA = "cordial-issue-bridge";
@@ -188,8 +189,16 @@ export class GitHub {
     await this.#call("PATCH", `/repos/${owner}/${repo}/issues/${number}`, { body }, true);
   }
 
-  /** One issue, for the close button to check who filed it. */
-  async issue(number: number): Promise<{ body: string | null; state: string; title: string }> {
+  /**
+   * One issue, for the close button to check who filed it and for the editor to
+   * read what is there.
+   *
+   * `labels` is flattened to names: the API returns objects, or bare strings on
+   * some older payloads, and nothing here wants either shape.
+   */
+  async issue(
+    number: number,
+  ): Promise<{ body: string | null; state: string; title: string; labels: string[] }> {
     const { owner, repo } = this.#repo;
     const response = await this.#call(
       "GET",
@@ -197,7 +206,60 @@ export class GitHub {
       undefined,
       true,
     );
-    return await response.json();
+    const issue = await response.json() as {
+      body: string | null;
+      state: string;
+      title: string;
+      labels?: ({ name?: string } | string)[];
+    };
+    return {
+      body: issue.body,
+      state: issue.state,
+      title: issue.title,
+      labels: (issue.labels ?? [])
+        .map((l) => typeof l === "string" ? l : l.name ?? "")
+        .filter(Boolean),
+    };
+  }
+
+  /**
+   * Every label in the repository, a hundred to a page.
+   *
+   * Capped at ten pages: a repository with a thousand labels has a problem the
+   * form cannot solve, and an unbounded loop in a request handler is how a
+   * misbehaving API turns into a hung interaction.
+   */
+  async labels(): Promise<Label[]> {
+    const { owner, repo } = this.#repo;
+    const all: Label[] = [];
+    for (let page = 1; page <= 10; page++) {
+      const response = await this.#call(
+        "GET",
+        `/repos/${owner}/${repo}/labels?per_page=100&page=${page}`,
+        undefined,
+        true,
+      );
+      const batch = await response.json() as { name: string; description?: string | null }[];
+      for (const l of batch) all.push({ name: l.name, description: l.description });
+      if (batch.length < 100) break;
+    }
+    return all;
+  }
+
+  /**
+   * Change an issue's title, body and labels in one request.
+   *
+   * One `PATCH` rather than three, so an edit lands whole or not at all: a
+   * title changed and a body that failed would leave the audit comment
+   * describing something that half happened. Sets fixed values, so repeating it
+   * changes nothing and it is safe to retry.
+   */
+  async updateIssue(
+    number: number,
+    fields: { title?: string; body?: string; labels?: string[] },
+  ): Promise<void> {
+    const { owner, repo } = this.#repo;
+    await this.#call("PATCH", `/repos/${owner}/${repo}/issues/${number}`, fields, true);
   }
 
   /**
@@ -220,11 +282,20 @@ export class GitHub {
     }, true);
   }
 
-  async comment(number: number, body: string): Promise<void> {
+  /** Returns the comment, so an audit entry can be amended if the edit it records fails. */
+  async comment(number: number, body: string): Promise<{ id: number; html_url: string }> {
     const { owner, repo } = this.#repo;
-    await this.#call("POST", `/repos/${owner}/${repo}/issues/${number}/comments`, {
-      body,
-    });
+    const response = await this.#call(
+      "POST",
+      `/repos/${owner}/${repo}/issues/${number}/comments`,
+      { body },
+    );
+    return await response.json();
+  }
+
+  async editComment(id: number, body: string): Promise<void> {
+    const { owner, repo } = this.#repo;
+    await this.#call("PATCH", `/repos/${owner}/${repo}/issues/comments/${id}`, { body }, true);
   }
 }
 

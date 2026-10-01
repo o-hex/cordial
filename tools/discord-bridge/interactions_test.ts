@@ -425,3 +425,283 @@ Deno.test("the thread's first message carries every control", async () => {
     "cordial-reopen:12",
   ]);
 });
+
+// ---------------------------------------------------------------------------
+// Labels in the report form, and editing a filed report.
+// ---------------------------------------------------------------------------
+
+import { renderIssueBody } from "./issue_body.ts";
+import type { Label } from "./labels.ts";
+
+const bugForm = forms.find((f) => f.slug === "bug_report")!;
+const repoLabels: Label[] = [
+  "bug",
+  "enhancement",
+  "confirmed",
+  "wontfix",
+  "priority: high",
+  "area:graphics",
+  "area:input",
+  "gpu:nvidia",
+  "compositor:sway",
+].map((name) => ({ name }));
+const ALLOW = ["area:*", "platform:*", "compositor:*", "gpu:*"];
+
+type Json = Record<string, unknown>;
+
+/** The fakes, plus a GitHub that remembers the issue and what was done to it. */
+function tracker(
+  options: {
+    filer?: string | null;
+    known?: Label[] | null;
+    labelsOnIssue?: string[];
+    roles?: string[];
+    body?: string;
+  } = {},
+) {
+  const f = fakes();
+  const values = {
+    "what-happened": "The window opens and stays black.",
+    "what-expected": "The Roblox home screen.",
+    "repro": "Launch it.",
+    "diagnostics": "Cordial 0.13.2 (91f8ee9)\nInstall rpm",
+  };
+  const filer = options.filer === undefined ? "9" : options.filer;
+  const issue = {
+    title: "[Bug]: The window opens and stays black.",
+    state: "open",
+    labels: options.labelsOnIssue ?? ["bug"],
+    body: options.body ??
+      (filer
+        ? renderIssueBody(bugForm, { values, reporter: { id: filer, tag: "Someone" } }, "777")
+        : "### What happened\n\nfiled on the web"),
+  };
+  const github = f.context.github as unknown as Json;
+  github.issue = () => Promise.resolve({ ...issue, labels: [...issue.labels] });
+  github.comment = (...args: unknown[]) => {
+    f.calls.push({ what: "comment", args });
+    return Promise.resolve({
+      id: 55,
+      html_url: "https://github.com/o/r/issues/12#issuecomment-55",
+    });
+  };
+  github.updateIssue = (number: number, fields: Json) => {
+    f.calls.push({ what: "updateIssue", args: [number, fields] });
+    if (typeof fields.title === "string") issue.title = fields.title;
+    if (typeof fields.body === "string") issue.body = fields.body;
+    if (Array.isArray(fields.labels)) issue.labels = fields.labels as string[];
+    return Promise.resolve();
+  };
+  github.editComment = f.calls.push.bind(f.calls) && ((...args: unknown[]) => {
+    f.calls.push({ what: "editComment", args });
+    return Promise.resolve();
+  });
+  const discord = f.context.discord as unknown as Json;
+  discord.renameThread = (...args: unknown[]) => {
+    f.calls.push({ what: "renameThread", args });
+    return Promise.resolve();
+  };
+  const known = options.known === undefined ? repoLabels : options.known;
+  f.context.labels = { get: () => Promise.resolve(known) };
+  f.context.reporterLabels = ALLOW;
+  f.context.moderatorRoleIds = options.roles ?? [];
+  return { ...f, issue };
+}
+
+const asUser = (id: string, extra: Json = {}) => ({
+  member: { user: { id, username: `u${id}`, global_name: `User ${id}` }, ...extra },
+});
+const MOD = asUser("mod", { permissions: String(1n << 13n) });
+
+const pressAs = (customId: string, who: Json = asUser("9")) => ({
+  type: InteractionType.MESSAGE_COMPONENT,
+  token: "tok",
+  channel_id: "777",
+  data: { custom_id: customId },
+  ...who,
+} as never);
+
+/** What a person types into a modal, in the shape Discord submits it. */
+function submission(
+  modal: { custom_id: string },
+  values: Record<string, string>,
+  selections: Record<string, string[]> = {},
+  who: Json = asUser("9"),
+) {
+  return {
+    type: InteractionType.MODAL_SUBMIT,
+    token: "tok",
+    channel_id: "777",
+    data: {
+      custom_id: modal.custom_id,
+      components: [
+        ...Object.entries(values).map(([custom_id, value]) => ({
+          type: 18,
+          component: { custom_id, value },
+        })),
+        ...Object.entries(selections).map(([custom_id, v]) => ({
+          type: 18,
+          component: { custom_id, values: v },
+        })),
+      ],
+    },
+    ...who,
+  } as never;
+}
+
+type Modal = { custom_id: string; title: string; components: Json[] };
+const modalOf = (response: unknown) => (response as { data: Modal }).data;
+const inputs = (modal: Modal) =>
+  modal.components.map((c) => (c.component as Json).custom_id as string);
+const said = (calls: { what: string; args: unknown[] }[]) =>
+  (calls.filter((c) => c.what === "editOriginal").at(-1)!.args[1] as { content: string }).content;
+
+Deno.test("the report form offers a reporter the allowed labels, in the fifth slot", async () => {
+  const t = tracker();
+  const { response } = await handle(t.context, press("cordial-issue-open:bug_report"));
+  const modal = modalOf(response);
+  assertEquals((response as { type: number }).type, ResponseType.MODAL);
+  assert(modal.components.length <= 5, "a modal never holds more than five");
+  // Every required field kept its place; the picker took the optional one's.
+  const ids = inputs(modal);
+  for (const required of ["what-happened", "what-expected", "repro", "diagnostics"]) {
+    assert(ids.includes(required), `${required} must survive the picker`);
+  }
+  assertEquals(ids.at(-1), "cordial-labels");
+  assert(modal.custom_id.endsWith(":main:l"), modal.custom_id);
+
+  const picker = modal.components.at(-1)!.component as { options: { value: string }[] };
+  const offered = picker.options.map((o) => o.value);
+  assertEquals(offered, ["gpu:nvidia", "compositor:sway", "area:graphics", "area:input"]);
+  for (const hidden of ["confirmed", "wontfix", "priority: high", "bug"]) {
+    assert(!offered.includes(hidden), `${hidden} must not be offered to a reporter`);
+  }
+});
+
+Deno.test("a moderator's form offers every label except the ones the template applies", async () => {
+  const t = tracker();
+  const { response } = await handle(t.context, press("cordial-issue-open:bug_report", MOD));
+  const picker = modalOf(response).components.at(-1)!.component as {
+    options: { value: string }[];
+  };
+  const offered = picker.options.map((o) => o.value);
+  assert(offered.includes("confirmed") && offered.includes("priority: high"));
+  assert(!offered.includes("bug"), "bug is applied by the template already");
+});
+
+Deno.test("with no label the reporter may pick, the form is exactly what it was", async () => {
+  const t = tracker({ known: L("bug", "confirmed") });
+  const { response } = await handle(t.context, press("cordial-issue-open:bug_report"));
+  const modal = modalOf(response);
+  assert(!inputs(modal).includes("cordial-labels"));
+  assertEquals(modal.custom_id, "cordial-issue:bug_report:main");
+  assertEquals(modal.components.length, 5);
+});
+
+Deno.test("if the label list cannot be had, the form opens without a picker", async () => {
+  const t = tracker({ known: null });
+  const { response } = await handle(t.context, press("cordial-issue-open:bug_report"));
+  assert(!inputs(modalOf(response)).includes("cordial-labels"));
+  assertEquals(modalOf(response).custom_id, "cordial-issue:bug_report:main");
+});
+
+function L(...names: string[]): Label[] {
+  return names.map((name) => ({ name }));
+}
+
+const fileWithPicks = (picks: string[], custom = "cordial-issue:bug_report:main:l") =>
+  submission(
+    { custom_id: custom },
+    {
+      "what-happened": "Black window.",
+      "what-expected": "Home.",
+      "repro": "Launch.",
+      "diagnostics": "Cordial 0.13.2",
+    },
+    { "cordial-labels": picks },
+  );
+
+Deno.test("the chosen labels are applied when the issue is created", async () => {
+  const t = tracker();
+  const { after } = await handle(t.context, fileWithPicks(["gpu:nvidia", "area:input"]));
+  await after!();
+  const [created] = t.of("createIssue");
+  assertEquals(created.args[2], ["bug", "gpu:nvidia", "area:input"], "template label first");
+  assertStringIncludes(said(t.calls), "Labels: gpu:nvidia, area:input");
+});
+
+Deno.test("a reporter who forges a protected label gets the report without it", async () => {
+  const t = tracker();
+  const { after } = await handle(
+    t.context,
+    fileWithPicks(["confirmed", "priority: high", "wontfix", "area:input", "not-a-label"]),
+  );
+  await after!();
+  assertEquals(t.of("createIssue")[0].args[2], ["bug", "area:input"]);
+  const reply = said(t.calls);
+  assertStringIncludes(reply, "cannot be chosen here");
+  assertStringIncludes(reply, "confirmed");
+  assertStringIncludes(reply, "Filed as", "the report still filed");
+});
+
+Deno.test("a moderator filing a report may apply any label", async () => {
+  const t = tracker();
+  const { after } = await handle(
+    t.context,
+    { ...(fileWithPicks(["confirmed", "priority: high"]) as Json), ...MOD } as never,
+  );
+  await after!();
+  assertEquals(t.of("createIssue")[0].args[2], ["bug", "confirmed", "priority: high"]);
+});
+
+Deno.test("if the label list is gone at submit, the report files without labels and says so", async () => {
+  const t = tracker({ known: null });
+  const { after } = await handle(t.context, fileWithPicks(["area:input"]));
+  await after!();
+  assertEquals(t.of("createIssue")[0].args[2], ["bug"]);
+  assertStringIncludes(said(t.calls), "no labels were added");
+  assertStringIncludes(said(t.calls), "Filed as");
+});
+
+Deno.test("the optional field the picker displaced is offered in the follow-up", async () => {
+  const t = tracker();
+  const { after } = await handle(t.context, fileWithPicks([]));
+  await after!();
+  const reply = t.of("editOriginal")[0].args[1] as {
+    content: string;
+    components: { components: { custom_id: string }[] }[];
+  };
+  const button = reply.components[0].components[0].custom_id;
+  assertEquals(button, "cordial-issue-extra:bug_report:12:l");
+
+  const { response } = await handle(t.context, press(button));
+  const extra = modalOf(response);
+  assert(extra.components.length <= 5);
+  // Five optional fields in all now, one more than without the picker.
+  assertEquals(extra.components.length, 5);
+  assertEquals(inputs(extra)[0], "engine-log", "the field that gave way is first in line");
+});
+
+Deno.test("a report filed with no picks needs no label lookup at all", async () => {
+  const t = tracker({ known: null });
+  const { after } = await handle(t.context, fileWithPicks([]));
+  await after!();
+  assertEquals(t.of("createIssue")[0].args[2], ["bug"]);
+  assert(!said(t.calls).includes("label"), "nothing to apologise for");
+});
+
+Deno.test("Mark as completed also accepts a configured moderator role", async () => {
+  const t = tracker({ roles: ["555"] });
+  const withIssue = t.context.github as unknown as Json;
+  withIssue.setIssueOpen = (...a: unknown[]) => {
+    t.calls.push({ what: "setIssueOpen", args: a });
+    return Promise.resolve();
+  };
+  (t.context.discord as unknown as Json).setArchived = () => Promise.resolve();
+  const { after } = await handle(
+    t.context,
+    pressAs("cordial-fixed:12", asUser("r", { roles: ["555"] })),
+  );
+  await after!();
+  assertEquals(t.of("setIssueOpen")[0].args, [12, false, true]);
+});

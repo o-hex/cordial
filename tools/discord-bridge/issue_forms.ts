@@ -110,6 +110,9 @@ export interface IssueForm {
 
 export class FormError extends Error {}
 
+/** The `custom_id` of the label picker, which no template field can share. */
+export const LABEL_SELECT_ID = "cordial-labels";
+
 /** Shorten with an ellipsis, so a cut is legible as a cut. */
 function clip(text: string | undefined, limit: number): string {
   const flat = (text ?? "").split(/\s+/).filter(Boolean).join(" ");
@@ -181,6 +184,58 @@ export function fieldToComponent(block: FormBlock): unknown {
 }
 
 /**
+ * Fill `capacity` slots in template order; what is left over is dropped if
+ * optional and reported if required.
+ *
+ * Shared between the plain layout and the one that gives a slot to the label
+ * picker, so the two cannot disagree about which optional field gives way.
+ */
+function pack(fields: FormBlock[], capacity: number) {
+  const placed: FormBlock[] = [];
+  const dropped: FormBlock[] = [];
+  const overflowRequired: string[] = [];
+  for (const block of fields) {
+    if (placed.length < capacity) placed.push(block);
+    else if (isRequired(block)) overflowRequired.push(block.id ?? "?");
+    else dropped.push(block);
+  }
+  return { placed, dropped, overflowRequired };
+}
+
+/**
+ * The layout when the label picker takes one of the five slots.
+ *
+ * Unlike `pack`, this lets a required field **displace an optional one that
+ * came before it**: the picker is the newcomer, and it must not be what costs a
+ * form its place. `broken_feature` is the case -- an optional field sits ahead of
+ * its last required one, so a first-come layout with four slots would push the
+ * required field out. Here the earliest optionals keep the slots left over once
+ * every required field has one, and the form's own order is preserved.
+ *
+ * Null if the required fields alone do not fit in four. The caller then opens
+ * the form without a picker, and `deno task check` says so in CI, rather than a
+ * template edit quietly costing a form its Diagnostics box.
+ */
+export function layoutWithLabels(
+  form: IssueForm,
+): { placed: FormBlock[]; dropped: FormBlock[] } | null {
+  const capacity = MODAL_MAX_COMPONENTS - 1;
+  const required = form.fields.filter(isRequired).length;
+  if (required > capacity) return null;
+  let optionalRoom = capacity - required;
+  const placed: FormBlock[] = [];
+  const dropped: FormBlock[] = [];
+  for (const block of form.fields) {
+    if (isRequired(block)) placed.push(block);
+    else if (optionalRoom > 0) {
+      optionalRoom--;
+      placed.push(block);
+    } else dropped.push(block);
+  }
+  return { placed, dropped };
+}
+
+/**
  * Parse one template and decide what fits.
  *
  * Required fields never give way: filing without Diagnostics is the failure
@@ -196,15 +251,7 @@ export function parseForm(slug: string, yamlText: string): IssueForm {
   };
 
   const fields = (doc.body ?? []).filter((b) => b.type !== "markdown");
-  const placed: FormBlock[] = [];
-  const dropped: FormBlock[] = [];
-  const overflowRequired: string[] = [];
-
-  for (const block of fields) {
-    if (placed.length < MODAL_MAX_COMPONENTS) placed.push(block);
-    else if (isRequired(block)) overflowRequired.push(block.id ?? "?");
-    else dropped.push(block);
-  }
+  const { placed, dropped, overflowRequired } = pack(fields, MODAL_MAX_COMPONENTS);
 
   if (overflowRequired.length) {
     // A required field pushed out by an *optional* one that came first is a
@@ -232,13 +279,83 @@ export function parseForm(slug: string, yamlText: string): IssueForm {
   };
 }
 
-/** The modal Discord opens when somebody presses this form's button. */
-export function modalFor(form: IssueForm, part: "main" | "extra" = "main"): unknown {
-  const blocks = part === "main" ? form.placed : form.dropped.slice(0, MODAL_MAX_COMPONENTS);
+/**
+ * The modal Discord opens when somebody presses this form's button.
+ *
+ * `labelPicker`, when given, is a ready-made `Label` component for the label
+ * menu and takes the fifth slot: an optional field of the form moves to the
+ * follow-up modal to make room. If the form cannot spare the slot -- a required
+ * field would lose its place -- the picker is left out and the form is exactly
+ * what it was.
+ *
+ * For the `extra` part the argument only says whether the main modal carried a
+ * picker, so any truthy value will do.
+ *
+ * Whether the picker was included rides in the `custom_id` (`:l`), because the
+ * submit arrives as a fresh interaction and the follow-up button after it needs
+ * to know which optional fields moved. There is nowhere else to keep it.
+ */
+export function modalFor(
+  form: IssueForm,
+  part: "main" | "extra" = "main",
+  labelPicker?: unknown,
+): unknown {
+  const layout = labelPicker ? layoutWithLabels(form) : null;
+  const withPicker = Boolean(labelPicker && layout);
+  const source = layout ?? form;
+  const blocks = part === "main" ? source.placed : source.dropped.slice(0, MODAL_MAX_COMPONENTS);
+  const components = blocks.map(fieldToComponent);
+  if (part === "main" && withPicker) components.push(labelPicker);
   return {
-    custom_id: `cordial-issue:${form.slug}:${part}`,
+    custom_id: `cordial-issue:${form.slug}:${part}${withPicker ? ":l" : ""}`,
     title: clip(part === "main" ? form.name : `More about: ${form.name}`, MODAL_TITLE_MAX),
-    components: blocks.map(fieldToComponent),
+    components,
+  };
+}
+
+/**
+ * The optional fields a form offers after filing, given whether the picker
+ * took a slot. The follow-up button and the extra modal both read this, so the
+ * count in the reply and the fields in the dialog cannot disagree.
+ */
+export function droppedFor(form: IssueForm, withPicker: boolean): FormBlock[] {
+  return (withPicker ? layoutWithLabels(form)?.dropped : null) ?? form.dropped;
+}
+
+/**
+ * One `Label` wrapping a multi-select of GitHub labels.
+ *
+ * `required: false` and `min_values: 0` because a report must never be blocked
+ * on a classification the reporter may not feel qualified to make. `selected`
+ * marks options as already chosen, which is how the editor shows what is on
+ * the issue now.
+ */
+export function labelPickerComponent(
+  offered: { name: string; description?: string | null }[],
+  options: { description: string; selected?: readonly string[] },
+): unknown {
+  const selected = new Set((options.selected ?? []).map((s) => s.toLowerCase()));
+  return {
+    type: LABEL,
+    label: "Labels",
+    description: clip(options.description, DESCRIPTION_MAX),
+    component: {
+      type: STRING_SELECT,
+      custom_id: LABEL_SELECT_ID,
+      required: false,
+      min_values: 0,
+      max_values: Math.max(1, offered.length),
+      placeholder: "Optional",
+      options: offered.map((l) => {
+        const description = clip(l.description ?? "", 100);
+        return {
+          label: clip(l.name, 100),
+          value: l.name,
+          ...(description ? { description } : {}),
+          ...(selected.has(l.name.toLowerCase()) ? { default: true } : {}),
+        };
+      }),
+    },
   };
 }
 

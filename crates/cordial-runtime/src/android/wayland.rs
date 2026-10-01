@@ -3925,7 +3925,52 @@ static SHIFT_DURING_RIGHT_DRAG: AtomicBool = AtomicBool::new(false);
 /// would kill the camera for good with nothing on screen to explain it,
 /// which is the same shape as the Escape latch this release just removed.
 static RIGHT_DRAG_LATCH_SINCE: AtomicI64 = AtomicI64::new(0);
+
+/// The engine, not a right-button drag, is what holds the pointer lock -- shift
+/// lock or first person -- and so Cordial keeps the engine's pointer at the
+/// canvas centre while it is held. Set from `sync_pointer_lock`, read when the
+/// compositor confirms the lock and when it is released.
+///
+/// **KWin only, because it is the one compositor where it was measured.** The
+/// PR that added it showed, on Plasma, that leaving shift lock puts the cursor
+/// back at the canvas centre when the stored position is recentred while the
+/// lock is held and the hint is committed on release. Nobody has run shift lock
+/// or first person with it on Mutter, sway or Hyprland, so they keep the
+/// behaviour they had: the flag is never set there, and [`engine_owns_lock`] is
+/// where that is decided and tested.
 static ENGINE_OWNS_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Whether this tick's lock is the engine's to recentre. `toplevel_lock` is
+/// `constrain_toplevel()`: false everywhere but KWin unless
+/// `CORDIAL_POINTER_LOCK_SURFACE` says otherwise.
+///
+/// A right-button drag Cordial started itself is not the engine's, and
+/// recentring under it would snap the camera to the middle of the canvas every
+/// tick -- unless the engine had the lock before the drag or shift went down
+/// during it, in which case the engine does own it.
+fn engine_owns_lock(
+    toplevel_lock: bool,
+    engine_wants: bool,
+    dragging: bool,
+    wanted_before_drag: bool,
+    shift_during_drag: bool,
+) -> bool {
+    toplevel_lock && engine_wants && (!dragging || wanted_before_drag || shift_during_drag)
+}
+
+/// Whether releasing the lock sends an extra `wl_surface.commit` on the parent
+/// to deliver the cursor hint now.
+///
+/// Never while the stacking gate is waiting for GTK's frame
+/// ([ADR-047](../../../../docs/adr/ADR-047-the-canvas-is-lowered-only-under-a-presented-frame.md)):
+/// a commit of ours resolves GDK's pending presentation feedback, and the gate
+/// would take that as GTK having attached a buffer. Focusing the chat box
+/// while in shift lock releases the lock and arms the gate in the same tick,
+/// which is exactly the overlap. The hint then rides on GTK's own next commit,
+/// which the gate is already waiting for; `INFERRED`, not observed.
+fn release_commits_parent(owned: bool, gate_arming: bool) -> bool {
+    owned && !gate_arming
+}
 
 
 /// `CORDIAL_NO_POINTER_LOCK=1` — never capture the pointer, whatever the engine
@@ -3999,7 +4044,7 @@ unsafe extern "C" fn locked_pointer_locked(_data: *mut c_void, _lp: *mut c_void)
     // be drained by.
     super::input::reset_mouse_delta();
     super::input::forget_pending_unlocked_delta();
-    if ENGINE_OWNS_LOCK.load(Ordering::Acquire) {
+    if ENGINE_OWNS_LOCK.load(Ordering::Acquire) && WaylandWindow::constrain_toplevel() {
         if let Some(w) = current() {
             let (cx, cy) = w.canvas_centre();
             w.set_pointer_position(cx, cy);
@@ -4472,10 +4517,13 @@ impl WaylandWindow {
         // duplicating a decision the engine had already made correctly.
         let want = asked;
         if want {
-            let owned = engine_wants
-                && (!dragging
-                    || LOCK_WANTED_BEFORE_RIGHT_DRAG.load(Ordering::Acquire)
-                    || SHIFT_DURING_RIGHT_DRAG.load(Ordering::Acquire));
+            let owned = engine_owns_lock(
+                Self::constrain_toplevel(),
+                engine_wants,
+                dragging,
+                LOCK_WANTED_BEFORE_RIGHT_DRAG.load(Ordering::Acquire),
+                SHIFT_DURING_RIGHT_DRAG.load(Ordering::Acquire),
+            );
             ENGINE_OWNS_LOCK.store(owned, Ordering::Release);
             if owned && POINTER_LOCK_ACTIVE.load(Ordering::Acquire) {
                 let (cx, cy) = self.canvas_centre();
@@ -4541,10 +4589,15 @@ impl WaylandWindow {
 
 /// Whether to constrain the GTK toplevel rather than the engine's subsurface.
 ///
-/// KWin only, and only because of KDE bug 463088 -- see `lock_pointer`. On
-/// every other compositor the subsurface is the surface that actually holds
-/// pointer focus over the canvas, and constraining anything else is a lock that
-/// is granted and never activates.
+/// KWin only. KDE bug 463088 is why the toplevel is constrained at all, and the
+/// canvas being cut out of the toplevel's input region is why that was not
+/// enough -- see `lock_pointer`. On every other compositor the subsurface is the
+/// surface that actually holds pointer focus over the canvas, and constraining
+/// anything else is a lock that is granted and never activates.
+///
+/// This is also the gate for everything the toplevel lock needed beyond the
+/// constraint itself: the canvas in the input region, recentring the engine's
+/// pointer while it holds the lock, and the hint commit on release.
 fn constrain_toplevel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -4581,6 +4634,16 @@ fn constrain_toplevel() -> bool {
         // still lets the physical cursor leave it (KDE bug 463088). Native game
         // windows such as Sober's SDL3 window constrain their xdg_toplevel and
         // do not hit that path.
+        //
+        // **Constraining the toplevel is only half of what KWin needs.** KWin
+        // activates a lock on the toplevel only where the pointer is inside the
+        // toplevel's *input region*, and Cordial cuts the canvas out of that
+        // region so clicks reach the engine's subsurface. A lock requested over
+        // the canvas was therefore granted and never activated, which is the
+        // cursor leaving the window during a right drag. `open` now keeps the
+        // canvas in the region on this path (`set_canvas_in_input_region`).
+        // Measured by the PR author on Plasma; not reproducible on sway, which
+        // takes the other branch.
         //
         // So the two halves of 3d67e59 are separated, because only one of them
         // was ever about the surface. Using **GDK's** pointer rather than
@@ -4650,16 +4713,14 @@ fn constrain_toplevel() -> bool {
         if slot.is_null() {
             return;
         }
-        let centre = ENGINE_OWNS_LOCK.swap(false, Ordering::AcqRel);
+        let centre = ENGINE_OWNS_LOCK.swap(false, Ordering::AcqRel) && Self::constrain_toplevel();
         let (x, y) = if centre {
             let (cx, cy) = self.canvas_centre();
             self.set_pointer_position(cx, cy);
-            if Self::constrain_toplevel() {
-                let (ox, oy) = *self.placed_at.lock().unwrap_or_else(|e| e.into_inner());
-                (cx + ox as f32, cy + oy as f32)
-            } else {
-                (cx, cy)
-            }
+            // `centre` implies the toplevel is what was locked, so the hint
+            // is in toplevel coordinates.
+            let (ox, oy) = *self.placed_at.lock().unwrap_or_else(|e| e.into_inner());
+            (cx + ox as f32, cy + oy as f32)
         } else {
             self.pointer_position()
         };
@@ -4677,9 +4738,9 @@ fn constrain_toplevel() -> bool {
                 f32_to_fixed(x),
                 f32_to_fixed(y),
             );
-            if centre {
-                let target = if Self::constrain_toplevel() { self.parent_surface } else { self.surface };
-                (self.wl.marshal_flags)(target, WL_SURFACE_COMMIT, std::ptr::null(), 1, 0);
+            let gate_arming = self.stacking_gate.lock().unwrap_or_else(|e| e.into_inner()).is_arming();
+            if release_commits_parent(centre, gate_arming) {
+                (self.wl.marshal_flags)(self.parent_surface, WL_SURFACE_COMMIT, std::ptr::null(), 1, 0);
             }
             (self.wl.marshal_flags)(
                 *slot,
@@ -6528,6 +6589,43 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recentring and the release hint are KWin's. Everything that is not
+    /// the toplevel-lock path must come out false whatever else is true, which
+    /// is the whole of "other compositors keep today's behaviour".
+    #[test]
+    fn the_engine_owns_the_lock_only_on_the_toplevel_path() {
+        for engine_wants in [false, true] {
+            for dragging in [false, true] {
+                for before in [false, true] {
+                    for shift in [false, true] {
+                        assert!(
+                            !engine_owns_lock(false, engine_wants, dragging, before, shift),
+                            "off KWin: engine_wants={engine_wants} dragging={dragging} \
+                             before={before} shift={shift}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(engine_owns_lock(true, true, false, false, false));
+        assert!(!engine_owns_lock(true, false, false, false, false));
+    }
+
+    #[test]
+    fn a_cordial_started_drag_is_not_the_engines_lock() {
+        assert!(!engine_owns_lock(true, true, true, false, false));
+        assert!(engine_owns_lock(true, true, true, true, false));
+        assert!(engine_owns_lock(true, true, true, false, true));
+    }
+
+    #[test]
+    fn the_release_commit_waits_for_the_stacking_gate() {
+        assert!(release_commits_parent(true, false));
+        assert!(!release_commits_parent(true, true));
+        assert!(!release_commits_parent(false, false));
+        assert!(!release_commits_parent(false, true));
+    }
 
     #[test]
     fn pointer_positions_and_side_buttons_keep_their_meaning() {

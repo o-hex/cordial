@@ -2289,6 +2289,21 @@ impl HostWindow {
     }
 }
 
+/// Whether the toplevel's input region should cover the canvas too, which
+/// [`input_region`] receives as `modal`.
+///
+/// Two unrelated reasons, and one exception. A web-view dialog is modal. On
+/// KWin the pointer lock is constrained on the toplevel and activates only
+/// where the pointer is inside the toplevel's input region, so while the canvas
+/// is on top and the lock path wants it (`canvas_in_input_region`) the cut-out
+/// must go -- the engine's subsurface keeps its own input region above the
+/// parent, so clicks still reach it. Not while the canvas is see-through, which
+/// is the editor or a dialog being drawn through it and wants the usual
+/// cut-out for the editor's own rectangle.
+fn claims_whole_window(dialog_up: bool, canvas_in_input_region: bool, see_through: bool) -> bool {
+    dialog_up || (canvas_in_input_region && !see_through)
+}
+
 /// The parent surface's input region: everything except the canvas, plus the
 /// editor's rectangle handed back.
 ///
@@ -2304,10 +2319,6 @@ impl HostWindow {
 /// `surface` is the whole surface including any CSD shadow, and is widened to
 /// cover the content if a configure has left it briefly smaller -- a region
 /// that does not reach the canvas would clip the hole rather than the chrome.
-fn claims_whole_window(dialog_up: bool, canvas_in_input_region: bool, see_through: bool) -> bool {
-    dialog_up || (canvas_in_input_region && !see_through)
-}
-
 fn input_region(
     surface: (i32, i32),
     content: (i32, i32, i32, i32),

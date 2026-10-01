@@ -22,13 +22,19 @@
 //! The file is read in pieces rather than slurped. `libroblox.so` is 118 MB and
 //! the three regions this needs total well under a megabyte.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 const SHT_DYNSYM: u32 = 11;
+const SHT_DYNAMIC: u32 = 6;
+const DT_NEEDED: u64 = 1;
+const STT_OBJECT: u8 = 1;
+const STT_COMMON: u8 = 5;
+const STT_TLS: u8 = 6;
 const SHN_UNDEF: u16 = 0;
+const STB_GLOBAL: u8 = 1;
 const STB_WEAK: u8 = 2;
 const EHDR_LEN: usize = 64;
 const SHDR_LEN: usize = 64;
@@ -100,8 +106,59 @@ fn read_at(f: &mut File, off: u64, len: usize, what: &str) -> io::Result<Vec<u8>
 /// a parallel table this deliberately does not read. The bare name is what the
 /// linker resolves on and what the host lookup wants.
 pub fn undefined_symbols(path: &Path) -> io::Result<Imports> {
-    let mut f = File::open(path)?;
+    read_dynsym(path).map(|(imports, _, _)| imports)
+}
 
+/// The names an object exports: `.dynsym` entries with a section, bound
+/// globally or weakly. Local symbols are not visible to any other object and
+/// are not counted.
+pub fn defined_symbols(path: &Path) -> io::Result<BTreeSet<String>> {
+    read_dynsym(path).map(|(_, exports, _)| exports)
+}
+
+/// The imports that are data rather than code: `STT_OBJECT`, `STT_COMMON` and
+/// `STT_TLS`. A linker hands both kinds the same address-sized answer, so it
+/// cannot tell them apart, but whoever supplies the answer must: a data
+/// import needs storage laid out as the defining library lays it out, and a
+/// function's address there would be read as the value. For the arm64 guest
+/// that is the difference between a stub and a variable
+/// (docs/vr/dynarmic-design.md §3.1, "Data imports").
+pub fn undefined_data_symbols(path: &Path) -> io::Result<BTreeSet<String>> {
+    read_dynsym(path).map(|(_, _, data)| data)
+}
+
+/// The object's `DT_NEEDED` entries, in order. Read from the `SHT_DYNAMIC`
+/// section and its linked string table, like `.dynsym` above.
+pub fn needed_libraries(path: &Path) -> io::Result<Vec<String>> {
+    let mut f = File::open(path)?;
+    let (shdrs, e_shnum) = read_section_headers(&mut f, path)?;
+    let Some(i) = (0..e_shnum).find(|&i| u32le(&shdrs[i * SHDR_LEN..], 0x04) == SHT_DYNAMIC) else {
+        return Ok(Vec::new());
+    };
+    let s = &shdrs[i * SHDR_LEN..(i + 1) * SHDR_LEN];
+    let link = u32le(s, 0x28) as usize;
+    if link >= e_shnum {
+        return Err(bad(format!("{}'s .dynamic links past the section table", path.display())));
+    }
+    let st = &shdrs[link * SHDR_LEN..(link + 1) * SHDR_LEN];
+    let strtab = read_at(&mut f, u64le(st, 0x18), u64le(st, 0x20) as usize, ".dynstr")?;
+    let dynamic = read_at(&mut f, u64le(s, 0x18), u64le(s, 0x20) as usize, ".dynamic")?;
+    let mut out = Vec::new();
+    for d in dynamic.chunks_exact(16) {
+        if u64le(d, 0) == DT_NEEDED {
+            let off = u64le(d, 8) as usize;
+            let end = strtab.get(off..).and_then(|t| t.iter().position(|&c| c == 0)).map(|n| off + n);
+            if let Some(end) = end {
+                out.push(String::from_utf8_lossy(&strtab[off..end]).into_owned());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The ELF header's checks and the section header table, shared by the
+/// readers above. Returns the table's bytes and its entry count.
+fn read_section_headers(f: &mut File, path: &Path) -> io::Result<(Vec<u8>, usize)> {
     // Length first, so a file too short to hold a header is reported as not
     // being an ELF object rather than as a truncated one -- the common case is
     // that something else entirely was handed in.
@@ -113,7 +170,7 @@ pub fn undefined_symbols(path: &Path) -> io::Result<Imports> {
         )));
     }
 
-    let ehdr = read_at(&mut f, 0, EHDR_LEN, "the ELF header")?;
+    let ehdr = read_at(f, 0, EHDR_LEN, "the ELF header")?;
     if &ehdr[0..4] != b"\x7fELF" {
         return Err(bad(format!("{} is not an ELF file", path.display())));
     }
@@ -149,18 +206,25 @@ pub fn undefined_symbols(path: &Path) -> io::Result<Imports> {
     // not fit in 16 bits and lives in section 0's sh_size. Rare, but cheap to
     // honour and it costs one read.
     if e_shnum == 0 {
-        let zero = read_at(&mut f, e_shoff, SHDR_LEN, "section header 0")?;
+        let zero = read_at(f, e_shoff, SHDR_LEN, "section header 0")?;
         e_shnum = u64le(&zero, 0x20);
     }
 
     let shdrs = read_at(
-        &mut f,
+        f,
         e_shoff,
         (e_shnum as usize)
             .checked_mul(SHDR_LEN)
             .ok_or_else(|| bad("section header table size overflows"))?,
         "the section header table",
     )?;
+    Ok((shdrs, e_shnum as usize))
+}
+
+fn read_dynsym(path: &Path) -> io::Result<(Imports, BTreeSet<String>, BTreeSet<String>)> {
+    let mut f = File::open(path)?;
+    let (shdrs, e_shnum) = read_section_headers(&mut f, path)?;
+    let e_shnum = e_shnum as u64;
 
     let mut found = None;
     for i in 0..e_shnum as usize {
@@ -201,8 +265,12 @@ pub fn undefined_symbols(path: &Path) -> io::Result<Imports> {
     let syms = read_at(&mut f, sym_off, sym_size as usize, ".dynsym")?;
 
     let mut out = Imports::new();
+    let mut exports = BTreeSet::new();
+    let mut data = BTreeSet::new();
     for chunk in syms.chunks_exact(SYM_LEN) {
-        if u16le(chunk, 0x06) != SHN_UNDEF {
+        let undefined = u16le(chunk, 0x06) == SHN_UNDEF;
+        let bind = chunk[0x04] >> 4;
+        if !undefined && bind != STB_GLOBAL && bind != STB_WEAK {
             continue;
         }
         let name_off = u32le(chunk, 0x00) as usize;
@@ -220,6 +288,13 @@ pub fn undefined_symbols(path: &Path) -> io::Result<Imports> {
         let Ok(name) = std::str::from_utf8(&strtab[name_off..end]) else {
             continue;
         };
+        if !undefined {
+            exports.insert(name.to_string());
+            continue;
+        }
+        if matches!(chunk[0x04] & 0xf, STT_OBJECT | STT_COMMON | STT_TLS) {
+            data.insert(name.to_string());
+        }
         let binding = if chunk[0x04] >> 4 == STB_WEAK {
             Binding::Weak
         } else {
@@ -238,7 +313,7 @@ pub fn undefined_symbols(path: &Path) -> io::Result<Imports> {
             }
         }
     }
-    Ok(out)
+    Ok((out, exports, data))
 }
 
 /// Every `*.so` directly inside `dir`, unioned.
@@ -283,6 +358,33 @@ pub fn undefined_symbols_in_dir(dir: &Path) -> (Imports, Vec<(String, String)>) 
         }
     }
     (all, skipped)
+}
+
+/// Every name some `*.so` directly inside `dir` exports.
+///
+/// The Quest build ships its own OpenXR loader and Meta's platform loader beside
+/// `libroblox.so`, and the engine's 73 `xr*` and `ovr_*` imports are answered by
+/// those two. Without this the pre-load report counted every one of them as
+/// something nothing could answer and predicted a failure that never came from
+/// them -- the real one was three `AAssetDir` calls further down the list.
+/// Used only to quieten that report: resolution itself is left to the linker,
+/// which already searches the siblings.
+pub fn defined_symbols_in_dir(dir: &Path) -> BTreeSet<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return BTreeSet::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".so") || n.contains(".so."))
+        })
+        .filter_map(|p| defined_symbols(&p).ok())
+        .flatten()
+        .collect()
 }
 
 #[cfg(test)]
@@ -392,6 +494,15 @@ mod tests {
             "a defined symbol is not an import: {got:?}"
         );
         assert_eq!(got.len(), 2, "the null entry must not be counted: {got:?}");
+    }
+
+    #[test]
+    fn a_defined_symbol_is_an_export_and_an_import_is_not() {
+        let (d, path, wanted) = synthetic("def", false);
+        let got = defined_symbols(&path).expect("parses");
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), ["defined"]);
+        let dir = defined_symbols_in_dir(d.path());
+        assert!(dir.contains("defined") && !dir.contains(wanted), "{dir:?}");
     }
 
     /// The eight weak imports in `libroblox.so` are the reason this is tracked

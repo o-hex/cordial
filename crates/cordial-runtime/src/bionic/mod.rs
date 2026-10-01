@@ -55,6 +55,11 @@ pub fn function_overrides() -> Vec<(&'static str, *mut c_void)> {
         f!("android_get_device_api_level", android_get_device_api_level),
         // Selector numbering differs wholesale between the two libcs.
         f!("sysconf", bionic_sysconf),
+        f!("pathconf", bionic_pathconf),
+        // Plain ctype, but the Quest build's platform loader is the first thing
+        // to import it, and as a Generic libc symbol it resolved only under
+        // `--host-libc`. Implemented rather than forwarded; see the function.
+        f!("isxdigit", bionic_isxdigit),
         // The legacy `__sF` streams. Zeroed storage below stops the load-time
         // failure; these make a write through `&__sF[k]` reach the host's real
         // stream instead of faulting on a zeroed FILE. Three separate engine
@@ -196,6 +201,13 @@ const LEGACY_FILE_SIZE: usize = 152;
 /// process: the function prologue and epilogue compare against the same word.
 /// Low byte zero is the usual convention — it terminates string copies.
 static STACK_CHK_GUARD: usize = 0x0011_2233_4455_6600usize.to_le();
+
+/// The canary's value. An arm64 guest reads it from TLS slot 5 as well as
+/// through the `__stack_chk_guard` import, and bionic keeps the two equal;
+/// so does the translator, which is why it asks here.
+pub fn stack_chk_guard() -> u64 {
+    STACK_CHK_GUARD as u64
+}
 
 extern "C" {
     fn __errno_location() -> *mut c_int;
@@ -533,6 +545,107 @@ extern "C" fn bionic_sysconf(name: c_int) -> i64 {
 
     eprintln!("[bionic] sysconf({name}) is not a selector bionic defines; returning -1");
     -1
+}
+
+// --------------------------------------------------------------------- pathconf
+
+extern "C" {
+    #[link_name = "pathconf"]
+    fn host_pathconf(path: *const c_char, name: c_int) -> i64;
+}
+
+/// `(bionic _PC_* value, glibc value)`. The same problem as `sysconf` on a
+/// smaller scale: bionic numbers its twenty selectors in its own order,
+/// starting with `_PC_FILESIZEBITS` at 0, while glibc starts with
+/// `_PC_LINK_MAX` and puts `_PC_FILESIZEBITS` at 13. Not one of the twenty
+/// agrees, so forwarding untranslated would answer `_PC_NAME_MAX` when asked
+/// for `_PC_PATH_MAX`. Bionic's values are from
+/// `third_party/mcpelauncher-linker/bionic/libc/include/unistd.h`, glibc's from
+/// `bits/confname.h`; bionic has no `_PC_SOCK_MAXBUF`, so glibc's 12 is never a
+/// target.
+const PATHCONF_MAP: &[(c_int, c_int)] = &[
+    (0, 13),  // _PC_FILESIZEBITS
+    (1, 0),   // _PC_LINK_MAX
+    (2, 1),   // _PC_MAX_CANON
+    (3, 2),   // _PC_MAX_INPUT
+    (4, 3),   // _PC_NAME_MAX
+    (5, 4),   // _PC_PATH_MAX
+    (6, 5),   // _PC_PIPE_BUF
+    (7, 20),  // _PC_2_SYMLINKS
+    (8, 18),  // _PC_ALLOC_SIZE_MIN
+    (9, 14),  // _PC_REC_INCR_XFER_SIZE
+    (10, 15), // _PC_REC_MAX_XFER_SIZE
+    (11, 16), // _PC_REC_MIN_XFER_SIZE
+    (12, 17), // _PC_REC_XFER_ALIGN
+    (13, 19), // _PC_SYMLINK_MAX
+    (14, 6),  // _PC_CHOWN_RESTRICTED
+    (15, 7),  // _PC_NO_TRUNC
+    (16, 8),  // _PC_VDISABLE
+    (17, 10), // _PC_ASYNC_IO
+    (18, 11), // _PC_PRIO_IO
+    (19, 9),  // _PC_SYNC_IO
+];
+
+/// bionic's `pathconf`, translated.
+///
+/// The Quest build's OpenXR loader imports it and nothing else here did, so
+/// until now it was unresolvable without `--host-libc` -- and with it, the host
+/// would have been handed bionic's selector numbers and answered a different
+/// question without complaint. The path is passed through untouched: a caller
+/// asking about `/system` would want `system_paths.cpp`'s redirection, but
+/// nothing has been seen to, and redirecting on a guess is worse than not.
+extern "C" fn bionic_pathconf(path: *const c_char, name: c_int) -> i64 {
+    match PATHCONF_MAP.iter().find(|(bionic, _)| *bionic == name) {
+        // SAFETY: `path` is the caller's C string, forwarded as-is to the host
+        // function with the same signature; `glibc` is a valid selector.
+        Some(&(_, glibc)) => unsafe { host_pathconf(path, glibc) },
+        None => {
+            // What bionic itself does for a selector it does not know.
+            // SAFETY: glibc's per-thread errno slot.
+            unsafe { *__errno_location() = 22 }; // EINVAL
+            -1
+        }
+    }
+}
+
+/// bionic's `isxdigit`. The ASCII answer, which is bionic's whatever the
+/// locale; glibc's reads the current locale's table, and nothing is gained by
+/// letting the host's locale decide what a hex digit is for the guest.
+extern "C" fn bionic_isxdigit(c: c_int) -> c_int {
+    u8::try_from(c).is_ok_and(|b| b.is_ascii_hexdigit()) as c_int
+}
+
+#[cfg(test)]
+mod pathconf_tests {
+    use super::*;
+
+    #[test]
+    fn bionic_path_max_is_the_hosts_path_max_not_its_name_max() {
+        // 5 is bionic's _PC_PATH_MAX and glibc's _PC_PIPE_BUF; 4096 against
+        // 255 is the difference the table exists for.
+        let root = c"/".as_ptr();
+        // SAFETY: a literal path and glibc's own selectors.
+        let (path_max, name_max) = unsafe { (host_pathconf(root, 4), host_pathconf(root, 3)) };
+        assert_eq!(bionic_pathconf(root, 5), path_max);
+        assert_eq!(bionic_pathconf(root, 4), name_max);
+        assert_ne!(path_max, name_max);
+    }
+
+    #[test]
+    fn an_unknown_selector_fails_with_einval() {
+        assert_eq!(bionic_pathconf(c"/".as_ptr(), 99), -1);
+        // SAFETY: this thread's errno slot.
+        assert_eq!(unsafe { *__errno_location() }, 22);
+    }
+
+    #[test]
+    fn isxdigit_is_ascii_only() {
+        for (c, want) in [(b'0', 1), (b'9', 1), (b'a', 1), (b'F', 1), (b'g', 0), (b' ', 0)] {
+            assert_eq!(bionic_isxdigit(c as c_int), want, "{:?}", c as char);
+        }
+        assert_eq!(bionic_isxdigit(-1), 0);
+        assert_eq!(bionic_isxdigit(0x1_30), 0);
+    }
 }
 
 // ----------------------------------------------------------------------- liblog

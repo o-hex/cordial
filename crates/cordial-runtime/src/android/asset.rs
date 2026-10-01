@@ -1338,6 +1338,106 @@ extern "C" fn asset_open_file_descriptor(
     fd
 }
 
+// ------------------------------------------------------------- directories
+//
+// The Quest build's OpenXR loader imports `AAssetManager_openDir` and its two
+// companions. The bionic linker binds every import when a library loads,
+// functions as much as data, and the loader is in `libroblox.so`'s
+// `DT_NEEDED`, so without these the engine did not load at all. The phone
+// build never imported them.
+
+/// An open `AAssetDir`: the file names directly inside one asset directory, and
+/// how far through them the caller has read.
+///
+/// `CString`s held here so that the pointer `AAssetDir_getNextFileName` returns
+/// stays valid until the next call or `close`, which is the NDK's promise.
+struct AssetDir {
+    names: Vec<std::ffi::CString>,
+    next: usize,
+}
+
+/// The file names directly inside `assets/<dir>/`, sorted.
+///
+/// Files only, and only one level: Android's `AAssetDir_getNextFileName` is
+/// documented to skip subdirectories, and a zip has no directory entries it
+/// can be relied on to carry anyway, so a subdirectory shows up here only as a
+/// name with a further `/` in it and is dropped. Sorted because Android's
+/// `AssetDir` is a sorted vector; nothing is known to depend on the order, but
+/// a listing that changed order between two APKs with the same contents would
+/// be one more thing to rule out.
+///
+/// `dir` is taken with or without surrounding slashes, and the empty string is
+/// the root of `assets/`. Overlays are not consulted: they replace files the APK
+/// already has and are not known to add any, so the APK's index is the listing.
+fn list_dir<'a>(entries: impl Iterator<Item = &'a str>, dir: &str) -> Vec<String> {
+    let dir = dir.trim_matches('/');
+    let prefix = if dir.is_empty() {
+        "assets/".to_string()
+    } else {
+        format!("assets/{dir}/")
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.strip_prefix(&prefix))
+        .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+extern "C" fn asset_manager_open_dir(_mgr: *mut c_void, dir_name: *const c_char) -> *mut c_void {
+    let Some(manager) = MANAGER.get() else {
+        eprintln!("[asset] openDir before an APK was set — pass --apk");
+        return std::ptr::null_mut();
+    };
+    // SAFETY: the API contract is a NUL-terminated path.
+    let Some(dir) = (unsafe { cstr(dir_name) }) else {
+        return std::ptr::null_mut();
+    };
+    // NULL is the documented failure value, and an unreadable APK is a
+    // failure; an empty listing would claim the directory is merely empty.
+    let Some(zip) = manager.archive() else {
+        return std::ptr::null_mut();
+    };
+    // A directory the APK does not have is an empty listing rather than NULL,
+    // which is what Android's AssetManager gives for one too (INFERRED from its
+    // `openDir` merging whatever it finds across asset paths, not measured on a
+    // device).
+    let names: Vec<std::ffi::CString> = list_dir(zip.file_names(), &dir)
+        .into_iter()
+        .filter_map(|n| std::ffi::CString::new(n).ok())
+        .collect();
+    if trace_assets_enabled() {
+        eprintln!("[asset] openDir: {dir:?} -> {} files", names.len());
+    }
+    Box::into_raw(Box::new(AssetDir { names, next: 0 })) as *mut c_void
+}
+
+extern "C" fn asset_dir_get_next_file_name(dir: *mut c_void) -> *const c_char {
+    if dir.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: `dir` came from asset_manager_open_dir and has not been closed.
+    let d = unsafe { &mut *(dir as *mut AssetDir) };
+    match d.names.get(d.next) {
+        Some(name) => {
+            d.next += 1;
+            name.as_ptr()
+        }
+        None => std::ptr::null(),
+    }
+}
+
+extern "C" fn asset_dir_close(dir: *mut c_void) {
+    if dir.is_null() {
+        return;
+    }
+    // SAFETY: `dir` came from Box::into_raw in asset_manager_open_dir and is
+    // closed exactly once, per the API contract.
+    drop(unsafe { Box::from_raw(dir as *mut AssetDir) });
+}
+
 /// Everything this module provides, for the symbol table.
 pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
     macro_rules! f {
@@ -1352,6 +1452,9 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
         f!("AAsset_getLength", asset_get_length),
         f!("AAsset_close", asset_close),
         f!("AAsset_openFileDescriptor", asset_open_file_descriptor),
+        f!("AAssetManager_openDir", asset_manager_open_dir),
+        f!("AAssetDir_getNextFileName", asset_dir_get_next_file_name),
+        f!("AAssetDir_close", asset_dir_close),
     ]
 }
 
@@ -1443,6 +1546,50 @@ mod overlay_tests {
         let path = dir.join(name);
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    #[test]
+    fn a_directory_listing_is_its_files_only_one_level_deep() {
+        let apk = apk_with(&[
+            ("assets/openxr/1/manifest.json", b"{}"),
+            ("assets/openxr/1/deeper/skip.json", b"{}"),
+            ("assets/openxr/other.json", b"{}"),
+            ("assets/root.txt", b"x"),
+            ("lib/arm64-v8a/libroblox.so", b"not an asset"),
+        ]);
+        let zip = archive_of(&apk);
+        assert_eq!(list_dir(zip.file_names(), "openxr/1"), ["manifest.json"]);
+        // Surrounding slashes are the caller's business, not a different dir.
+        assert_eq!(list_dir(zip.file_names(), "/openxr/1/"), ["manifest.json"]);
+        // `deeper/` is a subdirectory and `1/` is one too; neither is a file.
+        assert_eq!(list_dir(zip.file_names(), "openxr"), ["other.json"]);
+        assert_eq!(list_dir(zip.file_names(), ""), ["root.txt"]);
+        assert!(list_dir(zip.file_names(), "absent").is_empty());
+    }
+
+    #[test]
+    fn get_next_file_name_walks_the_listing_once_then_answers_null() {
+        let names = ["a.json", "b.json"]
+            .iter()
+            .map(|n| std::ffi::CString::new(*n).unwrap())
+            .collect();
+        let dir = Box::into_raw(Box::new(AssetDir { names, next: 0 })) as *mut c_void;
+        let mut seen = Vec::new();
+        loop {
+            let p = asset_dir_get_next_file_name(dir);
+            if p.is_null() {
+                break;
+            }
+            // SAFETY: a pointer into the listing, which is still open.
+            seen.push(unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_string());
+        }
+        assert_eq!(seen, ["a.json", "b.json"]);
+        // Exhausted stays exhausted rather than wrapping round.
+        assert!(asset_dir_get_next_file_name(dir).is_null());
+        asset_dir_close(dir);
+        // A null handle is refused rather than dereferenced.
+        assert!(asset_dir_get_next_file_name(std::ptr::null_mut()).is_null());
+        asset_dir_close(std::ptr::null_mut());
     }
 
     #[test]

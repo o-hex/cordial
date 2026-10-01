@@ -385,6 +385,14 @@ struct Stream {
     uint64_t trace_cycles = 0;
     uint64_t trace_frames = 0;
     float trace_peak = 0.0f;
+    // Output only. Frames with any non-zero sample, over the stream's life,
+    // and the slowest engine callback since the last line: the first is what
+    // tells sound from a punctual river of zeroes across a whole run rather
+    // than one second of it, and the second is the only view this side has of
+    // how close the engine came to PipeWire's deadline -- which matters most
+    // when the callback is arm64 code under the translator (guest_audio.rs).
+    uint64_t trace_nonsilent = 0;
+    int64_t trace_slowest_ns = 0;
     std::chrono::steady_clock::time_point trace_last{};
 };
 
@@ -443,21 +451,35 @@ bool trace_audio_enabled() {
 /// perfectly punctual river of zeroes, which is exactly what a bridge that
 /// negotiated the wrong format or handed the engine the wrong frame count
 /// would produce. A peak is the cheapest reading that tells those apart.
+///
+/// `nonsilent`, when given, receives the number of frames with any non-zero
+/// sample in them.
 float buffer_peak(const void* data, uint32_t frames, uint32_t channels, uint32_t bits,
-                  bool is_float) {
+                  bool is_float, uint32_t* nonsilent = nullptr) {
     const size_t samples = static_cast<size_t>(frames) * channels;
     float peak = 0.0f;
+    uint32_t loud = 0;
+    bool frame_loud = false;
+    auto sample = [&](size_t i, bool nonzero) {
+        frame_loud |= nonzero;
+        if (channels == 0 || (i + 1) % channels == 0) {
+            loud += frame_loud ? 1 : 0;
+            frame_loud = false;
+        }
+    };
     if (is_float && bits == 32) {
         const auto* p = static_cast<const float*>(data);
         for (size_t i = 0; i < samples; ++i) {
             float v = p[i] < 0.0f ? -p[i] : p[i];
             if (v > peak) peak = v;
+            sample(i, v != 0.0f);
         }
     } else if (!is_float && bits == 16) {
         const auto* p = static_cast<const int16_t*>(data);
         for (size_t i = 0; i < samples; ++i) {
             int v = p[i] < 0 ? -static_cast<int>(p[i]) : p[i];
             if (static_cast<float>(v) > peak) peak = static_cast<float>(v);
+            sample(i, v != 0);
         }
         peak /= 32768.0f;
     } else if (!is_float && bits == 32) {
@@ -466,9 +488,11 @@ float buffer_peak(const void* data, uint32_t frames, uint32_t channels, uint32_t
             int64_t v = p[i] < 0 ? -static_cast<int64_t>(p[i]) : p[i];
             float f = static_cast<float>(v);
             if (f > peak) peak = f;
+            sample(i, v != 0);
         }
         peak /= 2147483648.0f;
     }
+    if (nonsilent) *nonsilent = loud;
     return peak;
 }
 
@@ -486,24 +510,42 @@ bool fill_from_engine(void* dst, uint32_t frames, void* user) {
                              std::memory_order_relaxed);
     auto cb = s->data_callback;
     if (!cb) return false;
+    const bool trace = trace_audio_enabled();
+    const auto started = trace ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
     const bool cont = cb(reinterpret_cast<AAudioStream*>(s), s->data_user, dst,
                           static_cast<int32_t>(frames)) == AAUDIO_CALLBACK_RESULT_CONTINUE;
 
-    if (trace_audio_enabled()) {
+    if (trace) {
+        auto now = std::chrono::steady_clock::now();
+        const int64_t took =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - started).count();
+        if (took > s->trace_slowest_ns) s->trace_slowest_ns = took;
         ++s->trace_cycles;
         s->trace_frames += frames;
+        uint32_t loud = 0;
         float peak = buffer_peak(dst, frames, s->pw->channels(), s->pw->sample_bits(),
-                                  s->pw->sample_is_float());
+                                  s->pw->sample_is_float(), &loud);
+        s->trace_nonsilent += loud;
         if (peak > s->trace_peak) s->trace_peak = peak;
-        auto now = std::chrono::steady_clock::now();
         if (now - s->trace_last >= std::chrono::seconds(1)) {
             s->trace_last = now;
+            // The counts are the stream's totals; the peak and the slowest
+            // callback are this second's. This line used to say all of it
+            // was "since the last line", which was true of the peak only.
             std::fprintf(stderr,
-                "D/Cordial-AAudio          audio trace: %llu callback(s), %llu frame(s), peak "
-                "%.4f of full scale since the last line\n",
+                "D/Cordial-AAudio          audio trace: %llu callback(s), %llu frame(s), "
+                "%llu non-silent, %llu silence-filled cycle(s) in total; peak %.4f of full "
+                "scale, slowest callback %.2f ms (a %u-frame burst is %.2f ms) since the "
+                "last line\n",
                 static_cast<unsigned long long>(s->trace_cycles),
-                static_cast<unsigned long long>(s->trace_frames), s->trace_peak);
+                static_cast<unsigned long long>(s->trace_frames),
+                static_cast<unsigned long long>(s->trace_nonsilent),
+                static_cast<unsigned long long>(s->pw->silence_cycles()), s->trace_peak,
+                static_cast<double>(s->trace_slowest_ns) / 1e6, s->pw->burst_frames(),
+                s->pw->rate_hz() ? 1000.0 * s->pw->burst_frames() / s->pw->rate_hz() : 0.0);
             s->trace_peak = 0.0f;
+            s->trace_slowest_ns = 0;
         }
     }
     return cont;

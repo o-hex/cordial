@@ -348,7 +348,7 @@ fn load_base(explicit: Option<&str>) -> (Option<String>, Source) {
 const CORDIAL_KEY_PREFIX: &str = "Cordial";
 
 /// Whether a resolved key is Roblox's to receive.
-fn is_roblox_flag(key: &str) -> bool {
+pub(crate) fn is_roblox_flag(key: &str) -> bool {
     !key.starts_with(CORDIAL_KEY_PREFIX)
 }
 
@@ -415,41 +415,29 @@ fn is_roblox_flag(key: &str) -> bool {
 /// same moment -- and B logged some fifty times as much after it. Both were
 /// repeated and reproduced to the line, bucket for bucket.
 ///
-/// Two things this does **not** establish. The probe is a `DFLog*` flag, and
-/// whether `FFlag`/`FInt`/`FString` -- the durable family -- also update on a
-/// second call is untested; the startup path reads them once, and a re-call
-/// may or may not be the same path. And it changes nothing about the reverting
-/// above: a `DF*` key Roblox's own document contains still goes back to
-/// Roblox's value at the next fetch, whenever it was set. So "apply dynamic
-/// flags to the running client" remains the wrong shape for a feature even
-/// though the mechanism works -- the family that survives a run is the static
-/// one, and the family that can be pushed live is the one that gets reverted.
+/// Two things this did **not** establish when it was written, and one of them
+/// has since been answered. The probe is a `DFLog*` flag, and whether
+/// `FFlag`/`FInt`/`FString` -- the durable family -- also update on a second
+/// call is untested. And a `DF*` key Roblox's own document contains still goes
+/// back to Roblox's value at the next fetch, whenever it was set; that is the
+/// reverting above, and what to do about it is no longer open:
+/// [`crate::flag_reapply`] hands the engine the document again right after each
+/// refresh, so a `DF*` override holds for the whole run (ADR-051).
 ///
-/// `CORDIAL_EXPERIMENT_RESETTLE_MS` in `bin/load.rs` is the hook this was run
-/// with. It is deliberately not wired to anything a user can press.
+/// `CORDIAL_EXPERIMENT_RESETTLE_MS` in `bin/load.rs` is the hook the
+/// second-call measurement was run with. It is deliberately not wired to
+/// anything a user can press.
 ///
-/// **Not established:** whether the reloader merges or replaces, and whether a
-/// later fetch (one was seen at 120.1 s) reverts an override a second time
-/// after something else had changed it. Neither was tested.
+/// **Established since:** a later fetch does revert an override a second time --
+/// the engine's log shows the reloader finishing at about 120, 241 and 362
+/// seconds, signed in or out. Whether the reloader merges or replaces is still
+/// not known, and nothing here depends on it.
 fn apply_overrides(doc: String) -> String {
     let resolved = crate::flags::resolve(crate::flags::collect());
     if resolved.is_empty() {
         return doc;
     }
-    // Cordial's own keys ride the flag layering for its precedence and
-    // provenance, and are not Roblox flags — `CordialGraphicsBackend` asks
-    // Cordial whether to offer the engine a Vulkan loader, which is a question
-    // the engine has no idea it is being asked. Handing them over would put
-    // invented names in Roblox's settings document; the engine ignores what it
-    // does not know, but a flag it silently ignores is exactly the thing this
-    // project keeps mistaking for a flag that works.
-    let overrides: serde_json::Map<String, serde_json::Value> = resolved
-        .iter()
-        .filter(|(k, _)| is_roblox_flag(k))
-        .map(|(k, r)| (k.clone(), serde_json::Value::String(r.value.clone())))
-        .collect();
-
-    match merge(&doc, overrides) {
+    match merge(&doc, roblox_overrides(&resolved)) {
         Ok((merged, _)) => {
             crate::flags::report(&resolved);
             merged
@@ -459,6 +447,76 @@ fn apply_overrides(doc: String) -> String {
             doc
         }
     }
+}
+
+/// The resolved flags that are Roblox's to receive.
+///
+/// Cordial's own keys ride the flag layering for its precedence and
+/// provenance, and are not Roblox flags -- `CordialGraphicsBackend` asks
+/// Cordial whether to offer the engine a Vulkan loader, which is a question the
+/// engine has no idea it is being asked. Handing them over would put invented
+/// names in Roblox's settings document; the engine ignores what it does not
+/// know, but a flag it silently ignores is exactly the thing this project keeps
+/// mistaking for a flag that works.
+fn roblox_overrides(
+    resolved: &std::collections::BTreeMap<String, crate::flags::Resolved>,
+) -> serde_json::Map<String, serde_json::Value> {
+    resolved
+        .iter()
+        .filter(|(k, _)| is_roblox_flag(k))
+        .map(|(k, r)| (k.clone(), serde_json::Value::String(r.value.clone())))
+        .collect()
+}
+
+/// A settings document built to be handed to the engine a second time, and what
+/// building it cost. See [`crate::flag_reapply`] for why anything does.
+pub struct Reapply {
+    pub body: String,
+    /// How many Roblox flags were merged over the base document.
+    pub overrides: usize,
+    /// Where the base document came from.
+    pub source: Source,
+    /// Reading the base document (a cache read unless it had gone stale).
+    pub load: Duration,
+    /// Resolving the layers, parsing the document, merging and serialising it.
+    pub merge: Duration,
+}
+
+/// The document to re-apply: the base document with the profile's current
+/// overrides merged over it, read afresh so an edit made while the client runs
+/// is what gets kept.
+///
+/// `Ok(None)` is "nothing to keep", returned when no layer above Cordial's own
+/// built-in default contributes a Roblox flag -- unless `force`, which is for a
+/// caller that has just *changed* what is wanted (a live setting going back to
+/// the default), where handing the engine the document with nothing merged is
+/// the point.
+///
+/// Deliberately not [`load_reporting`]: that also writes the settings history
+/// and prints a launch banner, and neither belongs on a path that runs every
+/// couple of minutes. The base is the cached document, not the engine's latest
+/// fetch -- that one is not reachable without touching the engine -- so a key
+/// Roblox changed since this process started goes back to the older value for
+/// as long as the re-apply holds, which is the same trade the launch makes.
+pub fn reapply_document(force: bool) -> Result<Option<Reapply>, String> {
+    // Resolved before anything is read, so a profile with nothing to keep costs
+    // a few small file reads and not a 1.3 MB document.
+    let t0 = std::time::Instant::now();
+    let resolved = crate::flags::resolve(crate::flags::collect());
+    if !force && !crate::flag_reapply::needs_reapply(&resolved) {
+        return Ok(None);
+    }
+    let resolve_time = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let (base, source) = load_base(None);
+    let load = t1.elapsed();
+    let base = base.ok_or_else(|| match &source {
+        Source::Nothing(why) => format!("no base document: {why}"),
+        other => format!("no base document ({other})"),
+    })?;
+    let t2 = std::time::Instant::now();
+    let (body, overrides) = merge(&base, roblox_overrides(&resolved)).map_err(str::to_string)?;
+    Ok(Some(Reapply { body, overrides, source, load, merge: resolve_time + t2.elapsed() }))
 }
 
 /// Merge overrides into `applicationSettings`, returning the document and how

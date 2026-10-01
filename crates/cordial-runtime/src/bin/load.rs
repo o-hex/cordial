@@ -853,9 +853,11 @@ extern "C" fn run_bootstrap() {
         // Roblox's own reloader lands at 1.6-2.3 s and reapplies Roblox's
         // document over the top, so a `DF*` key Roblox ships is reverted
         // within seconds however it was set, while `FFlag`/`FInt`/`FString`
-        // are read once at startup and are *not* reverted. Whichever way this
-        // experiment comes out, "dynamic flags apply live" is the wrong shape:
-        // the dynamic family is the one that does not stick.
+        // are read once at startup and are *not* reverted. The experiment
+        // answered the first question (a second document is taken). The shape
+        // worry has since been answered too: `flag_reapply` below hands the
+        // document over again after each of the engine's own refreshes, so the
+        // dynamic family sticks (ADR-051). This hook stays as the one-shot probe.
         //
         // Off by default and deliberately not wired to anything a user can
         // press. Shipping an inference as a default is a mistake this file has
@@ -894,87 +896,34 @@ extern "C" fn run_bootstrap() {
             });
         }
 
-        // `CORDIAL_REASSERT_FLAGS_MS=<ms>` -- the actual fix for the flag
-        // reset a user reported: "DFIntTaskSchedulerTargetFps keeps resetting
-        // to 60". Unlike the one-shot experiment above, this loops for the
-        // life of the process rather than firing once.
+        // Keep the profile's flag overrides in force after the engine's own
+        // settings refresh (ADR-051). The engine refetches Roblox's document
+        // about every two minutes and applies it over the top, which puts every
+        // `DF*` override back to Roblox's value; `flag_reapply` hands the
+        // engine the document again, with the overrides merged, once the
+        // engine's log says the refresh has finished. Started here, after the
+        // launch call above has been answered, because that call is the first
+        // apply and the worker's timing runs from it.
         //
-        // **The cause, established rather than assumed.**
-        // `client_settings.rs`'s `apply_overrides` doc comment and
-        // `docs/analysis/flag-init.md` §47/§49 both measure it: the engine's
-        // own `DynamicFastVariableReloader` fetches Roblox's settings document
-        // at t≈1.6-2.3 s and again near t≈120 s and *reapplies it*, which
-        // reverts a `DF*` override -- `DFIntTaskSchedulerTargetFps` among
-        // them -- for any key that document contains. `FIntTaskSchedulerTargetFps`,
-        // the same name in the durable family that is read once and never
-        // reverted, was tried as an escape (§49) and measured to do nothing on
-        // this build, so there is no route to this flag that avoids the
-        // reloader.
-        //
-        // **The fix is to out-run the reloader rather than to stop it.**
-        // Stopping it would mean reaching into the engine's own settings
-        // service, which ADR-001 rules out. Re-calling
-        // `nativeInitClientSettings` does not: it is the identical JNI entry
-        // point the engine itself exports and the identical call this
-        // function already makes once, above, on a schedule Cordial controls
-        // rather than the engine's own. `client_settings.rs` established that
-        // a second call answers `0` and the new values take effect (measured
-        // 2026-09-01); `flag-init.md`'s three-arm HTTP-trace experiment (A: no
-        // re-call, ~330 lines/10s after the trigger; B: a re-call, ~330 lines
-        // sustained; C: no re-call, ~6 lines) is the same finding with a
-        // number attached. Neither experiment looped it, so a *repeating*
-        // re-call closing the window between reloads rather than one sampled
-        // point is this file's own extension of a mechanism already shown to
-        // work, not a re-derivation of one still in doubt.
-        //
-        // Off unless a cap has been chosen: `cordial-shell`'s Frame rate limit
-        // row sets this whenever it is not "display refresh" (`launch.rs`), so
-        // the reassertion loop only runs for someone who asked this project to
-        // hold a flag at a value that is not the engine's own default -- the
-        // one case where a silent reset back to 60 would otherwise be
-        // indistinguishable from the setting never having done anything.
-        //
-        // **Not verified in-game today.** NO signed-in launches are available
-        // this session (the test account hit its daily cap), so this has been
-        // exercised only against the signed-out landing UI, where
-        // `DFIntTaskSchedulerTargetFps` reasserting on schedule was observed
-        // in the log but its effect on the actual present rate over a
-        // multi-minute session, past the ~120 s reload this loop exists to
-        // survive, is INFERRED from the mechanism above rather than measured
-        // end to end.
-        if let Some(ms) = std::env::var("CORDIAL_REASSERT_FLAGS_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|ms| *ms > 0)
+        // The call is made from the worker's own thread, as the resettle
+        // experiment above makes it from its thread; neither is the pump.
+        // `CORDIAL_NO_FLAG_REDELIVERY=1` withdraws it, which is the control a
+        // measurement needs.
         {
-            // Already a plain `usize` on `plan` for the same reason the
-            // experiment above captures it that way before crossing into its
-            // own thread: a raw pointer is not `Send`, and this integer names
-            // a symbol in a library that stays loaded and at this address for
-            // the life of the process.
             let native = plan.settings_native;
-            std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-                // Re-read from disk every time, the same as the one-shot
-                // experiment: `load` runs `flags::collect()` afresh, which is
-                // what lets `frame_rate_limit()` (or a plugin's own flags.json)
-                // pick up a change made while the client is open, and is also
-                // simply the current, correct set of overrides to keep
-                // asserting.
-                let settings = cordial_runtime::client_settings::load(None).unwrap_or_default();
-                // SAFETY: `native as *mut std::ffi::c_void` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
-                match unsafe { linker::game_activity::init_client_settings(
-                    native as *mut std::ffi::c_void,
-                    &settings,
-                    "",
-                    "",
-                ) } {
-                    Ok(code) => println!(
-                        "  [reassert] nativeInitClientSettings -> {code} ({} bytes, every {ms} ms)",
-                        settings.len()
-                    ),
-                    Err(e) => println!("  [reassert] nativeInitClientSettings failed: {e}"),
-                }
+            cordial_runtime::flag_reapply::start(cordial_runtime::flag_reapply::Hooks {
+                call: Box::new(move |settings| {
+                    // SAFETY: `native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                    unsafe {
+                        linker::game_activity::init_client_settings(
+                            native as *mut std::ffi::c_void,
+                            settings,
+                            "",
+                            "",
+                        )
+                    }
+                }),
+                document: Box::new(cordial_runtime::client_settings::reapply_document),
             });
         }
     }

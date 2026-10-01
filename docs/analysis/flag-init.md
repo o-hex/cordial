@@ -5465,6 +5465,21 @@ The engine asks for **`GoogleAndroidApp`**. `client_settings.rs` asks for
 **`AndroidApp`**. Nobody has diffed the two documents. Cordial may be merging
 overrides into a different settings set from the one the engine reloads.
 
+### Addendum 2026-10-01: the reload is observable, and a re-call undoes it
+
+The reloader writes its end to the engine log (`DynamicFastVariableReloader
+finished flag fetch`), at 120.1-121.5 s in every log that ran that long, signed
+in or out, and again at about 241 and 362 s. Handing the engine its document
+again right after (`nativeInitClientSettings`, a second call) keeps a `DF*`
+override in force: `DFIntTaskSchedulerTargetFps=20` held 20 presents a second to
+the end of 175-195 s runs, and the same run with the re-apply withdrawn went from
+20 to about 57 a second at the 120 s refresh. See ADR-051 for the numbers. Two
+corrections to the above: a key **absent** from Roblox's document is reset at the
+refresh too (`DFIntTaskSchedulerTargetFps` is not in the document, and it
+reverted), so "pick a key Roblox does not ship" does not survive a refresh; and a
+second call that merely *stops carrying* a key does not unset it, only the next
+refresh does.
+
 ## §48: the flag inventory was three orders of magnitude short, and delivery is unverified
 
 `docs/traces/native-flag-names.txt` holds 139 names, and a search across it for

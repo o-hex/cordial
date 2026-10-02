@@ -1,0 +1,98 @@
+---
+title: "Asset overrides"
+description: "Replace Roblox's built-in textures, fonts and interface images without modifying any files."
+icon: "image"
+---
+
+Roblox's app carries its own textures, fonts and interface images. An **asset
+override** is a file of yours that Cordial serves in place of one of them: a
+different cursor, a font you can read more easily, a recoloured button.
+
+Cordial never edits Roblox's files. When the game asks for one of its
+built-in assets, Cordial checks your overrides first and hands over your file
+if there is one. Delete your file and the original comes back, with nothing to
+repair.
+
+<Note>
+Overrides replace files that ship inside the app. They cannot change assets a
+game downloads from Roblox's servers, such as a game's own maps, models or
+decals.
+</Note>
+
+## Adding an override
+
+<Steps>
+  <Step title="Find the file you want to replace">
+    Overrides mirror the folder layout of the `assets/` directory inside
+    Roblox's Android app. For example, the mouse cursor is
+    `content/textures/Cursors/KeyboardMouse/ArrowCursor.png`, and the fonts
+    are under `content/fonts/`.
+  </Step>
+  <Step title="Put your file at the same path in the override folder">
+    <Tabs>
+      <Tab title="Flatpak">
+        `~/.var/app/io.github.luohoa97.Cordial/config/cordial/overlay/`
+      </Tab>
+      <Tab title="Other installs">
+        `~/.config/cordial/overlay/`
+      </Tab>
+    </Tabs>
+    So a replacement cursor goes at
+    `~/.config/cordial/overlay/content/textures/Cursors/KeyboardMouse/ArrowCursor.png`.
+    Keep the original file name and format.
+  </Step>
+  <Step title="Start Roblox again">
+    Cordial reads the overrides at launch. A change made while the game is
+    running applies the next time you start it.
+  </Step>
+</Steps>
+
+This folder applies to every profile. Set `CORDIAL_OVERLAY` to use a different
+folder.
+
+## Sharing overrides as a plugin
+
+A plugin can carry an `overlay/` folder laid out the same way. That is the way
+to share a texture or font pack: it needs no code, so it installs from
+**Settings → Plugins → Install from a file** without asking for any
+permissions, and it can be switched on and off per profile like any other
+plugin.
+
+```text
+my-cursor-pack/
+├── plugin.json
+└── overlay/
+    └── content/textures/Cursors/KeyboardMouse/ArrowCursor.png
+```
+
+```json plugin.json
+{
+  "id": "my-cursor-pack",
+  "name": "My cursor pack",
+  "version": "1.0.0",
+  "capabilities": []
+}
+```
+
+If two sources replace the same file, your own override folder wins over every
+plugin.
+
+## Bloxstrap mods
+
+Bloxstrap's mods are made for the Windows client, whose files are laid out
+differently. Cursor and font mods carry over unchanged. A file whose path does
+not exist in the Android app is simply never asked for, so a mod that has no
+effect usually means its files do not match a path inside the Android app's
+`assets/` folder.
+
+## Limits
+
+- **Only the app's built-in assets.** Overrides cover files under `assets/`
+  in the Android app, and nothing else.
+- **Applied at launch.** Changing an override, or switching an override plugin
+  on or off, takes effect at the next start.
+- **Your responsibility.** Cordial does not check what a replacement changes.
+  Swapping something that affects gameplay rather than looks is on you, and
+  Roblox's rules apply to it as they would to anything else.
+- **Nothing is drawn over the game.** Overrides replace files; Cordial does not
+  inject an overlay into the game's picture.

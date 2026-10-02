@@ -46,7 +46,7 @@ inside it, and the picker will not take it.
 If you are writing a plugin rather than installing one, skip the archive: put
 the folder straight into `~/.local/share/cordial/plugins/<plugin-id>/` so that
 its `plugin.json` is at `…/<plugin-id>/plugin.json`. Under Flatpak that path is
-`~/.var/app/io.github.luohoa97.Cordial/data/plugins/` instead, since that is
+`~/.var/app/io.github.luohoa97.Cordial/data/cordial/plugins/` instead, since that is
 where the sandbox keeps its data.
 
 **Or load the folder where it is.** Settings → Plugins → Developing a plugin →

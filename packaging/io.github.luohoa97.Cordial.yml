@@ -1,7 +1,7 @@
 # Flatpak manifest for Cordial.
 #
 # Flatpak is the primary distribution target (spec §11), which is why the plugin
-# directory is `~/.var/app/io.github.luohoa97.Cordial/data/plugins/` and drag-and-drop
+# directory is `~/.var/app/io.github.luohoa97.Cordial/data/cordial/plugins/` and drag-and-drop
 # is the install path rather than a convenience.
 #
 # Build:

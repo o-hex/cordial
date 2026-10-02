@@ -174,3 +174,30 @@ If plugin settings ever needed to be shared deliberately between profiles — a
 theme a user wants everywhere — that wants an explicit copy or an export, not a
 second global location. The moment there are two places a setting can live, the
 question "which one am I editing?" has no answer a user can check.
+
+## Notes moved from docs/plugin-api.md (2026-10-02)
+
+### Why grants moved into the profile, and the old global file
+
+Plugin *code* is installed once for the machine; what a plugin is allowed to do
+belongs to the account. Approving something in a profile you made to try it out
+does not approve it in the profile you actually play on, and that is a security
+property rather than tidiness. Grants used to live at
+`~/.config/cordial/plugin-grants.json` — one list, every account — which meant an
+approval given in a throwaway profile silently held against the account with the
+purchases and the friends list, and nothing about approving it there ever
+suggested it would apply here. ADR-003's default deny is only worth something if
+the thing being denied is the thing the user was asked about.
+
+A pre-existing global file is **moved** into whichever profile first looks for
+one — in practice `default` — and every other profile starts at default deny.
+Moved rather than copied: copying would faithfully rebuild the global allow-list
+the change exists to remove. The migration is skipped entirely if the profile
+already has its own file, so it can never widen approvals you have already made,
+and a failed move leaves the old file untouched rather than writing half a
+document.
+
+`CORDIAL_PLUGIN_GRANTS` overrides the path outright. It is global by nature — it
+makes one grants file serve every profile, which is the arrangement per-profile
+grants exist to end — so treat it as a development switch, not a supported
+configuration.

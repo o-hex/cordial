@@ -1,7 +1,7 @@
 # ADR-026: Cordial publishes what it observes, and plugins may never veto it
 
 **Status:** accepted
-**Related:** [ADR-001](ADR-001-in-process-hooking.md), [ADR-003](ADR-003-plugin-isolation.md), [ADR-006](ADR-006-plugin-events.md), [ADR-007](ADR-007-host-resources-are-brokered.md)
+**Related:** [ADR-001](ADR-001-in-process-hooking.md), [ADR-003](ADR-003-plugin-isolation.md), [ADR-006](ADR-006-plugin-events-and-first-party.md), [ADR-007](ADR-007-host-resources-are-brokered.md)
 
 ## Decision
 
@@ -126,3 +126,69 @@ is a different ADR and must not be reached by widening this one. Or evidence
 that lossy delivery is losing something that matters, which would argue for a
 deeper queue or a durable side channel for one specific family — not for making
 the client wait.
+
+## Notes moved from docs/plugin-api.md (2026-10-02)
+
+### A core event may be observed and never vetoed, delayed or altered
+
+ADR-026 states the rule; the enforcement is structural rather than a check
+somebody remembered to write.
+
+**There is no channel to answer on.** Delivery is a `Push`, and a `Push` has no
+`id`. A `Response` is only ever matched to a request by its `id`, so a plugin
+has nothing to correlate a reply to. `publish_core` returns
+`Delivered { sent, dropped }` — two counts for the publisher — and does not
+read the plugin's stdout at all. There is no return value to make meaningful,
+which is a stronger guarantee than a return value that is documented as ignored.
+
+**Nothing waits.** `publish_core` hands each recipient's event to that plugin's
+own `Pump` via `offer`, which is a `try_send` on a
+`std::sync::mpsc::sync_channel` 256 deep. `try_send` never blocks. A separate
+thread per plugin does the actual write into that plugin's stdin. So the
+publisher's cost is a queue push, and it does not track how fast — or whether —
+the plugin reads.
+
+That matters because a push is a blocking write into a pipe, 64 KiB on Linux,
+and the thread publishing a platform event is a thread the client is waiting
+on. The engine's looper is measured in millions of polls a second. A bus that
+let it queue behind a wedged plugin would be a worse bug than anything it was
+built to observe.
+
+**Cordial's own decisions are explicitly outside this rule.** Whether *Cordial*
+shows a toast or opens a URL in its web view is not the engine's behaviour and
+could sensibly be influenced one day. If that is ever built it gets its own
+name and its own ADR, so nobody reaches for it as a way to make platform events
+vetoable after all.
+
+### What happens when a subscriber is slow
+
+It misses events, and the loss is counted rather than silent.
+
+- The queue is `QUEUE_DEPTH = 256` pushes deep, per plugin.
+- A publish that finds it full **drops the event** and increments that plugin's
+  drop counter. The plugin is not told, and there is no sequence number in a
+  `Push` from which it could infer a gap.
+- `plugin_host::dropped_core_events()` returns `(id, count)` for every plugin
+  that lost something, and **the client calls it at exit**, printing
+  `  plugin <id>: <n> core event(s) dropped, its queue was full` for each. A
+  plugin that has already exited is not listed — its listener went with it — so
+  "no drops reported" is a weaker claim than it looks for a plugin that died
+  mid-run. (`Session::dropped_by_plugin()` is the same thing on the host nobody
+  runs, and has no non-test caller.)
+- `plugin_host::flush_core_events(limit)` waits, bounded, for queued pushes to
+  reach every plugin. `limit` is applied **per plugin**, not to the call as a
+  whole, so the worst case is `limit` multiplied by the number of running
+  plugins. The client calls it with 500 ms immediately after publishing
+  `client.shutdown`: delivery is asynchronous, so a publish followed by an exit
+  is a race the exit wins, and that is the one event whose whole point is being
+  last. It returns `false` if a deadline passed first, and the client then
+  prints `  plugins: a plugin did not read its queue within 500 ms; exiting
+  without it`, because a plugin that stopped reading must not be able to hold up
+  the exit.
+
+Measured, in `host.rs`'s own test: 4000 events of 4 KiB each published in about
+6 ms, 3735 of them dropped and counted, with the consumer far behind. That test
+is honest about what it does *not* prove — the fixture process exits rather
+than wedging, so what is demonstrated is that the publisher's cost does not
+track the reader's speed, not that a genuinely wedged consumer was survived.
+

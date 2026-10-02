@@ -52,7 +52,7 @@ A plugin may not declare under `cordial`: `"cordial" is reserved for Cordial's o
 
 ### Observed, never vetoed
 
-Core events are observed and cannot be vetoed, delayed or altered ([ADR-026](../adr/ADR-026-the-core-event-bus.md)). This is structural: delivery is a push with no `id`, so there is nothing to answer on, and `publish_core` never reads the plugin's stdout. Publishing is a `try_send` onto a per-plugin queue and never blocks the thread publishing a platform event.
+Core events are observed and cannot be vetoed, delayed or altered ([ADR-026](../adr/ADR-026-the-core-event-bus.md)). This is structural: delivery is a push with no `id`, so there is nothing to answer on, and `publish_core` never reads the plugin's stdout. Publishing is a `try_send` onto a per-plugin queue and never blocks the thread publishing a platform event. Why a structural absence is a stronger guarantee than an ignored return value: [ADR-026](../adr/ADR-026-the-core-event-bus.md).
 
 ### A slow subscriber misses events
 

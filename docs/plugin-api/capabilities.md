@@ -21,7 +21,7 @@ A plugin absent from the grants file gets nothing, and a capability it requested
 | `plugin-grants.json` is missing | Nothing is granted. |
 | It is malformed | Nothing is granted, and Cordial says so: `plugin grants: <path> is not usable (<error>); granting nothing`. A typo must not become a privilege escalation. |
 | It names an unknown capability, anywhere | **Nothing is granted to anybody.** The first unknown name abandons the whole document: `… (unknown capability "process.spawn" granted to "x"); granting nothing`. |
-| `plugin-enabled.json` is malformed | Every plugin is treated as enabled (`plugins: <path> is not usable (<error>); treating every plugin as enabled`), except ids in `SHIPS_DISABLED`, today `fps-flex`, which stay off. The grants file fails closed; the enablement file does not. |
+| `plugin-enabled.json` is malformed | Every plugin is treated as enabled (`plugins: <path> is not usable (<error>); treating every plugin as enabled`), except ids in `SHIPS_DISABLED`, today `fps-flex`, which stay off. The grants file fails closed; the enablement file does not. Why: [ADR-003](../adr/ADR-003-plugin-isolation.md). |
 
 There is no capability meaning "anything" and no grants entry meaning "all". The list is closed ([ADR-003](../adr/ADR-003-plugin-isolation.md)): there is no `process.spawn`, filesystem path or memory access to ask for.
 
@@ -108,7 +108,7 @@ The file is `<profile>/plugin-grants.json`:
 
 Plugin code is installed once for the machine. What a plugin may do belongs to the account, so approving something in a profile you made to try it out does not approve it in the profile you play on ([ADR-013](../adr/ADR-013-per-profile-configuration.md)).
 
-- A pre-existing global `~/.config/cordial/plugin-grants.json` is **moved** into whichever profile first looks for one, in practice `default`. Every other profile starts at default deny. The move is skipped if the profile already has its own file, and a failed move leaves the old file untouched.
+- A pre-existing global `~/.config/cordial/plugin-grants.json` is **moved** into whichever profile first looks for one, in practice `default`. Every other profile starts at default deny. The move is skipped if the profile already has its own file, and a failed move leaves the old file untouched. Why: [ADR-013](../adr/ADR-013-per-profile-configuration.md).
 - `CORDIAL_PLUGIN_GRANTS` overrides the path for every profile at once. It is a development switch.
 
 ## Granting and revoking
@@ -117,7 +117,7 @@ Plugin code is installed once for the machine. What a plugin may do belongs to t
 
 ### Install
 
-`consent::verdict` decides whether to ask. A plugin with no entry module and no capabilities installs silently. Anything else gets a dialog listing each capability's consequence sentence, and Allow writes **every requested capability** into the grants file at once. Escape and "Not now" grant nothing.
+`consent::verdict` decides whether to ask. A plugin with no entry module and no capabilities installs silently. Anything else gets a dialog listing each capability's consequence sentence, and Allow writes **every requested capability** into the grants file at once. Escape and "Not now" grant nothing. Why: [ADR-003](../adr/ADR-003-plugin-isolation.md).
 
 ### Switch it on
 

@@ -255,7 +255,7 @@ Roots form a stack, lowest first: every plugin in registration order, then the u
 > [!CAUTION]
 > Gameplay-affecting substitution is possible and Cordial builds no detection for it. Replacing a collision or hitbox mesh with a smaller or absent one is an advantage, not a cosmetic change. [ADR-010](../adr/ADR-010-plugin-asset-overlays.md) leaves it to the user's responsibility, as Sober and Bloxstrap do, and the capability's consent text says so.
 
-Diagnostics: `--check-overlays` reports which of your files match nothing in the current build, and the shadow report names every case where two layers offered one file and which won:
+Overlays are resolved by interception rather than a mount (Why: [ADR-010](../adr/ADR-010-plugin-asset-overlays.md)), which is what makes the diagnostics possible. `--check-overlays` reports which of your files match nothing in the current build, and the shadow report names every case where two layers offered one file and which won:
 
 ```text
 user wins over plugin:winter   content/textures/wood.png

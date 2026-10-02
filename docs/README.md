@@ -1,5 +1,9 @@
 # Documentation index
 
+The user and plugin-developer pages here are also published, with search, at
+[cordial.mintlify.app](https://cordial.mintlify.app). This index covers the
+whole folder, including the working notes the site leaves out.
+
 Start with [`NEXT.md`](NEXT.md). The rest here is reference, in roughly the
 order a newcomer would want it.
 

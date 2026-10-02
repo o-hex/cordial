@@ -12,7 +12,14 @@ container or virtual machine, on x86-64 or aarch64. GPL-3.0-or-later.
     <img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?style=for-the-badge&logo=discord&logoColor=white"
          alt="Join the Cordial Discord">
   </a>
+  <a href="https://cordial.mintlify.app">
+    <img src="https://img.shields.io/badge/Docs-cordial.mintlify.app-FF1B6B?style=for-the-badge&logo=readthedocs&logoColor=white"
+         alt="Read the Cordial documentation">
+  </a>
 </p>
+
+Documentation: **[cordial.mintlify.app](https://cordial.mintlify.app)**, built
+from [`docs/`](docs/README.md).
 
 ## Demo
 

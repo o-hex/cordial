@@ -202,3 +202,13 @@ this decision and is not fixed by it.
 
 `unpacked_plugins` edits inside a listed folder already reload (ADR-038); adding
 or removing a folder is next launch.
+
+## Notes moved from docs/status.md (2026-10-02)
+
+The frame-rate row on the status page was cut down to "unsettled"; the reasoning behind that, and what would settle it, is kept here because `present_mode` is the setting it concerns.
+
+Frame rate was measured with pointer motion driven for the whole run, because presents drop to exactly 1/s when nothing is happening and every earlier figure in this repository was that idle throttle integrated. That run, on 2026-08-02, read a flat 60.0 on MAILBOX against a variable 35-50 on FIFO across four runs of 120 s.
+
+**Do not quote those two numbers as settled, because they contradict the other record of the same thing.** `crates/cordial-runtime/src/android/vulkan.rs` says FIFO tracks the output exactly, 60.0 on the 59.88 Hz panel and 49.4 on the 49.96 Hz one, and that Sober clears both on the same machine and APK. A 35-50 FIFO sits below both refresh rates and was noted as unexplained at the time; the same 35-47 band later turned up as the *uncapped* arm in `docs/analysis/flag-init.md` §49, which is what a scheduler-paced rate would look like rather than a vsync-locked one. A flat 60 is also the one thing MAILBOX is supposed not to produce.
+
+What would settle it, and neither costs much: take the same input-driven count under `CORDIAL_PRESENT_MODE=fifo` and then `=mailbox`, on each output in turn. If MAILBOX follows the panel, near 60 on the 59.88 Hz one and near 50 on the 49.96 Hz one, the ceiling is the display and the present mode is not escaping it. If it stays near 60 on the 49.96 Hz output, the ceiling is the engine's own pacing and the display is irrelevant. `refresh.rs` notes Cordial has never told the engine the real refresh rate, so that is the third arm worth running.

@@ -1,89 +1,67 @@
-# Shaders (vkBasalt): sharpening and anti-aliasing over the game
+# Shaders (vkBasalt)
 
-Cordial can hand the client's frame to
-[vkBasalt](https://github.com/DadSchoorse/vkBasalt), an open-source Vulkan
-implicit layer, for a sharpen pass and an anti-alias pass before it reaches the
-screen. Off by default, because it changes what is drawn: **Settings →
-General → Performance → Shaders (vkBasalt)**.
+<!-- description: Add sharpening and anti-aliasing over the game with vkBasalt, an open-source Vulkan layer. -->
+<!-- icon: palette -->
 
-The switch is only offered once vkBasalt is actually installed — a settings row
-that turns on and does nothing is worse than no row at all.
+Cordial can hand the client's frame to [vkBasalt](https://github.com/DadSchoorse/vkBasalt) for a sharpen pass (CAS) and an anti-alias pass (SMAA) before it reaches the screen. It is off by default because it changes what is drawn.
 
-## Install
+Turn it on at **Settings → General → Performance → Shaders (vkBasalt)**. It applies at the next launch. The switch is only offered once vkBasalt is installed.
 
-- **Fedora / rpm-ostree layering:** `dnf install vkBasalt` (`sudo dnf install
-  -y vkBasalt` in a `distrobox` if the host is immutable).
-- **Arch:** `pacman -S vkbasalt` (multilib for a 32-bit game).
-- **Flatpak:** `flatpak install flathub org.freedesktop.Platform.VulkanLayer.vkBasalt//25.08`. Name the `25.08` branch: if `flatpak` asks which one, the `stable` branch is end-of-life and Cordial never loads it.
-  This is a runtime extension, not a Cordial package change — it mounts under
-  `org.freedesktop.Platform`'s own `VulkanLayer` extension point, the same one
-  MangoHUD uses, so Cordial's manifest needs nothing added for it to be seen.
+## Install vkBasalt
 
-Settings looks for the layer each time it is opened, so a host package is
-picked up by reopening it. A Flatpak extension is mounted when the sandbox
-starts, so quit Cordial and start it again.
+Which one you need depends on how Cordial was installed. A host package is invisible to a Flatpak build.
 
-## Config
+<!-- tabs -->
 
-Turning the switch on for the first time writes
-`<profile>/vkBasalt.conf` inside that profile's own data directory (next to its
-`appData` and cookie store) with sharpening (CAS) and anti-aliasing (SMAA) at
-vkBasalt's own documented defaults. **Cordial never rewrites this file again**
-— edit the effects list, the sharpening strength, or anything else vkBasalt
-supports, and your changes stay. The settings row names the exact path for
-your profile once vkBasalt is detected.
+### Fedora
 
-The full key reference is vkBasalt's own:
-[`vkBasalt.json.in`](https://github.com/DadSchoorse/vkBasalt/blob/master/config/vkBasalt.json.in).
+```bash
+sudo dnf install vkBasalt
+```
 
-## Toggle key
+On an immutable host, run it in a `distrobox`, or layer it with `rpm-ostree`.
 
-Cordial's generated config sets `toggleKey = Scroll_Lock`, not vkBasalt's own
-`Home` default. Home is a real Roblox chat key — it jumps the cursor to the
-start of a line — and vkBasalt does not consume the key or care which window
-has focus, so the upstream default would toggle the effect on and off every
-time somebody typed a message starting with that jump.
+### Arch
 
-**On Cordial's default Wayland backend, the toggle key does nothing at all.**
-Confirmed by reading vkBasalt's own source
-(`src/keyboard_input_x11.cpp`): it polls a real X11 keyboard with
-`XQueryKeymap`, and does so only when `$DISPLAY` is set. Wayland sets
-`WAYLAND_DISPLAY`, not `DISPLAY`, so with no XWayland running the check
-degrades to "no X11 support" and the key can never register as pressed. The
-generated config sets `enableOnLaunch = True` for exactly this reason: it is
-the only lever there is on Wayland. The toggle key works on Cordial's X11
-backend, or if XWayland happens to be running alongside a Wayland session.
+```bash
+sudo pacman -S vkbasalt
+```
 
-## What was verified and how
+Add the multilib package for a 32-bit game.
 
-- **The layer loads.** Running the client with `ENABLE_VKBASALT=1` and
-  `VKBASALT_LOG_LEVEL=info` shows the Vulkan loader inserting
-  `VK_LAYER_VKBASALT_post_processing` as both an instance and a device layer,
-  and vkBasalt logging the exact config file and values Cordial generated.
-- **The effect is visible.** Compared with `grim`, taken in a nested Wayland
-  compositor rather than through `cordial_screenshot` — Cordial's own
-  screenshot verb reads the frame out of its Vulkan swapchain, which is filled
-  before vkBasalt's layer runs, so it cannot show the layer's own work. The
-  landing screen's edges are visibly sharper with the layer on; the
-  pixel-level difference is real but modest on that mostly-flat screen, and was
-  not checked against in-game 3D content.
-- **Frame cost**, CPU on the whole `cordial-run` process with synthetic pointer
-  input flowing continuously for 60 s, two runs each, on the landing screen
-  only (a throwaway signed-out profile, not a loaded game): roughly 6.7% CPU
-  with shaders off and 7.0–7.1% with them on. The frame rate itself did not
-  move in this measurement, because it was paced by the synthetic input rate
-  in a headless nested compositor rather than by a real display's vsync — not
-  a general "vkBasalt costs nothing" claim, just what this one screen and this
-  one input pattern showed.
-- **Layers are not disabled.** Cordial's own Vulkan interposition
-  (`crates/cordial-runtime/src/android/vulkan.rs`) forwards
-  `enabled_layer_count` and `pp_enabled_layer_names` unchanged when it patches
-  `vkCreateInstance`, and nothing in Cordial sets `VK_LOADER_LAYERS_DISABLE` or
-  any other loader variable that would suppress an implicit layer.
+### Flatpak
 
-**Untested:** AMD and NVIDIA GPUs — the above was measured on the Mesa driver
-present in the build container. vkBasalt's own anti-cheat interaction risk
-(Sober disabled and later restored MangoHUD and vkBasalt over exactly this
-concern — [sober#868](https://github.com/vinegarhq/sober/issues/868)) is the
-same one Cordial already accepts for MangoHUD; see
-[ADR-041](adr/ADR-041-vkbasalt-post-processing.md).
+```bash
+flatpak install flathub org.freedesktop.Platform.VulkanLayer.vkBasalt//25.08
+```
+
+Name the `25.08` branch. If `flatpak` asks which one, the `stable` branch is end-of-life and Cordial never loads it. This is a runtime extension, not a Cordial package, so Cordial's manifest needs nothing added.
+
+<!-- /tabs -->
+
+Settings looks for the layer each time it is opened, so a host package is picked up by reopening Settings. A Flatpak extension is mounted when the sandbox starts, so quit Cordial and start it again.
+
+## Change the effects
+
+The first time you turn the switch on, Cordial writes `<profile>/vkBasalt.conf` in that profile's data directory with sharpening and anti-aliasing at vkBasalt's documented defaults. **Cordial never rewrites this file again.** Edit the effects list, the sharpening strength or anything else vkBasalt supports and your changes stay. Once vkBasalt is detected, the settings row names the exact path for your profile.
+
+The full key reference is vkBasalt's own: [`vkBasalt.json.in`](https://github.com/DadSchoorse/vkBasalt/blob/master/config/vkBasalt.json.in).
+
+## Toggle the effect on and off
+
+The generated config sets `toggleKey = Scroll_Lock`, not vkBasalt's own `Home`. Home is a Roblox chat key (it jumps to the start of a line), and vkBasalt does not care which window has focus, so Home would toggle the effect every time you typed a message.
+
+> [!NOTE]
+> On Cordial's default Wayland backend the toggle key does nothing. vkBasalt reads a real X11 keyboard and only when `$DISPLAY` is set, and a Wayland session sets `WAYLAND_DISPLAY` instead. The generated config sets `enableOnLaunch = True` for this reason: the effect is on from the start and stays on. The key works on Cordial's X11 backend, or when XWayland is running alongside a Wayland session.
+
+## What is checked and what is not
+
+- **The layer loads.** With `ENABLE_VKBASALT=1` and `VKBASALT_LOG_LEVEL=info`, the Vulkan loader inserts `VK_LAYER_VKBASALT_post_processing` and vkBasalt logs the config Cordial generated.
+- **The effect is visible** on the landing screen, where edges are visibly sharper. The difference is modest on that mostly flat screen, and it was not checked against in-game 3D content.
+- **Cost:** on the landing screen, CPU for the whole client went from about 6.7% with shaders off to 7.0 to 7.1% with them on. That is one screen and one input pattern, not a claim that vkBasalt costs nothing.
+- **Untested:** AMD and NVIDIA GPUs. Everything above ran on the Mesa driver.
+
+> [!WARNING]
+> vkBasalt is a third-party library loaded into the client's process by the Vulkan loader. Sober disabled and later restored MangoHud and vkBasalt over anti-cheat concerns ([sober#868](https://github.com/vinegarhq/sober/issues/868)). Cordial accepts the same risk it already accepts for [MangoHud](mangohud.md) and ships neither.
+
+Why: [ADR-041](adr/ADR-041-vkbasalt-post-processing.md), which also holds the measurements.

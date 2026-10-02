@@ -225,3 +225,9 @@ repos (Arch Linux's own trusted-user review). What it fixes is the gap that
 exists without it: anyone who can write to the GitHub Pages site can serve a
 different package under the same name with no warning to an installed
 client, the same gap named for each of the other two channels.
+
+## Notes moved from docs/install.md (2026-10-02)
+
+The release-page `.pkg.tar.zst` is built by the same `makepkg` run an AUR user's own machine would do, and its cosign signature is keyless, so there is no key to add to a keyring and none to trust. On 2026-09-30 `cordial.db.sig` verified as a good signature against the published keyring; `pacman -Sy` was not run, and neither was the `pacman.conf` stanza. The `SigLevel = DatabaseRequired PackageNever` line comes from the section above, which says itself that it was reasoned from `pacman.conf(5)` rather than tried.
+
+The `cordial`, `cordial-bin` and `cordial-git` AUR packages belong to an account that is not the maintainer's (`taxin-404`). On 2026-09-30 they were copies of `packaging/aur/` from 0.17.0, fetching only from this repository, and `cordial-bin`'s checksum matched the official 0.17.0 release file.

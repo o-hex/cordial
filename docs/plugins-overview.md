@@ -63,36 +63,34 @@ the capabilities it needs. Until you choose **Allow**, it does nothing.
 > unlocks those shortcuts (the one Bloxstrap uses). Cordial cannot check whether
 > yours is.
 
-## Installing a plugin
+## Install a plugin
 
-There is no plugin store yet. A plugin reaches you as a file someone shares,
-or as a folder you are writing yourself.
+There is no plugin store yet. A plugin reaches you as a file someone shares, or as a folder you are writing yourself.
 
 <!-- steps -->
 
 ### Turn plugins on
 
-Open **Settings → Plugins** and switch on **Use Plugins**. If Deno is not
-installed, the page offers a **Download** button (about 39 MB). A `deno`
-already on your system is used instead.
+Open **Settings → Plugins** and switch on **Use Plugins**. If Deno is not installed, the page offers a **Download** button (about 39 MB). A `deno` already on your system is used instead. See [Deno](plugins.md#deno).
 
 ### Install the archive
 
-Under **Install from a file**, choose **Choose file…** and pick the plugin.
-It must be a `.tar.zst` archive; a `.tar.gz` is refused. Installing a
-plugin does not allow it to do anything: a plugin that contains code
-arrives switched off.
+Under **Install from a file**, choose **Choose file…** and pick the plugin. You do not need a terminal and you do not need to know where plugins live.
+
+The file must be a `.tar.zst`. A `.tar.gz` is not a Cordial plugin archive, whatever is inside it, and the picker refuses it. Why: [ADR-014](adr/ADR-014-plugin-registry-and-unpacking.md).
 
 ### Switch it on and grant what it needs
 
-The plugin appears under **Installed**. Switch it on, then turn on only the
-capabilities you are happy to give it. Changes reach a running game within
-about a second. FastFlags are the exception: they apply at the next launch.
+The plugin appears under **Installed**, switched off, with the permissions it asks for listed. Nothing runs until you switch it on. Then turn on only the capabilities you are happy to give it.
 
 <!-- /steps -->
 
-To remove a plugin, use its **Remove** button. Built-in plugins cannot be
-removed, only switched off.
+Installing, updating, removing, enabling, disabling and granting reach a running game within a second or two, with no restart. FastFlags are the exception: they apply at the next launch.
+
+To remove a plugin, use its **Remove** button. Built-in plugins cannot be removed, only switched off. If you are writing a plugin rather than installing one, you can [load its folder directly](plugins.md#load-a-plugin-from-a-folder).
+
+> [!WARNING]
+> **Trust the source.** A plugin runs as a real process on your machine. Cordial gives it no file access, network, environment or subprocess of its own, and every capability it uses is one you approved by name. That is a boundary, not a guarantee about intent. Installing something because a stranger linked it is the same decision it is anywhere else.
 
 ### Where plugins live
 
@@ -101,8 +99,7 @@ removed, only switched off.
 | Flatpak | `~/.var/app/io.github.luohoa97.Cordial/data/cordial/plugins/` |
 | Other installs | `~/.local/share/cordial/plugins/` |
 
-Which plugins are switched on, and what each may do, is stored per profile, so
-two profiles can have different plugins on.
+Which plugins are switched on, and what each may do, is stored per profile, so two profiles can have different plugins on.
 
 ## Writing a plugin
 

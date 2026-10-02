@@ -314,3 +314,7 @@ therefore the plan, not a stopgap for §2** -- the same framing
 [flatpak-remote-signing.md](flatpak-remote-signing.md) gives for Flathub, and
 for the same underlying reason: the channel Cordial controls is the one that
 can actually ship this week.
+
+## Notes moved from docs/install.md (2026-10-02)
+
+What was observed on 2026-09-30 when the key's fingerprint was recorded: `InRelease` verified as a good signature against the published keyring, and the `amd64` and `arm64` `Packages` files both listed 0.20.1-1. `apt install` itself was not run. The keyring form (one file named on the `deb` line, not the system-wide trusted keyring) is the `apt-key`-free one. A `curl` in a document is exactly what a supply-chain attack looks like, which is why the install page asks the reader to check the fingerprint.

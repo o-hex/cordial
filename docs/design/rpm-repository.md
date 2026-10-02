@@ -321,3 +321,7 @@ process with its own timeline. **§1 is therefore the plan, not a stopgap for
 [`flatpak-remote-signing.md`](flatpak-remote-signing.md) gives Flathub, for
 the same underlying reason: the channel Cordial controls is the one that can
 actually ship this week.
+
+## Notes moved from docs/install.md (2026-10-02)
+
+Only one Fedora release is built at a time (Fedora 44 as of 2026-10-02), for the reasons in `packaging/rpm/build-rpm.sh`'s header. The repository is split by `$releasever` because a `.rpm` built against Fedora 44's `gtk4` and `libadwaita` is not guaranteed to install on a different release (see "Why `$releasever`, and what that honestly costs" above). A `dnf` reporting a release other than 44 therefore gets a 404 from the repository URL rather than a build meant for a different release, until `release.yml` builds a second one. On 2026-09-30 `rpm/44/x86_64/repodata/repomd.xml.asc` verified as a good signature against the published key; `dnf install` was not run.

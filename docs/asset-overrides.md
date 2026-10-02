@@ -34,6 +34,7 @@ are under `content/fonts/`.
 |---|---|
 | Flatpak | `~/.var/app/io.github.luohoa97.Cordial/config/cordial/overlay/` |
 | Other installs | `~/.config/cordial/overlay/` |
+
 So a replacement cursor goes at
 `~/.config/cordial/overlay/content/textures/Cursors/KeyboardMouse/ArrowCursor.png`.
 Keep the original file name and format.

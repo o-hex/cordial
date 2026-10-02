@@ -128,3 +128,69 @@ Roblox. VineShade's repository carries no licence file, so nothing in it may be
 copied; only the idea ("vkBasalt plus a launcher, tuned for Roblox") was
 taken, which is the same line AGENTS.md draws for Sober's binary and mocktail's
 source.
+
+## Notes moved from docs/shaders.md (2026-10-02)
+
+What was verified, and how:
+
+- **The layer loads.** Running the client with `ENABLE_VKBASALT=1` and
+  `VKBASALT_LOG_LEVEL=info` shows the Vulkan loader inserting
+  `VK_LAYER_VKBASALT_post_processing` as both an instance and a device layer,
+  and vkBasalt logging the exact config file and values Cordial generated.
+- **The effect is visible.** Compared with `grim`, taken in a nested Wayland
+  compositor rather than through `cordial_screenshot`, because Cordial's own
+  screenshot verb reads the frame out of its Vulkan swapchain, which is filled
+  before vkBasalt's layer runs, so it cannot show the layer's own work. The
+  landing screen's edges are visibly sharper with the layer on; the pixel-level
+  difference is real but modest on that mostly-flat screen, and was not checked
+  against in-game 3D content.
+- **Frame cost**, CPU on the whole `cordial-run` process with synthetic pointer
+  input flowing continuously for 60 s, two runs each, on the landing screen
+  only (a throwaway signed-out profile, not a loaded game): roughly 6.7% CPU
+  with shaders off and 7.0-7.1% with them on. The frame rate itself did not
+  move, because it was paced by the synthetic input rate in a headless nested
+  compositor rather than by a real display's vsync. Not a general "vkBasalt
+  costs nothing" claim, just what this one screen and this one input pattern
+  showed.
+- **Layers are not disabled.** Cordial's own Vulkan interposition
+  (`crates/cordial-runtime/src/android/vulkan.rs`) forwards
+  `enabled_layer_count` and `pp_enabled_layer_names` unchanged when it patches
+  `vkCreateInstance`, and nothing in Cordial sets `VK_LOADER_LAYERS_DISABLE` or
+  any other loader variable that would suppress an implicit layer.
+
+**Wayland toggle key, the check behind the claim.** Confirmed by reading
+vkBasalt's `src/keyboard_input_x11.cpp`: it polls a real X11 keyboard with
+`XQueryKeymap` and only when `$DISPLAY` is set. Wayland sets `WAYLAND_DISPLAY`,
+not `DISPLAY`, so with no XWayland running the check degrades to "no X11
+support" and the key can never register as pressed. `enableOnLaunch = True` is
+the only lever there is on Wayland.
+
+**Settings rows are gated on the layer being installed**, for the reason
+`ENABLE_VKBASALT=1` with no layer is silent. The same rule governs MangoHUD.
+
+## Notes moved from docs/mangohud.md (2026-10-02)
+
+**How the layer is found.** Cordial looks for a `mangohud*.json` file in the
+Vulkan loader's implicit-layer directories (`$XDG_DATA_HOME` or
+`~/.local/share`, `$XDG_CONFIG_HOME` or `~/.config`, each of `$XDG_DATA_DIRS`,
+`/etc`, all under `vulkan/implicit_layer.d`) and in the Flatpak extension's mount
+at `/usr/lib/extensions/vulkan/MangoHud`. It matches on the prefix because
+upstream ships the file as `MangoHud.json`, `MangoHud.x86_64.json` or
+`MangoHud.x86.json` depending on version.
+
+**Why the overlay string is fixed.** `MANGOHUD_CONFIG` is set by Cordial rather
+than left to MangoHud's default, so what the switch turns on is a known overlay
+and not whatever config file happens to be lying around. It is set unconditionally
+in `crates/cordial-shell/src/launch.rs`, so a `MANGOHUD_CONFIG` exported in the
+user's own environment is replaced, not merged.
+
+**INFERRED, not run:** MangoHud's documentation says a config file
+(`MangoHud.conf`) is ignored whenever `MANGOHUD_CONFIG` is set, unless
+`read_cfg` is one of the options. Cordial's string does not include `read_cfg`,
+so a `MangoHud.conf` should have no effect. The installed 0.8.4 library contains
+the `read_cfg` and `MANGOHUD_CONFIGFILE` strings, but nobody has launched a
+client with a config file to see which wins.
+
+**Not checked:** the overlay was not screenshotted and its frame cost was not
+measured. `cordial_screenshot` reads the swapchain before any implicit layer
+runs, so it cannot show the overlay either; a nested-compositor `grim` capture can.

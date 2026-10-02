@@ -745,3 +745,7 @@ wake.
 | Wrap `pthread_setname_np` | **Adopt only as instrumentation, if at all** | It is the right hook for anything name-based, because the name does not exist at `pthread_create` — but the thing to do with it first is record the inventory Cordial lacks, not bind anything. |
 | Math builtins in a libm shim | **Do not adopt** | Cordial cannot remove the guest's PLT without editing the guest, which ADR-001 forbids; the engine imports no math function with a single-instruction form, so there is no builtin to substitute; changing which libm answers is an unbounded correctness change; and the pattern carries a plausible self-recursion fault that has never been compiled. |
 | Silencing Android logging, memoising asset misses, `MADV_FREE` rewriting | **Do not adopt** | Two regressions and a stub that lies, travelling in the same branch under the performance heading. |
+
+## Notes moved from docs/status.md (2026-10-02)
+
+A list of runtime-overhead changes that stood on the status page: pointer positions use atomic pairs; ordinary Vulkan presents no longer contend on the screenshot mutex; looper accounting runs only when instrumentation is enabled; unchanged text avoids repeated cloning and GTK updates; and environment and configuration probes used by hot paths are cached for the process lifetime. These are runtime changes, not Roblox graphics options or FastFlags.

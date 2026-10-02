@@ -1,8 +1,12 @@
 # `cordial.runtime/1`: the runtime spec
 
-**Status: draft v0.1, accepted as design in [ADR-052](adr/ADR-052-the-runtime-spec.md). Nothing here is implemented.** No runtime speaks it, `cordial` has no code to load one, and no `--runtime-check` exists. Treat every section as a proposal until the ADR's implementation lands. Sections marked **draft** are the least settled.
+<!-- description: The draft protocol between Cordial and a runtime that turns Play into a running Roblox client. Not implemented yet. -->
+<!-- icon: microchip -->
 
-Written for someone building a runtime. Cordial lists only its own built-in runtime for now (ADR-052), so a runtime written to this spec will not appear in Cordial until the maintainer vets it, and one that injects code into the Roblox client will not be listed at all.
+> [!WARNING]
+> **Draft v0.1, accepted as design in [ADR-052](adr/ADR-052-the-runtime-spec.md). Nothing here is implemented.** No runtime speaks it, `cordial` has no code to load one, and no `--runtime-check` exists. Treat every section as a proposal. Sections marked **draft** are the least settled.
+
+This page is for someone building a runtime. Cordial lists only its own built-in runtime for now ([ADR-052](adr/ADR-052-the-runtime-spec.md)), so a runtime written to this spec will not appear in Cordial until the maintainer vets it. One that injects code into the Roblox client will not be listed at all.
 
 A **runtime** is whatever turns Play into a running Roblox client. Cordial is the launcher: window chrome, profiles, FastFlag layers, plugins, presence, doctor, report and the update UI. The spec carries events and effects, never channels or code.
 

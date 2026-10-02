@@ -139,3 +139,9 @@ driver that matters — the semantics are the X server's and evdev's, not ours.
 The rule at the top of AGENTS.md applies: this is settled by running something
 and reading both numbers with the server's acceleration turned up, not by
 reasoning about what the field ought to mean.
+
+## Notes moved from docs/status.md (2026-10-02)
+
+**The keyboard took a week and the answer was one number.** `nativePassKeyEvent` wants Linux evdev codes; it was being handed Android keycodes. Exactly one key worked, `D`, because `AKEYCODE_D` and `KEY_D` are both 32, and Alt made the character jump, because `AKEYCODE_ALT_LEFT` is 57 and so is `KEY_SPACE`. Four theories were measured and disproved first, every one of them assuming a number was wrong somewhere. The numbers were fine; the vocabulary was.
+
+The camera uses the compositor's *unaccelerated* motion pair: using the accelerated one made sensitivity depend on the desktop's mouse settings and made the camera speed up through a fast sweep.

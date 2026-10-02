@@ -21,7 +21,8 @@ twice:
   # Title, <!-- description: ... -->, <!-- icon: ... -->,
   <!-- sidebarTitle: ... -->            -> frontmatter
 
-Any other HTML comment is dropped, since MDX does not accept them.
+Callouts and accordions inside a step or tab are translated as well. Any
+other HTML comment is dropped, since MDX does not accept them.
 
 Usage: build.py <out-dir>
 """
@@ -89,7 +90,8 @@ CARD = re.compile(r"^\s*[-*]\s+\[([^\]]+)\]\(([^)]+)\)\s*[:\u2014-]?\s*(.*)$")
 
 
 def attr(text):
-    return text.replace("\\", "\\\\").replace('"', '\\"')
+    # MDX attribute strings take no backslash escapes, so a quote becomes an entity.
+    return text.replace("&", "&amp;").replace('"', "&quot;")
 
 
 def region(kind, body):
@@ -101,18 +103,24 @@ def region(kind, body):
         return out + ["</Columns>"]
     outer, inner = ("Steps", "Step") if kind == "steps" else ("Tabs", "Tab")
     level = next((len(m.group(1)) for m in map(HEADING.match, body) if m), None)
-    out, open_ = [f"<{outer}>"], False
+    out, open_, chunk = [f"<{outer}>"], False, []
     for l in body:
         m = HEADING.match(l)
         if m and len(m.group(1)) == level:
+            # A step's or tab's own callouts and accordions are translated too.
+            out += components(chunk, False).split("\n") if chunk else []
+            chunk = []
             if open_:
                 out += ["", f"</{inner}>"]
             out += [f'<{inner} title="{attr(m.group(2))}">', ""]
             open_ = True
         elif open_:
-            out.append(l)
+            chunk.append(l)
+            continue
+        out += components(chunk, False).split("\n") if chunk else []
+        chunk = []
     if open_:
-        out += ["", f"</{inner}>"]
+        out += components(chunk, False).split("\n") + ["", f"</{inner}>"]
     return out + [f"</{outer}>"]
 
 

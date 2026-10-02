@@ -233,3 +233,11 @@ separate change with its own verification and is out of scope here.
 **It does not re-verify the web view end-to-end on this base.** See above —
 flagged, not silently carried forward, and not blocking the measurements this
 ADR is actually about.
+
+## Notes moved from docs/install.md (2026-10-02)
+
+Moved out of the install page, where it was user-facing prose, when that page was cut down to what a reader acts on.
+
+**The web view, and what is still not established.** WebKitGTK does not link the processes that draw a page. It spawns `WebKitWebProcess` and `WebKitNetworkProcess`, loads an injected bundle, and runs `bwrap` and `xdg-dbus-proxy` for its own sandbox: five things reached through absolute paths fixed when WebKitGTK itself was built, `/usr/libexec/webkitgtk-6.0` on Fedora and somewhere different on every other distribution. Up to and including v0.13.0 the AppImage carried copies of them and nothing made WebKitGTK look at the copies, so on a host that had never installed WebKitGTK the sign-in window came up blank and the log said `Failed to spawn child process ".../WebKitNetworkProcess"`. Installing WebKitGTK did not help unless you were on Fedora, because nobody else uses that path.
+
+Cordial now makes those paths resolve to its own copies inside a private mount namespace, which needs `bwrap` and unprivileged overlay mounts. If the kernel or distribution refuses either, the AppImage says so on standard error and carries on without them, and the web view then needs WebKitGTK 6.0 installed at Fedora's path. This has been measured on a stand-in for a machine with no WebKitGTK, but not yet on a real one, and not on any distribution other than Fedora. The Flatpak is unaffected either way.

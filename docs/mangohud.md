@@ -1,40 +1,43 @@
-# MangoHUD: frame rate and load over the game
+# MangoHud overlay
 
-Cordial can turn on [MangoHud](https://github.com/flightlessmango/MangoHud), an
-open-source Vulkan implicit layer, to draw a frame rate, a frame-time graph and
-CPU and GPU load over the client. Off by default, because it draws over the
-game whether or not you wanted it there: **Settings → General → Performance →
-MangoHUD overlay**.
+<!-- description: Draw frame rate, a frame-time graph and CPU and GPU load over the game with MangoHud. -->
+<!-- icon: gauge -->
 
-The switch is only offered once MangoHud's Vulkan layer is actually installed.
-`MANGOHUD=1` with no layer is not an error; the client starts and nothing
-appears, which looks exactly like a broken setting. Without the layer the row is
-greyed out and its subtitle says what to install.
+Cordial can turn on [MangoHud](https://github.com/flightlessmango/MangoHud), an open-source Vulkan layer, to draw a frame rate, a frame-time graph and CPU and GPU load over the client. It is off by default because it draws over the game.
 
-## Install
+Turn it on at **Settings → General → Performance → MangoHUD overlay**. It applies at the next launch.
 
-Which one is right depends on how *Cordial* was installed, and the two are not
-interchangeable: a host package is invisible to a Flatpak build, and the Flatpak
-extension's library path exists only inside a sandbox.
+The switch is only offered once MangoHud's Vulkan layer is installed. Without the layer the row is greyed out and its subtitle says what to install. (`MANGOHUD=1` with no layer is not an error, so the client would start and nothing would appear, which looks like a broken setting.)
 
-- **Fedora:** `dnf install mangohud`.
-- **Arch:** `pacman -S mangohud`.
-- **Flatpak:** `flatpak install flathub org.freedesktop.Platform.VulkanLayer.MangoHud//25.08`. Name the `25.08` branch: if `flatpak` asks which one, the `stable` branch is end-of-life and Cordial never loads it.
-  A runtime extension, not a Cordial package: it mounts under
-  `org.freedesktop.Platform`'s `VulkanLayer` extension point, so Cordial's
-  manifest needs nothing added for it to be seen
-  ([ADR-041](adr/ADR-041-vkbasalt-post-processing.md)).
+## Install MangoHud
 
-Cordial looks for a `mangohud*.json` file in the Vulkan loader's implicit-layer
-directories (`$XDG_DATA_HOME` or `~/.local/share`, `$XDG_CONFIG_HOME` or
-`~/.config`, each of `$XDG_DATA_DIRS`, `/etc`, all under `vulkan/implicit_layer.d`)
-and in the Flatpak extension's mount at `/usr/lib/extensions/vulkan/MangoHud`.
-It matches on the prefix because upstream ships the file as `MangoHud.json`,
-`MangoHud.x86_64.json` or `MangoHud.x86.json` depending on version.
+A host package is invisible to a Flatpak build, and the Flatpak extension exists only inside the sandbox, so install the one that matches how Cordial was installed.
 
-The check runs each time Settings is opened, so a host package is picked up by
-closing and reopening Settings. A Flatpak extension is mounted when the sandbox
-starts, so quit Cordial and start it again.
+<!-- tabs -->
+
+### Fedora
+
+```bash
+sudo dnf install mangohud
+```
+
+### Arch
+
+```bash
+sudo pacman -S mangohud
+```
+
+### Flatpak
+
+```bash
+flatpak install flathub org.freedesktop.Platform.VulkanLayer.MangoHud//25.08
+```
+
+Name the `25.08` branch. If `flatpak` asks which one, the `stable` branch is end-of-life and Cordial never loads it. This is a runtime extension, not a Cordial package, so Cordial's manifest needs nothing added.
+
+<!-- /tabs -->
+
+Settings checks for the layer each time it opens, so a host package is picked up by closing and reopening Settings. A Flatpak extension is mounted when the sandbox starts, so quit Cordial and start it again.
 
 ## What it shows
 
@@ -45,37 +48,20 @@ MANGOHUD=1
 MANGOHUD_CONFIG=fps,frametime,frame_timing=1,cpu_stats,gpu_stats
 ```
 
-That is the frame rate, the frame-time graph, and CPU and GPU load. The value is
-set by Cordial rather than left to MangoHud's default, so what the switch turns
-on is a known overlay and not whatever config file happens to be lying around.
-At launch the shell prints `shell: MangoHUD on, via <layer path>`, or says that
-the layer is missing if the switch is on and MangoHud has since been removed.
+That is the frame rate, the frame-time graph, and CPU and GPU load. Cordial sets the value itself so the switch turns on a known overlay and not whatever config file is lying around. At launch the shell prints `shell: MangoHUD on, via <layer path>`, or says the layer is missing if the switch is on and MangoHud has since been removed.
 
-## Changing what it shows
+## Change what it shows
 
-Cordial has no setting for it. The `MANGOHUD_CONFIG` string is fixed in
-`crates/cordial-shell/src/launch.rs`, and because Cordial sets it on the client
-unconditionally, a `MANGOHUD_CONFIG` exported in your own environment is
-replaced, not merged.
+Cordial has no setting for it. The `MANGOHUD_CONFIG` string is fixed in `crates/cordial-shell/src/launch.rs`, and because Cordial sets it unconditionally, a `MANGOHUD_CONFIG` exported in your own environment is replaced, not merged. Changing the overlay means changing `launch.rs` and rebuilding.
 
-**INFERRED, not run here:** MangoHud's documentation says a config file
-(`MangoHud.conf`) is ignored whenever `MANGOHUD_CONFIG` is set, unless
-`read_cfg` is one of the options. Cordial's string does not include `read_cfg`,
-so expect a `MangoHud.conf` to have no effect. The installed 0.8.4 library does
-contain the `read_cfg` and `MANGOHUD_CONFIGFILE` strings, but nobody has
-launched a client with a config file to see which wins. Until Cordial exposes
-the string, changing the overlay means changing `launch.rs` and rebuilding.
+> [!NOTE]
+> **INFERRED, not run here:** MangoHud's documentation says a config file (`MangoHud.conf`) is ignored whenever `MANGOHUD_CONFIG` is set, unless `read_cfg` is one of the options. Cordial's string does not include `read_cfg`, so expect a `MangoHud.conf` to have no effect. The installed 0.8.4 library contains the `read_cfg` and `MANGOHUD_CONFIGFILE` strings, but nobody has launched a client with a config file to see which wins.
 
-## What was not checked
+## What is not checked
 
-The overlay was not screenshotted for this page, and its frame cost was not
-measured. `cordial_screenshot` reads the frame out of Cordial's own swapchain,
-which is filled before any implicit layer runs, so it cannot show the overlay
-either; a nested-compositor `grim` capture, as [shaders.md](shaders.md)
-describes, can.
+The overlay was not screenshotted for this page and its frame cost was not measured. `cordial_screenshot` reads the frame from Cordial's own swapchain, before any layer runs, so it cannot show the overlay; a `grim` capture in a nested compositor can.
 
-Sober disabled and later restored MangoHud over anti-cheat concerns
-([sober#868](https://github.com/vinegarhq/sober/issues/868)). The risk is the
-one [ADR-041](adr/ADR-041-vkbasalt-post-processing.md) already weighs for
-vkBasalt: it is a third-party library loaded into the client's process by the
-Vulkan loader, and Cordial ships neither.
+> [!WARNING]
+> MangoHud is a third-party library loaded into the client's process by the Vulkan loader. Sober disabled and later restored it over anti-cheat concerns ([sober#868](https://github.com/vinegarhq/sober/issues/868)). Cordial ships neither it nor [vkBasalt](shaders.md).
+
+Why: [ADR-041](adr/ADR-041-vkbasalt-post-processing.md).

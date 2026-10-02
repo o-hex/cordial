@@ -87,3 +87,7 @@ routine.
 The honest residue: a genuinely novel host resource will need a release, and
 Cordial will sometimes be the bottleneck. That is the cost of the sandbox being
 readable in one file and staying true, and it is worth paying.
+
+## Notes moved from docs/plugins.md (2026-10-02)
+
+**Before 0.13.1 there was no interpreter and no download row**, so on every install except a hand-built one with Deno already present, plugins were listed, granted and switched on without ever running a line. Arch is the only distribution that packages Deno, and Cordial's AUR packages depend on it; Fedora and Debian ship none, and inside the Flatpak there is no host to install one on, which is why Cordial offers to fetch a pinned release itself (checksum written into the source, verified before the file is put in place, stored under Cordial's own data directory).

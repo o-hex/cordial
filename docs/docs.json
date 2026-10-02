@@ -46,6 +46,13 @@
         "pages": [
           "plugin-development",
           "plugin-api",
+          "plugin-api/getting-started",
+          "plugin-api/protocol",
+          "plugin-api/capabilities",
+          "plugin-api/events",
+          "plugin-api/flags",
+          "plugin-api/surface",
+          "plugin-api/limits",
           "runtime-spec"
         ]
       },

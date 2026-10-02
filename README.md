@@ -130,7 +130,7 @@ flatpak run io.github.luohoa97.Cordial
 
 The remote is signed. Its key fingerprint, and what to do if you added it before
 it was, are in
-[`docs/install.md`](docs/install.md#trust-and-what-the-flatpak-signature-covers).
+[`docs/install.md`](docs/install.md#check-what-you-downloaded).
 
 A plain install lands on `stable`, which moves only when a release is tagged.
 `master` follows every commit to `main`:
@@ -175,7 +175,7 @@ WebKitGTK-6.0 headers are optional and probed at build time; without them the
 binary is quietly less capable. The Nix flake's package builds and runs
 `--help` and `--diagnostics`, but has never run a game
 ([CONTRIBUTING.md](CONTRIBUTING.md#or-use-the-flake)). Full list:
-[`docs/install.md`](docs/install.md#building-from-source).
+[`docs/install.md`](docs/install.md#from-source).
 
 ## Configuration
 

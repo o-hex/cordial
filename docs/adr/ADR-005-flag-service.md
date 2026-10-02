@@ -79,3 +79,44 @@ If a future Roblox build re-read the static families at runtime, the split would
 become unnecessary and the two surfaces should collapse into one. That is
 checkable: set an `FFlag` with an observable effect while the client is running
 and see whether behaviour changes. It does not today.
+
+## Notes moved from docs/fastflags.md (2026-10-02)
+
+**A documented example is the first thing anybody copies, so check it.** The page's
+example once carried `"FStringDebugGraphicsPreferredBackend": "Vulkan"`, which
+reads perfectly and is not a Roblox flag: `DebugGraphicsPreferredBackend` appears
+zero times in `libroblox.so`, and nothing resembling it does either. The real names
+in that family are `DebugGraphicsDisableVulkan`, `DebugGraphicsDisableOpenGL`,
+`DebugGraphicsDisableVulkan11` and so on. A user reported it and it was checked
+against the binary. An unknown name goes into the settings document like any other
+key and nothing rejects it, so an invented flag looks exactly like a working one;
+the engine's own table stores the name without the `FFlag`/`FInt`/`FString` prefix,
+which is why the check is `strings libroblox.so | grep -x <name without prefix>`.
+The backend is a Settings choice because Cordial decides it before the engine starts.
+
+**The Android client has no frame-rate row in its menu**, and nothing here can add
+a row the client does not draw, so raising the frame rate takes two separate levers:
+Frame pacing (`VkSwapchainCreateInfoKHR::presentMode`, whether a finished frame
+waits for the next refresh) and Frame rate limit (what the engine's own scheduler
+aims at). Leaving Frame pacing on FIFO caps the rate at the panel's whatever the
+limit says. It was first reported as a missing feature, which is a fair reading of
+an interface that has no such control. Measurements behind the caps (nothing above
+240, a cap above 60 measuring worse on a 60 Hz headless output) are in
+[ADR-051](ADR-051-overrides-are-reapplied-after-the-engines-refresh.md).
+
+**Roblox's graphics-quality FastFlags** (`DebugFRMQualityLevelOverride` and the MSAA
+overrides) were tested and change nothing here, because they govern 3D scene
+rendering and the signed-out landing page is a 2D interface. Render resolution and
+density (`CORDIAL_RESOLUTION`, `CORDIAL_DPI_SCALE`) are the levers that apply to it.
+
+**`CordialDeviceProfile` in `flags.json` is INFERRED to have no effect.**
+`flags::device_profile()` reads the environment first, then the flag layers, but
+nothing outside `flags.rs` calls it; `native/init_params.cpp` reads
+`CORDIAL_DEVICE_PROFILE` directly, which the shell sets from the Graphics
+optimisation row. Established by reading callers, not by running a client.
+
+**Flag-family timing.** `FFlag`/`FInt`/`FString` are read once at startup; only the
+`DF` family is re-read while the client runs. That matters to anything that changes
+flags dynamically: a plugin loaded part-way through a session cannot change a
+startup flag, whatever it writes. Overrides are merged into the settings document
+the engine is given at startup, and the launch log reports how many were applied.

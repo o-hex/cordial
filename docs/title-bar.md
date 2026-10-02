@@ -1,15 +1,21 @@
 # Game title bar
 
-Settings → Appearance → Game window → Title bar offers **Default**, **Compact**
-and **Hidden**. The choice applies to the next game window you open.
+<!-- description: Choose a default, compact or hidden title bar for the game window. -->
+<!-- icon: window-maximize -->
 
-This setting applies only to Wayland game windows. The X11 runtime uses an
-unrelated native window and is unaffected.
+**Settings → General → Game window → Title bar** offers **Default**, **Compact** and **Hidden**. The choice applies to a game that is already running. Default is the default.
 
-Hidden removes the title bar without requesting fullscreen, so a tiled window
-keeps its tile. Entering and leaving fullscreen does not restore a hidden bar.
-Default remains the default for new installations.
+| Choice | What you get |
+|---|---|
+| Default | The normal header bar |
+| Compact | A shorter header bar |
+| Hidden | No title bar and no window controls. A tiled window keeps its tile, because hiding does not request fullscreen. |
 
-Window controls are absent in Hidden mode. Use your desktop's window shortcuts
-to move or close the game, and the Cordial launcher to change this preference.
-For direct `cordial-run` launches, `CORDIAL_TITLE_BAR=hidden` selects the same mode.
+- Entering and leaving fullscreen does not bring a hidden bar back.
+- With the bar hidden, use your desktop's window shortcuts to move or close the game, and the Cordial launcher to change this setting.
+- A direct `cordial-run` launch takes `CORDIAL_TITLE_BAR=hidden` for the same mode.
+
+> [!NOTE]
+> This applies only to Wayland game windows. The X11 runtime uses a native window with no Cordial title bar, so the setting does nothing there.
+
+Changing the bar resizes the canvas, which reaches the engine as an ordinary window resize. Why: [ADR-044](adr/ADR-044-settings-reach-a-running-game.md#title-bar).

@@ -144,7 +144,7 @@ pub struct Desired {
     pub plugin: Plugin,
     /// The raw grants-file entry for this id -- **not** intersected with
     /// `plugin.requested`. Matches `start_all`'s own launch-time semantics
-    /// (`docs/plugin-api.md` calls this out explicitly: "the grants file is
+    /// (`docs/plugin-api/capabilities.md` calls this out explicitly: "the grants file is
     /// authoritative, and it is not intersected with the manifest"), so a
     /// plugin whose files have not changed gets exactly what a fresh launch
     /// would have given it. The narrower, intersected set a *restart* must
@@ -305,7 +305,7 @@ pub fn diff(
 /// existing rather than the caller just reusing `Desired::granted`. A
 /// plugin's grants file is not intersected with its manifest anywhere else
 /// in this codebase -- a capability written into it by hand that the
-/// manifest never requested is granted regardless (`docs/plugin-api.md` says
+/// manifest never requested is granted regardless (`docs/plugin-api/capabilities.md` says
 /// so, under "The grants file is authoritative"). That is safe when the
 /// files on disk are the ones the user approved. It stops being safe the
 /// moment those files can change out from under a grant that was given to a

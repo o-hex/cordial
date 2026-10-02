@@ -322,6 +322,17 @@ as MDX: a `<placeholder>` goes in backticks, and code blocks are fenced, not
 indented. CI runs `mint validate` and `mint broken-links` on every change to
 `docs/`.
 
+**A user page says what to do; the ADR says why.** Every published guide page
+leads with what the feature does and how to use it, then what is broken. Use
+the components where they help the reader: steps for a procedure, tabs for
+per-install or per-distribution variants, a callout for the one thing that
+will bite, `<details>` for a full variable list or troubleshooting. Reasoning,
+history, how something was measured and retractions do not go on that page:
+add them to the ADR they belong to and link it in one line ("Why:
+[ADR-0NN](adr/...)"). Anything the reader acts on stays on the page: commands,
+paths, Settings labels, and `INFERRED` where a claim is not measured.
+[`docs/plugins-overview.md`](docs/plugins-overview.md) is the model.
+
 **The README has a length ceiling, and it is the one document here that
 does.** It is read by somebody deciding whether to install Cordial and then
 installing it, and nobody in that state reads twelve hundred lines. It reached

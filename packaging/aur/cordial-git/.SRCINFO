@@ -17,6 +17,7 @@ pkgbase = cordial-git
 	makedepends = boost
 	makedepends = lld
 	makedepends = llvm
+	makedepends = vulkan-headers
 	depends = gtk4
 	depends = libadwaita
 	depends = webkitgtk-6.0

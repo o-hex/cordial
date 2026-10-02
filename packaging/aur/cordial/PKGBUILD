@@ -112,6 +112,9 @@ makedepends=(
   'boost'
   'lld'
   'llvm'
+  # Vulkan's C headers, for the guest_vk and guest_xr layout tests check() runs:
+  # they compile a probe against them for arm64 and fail without them.
+  'vulkan-headers'
 )
 optdepends=(
   # `bwrap` is genuinely optional: sandbox.rs only ever *subtracts* from what

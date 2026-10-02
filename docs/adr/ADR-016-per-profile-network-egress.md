@@ -75,6 +75,14 @@ consult proxy environment variables on its own, so setting them would do
 nothing for the one HTTP request Cordial itself makes, before the engine
 exists to blame for anything.
 
+*Correction, 2026-10-02: that paragraph is wrong.* ureq 3's default `Config`
+takes `Proxy::try_from_env()`, which reads `ALL_PROXY`, `HTTPS_PROXY`,
+`HTTP_PROXY`, their lowercase forms and `NO_PROXY`, and Cordial overrides none
+of it (read from ureq 3.3.0's source, not run). Cordial's own requests do
+follow a proxy in the environment, verifying its certificate against ureq's
+bundled roots. The decision is unaffected: an environment variable is
+process-wide, not per profile, and the second ground below holds on its own.
+
 **Even where the engine's traffic would see it, it is not the traffic that
 matters most.** `client_settings.rs` and `android/asset.rs` both record, from
 the engine's own observed behaviour, that its HTTP stack is curl —

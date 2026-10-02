@@ -148,9 +148,21 @@
     ]
   },
   "navbar": {
+    "links": [
+      {
+        "label": "Discord",
+        "href": "https://discord.gg/qJzU3Xfr9b"
+      }
+    ],
     "primary": {
       "type": "github",
       "href": "https://github.com/luohoa97/cordial"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/luohoa97/cordial",
+      "discord": "https://discord.gg/qJzU3Xfr9b"
     }
   }
 }

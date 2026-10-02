@@ -121,6 +121,40 @@ pub fn active() -> PathBuf {
     ACTIVE.get().cloned().unwrap_or_else(|| root().join(DEFAULT_NAME))
 }
 
+pub use cordial_shell::profile::Build;
+
+static BUILD: OnceLock<Build> = OnceLock::new();
+
+/// Record which build this instance runs: the Quest build under
+/// `--guest-arm64`, the phone build otherwise. Once, before anything opens
+/// engine storage, for the same reason as [`set_active`].
+pub fn set_build(build: Build) {
+    let _ = BUILD.set(build);
+}
+
+pub fn build() -> Build {
+    BUILD.get().copied().unwrap_or(Build::Phone)
+}
+
+/// The directory this instance's engine storage hangs off: `data/` and `run/`
+/// live under it. The profile itself for the phone build, and its `quest/`
+/// for the Quest build ([ADR-053](../../../docs/adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md)).
+/// Everything that is the account -- the lock, the saved sign-in, flags,
+/// grants, the control sockets -- stays on [`active`].
+pub fn engine_root() -> PathBuf {
+    cordial_shell::profile::engine_root(&active(), build())
+}
+
+/// The engine's `files`/`cache` root: `CORDIAL_FILES_DIR` if somebody set it,
+/// otherwise `data/` under [`engine_root`]. One function rather than the five
+/// hand-written `format!`s it replaces, which is how a Quest run would
+/// otherwise have read its logs from one tree and written them to another.
+pub fn engine_data() -> PathBuf {
+    std::env::var_os("CORDIAL_FILES_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| engine_root().join("data"))
+}
+
 /// A profile name that cannot escape the profile root.
 ///
 /// Names reach this from a command line and, later, from the launcher's own UI,

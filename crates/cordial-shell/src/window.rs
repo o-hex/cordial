@@ -217,7 +217,7 @@ pub fn build(
         chooser::build(&source, move |id| {
             let Some(window) = toasts.root().and_downcast::<gtk::Window>() else { return };
             match id {
-                chooser::ROBLOX => activate_roblox(&window, &toasts, &config, &join, &lifecycle),
+                chooser::ROBLOX => activate_roblox(&window, &toasts, &config, &join, &lifecycle, Mode::Phone),
                 // Unreachable while there is one entry, and deliberately loud
                 // rather than ignored: the moment plugin-contributed entries
                 // exist, an id core does not know how to launch is a bug in the
@@ -248,10 +248,36 @@ pub fn build(
     // remainder, and the width clamp is tighter than the 480 the groups used
     // because a boxed list and a pill button stretched to a launcher's full
     // width look like a preferences page whatever is in them.
+    // Under the Roblox button, never beside it: the main button keeps its
+    // place and its look, and VR is the secondary entry (ADR-053). Absent on a
+    // host that cannot run the Quest build.
+    let vr_entry = {
+        let toasts = toasts.clone();
+        let config_for_play = config.clone();
+        let join = join.clone();
+        let lifecycle = lifecycle.clone();
+        crate::vr_entry::build(config.clone(), move || {
+            let Some(window) = toasts.root().and_downcast::<gtk::Window>() else { return };
+            activate_roblox(&window, &toasts, &config_for_play, &join, &lifecycle, Mode::Vr);
+        })
+    };
+    let refresh_vr = vr_entry.as_ref().map(|e| e.refresh.clone());
+
     let column = gtk::Box::new(gtk::Orientation::Vertical, 24);
     column.set_valign(gtk::Align::Center);
     column.append(&profile_row);
-    column.append(&chooser_widget);
+    match &vr_entry {
+        // Closer to the button it sits under than the 24 between the column's
+        // two existing controls, so it reads as part of the launch rather than
+        // a third section.
+        Some(entry) => {
+            let launch = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            launch.append(&chooser_widget);
+            launch.append(&entry.widget);
+            column.append(&launch);
+        }
+        None => column.append(&chooser_widget),
+    }
 
     let clamp = adw::Clamp::builder().maximum_size(360).child(&column).build();
     clamp.set_margin_top(24);
@@ -352,6 +378,9 @@ pub fn build(
     host.header().pack_end(&menu_button);
 
     let window = host.window().clone();
+    if let Some(refresh) = &refresh_vr {
+        crate::vr_entry::follow_window(&window, refresh.clone());
+    }
     // `HostWindow` is deliberately application-less — the runtime has no
     // `GApplication` — so the shell binary attaches its own here, which is
     // what makes the window keep `app` alive and quit with it.
@@ -416,7 +445,13 @@ pub fn build(
         }
         // The Version page can pin the profile the launcher row describes.
         let refresh = refresh_profile_row.clone();
-        settings.connect_closed(move |_| refresh());
+        let refresh_vr = refresh_vr.clone();
+        settings.connect_closed(move |_| {
+            refresh();
+            if let Some(r) = &refresh_vr {
+                r();
+            }
+        });
         // **Make room for it first, if this window has not got any.**
         //
         // Raising [`DEFAULT_WIDTH`] fixes the cramped dialog for a profile that
@@ -510,7 +545,7 @@ pub fn build(
     {
         let window = window.clone();
         let toasts = toasts.clone();
-        let config = config_for_launch;
+        let config = config_for_launch.clone();
         let join = join.clone();
         let lifecycle = lifecycle.clone();
         launch_action.connect_activate(move |_, _| {
@@ -520,7 +555,21 @@ pub fn build(
             // confirmation, build discovery or profile acquisition can return,
             // while retaining the URL for a manual retry if any of them does.
             join.invalidate_lookup(&config.borrow().profile);
-            activate_roblox(&window.clone().upcast(), &toasts, &config, &join, &lifecycle);
+            activate_roblox(&window.clone().upcast(), &toasts, &config, &join, &lifecycle, Mode::Phone);
+        });
+    }
+
+    // "Play in VR", as an action, for the same reason `win.launch` is one: the
+    // same call the button makes, reachable by name, and not a second path.
+    let launch_vr_action = gtk::gio::SimpleAction::new("launch-vr", None);
+    {
+        let window = window.clone();
+        let toasts = toasts.clone();
+        let config = config_for_launch.clone();
+        let join = join.clone();
+        let lifecycle = lifecycle.clone();
+        launch_vr_action.connect_activate(move |_, _| {
+            activate_roblox(&window.clone().upcast(), &toasts, &config, &join, &lifecycle, Mode::Vr);
         });
     }
 
@@ -592,6 +641,7 @@ pub fn build(
     actions.add_action(&about_action);
     actions.add_action(&report_action);
     actions.add_action(&launch_action);
+    actions.add_action(&launch_vr_action);
     actions.add_action(&settings_action);
     actions.add_action(&profile_action);
     actions.add_action(&fullscreen_action);
@@ -851,7 +901,7 @@ fn persist_window_size(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) 
     }
 }
 
-/// `CORDIAL_SHELL_PRESENT=settings,settings=updates,update,report,about,launch,maximise,fullscreen`
+/// `CORDIAL_SHELL_PRESENT=settings,settings=updates,update,report,about,launch,launch-vr,maximise,fullscreen`
 /// opens those windows at startup and puts the launcher into those states.
 ///
 /// A test seam, and it exists because there is no other way to photograph these
@@ -866,7 +916,7 @@ fn persist_window_size(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) 
 /// **`settings=<page>` opens Settings on a named page**, which is the same
 /// problem one level down: the window has five tabs and a photograph of it shows
 /// one. The names are the `name` each `AdwPreferencesPage` is built with —
-/// `roblox`, `updates`, `version`, `general`, `plugins`, `fastflags` — and an unknown one
+/// `roblox`, `updates`, `version`, `vr`, `general`, `plugins`, `fastflags` — and an unknown one
 /// is libadwaita's warning to answer, not this function's, because a name that
 /// silently fell back to the first page would produce a screenshot captioned as
 /// something it is not.
@@ -900,6 +950,9 @@ fn open_on_start(window: &adw::Window, update_button: &gtk::Button) {
                 "launch" => {
                     let _ = window.activate_action("win.launch", None);
                 }
+                "launch-vr" => {
+                    let _ = window.activate_action("win.launch-vr", None);
+                }
                 // Same seam, for the same reason, one property further: a
                 // window-state round trip cannot be checked without putting the
                 // window into a state, and maximising is not something an agent
@@ -908,6 +961,8 @@ fn open_on_start(window: &adw::Window, update_button: &gtk::Button) {
                 "fullscreen" => {
                     let _ = window.activate_action("win.fullscreen", None);
                 }
+                // Read by Settings → VR itself, once that page exists.
+                "vr-pull" => {}
                 other => println!("  shell: CORDIAL_SHELL_PRESENT does not know {other:?}"),
             }
         }
@@ -926,6 +981,7 @@ fn activate_roblox(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
     lifecycle: &LaunchLifecycle,
+    mode: Mode,
 ) {
     // Root gets one warning before it costs an hour. See `root_warning`: no
     // session bus means no PipeWire, and the engine calls `abort()` at
@@ -940,7 +996,7 @@ fn activate_roblox(
         let join = join.clone();
         let lifecycle = lifecycle.clone();
         root_warning::confirm(&window.clone(), move || {
-            launch_now_tracked(&window, &toasts, &config, &join, &lifecycle);
+            launch_now_tracked(&window, &toasts, &config, &join, &lifecycle, mode);
         });
         return;
     }
@@ -964,12 +1020,12 @@ fn activate_roblox(
         let join = join.clone();
         let lifecycle = lifecycle.clone();
         multi_instance_warning::confirm(&window.clone(), &config_for_dialog, move || {
-            launch_now_tracked(&window, &toasts, &config, &join, &lifecycle);
+            launch_now_tracked(&window, &toasts, &config, &join, &lifecycle, mode);
         });
         return;
     }
 
-    launch_now_tracked(window, toasts, config, join, lifecycle);
+    launch_now_tracked(window, toasts, config, join, lifecycle, mode);
 }
 
 /// The launch itself, once anything that had to be asked has been.
@@ -979,8 +1035,9 @@ fn launch_now_tracked(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
     lifecycle: &LaunchLifecycle,
+    mode: Mode,
 ) {
-    match try_launch_tracked(window, config, join, lifecycle) {
+    match try_launch_tracked(window, config, join, lifecycle, mode) {
         Outcome::Started => {}
         Outcome::Failed(message) => {
             window.present();
@@ -988,7 +1045,7 @@ fn launch_now_tracked(
         }
         Outcome::ProfileBusy(name, holder) => {
             window.present();
-            profile_busy(window, toasts, config, join, lifecycle, &name, holder)
+            profile_busy(window, toasts, config, join, lifecycle, mode, &name, holder)
         }
         Outcome::ProfileChanged => {
             window.present();
@@ -1006,7 +1063,7 @@ fn launch_now_tracked(
                 // Returning whether it worked is what lets the instructions
                 // window stay up while the user is still following them.
                 matches!(
-                    try_launch_tracked(&window, &config, &join, &lifecycle),
+                    try_launch_tracked(&window, &config, &join, &lifecycle, mode),
                     Outcome::Started
                 )
             });
@@ -1021,7 +1078,17 @@ fn launch_now(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
 ) {
-    launch_now_tracked(window, toasts, config, join, &LaunchLifecycle::default());
+    launch_now_tracked(window, toasts, config, join, &LaunchLifecycle::default(), Mode::Phone);
+}
+
+/// Which build a press of a launch control starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The phone build, through GameActivity: the Roblox button.
+    Phone,
+    /// The Quest build, under the translator, in an OpenXR session: "Play in
+    /// VR" (ADR-053).
+    Vr,
 }
 
 enum Outcome {
@@ -1051,11 +1118,30 @@ fn try_launch_tracked(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
     lifecycle: &LaunchLifecycle,
+    mode: Mode,
 ) -> Outcome {
     let (roblox, profile_name) = {
         let config = config.borrow();
         (config.roblox.clone(), config.profile.clone())
     };
+
+    // "Play in VR" takes the Quest build the user imported, and nothing
+    // about the phone build -- its location, its pin, the instructions for
+    // getting one -- applies to it. Re-checked here rather than trusted from
+    // the button, because the button's state was gathered when it was drawn.
+    if mode == Mode::Vr {
+        let readiness = cordial_shell::vr::Readiness::gather(config.borrow().vr_openxr_runtime.as_deref());
+        if !readiness.ready() {
+            return Outcome::Failed(readiness.missing().join("\n\n"));
+        }
+        let entry = readiness.quest_build.clone().expect("ready means a Quest build is present");
+        let Some(apk) = entry.base_apk() else {
+            return Outcome::Failed(format!("The Quest build in {} has no APK beside it.", entry.dir.display()));
+        };
+        let build = install::Build { apk, lib_dir: entry.dir.clone() };
+        let vr = Some(launch::VrLaunch { openxr_runtime: readiness.manifest_for_launch() });
+        return start(window, join, lifecycle, &profile_name, build, vr);
+    }
 
     let build = match install::locate(&roblox) {
         Ok(build) => build,
@@ -1076,12 +1162,26 @@ fn try_launch_tracked(
         Err(NotFound::NoBuild) => return Outcome::NoBuild,
         Err(NotFound::Unusable(message)) => return Outcome::Failed(message),
     };
+    start(window, join, lifecycle, &profile_name, build, None)
+}
 
+/// From the profile's claim to a running client, for either build.
+fn start(
+    window: &gtk::Window,
+    join: &PendingJoin,
+    lifecycle: &LaunchLifecycle,
+    profile_name: &str,
+    build: install::Build,
+    vr: Option<launch::VrLaunch>,
+) -> Outcome {
     // ADR-012's claim, taken before the process exists so that a refusal
     // costs nothing. A second window on one profile is two processes writing
     // one cookie store; the message names the profile because "already open"
     // on its own does not tell anyone which one to close.
-    let claim = match profile::acquire(&profile_name) {
+    // One lock for both builds: the Quest build's storage lives inside the
+    // same profile directory, so a VR launch and an ordinary one on one
+    // profile contend for the same `.lock` (ADR-053).
+    let claim = match profile::acquire(profile_name) {
         Ok(claim) => claim,
         Err(profile::Error::Busy(name, holder)) => return Outcome::ProfileBusy(name, holder),
         Err(e) => return Outcome::Failed(e.to_string()),
@@ -1092,7 +1192,7 @@ fn try_launch_tracked(
     // saved values changed in between, the name no longer identifies the
     // session that was authenticated. Returning drops the claim before manual
     // recovery.
-    let secret_store = match join.matched_store_if_current(&profile_name, claim.profile_dir()) {
+    let secret_store = match join.matched_store_if_current(profile_name, claim.profile_dir()) {
         Ok(store) => store,
         Err(()) => {
             join.clear_profile_match();
@@ -1111,6 +1211,7 @@ fn try_launch_tracked(
             run_seconds: run_seconds_override(),
             join_url: url.as_deref(),
             secret_store,
+            vr,
         },
     ) {
         Ok(instance) => instance,
@@ -1309,6 +1410,7 @@ fn profile_busy(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
     lifecycle: &LaunchLifecycle,
+    mode: Mode,
     name: &str,
     holder: Option<profile::Holder>,
 ) {
@@ -1363,6 +1465,7 @@ fn profile_busy(
                     config.clone(),
                     join.clone(),
                     lifecycle.clone(),
+                    mode,
                     h,
                 );
             }
@@ -1423,6 +1526,7 @@ fn close_then_launch(
     config: Rc<RefCell<ShellConfig>>,
     join: PendingJoin,
     lifecycle: LaunchLifecycle,
+    mode: Mode,
     holder: profile::Holder,
 ) {
     if let Err(message) = holder.ask_to_stop() {
@@ -1440,7 +1544,7 @@ fn close_then_launch(
 
     glib::timeout_add_local(STOP_POLL, move || {
         if holder.has_exited() {
-            activate_roblox(&window, &toasts, &config, &join, &lifecycle);
+            activate_roblox(&window, &toasts, &config, &join, &lifecycle, mode);
             return glib::ControlFlow::Break;
         }
         waited.set(waited.get() + STOP_POLL);

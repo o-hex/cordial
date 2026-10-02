@@ -1,0 +1,13 @@
+[package]
+name = "cordial-guest"
+description = "Runs arm64 guest code on an x86-64 host through dynarmic (docs/vr/dynarmic-design.md)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "cordial_guest_shim"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+cmake = "0.1"

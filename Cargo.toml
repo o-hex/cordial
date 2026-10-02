@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cordial-linker-sys",
+    "crates/cordial-guest",
     "crates/cordial-runtime",
     "crates/cordial-plugins",
     "crates/cordial-shell",

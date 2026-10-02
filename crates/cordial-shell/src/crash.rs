@@ -117,11 +117,12 @@ pub fn describe(status: &std::process::ExitStatus) -> String {
 /// output) or the Flatpak is missing the driver the host runs, which is a fact
 /// about the install and not a guess about the crash. Each says "may". The
 /// wording, the evidence and the tests live in `cordial_shell::nvidia`.
-fn description(status: &std::process::ExitStatus, output: &str) -> String {
+fn description(status: &std::process::ExitStatus, output: &str, command_line: &str) -> String {
     let mut text = describe(status);
     let extra = [
         cordial_shell::nvidia::crash_hint(output),
         cordial_shell::nvidia::flatpak_gl_here().advice(),
+        cordial_shell::vr::crash_hint(command_line),
     ];
     for hint in extra.into_iter().flatten() {
         text.push_str("\n\n");
@@ -144,7 +145,7 @@ pub fn present(
     let status_page = adw::StatusPage::builder()
         .icon_name("dialog-error-symbolic")
         .title("Roblox stopped unexpectedly")
-        .description(description(status, output))
+        .description(description(status, output, command_line))
         .build();
 
     let body = gtk::Box::new(gtk::Orientation::Vertical, 12);

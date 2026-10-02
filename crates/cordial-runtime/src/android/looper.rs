@@ -1392,6 +1392,15 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
             // reach the engine at all. Backgrounding the window should slow the
             // game down, not drop a button press.
             super::gamepad::poll();
+        } else {
+            super::pump_window_only();
+            // The control socket under `--app-bridge`, with 0 for the handle.
+            // It was only ever drained in the arm above, so a `click` or
+            // `text` sent to a VR client queued and never ran, and nothing
+            // could focus or type into a box there. 0 is the same "no
+            // activity" every AGDK entry point already refuses by name; the
+            // plain JNI natives each verb also drives do not take one.
+            crate::devctl::apply_queued(0);
         }
         looper_poll_once(
             if watching { 50 } else { 8 },
@@ -1420,6 +1429,10 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
         // callback would re-enter it. One acquire load when no link is waiting,
         // which is every ordinary launch.
         crate::deeplink::tick();
+
+        // A `Game.launch` the app shell published, answered from this thread
+        // for the same reason: the bus delivered it on the engine's own.
+        crate::game_launch::tick();
 
         // Text the engine asked to have put on the clipboard, for the third
         // time the same reason: the engine publishes on whichever thread the

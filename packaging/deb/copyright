@@ -7,7 +7,8 @@ Source: https://github.com/luohoa97/cordial
 # installed alongside this file as a standalone notice -- see
 # packaging/deb/build-deb.sh, which stages
 # usr/share/doc/cordial/{NOTICE,libbadcpu-MIT.txt,mcpelauncher-linker-MIT.txt,
-# aosp-NOTICE.txt,libjnivm-MIT.txt,mocktail-webview-Apache-2.0.txt} next to
+# aosp-NOTICE.txt,libjnivm-MIT.txt,mocktail-webview-Apache-2.0.txt, and the
+# dynarmic files named below} next to
 # this file. That mirrors THIRD-PARTY-NOTICES.md, which is the long form of
 # the same list and is installed as usr/share/doc/cordial/THIRD-PARTY-NOTICES.md.
 # GPL-3.0-or-later is the one licence every Debian and Ubuntu install already
@@ -52,6 +53,59 @@ Comment:
  usr/share/doc/cordial/NOTICE, and Apache-2.0 section 4(d), which requires
  that file to travel with a binary distribution and not only with source.
  Full licence text at usr/share/doc/cordial/mocktail-webview-Apache-2.0.txt.
+
+Files: third_party/dynarmic/*
+Copyright: 2017 merryhime
+License: 0BSD
+Comment:
+ The arm64 recompiler behind the VR mode, compiled into x86-64 builds only.
+ Full text at usr/share/doc/cordial/dynarmic-0BSD.txt.
+
+Files: third_party/dynarmic/externals/fmt/*
+Copyright: 2012 - present, Victor Zverovich and {fmt} contributors
+License: MIT
+Comment:
+ Full text at usr/share/doc/cordial/fmt-MIT.txt.
+
+Files: third_party/dynarmic/externals/mcl/*
+Copyright: 2022 merryhime
+License: MIT
+Comment:
+ Full text at usr/share/doc/cordial/mcl-MIT.txt.
+
+Files: third_party/dynarmic/externals/robin-map/*
+Copyright: 2017 Thibaut Goetghebuer-Planchon
+License: MIT
+Comment:
+ Full text at usr/share/doc/cordial/robin-map-MIT.txt.
+
+Files: third_party/dynarmic/externals/xbyak/*
+Copyright: 2007 MITSUNARI Shigeo
+License: BSD-3-Clause
+Comment:
+ Full text at usr/share/doc/cordial/xbyak-BSD-3-Clause.txt.
+
+Files: third_party/dynarmic/externals/zydis/* third_party/dynarmic/externals/zycore/*
+Copyright: 2014-2024 Florian Bernd
+License: MIT
+Comment:
+ Full texts at usr/share/doc/cordial/zydis-MIT.txt and zycore-MIT.txt.
+
+License: 0BSD
+ Permission to use, copy, modify, and/or distribute this software for any
+ purpose with or without fee is hereby granted.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+ REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+ AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+ INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+ LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+ OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+ PERFORMANCE OF THIS SOFTWARE.
+
+License: BSD-3-Clause
+ The full text, with its copyright line, is at
+ usr/share/doc/cordial/xbyak-BSD-3-Clause.txt.
 
 License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy

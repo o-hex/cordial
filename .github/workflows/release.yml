@@ -18,7 +18,7 @@
 # None of the four jobs below fetch, embed or reference any Roblox material.
 # Every one of them builds Cordial's own source (plus the same third-party OSS
 # Cordial always depends on -- libbadcpu, mcpelauncher-linker, libjnivm,
-# mocktail-webview) and nothing else; the resulting packages start, find no
+# mocktail-webview, and on x86-64 dynarmic with its externals) and nothing else; the resulting packages start, find no
 # Roblox build, and say so, exactly like every other packaging format already
 # does. See AGENTS.md, "Permanently out of scope".
 #
@@ -193,7 +193,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             git ca-certificates curl build-essential clang cmake pkg-config \
-            binutils llvm lld \
+            binutils llvm lld libboost-dev \
             libssl-dev \
             libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev \
             libpipewire-0.3-dev libpulse-dev libasound2-dev \
@@ -316,7 +316,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             git ca-certificates curl build-essential clang cmake pkg-config \
-            binutils libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev \
+            binutils libboost-dev libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev \
             libpipewire-0.3-dev libpulse-dev libasound2-dev zlib1g-dev \
             desktop-file-utils
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \

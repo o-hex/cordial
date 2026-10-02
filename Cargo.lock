@@ -300,6 +300,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cordial-guest"
+version = "0.23.2"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "cordial-linker-sys"
 version = "0.23.2"
 dependencies = [
@@ -328,6 +335,7 @@ dependencies = [
 name = "cordial-runtime"
 version = "0.23.2"
 dependencies = [
+ "cordial-guest",
  "cordial-linker-sys",
  "cordial-plugins",
  "cordial-shell",

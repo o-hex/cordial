@@ -82,8 +82,23 @@ sharing an address. The risk is collateral rather than causal.
 - **Does VR work inside a joined place?** This is the one VR question left, and
   it is here because it needs a signed-in client in an experience. Everything
   reachable signed out has been measured — see below.
+  *Answered 2026-10-01, for a different build:* the Meta Quest build under the
+  in-process translator runs in a joined place at 44 to 65 frames/s on Monado's
+  simulated HMD ([ADR-053](adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md)).
+  The phone build in a joined place is still untested.
 
 ## VR: five routes measured, all negative, one gap left (2026-09-16)
+
+*Corrected 2026-10-01:* the five routes were measured on the x86-64 phone build and
+were negative for it. VR now runs through Roblox's Meta Quest build instead: the x86-64
+`cordial-run` links its arm64 engine, runs it under dynarmic and bridges its OpenXR and
+Vulkan calls to the host (`--guest-arm64 --app-bridge`). The engine constructs its VR
+device through ordinary OpenXR once a runtime is present, with nothing written into it,
+and reached `FOCUSED` at 89.95 to 90.00 `xrEndFrame`/s at 90 Hz on Monado's simulated
+HMD's landing panel, 44 to 65 in game. Nothing has been measured on WiVRn or on a real
+headset. See [ADR-053](adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md),
+[`vr.md`](vr.md) and [`vr/dynarmic-design.md`](vr/dynarmic-design.md). The record
+below is kept as the phone build's history.
 
 Worth reading before anyone spends a week on it. `docs/analysis/vr-reachability.md`
 is the full record; this is the shape of it.
@@ -116,6 +131,18 @@ is known rather than guessed: `libroblox.so` creates its own Vulkan device and
 `android/vulkan.rs` only interposes, so OpenXR owning creation means reversing
 that layer and filtering `vkEnumeratePhysicalDevices`, which is not intercepted
 at all today.
+
+*Corrected 2026-10-01:* the paragraph above had no code behind it. No branch
+contained any OpenXR code when it was written: `git log --all -S` for
+`xrCreateVulkanDeviceKHR` finds only the commit that added this paragraph
+(`89e46ce`, which changed this file alone) and the cordial-vr fork's bridge
+(`b038aaa`, 2026-09-30), and `XR_REFERENCE_SPACE_TYPE_STAGE` and `openxr/openxr.h`
+appear in nothing earlier than the fork. "The only demonstrated way to construct a
+device" above is also no longer true. What now exists is the fork's: the Quest engine
+itself creates its Vulkan device through `xrCreateVulkanDeviceKHR`, which
+`guest_xr.rs` passes to the host runtime with Cordial's own `vkGetInstanceProcAddr`,
+rather than Cordial taking device creation over from the engine. Hand tracking and
+scripted poses over Monado's `remote` driver have not been done.
 
 ## Releases, and how they reach people
 
@@ -1266,11 +1293,11 @@ superseded by 024, which restores X11).
 | [ADR-036](adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md) | The unsafe/safe boundary is a lint, not a convention | Accepted, 2026-09-16 |
 | [ADR-037](adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md) | The build store's three writers share one lock, and an entry now proves its own bytes | Accepted, implemented |
 | [ADR-038](adr/ADR-038-plugin-hot-swap.md) | A running client reconciles its plugin set; nothing pushes to it | Accepted |
-| [ADR-039](adr/ADR-039-a-runtime-backend-seam-and-why-macos-waits.md) | A runtime-backend seam is cheap to describe and not worth building yet | Accepted, no code changes |
+| [ADR-039](adr/ADR-039-a-runtime-backend-seam-and-why-macos-waits.md) | A runtime-backend seam is cheap to describe and not worth building yet | Accepted, no code changes; its "do not build a translation layer" quotation corrected for the Quest build by ADR-053 |
 | [ADR-040](adr/ADR-040-the-engine-already-runs-mimalloc.md) | The engine already runs mimalloc, so there is no allocator to switch | Accepted |
 | [ADR-041](adr/ADR-041-vkbasalt-post-processing.md) | vkBasalt post-processing is a driver-stack layer, not in-process hooking | Accepted |
 | [ADR-042](adr/ADR-042-texture-format-query-observability.md) | Vulkan texture-format queries are counted and, test-only, maskable — nothing is translated | Accepted |
-| [ADR-043](adr/ADR-043-the-roblox-build-is-the-binarys-architecture.md) | The Roblox build's architecture is the binary's; choosing another needs a second runtime, so Settings shows it read-only | Accepted |
+| [ADR-043](adr/ADR-043-the-roblox-build-is-the-binarys-architecture.md) | The Roblox build's architecture is the binary's; choosing another needs a second runtime, so Settings shows it read-only | Accepted; decision 5 and the premise of decision 3 superseded by ADR-053 |
 | [ADR-044](adr/ADR-044-settings-reach-a-running-game.md) | Settings that can change reach a running game over a small socket; the rest say "Applies at next launch" | Accepted |
 
 ## A whole class of bug: hooks that register and never bind

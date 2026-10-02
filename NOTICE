@@ -59,3 +59,15 @@ they have changed. Cordial's derived work states its origin in its own header
 rather than only here, because a NOTICE at the repository root is not where
 somebody reading a source file looks.
 -------------------------------------------------------------------------------
+OpenXR headers
+Copyright 2017-2025 The Khronos Group Inc.
+Licensed under the Apache License, Version 2.0 or the MIT License, at your option.
+https://github.com/KhronosGroup/OpenXR-SDK
+
+third_party/openxr/include/openxr/ holds openxr.h, openxr_platform.h and
+openxr_platform_defines.h from OpenXR-SDK release-1.1.47, unmodified. They are
+not compiled into any binary: the OpenXR layout-diff gate
+(crates/cordial-runtime/src/guest_xr.rs) compiles its probe against them, and
+tools/vr/gen-guest-xr.py generates the guest's OpenXR tables from the matching
+xr.xml, which is not vendored. Each header carries its SPDX line.
+-------------------------------------------------------------------------------

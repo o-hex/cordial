@@ -100,6 +100,10 @@
               echo "error: third_party/libjnivm (a git submodule) has no content in this source tree; see above." >&2
               exit 1
             fi
+            if [ ! -f third_party/dynarmic/externals/xbyak/xbyak/xbyak.h ]; then
+              echo "error: third_party/dynarmic or its externals (git submodules) have no content in this source tree; see above." >&2
+              exit 1
+            fi
           '';
 
           # The committed lockfile, not a `cargoHash`. Worked on the first
@@ -204,6 +208,10 @@
             # `-lz` on cordial-linker-sys's native link line
             # (`cargo:rustc-link-lib=dylib=z`); glibc does not bundle zlib.
             zlib
+
+            # Headers only, for dynarmic (crates/cordial-guest, the VR
+            # mode's translator), which find_package()s Boost.
+            boost
           ];
 
           # Both crates' `webview` feature, and both, not one. The shell
@@ -367,6 +375,21 @@
               "$out/share/licenses/cordial/libjnivm-MIT.txt"
             install -Dm644 third_party/mocktail-webview/LICENSE \
               "$out/share/licenses/cordial/mocktail-webview-Apache-2.0.txt"
+            # dynarmic and its compiled-in externals, the VR translator.
+            install -Dm644 third_party/dynarmic/LICENSE.txt \
+              "$out/share/licenses/cordial/dynarmic-0BSD.txt"
+            install -Dm644 third_party/dynarmic/externals/fmt/LICENSE \
+              "$out/share/licenses/cordial/fmt-MIT.txt"
+            install -Dm644 third_party/dynarmic/externals/mcl/LICENSE \
+              "$out/share/licenses/cordial/mcl-MIT.txt"
+            install -Dm644 third_party/dynarmic/externals/robin-map/LICENSE \
+              "$out/share/licenses/cordial/robin-map-MIT.txt"
+            install -Dm644 third_party/dynarmic/externals/xbyak/COPYRIGHT \
+              "$out/share/licenses/cordial/xbyak-BSD-3-Clause.txt"
+            install -Dm644 third_party/dynarmic/externals/zydis/LICENSE \
+              "$out/share/licenses/cordial/zydis-MIT.txt"
+            install -Dm644 third_party/dynarmic/externals/zycore/LICENSE \
+              "$out/share/licenses/cordial/zycore-MIT.txt"
           '';
 
           meta = {
@@ -418,6 +441,12 @@
             # them means everyone builds the same Cordial.
             pipewire
             webkitgtk_6_0
+
+            # dynarmic's Boost headers, and lld and llvm for
+            # cordial-guest's arm64 test image.
+            boost
+            lld
+            llvm
           ];
 
           shellHook = ''

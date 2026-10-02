@@ -1,0 +1,27 @@
+diff --git a/linker/linker.cpp b/linker/linker.cpp
+index 5cc42383b..ea03059e6 100644
+--- a/linker/linker.cpp
++++ b/linker/linker.cpp
+@@ -3196,7 +3196,13 @@ bool soinfo::prelink_image() {
+         return false;
+ 
+ #endif
+-#if 0
++      // Cordial: these were compiled out as `#if 0` in the port, though
++      // `relocate_relr` and its call in linker_relocate.cpp were kept. A library
++      // packed with RELR then loaded with every relative pointer left as a bare
++      // file offset and died at its first constructor: the Quest build's
++      // `libovrplatformloader.so` has one `.init_array` entry, stored as 0xcec64
++      // and covered by its `.relr.dyn`, and qemu reported SIGSEGV at exactly
++      // 0xcec64. Upstream bionic parses these tags; so does this again.
+       case DT_RELR:
+       case DT_ANDROID_RELR:
+         relr_ = reinterpret_cast<ElfW(Relr)*>(load_bias + d->d_un.d_ptr);
+@@ -3214,7 +3220,6 @@ bool soinfo::prelink_image() {
+           return false;
+         }
+         break;
+-#endif
+       // Ignored (see DT_RELCOUNT comments for details).
+       // There is no DT_RELRCOUNT specifically because it would only be ignored.
+       case DT_ANDROID_RELRCOUNT:

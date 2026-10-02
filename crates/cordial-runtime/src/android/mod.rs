@@ -31,6 +31,7 @@ pub mod vulkan;
 pub mod vulkan_etc;
 pub mod wayland;
 pub mod window;
+pub mod xr_mirror;
 
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -396,6 +397,15 @@ pub fn pump_input_events(handle: i64) {
     match backend() {
         Backend::Wayland => wayland::pump_input_events(handle),
         Backend::X11 => window::pump_input_events(handle),
+    }
+}
+
+/// Keep the window itself alive when there is no GameActivity to feed, as
+/// under `--app-bridge`. Wayland only: the X11 window has no toolkit loop of
+/// its own to starve.
+pub fn pump_window_only() {
+    if let Backend::Wayland = backend() {
+        wayland::pump_window_only();
     }
 }
 

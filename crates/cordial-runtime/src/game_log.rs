@@ -325,15 +325,13 @@ fn newest_log(dir: &Path) -> Option<PathBuf> {
 
 /// Where the engine writes its logs, for this profile.
 ///
-/// The same expression `load.rs` uses to build the tree in the first place:
-/// `CORDIAL_FILES_DIR` when set, otherwise `<profile>/data`. Repeated rather
-/// than shared because the two are the same fact from opposite ends -- one
-/// creates the directory and one reads it -- and a helper spanning a binary
-/// and its library would be the wrong shape for one `format!`.
+/// The same root `load.rs` builds the tree under, from the same function:
+/// `CORDIAL_FILES_DIR` when set, otherwise `data/` under the profile's engine
+/// root. This used to repeat the `format!`, which was fine while there was one
+/// layout and would have read a Quest run's logs from the phone build's tree
+/// once there were two (ADR-053).
 fn logs_dir() -> PathBuf {
-    let root = std::env::var("CORDIAL_FILES_DIR")
-        .unwrap_or_else(|_| format!("{}/data", crate::profile::active().display()));
-    PathBuf::from(root).join("files/appData/logs")
+    crate::profile::engine_data().join("files/appData/logs")
 }
 
 /// `CORDIAL_CLOSE_ON_LEAVE=1` — exit when the user leaves a game.

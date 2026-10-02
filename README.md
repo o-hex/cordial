@@ -26,6 +26,17 @@ Roblox **DOORS**, unmodified, on Cordial.
 [Full size](https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-doors.mp4),
 more in [`docs/media`](docs/media).
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-vr.webp"
+       alt="Roblox's Meta Quest build in VR on Linux, playing TUNNELER"
+       width="360">
+</p>
+
+Roblox's **Meta Quest** build in VR on Linux, playing
+[TUNNELER](https://www.roblox.com/games/4635669637/TUNNELER).
+[Full size](https://raw.githubusercontent.com/luohoa97/cordial/main/docs/media/cordial-vr.mp4);
+setting it up is in [`docs/vr.md`](docs/vr.md).
+
 ## Why Cordial
 
 I used Sober for a year, and it worked really well. Cordial started off as a weekend project because I was bored, and I believe a project like this is something people have the right to read, modify, and learn from.
@@ -165,6 +176,10 @@ binary is quietly less capable. The Nix flake's package builds and runs
 wherever `CORDIAL_FLAGS` points. Settings → FastFlags → Import reads a
 Bloxstrap, Fishstrap or Sober list (`cordial --import-flags` does it from a
 terminal). Layering, syntax and import: [`docs/fastflags.md`](docs/fastflags.md).
+
+**VR (experimental, x86-64).** Play in VR runs the Meta Quest build of Roblox,
+copied from your own headset, through an OpenXR runtime such as WiVRn. See
+[`docs/vr.md`](docs/vr.md).
 
 **Something not working?** `cordial --doctor` checks the display, GPU and
 Vulkan, sound, keyring and the Roblox build, with what to do about each; Report

@@ -862,6 +862,13 @@ pub fn tick() {
     if std::env::var_os("CORDIAL_DEEPLINK_PROBE").is_some() {
         println!("[deeplink] (app ready) {GAME_LAUNCH} is: {launched:?}");
     }
+    if launched.is_none() && crate::game_launch::arrived() {
+        println!(
+            "[deeplink] the app shell asked to launch an experience; the link reached the engine \
+             (Game.launch went to the app-bridge subscriber, so the bus holds no copy to read back)"
+        );
+        return;
+    }
     match (launched, cold_start_flag(lib)) {
         (Some(_), _) => println!(
             "[deeplink] the app shell asked to launch an experience; the link reached the engine"

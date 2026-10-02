@@ -348,16 +348,43 @@ cond_op!(cond_broadcast, pthread_cond_broadcast);
 /// # Safety
 ///
 /// `cond` must be a bionic `pthread_cond_t` this module has already seen
-/// (statically- or explicitly-initialised); `mutex` must point at storage the
-/// size of bionic's `pthread_mutex_t` (40 bytes), which is layout-identical to
-/// glibc's on x86-64 and so passes straight through.
+/// (statically- or explicitly-initialised); `mutex` must point at a bionic
+/// `pthread_mutex_t` (40 bytes). See [`wait_mutex`] for which object glibc is
+/// actually handed.
 pub unsafe extern "C" fn cond_wait(cond: *mut c_void, mutex: *mut c_void) -> c_int {
     let Some(backing) = cond_backing(cond) else {
         return libc_einval();
     };
-    // SAFETY: `mutex` is a bionic pthread_mutex_t, which is layout-identical to
-    // glibc's on x86-64 (both 40 bytes) and so passes straight through.
+    let Some(mutex) = wait_mutex(mutex) else {
+        return libc_einval();
+    };
+    // SAFETY: `mutex` is glibc's own mutex: the bionic object itself on x86-64,
+    // where the two layouts agree, and its backing object on aarch64.
     unsafe { pthread_cond_wait(backing, mutex) }
+}
+
+/// The mutex glibc's condition-variable wait should release and retake.
+///
+/// On aarch64 this has to be the wrapper's backing object, never the bionic
+/// `pthread_mutex_t` itself. Passing the bionic object through -- which is
+/// what this did while the comment above it said "layout-identical to glibc's
+/// on x86-64" -- let glibc "unlock" memory nobody had locked, wait, and then
+/// lock it in glibc's own encoding, while the backing mutex the caller really
+/// held stayed locked for the whole wait. The next wrapped operation found
+/// `__lock=2` and the waiter's tid in words bionic reserves, refused them as
+/// corruption with EINVAL, and libc++ turned that into an uncaught
+/// `std::system_error("mutex lock failed")` and `abort()`. Seen on the Quest
+/// build's first app-bridge run under qemu-aarch64, four runs of four, 125 s
+/// in; the words, reported by `report_mutex_failure`, were `0x00000002 0xfc001e00 0x00020754`.
+fn wait_mutex(mutex: *mut c_void) -> Option<*mut c_void> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        mutex_backing(mutex)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        (!mutex.is_null()).then_some(mutex)
+    }
 }
 
 /// # Safety
@@ -370,6 +397,9 @@ pub unsafe extern "C" fn cond_timedwait(
     abstime: *const c_void,
 ) -> c_int {
     let Some(backing) = cond_backing(cond) else {
+        return libc_einval();
+    };
+    let Some(mutex) = wait_mutex(mutex) else {
         return libc_einval();
     };
     // SAFETY: as above; `struct timespec` is identical between the two libcs.
@@ -639,14 +669,40 @@ fn mutex_backing(mutex: *mut c_void) -> Option<*mut c_void> {
     (!backing.is_null()).then_some(backing)
 }
 
+/// Say what a failing mutex operation saw, on stderr, every time.
+///
+/// libc++'s `std::mutex::lock` turns any nonzero return into
+/// `std::system_error("mutex lock failed")`, which the engine does not catch,
+/// so the first sign of a failure here used to be a bare `abort()` with no
+/// message -- the Quest build's first app-bridge run under qemu died exactly
+/// that way, and only a stack scan found the string. It fires only on the
+/// path that is about to end the process, so it costs nothing otherwise.
+#[cfg(target_arch = "aarch64")]
+fn report_mutex_failure(op: &str, mutex: *mut c_void, rc: c_int) {
+    let words = if mutex.is_null() {
+        String::from("null")
+    } else {
+        // SAFETY: bionic's contract is a pointer to a 40-byte pthread_mutex_t.
+        let w = unsafe { std::slice::from_raw_parts(mutex as *const u32, 10) };
+        w.iter().map(|x| format!("{x:#010x}")).collect::<Vec<_>>().join(" ")
+    };
+    eprintln!("[pthread] {op}({mutex:p}) -> {rc}; bionic words: {words}");
+}
+
 #[cfg(target_arch = "aarch64")]
 macro_rules! mutex_op {
     ($name:ident, $glibc:ident) => {
         pub extern "C" fn $name(mutex: *mut c_void) -> c_int {
             let Some(backing) = mutex_backing(mutex) else {
+                report_mutex_failure(stringify!($glibc), mutex, libc_einval());
                 return libc_einval();
             };
-            unsafe { $glibc(backing) }
+            let rc = unsafe { $glibc(backing) };
+            // EBUSY is trylock's ordinary answer, not a failure.
+            if rc != 0 && rc != 16 {
+                report_mutex_failure(stringify!($glibc), mutex, rc);
+            }
+            rc
         }
     };
 }
@@ -1117,6 +1173,56 @@ mod tests {
         {
             assert_eq!(std::mem::size_of::<BionicMutex>(), 40);
             assert_eq!(std::mem::size_of::<BionicAttr>(), 56);
+        }
+    }
+
+    /// A timed wait must release and retake the mutex the caller actually
+    /// holds, and leave the bionic object as the wrapper left it. On aarch64
+    /// the bionic object used to reach glibc directly -- see [`wait_mutex`] --
+    /// and the unlock after the wait then failed with EINVAL.
+    #[test]
+    fn cond_timedwait_keeps_the_mutex_usable() {
+        let mut cond_storage = [0u64; 6];
+        let mut mutex_storage = [0u64; 5];
+        let cond = cond_storage.as_mut_ptr() as *mut c_void;
+        let mutex = mutex_storage.as_mut_ptr() as *mut c_void;
+        let lock = mutex_lock_for_test(mutex);
+        assert_eq!(lock, 0);
+        // An absolute CLOCK_REALTIME deadline already in the past: the wait
+        // releases the mutex, times out at once and retakes it.
+        let ts = [0i64, 0i64];
+        let rc = unsafe { cond_timedwait(cond, mutex, ts.as_ptr() as *const c_void) };
+        assert_eq!(rc, 110, "ETIMEDOUT");
+        assert_eq!(mutex_unlock_for_test(mutex), 0);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(mutex_storage[0] as u32, READY);
+    }
+
+    fn mutex_lock_for_test(m: *mut c_void) -> c_int {
+        #[cfg(target_arch = "aarch64")]
+        {
+            mutex_lock(m)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            extern "C" {
+                fn pthread_mutex_lock(mutex: *mut c_void) -> c_int;
+            }
+            unsafe { pthread_mutex_lock(m) }
+        }
+    }
+
+    fn mutex_unlock_for_test(m: *mut c_void) -> c_int {
+        #[cfg(target_arch = "aarch64")]
+        {
+            mutex_unlock(m)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            extern "C" {
+                fn pthread_mutex_unlock(mutex: *mut c_void) -> c_int;
+            }
+            unsafe { pthread_mutex_unlock(m) }
         }
     }
 

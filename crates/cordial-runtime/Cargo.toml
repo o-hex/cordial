@@ -20,6 +20,13 @@ path = "src/bin/load.rs"
 [features]
 webview = ["cordial-shell/webview"]
 
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+# The arm64 guest: the Quest build's libroblox.so linked into this x86-64
+# process and run through dynarmic (docs/vr/dynarmic-design.md). x86-64 only
+# because dynarmic's A64 frontend has no arm64 host backend; the aarch64
+# build runs the engine natively instead.
+cordial-guest = { path = "../cordial-guest" }
+
 [dependencies]
 cordial-linker-sys = { path = "../cordial-linker-sys" }
 cordial-plugins = { path = "../cordial-plugins" }

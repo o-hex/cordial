@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+include!("../../patches/apply.rs");
+
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -14,11 +16,28 @@ fn main() {
         );
     }
 
+    // The loader patches that change behaviour rather than add a trace:
+    // 0005 so a RELR-packed library is relocated at all, 0006 so the x86-64
+    // client can link the Quest build's arm64 objects for the translator
+    // (inert until `--guest-arm64` sets a guest machine). In that order, since
+    // 0006 is made against 0005. patches/README.md has both, and
+    // patches/apply.rs why the loader is compiled from a patched overlay
+    // under OUT_DIR rather than from the submodule.
+    let linker = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("mcpelauncher-linker");
+    patched_overlay(
+        &root.join("third_party/mcpelauncher-linker"),
+        "bionic",
+        &linker,
+        &root.join("patches"),
+        &["0005-parse-relr-dynamic-tags", "0006-link-guest-arch-objects"],
+    );
+
     // AOSP bionic does not build with GCC; see docs/base-evaluation.md §2.1.
     let dst = cmake::Config::new(&native)
         .define("CMAKE_C_COMPILER", "clang")
         .define("CMAKE_CXX_COMPILER", "clang++")
         .define("CMAKE_BUILD_TYPE", "Release")
+        .define("CORDIAL_LINKER_DIR", &linker)
         // `CORDIAL_JNI_TRACE=1 cargo build` turns on libjnivm's trace.
         //
         // Not a convenience. libjnivm only emits `Constructed Unresolved

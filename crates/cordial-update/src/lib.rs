@@ -84,6 +84,7 @@ pub mod engine;
 pub mod install;
 pub mod metered;
 pub mod provider;
+pub mod quest;
 pub mod settings;
 pub mod store;
 pub mod url_policy;

@@ -213,6 +213,13 @@ fn fallback_library(class: &Class) -> &'static str {
     }
 }
 
+/// The Android soname an import belongs under when nothing has claimed it:
+/// the prefix table above, and `libc.so` for everything else. Public for the
+/// arm64 guest's table (`guest_link`), which buckets names the same way.
+pub fn library_for(symbol: &str) -> &'static str {
+    fallback_library(&classify(symbol))
+}
+
 /// Where a symbol resolves from, before any stub is considered.
 ///
 /// `None` means nothing on this machine can answer it. For a symbol in the

@@ -4,3 +4,6 @@
 [submodule "third_party/libjnivm"]
 	path = third_party/libjnivm
 	url = https://github.com/ChristopherHX/libjnivm
+[submodule "third_party/dynarmic"]
+	path = third_party/dynarmic
+	url = https://github.com/azahar-emu/dynarmic

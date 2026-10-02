@@ -222,6 +222,7 @@ fn changed_profile_after_account_resolution_falls_back_before_spawn() {
                 &config,
                 &join,
                 &lifecycle,
+                Mode::Phone,
             );
         });
     }

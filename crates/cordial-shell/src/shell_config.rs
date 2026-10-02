@@ -858,6 +858,14 @@ pub struct ShellConfig {
     /// both about the machine's software, not about an account (ADR-013).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marketplace_index_dir: Option<PathBuf>,
+    /// Which OpenXR runtime "Play in VR" hands the client: absent for the
+    /// system's active runtime, a detected runtime's id (`crate::vr::detect`),
+    /// or an absolute path to a manifest the user chose. Machine-wide like
+    /// `roblox`, because a runtime is software on the machine (ADR-013), and
+    /// passed per launch in `XR_RUNTIME_JSON` -- never written into the
+    /// system's own `active_runtime.json` (ADR-053).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vr_openxr_runtime: Option<String>,
     /// The base64 minisign public key the Marketplace section checks
     /// `marketplace_index_dir`'s signature against.
     ///
@@ -916,6 +924,7 @@ impl Default for ShellConfig {
             vkbasalt: false,
             fullscreen_accel: default_fullscreen_accel(),
             marketplace_index_dir: None,
+            vr_openxr_runtime: None,
             marketplace_public_key: None,
             multi_instance_warning_seen: false,
         }

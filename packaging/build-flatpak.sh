@@ -57,7 +57,7 @@ fi
 
 # There used to be a check here that the submodules were checked out. It is
 # gone because it no longer describes what happens: the manifest pins
-# third_party/mcpelauncher-linker and third_party/libjnivm as `git` sources by
+# third_party/mcpelauncher-linker, third_party/libjnivm and third_party/dynarmic as `git` sources by
 # commit and skips them out of the `dir` source, so this build clones them at
 # those commits and ignores whatever is in the tree. A local edit to either
 # submodule will not appear in the Flatpak, which is the point — issue #3 — and

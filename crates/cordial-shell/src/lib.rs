@@ -54,6 +54,13 @@ pub mod plugin_listing;
 pub mod plugin_preferences;
 pub mod profile;
 pub mod stacking_gate;
+/// What "Play in VR" needs from the machine: the Quest build, an OpenXR
+/// runtime, WiVRn's server (ADR-053). In the library so `--doctor` and the
+/// launcher read the same answers.
+pub mod vr;
+/// The headset half of getting the Quest build: `adb`, behind a trait so each
+/// state the setup pages handle is tested without a headset.
+pub mod quest_adb;
 pub mod title_bar;
 // Not pulled in by `host_window` or `network` -- registered here on its own
 // so `cordial-runtime` can reach it as `cordial_shell::refresh_watch`, which

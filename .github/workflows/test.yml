@@ -56,9 +56,13 @@ jobs:
         # optional features compile rather than silently taking their
         # "unavailable" arms — the shape that made web views do nothing for
         # months and audio do nothing before that.
+        #
+        # `boost-devel` is for dynarmic (crates/cordial-guest), which
+        # find_package()s Boost's headers on x86-64; `llvm` and `lld` also
+        # build that crate's arm64 test image.
         run: |
           dnf install -y --setopt=install_weak_deps=False \
-            git rust cargo clang cmake gcc-c++ binutils llvm lld \
+            git rust cargo clang cmake gcc-c++ binutils llvm lld boost-devel \
             pkgconf-pkg-config openssl-devel \
             gtk4-devel libadwaita-devel webkitgtk6.0-devel \
             pipewire-devel pulseaudio-libs-devel alsa-lib-devel \

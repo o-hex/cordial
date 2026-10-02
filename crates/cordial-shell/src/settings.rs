@@ -3108,6 +3108,11 @@ pub fn build_preferences_window(
     // Beside Updates, because the question it answers -- which build, and can I
     // go back -- is the one somebody an update just broke arrives with.
     window.add(&crate::roblox_versions::build_version_page(config.clone()));
+    // Only where the Quest build can run, after the pages about the phone
+    // build: VR is a second way to play, not a setting of the first (ADR-053).
+    if cordial_shell::vr::HOST_SUPPORTED {
+        window.add(&crate::vr_settings::build_vr_page(&window, parent.upcast_ref(), config.clone(), config_path.clone()));
+    }
     // **Five pages where there were seven**, reported as "why are there so many
     // tabs". Appearance held two groups and Get Plugins three; neither was a
     // destination, and a tab per group makes somebody hunt through seven pages

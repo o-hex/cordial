@@ -1,6 +1,6 @@
 # ADR-039: A runtime-backend seam is cheap to describe and not worth building yet
 
-**Status:** accepted — no code changes
+**Status:** accepted — no code changes. Its quotation of `docs/multiarch.md`'s "do not build a translation layer" no longer holds for the Meta Quest build, which runs under an in-process translator ([ADR-053](ADR-053-vr-is-a-mode-of-the-android-runtime.md)); the macOS decision is unaffected.
 **Date:** 2026-09-24
 **Related:** [ADR-001](ADR-001-in-process-hooking.md), [ADR-002](ADR-002-core-shell-and-ui-handoff.md), [ADR-003](ADR-003-plugin-isolation.md), [ADR-007](ADR-007-host-resources-are-brokered.md), [ADR-011](ADR-011-wayland-and-libadwaita.md), [ADR-012](ADR-012-profiles-and-instances.md), [ADR-019](ADR-019-development-control-surface.md), [ADR-033](ADR-033-roblox-versions-are-a-keyed-store.md), [ADR-036](ADR-036-unsafe-is-a-boundary-not-a-convention.md), [ADR-037](ADR-037-one-lock-and-a-content-hash-for-the-build-store.md), [ADR-038](ADR-038-plugin-hot-swap.md)
 
@@ -125,6 +125,16 @@ nothing across all tracked files, because TLS layout, relocation types and
 syscall numbers are upstream AOSP bionic's problem, already solved
 per-architecture, not Cordial's own code. That result does not transfer to
 macOS, for the reason given below.
+
+*Corrected 2026-10-01:* the quoted principle is no longer the whole of
+multiarch.md. Cordial now translates one build: the Quest build's arm64
+`libroblox.so` runs in the x86-64 `cordial-run` under dynarmic, with its
+Vulkan and OpenXR calls bridged to the host by generated thunks
+([ADR-053](ADR-053-vr-is-a-mode-of-the-android-runtime.md)). The phone build
+is still executed natively. Where this record leans on "do not build a
+translation layer" below, read it as a cost argument, not a rule this project
+has never broken; the macOS conclusion rests on Metal, Darling and the loader,
+not on that sentence.
 
 ### What is already backend-neutral
 

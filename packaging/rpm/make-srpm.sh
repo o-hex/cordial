@@ -94,12 +94,15 @@ echo "==> staging HEAD (submodules included)"
 # native/CMakeLists.txt has no linker to build and the *-sys build script
 # panics with "is not checked out". `git submodule status --recursive` prints
 # paths relative to the top level, nested ones included, so the loop is flat.
+# A submodule that is not initialised (status prefix `-`, as dynarmic's
+# externals that are never compiled can be) is skipped: `git archive` run in
+# its empty directory would archive the superproject instead.
 git archive --format=tar --prefix="cordial-${version}/" HEAD | tar -xf - -C "$work"
 while read -r path; do
     [ -n "$path" ] || continue
     ( cd "$path" && git archive --format=tar --prefix="cordial-${version}/${path}/" HEAD ) \
         | tar -xf - -C "$work"
-done < <(git submodule status --recursive | awk '{print $2}')
+done < <(git submodule status --recursive | awk '$1 !~ /^-/ {print $2}')
 
 echo "==> vendoring crates"
 ( cd "$stage" && cargo vendor --locked "$work/vendor" >/dev/null )

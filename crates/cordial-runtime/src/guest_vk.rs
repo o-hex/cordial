@@ -490,6 +490,23 @@ mod tests {
     /// runtime was generated with against these headers.
     #[test]
     fn layout_gate() {
+        // The probe asserts the exact header version the table was generated
+        // from, so it cannot say anything against other headers. Arch's
+        // rolling vulkan-headers (357 on 2026-10-02, against 341 here) made
+        // this a packaging failure rather than a finding; skipping says so
+        // instead. Point CORDIAL_VK_INCLUDE at matching headers to run it.
+        let host = std::fs::read_to_string(include_dir().join("vulkan/vulkan_core.h"))
+            .ok()
+            .and_then(|h| {
+                h.lines()
+                    .find_map(|l| l.strip_prefix("#define VK_HEADER_VERSION "))
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+            });
+        if host != Some(table::HEADER_VERSION) {
+            println!("layout gate skipped: headers at {} are VK_HEADER_VERSION {:?}, the table was generated from {}",
+                     include_dir().display(), host, table::HEADER_VERSION);
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("cordial-vk-gate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let arm = compile_probe("aarch64-linux-android26", &dir);

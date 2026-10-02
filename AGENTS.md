@@ -309,12 +309,18 @@ Where the user-facing writing lives, and who it is for:
 
 **`docs/` is also the docs site.** The pages `docs/docs.json` lists are
 published by Mintlify, from a `mintlify` branch the `Docs site` workflow
-generates; never edit that branch. The internal notes stay in the repository
-and off the site through `docs/.mintignore`. A published page must parse as
-MDX: put a `<placeholder>` in backticks, and fence code blocks rather than
-indenting them. Keep writing relative `.md` links; `tools/docs-site/build.py`
-rewrites them for the site. CI runs `mint validate` and `mint broken-links` on
-every change to `docs/`.
+generates; never edit that branch. Internal notes stay off the site through
+`docs/.mintignore`. Write plain Markdown that reads well on GitHub, and get
+Mintlify's components from syntax GitHub already renders, which
+`tools/docs-site/build.py` translates: `> [!NOTE]`/`[!TIP]`/`[!WARNING]`/
+`[!CAUTION]`/`[!IMPORTANT]` callouts, `<details><summary>` for an accordion,
+`<!-- steps -->`/`<!-- tabs -->` regions with one heading per step or tab,
+`<!-- cards -->` around a `- [Title](page.md): text` list, and the page's `#`
+heading plus `<!-- description: ... -->` and `<!-- icon: ... -->` for its
+frontmatter. Keep links relative with `.md`. A published page must still parse
+as MDX: a `<placeholder>` goes in backticks, and code blocks are fenced, not
+indented. CI runs `mint validate` and `mint broken-links` on every change to
+`docs/`.
 
 **The README has a length ceiling, and it is the one document here that
 does.** It is read by somebody deciding whether to install Cordial and then

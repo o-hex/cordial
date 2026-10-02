@@ -1,8 +1,7 @@
----
-title: "Asset overrides"
-description: "Replace Roblox's built-in textures, fonts and interface images without modifying any files."
-icon: "image"
----
+# Asset overrides
+
+<!-- description: Replace Roblox's built-in textures, fonts and interface images without modifying any files. -->
+<!-- icon: image -->
 
 Roblox's app carries its own textures, fonts and interface images. An **asset
 override** is a file of yours that Cordial serves in place of one of them: a
@@ -13,39 +12,38 @@ built-in assets, Cordial checks your overrides first and hands over your file
 if there is one. Delete your file and the original comes back, with nothing to
 repair.
 
-<Note>
-Overrides replace files that ship inside the app. They cannot change assets a
-game downloads from Roblox's servers, such as a game's own maps, models or
-decals.
-</Note>
+> [!NOTE]
+> Overrides replace files that ship inside the app. They cannot change assets a
+> game downloads from Roblox's servers, such as a game's own maps, models or
+> decals.
 
 ## Adding an override
 
-<Steps>
-  <Step title="Find the file you want to replace">
-    Overrides mirror the folder layout of the `assets/` directory inside
-    Roblox's Android app. For example, the mouse cursor is
-    `content/textures/Cursors/KeyboardMouse/ArrowCursor.png`, and the fonts
-    are under `content/fonts/`.
-  </Step>
-  <Step title="Put your file at the same path in the override folder">
-    <Tabs>
-      <Tab title="Flatpak">
-        `~/.var/app/io.github.luohoa97.Cordial/config/cordial/overlay/`
-      </Tab>
-      <Tab title="Other installs">
-        `~/.config/cordial/overlay/`
-      </Tab>
-    </Tabs>
-    So a replacement cursor goes at
-    `~/.config/cordial/overlay/content/textures/Cursors/KeyboardMouse/ArrowCursor.png`.
-    Keep the original file name and format.
-  </Step>
-  <Step title="Start Roblox again">
-    Cordial reads the overrides at launch. A change made while the game is
-    running applies the next time you start it.
-  </Step>
-</Steps>
+<!-- steps -->
+
+### Find the file you want to replace
+
+Overrides mirror the folder layout of the `assets/` directory inside
+Roblox's Android app. For example, the mouse cursor is
+`content/textures/Cursors/KeyboardMouse/ArrowCursor.png`, and the fonts
+are under `content/fonts/`.
+
+### Put your file at the same path in the override folder
+
+| Install | Override folder |
+|---|---|
+| Flatpak | `~/.var/app/io.github.luohoa97.Cordial/config/cordial/overlay/` |
+| Other installs | `~/.config/cordial/overlay/` |
+So a replacement cursor goes at
+`~/.config/cordial/overlay/content/textures/Cursors/KeyboardMouse/ArrowCursor.png`.
+Keep the original file name and format.
+
+### Start Roblox again
+
+Cordial reads the overrides at launch. A change made while the game is
+running applies the next time you start it.
+
+<!-- /steps -->
 
 This folder applies to every profile. Set `CORDIAL_OVERLAY` to use a different
 folder.

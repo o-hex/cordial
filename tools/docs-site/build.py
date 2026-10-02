@@ -8,6 +8,21 @@ the pages docs/docs.json publishes and rewrites each link: to another published
 page as `/path`, and to anything else in the repository (source files, the
 internal notes .mintignore keeps off the site) as a GitHub URL.
 
+Pages are plain Markdown that GitHub renders natively; components come from
+syntax GitHub already understands, translated here, so nothing is written
+twice:
+
+  > [!NOTE] / [!TIP] / [!WARNING] / [!CAUTION] / [!IMPORTANT]
+                                   -> <Note> <Tip> <Warning> <Danger> <Info>
+  <details><summary>T</summary>    -> <Accordion title="T">
+  <!-- steps --> ... <!-- /steps -->  with a heading per step -> <Steps>
+  <!-- tabs --> ... <!-- /tabs -->    with a heading per tab  -> <Tabs>
+  <!-- cards --> ... <!-- /cards -->  "- [Title](link): text" -> <Card>s
+  # Title, <!-- description: ... -->, <!-- icon: ... -->,
+  <!-- sidebarTitle: ... -->            -> frontmatter
+
+Any other HTML comment is dropped, since MDX does not accept them.
+
 Usage: build.py <out-dir>
 """
 import json
@@ -66,6 +81,106 @@ def rewrite(target, src_rel, pages, assets):
     return "/" + joined + anchor
 
 
+ALERTS = {"NOTE": "Note", "TIP": "Tip", "WARNING": "Warning", "CAUTION": "Danger", "IMPORTANT": "Info"}
+META = re.compile(r"^<!--\s*(description|icon|sidebarTitle)\s*:\s*(.*?)\s*-->\s*$")
+REGION = re.compile(r"^<!--\s*(/?)(steps|tabs|cards)\s*-->\s*$")
+HEADING = re.compile(r"^(#{2,6})\s+(.*)$")
+CARD = re.compile(r"^\s*[-*]\s+\[([^\]]+)\]\(([^)]+)\)\s*[:\u2014-]?\s*(.*)$")
+
+
+def attr(text):
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def region(kind, body):
+    if kind == "cards":
+        cards = [CARD.match(l) for l in body if CARD.match(l)]
+        out = ["<Columns cols={2}>"]
+        for m in cards:
+            out += [f'  <Card title="{attr(m.group(1))}" href="{m.group(2)}">', f"    {m.group(3)}", "  </Card>"]
+        return out + ["</Columns>"]
+    outer, inner = ("Steps", "Step") if kind == "steps" else ("Tabs", "Tab")
+    level = next((len(m.group(1)) for m in map(HEADING.match, body) if m), None)
+    out, open_ = [f"<{outer}>"], False
+    for l in body:
+        m = HEADING.match(l)
+        if m and len(m.group(1)) == level:
+            if open_:
+                out += ["", f"</{inner}>"]
+            out += [f'<{inner} title="{attr(m.group(2))}">', ""]
+            open_ = True
+        elif open_:
+            out.append(l)
+    if open_:
+        out += ["", f"</{inner}>"]
+    return out + [f"</{outer}>"]
+
+
+def components(lines, is_md):
+    meta, out, i, infence = {}, [], 0, False
+    while i < len(lines):
+        l = lines[i]
+        if FENCE.match(l):
+            infence = not infence
+            out.append(l)
+            i += 1
+            continue
+        if infence:
+            out.append(l)
+            i += 1
+            continue
+        if is_md and "title" not in meta and l.startswith("# "):
+            meta["title"] = l[2:].strip()
+            i += 1
+            continue
+        m = META.match(l)
+        if m:
+            meta[m.group(1)] = m.group(2)
+            i += 1
+            continue
+        m = re.match(r"^>\s*\[!(\w+)\]\s*$", l)
+        if m and m.group(1).upper() in ALERTS:
+            tag = ALERTS[m.group(1).upper()]
+            body = []
+            i += 1
+            while i < len(lines) and lines[i].startswith(">"):
+                body.append(re.sub(r"^>\s?", "", lines[i]))
+                i += 1
+            out += [f"<{tag}>", ""] + body + ["", f"</{tag}>"]
+            continue
+        m = REGION.match(l)
+        if m and not m.group(1):
+            kind, body = m.group(2), []
+            i += 1
+            while i < len(lines) and not REGION.match(lines[i]):
+                body.append(lines[i])
+                i += 1
+            i += 1
+            out += region(kind, body)
+            continue
+        m = re.match(r"^\s*<details>\s*(<summary>(.*?)</summary>)?\s*$", l)
+        if m:
+            title = m.group(2)
+            if title is None and i + 1 < len(lines):
+                s = re.match(r"^\s*<summary>(.*?)</summary>\s*$", lines[i + 1])
+                if s:
+                    title, i = s.group(1), i + 1
+            out += [f'<Accordion title="{attr(title or "Details")}">', ""]
+            i += 1
+            continue
+        if re.match(r"^\s*</details>\s*$", l):
+            out += ["", "</Accordion>"]
+            i += 1
+            continue
+        out.append(l)
+        i += 1
+    text = re.sub(r"<!--.*?-->", "", "\n".join(out), flags=re.S)
+    if meta:
+        front = ["---"] + [f'{k}: "{attr(v)}"' for k, v in meta.items()] + ["---", ""]
+        text = "\n".join(front) + text.lstrip("\n")
+    return text
+
+
 def main():
     out = sys.argv[1]
     if os.path.exists(out):
@@ -84,7 +199,8 @@ def main():
                 lines[i] = LINK.sub(lambda m: m.group(1) + rewrite(m.group(2), rel, pages, assets) + m.group(3), line)
         dest = os.path.join(out, rel)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        open(dest, "w").write("\n".join(lines))
+        has_front = bool(lines) and lines[0].strip() == "---"
+        open(dest, "w").write("\n".join(lines) if has_front else components(lines, rel.endswith(".md")))
     shutil.copy(os.path.join(DOCS, "docs.json"), out)
     for extra in ["logo"]:
         shutil.copytree(os.path.join(DOCS, extra), os.path.join(out, extra))

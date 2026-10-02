@@ -73,16 +73,16 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Switching rather than a worktree: the publish job owns this
+          # checkout, and `switch --orphan` starts from an empty tree.
           if git ls-remote --exit-code --heads origin mintlify >/dev/null; then
-            git fetch origin mintlify
-            git worktree add "$RUNNER_TEMP/branch" origin/mintlify
-            git -C "$RUNNER_TEMP/branch" checkout -B mintlify
+            git fetch -q origin mintlify
+            git switch -q -C mintlify origin/mintlify
+            git rm -rq .
           else
-            git worktree add --detach "$RUNNER_TEMP/branch"
-            git -C "$RUNNER_TEMP/branch" checkout --orphan mintlify
+            git switch -q --orphan mintlify
           fi
-          cd "$RUNNER_TEMP/branch"
-          git rm -rq --ignore-unmatch . >/dev/null
+          git clean -fdxq
           cp -r "$SITE"/. .
           git add -A
           if git diff --cached --quiet; then
@@ -90,4 +90,4 @@ jobs:
             exit 0
           fi
           git commit -q -m "Docs site from ${SOURCE::9}"
-          git push origin mintlify
+          git push -q origin mintlify

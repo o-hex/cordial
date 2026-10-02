@@ -176,12 +176,14 @@ and a decision here that costs Cordial capability. Both impressions are wrong.
 `allow_legacy_binary_patches` is set, and their `config/roblox_compatibility.json`
 sets that for exactly one build:
 
-    2.721.1108  status "legacy-researched"  allow_legacy_binary_patches: true
-                default_allowed: false
-                reason: "Reverse-engineered startup baseline; no verified real frame."
+```text
+2.721.1108  status "legacy-researched"  allow_legacy_binary_patches: true
+            default_allowed: false
+            reason: "Reverse-engineered startup baseline; no verified real frame."
 
-    2.725.1142  status "supported"          allow_legacy_binary_patches: false
-                default_allowed: true
+2.725.1142  status "supported"          allow_legacy_binary_patches: false
+            default_allowed: true
+```
 
 On 2.721.1108 they had never got a verified frame. Forcing the byte let them
 push past a gate they did not yet understand and watch what happened downstream.

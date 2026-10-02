@@ -34,7 +34,7 @@ supports, and your changes stay. The settings row names the exact path for
 your profile once vkBasalt is detected.
 
 The full key reference is vkBasalt's own:
-<https://github.com/DadSchoorse/vkBasalt/blob/master/config/vkBasalt.json.in>.
+[`vkBasalt.json.in`](https://github.com/DadSchoorse/vkBasalt/blob/master/config/vkBasalt.json.in).
 
 ## Toggle key
 

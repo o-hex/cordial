@@ -642,7 +642,9 @@ This is not a soft default. `grants::load` returns an empty map for a missing
 file, and — the part worth knowing — an empty map for a *malformed* one too,
 saying so on stdout rather than silently:
 
-    plugin grants: <path> is not usable (<error>); granting nothing
+```text
+plugin grants: <path> is not usable (<error>); granting nothing
+```
 
 Falling back to "grant what was requested" on a parse error would turn a typo
 into a privilege escalation, so a broken grants file denies everything.
@@ -674,7 +676,9 @@ grants **nothing to anybody**: `grants::parse` returns `Err` on the first
 unknown name and abandons the whole document, so `load` takes exactly the
 malformed-file path above with a more specific reason inside the parentheses —
 
-    plugin grants: <path> is not usable (unknown capability "process.spawn" granted to "x"); granting nothing
+```text
+plugin grants: <path> is not usable (unknown capability "process.spawn" granted to "x"); granting nothing
+```
 
 Skipping the name quietly would mean granting less than you believe you granted,
 with no way to tell. This fails harder than that, in the same direction.
@@ -1029,7 +1033,9 @@ ADR-003's default deny working exactly as intended.
 
 Whatever is withheld is named at startup, too:
 
-    plugin <id>: not granted flags.write, presence.set
+```text
+plugin <id>: not granted flags.write, presence.set
+```
 
 because a plugin silently doing less than it asked for is otherwise
 indistinguishable from a plugin that is broken.

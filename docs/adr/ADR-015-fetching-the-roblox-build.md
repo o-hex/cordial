@@ -53,9 +53,11 @@ most like that endpoint to answer for Android does not ask it.
 
 **Roblox publishes no Android artefact at all.** Measured, with a control:
 
-    setup.rbxcdn.com/DeployHistory.txt          200, 7210 lines, no android/apk
-    setup.rbxcdn.com/android/DeployHistory.txt  403 AccessDenied
-    clientsettingscdn…/client-version/AndroidApp 500
+```text
+setup.rbxcdn.com/DeployHistory.txt          200, 7210 lines, no android/apk
+setup.rbxcdn.com/android/DeployHistory.txt  403 AccessDenied
+clientsettingscdn…/client-version/AndroidApp 500
+```
 
 `roblox.com/download` answers 200 and links Google Play and the Amazon Appstore
 for Android — and no file. Three places an artefact would surface, absent from

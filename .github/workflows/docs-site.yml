@@ -1,0 +1,93 @@
+# The Mintlify docs site, built from docs/ and published to the `mintlify`
+# branch, which Mintlify deploys from.
+#
+# docs/ is the only copy of the documentation and is written for GitHub, with
+# relative `.md` links. Mintlify accepts only root-relative links without the
+# extension, so tools/docs-site/build.py copies the pages docs/docs.json
+# publishes and rewrites their links; the generated branch is never edited by
+# hand. `mint validate` and `mint broken-links` gate the publish, so a page that
+# does not parse as MDX fails here rather than on the live site.
+name: Docs site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "tools/docs-site/**"
+      - ".github/workflows/docs-site.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "tools/docs-site/**"
+      - ".github/workflows/docs-site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-site-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the site from docs/
+        run: python3 tools/docs-site/build.py site
+      - name: Validate
+        working-directory: site
+        run: |
+          npx -y mint@latest validate
+          npx -y mint@latest broken-links
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: site
+
+  publish:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: ${{ runner.temp }}/site
+      - name: Commit to the mintlify branch
+        env:
+          SITE: ${{ runner.temp }}/site
+          SOURCE: ${{ github.sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin mintlify >/dev/null; then
+            git fetch origin mintlify
+            git worktree add "$RUNNER_TEMP/branch" origin/mintlify
+            git -C "$RUNNER_TEMP/branch" checkout -B mintlify
+          else
+            git worktree add --detach "$RUNNER_TEMP/branch"
+            git -C "$RUNNER_TEMP/branch" checkout --orphan mintlify
+          fi
+          cd "$RUNNER_TEMP/branch"
+          git rm -rq --ignore-unmatch . >/dev/null
+          cp -r "$SITE"/. .
+          git add -A
+          if git diff --cached --quiet; then
+            echo "site unchanged"
+            exit 0
+          fi
+          git commit -q -m "Docs site from ${SOURCE::9}"
+          git push origin mintlify

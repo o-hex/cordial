@@ -40,8 +40,10 @@ starts, so quit Cordial and start it again.
 
 Cordial sets two variables on the client and nothing else:
 
-    MANGOHUD=1
-    MANGOHUD_CONFIG=fps,frametime,frame_timing=1,cpu_stats,gpu_stats
+```text
+MANGOHUD=1
+MANGOHUD_CONFIG=fps,frametime,frame_timing=1,cpu_stats,gpu_stats
+```
 
 That is the frame rate, the frame-time graph, and CPU and GPU load. The value is
 set by Cordial rather than left to MangoHud's default, so what the switch turns

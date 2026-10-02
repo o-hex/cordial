@@ -307,6 +307,15 @@ Where the user-facing writing lives, and who it is for:
 | `docs/analysis/`, `docs/NEXT.md` | Somebody continuing an investigation |
 | Release notes in `docs/releases/` | Somebody who just installed it and hit something |
 
+**`docs/` is also the docs site.** The pages `docs/docs.json` lists are
+published by Mintlify, from a `mintlify` branch the `Docs site` workflow
+generates; never edit that branch. The internal notes stay in the repository
+and off the site through `docs/.mintignore`. A published page must parse as
+MDX: put a `<placeholder>` in backticks, and fence code blocks rather than
+indenting them. Keep writing relative `.md` links; `tools/docs-site/build.py`
+rewrites them for the site. CI runs `mint validate` and `mint broken-links` on
+every change to `docs/`.
+
 **The README has a length ceiling, and it is the one document here that
 does.** It is read by somebody deciding whether to install Cordial and then
 installing it, and nobody in that state reads twelve hundred lines. It reached

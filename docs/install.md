@@ -162,7 +162,9 @@ gpg --show-keys --with-fingerprint /etc/apt/keyrings/cordial-archive-keyring.gpg
 The repository is signed: `dists/stable/InRelease` carries an OpenPGP
 signature, and the key above has this fingerprint:
 
-    E6BE 3043 5BD6 3471 FD1A  B331 DC05 1D16 7161 8AA6
+```text
+E6BE 3043 5BD6 3471 FD1A  B331 DC05 1D16 7161 8AA6
+```
 
 **INFERRED, not yet checked out of band:** that fingerprint was read from the
 published keyring on 2026-09-30, the same place a compromised site would have
@@ -215,7 +217,9 @@ curl -fsSL https://luohoa97.github.io/cordial/rpm/RPM-GPG-KEY-cordial | gpg --sh
 
 against this fingerprint:
 
-    E5FA CC1B D170 8EC9 4FFF  5817 FDD1 0A8B 6D7F 10B9
+```text
+E5FA CC1B D170 8EC9 4FFF  5817 FDD1 0A8B 6D7F 10B9
+```
 
 The `.repo` file sets `repo_gpgcheck=1` and `gpgcheck=0`: what is signed is
 each release directory's `repodata/repomd.xml`, not the individual `.rpm`
@@ -313,7 +317,9 @@ GPG key, and the repository summary has a detached signature, so `flatpak
 install` verifies that what it downloads was signed by that key and not merely
 that it matches the repository's own checksums. The key:
 
-    8364 5E9B 8F6C 4B29 227D  4629 4310 E617 967A BDD8
+```text
+8364 5E9B 8F6C 4B29 227D  4629 4310 E617 967A BDD8
+```
 
 Observed on 2026-09-30: `summary.sig` is published, and with that key imported
 into a throwaway OSTree repository `ostree remote refs` reads the summary with

@@ -1,0 +1,156 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Cordial",
+  "colors": {
+    "primary": "#FF1B6B",
+    "light": "#FF7A18",
+    "dark": "#FF1B6B"
+  },
+  "logo": "/logo/cordial.svg",
+  "favicon": "/logo/cordial.svg",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get started",
+        "pages": [
+          "index",
+          "install",
+          "status",
+          "doctor"
+        ]
+      },
+      {
+        "group": "Using Cordial",
+        "pages": [
+          "fastflags",
+          "asset-overrides",
+          "shaders",
+          "mangohud",
+          "title-bar",
+          "controllers",
+          "rich-presence",
+          "nvidia",
+          "vr"
+        ]
+      },
+      {
+        "group": "Plugins",
+        "pages": [
+          "plugins-overview",
+          "plugins"
+        ]
+      },
+      {
+        "group": "Plugin developers",
+        "pages": [
+          "plugin-development",
+          "plugin-api",
+          "runtime-spec"
+        ]
+      },
+      {
+        "group": "How it works",
+        "pages": [
+          "architecture",
+          "multiarch"
+        ]
+      },
+      {
+        "group": "Releases",
+        "pages": [
+          "releases/v0.23.2",
+          "releases/v0.23.1",
+          "releases/v0.23.0",
+          "releases/v0.22.0",
+          "releases/v0.21.1",
+          "releases/v0.21.0",
+          "releases/v0.20.1",
+          "releases/v0.20.0",
+          "releases/v0.19.0",
+          "releases/v0.18.0",
+          "releases/v0.17.0",
+          "releases/v0.16.0",
+          "releases/v0.15.1",
+          "releases/v0.15.0",
+          "releases/v0.14.2",
+          "releases/v0.14.1",
+          "releases/v0.14.0",
+          "releases/v0.13.2",
+          "releases/v0.13.1",
+          "releases/v0.13.0",
+          "releases/v0.12.1",
+          "releases/v0.12.0",
+          "releases/v0.11.0",
+          "releases/v0.10.0",
+          "releases/v0.9.0",
+          "releases/v0.8.0"
+        ]
+      },
+      {
+        "group": "Decisions (ADRs)",
+        "pages": [
+          "adr/ADR-001-in-process-hooking",
+          "adr/ADR-002-core-shell-and-ui-handoff",
+          "adr/ADR-003-plugin-isolation",
+          "adr/ADR-004-plugin-asset-overrides",
+          "adr/ADR-005-flag-service",
+          "adr/ADR-006-plugin-events-and-first-party",
+          "adr/ADR-007-host-resources-are-brokered",
+          "adr/ADR-008-plugins-are-typescript-on-deno",
+          "adr/ADR-009-capture-yes-overlay-injection-no",
+          "adr/ADR-010-plugin-asset-overlays",
+          "adr/ADR-011-wayland-and-libadwaita",
+          "adr/ADR-012-profiles-and-instances",
+          "adr/ADR-013-per-profile-configuration",
+          "adr/ADR-014-plugin-registry-and-unpacking",
+          "adr/ADR-015-fetching-the-roblox-build",
+          "adr/ADR-016-per-profile-network-egress",
+          "adr/ADR-017-sober-issue-corpus",
+          "adr/ADR-018-plugin-sub-sandboxing",
+          "adr/ADR-019-development-control-surface",
+          "adr/ADR-020-declarative-plugin-preferences",
+          "adr/ADR-021-everything-is-a-plugin",
+          "adr/ADR-022-plugins-observe-decide-act",
+          "adr/ADR-023-host-audio-backends",
+          "adr/ADR-024-x11-is-supported-again",
+          "adr/ADR-025-fetching-from-a-third-party-mirror",
+          "adr/ADR-026-the-core-event-bus",
+          "adr/ADR-027-plugin-overlays",
+          "adr/ADR-028-x11-input-comes-from-xinput2",
+          "adr/ADR-029-overlays-are-three-decisions",
+          "adr/ADR-030-reports-arrive-from-discord",
+          "adr/ADR-031-the-launcher-outlives-its-window",
+          "adr/ADR-032-appimage-build-base-moves-to-ubuntu-24-04",
+          "adr/ADR-033-roblox-versions-are-a-keyed-store",
+          "adr/ADR-034-symbol-resolution-asks-the-library",
+          "adr/ADR-035-browser-account-routing",
+          "adr/ADR-036-unsafe-is-a-boundary-not-a-convention",
+          "adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store",
+          "adr/ADR-038-plugin-hot-swap",
+          "adr/ADR-039-a-runtime-backend-seam-and-why-macos-waits",
+          "adr/ADR-040-the-engine-already-runs-mimalloc",
+          "adr/ADR-041-vkbasalt-post-processing",
+          "adr/ADR-042-texture-format-query-observability",
+          "adr/ADR-043-the-roblox-build-is-the-binarys-architecture",
+          "adr/ADR-044-settings-reach-a-running-game",
+          "adr/ADR-045-one-report-screen-outside-settings",
+          "adr/ADR-046-nvidia-is-gated-on-the-vendor-id",
+          "adr/ADR-047-the-canvas-is-lowered-only-under-a-presented-frame",
+          "adr/ADR-048-labels-and-edits-from-discord",
+          "adr/ADR-049-etc2-is-emulated-where-the-driver-lacks-it",
+          "adr/ADR-050-other-runtimes-are-launched-not-built",
+          "adr/ADR-051-overrides-are-reapplied-after-the-engines-refresh",
+          "adr/ADR-052-the-runtime-spec",
+          "adr/ADR-053-vr-is-a-mode-of-the-android-runtime"
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/luohoa97/cordial"
+    }
+  }
+}

@@ -11,12 +11,14 @@ back into the bionic linker, and the other three crates were supposed to stay
 clean of it. Nothing enforced that. A textual count on `main` before this
 change:
 
-    crate                unsafe sites   SAFETY comments
-    cordial-runtime          542            276
-    cordial-linker-sys       111             97
-    cordial-shell             15             10
-    cordial-plugins            1              1
-    cordial-update              1              0
+```text
+crate                unsafe sites   SAFETY comments
+cordial-runtime          542            276
+cordial-linker-sys       111             97
+cordial-shell             15             10
+cordial-plugins            1              1
+cordial-update              1              0
+```
 
 `cordial-plugins` and `cordial-update` each carried exactly one `unsafe`
 block, both raw libc calls that had nothing to do with the ABI edge --

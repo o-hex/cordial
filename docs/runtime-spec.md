@@ -49,7 +49,7 @@ Cordial sends `hello {spec:"1.0", cordial, session, profile}`. The runtime answe
 
 ## 4. Unsupported is never faked
 
-A capability that is not offered is shown as unsupported in the interface, with the runtime's name. No request for it is sent. A plugin that needs it is shown "limited on <runtime>" rather than loaded and silently dead. Replies never default to success.
+A capability that is not offered is shown as unsupported in the interface, with the runtime's name. No request for it is sent. A plugin that needs it is shown "limited on `<runtime>`" rather than loaded and silently dead. Replies never default to success.
 
 Error codes: `unsupported`, `invalid`, `failed`, `busy`. An unknown request gets `unsupported`. An unknown event is ignored. A message that does not parse closes the session, and the reason goes in the report. Emit only events the client actually produces; a declared event nothing publishes is a lie of the same kind.
 

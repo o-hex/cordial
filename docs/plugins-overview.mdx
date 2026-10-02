@@ -1,5 +1,6 @@
 ---
 title: "Plugins"
+sidebarTitle: "What plugins are"
 description: "What plugins are for, what they can and cannot do, and how to install one."
 icon: "puzzle-piece"
 ---
@@ -107,37 +108,9 @@ two profiles can have different plugins on.
 
 ## Writing a plugin
 
-A plugin is a folder with a `plugin.json` and, if it does anything at run
-time, a TypeScript file:
-
-```json plugin.json
-{
-  "id": "hello",
-  "name": "Hello",
-  "version": "1.0.0",
-  "entry": "main.ts",
-  "capabilities": ["log"]
-}
-```
-
-It talks to Cordial in JSON lines over standard input and output, so
-`console.log` would corrupt the conversation; write through the `log`
-capability instead. The shortest working example is
-[`plugins/flag-inspector/main.ts`](https://github.com/luohoa97/cordial/blob/main/plugins/flag-inspector/main.ts),
-and [`plugins/fps-flex/main.ts`](https://github.com/luohoa97/cordial/blob/main/plugins/fps-flex/main.ts)
-shows how to receive events.
-
-While developing, skip the archive: **Settings → Plugins → Add a plugin
-folder…** and pick the folder that holds `plugin.json`. It is listed as
-**Development** and reloads the next time you press Play.
-
-A plugin can also declare **preferences** (on/off switches, numbers, choices or
-text) in `plugin.json`, and Cordial draws a settings page for them behind a
-gear button on the plugin's row.
-
-The full reference is
-[`docs/plugin-api.md`](https://github.com/luohoa97/cordial/blob/main/docs/plugin-api.md)
-and [`plugins/README.md`](https://github.com/luohoa97/cordial/blob/main/plugins/README.md).
+See [Writing a plugin](/plugin-development) for a working plugin in five
+minutes, and the [plugin API reference](/plugin-api) for every method and
+event.
 
 ## What does not work yet
 

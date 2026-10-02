@@ -22,8 +22,8 @@ safe to paste into an issue.
 ## What is checked
 
 - **Which build this is.** "Official build" when the project's own release
-  workflows made it, otherwise "Unofficial build from <the git remote it was
-  built from>". A hint for whoever reads a report, not a check: a fork can set
+  workflows made it, otherwise "Unofficial build from" and the git remote it was
+  built from. A hint for whoever reads a report, not a check: a fork can set
   the same stamp, and nothing behaves differently because of it. It is also the
   `Build` line of the diagnostics block, and Report a Problem's issue link goes
   to the repository an unofficial build came from when that is a GitHub one.

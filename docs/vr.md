@@ -84,7 +84,9 @@ With WiVRn, its server must be running before you press Play in VR. Settings
 says when it is not. To run it without WiVRn changing your system's active
 runtime:
 
-    flatpak run --command=wivrn-server io.github.wivrn.wivrn --no-manage-active-runtime
+```text
+flatpak run --command=wivrn-server io.github.wivrn.wivrn --no-manage-active-runtime
+```
 
 ## In Cordial's Flatpak
 

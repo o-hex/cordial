@@ -136,6 +136,7 @@ pub fn run_with(config: &mut ShellConfig, env: &Env) -> Report {
         store_has_complete_entry: entries.iter().any(|e| e.complete),
         slot: slot_state(&env.slot, &env.store_root),
         slot_archive: slot_archive(&env.slot),
+        orphan_archive: orphan_archive(&entries, env.sober_apk.as_deref()),
         managed_apk: env.managed_apk.clone(),
         sober_apk: env.sober_apk.clone(),
         settings_apk: config.roblox.apk.clone(),
@@ -228,6 +229,24 @@ pub fn slot_archive(slot: &Path) -> Option<PathBuf> {
     fields.next()?;
     let path = PathBuf::from(fields.next()?.trim_end());
     path.is_file().then_some(path)
+}
+
+/// The archive an entry kept without its own archives was taken from.
+///
+/// The 0.24.1 Flatpak extracts Sober's engine into an entry and then fails to
+/// hard link Sober's archives across the read-only mount (`EXDEV`), keeping the
+/// entry "without its archives". The entry is moved with the rest of the cache
+/// store, which is correct, and it is then the only record left of what the
+/// old launch was running: the slot link into the cache now dangles. Its own
+/// `.from` stamp names the archive, in the slot's format; Sober's directory is
+/// the fallback for a stamp whose file has since been replaced or is unreadable,
+/// and only because an entry like this exists, so Sober alone still files nothing.
+pub fn orphan_archive(entries: &[store::Entry], sober: Option<&Path>) -> Option<PathBuf> {
+    let newest = entries
+        .iter()
+        .filter(|e| !e.complete)
+        .max_by(|a, b| store::compare(&a.version, &b.version))?;
+    slot_archive(&newest.dir).or_else(|| sober.map(Path::to_path_buf))
 }
 
 /// Point the old slot at the newest entry, when it is free to be pointed:
@@ -456,6 +475,63 @@ mod tests {
         assert_eq!(slot_state(&slot, &store_root), Slot::LinkIntoStore);
         std::fs::remove_dir_all(store_root.join("2.738.0.1397")).unwrap();
         assert_eq!(slot_state(&slot, &store_root), Slot::Absent, "dangling");
+    }
+
+    /// What the 0.24.1 Flatpak leaves for a user whose Roblox came from Sober:
+    /// an engine-only entry in the cache store (the hard link across Sober's
+    /// read-only mount failed), a slot link into it, and Sober's archives where
+    /// they always were. The first launch after the upgrade must complete that
+    /// entry from them, say so, and offer the update once; it used to move the
+    /// entry, file nothing, and refuse every launch.
+    #[test]
+    fn an_engine_only_entry_the_old_flatpak_kept_from_sober_is_completed_from_sober() {
+        let dir = scratch("engine-only");
+        let mut env = env_in(&dir);
+        let sober = dir.join("home/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client");
+        std::fs::create_dir_all(&sober).unwrap();
+        unsigned_apk(&sober.join("base.apk"), "2.737.0.1584");
+        std::fs::copy(sober.join("base.apk"), sober.join("split_config.x86_64.apk")).unwrap();
+        env.sober_apk = Some(sober.join("base.apk"));
+        // The fixture archive is unsigned and the filing checks the
+        // certificate, so it is refused; that it was *tried* is the claim,
+        // because before this the plan had nothing to try.
+        let entry = env.cache_store.join("2.737.0.1584");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("libroblox.so"), b"engine").unwrap();
+        cordial_update::cache::write_stamp(&entry, &sober.join("base.apk")).unwrap();
+        store::point_current_at(&env.slot, &entry).unwrap();
+
+        let report = run_with(&mut ShellConfig::default(), &env);
+        assert_eq!(report.moved, ["2.737.0.1584"]);
+        // The plan reached for Sober's archive instead of doing nothing; the
+        // refusal is the unsigned fixture's.
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert!(report.failures[0].contains("base.apk"), "{report:?}");
+        assert_eq!(std::fs::read_dir(&sober).unwrap().count(), 2, "nothing was added beside Sober's files");
+    }
+
+    #[test]
+    fn only_complete_entries_have_no_orphan_and_the_stamp_beats_sober() {
+        let dir = scratch("orphan");
+        let root = dir.join("builds");
+        launchable(&root, "2.738.0.1397");
+        let sober = dir.join("sober/base.apk");
+        std::fs::create_dir_all(sober.parent().unwrap()).unwrap();
+        std::fs::write(&sober, b"sober").unwrap();
+        assert_eq!(orphan_archive(&store::list_in(&root), Some(&sober)), None, "nothing is missing its archives");
+
+        let bare = root.join("2.737.0.1584");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join("libroblox.so"), b"engine").unwrap();
+        // No stamp: Sober's directory, because an entry is missing its archives.
+        assert_eq!(orphan_archive(&store::list_in(&root), Some(&sober)), Some(sober.clone()));
+        assert_eq!(orphan_archive(&store::list_in(&root), None), None);
+        // A stamp naming a file that exists is preferred to Sober.
+        let chosen = dir.join("chosen/base.apk");
+        std::fs::create_dir_all(chosen.parent().unwrap()).unwrap();
+        std::fs::write(&chosen, b"apk").unwrap();
+        cordial_update::cache::write_stamp(&bare, &chosen).unwrap();
+        assert_eq!(orphan_archive(&store::list_in(&root), Some(&sober)), Some(chosen));
     }
 
     #[test]

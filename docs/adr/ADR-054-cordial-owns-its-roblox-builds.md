@@ -268,6 +268,20 @@ which holds that entry with a signer record in the slot's format. The migration
 handles both shapes; the earlier measurement described a machine that has
 since pressed Download.
 
+**Corrected again, in the Flatpak, 2026-10-05.** The migration was run for the
+first time on real-shaped data: 0.24.1 installed from its bundle, launched once
+on Sober's archives with the read-only grant, then the main build installed
+over it. The old launch had left a *third* shape: an engine-only entry in
+`cache/cordial/builds/<version>` (`.signer`, `.from` naming Sober's archive, no
+`base.apk`) and `lib/<abi>` linked to it, because hard linking Sober's archives
+across the read-only mount fails with `EXDEV` -- the log says "kept without its
+archives ... Invalid cross-device link". `relocate` moved the entry and left the
+slot dangling, so the slot read as `Absent`, `migration_plan` named nothing, and
+every launch was refused ("kept without the APK it came from"). The plan now
+completes such an entry from the archive its own `.from` stamp names, Sober's
+directory being the fallback, and files it as `source=sober`. A Settings APK
+and a fresh install were measured as designed.
+
 **Differs from the text.**
 
 - **`.signer` records the archive by size and mtime, not by path.** The slot's
@@ -298,12 +312,13 @@ fetches it fresh. `CORDIAL_APK_DIR`, which was undocumented, is no longer read.
 
 **Still INFERRED.**
 
-- That a hard link from Sober's directory fails across the Flatpak's read-only
-  grant (the import copies and nothing depends on it).
+- ~~That a hard link from Sober's directory fails across the Flatpak's
+  read-only grant~~ -- measured: `EXDEV`, see "Corrected again" above.
 - What the engine shows when Roblox refuses an old client, and so the 60 second
   window and wording of the crash-page hint for a pinned profile.
 - That an older build may not understand what a newer one saved; the Version
   page says it has not measured.
 - That the Flatpak's file portal hands over only the chosen file, so a split
   APK's other half cannot be seen when imported that way.
-- The Flatpak itself was not run: every check above used a host build.
+- Only the migration and first-run paths were run in the Flatpak (2026-10-05);
+  the rest of the checks above used a host build.

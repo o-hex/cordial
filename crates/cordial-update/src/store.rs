@@ -1095,6 +1095,17 @@ pub struct Legacy {
     pub slot: Slot,
     /// The archive the slot's `.from` stamp names, if it is still there.
     pub slot_archive: Option<PathBuf>,
+    /// The archive named by the `.from` stamp of the newest entry the store
+    /// holds **without its archives**, if it is still there, else Sober's when
+    /// such an entry exists.
+    ///
+    /// 0.24.1's Flatpak keeps a build it extracted from Sober's directory as an
+    /// entry of the cache store with the engine and no `base.apk`, because the
+    /// hard link from Sober's read-only mount fails with `EXDEV` (measured, in
+    /// the Flatpak, 2026-10-05). `relocate` then moves that entry and leaves the
+    /// slot link dangling, so the slot reads as `Absent` and nothing else in the
+    /// plan names the archives the entry was missing.
+    pub orphan_archive: Option<PathBuf>,
     /// `build/<abi>/base.apk`, which only a build Cordial installed has.
     pub managed_apk: Option<PathBuf>,
     pub sober_apk: Option<PathBuf>,
@@ -1141,9 +1152,12 @@ pub fn migration_plan(legacy: &Legacy) -> Vec<Step> {
             .as_ref()
             .or(legacy.managed_apk.as_ref())
             .or(legacy.sober_apk.as_ref()),
-        // No slot: the only legacy evidence left is a build Cordial installed
-        // itself into its own directory.
-        _ => legacy.managed_apk.as_ref(),
+        // No slot: the legacy evidence left is a build Cordial installed itself
+        // into its own directory, or an entry the old Flatpak kept without its
+        // archives, which is the old launch's own build with half of it
+        // missing. Either is something the old launch was running; Sober's
+        // directory alone, with no such entry, still is not.
+        _ => legacy.managed_apk.as_ref().or(legacy.orphan_archive.as_ref()),
     };
     match candidate {
         Some(apk) => {
@@ -1556,6 +1570,7 @@ mod tests {
             store_has_complete_entry: false,
             slot: Slot::Absent,
             slot_archive: None,
+            orphan_archive: None,
             managed_apk: None,
             sober_apk: None,
             settings_apk: None,
@@ -1608,6 +1623,28 @@ mod tests {
         assert!(migration_plan(&Legacy { sober_apk: Some(sober.clone()), ..legacy() }).is_empty());
         assert!(migration_plan(&Legacy { slot: Slot::LinkIntoStore, sober_apk: Some(sober), ..legacy() }).is_empty());
         assert!(migration_plan(&legacy()).is_empty());
+    }
+
+    /// The 0.24.1 Flatpak's shape: an engine-only entry the old launch kept
+    /// from Sober's directory, a slot that no longer resolves, and nothing else.
+    /// Without this the first launch after the upgrade refuses every launch
+    /// ("kept without the APK it came from") and files nothing.
+    #[test]
+    fn an_entry_kept_without_its_archives_is_completed_from_the_archive_it_names() {
+        let sober = PathBuf::from("/home/u/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk");
+        let plan = migration_plan(&Legacy { orphan_archive: Some(sober.clone()), ..legacy() });
+        assert_eq!(plan, [Step::File { apk: sober, source: Source::Sober }]);
+        // Not a Sober path: filed as the old layout's own, like a managed build.
+        let kept = PathBuf::from("/home/u/Downloads/roblox/base.apk");
+        let plan = migration_plan(&Legacy { orphan_archive: Some(kept.clone()), ..legacy() });
+        assert_eq!(plan, [Step::File { apk: kept, source: Source::Legacy }]);
+        // A store that already has a complete build has nothing to complete.
+        assert!(migration_plan(&Legacy {
+            store_has_complete_entry: true,
+            orphan_archive: Some(PathBuf::from("/x/base.apk")),
+            ..legacy()
+        })
+        .is_empty());
     }
 
     #[test]

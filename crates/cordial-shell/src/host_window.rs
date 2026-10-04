@@ -32,6 +32,47 @@ use std::time::{Duration, Instant};
 /// `tests::app_id_matches_the_desktop_entry`.
 pub const APP_ID: &str = "Cordial";
 
+/// The id WebKit and the desktop portals know this program by, which is not
+/// [`APP_ID`] and must not be.
+///
+/// `WTF::applicationID()` takes `g_application_get_default()`'s id, else
+/// `g_get_prgname()` *if* that is a valid application id, else
+/// `org.webkit.app-<sha256 of the executable path>`. `Cordial` has no dot, so
+/// `cordial-run` -- which has no `GApplication` -- got the hashed name. Inside
+/// the Flatpak, WebKit spawns the web process through the portal's
+/// sub-sandbox and names an AT-SPI bus name after that id; the portal insists
+/// the name be prefixed by the real app id and refuses, and WebKit turns the
+/// refusal into a `g_error`. Measured on 0.24.1: opening any in-app web window
+/// ended the whole client with `Invalid sandbox a11y own name ... doesn't
+/// match app id`.
+///
+/// A bare default `GApplication` supplies the right answer without touching
+/// the window. GTK4's Wayland backend reads the `xdg_toplevel` app_id from the
+/// toplevel's own D-Bus properties, which only a `GtkApplication` association
+/// sets, and otherwise from the program name -- so `Cordial` stays what the
+/// compositor sees and ADR-009 is undisturbed. It is never registered, because
+/// the shell already owns this bus name and only the id is wanted.
+const WEBKIT_APP_ID: &str = "io.github.luohoa97.Cordial";
+
+/// Give WebKit an application id before anything asks it for one.
+///
+/// `applicationID()` is computed once per process, so this has to run before
+/// the first `WebKitWebView` -- `init_wayland` is the latest that can be. The
+/// application is leaked rather than stored: `g_application_set_default` holds
+/// no reference, and the default silently reverts to none when it is finalised.
+fn claim_webkit_application_id() {
+    use libadwaita::gio;
+    if gio::Application::default().is_some() {
+        return;
+    }
+    let app = gio::Application::builder()
+        .application_id(WEBKIT_APP_ID)
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.set_default();
+    std::mem::forget(app);
+}
+
 /// What the header bar says.
 ///
 /// It used to name the graphics backend and the name it gave was "OpenGL ES",
@@ -154,7 +195,8 @@ fn smallest_monitor() -> Option<(i32, i32)> {
 ///
 /// `glib::set_prgname` because a window with no `GApplication` takes its
 /// `xdg_toplevel.app_id` from the program name, which would otherwise be
-/// `cordial-run`. See [`APP_ID`].
+/// `cordial-run`. See [`APP_ID`]. `claim_webkit_application_id` is the other
+/// half of that, for WebKit rather than for the compositor.
 pub fn init_wayland() -> Result<(), String> {
     if std::env::var("GDK_BACKEND").is_ok_and(|v| v != "wayland") {
         // SAFETY: `g_setenv` is not thread-safe against a concurrent
@@ -167,6 +209,7 @@ pub fn init_wayland() -> Result<(), String> {
     }
     gtk::gdk::set_allowed_backends("wayland");
     glib::set_prgname(Some(APP_ID));
+    claim_webkit_application_id();
     adw::init().map_err(|e| format!("libadwaita would not initialise: {e}"))?;
     unmute_waylands_own_errors();
     Ok(())
@@ -2719,6 +2762,17 @@ mod tests {
             .find_map(|l| l.strip_prefix("StartupWMClass="))
             .expect("desktop entry declares StartupWMClass");
         assert_eq!(declared.trim(), APP_ID);
+    }
+
+    #[test]
+    fn the_webkit_id_is_a_valid_application_id_and_is_the_flatpaks() {
+        // WebKit only trusts an id GLib calls valid, and inside the Flatpak the
+        // portal only accepts a11y names prefixed by the app id in
+        // `/.flatpak-info`. `Cordial` fails the first, which is the bug.
+        assert!(!libadwaita::gio::Application::id_is_valid(APP_ID));
+        assert!(libadwaita::gio::Application::id_is_valid(WEBKIT_APP_ID));
+        let manifest = include_str!("../../../packaging/io.github.luohoa97.Cordial.yml");
+        assert!(manifest.contains(&format!("app-id: {WEBKIT_APP_ID}")));
     }
 
     #[test]

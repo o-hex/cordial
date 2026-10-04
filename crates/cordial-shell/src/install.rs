@@ -539,6 +539,29 @@ fn key_into_store(store_root: &Path, cache: &Path, archives: &[&Path]) {
             for trouble in cordial_update::store::keep_archives(&entry, archives) {
                 println!("  shell: {keyed} is kept without its archives: {trouble}");
             }
+            // The entry says who signed it and how it arrived. `verified_once`
+            // recorded the signer against the archive at `archives[0]`, so it
+            // is read back from there and written against the entry's own
+            // `base.apk` -- and only if that is a link to the same file, so an
+            // entry that already held a different archive is not vouched for
+            // by one it never contained.
+            let apk = archives.first().copied().unwrap_or(Path::new(""));
+            let same = same_inode(&entry.join(cordial_update::install::BASE_APK), apk);
+            let signer = cordial_update::cache::recorded_signer(cache, apk);
+            let source = match cordial_update::store::Source::for_path(apk) {
+                cordial_update::store::Source::Sober => cordial_update::store::Source::Sober,
+                _ => cordial_update::store::Source::File,
+            };
+            let written = match signer {
+                Some(fingerprint) if same => cordial_update::store::write_records(
+                    &entry,
+                    &cordial_update::store::Filing { source, signer: fingerprint, version_code: None },
+                ),
+                _ => cordial_update::store::record_source(&entry, source),
+            };
+            if let Err(e) = written {
+                println!("  shell: could not record where {keyed} came from: {e}");
+            }
             // The build just keyed is the one about to run: pruning protected
             // pins and not it, so keying a build older than the newest few
             // deleted it at once, and every launch after extracted it again.
@@ -552,6 +575,14 @@ fn key_into_store(store_root: &Path, cache: &Path, archives: &[&Path]) {
         }
         Ok(None) => {}
         Err(e) => println!("  shell: could not key {} into the store: {e}", cache.display()),
+    }
+}
+
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
     }
 }
 

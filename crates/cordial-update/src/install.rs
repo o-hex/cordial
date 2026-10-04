@@ -146,6 +146,10 @@ pub struct Store {
     pub keep: usize,
     /// Versions no prune may take, whatever their age.
     pub protect: Vec<String>,
+    /// What to write into an entry this install creates: who signed it, where
+    /// it came from. `None` leaves the entry as unrecorded as it was before
+    /// ADR-054, which a launch will not run until it has been checked.
+    pub record: Option<store::Filing>,
 }
 
 impl Store {
@@ -157,7 +161,7 @@ impl Store {
     /// thread, and three borrowed arguments would each need a binding outside
     /// the closure and a `move` that captured it. One owned value is a line.
     pub fn live(protect: Vec<String>) -> Self {
-        Store { root: crate::store::root(), keep: crate::store::KEEP, protect }
+        Store { root: crate::store::root(), keep: crate::store::KEEP, protect, record: None }
     }
 }
 
@@ -289,6 +293,13 @@ pub enum Failed {
     /// writes only what it installed, so an unmarked directory stops the
     /// install rather than overwriting it.
     NotOurs { path: String },
+    /// The store already keeps this version and its engine is not these bytes.
+    ///
+    /// Two byte-different engines claiming one version is the one thing the
+    /// store must not paper over (ADR-054): whichever was kept first would be
+    /// silently replaced, or silently kept in preference to the one just
+    /// verified.
+    Conflict { version: String },
     /// The caller asked to stop, and was still owed an answer for it.
     ///
     /// Only reachable before the swap begins -- see the `Cancel` checks in
@@ -315,6 +326,12 @@ impl fmt::Display for Failed {
                 "{path} holds a Roblox build Cordial did not install, so it will not be \
                  overwritten. Choose that APK on the Roblox page in Settings and Cordial will \
                  use it and leave it alone, or delete the directory to let Cordial manage one."
+            ),
+            Failed::Conflict { version } => write!(
+                f,
+                "Cordial already keeps Roblox {version}, and the engine in this download is not \
+                 the same bytes. It will not keep two different engines under one version. If \
+                 you want to replace the kept one, remove it in Settings first."
             ),
             Failed::Io { path, why } => write!(f, "{path}: {why}"),
             Failed::Cancelled => write!(f, "the install was stopped before anything was replaced"),
@@ -614,6 +631,26 @@ pub fn adopt(
                 for trouble in store::keep_archives(&entry, &[&base, &carrier_live]) {
                     println!("[update] {keyed} is keyed without its archives: {trouble}");
                 }
+                // After the archives, because the signer is recorded against
+                // the entry's own `base.apk`. No record means an entry a
+                // launch will check once before it runs it, so a failure
+                // here costs a verification and is said, not fatal.
+                //
+                // And only when the entry's `base.apk` is the file that was
+                // verified. An entry that was already kept holds its own
+                // archive, which nothing here has looked at, and vouching for
+                // it with a signature taken from a different file is how an
+                // unchecked archive acquires a checked entry's name.
+                let filing = store.record.clone();
+                let same = same_file(&entry.join(BASE_APK), &base);
+                let written = match filing {
+                    Some(f) if same => store::write_records(&entry, &f),
+                    Some(f) => store::record_source(&entry, f.source),
+                    None => store::record_source(&entry, store::Source::Legacy),
+                };
+                if let Err(e) = written {
+                    println!("[update] {keyed} could not be recorded: {e}");
+                }
                 if store.keep > 0 {
                     let dropped = store::prune_in(&store.root, store.keep, &store.protect);
                     if !dropped.is_empty() {
@@ -627,6 +664,15 @@ pub fn adopt(
     }
 
     Ok(Installed { base, carrier: carrier_live, engine: engine_live, version })
+}
+
+/// Whether two paths are one inode, which is what a hard link is.
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
 }
 
 /// Keep a build in the store without making it the build in use.
@@ -648,6 +694,7 @@ pub fn adopt(
 pub fn file_into_store(
     fetched: &[(&'static str, PathBuf)],
     root: &Path,
+    filing: &store::Filing,
     cancel: &crate::provider::Cancel,
 ) -> Result<String, Failed> {
     for (_, path) in fetched {
@@ -691,7 +738,7 @@ pub fn file_into_store(
         if cancel.stopped() {
             return Err(Failed::Cancelled);
         }
-        let entry = store::entry_dir_in(root, &version).expect("checked by is_valid_version above");
+        let incoming = store::hash_file(&engine).map_err(|e| io(&engine, e))?;
 
         // This does not go through `store::adopt_current`, so it is the one
         // caller that takes the store lock directly rather than getting it for
@@ -699,16 +746,38 @@ pub fn file_into_store(
         // Held from here so both branches below are covered.
         let _lock = store::lock(root).map_err(|e| io(root, e))?;
 
-        // Already kept. The engine there is the same version, so only the
-        // archives an entry kept without them is missing are added.
+        // **The engine's bytes decide which entry this is, then the version.**
+        // An entry with these exact bytes is this build whatever it is called
+        // (ADR-037's left-open `find_by_content_hash`); otherwise the name is
+        // the version the engine reports, and an entry already under that name
+        // with different bytes is refused rather than replaced or kept in
+        // preference (ADR-054).
+        let entry = match store::find_by_content_hash(root, &incoming) {
+            Some(kept) => kept.dir,
+            None => store::entry_dir_in(root, &version).expect("checked by is_valid_version above"),
+        };
+        let version = entry.file_name().and_then(|n| n.to_str()).unwrap_or(&version).to_string();
+
         if entry.join(engine::LIBRARY).is_file() {
+            if store::ensure_content_hash(&entry).as_ref() != Some(&incoming) {
+                return Err(Failed::Conflict { version });
+            }
+            // Already kept, and byte for byte this engine. Only the archives an
+            // entry kept without them is missing are added; an entry that
+            // already holds its own `base.apk` is not re-vouched for with a
+            // signature taken from a different file.
+            let had_base = entry.join(BASE_APK).is_file();
             for (name, path) in fetched {
                 let target = entry.join(name);
                 if !target.exists() {
                     land(path, &target)?;
                 }
             }
-            store::ensure_content_hash(&entry);
+            if !had_base {
+                store::write_records(&entry, filing).map_err(|e| io(&entry, e))?;
+            } else {
+                let _ = store::record_source(&entry, filing.source);
+            }
             return Ok(version);
         }
 
@@ -716,6 +785,11 @@ pub fn file_into_store(
             land(path, &gathering.join(name))?;
         }
         cache::record_version(&gathering, &version).map_err(|e| io(&gathering, e))?;
+        // Records go in with the entry rather than after it, so there is no
+        // moment at which an entry exists that a launch would call unchecked.
+        // Written against the kept `base.apk` in `gathering`; a rename does
+        // not change size or mtime, so the record survives it.
+        store::write_records(&gathering, filing).map_err(|e| io(&gathering, e))?;
         // A directory under the version's name with no engine in it is what a
         // killed install leaves, and `list_in` already ignores it; it is in
         // the way of the rename and holds nothing worth keeping.
@@ -1013,6 +1087,10 @@ mod tests {
         Source::for_test(serve(body.to_vec()), Sha256Hash::of(body))
     }
 
+    fn filing() -> store::Filing {
+        store::Filing { source: store::Source::Mirror, signer: "ab".repeat(32), version_code: Some(7) }
+    }
+
     fn silent() -> impl FnMut(&str, u64, Option<u64>) {
         |_, _, _| {}
     }
@@ -1082,7 +1160,7 @@ mod tests {
         )
         .unwrap();
 
-        let version = file_into_store(&[(BASE_APK, base.clone())], &root, &no_cancel()).expect("filed");
+        let version = file_into_store(&[(BASE_APK, base.clone())], &root, &filing(), &no_cancel()).expect("filed");
         assert_eq!(version, "2.730.0.790");
         let entries = store::list_in(&root);
         let names: Vec<&str> = entries.iter().map(|e| e.version.as_str()).collect();
@@ -1095,6 +1173,93 @@ mod tests {
             .flatten()
             .any(|e| e.file_name().to_string_lossy().starts_with(".filing"));
         assert!(!stray, "the gathering directory is not left behind");
+    }
+
+    /// An engine that scans as `version` and differs from `engine_bytes`
+    /// by a salt: the same version, other bytes.
+    fn engine_with(version: &str, salt: &[u8]) -> Vec<u8> {
+        let mut v = engine_bytes(version);
+        v.extend_from_slice(salt);
+        v
+    }
+
+    fn stage(root: &Path, name: &str, engine: &[u8], extra: &[u8]) -> PathBuf {
+        let staging = root.join(".fetching");
+        std::fs::create_dir_all(&staging).unwrap();
+        let path = staging.join(name);
+        std::fs::write(&path, zip_of(&[("assets/x.json", extra), (apk::LIBRARY_IN_APK, engine)])).unwrap();
+        path
+    }
+
+    /// Every filing route writes the proof; this is the Version page's.
+    #[test]
+    fn a_filed_entry_proves_who_signed_it_and_how_it_arrived() {
+        let dir = scratch("file-records");
+        let root = dir.join("builds");
+        let base = stage(&root, "a.apk", &engine_bytes("2.730.0.790"), b"{}");
+        file_into_store(&[(BASE_APK, base)], &root, &filing(), &no_cancel()).unwrap();
+        let entry = &store::list_in(&root)[0];
+        assert_eq!(entry.signer.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(entry.provenance.map(|p| p.source), Some(store::Source::Mirror));
+        assert_eq!(entry.version_code, Some(7));
+        assert!(entry.launchable());
+        assert!(entry.content_hash.is_some());
+    }
+
+    /// The control is the next test: the same engine in another container is
+    /// fine, so this refusal is about the bytes and not about the version.
+    #[test]
+    fn a_second_engine_under_one_version_is_refused_by_name_and_the_first_is_kept() {
+        let dir = scratch("file-conflict");
+        let root = dir.join("builds");
+        let first = stage(&root, "a.apk", &engine_bytes("2.730.0.790"), b"{}");
+        file_into_store(&[(BASE_APK, first)], &root, &filing(), &no_cancel()).unwrap();
+        let before = store::list_in(&root)[0].content_hash.clone();
+
+        let other = stage(&root, "b.apk", &engine_with("2.730.0.790", b"tampered"), b"{}");
+        let refused = file_into_store(&[(BASE_APK, other)], &root, &filing(), &no_cancel()).unwrap_err();
+        assert!(matches!(&refused, Failed::Conflict { version } if version == "2.730.0.790"), "{refused:?}");
+        assert!(refused.to_string().contains("2.730.0.790"));
+        let after = store::list_in(&root);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].content_hash, before, "the kept engine is untouched");
+    }
+
+    #[test]
+    fn the_same_engine_in_another_container_is_the_same_entry() {
+        let dir = scratch("file-same");
+        let root = dir.join("builds");
+        let engine = engine_bytes("2.730.0.790");
+        let first = stage(&root, "a.apk", &engine, b"{}");
+        file_into_store(&[(BASE_APK, first)], &root, &filing(), &no_cancel()).unwrap();
+        let signer = store::list_in(&root)[0].signer.clone();
+
+        // A monolithic archive from another distributor: other bytes outside
+        // the engine, the identical engine inside.
+        let second = stage(&root, "b.apk", &engine, b"{\"another\": \"container\"}");
+        let mut other = filing();
+        other.signer = "cd".repeat(32);
+        assert_eq!(file_into_store(&[(BASE_APK, second)], &root, &other, &no_cancel()).unwrap(), "2.730.0.790");
+        let entries = store::list_in(&root);
+        assert_eq!(entries.len(), 1, "linked, not duplicated");
+        assert_eq!(entries[0].signer, signer, "an entry that holds its own archive is not re-vouched for");
+    }
+
+    #[test]
+    fn adopting_a_build_records_its_signer_when_the_entry_holds_the_verified_file() {
+        let dir = scratch("adopt-records");
+        let build = dir.join("build");
+        let engine_into = dir.join("lib");
+        let root = dir.join("builds");
+        let base = zip_of(&[("assets/content/fonts/x.json", b"{}")]);
+        let split = zip_of(&[(apk::LIBRARY_IN_APK, &engine_bytes("2.734.0.917"))]);
+        let parts = Parts { base: source_for(&base), split: Some(source_for(&split)) };
+        let mut store = Store { root: root.clone(), keep: 3, protect: vec![], record: Some(filing()) };
+        store.record.as_mut().unwrap().source = store::Source::Sober;
+        install_into(&parts, &build, &engine_into, Some(&store), &no_cancel(), &mut silent()).unwrap();
+        let entry = &store::list_in(&root)[0];
+        assert_eq!(entry.signer.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(entry.provenance.map(|p| p.source), Some(store::Source::Sober));
     }
 
     /// The store, end to end and with a control: install one build, install a
@@ -1111,7 +1276,7 @@ mod tests {
         let engine_into = dir.join("lib");
         let store_root = dir.join("builds");
         let protect: Vec<String> = Vec::new();
-        let store = Store { root: store_root.clone(), keep: crate::store::KEEP, protect };
+        let store = Store { root: store_root.clone(), keep: crate::store::KEEP, protect, record: None };
 
         let install_one = |version: &str| {
             let base = zip_of(&[("assets/content/fonts/x.json", b"{}")]);
@@ -1172,7 +1337,7 @@ mod tests {
         let protect = vec!["2.730.0.1".to_string()];
 
         for version in ["2.730.0.1", "2.734.0.917", "2.738.0.1393", "2.740.0.5"] {
-            let store = Store { root: store_root.clone(), keep: 2, protect: protect.clone() };
+            let store = Store { root: store_root.clone(), keep: 2, protect: protect.clone(), record: None };
             let base = zip_of(&[("assets/content/fonts/x.json", b"{}")]);
             let split = zip_of(&[(apk::LIBRARY_IN_APK, &engine_bytes(version))]);
             let parts = Parts { base: source_for(&base), split: Some(source_for(&split)) };

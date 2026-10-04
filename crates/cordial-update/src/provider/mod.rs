@@ -606,8 +606,17 @@ pub(crate) fn obtain_into_store_from(
 
     let outcome = (|| {
         let archives = source.fetch(version, cancel, &staging, progress)?;
-        verify_archives(&archives, cancel, trusted, progress)?;
-        crate::install::file_into_store(&archive_names(&archives), root, cancel).map_err(from_install)
+        let certificate = verify_archives(&archives, cancel, trusted, progress)?;
+        // Filed with who signed it and where it came from, so the entry proves
+        // itself and a launch need not check it again (ADR-054). The mirror's
+        // `versionCode` rides along for display only.
+        let filing = crate::store::Filing {
+            source: crate::store::Source::Mirror,
+            signer: certificate,
+            version_code: Some(version.code).filter(|c| *c != 0),
+        };
+        crate::install::file_into_store(&archive_names(&archives), root, &filing, cancel)
+            .map_err(from_install)
     })();
 
     let _ = std::fs::remove_dir_all(&staging);
@@ -655,6 +664,22 @@ pub fn obtain_and_install(
     let outcome = (|| {
         let obtained = obtain(preferred, want, cancel, &staging, progress)?;
         let named = archive_names(&obtained.archives);
+        // What the entry will say about itself: the certificate `obtain` just
+        // verified, and where the archives came from. A copy out of Sober's
+        // directory is Sober's, whatever provider handed it over.
+        let recorded = store.map(|s| {
+            let mut s = s.clone();
+            s.record = Some(crate::store::Filing {
+                source: match obtained.provider {
+                    "local" => crate::store::Source::for_path(&obtained.archives.base),
+                    _ => crate::store::Source::Mirror,
+                },
+                signer: obtained.certificate_sha256.clone(),
+                version_code: Some(obtained.version.code).filter(|c| *c != 0),
+            });
+            s
+        });
+        let store = recorded.as_ref();
 
         let installed = crate::install::adopt(
             &named,

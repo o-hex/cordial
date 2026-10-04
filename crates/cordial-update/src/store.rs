@@ -341,6 +341,31 @@ pub fn content_hash(dir: &Path) -> Option<Sha256Hash> {
     Sha256Hash::parse(text.trim()).ok()
 }
 
+/// What a filing route knows about a build it is putting in the store.
+///
+/// Every route that creates an entry writes all of it, so that an entry proves
+/// who signed it, says how it arrived and (when the source knew) which
+/// `versionCode` it was. ADR-054.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filing {
+    pub source: Source,
+    /// The certificate the archives verified against, lowercase hex.
+    pub signer: String,
+    pub version_code: Option<u64>,
+}
+
+/// Write [`Filing`]'s records into the entry at `dir`. The signer is recorded
+/// against the `base.apk` that is in `dir` now, so call it after the archives
+/// have landed.
+pub fn write_records(dir: &Path, filing: &Filing) -> io::Result<()> {
+    record_signer(dir, &filing.signer)?;
+    record_source(dir, filing.source)?;
+    if let Some(code) = filing.version_code {
+        record_version_code(dir, code)?;
+    }
+    Ok(())
+}
+
 /// "size mtime", the identity of an archive that survives being moved.
 fn archive_identity(path: &Path) -> Option<String> {
     use std::time::UNIX_EPOCH;
@@ -406,7 +431,7 @@ fn record_content_hash(dir: &Path, hash: &Sha256Hash) -> io::Result<()> {
 /// A streamed SHA-256 of `path`, read a block at a time so a 100+ MB engine is
 /// never held whole -- the same reason [`crate::sha256::Hasher`] exists rather
 /// than `Sha256Hash::of` being used directly.
-fn hash_file(path: &Path) -> io::Result<Sha256Hash> {
+pub(crate) fn hash_file(path: &Path) -> io::Result<Sha256Hash> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Hasher::new();

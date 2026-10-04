@@ -1,6 +1,6 @@
 # ADR-054: Cordial owns its Roblox builds, and Sober's copy is an import
 
-**Status:** accepted; implementation in progress
+**Status:** accepted, implemented (see "As built" for what is still INFERRED)
 **Date:** 2026-10-04
 **Amends:** [ADR-033](ADR-033-roblox-versions-are-a-keyed-store.md), [ADR-037](ADR-037-one-lock-and-a-content-hash-for-the-build-store.md), [ADR-025](ADR-025-fetching-from-a-third-party-mirror.md) (its "free source first" ordering and the paragraph keeping Sober on the first-run screen)
 **Related:** [ADR-012](ADR-012-profiles-and-instances.md), [ADR-013](ADR-013-per-profile-configuration.md), [ADR-015](ADR-015-fetching-the-roblox-build.md), [ADR-043](ADR-043-the-roblox-build-is-the-binarys-architecture.md), [ADR-053](ADR-053-vr-is-a-mode-of-the-android-runtime.md)
@@ -237,3 +237,73 @@ screen" no longer hold. ADR-013's per-profile table gains
    download the newest build. Updates stay never-unasked otherwise (ADR-015).
 5. **A same-version build with a different engine hash is refused** by name.
 6. `shell.json`'s `lib_dir` is gone (4027469); nothing here reads it.
+
+## As built, 2026-10-04
+
+Implemented in ten steps as ordered in the plan; what differs from the text
+above, what was measured, and what is still not known.
+
+**Measured.**
+
+- *Two versions at once.* Two signed-out clients on 2.736.0.1408 and
+  2.738.0.1397 ran together in a headless compositor with input flowing:
+  presents read 776 and 774, then 918 and 915 about five seconds later; each
+  extracted its assets into its own `builds/<version>/assets/` (1,836 and 594
+  files) and both `.in-use` locks were refused to an exclusive request. The
+  control, the same two with a `--lib-dir` outside the store, used one shared
+  tree and the second client re-extracted over it while the first ran. Sequential,
+  one human session on the machine, not a frame rate.
+- *Migration.* Run against throwaway data directories: a Sober copy
+  (`source=sober`, Sober's files byte-identical by `stat` before and after), a
+  cache store in the maintainer's own shape (moved, verified once at launch,
+  launched from the store to the sign-in page), and a Settings APK (imported,
+  two unpinned profiles pinned, an existing pin kept, the setting cleared).
+- *Disk.* An entry measured 348 to 350 MB with extracted assets, against the
+  0.5 GB estimated above.
+
+**Corrected.** Context 3 measured `lib/x86_64` as a real directory naming
+Sober's `base.apk` with `builds/` empty. On the host install, measured again on
+2026-10-04, the slot is a link into `~/.cache/cordial/builds/2.738.0.1397`,
+which holds that entry with a signer record in the slot's format. The migration
+handles both shapes; the earlier measurement described a machine that has
+since pressed Download.
+
+**Differs from the text.**
+
+- **`.signer` records the archive by size and mtime, not by path.** The slot's
+  stamp includes the path, and the store moves, so a path-bearing record would
+  have unverified every entry on the move. A record in the slot's format reads
+  as unchecked and is replaced by one verification. A copy loses mtime, so a
+  store moved by copy (not rename) is verified again once.
+- **Sober's directory alone files nothing.** The migration copies Sober's build
+  only when the old launch was running it, which always left a real directory in
+  the slot. A machine with Sober and no slot, or a wiped cache, gets the
+  first-run screen with both buttons, as the table above intends.
+- **Entries from before the records are verified at their first launch**, not
+  filed unsigned: `Latest` ignores an unsigned entry, so the shell checks each
+  once before resolving.
+- **A recorded signer must still be trusted.** `Latest` skips an entry whose
+  certificate is no longer pinned and a pin to one is refused naming the
+  fingerprint.
+- **The Quest store takes no `.in-use` lock and collects with a spare of two**,
+  which is the bound it had; it stays out of the rest of this ADR.
+- **"From the store view" is a Remove row, not a collection on opening the
+  page**, which would delete builds by looking at them.
+- **The mirror's `versionCode` is recorded** in `.version-code` when the
+  download supplies one, for display only.
+
+**Not done.** The profile row does not say "N releases behind the newest build
+on offer": that needs the mirror's list cached somewhere, and the Version page
+fetches it fresh. `CORDIAL_APK_DIR`, which was undocumented, is no longer read.
+
+**Still INFERRED.**
+
+- That a hard link from Sober's directory fails across the Flatpak's read-only
+  grant (the import copies and nothing depends on it).
+- What the engine shows when Roblox refuses an old client, and so the 60 second
+  window and wording of the crash-page hint for a pinned profile.
+- That an older build may not understand what a newer one saved; the Version
+  page says it has not measured.
+- That the Flatpak's file portal hands over only the chosen file, so a split
+  APK's other half cannot be seen when imported that way.
+- The Flatpak itself was not run: every check above used a host build.

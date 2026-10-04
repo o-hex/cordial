@@ -493,13 +493,9 @@ fn build_apk_row(
             let meter_step = meter.clone();
             crate::updater::on_worker_reporting(
                 move |report: &dyn Fn(cordial_update::provider::Progress)| {
-                    // `Newest`, the same as the Updates page and for the same
-                    // reason: this button is shown when Sober's copy is on the
-                    // disk, and `Any` would always pick that, so pressing it
-                    // would copy the build already in use and change nothing
-                    // but where it lives. `Newest` still takes the local copy
-                    // when it is as new as anything on offer, which costs no
-                    // bytes.
+                    // `Newest`, the same as the Updates page. The mirror is the
+                    // only source (ADR-054): pressing this downloads the newest
+                    // build and never copies Sober's.
                     cordial_update::provider::obtain_and_install(
                         None,
                         cordial_update::provider::Want::Newest,

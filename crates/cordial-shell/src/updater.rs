@@ -1192,10 +1192,11 @@ pub fn present(
                 {
                     let cancel = cancel.clone();
                     move |report: &dyn Fn(cordial_update::provider::Progress)| {
-                    // `Newest`, and this is the button where that matters.
-                    // With `Any` a local copy always wins, so anybody with
-                    // Sober installed would press Update, watch it succeed,
-                    // and receive the build they already had -- for ever.
+                    // `Newest`. The mirror is the only source now (ADR-054), so
+                    // this and `Any` ask the same question; it is spelled for
+                    // what the button means. Sober's copy used to win under
+                    // `Any` and an Update press then reinstalled the build
+                    // already in use -- that is gone with the source.
                     cordial_update::provider::obtain_and_install(
                         None,
                         cordial_update::provider::Want::Newest,

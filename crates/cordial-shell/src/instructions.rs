@@ -23,6 +23,13 @@
 //! one is a way out of a dead end, the other is saying who the work is owed to.
 //! Confusing them is how the acknowledgement ended up as an instruction.
 //!
+//! ## Sober is a second, explicit action
+//!
+//! Where Sober's package directory holds a build Cordial's store does not, a
+//! second control copies it in instead of downloading. It is below the
+//! download and says what it costs; the download is the default because
+//! Cordial keeps its own builds ([ADR-054](../../../docs/adr/ADR-054-cordial-owns-its-roblox-builds.md)).
+//!
 //! ## It does not download on its own
 //!
 //! An empty first run could fetch the build without being asked, and it must
@@ -41,13 +48,25 @@ use crate::updater;
 /// What the screen says above the button.
 ///
 /// Two sentences: what is missing, and that pressing the button fixes it.
-const ADVICE: &str =
-    "Cordial ships no Roblox build. Press the button and it will download and verify one.";
+const ADVICE: &str = "Cordial downloads Roblox for you and keeps its own copy.";
 
 /// Said once, small, under the button. Where the build comes from is on the
 /// Updates page in Settings for anybody who wants it; this is the sentence that
 /// stops "download" reading as "trust whatever arrives".
-const CHECKED: &str = "Installs only if Roblox's signing certificate signed it.";
+const CHECKED: &str = "It checks Roblox's signing certificate before using it.";
+
+/// The second action, offered only when Sober's package directory holds a build
+/// the store does not. A copy, not a link: the bytes become Cordial's, Sober's
+/// files are not touched, and its later updates are not followed.
+/// ADR-054.
+fn sober_line(found: &cordial_update::provider::import::Found) -> String {
+    format!(
+        "Sober's Roblox {} is on this computer. Copy it into Cordial instead of downloading \
+         ({}; Cordial does not change Sober's files and does not follow its updates).",
+        found.version,
+        cordial_shell::profile::human_bytes(found.bytes)
+    )
+}
 
 /// The one button.
 const FETCH: &str = "Download Roblox";
@@ -83,6 +102,29 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
     checked.add_css_class("caption");
     body.append(&checked);
 
+    // Only when there is something to copy that the store does not already
+    // hold. Looked for here, on the main thread, because it opens two archives
+    // and reads one version string -- the same order of cost as the version
+    // scan `diagnostics` already does when the launcher draws.
+    let sober = cordial_update::provider::import::sober_offer(&cordial_update::store::list());
+    let copy = sober.as_ref().map(|found| {
+        let line = gtk::Label::builder()
+            .label(sober_line(found))
+            .wrap(true)
+            .max_width_chars(60)
+            .justify(gtk::Justification::Center)
+            .build();
+        line.add_css_class("dim-label");
+        line.add_css_class("caption");
+        line.set_margin_top(12);
+        body.append(&line);
+        let button = gtk::Button::with_label("Copy Sober's build");
+        button.add_css_class("pill");
+        button.set_halign(gtk::Align::Center);
+        body.append(&button);
+        (line, button)
+    });
+
     // The bar replaces the button in place rather than opening in front of it.
     // See `download_progress`: a second window for one action leaves two things
     // to dismiss and says nothing this space could not.
@@ -108,6 +150,8 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
 
     let to_close = window.clone();
     let retry = std::rc::Rc::new(retry);
+    let (to_close_for_copy, retry_for_copy) = (to_close.clone(), retry.clone());
+    let (fetch_for_copy, meter_for_copy) = (fetch.clone(), meter.clone());
     fetch.connect_clicked(move |b| {
         // The button stays and becomes Cancel, rather than vanishing. See
         // `updater.rs` for the same treatment and the reason: a few hundred
@@ -145,13 +189,12 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
             {
                 let cancel = cancel.clone();
                 move |report: &dyn Fn(cordial_update::provider::Progress)| {
-                // `Any`, not `Newest`. This screen has no build at all, so the
-                // cheapest usable one is the right answer -- and on most
-                // machines that is a copy already on the disk, which costs no
-                // request and no bytes.
+                // The mirror, newest first. A build already on this disk (Sober's)
+                // is no longer taken silently: it is the second control below,
+                // and a press of this one always downloads (ADR-054).
                 cordial_update::provider::obtain_and_install(
                     None,
-                    cordial_update::provider::Want::Any,
+                    cordial_update::provider::Want::Newest,
                     Some(&cordial_update::install::Store::live(
                         cordial_shell::profile::all_pinned_versions(),
                     )),
@@ -186,6 +229,54 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
         );
     });
 
+    if let (Some((line, button)), Some(found)) = (copy, sober) {
+        let (to_close, retry) = (to_close_for_copy, retry_for_copy);
+        let (fetch, meter) = (fetch_for_copy, meter_for_copy);
+        button.connect_clicked(move |b| {
+            // Nothing else may start while the copy runs: both write the
+            // store's one install directory, and the second would be refused
+            // by its lock with a sentence about "another Cordial".
+            b.set_sensitive(false);
+            fetch.set_sensitive(false);
+            line.set_visible(false);
+            b.set_label("Copying...");
+            meter.start();
+            let (b, fetch, line) = (b.clone(), fetch.clone(), line.clone());
+            let (meter_step, meter_done) = (meter.clone(), meter.clone());
+            let (to_close, retry, found) = (to_close.clone(), retry.clone(), found.clone());
+            updater::on_worker_reporting(
+                move |report: &dyn Fn(cordial_update::provider::Progress)| {
+                    cordial_update::provider::import_and_install(
+                        &found,
+                        cordial_update::store::Source::Sober,
+                        Some(&cordial_update::install::Store::live(
+                            cordial_shell::profile::all_pinned_versions(),
+                        )),
+                        &cordial_update::provider::Cancel::new(),
+                        &mut |p| report(p),
+                    )
+                    .map_err(|e| e.to_string())
+                },
+                move |step| meter_step.step(&step),
+                move |outcome| match outcome {
+                    Ok(version) => {
+                        meter_done.finish(&version);
+                        if retry() {
+                            to_close.close();
+                        }
+                    }
+                    Err(why) => {
+                        meter_done.failed(&why);
+                        b.set_sensitive(true);
+                        b.set_label("Copy Sober's build");
+                        fetch.set_sensitive(true);
+                        line.set_visible(true);
+                    }
+                },
+            );
+        });
+    }
+
     window.present();
 }
 
@@ -204,8 +295,8 @@ mod tests {
     /// reading as "trust whatever arrives".
     #[test]
     fn the_screen_promises_a_download_and_says_what_is_checked() {
-        assert!(ADVICE.contains("Cordial ships no Roblox build"));
-        assert!(ADVICE.contains("download"));
+        assert!(ADVICE.contains("downloads Roblox for you"));
+        assert!(ADVICE.contains("its own copy"));
         assert!(CHECKED.contains("signing certificate"));
         assert_eq!(FETCH, "Download Roblox");
     }
@@ -223,5 +314,22 @@ mod tests {
             assert!(!text.contains("Sober"), "{text}");
             assert!(!text.contains("flatpak"), "{text}");
         }
+    }
+
+    /// The Sober line says what is being offered, what it costs and what it
+    /// does not do -- and is the only text on this screen that names Sober.
+    #[test]
+    fn the_sober_offer_names_the_build_the_size_and_what_it_leaves_alone() {
+        let found = cordial_update::provider::import::Found {
+            dir: "/s".into(),
+            archives: cordial_update::provider::Archives { base: "/s/base.apk".into(), split: "/s/split.apk".into() },
+            version: "2.738.0.1397".into(),
+            bytes: 150_608_780,
+        };
+        let line = sober_line(&found);
+        assert!(line.contains("Sober's Roblox 2.738.0.1397"), "{line}");
+        assert!(line.contains("150.6 MB"), "{line}");
+        assert!(line.contains("does not change Sober's files"), "{line}");
+        assert!(line.contains("does not follow its updates"), "{line}");
     }
 }

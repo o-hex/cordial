@@ -14,8 +14,9 @@
 //! down. A mirror can decline to serve a version, or serve an older one while
 //! claiming it is current -- **nothing here verifies the version list**, only
 //! the archives. And a mirror sees who asked and when. Those are the terms, and
-//! they are why [`super::local`] is tried first and why this is not the default
-//! on a metered connection.
+//! they are why this is not downloaded from without being asked on a metered
+//! connection, and why Sober's copy is offered as an import
+//! ([`super::import`]) for anybody who prefers Google Play's route.
 //!
 //! ## The protocol has no specification, and this is a reader for it
 //!

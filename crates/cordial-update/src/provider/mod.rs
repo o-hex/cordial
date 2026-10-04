@@ -657,13 +657,25 @@ pub fn update_store(
     cancel: &Cancel,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<String, Unreachable> {
-    update_store_from(&mirror::ApkPure, store, &crate::apk_signature::pinned(), cancel, progress)
+    update_store_from(
+        &mirror::ApkPure,
+        store,
+        &crate::apk_signature::pinned(),
+        &crate::install::engine_dir(),
+        cancel,
+        progress,
+    )
 }
 
+/// `slot` is a parameter so a test can hand it a scratch one: the filing
+/// re-points it, and a test that was given the real `engine_dir()` re-pointed
+/// the developer's own `$XDG_CACHE_HOME/cordial/lib/<abi>` into a temp dir that
+/// vanished at reboot.
 pub(crate) fn update_store_from(
     source: &dyn Provider,
     store: &crate::install::Store,
     trusted: &[String],
+    slot: &Path,
     cancel: &Cancel,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<String, Unreachable> {
@@ -677,7 +689,7 @@ pub(crate) fn update_store_from(
         Some(have) => have.version.clone(),
         None => obtain_into_store_from(source, &newest, &store.root, trusted, cancel, progress)?,
     };
-    after_filing(store, &version, &crate::install::engine_dir());
+    after_filing(store, &version, slot);
     Ok(version)
 }
 
@@ -878,8 +890,11 @@ mod tests {
         kept_entry(&root, "2.738.0.1397");
         let store = crate::install::Store { root: root.clone(), protect: vec![] };
         // The mirror says three components, the store keeps four: one build.
-        let version = update_store_from(&Never("2.738.1397"), &store, &[], &Cancel::new(), &mut |_| {}).unwrap();
+        let slot = dir.join("lib/x86_64");
+        let version =
+            update_store_from(&Never("2.738.1397"), &store, &[], &slot, &Cancel::new(), &mut |_| {}).unwrap();
         assert_eq!(version, "2.738.0.1397");
+        assert!(std::fs::symlink_metadata(&slot).is_ok(), "the scratch slot was the one pointed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -529,8 +529,14 @@ pub(crate) fn lock(root: &Path) -> io::Result<std::fs::File> {
 /// hand-set `--lib-dir`, a build of unknown version still in the old slot. All
 /// ordinary, none of them things to record against.
 pub fn entry_at(path: &Path) -> Option<PathBuf> {
+    entry_at_in(&root(), path)
+}
+
+/// [`entry_at`] against a given store root, so the answer can be tested
+/// without the machine's real store.
+pub fn entry_at_in(root: &Path, path: &Path) -> Option<PathBuf> {
     let resolved = std::fs::canonicalize(path).ok()?;
-    let root = std::fs::canonicalize(root()).ok()?;
+    let root = std::fs::canonicalize(root).ok()?;
     let name = resolved.file_name()?.to_str()?;
     (resolved.parent() == Some(root.as_path()) && is_valid_version(name)).then_some(resolved)
 }
@@ -749,6 +755,83 @@ pub fn detach(live: &Path) -> io::Result<()> {
     std::fs::create_dir_all(live)
 }
 
+/// Where an entry's extracted assets live.
+///
+/// Inside the entry, so every build has its own tree and two profiles on two
+/// versions never re-extract over each other, and so removing an entry takes
+/// its assets with it. The runtime derives it from [`entry_at`] of its
+/// `--lib-dir`; anything outside the store keeps the shared tree it always
+/// had. ADR-054.
+pub const ASSETS: &str = "assets";
+
+pub fn assets_dir(entry: &Path) -> PathBuf {
+    entry.join(ASSETS)
+}
+
+/// Mark the entry at `dir` as in use, for as long as the returned file lives.
+///
+/// A shared, non-blocking `flock` on [`IN_USE`]: any number of clients may run
+/// one build, and none of them can have it removed from under them, because
+/// [`gc_in`] and [`remove_in`] ask for the same file exclusively. The lock
+/// belongs to the open file description, so a client that crashes or is killed
+/// releases it, which a file holding a pid would not.
+///
+/// Refuses (rather than waits) when the entry is being removed right now: the
+/// directory is about to disappear and starting a client in it would only fail
+/// later and elsewhere.
+pub fn hold_in_use(dir: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(IN_USE))?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared).map_err(|_| {
+        io::Error::new(io::ErrorKind::WouldBlock, format!("{} is being removed", dir.display()))
+    })?;
+    Ok(file)
+}
+
+/// Take the entry exclusively, which succeeds only when no client holds it.
+/// The caller keeps the file for as long as it needs the answer to stay true.
+fn claim_unused(dir: &Path) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(IN_USE))
+        .ok()?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).ok()?;
+    Some(file)
+}
+
+/// Whether any client is running the entry at `dir` right now.
+pub fn is_in_use(dir: &Path) -> bool {
+    claim_unused(dir).is_none() && dir.is_dir()
+}
+
+/// Remove what [`gc_plan`] says nothing needs, and return what went.
+///
+/// Each victim is claimed exclusively before it is touched and held while it is
+/// deleted, so a client that started between the plan and the delete is not
+/// failed under: it holds the entry, the claim is refused and the entry stays.
+/// Run after a filing and from the store view, never at launch with a window
+/// open. [ADR-054](../../../docs/adr/ADR-054-cordial-owns-its-roblox-builds.md).
+pub fn gc_in(root: &Path, pins: &[String], spare: usize) -> Vec<String> {
+    let Ok(_lock) = lock(root) else { return Vec::new() };
+    let entries = list_in(root);
+    let running: Vec<String> =
+        entries.iter().filter(|e| is_in_use(&e.dir)).map(|e| e.version.clone()).collect();
+    let mut removed = Vec::new();
+    for version in gc_plan(&entries, pins, &running, spare) {
+        let Some(dir) = entry_dir_in(root, &version) else { continue };
+        let Some(_held) = claim_unused(&dir) else { continue };
+        if std::fs::remove_dir_all(&dir).is_ok() {
+            removed.push(version);
+        }
+    }
+    removed
+}
+
 /// Drop the oldest entries until at most `keep` remain, never touching one
 /// named in `protect`.
 ///
@@ -807,6 +890,9 @@ pub fn remove_in(root: &Path, live: &Path, version: &str, protect: &[String]) ->
     if protect.iter().any(|p| p == version) {
         return Err(format!("A profile is pinned to Roblox {version}. Clear that pin first."));
     }
+    let Some(_held) = claim_unused(&dir) else {
+        return Err(format!("Roblox {version} is running in a client. Close it first."));
+    };
     std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
@@ -1595,5 +1681,86 @@ mod tests {
         for s in [Source::Mirror, Source::Sober, Source::File, Source::Legacy] {
             assert_eq!(Source::parse(s.as_str()), Some(s));
         }
+    }
+
+    #[test]
+    fn gc_skips_a_build_a_client_holds_and_takes_it_once_the_client_is_gone() {
+        let scratch = Scratch::new("gc-in-use");
+        let root = scratch.path();
+        for v in ["2.742.0.9", "2.738.0.1", "2.734.0.1"] {
+            build(root, v);
+        }
+        let running = hold_in_use(&root.join("2.734.0.1")).unwrap();
+        // Spare zero: 2.738 and 2.734 are both candidates; only the idle one goes.
+        assert_eq!(gc_in(root, &[], 0), ["2.738.0.1"]);
+        assert!(root.join("2.734.0.1").is_dir(), "held by a client");
+        assert!(is_in_use(&root.join("2.734.0.1")));
+
+        drop(running);
+        assert_eq!(gc_in(root, &[], 0), ["2.734.0.1"]);
+        assert_eq!(list_in(root).len(), 1, "the newest is never removed");
+    }
+
+    #[test]
+    fn two_clients_may_share_a_build_and_removal_refuses_it_by_name() {
+        let scratch = Scratch::new("in-use-shared");
+        let root = scratch.path().join("builds");
+        let live = scratch.path().join("lib/x86_64");
+        let dir = build(&root, "2.738.0.1");
+        build(&root, "2.742.0.9");
+        let a = hold_in_use(&dir).unwrap();
+        let b = hold_in_use(&dir).expect("a second client on the same build is fine");
+        let refused = remove_in(&root, &live, "2.738.0.1", &[]).unwrap_err();
+        assert!(refused.contains("running"), "{refused}");
+        drop((a, b));
+        remove_in(&root, &live, "2.738.0.1", &[]).unwrap();
+    }
+
+    #[test]
+    fn a_build_that_is_being_removed_cannot_be_started() {
+        let scratch = Scratch::new("in-use-removing");
+        let dir = build(scratch.path(), "2.738.0.1");
+        let claim = claim_unused(&dir).expect("nothing holds it");
+        let refused = hold_in_use(&dir).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+        drop(claim);
+        hold_in_use(&dir).unwrap();
+    }
+
+    #[test]
+    fn two_entries_have_two_asset_trees_and_removing_one_takes_its_own() {
+        let scratch = Scratch::new("assets");
+        let root = scratch.path();
+        let a = build(root, "2.738.0.1");
+        let b = build(root, "2.734.0.1");
+        assert_ne!(assets_dir(&a), assets_dir(&b));
+        assert_eq!(assets_dir(&a), a.join("assets"));
+        std::fs::create_dir_all(assets_dir(&b).join("content")).unwrap();
+        std::fs::write(assets_dir(&b).join("content/x"), b"x").unwrap();
+        assert_eq!(gc_in(root, &[], 0), ["2.734.0.1"]);
+        assert!(!b.exists(), "its assets went with it");
+        assert!(a.is_dir());
+    }
+
+    /// What the runtime does with `--lib-dir`: a store entry gets its own tree,
+    /// through the slot's link as well as directly, and anything else has none.
+    #[test]
+    fn the_assets_root_follows_the_entry_and_a_foreign_lib_dir_has_none() {
+        let scratch = Scratch::new("assets-root");
+        let root = scratch.path().join("builds");
+        let a = build(&root, "2.738.0.1");
+        let b = build(&root, "2.734.0.1");
+        let live = scratch.path().join("lib/x86_64");
+        point_current_at(&live, &a).unwrap();
+
+        let of = |p: &Path| entry_at_in(&root, p).map(|e| assets_dir(&e));
+        let (ra, rb) = (of(&a).unwrap(), of(&b).unwrap());
+        assert_ne!(ra, rb, "two versions, two trees");
+        assert_eq!(of(&live), Some(ra), "through the slot's link it is the same entry's tree");
+
+        let foreign = scratch.path().join("somewhere/lib");
+        std::fs::create_dir_all(&foreign).unwrap();
+        assert_eq!(of(&foreign), None, "a hand-typed --lib-dir keeps the shared tree");
+        assert_eq!(of(&root.join("missing")), None);
     }
 }

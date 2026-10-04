@@ -392,8 +392,27 @@ fn parse() -> Result<Options, String> {
     Ok(opt)
 }
 
-/// Where the APK's assets are unpacked, under the cache root.
+/// The `--lib-dir` this process was given, once parsed, for [`assets_root`].
+static LIB_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Where the APK's assets are unpacked.
+///
+/// **Inside the store entry the engine came from, when it came from one.** One
+/// tree per build flavour, stamped with the APK it was made from, meant a
+/// second profile on another version re-extracted over the first one's tree
+/// while that client was running -- the rewrite-under-a-reader failure ADR-053
+/// records for phone against Quest, only between two phone builds. An entry's
+/// own `assets/` is stamped against the entry's own `base.apk`, so a profile
+/// following Latest and one pinned to the same version share one tree, and two
+/// versions never touch each other's. Anything outside the store (a
+/// hand-typed `--lib-dir`) keeps the shared tree, under the cache root.
+/// ADR-054; the Quest build is not a version directory and keeps its own.
 fn assets_root() -> std::path::PathBuf {
+    if cordial_runtime::profile::build() == cordial_runtime::profile::Build::Phone {
+        if let Some(entry) = LIB_DIR.get().and_then(|d| cordial_update::store::entry_at(std::path::Path::new(d))) {
+            return cordial_update::store::assets_dir(&entry);
+        }
+    }
     std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
@@ -407,6 +426,21 @@ fn assets_root() -> std::path::PathBuf {
             cordial_runtime::profile::Build::Phone => "cordial/assets",
             cordial_runtime::profile::Build::Quest => "cordial/assets-arm64-v8a",
         })
+}
+
+/// Say that this process is running the store entry `--lib-dir` names, for as
+/// long as the returned file is kept: garbage collection and removal ask for
+/// the same lock exclusively, so a build in use is never taken from under it.
+/// Nothing to hold for a `--lib-dir` outside the store.
+fn hold_build(lib_dir: &str) -> Result<Option<std::fs::File>, String> {
+    let _ = LIB_DIR.set(lib_dir.to_string());
+    if cordial_runtime::profile::build() != cordial_runtime::profile::Build::Phone {
+        return Ok(None);
+    }
+    let Some(entry) = cordial_update::store::entry_at(std::path::Path::new(lib_dir)) else {
+        return Ok(None);
+    };
+    cordial_update::store::hold_in_use(&entry).map(Some).map_err(|e| e.to_string())
 }
 
 /// The directory the engine should treat as its asset folder.
@@ -1786,6 +1820,16 @@ fn main() -> ExitCode {
         Err(refusal) => {
             eprintln!("error: {refusal}");
             return ExitCode::from(3);
+        }
+    };
+
+    // The build this client runs is in use from here to the process's end. Bound
+    // to a name for the same reason `_claim` is: the lock is the open file.
+    let _in_use = match hold_build(&opt.lib_dir) {
+        Ok(held) => held,
+        Err(why) => {
+            eprintln!("error: {why}");
+            return ExitCode::from(4);
         }
     };
 

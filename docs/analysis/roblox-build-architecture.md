@@ -278,7 +278,7 @@ Cordial cannot run. Specifically:
    result on the landing screen (fps with input driven, per AGENTS.md, CPU) is
    the bar.
 3. **Quest.** Not viable; no option. *(Superseded 2026-10-01: it runs, and is
-   offered as "Play in VR" rather than as an option in this row; ADR-053.)*
+   offered as "Play in VR" in Settings → VR rather than as an option in this row; ADR-053.)*
 4. **Auto.** Must mean "the architecture of the running binary" and nothing
    else: `HOST_ABI`, resolved once, never re-derived from what a mirror lists,
    never changed because a newer release exists elsewhere. That is already

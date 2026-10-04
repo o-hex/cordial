@@ -68,7 +68,7 @@ If you already have a Quest build of Roblox copied off your own headset, **I Hav
 
 ### Start your OpenXR runtime
 
-With WiVRn, its server must be running before you press Play in VR; Settings says when it is not. To run it without WiVRn changing your system's active runtime:
+With WiVRn, its server must be running before you press Play in VR; the VR page says when it is not. To run it without WiVRn changing your system's active runtime:
 
 ```text
 flatpak run --command=wivrn-server io.github.wivrn.wivrn --no-manage-active-runtime
@@ -80,7 +80,7 @@ flatpak run --command=wivrn-server io.github.wivrn.wivrn --no-manage-active-runt
 
 ### Press Play in VR
 
-It sits under the Roblox button on the launcher.
+**Settings → VR → Play in VR**, at the top of the page. If it is greyed, the line under it says what is missing: no Quest build imported yet, no OpenXR runtime found, or WiVRn's server not running. The launcher itself only has the Roblox button. Why: [ADR-053](adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md).
 
 <!-- /steps -->
 

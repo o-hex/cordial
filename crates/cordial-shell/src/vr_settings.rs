@@ -1,7 +1,8 @@
-//! Settings → VR: the Quest build and the OpenXR runtime.
+//! Settings → VR: Play in VR, the Quest build and the OpenXR runtime.
 //!
-//! Two groups, for the two things "Play in VR" needs that a user supplies
-//! (ADR-053). The Quest build comes from the user's own headset -- Cordial
+//! The launcher carries only the Roblox button, so this page is where VR is
+//! started from (ADR-053, decision 7). Below the button, two groups for the two
+//! things "Play in VR" needs that a user supplies. The Quest build comes from the user's own headset -- Cordial
 //! ships no Roblox code and downloads no Quest build from anywhere -- either
 //! as an APK file they already have or pulled over `adb`. The runtime is
 //! chosen here and handed to one launch at a time; the system's active runtime
@@ -37,9 +38,72 @@ pub fn build_vr_page(
              finished yet; use an alt account.",
         )
         .build();
-    page.add(&build_quest_group(dialog, parent));
-    page.add(&build_runtime_group(parent, config, config_path));
+    let (play, refresh_play) = build_play_group(dialog, parent, config.clone());
+    page.add(&play);
+    page.add(&build_quest_group(dialog, parent, refresh_play.clone()));
+    page.add(&build_runtime_group(parent, config, config_path, refresh_play));
     page
+}
+
+/// "Play in VR", with the reason under it when it cannot start.
+///
+/// A row with the sentence on screen rather than a bare insensitive button,
+/// because an unavailable control that cannot say why is the failure
+/// `settings::detail` exists to avoid. The returned closure re-reads the
+/// Quest build, the runtime and WiVRn's server; the other groups call it after
+/// they change one of those, so the button never describes a page that has
+/// since moved on.
+fn build_play_group(
+    dialog: &adw::PreferencesDialog,
+    parent: &gtk::Window,
+    config: Rc<RefCell<ShellConfig>>,
+) -> (adw::PreferencesGroup, Rc<dyn Fn()>) {
+    let group = adw::PreferencesGroup::new();
+    let row = adw::ActionRow::builder()
+        .title("Play in VR")
+        .use_markup(false)
+        .build();
+    let button = gtk::Button::builder()
+        .label("Play in VR")
+        .valign(gtk::Align::Center)
+        .css_classes(["suggested-action"])
+        .build();
+    row.add_suffix(&button);
+    group.add(&row);
+
+    {
+        let dialog = dialog.clone();
+        let parent = parent.clone();
+        button.connect_clicked(move |_| {
+            // Closed first: the launch reports its failures as toasts and
+            // alerts on the main window, which a Settings dialog would cover.
+            // The same action the launcher button called, so there is still
+            // one launch path (`win.launch-vr`).
+            dialog.close();
+            let _ = parent.activate_action("win.launch-vr", None);
+        });
+    }
+
+    let refresh: Rc<dyn Fn()> = Rc::new(move || {
+        // Without a Quest build nothing else can make the button usable, so a
+        // machine that has never been set up for VR stops here: no scan for
+        // OpenXR runtimes and no `flatpak info` subprocess on the GTK thread.
+        if quest::current().is_none() {
+            button.set_sensitive(false);
+            // Not `vr::NO_QUEST_BUILD`, which points at this very page.
+            row.set_subtitle("Import the Quest build of Roblox from your headset first, below.");
+            return;
+        }
+        let readiness = vr::Readiness::gather(config.borrow().vr_openxr_runtime.as_deref());
+        let missing = readiness.missing();
+        button.set_sensitive(missing.is_empty());
+        row.set_subtitle(&match missing.first() {
+            Some(first) => first.clone(),
+            None => readiness.summary(),
+        });
+    });
+    refresh();
+    (group, refresh)
 }
 
 fn quest_status() -> String {
@@ -52,6 +116,7 @@ fn quest_status() -> String {
 fn build_quest_group(
     dialog: &adw::PreferencesDialog,
     parent: &gtk::Window,
+    refresh_play: Rc<dyn Fn()>,
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
         .title("Quest build")
@@ -93,12 +158,15 @@ fn build_quest_group(
     {
         let dialog = dialog.clone();
         let status = status.clone();
+        let refresh_play = refresh_play.clone();
         start.connect_clicked(move |_| {
             let status = status.clone();
+            let refresh_play = refresh_play.clone();
             crate::quest_wizard::open(
                 &dialog,
                 Rc::new(move |version: String| {
-                    status.set_subtitle(&format!("Roblox {version}, imported"))
+                    status.set_subtitle(&format!("Roblox {version}, imported"));
+                    refresh_play();
                 }),
             );
         });
@@ -129,13 +197,16 @@ fn build_quest_group(
     {
         let parent = parent.clone();
         let status = status.clone();
+        let refresh_play = refresh_play.clone();
         choose.connect_clicked(move |b| {
             let status = status.clone();
+            let refresh_play = refresh_play.clone();
             let b = b.clone();
             choose_file(&parent, "Choose the Quest APK", false, move |path| {
                 b.set_sensitive(false);
                 status.set_subtitle("Checking Roblox's signature and filing the build…");
                 let status = status.clone();
+                let refresh_play = refresh_play.clone();
                 let b = b.clone();
                 // A 140 MB copy and a hash of a 110 MB engine: about a second,
                 // and not on the main thread.
@@ -155,6 +226,7 @@ fn build_quest_group(
                             Ok(version) => format!("Roblox {version}, imported"),
                             Err(why) => format!("{}\n{why}", quest_status()),
                         });
+                        refresh_play();
                     },
                 );
             });
@@ -189,6 +261,7 @@ fn build_runtime_group(
     parent: &gtk::Window,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
+    refresh_play: Rc<dyn Fn()>,
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
         .title("OpenXR runtime")
@@ -254,11 +327,13 @@ fn build_runtime_group(
         let config_path = config_path.clone();
         let ids = ids.clone();
         let show_status = show_status.clone();
+        let refresh_play = refresh_play.clone();
         combo.connect_selected_notify(move |row| {
             let id = ids.borrow().get(row.selected() as usize).cloned().flatten();
             config.borrow_mut().vr_openxr_runtime = id;
             persist(&config, &config_path);
             show_status();
+            refresh_play();
         });
     }
 
@@ -279,6 +354,8 @@ fn build_runtime_group(
             let config_path = config_path.clone();
             let combo = combo.clone();
             let ids = ids.clone();
+            let show_status = show_status.clone();
+            let refresh_play = refresh_play.clone();
             choose_file(
                 &parent,
                 "Choose an OpenXR runtime manifest",
@@ -302,6 +379,8 @@ fn build_runtime_group(
                     // index already selected fires nothing.
                     config.borrow_mut().vr_openxr_runtime = Some(path.clone());
                     persist(&config, &config_path);
+                    show_status();
+                    refresh_play();
                 },
             );
         });

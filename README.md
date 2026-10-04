@@ -185,7 +185,7 @@ wherever `CORDIAL_FLAGS` points. Settings → FastFlags → Import reads a
 Bloxstrap, Fishstrap or Sober list (`cordial --import-flags` does it from a
 terminal). Layering, syntax and import: [`docs/fastflags.md`](docs/fastflags.md).
 
-**VR (experimental, x86-64).** Play in VR runs the Meta Quest build of Roblox,
+**VR (experimental, x86-64).** Settings → VR → Play in VR runs the Meta Quest build of Roblox,
 copied from your own headset, through an OpenXR runtime such as WiVRn. See
 [`docs/vr.md`](docs/vr.md).
 

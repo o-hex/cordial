@@ -76,7 +76,7 @@ can run. Until then the row is honest and free.
 
 *2026-10-01:* for the Quest build that has now happened in part. ADR-053 keys
 the store by ABI and version (`builds/arm64-v8a/<version>/`), and the Quest
-build is reached through Settings → VR and "Play in VR", not through this row.
+build is reached through Settings → VR (which holds "Play in VR"), not through this row.
 `HOST_ABI` and the read-only row are unchanged, because nothing translates the
 phone build.
 

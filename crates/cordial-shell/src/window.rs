@@ -248,36 +248,12 @@ pub fn build(
     // remainder, and the width clamp is tighter than the 480 the groups used
     // because a boxed list and a pill button stretched to a launcher's full
     // width look like a preferences page whatever is in them.
-    // Under the Roblox button, never beside it: the main button keeps its
-    // place and its look, and VR is the secondary entry (ADR-053). Absent on a
-    // host that cannot run the Quest build.
-    let vr_entry = {
-        let toasts = toasts.clone();
-        let config_for_play = config.clone();
-        let join = join.clone();
-        let lifecycle = lifecycle.clone();
-        crate::vr_entry::build(config.clone(), move || {
-            let Some(window) = toasts.root().and_downcast::<gtk::Window>() else { return };
-            activate_roblox(&window, &toasts, &config_for_play, &join, &lifecycle, Mode::Vr);
-        })
-    };
-    let refresh_vr = vr_entry.as_ref().map(|e| e.refresh.clone());
-
     let column = gtk::Box::new(gtk::Orientation::Vertical, 24);
     column.set_valign(gtk::Align::Center);
     column.append(&profile_row);
-    match &vr_entry {
-        // Closer to the button it sits under than the 24 between the column's
-        // two existing controls, so it reads as part of the launch rather than
-        // a third section.
-        Some(entry) => {
-            let launch = gtk::Box::new(gtk::Orientation::Vertical, 12);
-            launch.append(&chooser_widget);
-            launch.append(&entry.widget);
-            column.append(&launch);
-        }
-        None => column.append(&chooser_widget),
-    }
+    // The Roblox button and nothing under it. VR is started from Settings → VR
+    // (ADR-053, decision 7): the launcher stays one button.
+    column.append(&chooser_widget);
 
     let clamp = adw::Clamp::builder().maximum_size(360).child(&column).build();
     clamp.set_margin_top(24);
@@ -378,9 +354,6 @@ pub fn build(
     host.header().pack_end(&menu_button);
 
     let window = host.window().clone();
-    if let Some(refresh) = &refresh_vr {
-        crate::vr_entry::follow_window(&window, refresh.clone());
-    }
     // `HostWindow` is deliberately application-less — the runtime has no
     // `GApplication` — so the shell binary attaches its own here, which is
     // what makes the window keep `app` alive and quit with it.
@@ -445,13 +418,7 @@ pub fn build(
         }
         // The Version page can pin the profile the launcher row describes.
         let refresh = refresh_profile_row.clone();
-        let refresh_vr = refresh_vr.clone();
-        settings.connect_closed(move |_| {
-            refresh();
-            if let Some(r) = &refresh_vr {
-                r();
-            }
-        });
+        settings.connect_closed(move |_| refresh());
         // **Make room for it first, if this window has not got any.**
         //
         // Raising [`DEFAULT_WIDTH`] fixes the cramped dialog for a profile that
@@ -559,8 +526,9 @@ pub fn build(
         });
     }
 
-    // "Play in VR", as an action, for the same reason `win.launch` is one: the
-    // same call the button makes, reachable by name, and not a second path.
+    // "Play in VR", as an action: the same call Settings → VR's button makes,
+    // reachable by name, so the page does not hold the window's internals and
+    // there is still one launch path.
     let launch_vr_action = gtk::gio::SimpleAction::new("launch-vr", None);
     {
         let window = window.clone();

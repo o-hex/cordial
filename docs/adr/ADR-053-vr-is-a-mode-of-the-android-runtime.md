@@ -113,12 +113,23 @@ hands-on session is noted under "Not established" below.
    `quest/` exists. **INFERRED:** that no phone build writes `HasEverUsedVR`
    true; Sober's phone 2.737 profile reads false.
 
-7. **The launcher's entry is secondary.** "Play in VR" sits under the Roblox
-   button, which keeps its place and look. It is absent on a host that is not
-   x86-64, insensitive until all three prerequisites are met, and says the
-   first missing one beneath it, with a link to Settings → VR. `--diagnostics`
-   gains a VR line and `--doctor` VR checks, which are never worse than `info`
-   unless a chosen runtime has gone.
+7. **VR lives in Settings → VR, not on the launcher.** *(Revised 2026-10-04;
+   the earlier text is kept below.)* The launcher shows the Roblox button and
+   nothing else, because the maintainer wants it kept to that one control. The
+   page has a "Play in VR" row at the top whose button calls `win.launch-vr`,
+   the same launch the launcher button used to make, and which is greyed with
+   the first missing prerequisite written beneath it: no Quest build imported,
+   no usable OpenXR runtime, or WiVRn's server not running. The page is absent
+   on a host that is not x86-64, as before. `--diagnostics` gains a VR line and
+   `--doctor` VR checks, which are never worse than `info` unless a chosen
+   runtime has gone.
+
+   *Superseded text:* "Play in VR" sat under the Roblox button, which kept its
+   place and look. It was absent on a host that is not x86-64, insensitive until
+   all three prerequisites were met, and said the first missing one beneath it,
+   with a link to Settings → VR. That put a second, large control on a window
+   whose whole job is one button, which is the reason it moved. The cost is one
+   more step to start a VR session; the readiness reasons are unchanged.
 
 ## When Roblox stops accepting the build
 
@@ -139,8 +150,8 @@ of a refused Quest client is what a real detector needs.
 
 ## Measured for this change, 2026-10-01
 
-From the launcher's own action (`win.launch-vr`, the same call as the
-button) in a nested headless KWin, throwaway data root, Monado's simulated
+From the launcher's own action (`win.launch-vr`, the same call the
+button made) in a nested headless KWin, throwaway data root, Monado's simulated
 HMD: the Quest build imported from the CLI, `XR_RUNTIME_JSON` set from the
 setting, `FOCUSED`, the landing panel, and a 60 s run ending in exit 0. Rate in
 10 s windows: 71.5, 85.9, 90.0, 62.2, 68.5, 63.5 frames/s at 90 Hz, on a host

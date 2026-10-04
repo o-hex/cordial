@@ -47,7 +47,6 @@ mod root_warning;
 mod settings;
 mod shell_config;
 mod updater;
-mod vr_entry;
 mod vr_settings;
 mod quest_wizard;
 mod x11_notice;

@@ -21,7 +21,7 @@ use std::process::Command;
 /// Whether this build of Cordial can run the Quest build at all.
 ///
 /// The translator has an x86-64 host backend only, and `cordial-run` refuses
-/// `--guest-arm64` elsewhere. The launcher hides the VR entry rather than
+/// `--guest-arm64` elsewhere. Settings hides the VR page rather than
 /// greying it out on other hosts: there is nothing the user can do about it.
 pub const HOST_SUPPORTED: bool = cfg!(target_arch = "x86_64");
 
@@ -99,9 +99,9 @@ impl Places {
     }
 }
 
-/// WiVRn's Flatpak location, asked once per process. The launcher refreshes
-/// the VR entry each time its window comes to the front, and a subprocess per
-/// focus change is not worth catching an install made while it was open.
+/// WiVRn's Flatpak location, asked once per process. Settings → VR re-reads
+/// readiness whenever a choice on the page changes, and a subprocess per
+/// change is not worth catching an install made while it was open.
 fn wivrn_flatpak_location() -> Option<PathBuf> {
     static ASKED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     ASKED
@@ -363,11 +363,11 @@ pub fn wivrn_start_command(places: &Places) -> String {
     }
 }
 
-/// What the VR entry says when no Quest build has been imported, which is the
+/// What Settings → VR's Play in VR row says when no Quest build has been imported, which is the
 /// first thing missing on every machine that has never been set up for VR.
 pub const NO_QUEST_BUILD: &str = "Import the Quest build of Roblox from your headset in Settings → VR.";
 
-/// Everything the VR entry needs, gathered once.
+/// Everything Play in VR needs, gathered once.
 #[derive(Debug, Clone)]
 pub struct Readiness {
     pub quest_build: Option<cordial_update::store::Entry>,

@@ -66,7 +66,13 @@ From the [0.23.2 release notes](releases/v0.23.2.md), the newest list:
 - **The signed-in startup freeze is not fixed.**
 - **Movement keys sometimes stop working after joining a game**
   ([#29](https://github.com/luohoa97/cordial/issues/29)). Respawning or re-joining
-  brings them back.
+  brings them back. To report it, start Cordial with `CORDIAL_TRACE_KEYS=1`,
+  press W in the stuck state, and paste the `[cordial] key` lines from the
+  terminal: `flatpak run --env=CORDIAL_TRACE_KEYS=1 io.github.luohoa97.Cordial`,
+  or `CORDIAL_TRACE_KEYS=1 cordial` for a native install. `result=ok` on
+  `path=native` means the key reached the engine; `result=gated` means Cordial
+  dropped it because the window had no keyboard focus. Every key is printed,
+  including ones typed into a password box, so trim the paste to the W lines.
 - **A touchscreen can crash the client**
   ([#36](https://github.com/luohoa97/cordial/issues/36)).
 - **A Roblox version released only for ARM64 is not shown on x86_64 machines.**

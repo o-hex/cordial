@@ -96,13 +96,11 @@ pub const IN_USE: &str = ".in-use";
 /// yesterday's build two clicks away; zero would be the literal "newest only".
 pub const SPARE: usize = 1;
 
-/// How many entries to keep, counting the current one.
-///
-/// By count rather than by age, because age says nothing about how much disk
-/// this is using and an engine directory is not small -- about 115 MB each on
-/// the build measured here. An unbounded store is a disk-full bug reported as
-/// something else entirely.
-pub const KEEP: usize = 3;
+/// How many builds the Quest store keeps, newest first: the newest and two
+/// spares, which is the bound the phone store used before [`gc_plan`] replaced
+/// it. The Quest store has no pins and no running-client lock (ADR-053 keeps it
+/// out of ADR-054's), so a count is what it has.
+pub const QUEST_SPARE: usize = 2;
 
 /// `$XDG_DATA_HOME/cordial`, or `~/.local/share/cordial`: where profiles live,
 /// and now where the builds do.
@@ -609,7 +607,7 @@ pub fn find_by_content_hash(root: &Path, hash: &Sha256Hash) -> Option<Entry> {
 ///
 /// Callers used to key or prune a build from three places, two of them taking
 /// different lock files and one taking none. Everything now reaches the store
-/// only through [`crate::install::file_into_store`], [`gc_in`], [`prune_in`],
+/// only through [`crate::install::file_into_store`], [`gc_in`],
 /// [`remove_in`] or [`relocate`], so the lock lives inside those rather than at
 /// each caller. See
 /// [ADR-037](../../../docs/adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md).
@@ -835,46 +833,6 @@ pub fn gc_in(root: &Path, pins: &[String], spare: usize) -> Vec<String> {
         let Some(_held) = claim_unused(&dir) else { continue };
         if std::fs::remove_dir_all(&dir).is_ok() {
             removed.push(version);
-        }
-    }
-    removed
-}
-
-/// Drop the oldest entries until at most `keep` remain, never touching one
-/// named in `protect`.
-///
-/// Returns what it removed, so a caller can say so rather than a user finding
-/// out by the store being smaller than they left it.
-///
-/// **`protect` is not optional and is not a convenience.** The current entry is
-/// in it, and so is every version any profile has pinned -- pruning a pinned
-/// build turns a deliberate choice into a launch failure with no explanation,
-/// which is the one outcome that makes the pin worse than not having it.
-pub fn prune_in(root: &Path, keep: usize, protect: &[String]) -> Vec<String> {
-    // Best-effort, matching the per-entry `is_ok()` below: a store this cannot
-    // lock right now is pruned on the next call rather than the caller being
-    // handed an error type it would only ever log.
-    let Ok(_lock) = lock(root) else {
-        return Vec::new();
-    };
-    let all = list_in(root);
-    let mut removed = Vec::new();
-    // Newest first, so counting down the list keeps the newest `keep` and the
-    // candidates are what is left. A protected entry still occupies one of the
-    // kept slots, deliberately: the alternative is that pinning three builds
-    // silently raises the bound to six.
-    let mut kept = 0usize;
-    for entry in all {
-        if protect.contains(&entry.version) {
-            kept += 1;
-            continue;
-        }
-        if kept < keep {
-            kept += 1;
-            continue;
-        }
-        if std::fs::remove_dir_all(&entry.dir).is_ok() {
-            removed.push(entry.version);
         }
     }
     removed
@@ -1320,19 +1278,24 @@ mod tests {
         assert!(live.join(crate::engine::LIBRARY).is_file(), "and it is still there");
     }
 
+    /// What `prune_in(.., KEEP = 3, ..)` got wrong, on disk: with the pin
+    /// counted against the bound, one pinned old build left room for only one
+    /// of the unreferenced others, and an old unreferenced build the bound did
+    /// not reach stayed for ever. `gc_in` keeps the newest, the pin and one
+    /// spare, and removes the rest.
     #[test]
-    fn pruning_keeps_the_newest_and_never_takes_something_protected() {
-        let scratch = Scratch::new("prune");
+    fn gc_keeps_the_newest_the_pin_and_one_spare_on_disk() {
+        let scratch = Scratch::new("gc-disk");
         let root = scratch.path();
         for v in ["2.730.0.1", "2.734.0.917", "2.738.0.1393", "2.740.0.5", "2.742.0.9"] {
             build(root, v);
         }
-        // Two kept by count, plus the pinned one which is older than both.
-        let removed = prune_in(root, 2, &["2.730.0.1".to_string()]);
+        let removed = gc_in(root, &["2.730.0.1".to_string()], SPARE);
         assert_eq!(removed, vec!["2.738.0.1393", "2.734.0.917"]);
 
         let left: Vec<String> = list_in(root).into_iter().map(|e| e.version).collect();
         assert_eq!(left, vec!["2.742.0.9", "2.740.0.5", "2.730.0.1"]);
+        assert!(gc_in(root, &["2.730.0.1".to_string()], SPARE).is_empty(), "idempotent on disk too");
     }
 
     #[test]
@@ -1435,13 +1398,13 @@ mod tests {
         let start = std::time::Instant::now();
         let handle = std::thread::spawn(move || {
             // Must block until the lock taken above is released below.
-            prune_in(&waited_root, 5, &[]);
+            gc_in(&waited_root, &[], 5);
             start.elapsed()
         });
         std::thread::sleep(std::time::Duration::from_millis(200));
         drop(held);
         let elapsed = handle.join().unwrap();
-        assert!(elapsed >= std::time::Duration::from_millis(180), "prune_in ran concurrently: {elapsed:?}");
+        assert!(elapsed >= std::time::Duration::from_millis(180), "gc_in ran concurrently: {elapsed:?}");
     }
 
     // ---- planning ----

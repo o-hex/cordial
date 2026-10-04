@@ -352,10 +352,9 @@ fn populate(view: &Rc<View>) {
 
     if !entries.is_empty() {
         let note = adw::PreferencesGroup::builder()
-            .description(format!(
-                "Cordial keeps the newest {} and any build a profile is pinned to. Removing one does not touch APKs that came from Sober.",
-                store::KEEP
-            ))
+            .description(
+                "Cordial keeps the newest build, the one before it, any build a profile is pinned to and any a client is running. Removing one does not touch Sober's files.",
+            )
             .build();
         add_group(view, note);
     }

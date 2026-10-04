@@ -216,7 +216,7 @@ pub fn import_files(files: &[PathBuf], root: &Path, trusted: &[String]) -> Resul
     let version = result?;
     // Bounded like the phone store, and nothing to protect: there is no pin,
     // and the newest entry -- the one just filed or found -- is always kept.
-    store::prune_in(root, store::KEEP, &[]);
+    store::gc_in(root, &[], store::QUEST_SPARE);
     Ok(version)
 }
 
@@ -279,7 +279,7 @@ mod tests {
         let dir = scratch("nested");
         let builds = dir.join("builds");
         let quest = root_in(&builds);
-        for (root, v) in [(&builds, "2.737.0.1"), (&quest, "2.740.0.927")] {
+        for (root, v) in [(&builds, "2.737.0.1"), (&builds, "2.730.0.1"), (&quest, "2.740.0.927")] {
             let e = root.join(v);
             std::fs::create_dir_all(&e).unwrap();
             std::fs::write(e.join(engine::LIBRARY), b"x").unwrap();
@@ -291,11 +291,12 @@ mod tests {
             .collect();
         assert_eq!(
             phone,
-            ["2.737.0.1"],
+            ["2.737.0.1", "2.730.0.1"],
             "the phone listing must not offer the Quest build"
         );
-        // And pruning the phone store to nothing leaves the Quest store alone.
-        store::prune_in(&builds, 0, &[]);
+        // And collecting the phone store down to its newest leaves the Quest
+        // store alone.
+        assert_eq!(store::gc_in(&builds, &[], 0), ["2.730.0.1"]);
         assert!(quest.join("2.740.0.927").join(engine::LIBRARY).is_file());
         assert_eq!(
             current_in(&quest).map(|e| e.version).as_deref(),

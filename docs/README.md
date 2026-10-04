@@ -87,6 +87,7 @@ All 53. Status is marked where it is not plain "accepted"; [`HANDOVER.md`](HANDO
 | [ADR-051](adr/ADR-051-overrides-are-reapplied-after-the-engines-refresh.md) | The profile's flag overrides are handed to the engine again after each of its own settings refreshes, triggered by its log |
 | [ADR-052](adr/ADR-052-the-runtime-spec.md) | Launcher features reach runtimes through a published spec, `cordial.runtime/1`; Cordial lists only its own runtime for now; supersedes ADR-050's launching design in part |
 | [ADR-053](adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md) | VR is a launch mode of the Android runtime: the Quest build, user-supplied and keyed by ABI in the store, run under an in-process translator; the OpenXR runtime is passed per launch; a profile shares its sign-in and lock across both builds and keeps their engine storage apart. Supersedes ADR-043's "Quest is rejected" |
+| [ADR-054](adr/ADR-054-cordial-owns-its-roblox-builds.md) | Cordial owns its Roblox builds: launches resolve from a store of verified builds, each profile follows Latest or a pinned version, and Sober's copy is an explicit import |
 
 ## Design notes
 

@@ -1,6 +1,7 @@
 # ADR-037: The build store's three writers share one lock, and an entry now proves its own bytes
 
 **Status:** accepted, implemented
+**Amended by:** [ADR-054](ADR-054-cordial-owns-its-roblox-builds.md) (launches resolve from the store; Sober is an import; 2026-10-04)
 **Date:** 2026-09-24
 **Extends:** [ADR-033](ADR-033-roblox-versions-are-a-keyed-store.md)
 **Related:** [ADR-012](ADR-012-profiles-and-instances.md), [ADR-025](ADR-025-fetching-from-a-third-party-mirror.md)

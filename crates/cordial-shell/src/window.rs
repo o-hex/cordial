@@ -1274,7 +1274,21 @@ fn start_attempt(
         Ok(instance) => instance,
         Err(message) => return Outcome::Failed(message),
     };
+    let started_at = std::time::Instant::now();
+    let pinned = profile::dir(profile_name).ok().and_then(|d| profile::pinned_version(&d)).is_some();
     join.clear();
+    // What this profile's client is running, for the Version page's warning
+    // about moving it to an older build. Only a store entry is recorded: the
+    // `CORDIAL_APK` override and the Quest build are not versions of the store.
+    if let Some(entry) = cordial_update::store::entry_at(&build.lib_dir) {
+        if let Some(version) = entry.file_name().and_then(|n| n.to_str()) {
+            if let Ok(dir) = profile::dir(profile_name) {
+                if let Err(e) = profile::record_last_roblox_version(&dir, version) {
+                    println!("  shell: could not record the build {profile_name:?} last ran: {e}");
+                }
+            }
+        }
+    }
     lifecycle.client_started();
     // From here Settings changes reach this client as well as the next launch:
     // see `live`. Registered with the values its environment carried, so a
@@ -1465,7 +1479,13 @@ fn start_attempt(
             ExitPresentation::Crash => {
                 println!("  shell: the client {status}; showing the crash page");
                 window.present();
-                crash::present(&window, &status, &instance.command_line, &output);
+                crash::present(
+                    &window,
+                    &status,
+                    &instance.command_line,
+                    &output,
+                    crash::pinned_hint(pinned, started_at.elapsed()),
+                );
             }
             ExitPresentation::Close => {
                 println!("  shell: the client exited cleanly ({status}); no crash page");

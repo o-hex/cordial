@@ -274,6 +274,16 @@ fn populate(view: &Rc<View>) {
     let status = adw::ActionRow::builder().title("").build();
     status.set_visible(false);
     status.set_subtitle_lines(4);
+    // Derived from the state rather than raised by the click, because every
+    // choice repopulates this page and an event-driven message would vanish
+    // with the rows. It stands for as long as the profile would run a build
+    // older than the one it last ran.
+    let target = pinned.clone().or_else(|| current.clone());
+    if let Some(warning) = target.as_deref().and_then(|t| {
+        profile::downgrade_warning(profile::last_roblox_version(&profile_dir).as_deref(), t)
+    }) {
+        show_status(&status, "Older than this profile last ran", &warning);
+    }
 
     let follow = adw::ActionRow::builder()
         .title("Latest")

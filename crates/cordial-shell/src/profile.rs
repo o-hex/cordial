@@ -824,6 +824,52 @@ pub fn set_pinned_version(profile_dir: &Path, version: Option<&str>) -> Result<(
     }
 }
 
+/// The Roblox build this profile's client was last started on.
+///
+/// A plain file beside [`PIN`], written when the client is spawned. A profile
+/// recorded nothing about the build that last ran it, so moving it to an older
+/// one could not be noticed ([ADR-054](../../../docs/adr/ADR-054-cordial-owns-its-roblox-builds.md)).
+/// Per-profile `data/` is not snapshotted and is not touched by a move between
+/// builds; this only lets the Version page say what is being moved from.
+pub const LAST_BUILD: &str = "last-roblox-version";
+
+/// The build the profile last ran, if one was recorded and still reads as a
+/// version.
+pub fn last_roblox_version(profile_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(profile_dir.join(LAST_BUILD)).ok()?;
+    let trimmed = text.trim().to_string();
+    cordial_update::store::is_valid_version(&trimmed).then_some(trimmed)
+}
+
+/// Record that this profile's client was started on `version`.
+pub fn record_last_roblox_version(profile_dir: &Path, version: &str) -> Result<(), String> {
+    if !cordial_update::store::is_valid_version(version) {
+        return Err(format!("{version:?} is not a Roblox version"));
+    }
+    let path = profile_dir.join(LAST_BUILD);
+    std::fs::write(&path, version).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// What to say when a profile that last ran `last` is about to run `target`,
+/// or `None` when there is nothing to say.
+///
+/// **Only for an older build.** The same build and a newer one are the
+/// ordinary cases and a warning there would be noise. Nothing measured says a
+/// same-flavour downgrade corrupts anything -- ADR-053 measured different
+/// caches and settings keys across phone and Quest builds only -- so this is
+/// worded as what is not known, and says what clears the stored data.
+/// **INFERRED** that an older build may not understand what a newer one saved.
+pub fn downgrade_warning(last: Option<&str>, target: &str) -> Option<String> {
+    let last = last?;
+    (cordial_update::store::compare(target, last) == std::cmp::Ordering::Less).then(|| {
+        format!(
+            "This profile last ran Roblox {last}. An older build may not understand what a newer \
+             one saved. Cordial has not measured what happens; Settings, Roblox, Stored data \
+             clears it."
+        )
+    })
+}
+
 /// Every version any profile has pinned.
 ///
 /// What the store must not prune. Collected across all profiles rather than
@@ -1664,4 +1710,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+
+    /// The warning is for an older build only: the same one and a newer one
+    /// are ordinary, and a profile that has recorded nothing has nothing to
+    /// warn about.
+    #[test]
+    fn a_downgrade_warns_and_nothing_else_does() {
+        let warned = downgrade_warning(Some("2.738.0.1397"), "2.736.0.1408").expect("older warns");
+        assert!(warned.contains("last ran Roblox 2.738.0.1397"), "{warned}");
+        assert!(warned.contains("Stored data"), "{warned}");
+        assert!(warned.contains("has not measured"), "it must not claim a harm nobody measured: {warned}");
+        assert_eq!(downgrade_warning(Some("2.738.0.1397"), "2.738.0.1397"), None, "the same build");
+        assert_eq!(downgrade_warning(Some("2.736.0.1408"), "2.738.0.1397"), None, "a newer build");
+        assert_eq!(downgrade_warning(None, "2.700.0.1"), None, "nothing recorded");
+        // Numeric, not textual: 2.99 is older than 2.738.
+        assert!(downgrade_warning(Some("2.738.0.1"), "2.99.0.1").is_some());
+    }
+
+    #[test]
+    fn the_last_build_round_trips_and_a_hand_edited_value_is_ignored() {
+        let (dir, _guard) = scratch("last-build");
+        assert_eq!(last_roblox_version(&dir), None);
+        record_last_roblox_version(&dir, "2.738.0.1397").unwrap();
+        assert_eq!(last_roblox_version(&dir).as_deref(), Some("2.738.0.1397"));
+        assert!(record_last_roblox_version(&dir, "../etc").is_err());
+        std::fs::write(dir.join(LAST_BUILD), "../../etc/passwd").unwrap();
+        assert_eq!(last_roblox_version(&dir), None);
+    }
 }

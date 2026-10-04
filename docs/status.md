@@ -77,9 +77,12 @@ The rest of the list in the
 
 ## Not tested
 
-- **NVIDIA GPUs.** First runs recorded 2026-10-03 (RTX 4070, driver 615.71.09):
-  boots, renders, survives resize and fullscreen, and MAILBOX holds the panel's
-  rate. Unverified on hybrid laptops, on 535/550, and in a Flatpak; see
+- **NVIDIA GPUs.** Two users' reports so far: driver 610.57 in the Flatpak
+  (2026-10-01, fullscreen in and out held), and an RTX 4070 on 615.71.09
+  (2026-10-03, natively), which booted and rendered and got through one
+  resize and fullscreen session, with one SIGSEGV at startup in eight launches.
+  MAILBOX presented 59.9 a second on a 240 Hz output at the engine's default
+  target. Unverified on hybrid laptops and on 535/550; see
   [NVIDIA graphics](nvidia.md).
 - **Real ARM64 hardware.** See [Architectures](multiarch.md).
 - **The AppImage's web view on a machine without WebKitGTK**, and on anything but

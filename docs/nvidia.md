@@ -4,11 +4,12 @@
 <!-- icon: microchip -->
 
 > [!WARNING]
-> **Most of this page is untested on NVIDIA hardware.** The first runs on
-> NVIDIA were recorded 2026-10-03 (RTX 4070, driver 615.71.09, KDE on Wayland):
-> the client boots, renders and survives resize and fullscreen, and nothing
-> below has yet been run on a hybrid laptop, on a 535/550 driver, or in a
-> Flatpak. What follows is what people running the same Roblox engine (through
+> **Most of this page is untested on NVIDIA hardware.** Two users have
+> reported runs: driver 610.57 in the Flatpak (2026-10-01, fullscreen in and
+> out held), and an RTX 4070 on 615.71.09 under KDE on Wayland (2026-10-03),
+> which booted and rendered, got through one resize and fullscreen session,
+> and crashed once at startup in eight launches. Nothing below has been run on
+> a hybrid laptop or a 535/550 driver. What follows is what people running the same Roblox engine (through
 > Sober) have reported, what Cordial does about the reports it can act on, and
 > what to try. Where something is a guess it says so.
 

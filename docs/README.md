@@ -18,7 +18,7 @@ order a newcomer would want it.
 | [`shaders.md`](shaders.md) | The vkBasalt switch: sharpening and anti-aliasing over the game, and its config file |
 | [`mangohud.md`](mangohud.md) | The MangoHUD switch: what it shows, and how to install the layer |
 | [`vr.md`](vr.md) | Play in VR: getting Roblox off your own Quest, choosing the OpenXR runtime, updating after Roblox updates, and what is still broken |
-| [`nvidia.md`](nvidia.md) | NVIDIA graphics: what is known, what Cordial does, the Flatpak driver extension, and how to report a problem. Untested on NVIDIA hardware |
+| [`nvidia.md`](nvidia.md) | NVIDIA graphics: what is known, what Cordial does, the Flatpak driver extension, and how to report a problem. Two users' NVIDIA reports so far |
 | [`plugins.md`](plugins.md) | Installing a plugin from an archive, and why Cordial fetches Deno |
 | [`runtime-spec.md`](runtime-spec.md) | Draft `cordial.runtime/1`: what a runtime implements for Cordial's launcher features. Nothing implements it yet |
 | [`architecture.md`](architecture.md) | How the pieces fit, as a diagram: shell, linker, symbol table, JNI, framework, plugins |

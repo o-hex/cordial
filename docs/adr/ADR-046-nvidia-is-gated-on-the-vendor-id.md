@@ -71,7 +71,8 @@ for everybody, on evidence this project cannot test.
 - Every NVIDIA behaviour is `INFERRED` until somebody with the hardware runs the
   plan in [`docs/analysis/nvidia-support.md`](../analysis/nvidia-support.md), and
   its comment says so. The claim "NVIDIA is supported" is not made anywhere;
-  `docs/nvidia.md` opens by saying nothing has been run on NVIDIA.
+  `docs/nvidia.md` opens by saying how little has been run on NVIDIA (two users'
+  reports by 2026-10-04).
 - The crash page can speak about NVIDIA only when the client's own output shows an
   NVIDIA device, so an unrelated crash on an Intel machine never mentions it.
 - If a run on real hardware shows the retry does nothing, delete it, and this ADR

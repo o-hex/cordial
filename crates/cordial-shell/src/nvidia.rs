@@ -1,7 +1,8 @@
 //! What Cordial does only when the GPU is NVIDIA's, and why each thing is here.
 //!
-//! **No NVIDIA hardware exists on the development machine, so nothing in this
-//! file has run against a real NVIDIA driver.** Every behaviour below is one of
+//! **No NVIDIA hardware exists on the development machine.** Two users have
+//! since run Cordial on NVIDIA drivers (docs/analysis/nvidia-support.md), but
+//! nothing here was checked against those runs beyond what they report. Every behaviour below is one of
 //! two kinds and says which. Some are *observations* about the host that are
 //! true whatever the hardware is (parsing `/proc/driver/nvidia/version`,
 //! comparing a Flatpak extension's name with it). The rest are *reactions to a

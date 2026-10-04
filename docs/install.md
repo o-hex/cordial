@@ -25,13 +25,23 @@ before using it
 ([ADR-015](adr/ADR-015-fetching-the-roblox-build.md),
 [ADR-025](adr/ADR-025-fetching-from-a-third-party-mirror.md)).
 
-- **Sober is installed:** Cordial reads the APK where Sober keeps it,
-  `~/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/`. Nothing is
-  copied or modified, and you never get asked for a build.
-- **You have your own APK:** give Settings a path to it, or pass `--apk` on the
-  command line. On a split build the engine is in `split_config.x86_64.apk`
-  rather than `base.apk`; Cordial checks the sibling files and says which it
-  tried if it finds none.
+- **Sober is installed:** until Cordial has a copy of its own, it runs the APK
+  where Sober keeps it,
+  `~/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/`, and never
+  writes to it. **Settings → Roblox** says so on the APK row and offers
+  **Download Roblox** there. Press it and Cordial verifies and installs its own
+  copy, then uses that, whether or not Sober stays installed. It takes the newest
+  build on offer, so if Sober's file is the newest, Cordial copies it and
+  downloads nothing.
+- **You have your own APK:** **Settings → Roblox → Choose…** takes a path to it,
+  or pass `--apk` on the command line. A chosen APK is used in preference to
+  Cordial's own download, so clear it (the button beside the path) before you
+  expect a download to take over. On a split build the engine is in
+  `split_config.x86_64.apk` rather than `base.apk`; keep the two in one folder
+  and Cordial checks the sibling files, saying which it tried if it finds none.
+
+The engine itself is unpacked from the APK into Cordial's own cache, and there
+is nothing to configure for it.
 
 Nothing else is needed to run a package. The Flatpak carries its own toolchain
 and libraries.

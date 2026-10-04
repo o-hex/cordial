@@ -1096,16 +1096,14 @@ mod tests {
     }
 
     #[test]
-    fn the_roblox_paths_round_trip() {
+    fn the_roblox_apk_round_trips() {
         let p = scratch("roblox.json");
         let mut config = ShellConfig::default();
         config.roblox.apk = Some(PathBuf::from("/somewhere/base.apk"));
-        config.roblox.lib_dir = Some(PathBuf::from("/somewhere/lib/x86_64"));
         config.profile = "alt_account".into();
         save(&p, &config).unwrap();
         let back = load(&p);
         assert_eq!(back.roblox.apk, config.roblox.apk);
-        assert_eq!(back.roblox.lib_dir, config.roblox.lib_dir);
         assert_eq!(back.profile, "alt_account");
     }
 

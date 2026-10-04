@@ -114,8 +114,9 @@ aarch64.
 You also need Roblox's Android build. Cordial does not ship it. First run has a
 **Download Roblox** button that fetches it from APKPure and refuses anything
 not signed by Roblox's own certificate. If [Sober](https://sober.vinegarhq.org/)
-is installed, Cordial uses the APK already on disk without copying or modifying
-it. You can also point Cordial at your own APK in Settings.
+is installed, Cordial runs its APK until you press **Download Roblox** in
+Settings → Roblox, which gives Cordial a copy of its own. You can also choose
+your own APK there.
 
 **Flatpak (recommended):** it runs on the same GNOME 50 runtime everywhere, with
 the GTK, WebKit, Vulkan loader and audio libraries Cordial is built and tested

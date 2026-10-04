@@ -23,10 +23,10 @@
 //! that picker is gone rather than kept in two places. `profile_switcher.rs`
 //! states the rule it broke: *two ways to set one value drift, and the one that
 //! drifts is the one nobody is looking at.* Choosing a build is configuration
-//! and lives on the Roblox page in Settings beside the engine directory it has
-//! to agree with; this window answers the one question a header-bar button can
-//! answer on its own — which build am I on, and has Roblox published a newer
-//! engine — and offers the single control that state earns.
+//! and lives on the Roblox page in Settings, where the Download button for
+//! Cordial's own copy is too; this window answers the one question a header-bar
+//! button can answer on its own — which build am I on, and has Roblox published
+//! a newer engine — and offers the single control that state earns.
 //!
 //! The settings themselves moved too, off the Roblox page and onto one of their
 //! own. That page was answering "where is the build" and "when does the build
@@ -1720,38 +1720,6 @@ fn version_line(recorded: Option<String>) -> String {
     }
 }
 
-/// What the extracted engine is, and whether it still matches the APK above.
-///
-/// The stamp is shown verbatim because it is the thing that decides: `install`
-/// re-extracts when it stops matching, and somebody looking at a Cordial that
-/// re-extracts 115 MB every launch has no other way to see what it is comparing.
-///
-/// Said on the Roblox page's engine-directory row now rather than in the
-/// header-bar button's window. It followed the engine directory, which is what
-/// it is about; the alternative on offer was deleting it with the row it used to
-/// sit in, and this is the only place the re-extraction is visible at all.
-pub(crate) fn cache_line(engine: bool, stamp: Option<String>, current: bool) -> String {
-    if !engine {
-        return format!(
-            "None yet. Cordial takes {} out of the APK the first time you launch, \
-             into its own cache.",
-            cordial_update::apk::LIBRARY_IN_APK
-        );
-    }
-    match stamp {
-        Some(stamp) if current => format!("Extracted from the APK above.\n{stamp}"),
-        // The case the stamp exists for: a new build at the same path used to
-        // leave the old engine in place, and Cordial ran it against the new
-        // APK's assets.
-        Some(stamp) => {
-            format!("Extracted from a different build, so the next launch extracts again.\n{stamp}")
-        }
-        None => "An engine is cached and nothing records which APK it came from, so the next \
-                 launch extracts again."
-            .to_string(),
-    }
-}
-
 /// What NetworkManager said, and what the switches make of it.
 ///
 /// Surfaced rather than left to be discovered when a download silently does not
@@ -2265,21 +2233,6 @@ mod tests {
             installed_version(Some(install::Origin::Managed)),
             cache::recorded_version(&install::engine_cache())
         );
-    }
-
-    #[test]
-    fn a_cache_from_another_build_says_it_will_be_extracted_again() {
-        // The defect the stamp exists for, in the one place a user can see it:
-        // a new build at the same path used to leave the old engine in place.
-        let stale = cache_line(true, Some("10 1754000000 /a/base.apk".into()), false);
-        assert!(stale.contains("different build"), "{stale}");
-        assert!(stale.contains("/a/base.apk"), "the stamp is what decides, so it is shown");
-
-        let fresh = cache_line(true, Some("10 1754000000 /a/base.apk".into()), true);
-        assert!(fresh.contains("Extracted from the APK above"), "{fresh}");
-
-        assert!(cache_line(false, None, false).contains("None yet"));
-        assert!(cache_line(true, None, false).contains("nothing records"));
     }
 
     #[test]

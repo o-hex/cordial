@@ -54,16 +54,27 @@ use cordial_update::apk::LIBRARY_IN_APK;
 
 /// What the user has pinned by hand, if anything.
 ///
-/// Both are `None` on a fresh install and stay that way for anyone who lets
-/// detection do its job — which is the intended case, not a degraded one. A
-/// value here is an override, and [`locate`] honours it over anything it would
-/// otherwise find, because a user who went to Settings and chose a file meant
-/// that file.
+/// `None` on a fresh install and for anyone who lets detection do its job --
+/// which is the intended case, not a degraded one. A value here is an
+/// override, and [`locate`] honours it over anything it would otherwise find,
+/// because a user who went to Settings and chose a file meant that file.
+///
+/// **There used to be a second field, `lib_dir`, and it is gone on purpose.**
+/// It was an "Engine directory" row in Settings that nobody needed to fill in:
+/// the engine is always extracted from the APK, into Cordial's own cache, and
+/// kept in step with it. A saved directory was worse than useless, because it
+/// was used as it stood and never compared with the APK, so a stale one ran an
+/// old engine against a new build's assets with nothing on screen saying so.
+/// An existing `shell.json` that still carries `"lib_dir"` loads without
+/// complaint (serde skips keys it does not know), the value is ignored rather
+/// than silently honoured -- a hidden setting the UI can no longer show or
+/// clear is the thing to avoid -- and the next save drops it from the file.
+/// The developer override is `cordial-run --lib-dir`, which does not go
+/// through this struct.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RobloxInstall {
     pub apk: Option<PathBuf>,
-    pub lib_dir: Option<PathBuf>,
 }
 
 /// A build that has been found and checked: both of these exist right now.
@@ -210,8 +221,8 @@ impl Origin {
                  page to let Cordial manage a build instead.",
             ),
             Origin::Sober => Some(
-                "This build belongs to Sober and Cordial will not write to it. Download one \
-                 and Cordial will manage its own copy.",
+                "This build belongs to Sober and Cordial will not write to it. Press Download \
+                 Roblox on the Roblox page and Cordial will manage its own copy.",
             ),
         }
     }
@@ -221,7 +232,10 @@ impl Origin {
             Origin::Environment => "Set by CORDIAL_APK for this run only",
             Origin::Chosen => "Chosen in Settings",
             Origin::Managed => "Downloaded by Cordial",
-            Origin::Sober => "Found in Sober's download (org.vinegarhq.Sober), which Cordial does not manage",
+            Origin::Sober => {
+                "Found in Sober's download (org.vinegarhq.Sober). Once Cordial has downloaded \
+                 its own copy it uses that instead."
+            }
         }
     }
 }
@@ -359,7 +373,7 @@ fn locate_with(
     // Before any of the four paths below returns a `Build`, so that none of
     // them can hand the loader an archive nobody established the origin of.
     let fresh_signer = verify(&apk, &engine_cache())?;
-    let build = locate_verified(configured, apk)?;
+    let build = locate_verified(apk)?;
     // Not fatal if it cannot be written: the cost is verifying again next
     // launch, which is slow rather than wrong. The same shape as the version
     // and stamp writes in `locate_verified`.
@@ -372,21 +386,7 @@ fn locate_with(
 }
 
 /// The rest of [`locate_with`], once the archive's signature is established.
-fn locate_verified(configured: &RobloxInstall, apk: PathBuf) -> Result<Build, NotFound> {
-    // An explicit --lib-dir wins and is not second-guessed: someone who set it
-    // has a reason, and quietly extracting over the top of it would hide a
-    // mismatch between the engine they meant to test and the one they got.
-    if let Some(lib_dir) = &configured.lib_dir {
-        return if lib_dir.join(LIBRARY).is_file() {
-            Ok(Build { apk, lib_dir: lib_dir.clone() })
-        } else {
-            Err(NotFound::Unusable(format!(
-                "No {LIBRARY} in {}. Open Settings and clear the engine directory to let Cordial extract one.",
-                lib_dir.display()
-            )))
-        };
-    }
-
+fn locate_verified(apk: PathBuf) -> Result<Build, NotFound> {
     // Beside the APK, which is where it lands if you unzip in place.
     if let Some(beside) = apk.parent().map(|d| d.join("lib").join(cordial_update::apk::HOST_ABI)) {
         if beside.join(LIBRARY).is_file() {
@@ -609,8 +609,8 @@ fn extract_engine(apk: &Path, into: &Path) -> Result<PathBuf, String> {
 
     Err(format!(
         "No {LIBRARY_IN_APK} in {} or its split_config siblings ({} tried). \
-         On a split build the engine is in {}, not base.apk — \
-         if it is somewhere else, set the engine directory in Settings.",
+         On a split build the engine is in {}, not base.apk, so that file has to sit \
+         in the same folder as base.apk.",
         apk.display(),
         tried.len(),
         cordial_update::install::SPLIT_APK
@@ -639,7 +639,7 @@ mod tests {
         // if Sober's copy is sitting right there.
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(APK_OVERRIDE);
-        let install = RobloxInstall { apk: Some(PathBuf::from("/somewhere/base.apk")), lib_dir: None };
+        let install = RobloxInstall { apk: Some(PathBuf::from("/somewhere/base.apk")) };
         let (apk, origin) = effective_apk(&install).unwrap();
         assert_eq!(apk, PathBuf::from("/somewhere/base.apk"));
         assert_eq!(origin, Origin::Chosen);
@@ -651,7 +651,7 @@ mod tests {
         // without silently rewriting what the user chose in Settings.
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(APK_OVERRIDE, "/from/env/base.apk");
-        let install = RobloxInstall { apk: Some(PathBuf::from("/from/settings/base.apk")), lib_dir: None };
+        let install = RobloxInstall { apk: Some(PathBuf::from("/from/settings/base.apk")) };
         let (apk, origin) = effective_apk(&install).unwrap();
         std::env::remove_var(APK_OVERRIDE);
         assert_eq!(apk, PathBuf::from("/from/env/base.apk"));
@@ -709,6 +709,27 @@ mod tests {
         assert!(Origin::Sober.describe().contains("Sober"));
     }
 
+    /// The Sober line used to end "which Cordial does not manage", which reads
+    /// as a permanent state and offered no way out of it. It has to say that
+    /// Cordial's own copy takes over, because the Roblox page now has a button
+    /// that gets one.
+    #[test]
+    fn the_sober_origin_says_cordial_will_use_its_own_copy() {
+        let text = Origin::Sober.describe();
+        assert!(text.contains("its own copy"), "{text}");
+        assert!(!text.contains("does not manage"), "{text}");
+    }
+
+    /// An old `shell.json` that still names an engine directory must load, and
+    /// the value must go nowhere. See [`RobloxInstall`].
+    #[test]
+    fn a_saved_engine_directory_is_ignored_and_does_not_break_loading() {
+        let old = r#"{"apk": "/chosen/base.apk", "lib_dir": "/old/lib/x86_64"}"#;
+        let loaded: RobloxInstall = serde_json::from_str(old).unwrap();
+        assert_eq!(loaded.apk, Some(PathBuf::from("/chosen/base.apk")));
+        assert!(!serde_json::to_string(&loaded).unwrap().contains("lib_dir"));
+    }
+
     #[test]
     fn the_split_apk_is_tried_after_the_one_it_was_given() {
         // The engine is not in base.apk on a split build. Asserting otherwise
@@ -746,7 +767,7 @@ mod tests {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(APK_OVERRIDE);
         let dir = scratch("stale");
-        let install = RobloxInstall { apk: Some(dir.join("gone.apk")), lib_dir: None };
+        let install = RobloxInstall { apk: Some(dir.join("gone.apk")) };
         match locate(&install) {
             Err(NotFound::Unusable(msg)) => assert!(msg.contains("Settings"), "{msg}"),
             other => panic!("expected a usable message, got {other:?}"),
@@ -781,7 +802,7 @@ mod tests {
 
         let apk = dir.join("base.apk");
         std::fs::write(&apk, apk_holding(b"the old engine")).unwrap();
-        let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
+        let install = RobloxInstall { apk: Some(apk.clone()) };
 
         let first = locate_with(&install, |_, _| Ok(None)).unwrap();
         assert_eq!(std::fs::read(first.lib_dir.join(LIBRARY)).unwrap(), b"the old engine");
@@ -816,7 +837,7 @@ mod tests {
 
         let apk = dir.join("base.apk");
         std::fs::write(&apk, apk_holding(b"the engine")).unwrap();
-        let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
+        let install = RobloxInstall { apk: Some(apk.clone()) };
 
         let build = locate_with(&install, |_, _| Ok(None)).unwrap();
         // Something no extraction would ever produce, so its survival is proof
@@ -897,7 +918,7 @@ mod tests {
 
         let apk = dir.join("base.apk");
         std::fs::write(&apk, apk_holding(b"an engine nobody signed")).unwrap();
-        let install = RobloxInstall { apk: Some(apk.clone()), lib_dir: None };
+        let install = RobloxInstall { apk: Some(apk.clone()) };
         let refused = locate(&install);
 
         match previous {

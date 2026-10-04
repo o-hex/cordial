@@ -22,6 +22,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use libadwaita as adw;
 use libadwaita::glib;
@@ -341,42 +342,201 @@ pub fn persist(config: &Rc<RefCell<ShellConfig>>, path: &Rc<PathBuf>) {
     }
 }
 
-/// One row showing a path Cordial is using, where it came from, and how to
-/// change it.
+/// Which buttons the APK row carries, as a function of where the build in use
+/// came from.
 ///
-/// The provenance line is not decoration. The build usually comes from another
-/// application's private directory (Sober's), and a user who does not know that
-/// has no way to understand why deleting Sober broke Cordial. ADR-002's rule
-/// about not silently depending on something applies to a path exactly as much
-/// as to a capability.
-fn path_row(
-    title: &str,
-    effective: Option<(PathBuf, String)>,
-    chosen: bool,
-    on_choose: impl Fn() + 'static,
-    on_clear: impl Fn() + 'static,
-) -> adw::ActionRow {
-    let subtitle = match &effective {
-        Some((path, origin)) => format!("{}\n{origin}", path.display()),
-        None => "Not found. Press Roblox in the launcher for how to get one.".to_string(),
-    };
-    let row = adw::ActionRow::builder().title(title).subtitle(subtitle).build();
-    row.set_subtitle_lines(3);
+/// **Download Roblox is offered exactly where it changes the answer.** With
+/// nothing found there is nothing to launch, and with Sober's file in use the
+/// download is what makes Cordial run its own copy instead (`effective_apk`
+/// prefers its own download over Sober's). It is withheld for the other three:
+/// a build Cordial already manages is updated from the Updates page, and a
+/// chosen file or `CORDIAL_APK` outranks anything downloaded, so the button
+/// would spend a few hundred megabytes on a build the launcher would then
+/// decline to use -- the case `Origin::updatable` already guards against.
+/// Clearing a chosen file is what gets somebody out of that.
+///
+/// `chosen` is the saved setting rather than `origin == Chosen`, because
+/// `CORDIAL_APK` can mask a saved choice and the clear button must still reach
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApkControls {
+    download: bool,
+    clear: bool,
+}
 
-    if chosen {
-        let clear = gtk::Button::from_icon_name("edit-clear-symbolic");
-        clear.set_tooltip_text(Some("Forget this and look again on the next launch"));
-        clear.set_valign(gtk::Align::Center);
-        clear.add_css_class("flat");
-        clear.connect_clicked(move |_| on_clear());
-        row.add_suffix(&clear);
+fn apk_controls(origin: Option<install::Origin>, chosen: bool) -> ApkControls {
+    ApkControls { download: matches!(origin, None | Some(install::Origin::Sober)), clear: chosen }
+}
+
+/// The two lines under "APK": the path, and where it came from.
+fn apk_subtitle(effective: Option<&(PathBuf, install::Origin)>) -> String {
+    match effective {
+        Some((path, origin)) => format!("{}\n{}", path.display(), origin.describe()),
+        None => "Not found. Press Download Roblox, or choose an APK you already have.".to_string(),
     }
+}
+
+/// The APK row: the build in use, where it came from, and how to change it.
+///
+/// The provenance line is not decoration. A detected path that presents itself
+/// as configuration is how a user ends up not knowing that deleting another
+/// application will break this one, and the line now also says that Cordial's
+/// own copy takes over once it has one. ADR-002's rule about not silently
+/// depending on something applies to a path exactly as much as to a capability.
+///
+/// Returns the progress meter as well, for the caller to put in the group under
+/// the row: it is a separate widget because a bar inside an `AdwActionRow`
+/// fights the suffix buttons for the width.
+///
+/// **Everything on the row is recomputed by one closure, `refresh`**, which the
+/// choose, clear and download paths all call. The row used to be built once and
+/// left, which was harmless while nothing on this page could change what the
+/// build was. A download does, and a row that went on saying "Found in Sober's
+/// download" beside a finished install is the stale-label failure this crate
+/// keeps rediscovering.
+fn build_apk_row(
+    window: &gtk::Window,
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+) -> (adw::ActionRow, Rc<crate::download_progress::Meter>) {
+    let row = adw::ActionRow::builder().title("APK").build();
+    row.set_subtitle_lines(4);
+
+    let clear = gtk::Button::from_icon_name("edit-clear-symbolic");
+    clear.set_tooltip_text(Some("Forget this and use the build Cordial manages"));
+    clear.set_valign(gtk::Align::Center);
+    clear.add_css_class("flat");
+    row.add_suffix(&clear);
+
+    let download = gtk::Button::with_label("Download Roblox");
+    download.set_valign(gtk::Align::Center);
+    row.add_suffix(&download);
 
     let choose = gtk::Button::with_label("Choose…");
     choose.set_valign(gtk::Align::Center);
-    choose.connect_clicked(move |_| on_choose());
     row.add_suffix(&choose);
-    row
+
+    let meter = crate::download_progress::Meter::new();
+    meter.widget().set_margin_top(8);
+    meter.widget().set_margin_bottom(8);
+    meter.widget().set_margin_start(12);
+    meter.widget().set_margin_end(12);
+
+    let refresh: Rc<dyn Fn()> = {
+        let (row, clear, download, config) = (row.clone(), clear.clone(), download.clone(), config.clone());
+        Rc::new(move || {
+            let effective = install::effective_apk(&config.borrow().roblox);
+            let controls = apk_controls(
+                effective.as_ref().map(|(_, origin)| *origin),
+                config.borrow().roblox.apk.is_some(),
+            );
+            // Escaped: the subtitle is Pango markup and a path may hold `&`.
+            row.set_subtitle(&glib::markup_escape_text(&apk_subtitle(effective.as_ref())));
+            clear.set_visible(controls.clear);
+            download.set_visible(controls.download);
+        })
+    };
+    refresh();
+
+    {
+        let (config, config_path, refresh, window) =
+            (config.clone(), config_path.clone(), refresh.clone(), window.clone());
+        choose.connect_clicked(move |_| {
+            let (config, config_path, refresh) = (config.clone(), config_path.clone(), refresh.clone());
+            choose_file(&window, "Choose the Roblox APK", false, move |path| {
+                config.borrow_mut().roblox.apk = Some(path);
+                persist(&config, &config_path);
+                refresh();
+            });
+        });
+    }
+    {
+        let (config, config_path, refresh) = (config.clone(), config_path.clone(), refresh.clone());
+        clear.connect_clicked(move |_| {
+            config.borrow_mut().roblox.apk = None;
+            persist(&config, &config_path);
+            refresh();
+        });
+    }
+
+    // One handler, two meanings, decided by whether a download is running --
+    // `Some` while it is, holding the token that stops it. Two handlers (one to
+    // start, one connected later to cancel) both fire on the second press, and
+    // the first of them starts another download.
+    let running: Rc<RefCell<Option<Arc<cordial_update::provider::Cancel>>>> = Rc::new(RefCell::new(None));
+    {
+        let (meter, refresh, choose, clear) = (meter.clone(), refresh.clone(), choose.clone(), clear.clone());
+        download.connect_clicked(move |button| {
+            if let Some(cancel) = running.borrow().as_ref() {
+                cancel.stop();
+                button.set_sensitive(false);
+                button.set_label("Stopping...");
+                return;
+            }
+            let cancel = Arc::new(cordial_update::provider::Cancel::new());
+            *running.borrow_mut() = Some(cancel.clone());
+            meter.start();
+            button.set_label("Cancel");
+            // Not changeable mid-download: a choice made now would be
+            // overwritten by whichever build the finishing install made current.
+            choose.set_sensitive(false);
+            clear.set_sensitive(false);
+
+            let (button, meter_done, refresh, choose, clear, running) = (
+                button.clone(),
+                meter.clone(),
+                refresh.clone(),
+                choose.clone(),
+                clear.clone(),
+                running.clone(),
+            );
+            let meter_step = meter.clone();
+            crate::updater::on_worker_reporting(
+                move |report: &dyn Fn(cordial_update::provider::Progress)| {
+                    // `Newest`, the same as the Updates page and for the same
+                    // reason: this button is shown when Sober's copy is on the
+                    // disk, and `Any` would always pick that, so pressing it
+                    // would copy the build already in use and change nothing
+                    // but where it lives. `Newest` still takes the local copy
+                    // when it is as new as anything on offer, which costs no
+                    // bytes.
+                    cordial_update::provider::obtain_and_install(
+                        None,
+                        cordial_update::provider::Want::Newest,
+                        Some(&cordial_update::install::Store::live(
+                            cordial_shell::profile::all_pinned_versions(),
+                        )),
+                        &cancel,
+                        &mut |p| report(p),
+                    )
+                    .map(|(got, _)| got.version.name)
+                    .map_err(|e| e.to_string())
+                },
+                move |step| meter_step.step(&step),
+                move |outcome| {
+                    *running.borrow_mut() = None;
+                    button.set_sensitive(true);
+                    button.set_label("Download Roblox");
+                    choose.set_sensitive(true);
+                    clear.set_sensitive(true);
+                    match outcome {
+                        Ok(version) => meter_done.finish(&version),
+                        // A stop is not a failure and must not be drawn as one;
+                        // `updater.rs` makes the same distinction.
+                        Err(why) if why == cordial_update::Unreachable::Cancelled.to_string() => {
+                            meter_done.stopped()
+                        }
+                        Err(why) => meter_done.failed(&why),
+                    }
+                    // After the outcome either way: a failed install can still
+                    // have left the row's answer different from what it was.
+                    refresh();
+                },
+            );
+        });
+    }
+
+    (row, meter)
 }
 
 /// "Roblox" — where the build is.
@@ -405,92 +565,23 @@ fn build_roblox_page(
         // cannot work out from the controls: that leaving both empty is a
         // working state rather than an unfinished one. The "and never will"
         // half was the project talking about itself.
-        .description("Leave these empty and Cordial finds a build. Choose a file to pin one.")
+        .description("Cordial runs the Roblox build it downloaded. Choose a file to use your own instead.")
         .build();
 
-    let apk = install::effective_apk(&config.borrow().roblox)
-        .map(|(path, origin)| (path, origin.describe().to_string()));
-    let apk_chosen = config.borrow().roblox.apk.is_some();
-
-    let window = parent.as_ref().clone();
-    let apk_row = {
-        let config = config.clone();
-        let config_path = config_path.clone();
-        let window = window.clone();
-        let cleared = config.clone();
-        let cleared_path = config_path.clone();
-        path_row(
-            "APK",
-            apk,
-            apk_chosen,
-            move || {
-                let config = config.clone();
-                let config_path = config_path.clone();
-                choose_file(&window, "Choose the Roblox APK", false, move |path| {
-                    config.borrow_mut().roblox.apk = Some(path);
-                    persist(&config, &config_path);
-                });
-            },
-            move || {
-                cleared.borrow_mut().roblox.apk = None;
-                persist(&cleared, &cleared_path);
-            },
-        )
-    };
+    // Cordial's own download, then Sober's file, in that order. See
+    // `install::effective_apk`: the Download button below is how somebody with
+    // Sober installed gets from the second to the first, which the first-run
+    // screen cannot do for them because it only appears when nothing is found.
+    let (apk_row, meter) = build_apk_row(parent.as_ref(), config.clone(), config_path.clone());
     group.add(&apk_row);
+    group.add(meter.widget());
 
-    // Shown separately from the APK because it usually is separate: on a split
-    // build `libroblox.so` is inside `split_config.x86_64.apk`, not `base.apk`,
-    // and Cordial extracts it into its own cache rather than writing into
-    // whichever application's directory the APK came from.
-    //
-    // The extracted case carries `updater::cache_line`, which says whether the
-    // engine still matches the APK above. That used to be a row in the
-    // header-bar button's window; it belongs here, beside the directory it is
-    // about, and it is the only place a Cordial that re-extracts 115 MB on every
-    // launch says what it is comparing.
-    let lib = config.borrow().roblox.lib_dir.clone().map(|p| (p, "Chosen in Settings".to_string())).or_else(
-        || {
-            let cache = install::engine_cache();
-            if !cache.join(install::LIBRARY).is_file() {
-                return None;
-            }
-            let apk = install::effective_apk(&config.borrow().roblox).map(|(path, _)| path);
-            let line = crate::updater::cache_line(
-                true,
-                cordial_update::cache::stamp_of(&cache),
-                apk.as_deref().is_some_and(|apk| cordial_update::cache::is_current(&cache, apk)),
-            );
-            Some((cache, line))
-        },
-    );
-    let lib_chosen = config.borrow().roblox.lib_dir.is_some();
-
-    let lib_row = {
-        let config = config.clone();
-        let config_path = config_path.clone();
-        let window = window.clone();
-        let cleared = config.clone();
-        let cleared_path = config_path.clone();
-        path_row(
-            "Engine directory",
-            lib,
-            lib_chosen,
-            move || {
-                let config = config.clone();
-                let config_path = config_path.clone();
-                choose_file(&window, "Choose the directory holding libroblox.so", true, move |path| {
-                    config.borrow_mut().roblox.lib_dir = Some(path);
-                    persist(&config, &config_path);
-                });
-            },
-            move || {
-                cleared.borrow_mut().roblox.lib_dir = None;
-                persist(&cleared, &cleared_path);
-            },
-        )
-    };
-    group.add(&lib_row);
+    // **There is no "Engine directory" row, and that is a removal rather than
+    // an omission.** It was a second path to choose, beside the APK, for a file
+    // Cordial extracts from that APK itself into its own cache and keeps in
+    // step with it. Nobody needed to choose it, and a chosen one was used
+    // as it stood and never compared with the APK. `install::RobloxInstall`
+    // says what became of a value an older Cordial saved.
     page.add(&group);
 
     // The update settings were a group on this page, on the argument that they
@@ -3579,6 +3670,46 @@ fn import_flags_file(
 
 #[cfg(test)]
 mod tests {
+    use crate::install::Origin;
+
+    /// The row's buttons per origin, which is the whole of the change: Download
+    /// Roblox where it makes Cordial run its own copy, and nowhere it would
+    /// spend 230 MB on a build the launcher then declines to use.
+    #[test]
+    fn download_is_offered_when_nothing_is_found_or_sober_is_in_use() {
+        assert!(apk_controls(None, false).download, "nothing found: the download is the way in");
+        assert!(apk_controls(Some(Origin::Sober), false).download, "Sober's file: the way to Cordial's own");
+        for origin in [Origin::Managed, Origin::Chosen, Origin::Environment] {
+            assert!(
+                !apk_controls(Some(origin), origin == Origin::Chosen).download,
+                "{origin:?} outranks or already is Cordial's own, so a download would change nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_follows_the_saved_choice_not_the_origin() {
+        assert!(apk_controls(Some(Origin::Chosen), true).clear);
+        // `CORDIAL_APK` masks a saved choice; the choice must stay clearable.
+        assert!(apk_controls(Some(Origin::Environment), true).clear);
+        assert!(!apk_controls(Some(Origin::Sober), false).clear);
+        assert!(!apk_controls(None, false).clear);
+    }
+
+    #[test]
+    fn the_subtitle_names_the_path_and_where_it_came_from() {
+        let sober = (PathBuf::from("/x/base.apk"), Origin::Sober);
+        let line = apk_subtitle(Some(&sober));
+        assert!(line.starts_with("/x/base.apk\n"), "{line}");
+        assert!(line.contains("Sober") && line.contains("its own copy"), "{line}");
+
+        let managed = (PathBuf::from("/data/base.apk"), Origin::Managed);
+        assert!(apk_subtitle(Some(&managed)).contains("Downloaded by Cordial"));
+
+        let none = apk_subtitle(None);
+        assert!(none.contains("Download Roblox"), "{none}");
+        assert!(!none.contains("launcher"), "it used to point at a screen that no longer says anything: {none}");
+    }
     use super::*;
 
     /// A manifest built for this test and nowhere near the UI. The distinction

@@ -143,7 +143,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let configured = install::RobloxInstall {
             apk: Some(dir.path().join("not-there.apk")),
-            lib_dir: None,
         };
         let out = roblox(&configured, true);
         // `CORDIAL_APK` set in the environment takes precedence over the

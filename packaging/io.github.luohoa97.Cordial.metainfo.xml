@@ -78,6 +78,15 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.24.1" date="2026-10-04">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.24.1</url>
+      <description>
+        <p>
+          A start that gets stuck on the loading screen is now restarted
+          automatically, and Enter in a text box does what Roblox asks.
+        </p>
+      </description>
+    </release>
     <release version="0.24.0" date="2026-10-04">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.24.0</url>
       <description>

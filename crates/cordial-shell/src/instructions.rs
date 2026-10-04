@@ -192,16 +192,11 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
                 // The mirror, newest first. A build already on this disk (Sober's)
                 // is no longer taken silently: it is the second control below,
                 // and a press of this one always downloads (ADR-054).
-                cordial_update::provider::obtain_and_install(
-                    None,
-                    cordial_update::provider::Want::Newest,
-                    Some(&cordial_update::install::Store::live(
-                        cordial_shell::profile::all_pinned_versions(),
-                    )),
+                cordial_update::provider::update_store(
+                    &cordial_update::install::Store::live(cordial_shell::profile::all_pinned_versions()),
                     &cancel,
                     &mut |p| report(p),
                 )
-                    .map(|(got, _)| got.version.name)
                     .map_err(|e| e.to_string())
             }},
             move |step| meter.step(&step),
@@ -246,16 +241,14 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
             let (to_close, retry, found) = (to_close.clone(), retry.clone(), found.clone());
             updater::on_worker_reporting(
                 move |report: &dyn Fn(cordial_update::provider::Progress)| {
-                    cordial_update::provider::import_and_install(
+                    cordial_update::provider::import_and_tidy(
                         &found,
                         cordial_update::store::Source::Sober,
-                        Some(&cordial_update::install::Store::live(
-                            cordial_shell::profile::all_pinned_versions(),
-                        )),
+                        &cordial_update::install::Store::live(cordial_shell::profile::all_pinned_versions()),
                         &cordial_update::provider::Cancel::new(),
                         &mut |p| report(p),
                     )
-                    .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())
                 },
                 move |step| meter_step.step(&step),
                 move |outcome| match outcome {

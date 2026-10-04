@@ -7,15 +7,16 @@
 //! user whose game stopped working had no way back short of finding an APK
 //! themselves.
 //!
-//! So the slot becomes a store. `~/.cache/cordial/builds/<version>/` holds the
-//! extracted library and its stamp, and the old single-slot path becomes a
-//! symlink into whichever entry is current. Everything that already computes
-//! that path -- `justfile`, `cordial-shell`'s `install::engine_cache`,
-//! `cordial_update::install::engine_dir`, and every `--lib-dir` anybody has
-//! typed -- keeps working without being told, because a symlink is a directory
-//! to everything that opens a file through it.
+//! So the slot becomes a store. `$XDG_DATA_HOME/cordial/builds/<version>/` holds
+//! the extracted library, the archives it came from and what proves them (who
+//! signed them, where they came from, which bytes), and a launch resolves to an
+//! entry and to nothing else ([ADR-054](../../../docs/adr/ADR-054-cordial-owns-its-roblox-builds.md);
+//! it was `~/.cache/cordial/builds` until then). The old single-slot path
+//! `~/.cache/cordial/lib/<abi>` is kept as a symlink to the newest entry so
+//! that `justfile` and every `--lib-dir` anybody has typed keep working, but a
+//! launch no longer reads it.
 //! [ADR-033](../../../docs/adr/ADR-033-roblox-versions-are-a-keyed-store.md)
-//! records the decision and what it deliberately leaves out.
+//! records the original decision and what it deliberately leaves out.
 //!
 //! **The version is a directory name, and it comes from scanning a binary.**
 //! [`crate::engine::scan`] finds it by looking for a plausible run of digits
@@ -88,6 +89,12 @@ pub const VERSION_CODE: &str = ".version-code";
 /// Garbage collection takes it exclusively and non-blocking, so a build in use
 /// is told apart from one that merely is not pinned.
 pub const IN_USE: &str = ".in-use";
+
+/// How many builds besides the newest, the pinned and the running a garbage
+/// collection keeps: one, so that the build before the newest stays. The reason
+/// the store exists (ADR-033) is that an update regresses and the user wants
+/// yesterday's build two clicks away; zero would be the literal "newest only".
+pub const SPARE: usize = 1;
 
 /// How many entries to keep, counting the current one.
 ///
@@ -561,21 +568,19 @@ pub(crate) fn hash_file(path: &Path) -> io::Result<Sha256Hash> {
 /// Make sure `entry` has a recorded content hash, computing one only if it
 /// does not already have one.
 ///
-/// Called from [`adopt_current`], which is where every install path but
-/// [`crate::install::file_into_store`] already converges to key a build; that
-/// one calls this itself. See
+/// Called by [`crate::install::file_into_store`] once an entry exists at its
+/// final name. See
 /// [ADR-037](../../../docs/adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md).
 ///
-/// **The cache-hit path is what makes this safe to call wherever a build is
-/// keyed**, rather than hashing a 100+ MB file each time. This used to say
-/// `adopt_current` reaches it on every launch; it does not, because once the
-/// single-slot path is a link `adopt_current` returns before getting here. An
-/// entry keyed before this existed therefore has no hash until it is keyed
-/// again, which ADR-037 now says too.
+/// **The recorded-hash path is what makes this safe to call wherever a build is
+/// filed**, rather than hashing a 100+ MB file each time: it reads
+/// `.content-sha256` first and returns it unhashed if it parses. An entry filed
+/// before ADR-037 has none until something asks, which is a filing of the same
+/// engine again.
 ///
-/// Failure is reported to the caller and is not fatal to keying the build --
-/// an entry with no recorded hash is exactly what one predating this feature
-/// looks like, and it still launches.
+/// Failure is reported to the caller and is not fatal -- an entry with no
+/// recorded hash is exactly what one predating this feature looks like, and it
+/// still launches.
 pub fn ensure_content_hash(entry: &Path) -> Option<Sha256Hash> {
     if let Some(existing) = content_hash(entry) {
         return Some(existing);
@@ -591,10 +596,10 @@ pub fn ensure_content_hash(entry: &Path) -> Option<Sha256Hash> {
 
 /// The entry under `root` whose recorded content hash is `hash`, if any.
 ///
-/// A lookup primitive and deliberately unwired: nothing here yet uses it to
-/// recognise that a fresh download is byte-identical to a build already kept
-/// under a different version label and link rather than duplicate it. See
-/// ADR-037's "What would change this".
+/// [`crate::install::file_into_store`] uses it to recognise that an incoming
+/// engine is byte-identical to one already kept, whatever either is called, and
+/// to file into that entry rather than duplicate it (ADR-054 wired what ADR-037
+/// left open).
 pub fn find_by_content_hash(root: &Path, hash: &Sha256Hash) -> Option<Entry> {
     list_in(root).into_iter().find(|e| e.content_hash.as_ref() == Some(hash))
 }
@@ -602,14 +607,11 @@ pub fn find_by_content_hash(root: &Path, hash: &Sha256Hash) -> Option<Entry> {
 /// An advisory lock over every write to the store at `root`, held for the
 /// duration of one mutation.
 ///
-/// Three call sites key or prune a build --
-/// [`crate::provider::obtain_and_install`], [`crate::provider::obtain_into_store`]
-/// and `cordial-shell`'s extraction of a build Sober or the user already
-/// supplied -- and before this existed two of them took different lock files
-/// and the third took none. All three reach the store only through
-/// [`adopt_current`], [`prune_in`], [`remove_in`] or
-/// [`crate::install::file_into_store`], so the lock lives inside those four
-/// rather than at each caller. See
+/// Callers used to key or prune a build from three places, two of them taking
+/// different lock files and one taking none. Everything now reaches the store
+/// only through [`crate::install::file_into_store`], [`gc_in`], [`prune_in`],
+/// [`remove_in`] or [`relocate`], so the lock lives inside those rather than at
+/// each caller. See
 /// [ADR-037](../../../docs/adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md).
 ///
 /// **Blocking, unlike [`crate::provider::exclusive`].** That lock guards a
@@ -674,9 +676,9 @@ pub fn record_loaded_by(dir: &Path, cordial: &str) -> io::Result<()> {
 /// rather than waiting.
 ///
 /// **It refuses when `live` is a real directory**, rather than deleting one.
-/// That directory is an engine somebody may be running, and on an install
-/// predating the store it is the *only* engine there is. [`adopt_current`] is
-/// the way one becomes an entry; this will not do it silently.
+/// That directory is an engine somebody may be running -- the `CORDIAL_APK`
+/// override's, or `just client`'s -- and this will not delete it to make room
+/// for a link.
 pub fn point_current_at(live: &Path, entry: &Path) -> io::Result<()> {
     use std::os::unix::fs::symlink;
 
@@ -724,126 +726,6 @@ pub fn current_in(root: &Path, live: &Path) -> Option<String> {
     // answering rather than erroring on.
     let name = resolved.file_name()?.to_str()?.to_string();
     (resolved.parent() == Some(root) && is_valid_version(&name)).then_some(name)
-}
-
-/// Take an existing single-slot engine into the store, and leave a link behind.
-///
-/// This is the migration, and it runs at most once per install: after it,
-/// `live` is a symlink and the first check here returns.
-///
-/// **A build whose version is unknown is left exactly where it is.** An APK the
-/// user obtained themselves carries no version Cordial can read without parsing
-/// Android's binary manifest -- [`crate::cache::recorded_version`] says so at
-/// more length -- and an entry keyed on a guess is worse than no entry: the
-/// store's whole contract is that a directory name identifies a build. So the
-/// return is `Ok(None)`, the old directory keeps working exactly as it did, and
-/// the store starts populating from the next build Cordial fetches itself.
-pub fn adopt_current(root: &Path, live: &Path) -> io::Result<Option<String>> {
-    let Ok(meta) = std::fs::symlink_metadata(live) else {
-        return Ok(None);
-    };
-    if !meta.is_dir() {
-        // Already a link, or not there. Either way there is nothing to adopt.
-        return Ok(None);
-    }
-    if !live.join(crate::engine::LIBRARY).is_file() {
-        return Ok(None);
-    }
-    let Some(version) = crate::cache::recorded_version(live).filter(|v| is_valid_version(v)) else {
-        return Ok(None);
-    };
-    let Some(into) = entry_dir_in(root, &version) else {
-        return Ok(None);
-    };
-
-    std::fs::create_dir_all(root)?;
-    // Held for the rest of this function: everything below either renames or
-    // deletes something under `root`, and this is one of three places that
-    // does so -- see [`lock`].
-    let _lock = lock(root)?;
-    if into.exists() {
-        // The store already has this version. Whatever is in the single slot is
-        // a second copy of a build already keyed, so the link replaces it
-        // rather than the directory being merged into an entry that is already
-        // complete. Removed only after the entry is confirmed to hold an
-        // engine, so a half-written entry cannot cost somebody the one they had.
-        if into.join(crate::engine::LIBRARY).is_file() {
-            // The provenance comes with it, though. The entry's stamp names
-            // the archive it was first extracted from; `live`'s names the one
-            // that was just extracted and is about to be run, and it is the
-            // one the next launch compares against. Keeping the entry's made
-            // every launch after this one find the cache stale and extract
-            // again. A record `live` lacks is removed from the entry rather
-            // than left beside a stamp it does not describe.
-            for record in [crate::cache::STAMP, crate::cache::SIGNER] {
-                let (fresh, kept) = (live.join(record), into.join(record));
-                if fresh.is_file() {
-                    std::fs::rename(&fresh, &kept)?;
-                } else {
-                    let _ = std::fs::remove_file(&kept);
-                }
-            }
-            std::fs::remove_dir_all(live)?;
-            point_current_at(live, &into)?;
-            ensure_content_hash(&into);
-            return Ok(Some(version));
-        }
-        std::fs::remove_dir_all(&into)?;
-    }
-    // A rename within one cache root, so this is a metadata change rather than
-    // a copy of 115 MB -- and it means there is no moment where both the old
-    // path and the new one hold half a build.
-    std::fs::rename(live, &into)?;
-    point_current_at(live, &into)?;
-    ensure_content_hash(&into);
-    Ok(Some(version))
-}
-
-/// Keep the archives this build was made from, beside the engine.
-///
-/// **Because the engine alone is not a build.** `libroblox.so` is the engine
-/// and the APKs are the assets, and Roblox ships them as one version --
-/// [`crate::cache`] exists entirely because pairing a new APK with an old
-/// engine is a silent mismatch that presents as anything but. So a store entry
-/// that held only the library would offer a rollback that swapped half the
-/// build, which is worse than offering none.
-///
-/// **Hard links, and no copy fallback.** The entry and `build/<abi>` end up as
-/// two names for one inode on one filesystem; installing the next build
-/// renames over the name under `build/<abi>` and the data stays alive under
-/// the entry's. That costs nothing, which is the only reason keeping every
-/// build's archives is affordable at all.
-///
-/// A copy would be 230 MB per entry, and there is one caller for which it is a
-/// real possibility rather than a theoretical one: `cordial-shell` links the
-/// user's *own* APKs -- Sober's, usually -- and those can sit on another
-/// filesystem. Spending 230 MB and a minute of somebody's launch on a rollback
-/// they have not asked for is not a decision to make silently, so a link that
-/// cannot be made is reported and the entry is simply marked incomplete.
-///
-/// Linking somebody else's file takes nothing away from them: the inode gains a
-/// name, and a program that replaces the file by renaming over it -- which is
-/// how a download lands -- leaves this name pointing at what was there. A
-/// program that rewrote the file in place would change this copy too, and
-/// nothing here can prevent that.
-///
-/// Failure is reported and not fatal. An entry with no archives beside it is
-/// still a real engine that the current build's assets match; it is only a
-/// rollback target that cannot be selected, and [`Entry::complete`] is how a
-/// picker tells the difference.
-pub fn keep_archives(entry: &Path, archives: &[&Path]) -> Vec<String> {
-    let mut trouble = Vec::new();
-    for archive in archives {
-        let Some(name) = archive.file_name() else { continue };
-        let target = entry.join(name);
-        if target.exists() || !archive.is_file() {
-            continue;
-        }
-        if let Err(e) = std::fs::hard_link(archive, &target) {
-            trouble.push(format!("{} could not be linked: {e}", archive.display()));
-        }
-    }
-    trouble
 }
 
 /// Break the link at `live` and leave an empty directory in its place.
@@ -1422,7 +1304,7 @@ mod tests {
     }
 
     /// The engine somebody may be running is not deleted to make room for a
-    /// link. `adopt_current` is the only thing that moves one.
+    /// link.
     #[test]
     fn a_real_directory_is_never_replaced_by_a_link_behind_your_back() {
         let scratch = Scratch::new("refuse");
@@ -1436,42 +1318,6 @@ mod tests {
         let refused = point_current_at(&live, &entry).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists);
         assert!(live.join(crate::engine::LIBRARY).is_file(), "and it is still there");
-    }
-
-    #[test]
-    fn an_existing_single_slot_becomes_an_entry_and_a_link() {
-        let scratch = Scratch::new("adopt");
-        let root = scratch.path().join("builds");
-        let live = scratch.path().join("lib/x86_64");
-        std::fs::create_dir_all(&live).unwrap();
-        std::fs::write(live.join(crate::engine::LIBRARY), b"engine").unwrap();
-        crate::cache::record_version(&live, "2.738.0.1393").unwrap();
-
-        let adopted = adopt_current(&root, &live).unwrap();
-        assert_eq!(adopted.as_deref(), Some("2.738.0.1393"));
-        assert!(std::fs::symlink_metadata(&live).unwrap().file_type().is_symlink());
-        assert!(root.join("2.738.0.1393").join(crate::engine::LIBRARY).is_file());
-        assert!(live.join(crate::engine::LIBRARY).is_file(), "and still reads through");
-
-        // Idempotent: run again and it is already a link, so there is nothing
-        // to adopt and nothing is disturbed.
-        assert_eq!(adopt_current(&root, &live).unwrap(), None);
-        assert_eq!(current_in(&root, &live).as_deref(), Some("2.738.0.1393"));
-    }
-
-    /// An APK the user brought themselves has no version Cordial can read. The
-    /// slot keeps working; it just does not become an entry.
-    #[test]
-    fn a_build_of_unknown_version_is_left_where_it_is() {
-        let scratch = Scratch::new("unknown");
-        let root = scratch.path().join("builds");
-        let live = scratch.path().join("lib/x86_64");
-        std::fs::create_dir_all(&live).unwrap();
-        std::fs::write(live.join(crate::engine::LIBRARY), b"engine").unwrap();
-
-        assert_eq!(adopt_current(&root, &live).unwrap(), None);
-        assert!(live.is_dir() && !live.is_symlink());
-        assert!(live.join(crate::engine::LIBRARY).is_file());
     }
 
     #[test]
@@ -1570,61 +1416,6 @@ mod tests {
         let found = find_by_content_hash(root, &hash_b).expect("engine B is in the store");
         assert_eq!(found.version, "2.738.0.1393");
         assert!(find_by_content_hash(root, &Sha256Hash::of(b"nothing kept this")).is_none());
-    }
-
-    /// `adopt_current` is what every install path but `file_into_store` already
-    /// funnels through, so hooking the hash in there is what makes it apply to
-    /// every one of them without touching a call site.
-    #[test]
-    fn adopting_a_build_records_its_content_hash() {
-        let scratch = Scratch::new("hash-adopt");
-        let root = scratch.path().join("builds");
-        let live = scratch.path().join("lib/x86_64");
-        std::fs::create_dir_all(&live).unwrap();
-        std::fs::write(live.join(crate::engine::LIBRARY), b"the adopted engine").unwrap();
-        crate::cache::record_version(&live, "2.738.0.1393").unwrap();
-
-        adopt_current(&root, &live).unwrap();
-        assert_eq!(
-            content_hash(&root.join("2.738.0.1393")),
-            Some(Sha256Hash::of(b"the adopted engine"))
-        );
-    }
-
-    /// **A second extraction of a version the store already keeps must leave
-    /// the entry stamped for the archive it was just extracted from.** Before
-    /// this, the fresh directory -- stamp and all -- was deleted in favour of
-    /// the entry, which kept the stamp of the *previous* archive. The next
-    /// launch then found the cache stale and extracted 116 MB again, and so on
-    /// every launch after. It happens whenever the archive's identity changes
-    /// without its version doing so: `stacked update` re-installing the same
-    /// build, a build moving from Sober's directory to Stacked's, or Sober
-    /// re-downloading one.
-    #[test]
-    fn re_adopting_a_kept_version_carries_the_new_stamp_and_signer_into_the_entry() {
-        let scratch = Scratch::new("readopt-stamp");
-        let root = scratch.path().join("builds");
-        let live = scratch.path().join("lib/x86_64");
-        std::fs::create_dir_all(&live).unwrap();
-        std::fs::write(live.join(crate::engine::LIBRARY), b"engine").unwrap();
-        crate::cache::record_version(&live, "2.738.0.1393").unwrap();
-        std::fs::write(live.join(crate::cache::STAMP), "old archive").unwrap();
-        std::fs::write(live.join(crate::cache::SIGNER), "old signer").unwrap();
-        adopt_current(&root, &live).unwrap();
-
-        // What `locate` does when the stamp no longer matches: detach, extract
-        // afresh, stamp, and key again.
-        detach(&live).unwrap();
-        std::fs::write(live.join(crate::engine::LIBRARY), b"engine").unwrap();
-        crate::cache::record_version(&live, "2.738.0.1393").unwrap();
-        std::fs::write(live.join(crate::cache::STAMP), "new archive").unwrap();
-        assert_eq!(adopt_current(&root, &live).unwrap().as_deref(), Some("2.738.0.1393"));
-
-        assert_eq!(crate::cache::stamp_of(&live).as_deref(), Some("new archive"));
-        assert!(
-            !live.join(crate::cache::SIGNER).exists(),
-            "a signer recorded for the old archive must not survive beside the new stamp"
-        );
     }
 
     /// The race this store lock exists to close: three code paths mutate one

@@ -460,16 +460,11 @@ fn build_build_row(window: &gtk::Window) -> (adw::ActionRow, Rc<crate::download_
                     // `Newest`, the same as the Updates page. The mirror is the
                     // only source (ADR-054): pressing this downloads the newest
                     // build and never copies Sober's.
-                    cordial_update::provider::obtain_and_install(
-                        None,
-                        cordial_update::provider::Want::Newest,
-                        Some(&cordial_update::install::Store::live(
-                            cordial_shell::profile::all_pinned_versions(),
-                        )),
-                        &cancel,
-                        &mut |p| report(p),
-                    )
-                    .map(|(got, _)| got.version.name)
+                    cordial_update::provider::update_store(
+                    &cordial_update::install::Store::live(cordial_shell::profile::all_pinned_versions()),
+                    &cancel,
+                    &mut |p| report(p),
+                )
                     .map_err(|e| e.to_string())
                 },
                 move |step| meter_step.step(&step),
@@ -537,10 +532,10 @@ fn build_build_row(window: &gtk::Window) -> (adw::ActionRow, Rc<crate::download_
             import(Box::new(|| {
                 let found = cordial_update::provider::import::detect_sober()
                     .ok_or_else(|| "Sober's package directory holds no Roblox build any more.".to_string())?;
-                cordial_update::provider::import_into_store(
+                cordial_update::provider::import_and_tidy(
                     &found,
                     cordial_update::store::Source::Sober,
-                    &cordial_update::store::root(),
+                    &cordial_update::install::Store::live(cordial_shell::profile::all_pinned_versions()),
                     &cordial_update::provider::Cancel::new(),
                     &mut |_| {},
                 )
@@ -555,10 +550,10 @@ fn build_build_row(window: &gtk::Window) -> (adw::ActionRow, Rc<crate::download_
             choose_file(&window, "Choose the Roblox APK", false, move |path| {
                 import(Box::new(move || {
                     let found = cordial_update::provider::import::from_file(&path)?;
-                    cordial_update::provider::import_into_store(
+                    cordial_update::provider::import_and_tidy(
                         &found,
                         cordial_update::store::Source::for_path(&path),
-                        &cordial_update::store::root(),
+                        &cordial_update::install::Store::live(cordial_shell::profile::all_pinned_versions()),
                         &cordial_update::provider::Cancel::new(),
                         &mut |_| {},
                     )

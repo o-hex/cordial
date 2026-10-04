@@ -235,9 +235,9 @@ pub fn header_button(
     let button = gtk::Button::from_icon_name(PACKAGE_ICON);
     let last: Rc<RefCell<Option<Checked>>> = Rc::new(RefCell::new(None));
     // **One process, one install, whichever control started it.** Background
-    // mode can start a silent `obtain_and_install` on launch, and a person can
+    // mode can start a silent `update_store` on launch, and a person can
     // open this window and press Download while that is still running --
-    // `provider::obtain_and_install`'s own flock only stops a *second
+    // `provider::update_store`'s own flock only stops a *second
     // process*, so two calls from this one raced each other for it and the
     // loser's refusal named "another Cordial", which was this one. Checked
     // and set around every call in this file, so the second attempt is
@@ -301,16 +301,11 @@ pub fn header_button(
                         on_worker_reporting(
                             |report: &dyn Fn(cordial_update::provider::Progress)| {
                                 let cancel = cordial_update::provider::Cancel::new();
-                                cordial_update::provider::obtain_and_install(
-                                    None,
-                                    cordial_update::provider::Want::Newest,
-                                    Some(&cordial_update::install::Store::live(
-                                        cordial_shell::profile::all_pinned_versions(),
-                                    )),
-                                    &cancel,
-                                    &mut |p| report(p),
-                                )
-                                .map(|(got, _)| got.version.name)
+                                cordial_update::provider::update_store(
+                    &cordial_update::install::Store::live(cordial_shell::profile::all_pinned_versions()),
+                    &cancel,
+                    &mut |p| report(p),
+                )
                                 .map_err(|e| e.to_string())
                             },
                             move |step| crate::download_progress::show_on_button(&header, Some(&step)),
@@ -1076,9 +1071,9 @@ pub fn present(
             }
 
             // **Refused here too, before this races the background install.**
-            // Background mode can already be running `obtain_and_install` on
+            // Background mode can already be running `update_store` on
             // its own worker thread when this window is opened -- the flock
-            // in `obtain_and_install` only stops a *second process*, so a
+            // in `update_store` only stops a *second process*, so a
             // second call from inside this one process reached it and lost,
             // and the refusal it got back named "another Cordial", which was
             // this same one. Checked and cleared around every call in this
@@ -1164,16 +1159,11 @@ pub fn present(
                     // what the button means. Sober's copy used to win under
                     // `Any` and an Update press then reinstalled the build
                     // already in use -- that is gone with the source.
-                    cordial_update::provider::obtain_and_install(
-                        None,
-                        cordial_update::provider::Want::Newest,
-                        Some(&cordial_update::install::Store::live(
-                            cordial_shell::profile::all_pinned_versions(),
-                        )),
-                        &cancel,
-                        &mut |p| report(p),
-                    )
-                        .map(|(got, _)| got.version.name)
+                    cordial_update::provider::update_store(
+                    &cordial_update::install::Store::live(cordial_shell::profile::all_pinned_versions()),
+                    &cancel,
+                    &mut |p| report(p),
+                )
                         .map_err(|e| e.to_string())
                 }},
                 {

@@ -158,6 +158,7 @@ pub struct LaunchRequest<'a> {
 }
 
 /// What a VR launch adds to an ordinary one.
+#[derive(Clone)]
 pub struct VrLaunch {
     /// The OpenXR runtime manifest to hand the client in `XR_RUNTIME_JSON`, for
     /// this launch only. `None` leaves the loader to the system's active

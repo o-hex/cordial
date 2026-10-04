@@ -36,6 +36,7 @@ use crate::settings;
 use crate::shell_config::ShellConfig;
 use crate::updater;
 use crate::window_state;
+use cordial_shell::freeze_recovery;
 use cordial_shell::host_window::HostWindow;
 use cordial_shell::profile;
 
@@ -102,6 +103,17 @@ const fn exit_presentation(
 /// ordering argument.
 const EARLY_EXIT_CHECK: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long the "Roblox got stuck starting" line stays up on a restart.
+const RECOVERY_NOTICE: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// How often a new client's log is read for the startup freeze (#92). Once a
+/// second is far more often than a five-second verdict needs, and the reading
+/// stops at the first decision, which a healthy start reaches in a few seconds.
+const FREEZE_POLL: Duration = Duration::from_secs(1);
+
+/// How long a stopped client has to exit on `SIGTERM` before it is killed.
+const FREEZE_KILL_AFTER: Duration = Duration::from_secs(5);
+
 /// The dialog shown while the client starts.
 ///
 /// Roblox takes a while to get from a launch to a window of its own, and until
@@ -119,7 +131,19 @@ const EARLY_EXIT_CHECK: std::time::Duration = std::time::Duration::from_secs(3);
 /// it is customised by pointing at a file, never by shipping alternatives:
 /// Roblox's own icons are their assets, and AGENTS.md rules out vendoring any
 /// of them however small.
+#[cfg(test)]
 fn starting_dialog(parent: &gtk::Window, profile: &str, joining: bool) -> Option<gtk::Window> {
+    starting_dialog_with(parent, profile, joining, None)
+}
+
+/// [`starting_dialog`] with a line of its own in place of the usual title, which
+/// is what a restart after a startup freeze (#92) uses to say what happened.
+fn starting_dialog_with(
+    parent: &gtk::Window,
+    profile: &str,
+    joining: bool,
+    notice: Option<&str>,
+) -> Option<gtk::Window> {
     // Browser auto-launch has no launcher surface or progress animation.
     if !parent.is_visible() {
         return None;
@@ -134,9 +158,10 @@ fn starting_dialog(parent: &gtk::Window, profile: &str, joining: bool) -> Option
     icon.set_pixel_size(72);
     content.append(&icon);
 
-    let title = gtk::Label::new(Some(&match joining {
-        true => format!("Starting Roblox on {profile}, joining the link"),
-        false => format!("Starting Roblox on {profile}"),
+    let title = gtk::Label::new(Some(&match (notice, joining) {
+        (Some(notice), _) => notice.to_owned(),
+        (None, true) => format!("Starting Roblox on {profile}, joining the link"),
+        (None, false) => format!("Starting Roblox on {profile}"),
     }));
     title.add_css_class("title-4");
     title.set_wrap(true);
@@ -1142,6 +1167,37 @@ fn start(
     build: install::Build,
     vr: Option<launch::VrLaunch>,
 ) -> Outcome {
+    start_attempt(window, join, lifecycle, profile_name, build, vr, Attempt::first())
+}
+
+/// Where a press of Play is in the freeze recovery (#92), and what a restart
+/// has to carry over from the launch it replaces.
+///
+/// A relaunch is an ordinary launch of the same profile, but the link and the
+/// account routing it started with were consumed by the first spawn, so the
+/// restart is handed them rather than reading a `PendingJoin` that is empty by
+/// then.
+#[derive(Clone)]
+struct Attempt {
+    restarts: u32,
+    carried: Option<(Option<String>, Option<cordial_shell::secrets::Store>)>,
+}
+
+impl Attempt {
+    fn first() -> Self {
+        Attempt { restarts: 0, carried: None }
+    }
+}
+
+fn start_attempt(
+    window: &gtk::Window,
+    join: &PendingJoin,
+    lifecycle: &LaunchLifecycle,
+    profile_name: &str,
+    build: install::Build,
+    vr: Option<launch::VrLaunch>,
+    attempt: Attempt,
+) -> Outcome {
     // ADR-012's claim, taken before the process exists so that a refusal
     // costs nothing. A second window on one profile is two processes writing
     // one cookie store; the message names the profile because "already open"
@@ -1160,18 +1216,26 @@ fn start(
     // saved values changed in between, the name no longer identifies the
     // session that was authenticated. Returning drops the claim before manual
     // recovery.
-    let secret_store = match join.matched_store_if_current(profile_name, claim.profile_dir()) {
-        Ok(store) => store,
-        Err(()) => {
-            join.clear_profile_match();
-            return Outcome::ProfileChanged;
-        }
+    let secret_store = match &attempt.carried {
+        Some((_, store)) => *store,
+        None => match join.matched_store_if_current(profile_name, claim.profile_dir()) {
+            Ok(store) => store,
+            Err(()) => {
+                join.clear_profile_match();
+                return Outcome::ProfileChanged;
+            }
+        },
     };
 
     // Read rather than taken: everything above this can still refuse, and a
     // busy profile that also cost the user their link would be two failures for
     // one press. It is cleared below, once there is a process holding it.
-    let url = join.peek();
+    let url = match &attempt.carried {
+        Some((url, _)) => url.clone(),
+        None => join.peek(),
+    };
+    let relaunch = (url.clone(), secret_store, vr.clone());
+    let freeze_watch = freeze_watch_for(claim.profile_dir(), vr.is_some());
     let instance = match launch::spawn(
         &build,
         claim,
@@ -1192,7 +1256,10 @@ fn start(
     // change made while it loads is sent once its socket exists.
     crate::live::register(instance.pid(), instance.live_socket.clone(), instance.launched_with.clone());
 
-    let starting = starting_dialog(&window, &profile_name, url.is_some());
+    let notice = (attempt.restarts > 0).then(|| {
+        freeze_recovery::status_line(attempt.restarts + 1, freeze_recovery::MAX_RESTARTS + 1)
+    });
+    let starting = starting_dialog_with(&window, &profile_name, url.is_some(), notice.as_deref());
 
     // **`SIGCHLD`, not a clock.** This was `timeout_add_local` at 500 ms for
     // the whole session -- two wakeups a second, forever, to ask a question
@@ -1221,7 +1288,10 @@ fn start(
     let dialog_closed = Rc::new(Cell::new(starting.is_none()));
     if let Some(starting) = starting.clone() {
         let dialog_closed = dialog_closed.clone();
-        glib::timeout_add_local_once(EARLY_EXIT_CHECK, move || {
+        // A restart's status line is the only thing the user is told, so it
+        // stays up long enough to be read rather than for the early-exit check.
+        let linger = if notice.is_some() { RECOVERY_NOTICE } else { EARLY_EXIT_CHECK };
+        glib::timeout_add_local_once(linger, move || {
             if !dialog_closed.replace(true) {
                 starting.close();
             }
@@ -1257,12 +1327,20 @@ fn start(
     // marker process that outlived the sandbox's own main process.
     let hold = window.application().map(|app| app.hold());
 
+    let freeze = FreezeState::default();
+    if let Some(supervisor) = freeze_watch {
+        watch_for_freeze(window, instance.pid(), supervisor, freeze.clone());
+    }
+    let build_again = build.clone();
+    let profile_again = profile_name.to_owned();
+
     let window = window.clone();
     let join = join.clone();
     let lifecycle = lifecycle.clone();
     let pid = glib::Pid(instance.pid() as i32);
     glib::child_watch_add_local(pid, move |_, wait_status| {
         crate::live::unregister(pid.0 as u32);
+        freeze.exited.set(true);
         // Named rather than left to the closure's drop, because *when* it is
         // released is the whole point: the application must not quit before
         // the crash page below has been put on screen.
@@ -1284,6 +1362,55 @@ fn start(
         // once the child has exited, and until then the only thing this check
         // costs is the branch.
         if window.application().is_none() {
+            return;
+        }
+        // A client the shell stopped because it froze at startup (#92) is not a
+        // crash and not a clean exit, and showing either would hide what
+        // happened. It is reaped by now, so the profile's lock went with it and
+        // the relaunch below is an ordinary launch that can take it.
+        if freeze.stopped.get() {
+            match freeze_recovery::after_freeze(attempt.restarts) {
+                freeze_recovery::Next::Restart { attempt: n, of } => {
+                    println!(
+                        "  shell: {} Launching attempt {n} of {of}.",
+                        freeze_recovery::status_line(n, of)
+                    );
+                    let (url, store, vr) = relaunch.clone();
+                    let next = Attempt { restarts: attempt.restarts + 1, carried: Some((url, store)) };
+                    match start_attempt(
+                        &window,
+                        &join,
+                        &lifecycle,
+                        &profile_again,
+                        build_again.clone(),
+                        vr,
+                        next,
+                    ) {
+                        Outcome::Started => {}
+                        Outcome::Failed(message) => {
+                            window.present();
+                            alert(&window, "Roblox could not start", &message);
+                        }
+                        _ => {
+                            window.present();
+                            alert(
+                                &window,
+                                "Roblox could not restart",
+                                "The profile was still in use when Cordial tried to start it again. \
+                                 Press Roblox to try once more.",
+                            );
+                        }
+                    }
+                }
+                freeze_recovery::Next::GiveUp => {
+                    println!(
+                        "  shell: the client froze at startup {} times; giving up",
+                        attempt.restarts + 1
+                    );
+                    window.present();
+                    alert(&window, freeze_recovery::GIVE_UP_HEADING, &freeze_recovery::give_up_body());
+                }
+            }
             return;
         }
         // GLib hands back the raw `waitpid` status, which is exactly what
@@ -1339,6 +1466,83 @@ fn start(
     });
 
     Outcome::Started
+}
+
+/// Shared between the poll that notices a startup freeze and the child watch
+/// that finds the client gone. Both run on the GTK main context, one at a time,
+/// so `Cell`s are enough.
+#[derive(Clone, Default)]
+struct FreezeState {
+    exited: Rc<Cell<bool>>,
+    /// Set by the poll when it has told the client to stop, so the child watch
+    /// restarts it instead of showing a crash page for a `SIGTERM`.
+    stopped: Rc<Cell<bool>>,
+}
+
+/// The watcher for a client about to start, unless the recovery is switched off
+/// with `CORDIAL_NO_FREEZE_RESTART=1`.
+fn freeze_watch_for(profile_dir: &std::path::Path, vr: bool) -> Option<freeze_recovery::Supervisor> {
+    if !freeze_recovery::enabled(std::env::var("CORDIAL_NO_FREEZE_RESTART").ok().as_deref()) {
+        return None;
+    }
+    let build = if vr { profile::Build::Quest } else { profile::Build::Phone };
+    Some(freeze_recovery::Supervisor::new(freeze_recovery::logs_dir(profile_dir, build)))
+}
+
+/// Read the new client's engine log until it is clearly healthy, clearly
+/// frozen, or clearly never going to say (#92), and stop a frozen one.
+///
+/// A launcher whose window has gone is not watched: with nothing to show the
+/// user and nothing to relaunch from, killing their client would only lose it.
+fn watch_for_freeze(
+    window: &gtk::Window,
+    pid: u32,
+    mut supervisor: freeze_recovery::Supervisor,
+    state: FreezeState,
+) {
+    let window = window.clone();
+    glib::timeout_add_local(FREEZE_POLL, move || {
+        if state.exited.get() || window.application().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        if supervisor.timed_out() {
+            println!(
+                "  shell: no finalize in the client's log after {}s; not watching for a freeze (#92)",
+                freeze_recovery::WATCH_FOR.as_secs()
+            );
+            return glib::ControlFlow::Break;
+        }
+        match supervisor.poll() {
+            freeze_recovery::Verdict::Undecided => glib::ControlFlow::Continue,
+            freeze_recovery::Verdict::Healthy => {
+                println!(
+                    "  shell: the client (pid {pid}) got past its first finalize; not a startup freeze (#92)"
+                );
+                glib::ControlFlow::Break
+            }
+            freeze_recovery::Verdict::Frozen => {
+                println!(
+                    "  shell: the client (pid {pid}) logged `Forcing finalize` with no render view \
+                     released and no controller teardown for {}s: stuck starting (#92); stopping it",
+                    freeze_recovery::FROZEN_AFTER.as_secs()
+                );
+                match freeze_recovery::terminate(pid) {
+                    Ok(()) => {
+                        state.stopped.set(true);
+                        let exited = state.exited.clone();
+                        glib::timeout_add_local_once(FREEZE_KILL_AFTER, move || {
+                            if !exited.get() {
+                                println!("  shell: the stuck client (pid {pid}) ignored SIGTERM; killing it");
+                                let _ = freeze_recovery::kill(pid);
+                            }
+                        });
+                    }
+                    Err(e) => println!("  shell: could not stop the stuck client: {e}"),
+                }
+                glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 /// Shorten a session, for testing. `--run` is a hard timer in `cordial-run` and

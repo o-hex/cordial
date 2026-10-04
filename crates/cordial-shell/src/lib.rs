@@ -41,6 +41,7 @@ mod build_remote;
 pub mod branding;
 pub mod doctor;
 pub mod frame_rate_limit;
+pub mod freeze_recovery;
 pub mod host_window;
 pub mod json_highlight;
 pub mod live_wire;

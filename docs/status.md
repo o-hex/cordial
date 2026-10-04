@@ -63,7 +63,15 @@ the older records it replaces, are in
 
 From the [0.23.2 release notes](releases/v0.23.2.md), the newest list:
 
-- **The signed-in startup freeze is not fixed.**
+- **The signed-in startup freeze is not fixed, but Cordial now restarts a stuck
+  start by itself** ([#92](https://github.com/luohoa97/cordial/issues/92)). When
+  the client's log shows it has stopped part-way through starting, Cordial
+  stops it, says "Roblox got stuck starting. Restarting it (2 of 3).", and
+  starts it again, at most twice per press of Roblox. If all three freeze, it
+  says so instead of showing a spinner; pressing Roblox again usually works.
+  `CORDIAL_NO_FREEZE_RESTART=1` turns the restart off. Not yet seen to recover
+  a real freeze: it has only been run against a recorded freeze log, not against
+  a live one.
 - **Movement keys sometimes stop working after joining a game**
   ([#29](https://github.com/luohoa97/cordial/issues/29)). Respawning or re-joining
   brings them back. To report it, start Cordial with `CORDIAL_TRACE_KEYS=1`,

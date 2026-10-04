@@ -220,6 +220,7 @@ pub fn build(
     app: &adw::Application,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
+    offer_newest: bool,
 ) -> Shell {
     // T1: the chooser core paints before the plugin host is up. One entry, and
     // it starts the client — see `chooser.rs` on why the second one went.
@@ -400,6 +401,40 @@ pub fn build(
     // worth a button whether or not anything newer exists.
     let update_button = updater::header_button(&window, config.clone());
     host.header().pack_end(&update_button);
+
+    // ADR-054, decision 4. Sober's build was just copied into Cordial's store
+    // by the migration, and from here its updates move when Cordial's Updates
+    // run -- which does not download unasked on a metered connection (ADR-015)
+    // -- instead of whenever Sober's app updated. Roblox refusing the old
+    // build would then look, to this user, like Cordial breaking, so the one
+    // launch that did the copy asks once whether to fetch the newest. Not
+    // remembered anywhere: `offer_newest` is only true on the run that did the
+    // copy, and the migration cannot do it twice.
+    if offer_newest {
+        let window = window.clone();
+        let update_button = update_button.clone();
+        glib::idle_add_local_once(move || {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Cordial now keeps its own copy of Roblox")
+                .body(
+                    "Cordial copied the Roblox build Sober had. From now on it changes when you \
+                     update it here, not when Sober does. Roblox refuses builds that are too \
+                     old, so check now whether there is a newer one.",
+                )
+                .build();
+            dialog.add_response("later", "Not Now");
+            dialog.add_response("check", "Check for Updates");
+            dialog.set_response_appearance("check", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("check"));
+            dialog.set_close_response("later");
+            dialog.connect_response(None, move |_, response| {
+                if response == "check" {
+                    update_button.emit_clicked();
+                }
+            });
+            dialog.present(Some(&window));
+        });
+    }
 
 
     // An action rather than only a button handler, because the header bar is no
@@ -1113,10 +1148,7 @@ fn try_launch_tracked(
     lifecycle: &LaunchLifecycle,
     mode: Mode,
 ) -> Outcome {
-    let (roblox, profile_name) = {
-        let config = config.borrow();
-        (config.roblox.clone(), config.profile.clone())
-    };
+    let profile_name = config.borrow().profile.clone();
 
     // "Play in VR" takes the Quest build the user imported, and nothing
     // about the phone build -- its location, its pin, the instructions for
@@ -1136,20 +1168,13 @@ fn try_launch_tracked(
         return start(window, join, lifecycle, &profile_name, build, vr);
     }
 
-    let build = match install::locate(&roblox) {
-        Ok(build) => build,
-        Err(NotFound::NoBuild) => return Outcome::NoBuild,
-        Err(NotFound::Unusable(message)) => return Outcome::Failed(message),
-    };
-
-    // A profile that names a Roblox version gets that one, whatever the current
-    // build is. Applied after `locate` rather than inside it, because `locate`
-    // answers "what build is on this machine" and has no business knowing about
-    // profiles -- and because a pin that cannot be honoured must refuse the
-    // launch rather than quietly hand back the build it was pinned away from.
+    // The profile's choice against the store: Latest unless it is pinned, and a
+    // pin that cannot be honoured refuses the launch rather than quietly
+    // handing back the build it was pinned away from. `CORDIAL_APK`, the
+    // developer override, is answered first inside `resolve`.
     let build = match profile::dir(&profile_name)
         .map_err(NotFound::Unusable)
-        .and_then(|d| install::apply_pin(build, &d))
+        .and_then(|d| install::resolve(&d))
     {
         Ok(build) => build,
         Err(NotFound::NoBuild) => return Outcome::NoBuild,

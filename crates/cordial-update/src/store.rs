@@ -97,9 +97,103 @@ pub const IN_USE: &str = ".in-use";
 /// something else entirely.
 pub const KEEP: usize = 3;
 
-/// `~/.cache/cordial/builds`.
+/// `$XDG_DATA_HOME/cordial`, or `~/.local/share/cordial`: where profiles live,
+/// and now where the builds do.
+pub fn data_root() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cordial")
+}
+
+/// `$XDG_DATA_HOME/cordial/builds`.
+///
+/// **Data, not cache.** It was `~/.cache/cordial/builds` until ADR-054, and a
+/// cache is what cleaners delete: a pinned build may not be obtainable again
+/// (the mirror keeps old versions today and nobody promises it will), so the
+/// place that holds somebody's only copy of Roblox 2.730 must not be the place
+/// `bleachbit` empties. In a Flatpak `XDG_DATA_HOME` is the sandbox's own
+/// `~/.var/app/<id>/data`, so nothing is shared with a host install.
 pub fn root() -> PathBuf {
+    data_root().join(BUILDS)
+}
+
+/// Where the store was before ADR-054, for [`relocate`] to move out of.
+pub fn cache_store() -> PathBuf {
     crate::install::cache_root().join(BUILDS)
+}
+
+/// Move what a pre-ADR-054 store holds from `from` to `to`, once.
+///
+/// Entry by entry (and the Quest store as one directory, which is not a
+/// version and is skipped by [`list_in`]), never overwriting: a name already
+/// under `to` is left where it is and in `from`, because two entries claiming
+/// one version is for [`crate::install::file_into_store`] to adjudicate by hash
+/// and not for a move to settle by order. A rename where both are on one
+/// filesystem, which is a metadata change; otherwise a copy to a hidden name
+/// and a rename, so a killed move leaves a name [`list_in`] skips rather than
+/// an entry holding half a build. Returns what moved.
+///
+/// Archives hard-linked between `build/<abi>` and an entry become two copies
+/// after a copy move. Nothing breaks by it; it costs the disk a link saved.
+pub fn relocate(from: &Path, to: &Path) -> io::Result<Vec<String>> {
+    let Ok(read) = std::fs::read_dir(from) else { return Ok(Vec::new()) };
+    let mut candidates: Vec<(String, PathBuf)> = read
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| Some((e.file_name().to_str()?.to_string(), e.path())))
+        .filter(|(name, _)| is_valid_version(name) || name == crate::quest::ABI)
+        .collect();
+    candidates.sort();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir_all(to)?;
+    let _lock = lock(to)?;
+    let mut moved = Vec::new();
+    for (name, source) in candidates {
+        let dest = to.join(&name);
+        if dest.exists() {
+            continue;
+        }
+        match std::fs::rename(&source, &dest) {
+            Ok(()) => {}
+            Err(_) => {
+                let hidden = to.join(format!(".moving.{}.{name}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&hidden);
+                let copied = copy_tree(&source, &hidden).and_then(|()| std::fs::rename(&hidden, &dest));
+                if let Err(e) = copied {
+                    let _ = std::fs::remove_dir_all(&hidden);
+                    return Err(e);
+                }
+                std::fs::remove_dir_all(&source)?;
+            }
+        }
+        moved.push(name);
+    }
+    // Nothing left that is an entry: the lock files and staging names that
+    // remain are this store's own and go with it. Anything else stays.
+    let leftover = std::fs::read_dir(from)
+        .map(|r| r.flatten().any(|e| !e.file_name().to_string_lossy().starts_with('.')))
+        .unwrap_or(false);
+    if !leftover {
+        let _ = std::fs::remove_dir_all(from);
+    }
+    Ok(moved)
+}
+
+fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)?.flatten() {
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if entry.file_type()?.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
 }
 
 /// Whether `version` may be used as a directory name.
@@ -188,6 +282,24 @@ impl Source {
             Source::File
         }
     }
+}
+
+/// `4 Oct 2026`, for a time in seconds since the epoch. Pure and in UTC, so a
+/// filing is described by the day it happened and not by the viewer's zone.
+pub fn format_date(secs: u64) -> String {
+    // Civil-from-days (Hinnant). Days since 1970-01-01 to y/m/d.
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    format!("{d} {} {y}", MONTHS[(m - 1) as usize])
 }
 
 /// [`Source`] and when it was filed.
@@ -755,6 +867,20 @@ pub fn detach(live: &Path) -> io::Result<()> {
     std::fs::create_dir_all(live)
 }
 
+impl Provenance {
+    /// What the interface says about how the entry arrived: a fact read off the
+    /// disk, never a guess.
+    pub fn label(&self) -> String {
+        let on = self.at.map(|t| format!(" on {}", format_date(t))).unwrap_or_default();
+        match self.source {
+            Source::Mirror => format!("Downloaded{on}"),
+            Source::Sober => format!("Imported from Sober{on}"),
+            Source::File => format!("Imported from a file{on}"),
+            Source::Legacy => format!("Found on disk by an earlier Cordial, filed{on}"),
+        }
+    }
+}
+
 /// Where an entry's extracted assets live.
 ///
 /// Inside the entry, so every build has its own tree and two profiles on two
@@ -872,20 +998,22 @@ pub fn prune_in(root: &Path, keep: usize, protect: &[String]) -> Vec<String> {
     removed
 }
 
-/// Remove one entry because somebody asked to, from the Version page.
+/// Remove one entry because somebody asked to, from the store view.
 ///
-/// Refuses the current entry and anything in `protect` for the same reason
-/// [`prune_in`] never takes them: the first leaves the slot a dangling link and
-/// nothing to launch, the second turns a profile's pin into a launch failure in
-/// a profile nobody touched. Removing an entry only drops its names for the
-/// archives, so an APK that was linked from Sober's directory stays there.
-pub fn remove_in(root: &Path, live: &Path, version: &str, protect: &[String]) -> Result<(), String> {
+/// Refuses the newest launchable entry (Latest, which would leave a profile
+/// nothing to launch), anything in `protect` (a profile's pin turned into a
+/// launch failure in a profile nobody touched), and an entry a client is
+/// running. Removing an entry only drops its own copies, so a Sober directory
+/// an import was made from is never touched.
+pub fn remove_in(root: &Path, version: &str, protect: &[String]) -> Result<(), String> {
     let Some(dir) = entry_dir_in(root, version) else {
         return Err(format!("{version:?} is not a Roblox version"));
     };
     let _lock = lock(root).map_err(|e| format!("could not lock the build store: {e}"))?;
-    if current_in(root, live).as_deref() == Some(version) {
-        return Err(format!("Roblox {version} is the current build, and removing it would leave nothing to launch."));
+    if latest(&list_in(root)).is_some_and(|e| e.version == version) {
+        return Err(format!(
+            "Roblox {version} is the newest build, which profiles on Latest launch. Removing it would leave them nothing."
+        ));
     }
     if protect.iter().any(|p| p == version) {
         return Err(format!("A profile is pinned to Roblox {version}. Clear that pin first."));
@@ -894,6 +1022,58 @@ pub fn remove_in(root: &Path, live: &Path, version: &str, protect: &[String]) ->
         return Err(format!("Roblox {version} is running in a client. Close it first."));
     };
     std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))
+}
+
+/// Check the archives an entry holds against `trusted`, as a filing would have.
+///
+/// For an entry that predates the records ADR-054 added, so it has none: the
+/// first launch checks it once and writes the answer down. Every archive in the
+/// entry is checked and they must share one certificate, the same rule
+/// [`crate::provider`] applies to a download, for the same reason: two halves
+/// signed by different keys are not two halves of one build.
+pub fn verify_entry(dir: &Path, trusted: &[String]) -> Result<String, String> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for name in [crate::install::BASE_APK, crate::install::SPLIT_APK] {
+        let path = dir.join(name);
+        if path.is_file() {
+            found.push(path);
+        }
+    }
+    if found.is_empty() {
+        return Err("it holds no archive to check".into());
+    }
+    let mut certificate: Option<String> = None;
+    for path in &found {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("archive");
+        let signer = crate::apk_signature::verify_signed_by(path, trusted).map_err(|e| format!("{name}: {e}"))?;
+        match &certificate {
+            None => certificate = Some(signer.certificate_sha256),
+            Some(first) if *first != signer.certificate_sha256 => {
+                return Err(format!("{name}: the two halves of this build were signed by different certificates"));
+            }
+            Some(_) => {}
+        }
+    }
+    certificate.ok_or_else(|| "nothing was checked".into())
+}
+
+/// Check every complete entry that has no signer record, and record the ones
+/// that pass. Returns what was checked and how each came out, for the caller
+/// to say: an entry that fails stays unrecorded and is never launched.
+pub fn ensure_verified(root: &Path, trusted: &[String]) -> Vec<(String, Result<String, String>)> {
+    let mut out = Vec::new();
+    for entry in list_in(root) {
+        if !entry.complete || entry.signer.is_some() {
+            continue;
+        }
+        let verdict = verify_entry(&entry.dir, trusted).and_then(|fingerprint| {
+            record_signer(&entry.dir, &fingerprint).map_err(|e| format!("could not record it: {e}"))?;
+            let _ = record_source(&entry.dir, Source::Legacy);
+            Ok(fingerprint)
+        });
+        out.push((entry.version, verdict));
+    }
+    out
 }
 
 // ---- planning ----------------------------------------------------------
@@ -1081,6 +1261,14 @@ pub enum Step {
 /// What the migration does, in order. `CORDIAL_APK` is not an input: it is a
 /// per-run override and nothing here may read it as a build.
 ///
+/// **Sober's directory alone is not a reason to file anything.** A machine
+/// that has Sober and has never run Cordial has no slot, so it gets the
+/// first-run screen with both buttons, and so does one whose cache was wiped
+/// while Sober stayed installed: nothing here re-imports silently. Sober's
+/// build is filed only when it is what the old launch was running, which
+/// always left a slot behind -- a real directory at `lib/<abi>` -- and there it
+/// is the fallback after the archive the slot's own stamp names.
+///
 /// A slot already linked into the store, or a store that already holds a
 /// complete build, has nothing to copy. A Settings APK is imported whether or
 /// not the store is empty, because it is the one legacy launch source that
@@ -1093,10 +1281,15 @@ pub fn migration_plan(legacy: &Legacy) -> Vec<Step> {
         return Vec::new();
     }
     let candidate = match legacy.slot {
-        Slot::Directory => legacy.slot_archive.as_ref().or(legacy.managed_apk.as_ref()),
+        Slot::Directory => legacy
+            .slot_archive
+            .as_ref()
+            .or(legacy.managed_apk.as_ref())
+            .or(legacy.sober_apk.as_ref()),
+        // No slot: the only legacy evidence left is a build Cordial installed
+        // itself into its own directory.
         _ => legacy.managed_apk.as_ref(),
-    }
-    .or(legacy.sober_apk.as_ref());
+    };
     match candidate {
         Some(apk) => {
             let source = match Source::for_path(apk) {
@@ -1114,24 +1307,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn removing_refuses_the_current_build_and_a_pinned_one_and_takes_the_rest() {
+    fn removing_refuses_the_newest_build_and_a_pinned_one_and_takes_the_rest() {
         let scratch = Scratch::new("remove");
         let root = scratch.path().join(BUILDS);
         for v in ["1.0", "2.0", "3.0"] {
-            std::fs::create_dir_all(root.join(v)).unwrap();
-            std::fs::write(root.join(v).join(crate::engine::LIBRARY), v).unwrap();
+            launchable(&root, v);
         }
-        let live = scratch.path().join("lib").join("x86_64");
-        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
-        point_current_at(&live, &root.join("3.0")).unwrap();
         let pins = vec!["2.0".to_string()];
 
-        assert!(remove_in(&root, &live, "3.0", &pins).is_err(), "the current build");
-        assert!(remove_in(&root, &live, "2.0", &pins).is_err(), "a pinned build");
-        assert!(remove_in(&root, &live, "../lib", &pins).is_err(), "not a version");
-        remove_in(&root, &live, "1.0", &pins).unwrap();
+        assert!(remove_in(&root, "3.0", &pins).is_err(), "the newest build, which Latest launches");
+        assert!(remove_in(&root, "2.0", &pins).is_err(), "a pinned build");
+        assert!(remove_in(&root, "../lib", &pins).is_err(), "not a version");
+        remove_in(&root, "1.0", &pins).unwrap();
         let left: Vec<String> = list_in(&root).into_iter().map(|e| e.version).collect();
         assert_eq!(left, ["3.0", "2.0"]);
+    }
+
+    /// An entry a launch may run: engine, its own archive, and a signer.
+    fn launchable(root: &Path, version: &str) -> PathBuf {
+        let dir = root.join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(crate::engine::LIBRARY), version).unwrap();
+        std::fs::write(dir.join(crate::install::BASE_APK), format!("apk {version}")).unwrap();
+        record_signer(&dir, &"ab".repeat(32)).unwrap();
+        dir
     }
 
     /// A scratch directory that deletes itself, so these tests need no
@@ -1622,14 +1821,24 @@ mod tests {
         assert_eq!(plan, [Step::File { apk: managed, source: Source::Legacy }]);
     }
 
-    /// The case that had no slot at all: Sober was what `effective_apk`
-    /// resolved to, and the launch ran it without ever keying anything.
+    /// Sober was what the old launch ran when the slot is a real directory that
+    /// names nothing else: the fallback after the stamp's own archive.
     #[test]
-    fn sober_alone_is_filed_as_sober_and_nothing_else_is_read() {
+    fn a_slot_with_no_archive_of_its_own_falls_back_to_sober() {
         let sober = PathBuf::from("/home/u/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk");
-        let plan = migration_plan(&Legacy { sober_apk: Some(sober.clone()), ..legacy() });
+        let plan = migration_plan(&Legacy { slot: Slot::Directory, sober_apk: Some(sober.clone()), ..legacy() });
         assert_eq!(plan, [Step::File { apk: sober, source: Source::Sober }]);
-        assert!(migration_plan(&legacy()).is_empty(), "no Sober and no slot: the first-run screen");
+    }
+
+    /// **The case the ADR is most careful about.** Sober installed, Cordial
+    /// never run (or its cache wiped): no slot, so nothing is filed silently and
+    /// the first-run screen offers the download and the copy.
+    #[test]
+    fn sober_alone_is_never_imported_without_being_asked() {
+        let sober = PathBuf::from("/home/u/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk");
+        assert!(migration_plan(&Legacy { sober_apk: Some(sober.clone()), ..legacy() }).is_empty());
+        assert!(migration_plan(&Legacy { slot: Slot::LinkIntoStore, sober_apk: Some(sober), ..legacy() }).is_empty());
+        assert!(migration_plan(&legacy()).is_empty());
     }
 
     #[test]
@@ -1705,15 +1914,14 @@ mod tests {
     fn two_clients_may_share_a_build_and_removal_refuses_it_by_name() {
         let scratch = Scratch::new("in-use-shared");
         let root = scratch.path().join("builds");
-        let live = scratch.path().join("lib/x86_64");
-        let dir = build(&root, "2.738.0.1");
-        build(&root, "2.742.0.9");
+        let dir = launchable(&root, "2.738.0.1");
+        launchable(&root, "2.742.0.9");
         let a = hold_in_use(&dir).unwrap();
         let b = hold_in_use(&dir).expect("a second client on the same build is fine");
-        let refused = remove_in(&root, &live, "2.738.0.1", &[]).unwrap_err();
+        let refused = remove_in(&root, "2.738.0.1", &[]).unwrap_err();
         assert!(refused.contains("running"), "{refused}");
         drop((a, b));
-        remove_in(&root, &live, "2.738.0.1", &[]).unwrap();
+        remove_in(&root, "2.738.0.1", &[]).unwrap();
     }
 
     #[test]
@@ -1762,5 +1970,75 @@ mod tests {
         std::fs::create_dir_all(&foreign).unwrap();
         assert_eq!(of(&foreign), None, "a hand-typed --lib-dir keeps the shared tree");
         assert_eq!(of(&root.join("missing")), None);
+    }
+
+    #[test]
+    fn the_store_is_data_and_the_old_one_moves_in_whole_once() {
+        let scratch = Scratch::new("relocate");
+        let (from, to) = (scratch.path().join("cache/builds"), scratch.path().join("data/builds"));
+        let a = launchable(&from, "2.738.0.1397");
+        std::fs::write(a.join("marker"), b"travels with it").unwrap();
+        launchable(&from, "2.736.0.1408");
+        // The Quest store rides along as one directory, and a stray stays put.
+        let quest = from.join("arm64-v8a/2.740.0.927");
+        std::fs::create_dir_all(&quest).unwrap();
+        std::fs::write(quest.join(crate::engine::LIBRARY), b"q").unwrap();
+        std::fs::create_dir_all(from.join("not-a-version")).unwrap();
+        std::fs::write(from.join(".store.lock"), b"").unwrap();
+
+        let moved = relocate(&from, &to).unwrap();
+        assert_eq!(moved, ["2.736.0.1408", "2.738.0.1397", "arm64-v8a"]);
+        assert_eq!(std::fs::read(to.join("2.738.0.1397/marker")).unwrap(), b"travels with it");
+        assert!(to.join("arm64-v8a/2.740.0.927").join(crate::engine::LIBRARY).is_file());
+        assert!(from.join("not-a-version").is_dir(), "what is not an entry is left alone");
+        assert!(!from.join("2.738.0.1397").exists());
+        // A moved entry is still signed: the record names the bytes, not the place.
+        assert!(list_in(&to).iter().all(|e| e.signer.is_some() && e.launchable()));
+
+        // Once: a second run finds nothing to move and nothing to disturb.
+        assert!(relocate(&from, &to).unwrap().is_empty());
+        // And a name already at the destination is not overwritten.
+        launchable(&from, "2.738.0.1397");
+        std::fs::write(from.join("2.738.0.1397/marker"), b"the other one").unwrap();
+        assert!(relocate(&from, &to).unwrap().is_empty());
+        assert_eq!(std::fs::read(to.join("2.738.0.1397/marker")).unwrap(), b"travels with it");
+        assert!(from.join("2.738.0.1397").is_dir());
+    }
+
+    #[test]
+    fn an_absent_cache_store_moves_nothing_and_creates_nothing() {
+        let scratch = Scratch::new("relocate-none");
+        let to = scratch.path().join("data/builds");
+        assert!(relocate(&scratch.path().join("nope"), &to).unwrap().is_empty());
+        assert!(!to.exists());
+    }
+
+    #[test]
+    fn dates_are_the_utc_day_of_the_filing() {
+        assert_eq!(format_date(0), "1 Jan 1970");
+        assert_eq!(format_date(1_759_579_200), "4 Oct 2025");
+        assert_eq!(format_date(1_791_081_816), "4 Oct 2026");
+        assert_eq!(format_date(951_782_400), "29 Feb 2000");
+        let p = Provenance { source: Source::Sober, at: Some(1_791_081_816) };
+        assert_eq!(p.label(), "Imported from Sober on 4 Oct 2026");
+        assert_eq!(Provenance { source: Source::Mirror, at: None }.label(), "Downloaded");
+        assert!(Provenance { source: Source::Legacy, at: Some(0) }.label().contains("earlier Cordial"));
+    }
+
+    #[test]
+    fn an_entry_that_fails_verification_stays_unrecorded_and_is_not_launchable() {
+        let scratch = Scratch::new("verify");
+        let root = scratch.path().join("builds");
+        let dir = build(&root, "2.738.0.1393");
+        std::fs::write(dir.join(crate::install::BASE_APK), b"not an apk at all").unwrap();
+        let trusted = vec!["44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477".to_string()];
+        let checked = ensure_verified(&root, &trusted);
+        assert_eq!(checked.len(), 1);
+        assert!(checked[0].1.is_err(), "{:?}", checked[0]);
+        assert!(!list_in(&root)[0].launchable());
+        // Nothing to check about an entry that is already recorded, or has no archive.
+        launchable(&root, "2.740.0.1");
+        build(&root, "2.730.0.1");
+        assert_eq!(ensure_verified(&root, &trusted).len(), 1, "the failing one is retried; the rest are not");
     }
 }

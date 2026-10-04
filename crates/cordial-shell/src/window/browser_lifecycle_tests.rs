@@ -78,7 +78,7 @@ fn automatic_browser_launch_starts_and_last_clean_client_closes_hidden_launcher(
         let config_path = config_path.clone();
         let started = started.clone();
         app.connect_activate(move |app| {
-            let shell = build(app, config.clone(), config_path.clone());
+            let shell = build(app, config.clone(), config_path.clone(), false);
             shell.join.queue(requested.into());
             started.set(WidgetExt::activate_action(&shell.window, "win.launch", None).is_ok());
         });
@@ -135,7 +135,7 @@ fn manual_launch_entry_invalidates_lookup_without_consuming_join() {
     let config = Rc::new(RefCell::new(ShellConfig::default()));
     config.borrow_mut().profile = "last-used".into();
     config.borrow_mut().roblox.apk = Some(root.path().join("missing.apk"));
-    let shell = build(&app, config, Rc::new(root.path().join("shell.json")));
+    let shell = build(&app, config, Rc::new(root.path().join("shell.json")), false);
     let requested = "roblox-player:1+launchmode:play+gameinfo:FAKE+placelauncherurl:x";
     let task = shell
         .queue_with_lookup(requested.into(), |_| Some("browser-account".into()))

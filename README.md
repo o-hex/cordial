@@ -112,11 +112,11 @@ checked. The Arch package is x86-64 only; Arch Linux itself does not build for
 aarch64.
 
 You also need Roblox's Android build. Cordial does not ship it. First run has a
-**Download Roblox** button that fetches it from APKPure and refuses anything
-not signed by Roblox's own certificate. If [Sober](https://sober.vinegarhq.org/)
-is installed, Cordial runs its APK until you press **Download Roblox** in
-Settings → Roblox, which gives Cordial a copy of its own. You can also choose
-your own APK there.
+**Download Roblox** button that fetches it from APKPure, refuses anything not
+signed by Roblox's own certificate, and keeps its own copy. If
+[Sober](https://sober.vinegarhq.org/) is installed, you can copy its build in
+instead; Cordial does not follow Sober's updates afterwards. Details in
+[`docs/install.md`](docs/install.md).
 
 **Flatpak (recommended):** it runs on the same GNOME 50 runtime everywhere, with
 the GTK, WebKit, Vulkan loader and audio libraries Cordial is built and tested

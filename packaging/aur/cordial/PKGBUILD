@@ -126,10 +126,10 @@ optdepends=(
   # starts and window.rs dlopens these for it; CORDIAL_MONITOR needs Xinerama.
   'libx11: X11 session fallback'
   'libxinerama: CORDIAL_MONITOR monitor selection under X11'
-  # Roblox's own Android build, unpacked by Sober, is the copy Cordial looks
-  # for first. It is a suggestion and not a dependency because a user-supplied
-  # APK works just as well and neither one comes from this package.
-  'sober: a Roblox build for Cordial to run (Cordial ships none)'
+  # Sober's Roblox build can be copied into Cordial's own store (Settings,
+  # Roblox). It is a suggestion and not a dependency: Cordial downloads its own
+  # build, and nothing from this package depends on Sober.
+  'sober: its Roblox build can be imported into Cordial (Cordial downloads its own)'
 )
 conflicts=('cordial-git' 'cordial-bin')
 install="$pkgname.install"

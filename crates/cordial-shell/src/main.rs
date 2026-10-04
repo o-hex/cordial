@@ -38,6 +38,7 @@ mod install;
 mod instructions;
 mod launch;
 mod live;
+mod migration;
 mod multi_instance_warning;
 mod profile_switcher;
 mod refresh_watch;
@@ -314,6 +315,17 @@ fn start(app: &libadwaita::Application, shell: &Rc<RefCell<Option<window::Shell>
     let config_path = Rc::new(shell_config::path());
     let config = Rc::new(RefCell::new(shell_config::load(&config_path)));
 
+    // ADR-054: before the window, because everything it draws and launches
+    // reads the store, and the first launch after the upgrade has things to
+    // move into it. Once, by construction -- see `migration`.
+    let migrated = migration::run(&mut config.borrow_mut());
+    migrated.print();
+    if migrated.config_changed() {
+        if let Err(e) = shell_config::save(&config_path, &config.borrow()) {
+            eprintln!("shell: could not save {}: {e}", config_path.display());
+        }
+    }
+
     // Applied before the window exists so the very first paint already
     // matches whatever the user last chose in Appearance, rather than
     // flashing the libadwaita default and then correcting itself.
@@ -324,7 +336,7 @@ fn start(app: &libadwaita::Application, shell: &Rc<RefCell<Option<window::Shell>
     let live_watch = live::start(&config_path, &config.borrow());
     std::mem::forget(live_watch);
 
-    *shell.borrow_mut() = Some(window::build(app, config, config_path));
+    *shell.borrow_mut() = Some(window::build(app, config, config_path, migrated.offer_newest()));
 }
 
 /// `cordial --import-quest-apk FILE`. Exit 0 when filed (or already held), 1

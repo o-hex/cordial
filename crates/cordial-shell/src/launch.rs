@@ -1570,7 +1570,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::env::set_var("CORDIAL_PROFILE_ROOT", &root);
 
-        let build = match install::locate(&install::RobloxInstall::default()) {
+        let build = match profile::dir("e2e").map_err(|e| install::NotFound::Unusable(e)).and_then(|d| install::resolve(&d)) {
             Ok(build) => build,
             Err(e) => {
                 println!("no Roblox build on this machine, nothing to prove: {e:?}");

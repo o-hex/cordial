@@ -144,7 +144,7 @@ pub fn present(parent: &impl IsA<gtk::Window>, retry: impl Fn() -> bool + 'stati
         .modal(true)
         .title("Set up Roblox")
         .default_width(560)
-        .default_height(520)
+        .default_height(if copy.is_some() { 660 } else { 520 })
         .content(&toolbar)
         .build();
 

@@ -35,7 +35,6 @@ use cordial_update::store::{self, Entry};
 use cordial_update::Unreachable;
 
 use crate::download_progress::Meter;
-use crate::install;
 use crate::shell_config::ShellConfig;
 
 /// Said above the choice, not after a failure, because the failure it pre-empts
@@ -248,9 +247,10 @@ fn populate(view: &Rc<View>) {
     let profile_dir = profile::dir(&profile_name);
     let pinned = profile_dir.as_ref().ok().and_then(|d| profile::pinned_version(d));
     let root = store::root();
-    let live = install::engine_cache();
-    let current = store::current_in(&root, &live);
     let entries = store::list();
+    // What Latest runs: the newest build a launch may run, not whatever the old
+    // slot happens to point at (ADR-054).
+    let current = store::latest(&entries).map(|e| e.version.clone());
     let pinned_anywhere = profile::all_pinned_versions();
     let this_cordial = env!("CARGO_PKG_VERSION");
 
@@ -325,9 +325,9 @@ fn populate(view: &Rc<View>) {
             remove.set_tooltip_text(Some(why));
         }
         let version = entry.version.clone();
-        let (root, live, pinned_anywhere) = (root.clone(), live.clone(), pinned_anywhere.clone());
+        let (root, pinned_anywhere) = (root.clone(), pinned_anywhere.clone());
         let (status_for_remove, weak_for_remove) = (status.clone(), weak.clone());
-        remove.connect_clicked(move |_| match store::remove_in(&root, &live, &version, &pinned_anywhere) {
+        remove.connect_clicked(move |_| match store::remove_in(&root, &version, &pinned_anywhere) {
             Ok(()) => repopulate_soon(&weak_for_remove),
             Err(e) => show_status(&status_for_remove, "The build was not removed", &e),
         });

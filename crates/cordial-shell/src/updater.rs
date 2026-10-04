@@ -41,14 +41,14 @@
 //! the newest release-notes major is the newest engine Roblox has shipped, and
 //! comparing it against the version of the build *here* is a real comparison.
 //!
-//! The catch is the other operand. Cordial knows the installed version only for
-//! a build it fetched itself ([`cordial_update::cache::recorded_version`]), and
-//! it has fetched none — an APK somebody obtained elsewhere carries no version
-//! this can read without parsing Android's binary manifest. So the ordinary
-//! state is **not knowing**, and the button says exactly that rather than
-//! rounding it to "up to date". Telling somebody they are current while Roblox
-//! refuses their build server-side is the failure this whole feature exists to
-//! prevent.
+//! The other operand is the build a profile on Latest runs: the newest entry in
+//! Cordial's store that holds its archives and has a recorded signer
+//! ([`cordial_update::store::latest`], ADR-054), read off the engine's own
+//! bytes when it was filed. With nothing in the store, or while `CORDIAL_APK`
+//! names the build for a run, it is **not known**, and the button says exactly
+//! that rather than rounding it to "up to date". Telling somebody they are
+//! current while Roblox refuses their build server-side is the failure this
+//! whole feature exists to prevent.
 //!
 //! ## Always present, immediately left of Settings
 //!
@@ -73,7 +73,6 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use cordial_update::cache;
 use cordial_update::changelog::{self, DocsSource, Entry, Notes, Release};
 use cordial_update::download::{Refusal, Source, URL_ENV};
 use cordial_update::metered::{self, Metered};
@@ -194,7 +193,7 @@ impl Checked {
     /// two version formats end up compared and neither is wrong-looking enough
     /// to notice.
     fn reread_installed(&mut self) {
-        self.installed = cache::recorded_version(&install::engine_cache());
+        self.installed = install::installed_version();
     }
 
     fn update_available(&self) -> bool {
@@ -259,8 +258,7 @@ pub fn header_button(
         let config = config.clone();
         let installing = installing.clone();
         glib::timeout_add_local_once(AFTER_WINDOW, move || {
-            let origin = install::effective_apk(&config.borrow().roblox).map(|(_, origin)| origin);
-            check(origin, move |checked| {
+            check(move |checked| {
                 let available = checked.update_available();
                 // The plan is asked for even though only one branch of it can be
                 // acted on today, because the settings are what decide it and a
@@ -522,37 +520,24 @@ fn short_reason(why: &str) -> String {
     }
 }
 
-/// The version to show as "installed", given which build is actually in
-/// effect.
-///
-/// **Only trustworthy for the build Cordial itself manages.**
-/// `cache::recorded_version` is the version stamped after an install this
-/// crate performed -- see `cordial_update::cache` -- and it is paired with the
-/// managed engine cache, not with whatever `effective_apk` resolves to right
-/// now. A user who chose their own APK, or is running Sober's directly, has an
-/// effective build this cache says nothing about; reading its stamp as
-/// "installed" used to compare one build's badge against a different build's
-/// version. `origin` is `None` on a fresh install with nothing found yet,
-/// which reads the same way here: not known, rather than guessed from
-/// whatever was last fetched.
+/// The version to show as "installed": what a profile on Latest launches, which
+/// is the newest build in Cordial's store that can be run
+/// ([`install::installed_version`]). `None` for an empty store, and while
+/// `CORDIAL_APK` names the build for this run -- the store then says nothing
+/// about what is running, and a badge compared against it would be about a
+/// different build.
 ///
 /// Shared between [`check`]'s worker and `present`'s provisional paint before
 /// the first check has landed, so the two cannot answer this differently.
-fn installed_version(origin: Option<install::Origin>) -> Option<String> {
-    match origin {
-        Some(install::Origin::Managed) => cache::recorded_version(&install::engine_cache()),
-        _ => None,
-    }
+fn installed_version() -> Option<String> {
+    install::installed_version()
 }
 
-fn check(origin: Option<install::Origin>, then: impl Fn(Checked) + 'static) {
-    // `origin` is resolved here, on the main thread, rather than on the
-    // worker: `effective_apk` reads config the main thread owns, and nothing
-    // off it should touch that.
+fn check(then: impl Fn(Checked) + 'static) {
     on_worker(
         move || {
             let metered = metered::current();
-            let installed = installed_version(origin);
+            let installed = installed_version();
             let release = changelog::latest().and_then(|r| changelog::notes(&r).map(|n| (r, n)));
             // Two independent requests on the same worker: the DevForum gives
             // the announcement, the Creator Hub gives the table -- found by
@@ -930,7 +915,6 @@ pub fn present(
         let action = action.clone();
         let button = button.clone();
         let banner_for_paint = banner.clone();
-        let config_for_paint = config.clone();
         Rc::new(move |checked: &Option<Checked>| {
             // **Which build is here, not a verdict on it.** This line used to
             // carry the outcome — "Up to date", or the longer "Whether this
@@ -950,11 +934,7 @@ pub fn present(
                 // Before the first check has landed: the same gate `check`'s
                 // worker applies, so this provisional line and the one that
                 // replaces it once the check answers cannot disagree.
-                None => {
-                    let origin = install::effective_apk(&config_for_paint.borrow().roblox)
-                        .map(|(_, origin)| origin);
-                    version_line(installed_version(origin))
-                }
+                None => version_line(installed_version()),
             };
             status_line.set_label(&installed);
             action.set_tooltip_text(Some(&format!("{subtitle}\n\n{INSTALLED_DESCRIPTION}")));
@@ -1002,7 +982,6 @@ pub fn present(
     let run_check: Rc<dyn Fn()> = {
         let last = last.clone();
         let paint = paint.clone();
-        let config = config.clone();
         let action = action.clone();
         let status_line = status_line.clone();
         let meter = meter.clone();
@@ -1016,11 +995,10 @@ pub fn present(
             // Roblox <version>", which is the right receipt for that download
             // and the wrong thing to leave sitting under the next check.
             meter.widget().set_visible(false);
-            let origin = install::effective_apk(&config.borrow().roblox).map(|(_, origin)| origin);
             let last = last.clone();
             let paint = paint.clone();
             let status_line = status_line.clone();
-            check(origin, move |checked| {
+            check(move |checked| {
                 *last.borrow_mut() = Some(checked);
                 paint(&last.borrow());
                 // **After `paint`, because `paint` owns this label** and sets
@@ -1078,7 +1056,6 @@ pub fn present(
         let status_line = status_line.clone();
         let action_for_click = action.clone();
         let meter = meter.clone();
-        let config_for_click = config.clone();
         let installing_for_click = installing.clone();
         action.connect_clicked(move |_| {
             if !last_for_click.borrow().as_ref().is_some_and(Checked::update_available) {
@@ -1086,26 +1063,16 @@ pub fn present(
                 return;
             }
 
-            // **Refused before a byte moves, not after.** `effective_apk`
-            // prefers a chosen APK over a downloaded one, so fetching here
-            // would spend a few hundred megabytes on a build the launcher
-            // would then decline to use -- a success that changes nothing,
-            // which is worse than a failure that says so.
-            //
-            // **The user's actual setting, not `RobloxInstall::default()`.**
-            // The guard used to ask about a build nobody configured -- always
-            // "nothing chosen, nothing downloaded" -- so a user who had in
-            // fact picked their own APK never saw this refusal at all and
-            // only found out the download changed nothing once it finished.
-            // `header_button`'s own check, a few hundred lines up, reads the
-            // real setting the same way this now does.
-            if let Some((_, origin)) = install::effective_apk(&config_for_click.borrow().roblox) {
-                if let Some(why) = origin.why_not_updatable() {
-                    status_line.set_visible(true);
-                    status_line.set_label(why);
-                    status_line.add_css_class("error");
-                    return;
-                }
+            // **Refused before a byte moves, not after.** `CORDIAL_APK` names
+            // the build for this run, so fetching here would spend a few
+            // hundred megabytes on a build the launch would then decline to
+            // use -- a success that changes nothing, which is worse than a
+            // failure that says so.
+            if let Some(why) = install::updates_blocked() {
+                status_line.set_visible(true);
+                status_line.set_label(why);
+                status_line.add_css_class("error");
+                return;
             }
 
             // **Refused here too, before this races the background install.**
@@ -1386,7 +1353,7 @@ pub fn build_update_page(
 /// belong: neither answers "which build am I on". They explain the two switches
 /// directly above them — an update that does not download because the desktop
 /// guesses metered is the confusion this row exists to pre-empt.
-fn build_source_group(config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesGroup {
+fn build_source_group(_config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesGroup {
     let group =
         // **This is the one place in the UI that names the mirror**, and it is
         // the right one: a settings page is where somebody goes to find out
@@ -1409,12 +1376,10 @@ fn build_source_group(config: Rc<RefCell<ShellConfig>>) -> adw::PreferencesGroup
     // the row computed from a build nobody was running rather than the one
     // this page is meant to describe, and someone who really had chosen their
     // own APK never saw the row telling them why updates were off for it.
-    if let Some((_, origin)) = install::effective_apk(&config.borrow().roblox) {
-        if let Some(why) = origin.why_not_updatable() {
-            let row = adw::ActionRow::builder().title("Updates are off for this build").subtitle(why).build();
-            row.set_subtitle_lines(4);
-            group.add(&row);
-        }
+    if let Some(why) = install::updates_blocked() {
+        let row = adw::ActionRow::builder().title("Updates are off for this run").subtitle(why).build();
+        row.set_subtitle_lines(4);
+        group.add(&row);
     }
 
     group.add(&build_architecture_row());
@@ -1589,8 +1554,11 @@ const FETCH_EXPLAINS: &str =
 /// Said on the installed-build group, where the picker used to be.
 ///
 /// It names where the picker went. A group that lost its only control and says
-/// nothing about it reads as a control that failed to appear.
-const INSTALLED_DESCRIPTION: &str = "Choose your own APK on the Roblox page in Settings.";
+/// nothing about it reads as a control that failed to appear. Which build a
+/// profile runs is chosen on the Version page, and a file or Sober's build is
+/// imported on the Roblox page (ADR-054).
+const INSTALLED_DESCRIPTION: &str =
+    "Which build a profile runs is chosen on the Version page in Settings.";
 
 /// The top row: which of the three states this is, and why.
 fn status_lines(checked: &Option<Checked>, automatic: Automatic) -> (String, String) {
@@ -1707,7 +1675,7 @@ fn check_outcome(checked: &Checked) -> (String, bool) {
 
 fn version_line(recorded: Option<String>) -> String {
     match recorded {
-        Some(version) => format!("Roblox {version}, recorded when Cordial fetched this build."),
+        Some(version) => format!("Roblox {version}, the newest build in Cordial's store."),
         // **Not the same claim as "Cordial has fetched none".** That used to
         // be the only reason this branch fired, and it stopped being true
         // once `Checked::installed` started asking which build is actually
@@ -2182,14 +2150,13 @@ mod tests {
     }
 
     #[test]
-    fn the_installed_group_says_where_the_apk_is_chosen_now_that_it_is_not_chosen_here() {
+    fn the_installed_group_says_where_the_build_is_chosen_now_that_it_is_not_chosen_here() {
         // The picker was here and in Settings at once. `profile_switcher.rs`
         // wrote down what that costs: two ways to set one value drift, and the
         // one that drifts is the one nobody is looking at. What is left has to
         // say where the other one is, or a group with no control in it reads as
         // a control that failed to appear.
-        assert!(INSTALLED_DESCRIPTION.contains("Roblox page in Settings"), "{INSTALLED_DESCRIPTION}");
-        assert!(INSTALLED_DESCRIPTION.contains("your own APK"), "{INSTALLED_DESCRIPTION}");
+        assert!(INSTALLED_DESCRIPTION.contains("Version page in Settings"), "{INSTALLED_DESCRIPTION}");
     }
 
 
@@ -2216,24 +2183,23 @@ mod tests {
         );
     }
 
-    /// **Finding 5, as a function.** `installed_version` is what
-    /// `Checked::installed` and the pre-check paint both call, and only
-    /// `Origin::Managed` may answer from the cache Cordial itself stamps.
-    /// Every other origin -- and no build found at all -- must read as "not
-    /// known" regardless of what a previous, unrelated install left in that
-    /// cache.
+    /// `CORDIAL_APK` is process-wide, so the test that sets it is kept apart
+    /// from any other that reads it.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `installed_version` is what `Checked::installed` and the pre-check paint
+    /// both call. It is what a profile on Latest launches, and while
+    /// `CORDIAL_APK` names the build for a run it is not known: the store says
+    /// nothing about what is running, and a badge compared against it would be
+    /// about a different build.
     #[test]
-    fn installed_version_is_none_for_every_origin_except_managed() {
-        assert_eq!(installed_version(None), None);
-        assert_eq!(installed_version(Some(install::Origin::Chosen)), None);
-        assert_eq!(installed_version(Some(install::Origin::Sober)), None);
-        assert_eq!(installed_version(Some(install::Origin::Environment)), None);
-        // The one origin that may answer delegates to the same place
-        // `Checked::reread_installed` reads, whatever that currently holds.
-        assert_eq!(
-            installed_version(Some(install::Origin::Managed)),
-            cache::recorded_version(&install::engine_cache())
-        );
+    fn installed_version_is_unknown_while_the_override_is_set() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(install::APK_OVERRIDE, "/from/env/base.apk");
+        let overridden = installed_version();
+        std::env::remove_var(install::APK_OVERRIDE);
+        assert_eq!(overridden, None);
+        assert_eq!(installed_version(), install::installed_version(), "otherwise the store's newest, in one place");
     }
 
     #[test]

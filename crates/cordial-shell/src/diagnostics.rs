@@ -177,9 +177,7 @@ fn session() -> String {
 /// binary)` at every launch the whole time. The diagnostics block was the one
 /// place that did not look.
 ///
-/// It matters more than a missing field usually would. Cordial adopts Sober's
-/// APK when it finds one, so a large share of users are on a build Cordial did
-/// not fetch -- and for them the block said `unknown` for exactly the field
+/// It matters more than a missing field usually would: the version is the field
 /// that identifies whether their engine is one Cordial can start. Issue #32 is
 /// three exchanges long because of it: the reporter's crash turned on which
 /// build they had, and the block they were asked for could not say.
@@ -189,8 +187,29 @@ fn session() -> String {
 /// that will actually be loaded, which is the stronger evidence of the two;
 /// and `unknown` now means there is genuinely no library to look at, not that
 /// nobody tried.
+///
+/// **It reads the store now**, because a launch does (ADR-054): the build a
+/// profile on Latest runs is the newest entry that holds its archives and has a
+/// recorded signer, and how it arrived is a record on disk. `CORDIAL_APK` is
+/// said when it is set, since the store then says nothing about what runs.
 fn roblox() -> String {
-    roblox_in(&crate::install::engine_cache())
+    if let Some(apk) = crate::install::override_apk() {
+        let engine = roblox_in(&crate::install::engine_cache());
+        return format!("{engine}, CORDIAL_APK override ({})", apk.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+    }
+    roblox_from(&cordial_update::store::list())
+}
+
+/// Split from [`roblox`] so the branches are testable without a store.
+fn roblox_from(entries: &[cordial_update::store::Entry]) -> String {
+    match cordial_update::store::latest(entries) {
+        Some(e) => {
+            let how = e.provenance.map(|p| p.label()).unwrap_or_else(|| "source not recorded".into());
+            format!("{} ({how})", e.version)
+        }
+        None if entries.is_empty() => "none (nothing in Cordial's store yet)".into(),
+        None => "none runnable (the store holds builds without an APK or a checked signature)".into(),
+    }
 }
 
 /// Split from [`roblox`] so the three branches are testable without an engine
@@ -344,7 +363,7 @@ mod tests {
 
 #[cfg(test)]
 mod roblox_version_tests {
-    use super::roblox_in;
+    use super::{roblox_from, roblox_in};
 
     /// A directory with neither a record nor a library is the only case that
     /// may still say "unknown", and it must say *why* -- the old wording
@@ -373,5 +392,31 @@ mod roblox_version_tests {
         cordial_update::cache::record_version(&dir, "2.736.0.1408").expect("record");
         assert_eq!(roblox_in(&dir), "2.736.0.1408 (fetched by Cordial)");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn kept(version: &str, runnable: bool, source: Option<cordial_update::store::Source>) -> cordial_update::store::Entry {
+        cordial_update::store::Entry {
+            version: version.into(),
+            dir: std::path::PathBuf::from("/x").join(version),
+            loaded_by: None,
+            bytes: 0,
+            complete: runnable,
+            content_hash: None,
+            signer: runnable.then(|| "ab".repeat(32)),
+            provenance: source.map(|source| cordial_update::store::Provenance { source, at: Some(1_791_081_816) }),
+            version_code: None,
+        }
+    }
+
+    /// The report names the build a profile on Latest runs and how it came,
+    /// and says plainly when there is none, which are different claims.
+    #[test]
+    fn the_report_names_the_latest_runnable_build_and_how_it_arrived() {
+        use cordial_update::store::Source;
+        let both = [kept("2.736.0.1408", true, Some(Source::Sober)), kept("2.738.0.1397", true, Some(Source::Mirror))];
+        assert_eq!(roblox_from(&both), "2.738.0.1397 (Downloaded on 4 Oct 2026)");
+        assert_eq!(roblox_from(&[kept("2.736.0.1408", true, None)]), "2.736.0.1408 (source not recorded)");
+        assert!(roblox_from(&[]).starts_with("none (nothing"));
+        assert!(roblox_from(&[kept("2.740.0.1", false, None)]).starts_with("none runnable"));
     }
 }

@@ -1,47 +1,43 @@
-//! Where the Roblox build is, and how Cordial goes looking for one.
+//! Where the Roblox build is, and how a launch gets it.
 //!
-//! Cordial ships no Roblox code and never will, so every launch depends on a
-//! build the user already has. Nothing in this project used to record where
-//! that was: the only way to run the client was a hand-typed `cordial-run`
-//! command line carrying `--lib-dir` and `--apk`, which is why the chooser's
-//! activate handler had nothing to call.
+//! **A launch resolves to a store entry, or to an explicit developer override,
+//! and to nothing else** ([ADR-054](../../../docs/adr/ADR-054-cordial-owns-its-roblox-builds.md)).
+//! It used to look in four places -- the environment, a path chosen in
+//! Settings, Cordial's own download, and Sober's package directory -- and
+//! follow whichever answered, so a machine with Sober silently ran whatever
+//! Sober last fetched and never met the first-run screen. The sources now are:
 //!
-//! The resolution order here is the same one `justfile`'s `dev` recipe uses,
-//! deliberately and to the letter, because that recipe has been run end to end
-//! and this had not. Two things in it are not guessable and both cost somebody
-//! an afternoon to establish:
+//! 1. `CORDIAL_APK`, the developer override: extracted into the old single
+//!    slot, never filed, never updated, and labelled as such.
+//! 2. The profile's pin, if it has one: that entry, or a refusal.
+//! 3. **Latest**: the newest complete, signature-recorded entry in the store.
 //!
-//! The engine is **not in `base.apk`** on a split build. `libroblox.so` lives
-//! in `split_config.x86_64.apk` beside it, so anything that assumes the APK it
-//! was given contains the engine fails on the ordinary case. Each candidate is
-//! tried in turn instead of one being asserted.
-//!
-//! And the extracted engine belongs in the cache rather than beside the APK,
-//! because the APK is usually inside another application's data directory,
-//! which Cordial has no business writing into.
+//! Sober's directory and a file chosen in Settings are *imports* now (see
+//! `cordial_update::provider::import` and [`crate::migration`]): the user asks,
+//! the archives are verified and copied into the store, and the original is
+//! forgotten.
 //!
 //! **Detection is a filesystem check every time, never a remembered answer.**
 //! A stored "yes, it is installed" goes stale the moment the user deletes the
-//! build or Sober replaces it, and a launcher that then fails with a path
-//! error is worse than one that simply looks again.
+//! build, and a launcher that then fails with a path error is worse than one
+//! that simply looks again. The store is read from disk at each launch.
 //!
-//! And the extracted engine is **stamped with the APK it came from**. Presence
-//! alone was the whole test until now, which meant a new Roblox build left the
-//! *old* engine in the cache and Cordial ran it against the new APK's assets —
-//! a silent version mismatch, and worse than the cold start the cache exists to
-//! avoid, because nothing about it presents as a caching problem. `justfile`'s
-//! `client` recipe had the same bug and had it fixed; this had not.
-//! [`cordial_update::cache`] owns the stamp and writes the same string that
-//! recipe writes, so the two never make each other re-extract 115 MB.
+//! The override path keeps the old behaviour of stamping the extracted engine
+//! with the APK it came from, because presence alone used to be the whole test
+//! and a new build then left the old engine in the cache --
+//! [`cordial_update::cache`] owns that and writes the same stamp `justfile`'s
+//! `client` recipe does.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use cordial_update::store::{self, Choice, Entry, Refusal, Resolved};
+
 /// The engine object. `--lib-dir` names the directory holding it.
 pub const LIBRARY: &str = "libroblox.so";
 
-/// Points this run at one APK without touching the saved settings. Set by
-/// `just dev --apk <path>`.
+/// Points this run at one APK without touching the saved settings or the
+/// store. Set by `just dev --apk <path>`.
 pub const APK_OVERRIDE: &str = "CORDIAL_APK";
 
 /// Its path inside whichever APK carries it.
@@ -52,25 +48,18 @@ pub const APK_OVERRIDE: &str = "CORDIAL_APK";
 /// it would disagree, and nothing would say so.
 use cordial_update::apk::LIBRARY_IN_APK;
 
-/// What the user has pinned by hand, if anything.
+/// The APK that used to be chosen in Settings.
 ///
-/// `None` on a fresh install and for anyone who lets detection do its job --
-/// which is the intended case, not a degraded one. A value here is an
-/// override, and [`locate`] honours it over anything it would otherwise find,
-/// because a user who went to Settings and chose a file meant that file.
+/// **Legacy, and read exactly once.** It was a launch source that outranked
+/// everything else; it is now an import, so [`crate::migration`] files the
+/// named file in the store, pins every profile that had no pin to the result
+/// (somebody who chose a file meant that file) and clears this field. Nothing
+/// else reads it and nothing writes it: a Cordial that still found a value here
+/// after the migration would be a launch source by another name.
 ///
-/// **There used to be a second field, `lib_dir`, and it is gone on purpose.**
-/// It was an "Engine directory" row in Settings that nobody needed to fill in:
-/// the engine is always extracted from the APK, into Cordial's own cache, and
-/// kept in step with it. A saved directory was worse than useless, because it
-/// was used as it stood and never compared with the APK, so a stale one ran an
-/// old engine against a new build's assets with nothing on screen saying so.
-/// An existing `shell.json` that still carries `"lib_dir"` loads without
-/// complaint (serde skips keys it does not know), the value is ignored rather
-/// than silently honoured -- a hidden setting the UI can no longer show or
-/// clear is the thing to avoid -- and the next save drops it from the file.
-/// The developer override is `cordial-run --lib-dir`, which does not go
-/// through this struct.
+/// There used to be a second field, `lib_dir`, and it is gone on purpose. An
+/// existing `shell.json` that still carries `"lib_dir"` loads without
+/// complaint (serde skips keys it does not know), and the next save drops it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RobloxInstall {
@@ -84,28 +73,23 @@ pub struct Build {
     pub lib_dir: PathBuf,
 }
 
-
 /// Why a launch cannot proceed, split by what the user can do about it.
 #[derive(Debug)]
 pub enum NotFound {
-    /// No APK anywhere. The answer is the Sober instructions, not an error
-    /// dialog — this is a first-run state rather than a fault, and it is the
-    /// only one with a scripted way out.
+    /// Nothing in the store. The first-run screen is the answer, not an error
+    /// dialog -- this is a state rather than a fault, and it has a one-press way
+    /// out.
     NoBuild,
-    /// An APK was found or configured, and getting the engine out of it did not
-    /// work. Carries something specific enough to act on.
+    /// Something is there and cannot be run, or the override named a file that
+    /// is unusable. Carries something specific enough to act on.
     Unusable(String),
 }
 
-/// Sober's copy of the official Android build.
+/// Sober's copy of the official Android build, for the import.
 ///
 /// Named rather than searched for, because the point is to be able to tell the
-/// user exactly where Cordial looked. Sober downloads the same official
-/// x86-64 Android build this runtime loads and leaves it unpacked, which makes
-/// it far and away the least painful way for someone to obtain one — but it is
-/// another application's private directory, so Cordial *offers* what it finds
-/// there and records the path only once the user has launched with it. It never
-/// silently depends on Sober being installed.
+/// user exactly where Cordial looked. It is another application's private
+/// directory, read by an import the user asked for and never written.
 pub fn sober_apk() -> PathBuf {
     sober_apk_under(&std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir))
 }
@@ -119,15 +103,17 @@ fn sober_apk_under(home: &Path) -> PathBuf {
     // for aarch64 -- Sober is a project this codebase may observe running but
     // never inspect (AGENTS.md) -- so this is INFERRED from the x86_64 naming
     // pattern, not confirmed against a real Sober install on ARM. See the same
-    // caveat in `cordial_update::provider::local`.
+    // caveat in `cordial_update::provider::import`.
     home.join(format!(
         ".var/app/org.vinegarhq.Sober/data/sober/packages/{}/com.roblox.client/base.apk",
         cordial_update::apk::HOST_ABI
     ))
 }
 
-/// Where Cordial keeps the engine it extracted. Same path `just dev` uses, so
-/// the two never make each other re-extract 115 MB.
+/// Where Cordial keeps the engine it extracted for the override and for
+/// `just client`: the old single slot. Same path `just dev` uses, so the two
+/// never make each other re-extract 115 MB. A launch from the store does not
+/// read it.
 pub fn engine_cache() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -140,173 +126,97 @@ pub fn engine_cache() -> PathBuf {
         .join(cordial_update::apk::HOST_ABI)
 }
 
-/// The APK Cordial would use, and whether the user picked it or Cordial found
-/// it. `None` means there is nothing to launch and the instructions are the
-/// answer.
-pub fn effective_apk(configured: &RobloxInstall) -> Option<(PathBuf, Origin)> {
-    // `CORDIAL_APK` overrides the saved setting outright, the same override
-    // pattern `CORDIAL_SHELL_CONFIG`, `CORDIAL_FLAGS` and `CORDIAL_PROFILE_ROOT`
-    // already use. `just dev --apk <path>` is what sets it: that recipe now
-    // starts the shell rather than the engine, so the one path that genuinely
-    // varies between contributors has to reach the shell somehow, and pointing
-    // it at a build for one run must not overwrite what the user chose in
-    // Settings.
-    if let Some(apk) = std::env::var_os(APK_OVERRIDE) {
-        return Some((PathBuf::from(apk), Origin::Environment));
-    }
-    if let Some(apk) = &configured.apk {
-        return Some((apk.clone(), Origin::Chosen));
-    }
-    // **Cordial's own download, which this did not look at until it was caught
-    // by running it.** The Download button installs into
-    // `cordial_update::install::build_dir()`, and every lookup here went from
-    // the environment, to the setting, to Sober -- so a user who pressed
-    // Download watched it verify and install a build, and then got "No Roblox
-    // build found" on the same screen. The feature installed to a directory
-    // the launcher did not know about.
-    //
-    // Ahead of Sober because it is the more deliberate of the two: somebody
-    // who pressed Download asked for this build, where Sober's is a file that
-    // happened to be on the disk. Behind the setting and the environment
-    // because both of those are somebody saying which build they want, and
-    // this must not override that.
-    if let Some(managed) = cordial_update::install::managed_base() {
-        return Some((managed, Origin::Managed));
-    }
-
-    let sober = sober_apk();
-    sober.is_file().then_some((sober, Origin::Sober))
+/// The APK `CORDIAL_APK` names for this run, if it is set.
+pub fn override_apk() -> Option<PathBuf> {
+    std::env::var_os(APK_OVERRIDE).map(PathBuf::from)
 }
 
-/// Where a path came from, so the UI can say. A detected path that presents
-/// itself as configuration is how a user ends up not knowing that deleting
-/// another application will break this one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
-    Environment,
-    Chosen,
-    /// Cordial downloaded it and put it there. See [`effective_apk`].
-    Managed,
-    Sober,
+/// Why updates are off, or `None` when they are on.
+///
+/// The one case left: `CORDIAL_APK` names the build for this run, so a download
+/// would fill the store with a build the launch then declines to use -- a
+/// success that changes nothing, which is worse than a failure that says so.
+/// Everything else downloads into the store, and a profile on Latest follows it.
+pub fn updates_blocked() -> Option<&'static str> {
+    override_apk().map(|_| "CORDIAL_APK names the build for this run, so a download would not be used.")
 }
 
-impl Origin {
-    /// Whether Cordial may replace this build with a newer one.
-    ///
-    /// **Only its own.** Everything else here is either a file somebody named
-    /// deliberately or a file belonging to another program, and Cordial writes
-    /// neither. That is one half of the rule; the other half is
-    /// `cordial_update::install::ours_to_write`, which stops it writing over a
-    /// build it did not install even inside its own directory.
-    ///
-    /// It also decides whether an update is worth *fetching*, which is the part
-    /// that is easy to miss. `effective_apk` prefers a chosen APK over a
-    /// downloaded one, so downloading a newer build while the user has chosen
-    /// their own would spend a few hundred megabytes on a file the launcher
-    /// would then decline to use. Silently. The Updates page says which case
-    /// the user is in rather than leaving them to notice.
-    pub fn updatable(self) -> bool {
-        matches!(self, Origin::Managed)
+/// The version a profile on Latest launches: the newest entry a launch may run.
+/// `None` for an empty store, and while `CORDIAL_APK` overrides it, because the
+/// store then says nothing about what runs.
+pub fn installed_version() -> Option<String> {
+    if override_apk().is_some() {
+        return None;
     }
+    store::latest(&store::list()).map(|e| e.version.clone())
+}
 
-    /// Why not, for the one line the Updates page shows.
-    pub fn why_not_updatable(self) -> Option<&'static str> {
-        match self {
-            Origin::Managed => None,
-            Origin::Environment => {
-                Some("CORDIAL_APK names the build for this run, so Cordial will not replace it.")
-            }
-            Origin::Chosen => Some(
-                "You chose this APK, so Cordial will not replace it. Clear it on the Roblox \
-                 page to let Cordial manage a build instead.",
-            ),
-            Origin::Sober => Some(
-                "This build belongs to Sober and Cordial will not write to it. Press Download \
-                 Roblox on the Roblox page and Cordial will manage its own copy.",
-            ),
+/// What a profile's choice comes to on this machine, as a build.
+///
+/// `CORDIAL_APK` first, then the profile's pin, else Latest. Every entry a
+/// launch may run has been checked for who signed it: filed by a route that
+/// verified it, or checked here once, now, for an entry that predates the
+/// records ([`cordial_update::store::ensure_verified`]).
+pub fn resolve(profile_dir: &Path) -> Result<Build, NotFound> {
+    if let Some(apk) = override_apk() {
+        return locate_override(&apk);
+    }
+    verify_store();
+    let entries = store::list();
+    let pinned = cordial_shell::profile::pinned_version(profile_dir);
+    let choice = match pinned.as_deref() {
+        Some(v) => Choice::Pinned(v),
+        None => Choice::Latest,
+    };
+    pick(&entries, choice)
+}
+
+/// [`resolve`]'s decision, over a given store listing so it can be tested
+/// without a store.
+fn pick(entries: &[Entry], choice: Choice<'_>) -> Result<Build, NotFound> {
+    match store::resolve(choice, entries) {
+        Resolved::Entry(version) => {
+            let entry = entries.iter().find(|e| e.version == version).expect("resolved from this list");
+            let apk = entry
+                .base_apk()
+                .ok_or_else(|| NotFound::Unusable(Refusal::Incomplete(version.clone()).to_string()))?;
+            Ok(Build { apk, lib_dir: entry.dir.clone() })
         }
+        Resolved::Refused(Refusal::Empty) => Err(NotFound::NoBuild),
+        Resolved::Refused(refusal) => Err(NotFound::Unusable(refusal.to_string())),
     }
+}
 
-    pub fn describe(self) -> &'static str {
-        match self {
-            Origin::Environment => "Set by CORDIAL_APK for this run only",
-            Origin::Chosen => "Chosen in Settings",
-            Origin::Managed => "Downloaded by Cordial",
-            Origin::Sober => {
-                "Found in Sober's download (org.vinegarhq.Sober). Once Cordial has downloaded \
-                 its own copy it uses that instead."
-            }
+/// Check, once, every entry that has no record of who signed it.
+///
+/// The first launch after ADR-054 meets entries the old Version page and the
+/// old updater filed without a record. Each is verified against the pinned
+/// certificates and the answer is written down, so this costs one pass over a
+/// build's archives (about half a second at 230 MB) once, on the main thread,
+/// the same trade the old launch made for its extraction. An entry that fails
+/// stays unrecorded and is never launched; the reason is said here.
+fn verify_store() {
+    for (version, verdict) in store::ensure_verified(&store::root(), &cordial_update::apk_signature::pinned()) {
+        match verdict {
+            Ok(fingerprint) => println!("  shell: checked Roblox {version}: signed by {fingerprint}"),
+            Err(why) => println!("  shell: Roblox {version} was not launchable: {why}"),
         }
     }
 }
 
-/// Swap in the build a profile has pinned, if it has pinned one.
-///
-/// **Both halves or neither.** A pin that moved only `lib_dir` would run an old
-/// engine against the current build's assets, which is the silent version
-/// mismatch `cordial_update::cache` exists to prevent and which presents as
-/// anything but a version problem. So an entry that does not hold its own
-/// `base.apk` is refused as a pin rather than half-applied -- that is what
-/// `store::Entry::complete` is, and every entry keyed before the archives were
-/// kept beside them is one.
-///
-/// **A missing entry is refused, not silently ignored.** Falling back to the
-/// current build would run the very version the user pinned away from, and say
-/// nothing. The message names the version and says what to do, because the two
-/// ways to get here -- a store pruned past it, or a profile copied to another
-/// machine -- both leave the user looking at a build they did not choose.
-///
-/// Roblox enforces a minimum client version server-side and will refuse an old
-/// build whenever it decides to. Nothing here can prevent that, and the
-/// settings page says so beside the picker rather than letting somebody
-/// conclude Cordial broke.
-pub fn apply_pin(build: Build, profile_dir: &Path) -> Result<Build, NotFound> {
-    let Some(version) = cordial_shell::profile::pinned_version(profile_dir) else {
-        return Ok(build);
-    };
-    let entries = cordial_update::store::list();
-    let Some(entry) = entries.iter().find(|e| e.version == version) else {
-        return Err(NotFound::Unusable(format!(
-            "This profile is pinned to Roblox {version}, and that build is not in Cordial's \
-             store. Open Settings and choose another version, or clear the pin to follow \
-             whichever build is current."
-        )));
-    };
-    let Some(apk) = entry.base_apk() else {
-        return Err(NotFound::Unusable(format!(
-            "This profile is pinned to Roblox {version}, and Cordial kept that build's engine \
-             without the APK it came from -- so its assets are gone and it cannot be run on its \
-             own. Clear the pin, or pin a build Cordial has downloaded since."
-        )));
-    };
-    Ok(Build { apk, lib_dir: entry.dir.clone() })
-}
+// ---- the developer override ---------------------------------------------
 
-/// Find a usable build, extracting the engine from the APK if that is what it
-/// takes.
-///
-/// The extraction runs on the calling thread and the calling thread is the one
-/// GTK draws on, so the window stops responding while it happens. Measured at
-/// 0.6 s for the 115 MB object on this machine, once, on the first launch after
-/// an install — which is a worse trade than a progress bar and a better one
-/// than the two states and a worker thread that a progress bar costs. If that
-/// stops being true, this is the place to move.
 /// Establish that Roblox signed this archive, at most once per build.
 ///
-/// **The check belongs here because this is the only place every launch passes
-/// through.** `cordial-update` verifies what it downloads, but the launcher
-/// reaches a build four other ways -- `CORDIAL_APK`, the APK chosen in
-/// Settings, an engine directory beside it, or Sober's package directory -- and
-/// none of those went through the downloader. Nothing in this crate called
-/// [`cordial_update::apk_signature`] at all, so a substituted archive launched
-/// exactly like a genuine one and was then keyed into the same store the
-/// Version page lists. Reported by @kanqz; issue #51.
+/// **The check belongs here because the override is the one launch path that
+/// reaches an archive nothing else verified.** The store's entries were checked
+/// when they were filed; `CORDIAL_APK` is a file somebody pointed at, and a
+/// substituted archive would otherwise launch exactly like a genuine one.
+/// Reported by @kanqz; issue #51.
 ///
 /// **Recorded rather than repeated**, because verifying digests the whole
 /// archive and `cordial_update::cache`'s own header argues against paying that
-/// on every launch. The first launch after this lands verifies once, the same
-/// one-off cost an unstamped cache already pays to re-extract; every launch
-/// after reads a fingerprint.
+/// on every launch.
 ///
 /// A refusal names which of the two failures happened, because
 /// [`cordial_update::apk_signature::Refusal`] distinguishes "somebody changed
@@ -315,9 +225,7 @@ pub fn apply_pin(build: Build, profile_dir: &Path) -> Result<Build, NotFound> {
 ///
 /// Returns the fingerprint when it had to verify, for [`locate_with`] to
 /// record once the engine directory has settled. Recording it here, before an
-/// extraction replaces that directory, wrote it into the build being replaced
-/// and cost a second verification on the next launch.
-///
+/// extraction replaces that directory, wrote it into the build being replaced.
 /// The fingerprint comes back with the archive's stamp as it was *before* the
 /// digest, so what is recorded describes the bytes that were checked.
 fn verified_once(apk: &Path, cache: &Path) -> Result<Option<(String, String)>, NotFound> {
@@ -331,52 +239,46 @@ fn verified_once(apk: &Path, cache: &Path) -> Result<Option<(String, String)>, N
     match cordial_update::apk_signature::verify_signed_by(apk, &pinned) {
         Ok(signer) => Ok(stamp.map(|s| (signer.certificate_sha256, s))),
         Err(e) => Err(NotFound::Unusable(format!(
-            "Cordial will not run {}: {e}.\n\nThis is the archive Cordial was pointed at, not \
-             one it downloaded. Clear the APK in Settings to let Cordial find or fetch a build \
-             it can check.",
+            "Cordial will not run {}: {e}.\n\nThis is the archive CORDIAL_APK named, not one \
+             Cordial downloaded. Unset CORDIAL_APK to launch from Cordial's own store.",
             apk.display()
         ))),
     }
 }
 
-pub fn locate(configured: &RobloxInstall) -> Result<Build, NotFound> {
-    locate_with(configured, verified_once)
+/// Run the archive `CORDIAL_APK` names: extract its engine into the old slot
+/// and launch from there. **Never filed in the store** and never updated.
+pub fn locate_override(apk: &Path) -> Result<Build, NotFound> {
+    locate_with(apk, verified_once)
 }
 
-/// [`locate`], with the signature check injected.
+/// [`locate_override`], with the signature check injected.
 ///
 /// **The seam exists so the extraction tests remain testable.** They drive real
 /// behaviour worth keeping -- that a new Roblox build at the same path
 /// re-extracts, and that an unchanged one does not -- against archives built by
-/// `apk_holding`, which are plain zips. Gating `locate` unconditionally would
-/// make every one of them unrunnable, and the way out is not to fabricate a
-/// signed archive: `cordial_update::apk_signature`'s own tests explain that one
+/// `apk_holding`, which are plain zips. Gating unconditionally would make every
+/// one of them unrunnable, and the way out is not to fabricate a signed
+/// archive: `cordial_update::apk_signature`'s own tests explain that one
 /// signed by an invented key exercises the parser and proves nothing about
 /// whether Roblox's real build is accepted.
 ///
 /// So tests inject a verifier that accepts, and a separate test drives the real
-/// entry point above to prove an unsigned archive is refused. The same shape as
-/// `browser_account::profile::matching_profile_with`, for the same reason.
+/// entry point above to prove an unsigned archive is refused.
 fn locate_with(
-    configured: &RobloxInstall,
+    apk: &Path,
     verify: impl FnOnce(&Path, &Path) -> Result<Option<(String, String)>, NotFound>,
 ) -> Result<Build, NotFound> {
-    let Some((apk, _)) = effective_apk(configured) else {
-        return Err(NotFound::NoBuild);
-    };
     if !apk.is_file() {
         return Err(NotFound::Unusable(format!(
-            "No APK at {}. Open Settings and choose one, or clear it to let Cordial look again.",
+            "CORDIAL_APK names {}, and there is no file there.",
             apk.display()
         )));
     }
-    // Before any of the four paths below returns a `Build`, so that none of
-    // them can hand the loader an archive nobody established the origin of.
-    let fresh_signer = verify(&apk, &engine_cache())?;
-    let build = locate_verified(apk)?;
+    let fresh_signer = verify(apk, &engine_cache())?;
+    let build = locate_verified(apk.to_path_buf())?;
     // Not fatal if it cannot be written: the cost is verifying again next
-    // launch, which is slow rather than wrong. The same shape as the version
-    // and stamp writes in `locate_verified`.
+    // launch, which is slow rather than wrong.
     if let Some((fingerprint, stamp)) = fresh_signer {
         if let Err(e) = cordial_update::cache::record_signer_stamped(&engine_cache(), &fingerprint, &stamp) {
             println!("  shell: verified {} but could not record it: {e}", build.apk.display());
@@ -395,10 +297,8 @@ fn locate_verified(apk: PathBuf) -> Result<Build, NotFound> {
     }
 
     // The cache is the only location here whose contents Cordial put there, so
-    // it is the only one it can vouch for — and it only vouches for it against
-    // the APK it was extracted from. An unstamped cache counts as stale, which
-    // re-extracts once for everyone upgrading past this change: 0.6 s, once,
-    // and the right answer for a directory nobody can attribute.
+    // it is the only one it can vouch for -- and only against the APK it was
+    // extracted from. An unstamped cache counts as stale.
     //
     // The stale engine is deliberately *not* deleted first. Extraction writes a
     // temporary and renames over it, so there is nothing to clear, and deleting
@@ -413,42 +313,16 @@ fn locate_verified(apk: PathBuf) -> Result<Build, NotFound> {
             apk.display()
         );
     } else if cache.join(LIBRARY).is_file() {
-        // Keyed here as well, or an install that is already up to date never
-        // reaches the store: this branch is every launch after the first, and
-        // the extraction below -- the only other place that keys -- runs only
-        // when Roblox changes. A no-op once the cache is a link.
-        // `cordial_update::install::SPLIT_APK`, not a filename rebuilt from
-        // `HOST_ABI` here: Play spells the split with underscores
-        // (`split_config.arm64_v8a.apk`) while `HOST_ABI` keeps the hyphen the
-        // APK's own `lib/arm64-v8a/` directory uses (see that constant's own
-        // comment). The two spellings are identical for x86_64, which is why
-        // rebuilding it from `HOST_ABI` here compiled and passed on that
-        // architecture while quietly constructing the wrong filename
-        // (`split_config.arm64-v8a.apk`) for aarch64.
-        let split = apk.parent().map(|d| d.join(cordial_update::install::SPLIT_APK));
-        let mut archives: Vec<&Path> = vec![apk.as_path()];
-        if let Some(split) = split.as_deref().filter(|s| s.is_file()) {
-            archives.push(split);
-        }
-        key_into_store(&cordial_update::store::root(), &cache, &archives);
         return Ok(Build { apk, lib_dir: cache });
     }
 
-    // **Before the extraction, and for the same reason `install::adopt` does
-    // it.** Once the cache path is a symlink into the keyed store, extracting
-    // "into the cache" writes *inside* whichever build is current -- so a Sober
-    // update, whose whole symptom is a stale cache, would overwrite the entry
-    // the user might want to go back to. `adopt_current` files the outgoing
-    // build away first; `detach` then leaves a real, empty directory to
-    // extract into. Both are no-ops on a build whose version was never known,
-    // which is exactly today's behaviour for an APK the user brought.
-    let store_root = cordial_update::store::root();
-    match cordial_update::store::adopt_current(&store_root, &cache) {
-        Ok(Some(kept)) => println!("  shell: kept the previous build as {kept}"),
-        Ok(None) => {}
-        Err(e) => println!("  shell: could not keep the previous build: {e}"),
-    }
-    if let Err(e) = cordial_update::store::detach(&cache) {
+    // **Detached first, and not filed.** The cache path is a symlink into the
+    // store whenever an update has pointed it at a kept build, and extracting
+    // "into the cache" through it would write inside whichever build that is.
+    // `detach` breaks the link and leaves a real, empty directory. It does
+    // *not* key the outgoing engine into the store, which the launch used to
+    // do: the override is for one run and leaves no entry behind.
+    if let Err(e) = store::detach(&cache) {
         return Err(NotFound::Unusable(format!("{}: {e}", cache.display())));
     }
 
@@ -458,131 +332,23 @@ fn locate_verified(apk: PathBuf) -> Result<Build, NotFound> {
             // and an extraction that then failed would claim a cache that is
             // not there, which is the same class of lie in the other direction.
             if let Err(e) = cordial_update::cache::write_stamp(&cache, &apk) {
-                // Not fatal: an unstamped cache re-extracts next launch, which
-                // is slow rather than wrong. Said out loud so a cache that
-                // re-extracts every time has an explanation somewhere.
                 println!("  shell: extracted {LIBRARY} but could not stamp the cache: {e}");
             }
-            // **And the version, or this build can never be updated.**
-            //
-            // `Checked::installed` reads `cache::recorded_version`, and
-            // `update_available` is deliberately both-or-nothing: an unknown
-            // installed version is not an old one. So a cache with no recorded
-            // version makes "is there an update" answer no, for ever -- the
-            // badge never lights, and pressing the button re-checks and returns
-            // to the same place.
-            //
-            // Until now the only writer was `cordial_update::install::adopt`,
-            // which runs when *Cordial* downloaded the build. Everyone whose
-            // build came from Sober or from an APK they chose themselves --
-            // which `provider::local` calls the source most users should end up
-            // on -- extracted their engine through this path instead, and could
-            // not update through the interface at all.
-            //
-            // **The extracted engine, not the archive `from` names.** This
-            // read `from` until 2026-09-13, and `from` is the *APK*:
-            // `extract_engine` returns the candidate it found the library in,
-            // not the library. Scanning the archive finds nothing -- measured
-            // on this host, `split_config.x86_64.apk` gives `None` where the
-            // engine out of it gives `2.738.0.1397`, and
-            // `engine::scan_the_real_build` keeps that as a guard. So the
-            // paragraph below, about a build that can never be updated, was
-            // describing a bug this code still had: every build that came from
-            // Sober or from a user's own APK went unrecorded, and the update
-            // check answered no for ever.
-            //
-            // It is also what the keyed store keys on, so an unrecorded version
-            // now means a build that cannot be kept or rolled back to either.
+            // The extracted engine, not the archive `from` names: scanning the
+            // archive finds nothing -- measured, `split_config.x86_64.apk`
+            // gives `None` where the engine out of it gives `2.738.0.1397`.
             match cordial_update::engine::version_of(&cache.join(LIBRARY)) {
                 Some(version) => {
                     if let Err(e) = cordial_update::cache::record_version(&cache, &version) {
                         println!("  shell: extracted {LIBRARY} but could not record its version: {e}");
                     }
                 }
-                // Not fatal, and worth saying: an engine whose version cannot
-                // be read leaves the update check unable to compare, which is
-                // the honest state rather than a guessed one.
                 None => println!("  shell: could not read a version out of the extracted {LIBRARY}"),
             }
             println!("  shell: extracted {LIBRARY} from {} into {}", from.display(), cache.display());
-
-            // And key what was just extracted, by the same route the outgoing
-            // build took above -- it is now a real directory with a version
-            // recorded in it, which is all `adopt_current` needs. `lib_dir`
-            // stays the same path either way; after this it reads through a
-            // link. Pruning protects every profile's pin, which is why it is
-            // asked for here rather than assumed empty.
-            let mut archives: Vec<&Path> = vec![apk.as_path()];
-            if from != apk {
-                archives.push(from.as_path());
-            }
-            key_into_store(&store_root, &cache, &archives);
             Ok(Build { apk, lib_dir: cache })
         }
         Err(e) => Err(NotFound::Unusable(e)),
-    }
-}
-
-/// Move a cache with a recorded version into the keyed store (ADR-033), keep
-/// the archives it came from beside it, and prune.
-///
-/// The archives are the user's own files -- Sober's, usually -- and
-/// hard-linking them costs no disk and takes nothing away from whoever else is
-/// using them. A link cannot be made across a filesystem boundary, and
-/// `store::keep_archives` says so rather than copying 230 MB onto somebody's
-/// launch without asking. Pruning protects every profile's pin.
-fn key_into_store(store_root: &Path, cache: &Path, archives: &[&Path]) {
-    match cordial_update::store::adopt_current(store_root, cache) {
-        Ok(Some(keyed)) => {
-            println!("  shell: kept {} as Roblox {keyed}", cache.display());
-            let entry = store_root.join(&keyed);
-            for trouble in cordial_update::store::keep_archives(&entry, archives) {
-                println!("  shell: {keyed} is kept without its archives: {trouble}");
-            }
-            // The entry says who signed it and how it arrived. `verified_once`
-            // recorded the signer against the archive at `archives[0]`, so it
-            // is read back from there and written against the entry's own
-            // `base.apk` -- and only if that is a link to the same file, so an
-            // entry that already held a different archive is not vouched for
-            // by one it never contained.
-            let apk = archives.first().copied().unwrap_or(Path::new(""));
-            let same = same_inode(&entry.join(cordial_update::install::BASE_APK), apk);
-            let signer = cordial_update::cache::recorded_signer(cache, apk);
-            let source = match cordial_update::store::Source::for_path(apk) {
-                cordial_update::store::Source::Sober => cordial_update::store::Source::Sober,
-                _ => cordial_update::store::Source::File,
-            };
-            let written = match signer {
-                Some(fingerprint) if same => cordial_update::store::write_records(
-                    &entry,
-                    &cordial_update::store::Filing { source, signer: fingerprint, version_code: None },
-                ),
-                _ => cordial_update::store::record_source(&entry, source),
-            };
-            if let Err(e) = written {
-                println!("  shell: could not record where {keyed} came from: {e}");
-            }
-            // The build just keyed is the one about to run: pruning protected
-            // pins and not it, so keying a build older than the newest few
-            // deleted it at once, and every launch after extracted it again.
-            // Found by review.
-            let mut protect = cordial_shell::profile::all_pinned_versions();
-            protect.push(keyed.clone());
-            let dropped = cordial_update::store::prune_in(store_root, cordial_update::store::KEEP, &protect);
-            if !dropped.is_empty() {
-                println!("  shell: removed older builds: {}", dropped.join(", "));
-            }
-        }
-        Ok(None) => {}
-        Err(e) => println!("  shell: could not key {} into the store: {e}", cache.display()),
-    }
-}
-
-fn same_inode(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
     }
 }
 
@@ -648,6 +414,7 @@ fn extract_engine(apk: &Path, into: &Path) -> Result<PathBuf, String> {
     ))
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,96 +426,101 @@ mod tests {
         p
     }
 
-    /// `CORDIAL_APK` is process-wide, so the two tests that care about it have
-    /// to be kept apart from each other. Same reasoning as `profile`'s own ENV
-    /// mutex, and the same reason: cargo runs these as threads of one process.
+    /// `CORDIAL_APK` is process-wide, so the tests that care about it have to be
+    /// kept apart from each other. Same reasoning as `profile`'s own ENV mutex,
+    /// and the same reason: cargo runs these as threads of one process.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    #[test]
-    fn a_chosen_apk_wins_over_anything_detected() {
-        // Someone who went to Settings and picked a file meant that file, even
-        // if Sober's copy is sitting right there.
-        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(APK_OVERRIDE);
-        let install = RobloxInstall { apk: Some(PathBuf::from("/somewhere/base.apk")) };
-        let (apk, origin) = effective_apk(&install).unwrap();
-        assert_eq!(apk, PathBuf::from("/somewhere/base.apk"));
-        assert_eq!(origin, Origin::Chosen);
-    }
-
-    #[test]
-    fn the_environment_override_wins_over_the_saved_setting() {
-        // `just dev --apk <path>` has to be able to point one run at a build
-        // without silently rewriting what the user chose in Settings.
-        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var(APK_OVERRIDE, "/from/env/base.apk");
-        let install = RobloxInstall { apk: Some(PathBuf::from("/from/settings/base.apk")) };
-        let (apk, origin) = effective_apk(&install).unwrap();
-        std::env::remove_var(APK_OVERRIDE);
-        assert_eq!(apk, PathBuf::from("/from/env/base.apk"));
-        assert_eq!(origin, Origin::Environment);
-    }
-
-    /// **Cordial updates its own build and nothing else.**
-    ///
-    /// The rule is not only about not overwriting somebody's file. It also
-    /// stops Cordial spending a few hundred megabytes fetching a build the
-    /// launcher would then decline to use, because `effective_apk` prefers a
-    /// chosen APK over a downloaded one -- a download that succeeds and changes
-    /// nothing, silently, which is worse than one that fails.
-    #[test]
-    fn only_a_build_cordial_installed_is_one_it_will_replace() {
-        assert!(Origin::Managed.updatable());
-        assert!(!Origin::Chosen.updatable());
-        assert!(!Origin::Environment.updatable());
-        assert!(!Origin::Sober.updatable());
-
-        // And every case that is not updatable says why, because "no updates
-        // for you" with no reason is the silent failure with a label on it.
-        for origin in [Origin::Chosen, Origin::Environment, Origin::Sober] {
-            let why = origin.why_not_updatable().expect("must say why");
-            assert!(!why.is_empty(), "{origin:?}");
+    /// An entry a launch may run, written to disk so `base_apk` finds a file.
+    fn kept(root: &Path, version: &str, signed: bool, with_apk: bool) -> Entry {
+        let dir = root.join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(LIBRARY), version).unwrap();
+        if with_apk {
+            std::fs::write(dir.join("base.apk"), format!("apk {version}")).unwrap();
+            if signed {
+                store::record_signer(&dir, &"ab".repeat(32)).unwrap();
+            }
         }
-        assert!(Origin::Managed.why_not_updatable().is_none());
+        store::list_in(root).into_iter().find(|e| e.version == version).unwrap()
     }
 
-    /// **The bug this test exists for was found by pressing the button.**
-    ///
-    /// The Download button installs into `cordial_update::install::build_dir()`,
-    /// and the lookup went environment -> setting -> Sober and stopped. So a
-    /// user could watch Cordial fetch a build, verify its signature and install
-    /// it, and then be told on the same screen that no Roblox build was found.
-    /// Every unit test passed throughout: each half was correct and nothing
-    /// asserted that they met.
+    /// The decision a launch makes, over entries on disk: Latest is the newest
+    /// build a launch may run, and a build that is newer but unchecked or
+    /// without its archive does not take its place.
     #[test]
-    fn a_build_cordial_downloaded_itself_is_one_the_launcher_can_find() {
-        let order = [Origin::Environment, Origin::Chosen, Origin::Managed, Origin::Sober];
-        assert_eq!(order.len(), 4, "a new origin needs a place in this order");
+    fn latest_is_the_newest_build_that_can_be_run_and_the_pin_is_exact() {
+        let dir = scratch("pick");
+        let root = dir.join("builds");
+        let entries = vec![
+            kept(&root, "2.740.0.5", false, true),
+            kept(&root, "2.739.0.1", true, false),
+            kept(&root, "2.738.0.1397", true, true),
+            kept(&root, "2.736.0.1408", true, true),
+        ];
+        let latest = pick(&entries, Choice::Latest).unwrap();
+        assert_eq!(latest.lib_dir, root.join("2.738.0.1397"));
+        assert_eq!(latest.apk, root.join("2.738.0.1397/base.apk"));
+        let pinned = pick(&entries, Choice::Pinned("2.736.0.1408")).unwrap();
+        assert_eq!(pinned.lib_dir, root.join("2.736.0.1408"));
 
-        // Managed comes after the two that are somebody stating a preference,
-        // and before the one that is a file which merely happens to be there.
-        let managed_at = order.iter().position(|o| *o == Origin::Managed).unwrap();
-        let sober_at = order.iter().position(|o| *o == Origin::Sober).unwrap();
-        let chosen_at = order.iter().position(|o| *o == Origin::Chosen).unwrap();
-        assert!(managed_at < sober_at, "a deliberate download must beat a file that was lying about");
-        assert!(chosen_at < managed_at, "an explicit choice in Settings must beat a download");
-
-        // And it says where it came from, because a detected path presenting
-        // itself as configuration is how somebody ends up not knowing that
-        // deleting another application will break this one.
-        assert!(Origin::Managed.describe().contains("Cordial"));
-        assert!(Origin::Sober.describe().contains("Sober"));
+        // A pin refuses and names itself; it never becomes Latest.
+        for (pin, needle) in [("2.700.0.1", "not in Cordial's store"), ("2.739.0.1", "without the APK"), ("2.740.0.5", "who signed")] {
+            match pick(&entries, Choice::Pinned(pin)) {
+                Err(NotFound::Unusable(msg)) => assert!(msg.contains(needle), "{pin}: {msg}"),
+                other => panic!("{pin}: expected a refusal, got {other:?}"),
+            }
+        }
     }
 
-    /// The Sober line used to end "which Cordial does not manage", which reads
-    /// as a permanent state and offered no way out of it. It has to say that
-    /// Cordial's own copy takes over, because the Roblox page now has a button
-    /// that gets one.
+    /// An empty store is the first-run state and not an error.
     #[test]
-    fn the_sober_origin_says_cordial_will_use_its_own_copy() {
-        let text = Origin::Sober.describe();
-        assert!(text.contains("its own copy"), "{text}");
-        assert!(!text.contains("does not manage"), "{text}");
+    fn an_empty_store_is_the_first_run_screen_and_an_unusable_one_is_a_message() {
+        assert!(matches!(pick(&[], Choice::Latest), Err(NotFound::NoBuild)));
+        let dir = scratch("pick-unusable");
+        let root = dir.join("builds");
+        let entries = vec![kept(&root, "2.740.0.5", false, true)];
+        assert!(matches!(pick(&entries, Choice::Latest), Err(NotFound::Unusable(_))));
+    }
+
+    /// **The point of ADR-054, as a test.** Nothing but the store and
+    /// `CORDIAL_APK` is a launch source: with Sober's file in its real place
+    /// and a Settings APK saved, a launch still finds an empty store and says
+    /// so.
+    #[test]
+    fn sober_and_a_saved_apk_are_not_launch_sources() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(APK_OVERRIDE);
+        let dir = scratch("not-sources");
+        let (data, home) = (dir.join("data"), dir.join("home"));
+        let sober = sober_apk_under(&home);
+        std::fs::create_dir_all(sober.parent().unwrap()).unwrap();
+        std::fs::write(&sober, b"sober's base.apk").unwrap();
+        let previous = (std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"));
+        std::env::set_var("XDG_DATA_HOME", &data);
+        std::env::set_var("HOME", &home);
+        let outcome = resolve(&data.join("cordial/profiles/default"));
+        for (k, v) in [("XDG_DATA_HOME", previous.0), ("HOME", previous.1)] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert!(matches!(outcome, Err(NotFound::NoBuild)), "{outcome:?}");
+        assert_eq!(std::fs::read(&sober).unwrap(), b"sober's base.apk", "and it was not touched");
+    }
+
+    #[test]
+    fn only_the_environment_override_turns_updates_off() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(APK_OVERRIDE);
+        assert!(updates_blocked().is_none());
+        std::env::set_var(APK_OVERRIDE, "/from/env/base.apk");
+        let why = updates_blocked();
+        let installed = installed_version();
+        std::env::remove_var(APK_OVERRIDE);
+        assert!(why.unwrap().contains("CORDIAL_APK"));
+        assert_eq!(installed, None, "the store says nothing about what an override runs");
     }
 
     /// An old `shell.json` that still names an engine directory must load, and
@@ -791,16 +563,10 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_apk_that_has_gone_away_is_reported_rather_than_ignored() {
-        // The stored path going stale is the ordinary way this breaks — the
-        // user moves or deletes the build. Falling back to detection silently
-        // would launch something other than what they chose.
-        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(APK_OVERRIDE);
+    fn an_override_that_has_gone_away_is_reported_rather_than_ignored() {
         let dir = scratch("stale");
-        let install = RobloxInstall { apk: Some(dir.join("gone.apk")) };
-        match locate(&install) {
-            Err(NotFound::Unusable(msg)) => assert!(msg.contains("Settings"), "{msg}"),
+        match locate_override(&dir.join("gone.apk")) {
+            Err(NotFound::Unusable(msg)) => assert!(msg.contains("CORDIAL_APK"), "{msg}"),
             other => panic!("expected a usable message, got {other:?}"),
         }
     }
@@ -816,65 +582,49 @@ mod tests {
 
     #[test]
     fn a_new_roblox_build_re_extracts_rather_than_running_the_old_engine() {
-        // The defect this fixes, end to end. Presence alone was the whole test,
-        // so a new build left the OLD engine in the cache and Cordial ran it
-        // against the new APK's assets — a version mismatch with nothing in it
-        // that looks like a caching problem. Delete the `is_current` call in
-        // `locate` and the second assertion below fails.
-        //
-        // `XDG_CACHE_HOME` is process-wide, hence the same guard the two
-        // `CORDIAL_APK` tests take.
+        // The defect this fixes, end to end, on the override path. Presence
+        // alone was the whole test, so a new build left the OLD engine in the
+        // cache and Cordial ran it against the new APK's assets. Delete the
+        // `is_current` call in `locate_verified` and the second assertion fails.
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(APK_OVERRIDE);
         let dir = scratch("restamp");
-        let cache_home = dir.join("cache");
         let previous = std::env::var_os("XDG_CACHE_HOME");
-        std::env::set_var("XDG_CACHE_HOME", &cache_home);
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
 
         let apk = dir.join("base.apk");
         std::fs::write(&apk, apk_holding(b"the old engine")).unwrap();
-        let install = RobloxInstall { apk: Some(apk.clone()) };
-
-        let first = locate_with(&install, |_, _| Ok(None)).unwrap();
+        let first = locate_with(&apk, |_, _| Ok(None)).unwrap();
         assert_eq!(std::fs::read(first.lib_dir.join(LIBRARY)).unwrap(), b"the old engine");
 
-        // A new Roblox build lands at the same path, which is exactly what
-        // Sober updating does.
         std::fs::write(&apk, apk_holding(b"the new engine, which is longer")).unwrap();
-        let second = locate_with(&install, |_, _| Ok(None)).unwrap();
+        let second = locate_with(&apk, |_, _| Ok(None)).unwrap();
         let got = std::fs::read(second.lib_dir.join(LIBRARY)).unwrap();
 
         match previous {
             Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
             None => std::env::remove_var("XDG_CACHE_HOME"),
         }
-        assert_eq!(
-            got, b"the new engine, which is longer",
-            "the cache must follow the APK it was extracted from"
-        );
+        assert_eq!(got, b"the new engine, which is longer", "the cache must follow the APK it was extracted from");
     }
 
     #[test]
     fn an_unchanged_apk_does_not_re_extract() {
         // The control for the test above. Re-extracting every launch would be
-        // 115 MB of pointless work and would make the fix indistinguishable
-        // from having no cache at all.
+        // 115 MB of pointless work.
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(APK_OVERRIDE);
         let dir = scratch("unchanged");
-        let cache_home = dir.join("cache");
         let previous = std::env::var_os("XDG_CACHE_HOME");
-        std::env::set_var("XDG_CACHE_HOME", &cache_home);
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
 
         let apk = dir.join("base.apk");
         std::fs::write(&apk, apk_holding(b"the engine")).unwrap();
-        let install = RobloxInstall { apk: Some(apk.clone()) };
-
-        let build = locate_with(&install, |_, _| Ok(None)).unwrap();
+        let build = locate_with(&apk, |_, _| Ok(None)).unwrap();
         // Something no extraction would ever produce, so its survival is proof
         // the second call did not extract.
         std::fs::write(build.lib_dir.join(LIBRARY), b"left alone").unwrap();
-        let again = locate_with(&install, |_, _| Ok(None)).unwrap();
+        let again = locate_with(&apk, |_, _| Ok(None)).unwrap();
         let got = std::fs::read(again.lib_dir.join(LIBRARY)).unwrap();
 
         match previous {
@@ -884,41 +634,40 @@ mod tests {
         assert_eq!(got, b"left alone", "an unchanged APK must not re-extract");
     }
 
-    /// **Keying a build older than the newest few must not delete it.** Pruning
-    /// protected the profiles' pins and not the build just keyed, so a build
-    /// that sorted below `KEEP` newer ones -- Sober's copy after Cordial has
-    /// fetched newer builds, say -- was removed the moment it was kept, and the
-    /// next launch extracted it again, every launch. Delete the `protect.push`
-    /// in `key_into_store` and the final assertion fails.
+    /// **The override is never filed.** Extracting through the slot while it is
+    /// a link into a kept build must break the link and leave that build
+    /// alone, and the store must have no new entry afterwards.
     #[test]
-    fn keying_an_older_build_does_not_prune_the_build_just_keyed() {
+    fn the_override_extracts_beside_the_store_and_files_nothing() {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = scratch("keyed-older");
-        let previous = std::env::var_os("XDG_DATA_HOME");
-        // `all_pinned_versions` reads the real profile root otherwise.
-        std::env::set_var("XDG_DATA_HOME", dir.join("data"));
+        std::env::remove_var(APK_OVERRIDE);
+        let dir = scratch("override-unfiled");
+        let (cache, data) = (dir.join("cache"), dir.join("data"));
+        let previous = (std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("XDG_DATA_HOME"));
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        std::env::set_var("XDG_DATA_HOME", &data);
 
-        let store = dir.join("builds");
-        for newer in ["2.760.0.1", "2.750.0.1", "2.740.0.1"] {
-            let entry = store.join(newer);
-            std::fs::create_dir_all(&entry).unwrap();
-            std::fs::write(entry.join(LIBRARY), b"engine").unwrap();
+        let root = store::root();
+        let entry = kept(&root, "2.738.0.1397", true, true);
+        store::point_current_at(&engine_cache(), &entry.dir).unwrap();
+
+        let apk = dir.join("base.apk");
+        std::fs::write(&apk, apk_holding(b"an engine for this run only")).unwrap();
+        let build = locate_with(&apk, |_, _| Ok(None)).unwrap();
+
+        let after = store::list();
+        let kept_bytes = std::fs::read(entry.dir.join(LIBRARY)).unwrap();
+        let slot_is_link = std::fs::symlink_metadata(engine_cache()).unwrap().file_type().is_symlink();
+        for (k, v) in [("XDG_CACHE_HOME", previous.0), ("XDG_DATA_HOME", previous.1)] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
         }
-        let live = dir.join("lib/x86_64");
-        std::fs::create_dir_all(&live).unwrap();
-        std::fs::write(live.join(LIBRARY), b"engine").unwrap();
-        cordial_update::cache::record_version(&live, "2.700.0.1").unwrap();
-
-        key_into_store(&store, &live, &[]);
-
-        match previous {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
-        assert!(
-            store.join("2.700.0.1").join(LIBRARY).is_file(),
-            "the build about to run must survive the prune that follows keying it"
-        );
+        assert_eq!(std::fs::read(build.lib_dir.join(LIBRARY)).unwrap(), b"an engine for this run only");
+        assert_eq!(after.len(), 1, "nothing was filed");
+        assert_eq!(kept_bytes, b"2.738.0.1397", "the kept build was not written through the slot");
+        assert!(!slot_is_link, "the link was broken, not followed");
     }
 
     #[test]
@@ -931,40 +680,31 @@ mod tests {
 
     /// **The regression guard for issue #51**, reported by @kanqz: a build the
     /// launcher was merely pointed at used to reach the loader without anything
-    /// asking whose signature was on it.
+    /// asking whose signature was on it. On the override path that is still a
+    /// file somebody named, so the real entry point must refuse an unsigned one.
     ///
-    /// This drives the real entry point rather than the seam, so deleting the
-    /// check in `locate` fails here. It asserts a *refusal*, which is what
-    /// makes it writable at all -- `apk_holding` produces a plain zip with no
-    /// signing block, exactly the shape of a substituted APK, and no genuine
-    /// signed archive is needed to prove that one is turned away.
+    /// It drives the real entry point rather than the seam, so deleting the
+    /// check fails here. `apk_holding` produces a plain zip with no signing
+    /// block, exactly the shape of a substituted APK.
     #[test]
-    fn an_unsigned_archive_is_refused_by_the_real_entry_point() {
+    fn an_unsigned_override_is_refused_by_the_real_entry_point() {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(APK_OVERRIDE);
         let dir = scratch("unsigned");
-        let cache_home = dir.join("cache");
         let previous = std::env::var_os("XDG_CACHE_HOME");
-        std::env::set_var("XDG_CACHE_HOME", &cache_home);
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
 
         let apk = dir.join("base.apk");
         std::fs::write(&apk, apk_holding(b"an engine nobody signed")).unwrap();
-        let install = RobloxInstall { apk: Some(apk.clone()) };
-        let refused = locate(&install);
+        let refused = locate_override(&apk);
 
         match previous {
             Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
             None => std::env::remove_var("XDG_CACHE_HOME"),
         }
         match refused {
-            Err(NotFound::Unusable(msg)) => {
-                assert!(msg.contains("no APK signing block"), "{msg}")
-            }
+            Err(NotFound::Unusable(msg)) => assert!(msg.contains("no APK signing block"), "{msg}"),
             other => panic!("an unsigned archive must not reach the loader, got {other:?}"),
         }
     }
-
-
-
-
 }

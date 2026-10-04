@@ -687,6 +687,31 @@ fn install_verified(
     store: Option<&crate::install::Store>,
     cancel: &Cancel,
 ) -> Result<crate::install::Installed, Unreachable> {
+    install_verified_in(
+        archives,
+        certificate,
+        source,
+        version_code,
+        store,
+        &crate::install::build_dir(),
+        &crate::install::engine_dir(),
+        cancel,
+    )
+}
+
+/// [`install_verified`] with both directories named, so it can be tested
+/// without the cache somebody is launching from.
+#[allow(clippy::too_many_arguments)]
+fn install_verified_in(
+    archives: &Archives,
+    certificate: &str,
+    source: crate::store::Source,
+    version_code: Option<u64>,
+    store: Option<&crate::install::Store>,
+    build: &Path,
+    engine_into: &Path,
+    cancel: &Cancel,
+) -> Result<crate::install::Installed, Unreachable> {
     let named = archive_names(archives);
     let recorded = store.map(|s| {
         let mut s = s.clone();
@@ -695,20 +720,23 @@ fn install_verified(
     });
     let installed = crate::install::adopt(
         &named,
-        &crate::install::build_dir(),
-        &crate::install::engine_dir(),
-        &crate::install::build_dir().join(crate::install::INCOMING_ENGINE),
+        build,
+        engine_into,
+        &build.join(crate::install::INCOMING_ENGINE),
         recorded.as_ref().or(store),
         cancel,
         &mut |_, _, _| {},
     )
     .map_err(from_install)?;
-    // The archives were verified a moment ago, so the launch that follows need
-    // not digest them again. Keyed to the installed base by `record_signer`
-    // itself, so it vouches for nothing else. Best effort: a record that
-    // cannot be written costs one verification, not a build.
-    if let Some(base) = crate::install::managed_base() {
-        let _ = crate::cache::record_signer(&crate::install::engine_dir(), certificate, &base);
+    // The slot's own signer record only when there is no store to hold the
+    // answer. With one, the entry carries it (`Store::record`), and writing the
+    // slot's three-field format through the link would replace the entry's
+    // record with one that vouches for nothing -- measured: an imported build
+    // came out unchecked until the next launch re-verified it.
+    if store.is_none() {
+        if let Some(base) = crate::install::managed_base_in(build) {
+            let _ = crate::cache::record_signer(engine_into, certificate, &base);
+        }
     }
     Ok(installed)
 }
@@ -721,6 +749,45 @@ fn check_import(
     progress: &mut dyn FnMut(Progress),
 ) -> Result<String, Unreachable> {
     verify_archives(&found.archives, cancel, trusted, progress)
+}
+
+/// File a build that is already on this machine in the store, after the same
+/// signature check a download gets, and leave everything else alone.
+///
+/// The migration's route and the Settings imports': it touches nothing outside
+/// `root`, makes no build current and takes the store's `.downloading` lock, so
+/// it cannot interleave with a download. The archives are copied (they lie
+/// outside Cordial's directories), the entry says where it came from, and the
+/// original is never written. Returns the version the engine reads as.
+pub fn import_into_store(
+    found: &import::Found,
+    source: crate::store::Source,
+    root: &Path,
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String, Unreachable> {
+    import_into_store_trusting(found, source, root, &crate::apk_signature::pinned(), cancel, progress)
+}
+
+pub fn import_into_store_trusting(
+    found: &import::Found,
+    source: crate::store::Source,
+    root: &Path,
+    trusted: &[String],
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String, Unreachable> {
+    cancel.check()?;
+    std::fs::create_dir_all(root)
+        .map_err(|e| Unreachable::NoSource { why: format!("{}: {e}", root.display()) })?;
+    ensure_room(root)?;
+    let _lock = exclusive(
+        &root.join(".downloading"),
+        "another Cordial window is already filing a Roblox build. Wait for it to finish.",
+    )?;
+    let certificate = check_import(found, trusted, cancel, progress)?;
+    let filing = crate::store::Filing { source, signer: certificate, version_code: None };
+    crate::install::file_into_store(&archive_names(&found.archives), root, &filing, cancel).map_err(from_install)
 }
 
 /// Copy a build that is already on this machine into Cordial's own, after the
@@ -784,6 +851,77 @@ mod tests {
             vec!["44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477".to_string()];
         let refused = check_import(&found, &trusted, &Cancel::new(), &mut |_| {}).unwrap_err();
         assert!(matches!(refused, Unreachable::Refused { .. }), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Found by running it.** Installing through the store used to write the
+    /// slot's own signer record through the slot's link, replacing the entry's
+    /// record with a three-field one that `signer_of` rejects, so a build that
+    /// had just been verified came out unchecked. The entry must come out
+    /// launchable, and it must name where it came from.
+    #[test]
+    fn an_install_through_the_store_leaves_a_launchable_entry() {
+        let dir = std::env::temp_dir().join(format!("cordial-install-verified-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let apk = dir.join("src.apk");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&apk).unwrap());
+        {
+            use std::io::Write;
+            w.start_file("lib/x86_64/libroblox.so", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(b"\0not an engine\02.737.0.1584\0").unwrap();
+        }
+        w.finish().unwrap();
+        let root = dir.join("builds");
+        let store = crate::install::Store { root: root.clone(), keep: 3, protect: vec![], record: None };
+        install_verified_in(
+            &Archives { base: apk.clone(), split: apk },
+            &"ab".repeat(32),
+            crate::store::Source::Sober,
+            None,
+            Some(&store),
+            &dir.join("build"),
+            &dir.join("lib"),
+            &Cancel::new(),
+        )
+        .unwrap();
+        let entry = &crate::store::list_in(&root)[0];
+        assert!(entry.launchable(), "{entry:?}");
+        assert_eq!(entry.signer.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(entry.provenance.map(|p| p.source), Some(crate::store::Source::Sober));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An import files an unsigned archive nowhere: refused over its signature,
+    /// and the store holds nothing afterwards, not even a staging directory.
+    #[test]
+    fn an_unsigned_import_leaves_the_store_empty() {
+        let dir = std::env::temp_dir().join(format!("cordial-import-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let apk = dir.join("base.apk");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&apk).unwrap());
+        {
+            use std::io::Write;
+            w.start_file("lib/x86_64/libroblox.so", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(b"\x7fELF unsigned").unwrap();
+        }
+        w.finish().unwrap();
+        let found = import::Found {
+            dir: dir.clone(),
+            archives: Archives { base: apk.clone(), split: apk },
+            version: "2.738.0.1397".into(),
+            bytes: 1,
+        };
+        let root = dir.join("builds");
+        let trusted =
+            vec!["44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477".to_string()];
+        let refused = import_into_store_trusting(
+            &found, crate::store::Source::Sober, &root, &trusted, &Cancel::new(), &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(refused, Unreachable::Refused { .. }), "{refused}");
+        assert!(crate::store::list_in(&root).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

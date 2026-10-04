@@ -20,28 +20,40 @@ problems reported with the other formats come from those libraries differing.
 
 ### Getting Roblox's build
 
-On first run, press **Download Roblox**. Cordial fetches a build and verifies it
-before using it
-([ADR-015](adr/ADR-015-fetching-the-roblox-build.md),
-[ADR-025](adr/ADR-025-fetching-from-a-third-party-mirror.md)).
+On first run, press **Download Roblox**. Cordial fetches the newest build from a
+mirror, checks that Roblox's own signing certificate signed it, and keeps its own
+copy in `~/.local/share/cordial/builds/` (in the Flatpak,
+`~/.var/app/io.github.luohoa97.Cordial/data/cordial/builds/`). Why:
+[ADR-015](adr/ADR-015-fetching-the-roblox-build.md),
+[ADR-025](adr/ADR-025-fetching-from-a-third-party-mirror.md),
+[ADR-054](adr/ADR-054-cordial-owns-its-roblox-builds.md).
 
-- **Sober is installed:** until Cordial has a copy of its own, it runs the APK
-  where Sober keeps it,
-  `~/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/`, and never
-  writes to it. **Settings → Roblox** says so on the APK row and offers
-  **Download Roblox** there. Press it and Cordial verifies and installs its own
-  copy, then uses that, whether or not Sober stays installed. It takes the newest
-  build on offer, so if Sober's file is the newest, Cordial copies it and
-  downloads nothing.
-- **You have your own APK:** **Settings → Roblox → Choose…** takes a path to it,
-  or pass `--apk` on the command line. A chosen APK is used in preference to
-  Cordial's own download, so clear it (the button beside the path) before you
-  expect a download to take over. On a split build the engine is in
-  `split_config.x86_64.apk` rather than `base.apk`; keep the two in one folder
-  and Cordial checks the sibling files, saying which it tried if it finds none.
+- **Sober is installed:** the first-run screen also offers **Copy Sober's
+  build**, and **Settings → Roblox** has **Import from Sober…** while Sober
+  holds a build Cordial does not. Either copies the files into Cordial's own
+  store after the same signature check. Cordial does not change Sober's files
+  and does not follow its updates: from then on the build changes when you
+  update it in Cordial (**Settings → Updates**), not when Sober updates.
+- **You have your own APK:** **Settings → Roblox → Import from a file…** copies
+  it into the store the same way. Keep `base.apk` and `split_config.x86_64.apk`
+  in one folder: on a split build the engine is in the split, and Cordial says
+  which file it looked for if it finds none. In the Flatpak the file chooser may
+  hand Cordial only the file you picked, so a split build's other half would not
+  be seen (INFERRED, not tried): import a single combined APK there, or copy
+  Sober's build. To run one APK for a single launch
+  without filing it, start Cordial with `CORDIAL_APK=/path/to/base.apk`.
+- **Upgrading from an older Cordial:** the first launch files whatever the old
+  layout ran (Cordial's own download, Sober's copy, or an APK chosen in Settings)
+  into the store, once. An APK chosen in Settings is imported, every profile with
+  no pinned version is pinned to it so it keeps running that file, and the saved
+  path is cleared.
 
-The engine itself is unpacked from the APK into Cordial's own cache, and there
-is nothing to configure for it.
+Each profile runs the newest build in the store (**Latest**) or one version you
+pinned on **Settings → Version**. The store keeps the newest build, the one
+before it, and any build a profile is pinned to.
+
+The engine and the game's assets are unpacked next to the build they came from,
+and there is nothing to configure for either.
 
 Nothing else is needed to run a package. The Flatpak carries its own toolchain
 and libraries.
@@ -70,7 +82,7 @@ Launch it from your application list, or with
 |---|---|
 | Update | `flatpak update` |
 | Uninstall | `flatpak uninstall io.github.luohoa97.Cordial` |
-| Uninstall and delete profiles, sign-in and the extracted Roblox build | `flatpak uninstall --delete-data io.github.luohoa97.Cordial` |
+| Uninstall and delete profiles, sign-in and the Roblox builds | `flatpak uninstall --delete-data io.github.luohoa97.Cordial` |
 
 **Branches.** The install above is `stable`, which moves only on a tagged
 release. `master` moves on every commit to `main`. The remote once published

@@ -637,6 +637,9 @@ mod tests {
             bytes: 0,
             complete: true,
             content_hash: None,
+            signer: None,
+            provenance: None,
+            version_code: None,
         };
         let stopped = Readiness::gather_in(Some(WIVRN_FLATPAK), &p, Some(entry.clone()), || false);
         assert_eq!(stopped.wivrn_server, Some(false));
@@ -679,6 +682,9 @@ mod tests {
             bytes: 0,
             complete: true,
             content_hash: None,
+            signer: None,
+            provenance: None,
+            version_code: None,
         };
         let r = Readiness::gather_in(None, &p, Some(entry), || true);
         assert!(matches!(r.runtime, Chosen::System(_)), "{:?}", r.runtime);

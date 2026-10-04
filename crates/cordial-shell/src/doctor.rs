@@ -1547,6 +1547,9 @@ mod tests {
             bytes: 0,
             complete: true,
             content_hash: None,
+            signer: None,
+            provenance: None,
+            version_code: None,
         };
         let set_up = Readiness { quest_build: Some(entry), runtime: Chosen::Manifest(wivrn), wivrn_server: Some(false), sandboxed: false };
         let lines = vr(&set_up, true);

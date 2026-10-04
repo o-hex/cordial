@@ -62,6 +62,33 @@ pub const LOADED_BY: &str = ".loaded-by";
 /// records why the directory itself stays named by version rather than by this.
 pub const CONTENT_SHA256: &str = ".content-sha256";
 
+/// Who signed the entry's `base.apk`, and which bytes that was checked against.
+///
+/// Same file name as [`crate::cache::SIGNER`], which records the same fact for
+/// the old single slot, but a different second line: the slot's stamp names an
+/// archive by size, mtime *and path*, and an entry has to survive being moved
+/// (the store itself moves from the cache to the data directory) without
+/// every build in it becoming unverified. So an entry's record is the
+/// fingerprint and the archive's size and mtime, nothing about where it sits.
+/// A record in the slot's format fails to parse as this one and reads as "not
+/// checked", which costs one verification and is the safe direction.
+/// [ADR-054](../../../docs/adr/ADR-054-cordial-owns-its-roblox-builds.md).
+pub const SIGNER: &str = crate::cache::SIGNER;
+
+/// Where the entry came from: `mirror`, `sober`, `file` or `legacy`, then the
+/// time it was filed in seconds since the epoch. Provenance for the interface
+/// to quote, so that "imported from Sober" is a fact on disk and not a guess.
+pub const SOURCE: &str = ".source";
+
+/// The mirror's `versionCode`, when the source supplied one. Display only: a
+/// source that cannot always supply a key is not a key.
+pub const VERSION_CODE: &str = ".version-code";
+
+/// Held shared, for as long as it runs, by every client running this entry.
+/// Garbage collection takes it exclusively and non-blocking, so a build in use
+/// is told apart from one that merely is not pinned.
+pub const IN_USE: &str = ".in-use";
+
 /// How many entries to keep, counting the current one.
 ///
 /// By count rather than by age, because age says nothing about how much disk
@@ -116,6 +143,61 @@ pub fn compare(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// Where a build in the store came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Downloaded by Cordial from the mirror.
+    Mirror,
+    /// Copied out of Sober's package directory by an import.
+    Sober,
+    /// A file the user chose.
+    File,
+    /// Found on disk by the migration from before the store was the only
+    /// source of a launch, with nothing recording where it came from.
+    Legacy,
+}
+
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Mirror => "mirror",
+            Source::Sober => "sober",
+            Source::File => "file",
+            Source::Legacy => "legacy",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Source> {
+        match text {
+            "mirror" => Some(Source::Mirror),
+            "sober" => Some(Source::Sober),
+            "file" => Some(Source::File),
+            "legacy" => Some(Source::Legacy),
+            _ => None,
+        }
+    }
+
+    /// What an archive at `path` is, judged by where it sits: Sober's package
+    /// directory is Sober's, anything else is a file somebody chose.
+    pub fn for_path(path: &Path) -> Source {
+        let sober = path.components().any(|c| c.as_os_str() == "org.vinegarhq.Sober")
+            || path.to_string_lossy().contains("sober/packages/");
+        if sober {
+            Source::Sober
+        } else {
+            Source::File
+        }
+    }
+}
+
+/// [`Source`] and when it was filed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Provenance {
+    pub source: Source,
+    /// Seconds since the epoch, if it was recorded.
+    pub at: Option<u64>,
+}
+
 /// One build in the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -152,9 +234,24 @@ pub struct Entry {
     ///
     /// [ADR-037]: ../../../docs/adr/ADR-037-one-lock-and-a-content-hash-for-the-build-store.md
     pub content_hash: Option<Sha256Hash>,
+    /// The certificate this entry's `base.apk` was verified against, if it was
+    /// and the file is still the one that was checked. `None` is "nobody has
+    /// checked", which is not "refused": a build that fails verification is
+    /// never filed. See [`SIGNER`].
+    pub signer: Option<String>,
+    /// Where it came from, if that was recorded. See [`SOURCE`].
+    pub provenance: Option<Provenance>,
+    /// The mirror's `versionCode`, when there was one. See [`VERSION_CODE`].
+    pub version_code: Option<u64>,
 }
 
 impl Entry {
+    /// Whether a launch may run this entry: it holds its own archives, and
+    /// somebody has established who signed them.
+    pub fn launchable(&self) -> bool {
+        self.complete && self.signer.is_some()
+    }
+
     /// The `base.apk` in this entry, if it has one.
     pub fn base_apk(&self) -> Option<PathBuf> {
         let base = self.dir.join(crate::install::BASE_APK);
@@ -207,6 +304,9 @@ pub fn list_in(root: &Path) -> Vec<Entry> {
             bytes: bytes_in(&dir),
             complete: dir.join(crate::install::BASE_APK).is_file(),
             content_hash: content_hash(&dir),
+            signer: signer_of(&dir),
+            provenance: provenance_of(&dir),
+            version_code: version_code_of(&dir),
             dir,
         });
     }
@@ -239,6 +339,63 @@ pub fn loaded_by(dir: &Path) -> Option<String> {
 pub fn content_hash(dir: &Path) -> Option<Sha256Hash> {
     let text = std::fs::read_to_string(dir.join(CONTENT_SHA256)).ok()?;
     Sha256Hash::parse(text.trim()).ok()
+}
+
+/// "size mtime", the identity of an archive that survives being moved.
+fn archive_identity(path: &Path) -> Option<String> {
+    use std::time::UNIX_EPOCH;
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(format!("{} {}", meta.len(), mtime))
+}
+
+/// The certificate fingerprint recorded for the entry in `dir`, if the record
+/// still describes the `base.apk` that is there now.
+pub fn signer_of(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(SIGNER)).ok()?;
+    let mut lines = text.lines();
+    let fingerprint = lines.next()?.trim();
+    let vouched_for = lines.next()?.trim();
+    let now = archive_identity(&dir.join(crate::install::BASE_APK))?;
+    (now == vouched_for && !fingerprint.is_empty()).then(|| fingerprint.to_ascii_lowercase())
+}
+
+/// Record that the `base.apk` in `dir` verified against `fingerprint`, as it is
+/// right now. Call it on the archive that is kept, after the check, never on
+/// the one that was checked: a copy does not keep its mtime.
+pub fn record_signer(dir: &Path, fingerprint: &str) -> io::Result<()> {
+    let identity = archive_identity(&dir.join(crate::install::BASE_APK)).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("{} has no base.apk to record a signer for", dir.display()))
+    })?;
+    std::fs::write(dir.join(SIGNER), format!("{}\n{identity}\n", fingerprint.trim().to_ascii_lowercase()))
+}
+
+pub fn provenance_of(dir: &Path) -> Option<Provenance> {
+    let text = std::fs::read_to_string(dir.join(SOURCE)).ok()?;
+    let mut words = text.split_whitespace();
+    let source = Source::parse(words.next()?)?;
+    Some(Provenance { source, at: words.next().and_then(|w| w.parse().ok()) })
+}
+
+/// Record where the entry in `dir` came from, and now. An existing record is
+/// kept: the first filing is the one that says how it arrived.
+pub fn record_source(dir: &Path, source: Source) -> io::Result<()> {
+    if provenance_of(dir).is_some() {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    std::fs::write(dir.join(SOURCE), format!("{} {now}\n", source.as_str()))
+}
+
+pub fn version_code_of(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join(VERSION_CODE)).ok()?.trim().parse().ok()
+}
+
+pub fn record_version_code(dir: &Path, code: u64) -> io::Result<()> {
+    std::fs::write(dir.join(VERSION_CODE), code.to_string())
 }
 
 /// Record `hash` as `dir`'s content hash.
@@ -628,6 +785,219 @@ pub fn remove_in(root: &Path, live: &Path, version: &str, protect: &[String]) ->
     std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
+// ---- planning ----------------------------------------------------------
+//
+// Everything below is a pure function of what is on disk, handed in. A launch,
+// a garbage collection and the first-run migration each decide something
+// destructive or something that refuses to start a client, and a decision that
+// can only be exercised by building a store is a decision nobody tests twice.
+// ADR-054.
+
+/// What a profile asks of the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice<'a> {
+    /// The newest build in the store, whatever it is when the client starts.
+    Latest,
+    /// One build, by the engine's version.
+    Pinned(&'a str),
+}
+
+/// Why a launch cannot take a build from the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// Nothing in the store. The first-run screen is the answer, not an error.
+    Empty,
+    /// Something is there and none of it can be run: kept without its
+    /// archives, or never checked for a signature.
+    NothingUsable { incomplete: Vec<String>, unsigned: Vec<String> },
+    Missing(String),
+    Incomplete(String),
+    Unsigned(String),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Empty => write!(f, "Cordial has no Roblox build yet."),
+            Refusal::NothingUsable { incomplete, unsigned } => {
+                write!(f, "Cordial's store holds Roblox builds it cannot run.")?;
+                if !unsigned.is_empty() {
+                    write!(
+                        f,
+                        " Cordial could not establish who signed {}, so it will not run {}.",
+                        unsigned.join(", "),
+                        if unsigned.len() == 1 { "it" } else { "them" }
+                    )?;
+                }
+                if !incomplete.is_empty() {
+                    write!(
+                        f,
+                        " {} kept without the APK it came from, so its assets are gone.",
+                        incomplete.join(", ")
+                    )?;
+                }
+                write!(f, " Download Roblox again from Settings.")
+            }
+            Refusal::Missing(v) => write!(
+                f,
+                "This profile is pinned to Roblox {v}, and that build is not in Cordial's store. \
+                 Open Settings and choose another version, or choose Latest."
+            ),
+            Refusal::Incomplete(v) => write!(
+                f,
+                "This profile is pinned to Roblox {v}, and Cordial kept that build's engine \
+                 without the APK it came from, so its assets are gone and it cannot be run on its \
+                 own. Choose Latest, or pin a build Cordial has downloaded since."
+            ),
+            Refusal::Unsigned(v) => write!(
+                f,
+                "This profile is pinned to Roblox {v}, and Cordial has not established who signed \
+                 that build, so it will not run it. Choose Latest, or download the build again."
+            ),
+        }
+    }
+}
+
+/// The outcome of [`resolve`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    Entry(String),
+    Refused(Refusal),
+}
+
+/// The newest entry a launch may run: complete, and with a recorded signer.
+///
+/// Ordered by [`compare`] rather than trusting the caller's order, so a list
+/// built by hand in a test and one from [`list_in`] answer the same.
+pub fn latest(entries: &[Entry]) -> Option<&Entry> {
+    entries.iter().filter(|e| e.launchable()).max_by(|a, b| compare(&a.version, &b.version))
+}
+
+/// What a profile's choice comes to, given the store.
+///
+/// **A pin refuses and never falls back.** Falling back to Latest would run the
+/// very build the user pinned away from and say nothing, which is the one
+/// outcome that makes a pin worse than not having one (ADR-033).
+pub fn resolve(choice: Choice<'_>, entries: &[Entry]) -> Resolved {
+    match choice {
+        Choice::Latest => match latest(entries) {
+            Some(entry) => Resolved::Entry(entry.version.clone()),
+            None if entries.is_empty() => Resolved::Refused(Refusal::Empty),
+            None => Resolved::Refused(Refusal::NothingUsable {
+                incomplete: entries.iter().filter(|e| !e.complete).map(|e| e.version.clone()).collect(),
+                unsigned: entries
+                    .iter()
+                    .filter(|e| e.complete && e.signer.is_none())
+                    .map(|e| e.version.clone())
+                    .collect(),
+            }),
+        },
+        Choice::Pinned(version) => match entries.iter().find(|e| e.version == version) {
+            None => Resolved::Refused(Refusal::Missing(version.to_string())),
+            Some(e) if !e.complete => Resolved::Refused(Refusal::Incomplete(version.to_string())),
+            Some(e) if e.signer.is_none() => Resolved::Refused(Refusal::Unsigned(version.to_string())),
+            Some(e) => Resolved::Entry(e.version.clone()),
+        },
+    }
+}
+
+/// Which builds a garbage collection removes.
+///
+/// Kept: the newest entry, every pinned one, every one in use, and the `spare`
+/// newest of whatever is left. **A pinned build does not count against
+/// `spare`**: the bound it replaces ([`KEEP`]) counted pins towards the limit,
+/// so two pins evicted the build before the newest, which is the one the
+/// store exists to keep.
+///
+/// Returns only names that are versions and are in `entries`, so nothing it
+/// returns can be a path outside the store, and applying the answer and asking
+/// again returns nothing.
+pub fn gc_plan(entries: &[Entry], pins: &[String], in_use: &[String], spare: usize) -> Vec<String> {
+    let mut by_age: Vec<&Entry> = entries.iter().filter(|e| is_valid_version(&e.version)).collect();
+    by_age.sort_by(|a, b| compare(&b.version, &a.version));
+    let newest = by_age.first().map(|e| e.version.clone());
+    let mut spared = 0usize;
+    let mut doomed = Vec::new();
+    for entry in by_age {
+        let v = &entry.version;
+        if Some(v) == newest.as_ref() || pins.contains(v) || in_use.contains(v) {
+            continue;
+        }
+        if spared < spare {
+            spared += 1;
+            continue;
+        }
+        doomed.push(v.clone());
+    }
+    doomed
+}
+
+/// What the slot at `lib/<abi>` was before this release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slot {
+    Absent,
+    /// A link into the store: the build it names is an entry already.
+    LinkIntoStore,
+    /// A real directory holding an engine, which no entry corresponds to.
+    Directory,
+}
+
+/// What the first launch after the upgrade finds on disk.
+#[derive(Debug, Clone)]
+pub struct Legacy {
+    pub store_has_complete_entry: bool,
+    pub slot: Slot,
+    /// The archive the slot's `.from` stamp names, if it is still there.
+    pub slot_archive: Option<PathBuf>,
+    /// `build/<abi>/base.apk`, which only a build Cordial installed has.
+    pub managed_apk: Option<PathBuf>,
+    pub sober_apk: Option<PathBuf>,
+    /// The APK chosen in Settings, which was a launch source before.
+    pub settings_apk: Option<PathBuf>,
+}
+
+/// One thing the migration does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// Verify these archives, copy them into the store and file them.
+    File { apk: PathBuf, source: Source },
+    /// The same for a file the user chose, and every profile with no pin is
+    /// pinned to the result: somebody who chose a file meant that file, and
+    /// Latest would otherwise move them off it.
+    ImportChosen { apk: PathBuf },
+}
+
+/// What the migration does, in order. `CORDIAL_APK` is not an input: it is a
+/// per-run override and nothing here may read it as a build.
+///
+/// A slot already linked into the store, or a store that already holds a
+/// complete build, has nothing to copy. A Settings APK is imported whether or
+/// not the store is empty, because it is the one legacy launch source that
+/// outranked everything else and the user chose it.
+pub fn migration_plan(legacy: &Legacy) -> Vec<Step> {
+    if let Some(apk) = &legacy.settings_apk {
+        return vec![Step::ImportChosen { apk: apk.clone() }];
+    }
+    if legacy.store_has_complete_entry {
+        return Vec::new();
+    }
+    let candidate = match legacy.slot {
+        Slot::Directory => legacy.slot_archive.as_ref().or(legacy.managed_apk.as_ref()),
+        _ => legacy.managed_apk.as_ref(),
+    }
+    .or(legacy.sober_apk.as_ref());
+    match candidate {
+        Some(apk) => {
+            let source = match Source::for_path(apk) {
+                Source::Sober => Source::Sober,
+                _ => Source::Legacy,
+            };
+            vec![Step::File { apk: apk.clone(), source }]
+        }
+        None => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,5 +1341,234 @@ mod tests {
         drop(held);
         let elapsed = handle.join().unwrap();
         assert!(elapsed >= std::time::Duration::from_millis(180), "prune_in ran concurrently: {elapsed:?}");
+    }
+
+    // ---- planning ----
+
+    fn fake(version: &str, complete: bool, signed: bool) -> Entry {
+        Entry {
+            version: version.into(),
+            dir: PathBuf::from("/nonexistent").join(version),
+            loaded_by: None,
+            bytes: 0,
+            complete,
+            content_hash: None,
+            signer: signed.then(|| "ab".repeat(32)),
+            provenance: None,
+            version_code: None,
+        }
+    }
+
+    fn names(v: &[Entry]) -> Vec<&str> {
+        v.iter().map(|e| e.version.as_str()).collect()
+    }
+
+    /// Sorted as text `2.99` beats `2.738`, and Latest would pick the wrong
+    /// build in whatever order the directory listing happened to come back.
+    #[test]
+    fn latest_is_the_numerically_newest_whatever_order_it_is_given() {
+        let all = [fake("2.99.0.1", true, true), fake("2.738.0.1397", true, true), fake("2.734.0.917", true, true)];
+        assert_eq!(latest(&all).unwrap().version, "2.738.0.1397");
+        let reversed: Vec<Entry> = all.iter().rev().cloned().collect();
+        assert_eq!(latest(&reversed).unwrap().version, "2.738.0.1397");
+        assert_eq!(names(&all), ["2.99.0.1", "2.738.0.1397", "2.734.0.917"]);
+    }
+
+    #[test]
+    fn latest_ignores_what_cannot_be_launched() {
+        let all = [
+            fake("2.740.0.5", true, false),
+            fake("2.739.0.1", false, true),
+            fake("2.738.0.1397", true, true),
+        ];
+        assert_eq!(resolve(Choice::Latest, &all), Resolved::Entry("2.738.0.1397".into()));
+    }
+
+    #[test]
+    fn latest_of_an_empty_store_is_the_first_run_state_and_of_an_unusable_one_a_refusal() {
+        assert_eq!(resolve(Choice::Latest, &[]), Resolved::Refused(Refusal::Empty));
+        let unusable = [fake("2.740.0.5", true, false), fake("2.739.0.1", false, true)];
+        let Resolved::Refused(Refusal::NothingUsable { incomplete, unsigned }) = resolve(Choice::Latest, &unusable)
+        else {
+            panic!("expected a refusal naming what is unusable");
+        };
+        assert_eq!(incomplete, ["2.739.0.1"]);
+        assert_eq!(unsigned, ["2.740.0.5"]);
+        // The sentence names both builds, because a user has to be able to
+        // tell which one is the problem.
+        let said = Refusal::NothingUsable { incomplete, unsigned }.to_string();
+        assert!(said.contains("2.740.0.5") && said.contains("2.739.0.1"), "{said}");
+    }
+
+    /// A pin is never turned into Latest: that would run the build the user
+    /// pinned away from, silently.
+    #[test]
+    fn a_pin_refuses_when_its_entry_is_missing_incomplete_or_unsigned() {
+        let all = [
+            fake("2.738.0.1397", true, true),
+            fake("2.734.0.917", false, true),
+            fake("2.730.0.1", true, false),
+        ];
+        assert_eq!(resolve(Choice::Pinned("2.738.0.1397"), &all), Resolved::Entry("2.738.0.1397".into()));
+        assert_eq!(
+            resolve(Choice::Pinned("2.700.0.1"), &all),
+            Resolved::Refused(Refusal::Missing("2.700.0.1".into()))
+        );
+        assert_eq!(
+            resolve(Choice::Pinned("2.734.0.917"), &all),
+            Resolved::Refused(Refusal::Incomplete("2.734.0.917".into()))
+        );
+        assert_eq!(
+            resolve(Choice::Pinned("2.730.0.1"), &all),
+            Resolved::Refused(Refusal::Unsigned("2.730.0.1".into()))
+        );
+        for refusal in [
+            Refusal::Missing("2.700.0.1".into()),
+            Refusal::Incomplete("2.734.0.917".into()),
+            Refusal::Unsigned("2.730.0.1".into()),
+        ] {
+            assert!(refusal.to_string().contains("pinned to Roblox"), "{refusal}");
+        }
+    }
+
+    fn store_of(versions: &[&str]) -> Vec<Entry> {
+        versions.iter().map(|v| fake(v, true, true)).collect()
+    }
+
+    #[test]
+    fn gc_keeps_the_newest_the_pinned_the_in_use_and_the_spare() {
+        let all = store_of(&["2.742.0.9", "2.740.0.5", "2.738.0.1397", "2.734.0.917", "2.730.0.1", "2.700.0.1"]);
+        // Newest, one spare (2.740), a pin (2.700) and one in use (2.734).
+        let doomed = gc_plan(&all, &["2.700.0.1".into()], &["2.734.0.917".into()], 1);
+        assert_eq!(doomed, ["2.738.0.1397", "2.730.0.1"]);
+        // Spare zero is the literal "newest only".
+        assert_eq!(gc_plan(&all, &[], &[], 0), ["2.740.0.5", "2.738.0.1397", "2.734.0.917", "2.730.0.1", "2.700.0.1"]);
+    }
+
+    /// The reason `KEEP = 3` is gone: it counted a pin towards the bound, so
+    /// two pinned old builds pushed the one before the newest out.
+    #[test]
+    fn pinned_builds_do_not_count_against_the_spare() {
+        let all = store_of(&["2.742.0.9", "2.740.0.5", "2.738.0.1397", "2.700.0.1", "2.690.0.1"]);
+        let doomed = gc_plan(&all, &["2.700.0.1".into(), "2.690.0.1".into()], &[], 1);
+        assert_eq!(doomed, ["2.738.0.1397"], "2.740 stays as the spare although two older builds are pinned");
+    }
+
+    #[test]
+    fn gc_never_returns_a_name_that_is_not_a_version_and_is_idempotent() {
+        let mut all = store_of(&["2.742.0.9", "2.740.0.5", "2.738.0.1397"]);
+        all.push(fake("../../etc", true, true));
+        all.push(fake("scratch", true, true));
+        let doomed = gc_plan(&all, &[], &[], 0);
+        assert!(doomed.iter().all(|v| is_valid_version(v)), "{doomed:?}");
+        assert_eq!(doomed, ["2.740.0.5", "2.738.0.1397"]);
+        let remaining: Vec<Entry> = all.into_iter().filter(|e| !doomed.contains(&e.version)).collect();
+        assert!(gc_plan(&remaining, &[], &[], 0).is_empty(), "applying the plan and asking again changes nothing");
+        assert!(gc_plan(&[], &[], &[], 1).is_empty());
+    }
+
+    #[test]
+    fn gc_with_one_build_removes_nothing() {
+        assert!(gc_plan(&store_of(&["2.742.0.9"]), &[], &[], 0).is_empty());
+    }
+
+    fn legacy() -> Legacy {
+        Legacy {
+            store_has_complete_entry: false,
+            slot: Slot::Absent,
+            slot_archive: None,
+            managed_apk: None,
+            sober_apk: None,
+            settings_apk: None,
+        }
+    }
+
+    #[test]
+    fn a_slot_linked_into_the_store_or_a_store_with_a_build_has_nothing_to_migrate() {
+        let sober = PathBuf::from("/home/u/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk");
+        assert!(migration_plan(&Legacy { slot: Slot::LinkIntoStore, ..legacy() }).is_empty());
+        assert!(migration_plan(&Legacy { store_has_complete_entry: true, sober_apk: Some(sober), ..legacy() })
+            .is_empty());
+    }
+
+    #[test]
+    fn an_unkeyed_slot_is_filed_from_the_archive_its_stamp_names() {
+        let sober = PathBuf::from("/home/u/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk");
+        let plan = migration_plan(&Legacy {
+            slot: Slot::Directory,
+            slot_archive: Some(sober.clone()),
+            ..legacy()
+        });
+        assert_eq!(plan, [Step::File { apk: sober, source: Source::Sober }]);
+
+        let managed = PathBuf::from("/home/u/.cache/cordial/build/x86_64/base.apk");
+        let plan = migration_plan(&Legacy {
+            slot: Slot::Directory,
+            slot_archive: None,
+            managed_apk: Some(managed.clone()),
+            ..legacy()
+        });
+        assert_eq!(plan, [Step::File { apk: managed, source: Source::Legacy }]);
+    }
+
+    /// The case that had no slot at all: Sober was what `effective_apk`
+    /// resolved to, and the launch ran it without ever keying anything.
+    #[test]
+    fn sober_alone_is_filed_as_sober_and_nothing_else_is_read() {
+        let sober = PathBuf::from("/home/u/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk");
+        let plan = migration_plan(&Legacy { sober_apk: Some(sober.clone()), ..legacy() });
+        assert_eq!(plan, [Step::File { apk: sober, source: Source::Sober }]);
+        assert!(migration_plan(&legacy()).is_empty(), "no Sober and no slot: the first-run screen");
+    }
+
+    #[test]
+    fn a_settings_apk_is_imported_even_when_the_store_has_builds() {
+        let chosen = PathBuf::from("/home/u/Downloads/roblox.apk");
+        let plan = migration_plan(&Legacy {
+            store_has_complete_entry: true,
+            settings_apk: Some(chosen.clone()),
+            sober_apk: Some(PathBuf::from("/x/sober/packages/x86_64/com.roblox.client/base.apk")),
+            ..legacy()
+        });
+        assert_eq!(plan, [Step::ImportChosen { apk: chosen }]);
+    }
+
+    #[test]
+    fn provenance_and_signer_round_trip_and_a_replaced_archive_unsigns_the_entry() {
+        let scratch = Scratch::new("records");
+        let dir = build(scratch.path(), "2.738.0.1393");
+        std::fs::write(dir.join(crate::install::BASE_APK), b"the archive").unwrap();
+        assert_eq!(signer_of(&dir), None);
+        record_signer(&dir, "ABCD").unwrap();
+        assert_eq!(signer_of(&dir).as_deref(), Some("abcd"));
+        // The record names the bytes, not the place: moving the entry keeps it.
+        let moved = scratch.path().join("moved");
+        std::fs::rename(&dir, &moved).unwrap();
+        assert_eq!(signer_of(&moved).as_deref(), Some("abcd"));
+        // A replaced archive is a different archive.
+        std::fs::write(moved.join(crate::install::BASE_APK), b"a different archive entirely").unwrap();
+        assert_eq!(signer_of(&moved), None);
+        // The slot's record format (three fields on line two) vouches for nothing.
+        std::fs::write(moved.join(SIGNER), "abcd\n27 1700000000 /somewhere/base.apk\n").unwrap();
+        assert_eq!(signer_of(&moved), None);
+
+        assert_eq!(provenance_of(&moved), None);
+        record_source(&moved, Source::Sober).unwrap();
+        let first = provenance_of(&moved).unwrap();
+        assert_eq!(first.source, Source::Sober);
+        assert!(first.at.unwrap() > 1_700_000_000);
+        record_source(&moved, Source::Mirror).unwrap();
+        assert_eq!(provenance_of(&moved).unwrap().source, Source::Sober, "the first filing is the record");
+    }
+
+    #[test]
+    fn a_source_is_told_by_where_the_archive_sits() {
+        let sober = Path::new("/home/u/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/com.roblox.client/base.apk");
+        assert_eq!(Source::for_path(sober), Source::Sober);
+        assert_eq!(Source::for_path(Path::new("/home/u/.local/share/sober/packages/x86_64/c/base.apk")), Source::Sober);
+        assert_eq!(Source::for_path(Path::new("/home/u/Downloads/roblox.apk")), Source::File);
+        for s in [Source::Mirror, Source::Sober, Source::File, Source::Legacy] {
+            assert_eq!(Source::parse(s.as_str()), Some(s));
+        }
     }
 }

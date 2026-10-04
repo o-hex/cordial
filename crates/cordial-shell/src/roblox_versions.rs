@@ -557,6 +557,9 @@ mod tests {
             // No fixture here has a real engine on disk to hash; `None` is
             // exactly what `ensure_content_hash` reports for the same reason.
             content_hash: None,
+            signer: None,
+            provenance: None,
+            version_code: None,
         }
     }
 

@@ -53,7 +53,7 @@ const SERVER_MINIMUM: &str =
 pub fn describe(entry: &Entry, current: Option<&str>, this_cordial: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     if current == Some(entry.version.as_str()) {
-        parts.push("Current build".into());
+        parts.push("Latest".into());
     }
     match entry.loaded_by.as_deref() {
         Some(v) if v == this_cordial => parts.push("Loaded by this Cordial".into()),
@@ -70,7 +70,7 @@ pub fn describe(entry: &Entry, current: Option<&str>, this_cordial: &str) -> Str
 /// Why a remove button is greyed out, or `None` when it is not.
 pub fn removal_blocked(version: &str, current: Option<&str>, pinned_anywhere: &[String]) -> Option<&'static str> {
     if current == Some(version) {
-        Some("The current build cannot be removed")
+        Some("Latest cannot be removed")
     } else if pinned_anywhere.iter().any(|p| p == version) {
         Some("A profile is pinned to this build")
     } else {
@@ -276,19 +276,19 @@ fn populate(view: &Rc<View>) {
     status.set_subtitle_lines(4);
 
     let follow = adw::ActionRow::builder()
-        .title("Follow the current build")
+        .title("Latest")
         .subtitle(subtitle(
             pinned.is_none(),
             &match &current {
-                Some(v) => format!("Roblox {v} now, and newer builds as they are installed"),
-                None => "Whichever build Cordial has, and newer builds as they are installed".into(),
+                Some(v) => format!("Roblox {v} now, and newer builds as they are downloaded"),
+                None => "The newest build Cordial has, and newer builds as they are downloaded".into(),
             },
         ))
         .activatable(true)
         .build();
     follow.set_subtitle_lines(2);
     follow.add_prefix(&tick(pinned.is_none()));
-    let play = icon_button("media-playback-start-symbolic", "Follow the current build and launch");
+    let play = icon_button("media-playback-start-symbolic", "Use Latest and launch");
     follow.add_suffix(&play);
     list.add(&follow);
     connect_use(&follow, &play, &profile_dir, None, &status, &weak);
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn the_current_build_loaded_by_this_cordial_says_both() {
         let line = describe(&entry("2.738.0.1397", Some("0.14.0"), true), Some("2.738.0.1397"), "0.14.0");
-        assert_eq!(line, "Current build · Loaded by this Cordial · 118.7 MB");
+        assert_eq!(line, "Latest · Loaded by this Cordial · 118.7 MB");
     }
 
     #[test]

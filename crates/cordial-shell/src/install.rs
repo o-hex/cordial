@@ -168,12 +168,34 @@ pub fn resolve(profile_dir: &Path) -> Result<Build, NotFound> {
         Some(v) => Choice::Pinned(v),
         None => Choice::Latest,
     };
-    pick(&entries, choice)
+    pick(&entries, choice, &cordial_update::apk_signature::pinned())
 }
 
-/// [`resolve`]'s decision, over a given store listing so it can be tested
-/// without a store.
-fn pick(entries: &[Entry], choice: Choice<'_>) -> Result<Build, NotFound> {
+/// [`resolve`]'s decision, over a given store listing and trusted set so it can
+/// be tested without a store.
+///
+/// **A recorded signer must still be one Cordial trusts.** The record was true
+/// when the entry was filed; the pinned set only ever grows (ADR-033), but a
+/// build of Cordial is free to ship a different one, and an entry signed by a
+/// certificate this build no longer pins is not run on the strength of an old
+/// answer. A pin to such an entry is refused naming the fingerprint, and Latest
+/// passes over it to the newest entry that is trusted.
+fn pick(entries: &[Entry], choice: Choice<'_>, trusted: &[String]) -> Result<Build, NotFound> {
+    let trusts = |fingerprint: &str| trusted.iter().any(|t| t.eq_ignore_ascii_case(fingerprint));
+    if let Choice::Pinned(version) = choice {
+        if let Some(fp) = entries.iter().find(|e| e.version == version).and_then(|e| e.signer.as_deref()) {
+            if !trusts(fp) {
+                return Err(NotFound::Unusable(format!(
+                    "Roblox {version} was signed by the certificate {fp}, which is not one this Cordial \
+                     trusts, so it will not run it. Choose Latest, or download the build again."
+                )));
+            }
+        }
+    }
+    let usable: Vec<Entry> =
+        entries.iter().filter(|e| e.signer.as_deref().map_or(true, |fp| trusts(fp))).cloned().collect();
+    let skipped = entries.len() - usable.len();
+    let entries = &usable[..];
     match store::resolve(choice, entries) {
         Resolved::Entry(version) => {
             let entry = entries.iter().find(|e| e.version == version).expect("resolved from this list");
@@ -182,6 +204,13 @@ fn pick(entries: &[Entry], choice: Choice<'_>) -> Result<Build, NotFound> {
                 .ok_or_else(|| NotFound::Unusable(Refusal::Incomplete(version.clone()).to_string()))?;
             Ok(Build { apk, lib_dir: entry.dir.clone() })
         }
+        // Nothing left only because everything was passed over: say so, rather
+        // than sending the user to a first-run screen that asks them to
+        // download what they already have.
+        Resolved::Refused(Refusal::Empty) if skipped > 0 => Err(NotFound::Unusable(format!(
+            "Cordial's store holds {skipped} build(s) signed by certificates this Cordial does not \
+             trust, so it will not run them. Download Roblox again from Settings."
+        ))),
         Resolved::Refused(Refusal::Empty) => Err(NotFound::NoBuild),
         Resolved::Refused(refusal) => Err(NotFound::Unusable(refusal.to_string())),
     }
@@ -445,6 +474,27 @@ mod tests {
         store::list_in(root).into_iter().find(|e| e.version == version).unwrap()
     }
 
+    /// The certificate `kept` records, which the tests below trust.
+    fn trusted() -> Vec<String> {
+        vec!["ab".repeat(32)]
+    }
+
+    /// A recorded signer is only as good as the set that is trusted now.
+    #[test]
+    fn an_entry_signed_by_a_certificate_no_longer_trusted_is_skipped_by_latest_and_refused_by_a_pin() {
+        let dir = scratch("untrusted");
+        let root = dir.join("builds");
+        let entries = vec![kept(&root, "2.740.0.5", true, true), kept(&root, "2.738.0.1397", true, true)];
+        // Trust nothing: Latest has nothing, and the pin names the fingerprint.
+        assert!(matches!(pick(&entries, Choice::Latest, &[]), Err(NotFound::Unusable(_))));
+        match pick(&entries, Choice::Pinned("2.740.0.5"), &[]) {
+            Err(NotFound::Unusable(msg)) => assert!(msg.contains(&"ab".repeat(32)), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        // Fingerprints compare without regard to case.
+        assert!(pick(&entries, Choice::Latest, &["AB".repeat(32)]).is_ok());
+    }
+
     /// The decision a launch makes, over entries on disk: Latest is the newest
     /// build a launch may run, and a build that is newer but unchecked or
     /// without its archive does not take its place.
@@ -458,15 +508,15 @@ mod tests {
             kept(&root, "2.738.0.1397", true, true),
             kept(&root, "2.736.0.1408", true, true),
         ];
-        let latest = pick(&entries, Choice::Latest).unwrap();
+        let latest = pick(&entries, Choice::Latest, &trusted()).unwrap();
         assert_eq!(latest.lib_dir, root.join("2.738.0.1397"));
         assert_eq!(latest.apk, root.join("2.738.0.1397/base.apk"));
-        let pinned = pick(&entries, Choice::Pinned("2.736.0.1408")).unwrap();
+        let pinned = pick(&entries, Choice::Pinned("2.736.0.1408"), &trusted()).unwrap();
         assert_eq!(pinned.lib_dir, root.join("2.736.0.1408"));
 
         // A pin refuses and names itself; it never becomes Latest.
         for (pin, needle) in [("2.700.0.1", "not in Cordial's store"), ("2.739.0.1", "without the APK"), ("2.740.0.5", "who signed")] {
-            match pick(&entries, Choice::Pinned(pin)) {
+            match pick(&entries, Choice::Pinned(pin), &trusted()) {
                 Err(NotFound::Unusable(msg)) => assert!(msg.contains(needle), "{pin}: {msg}"),
                 other => panic!("{pin}: expected a refusal, got {other:?}"),
             }
@@ -476,11 +526,11 @@ mod tests {
     /// An empty store is the first-run state and not an error.
     #[test]
     fn an_empty_store_is_the_first_run_screen_and_an_unusable_one_is_a_message() {
-        assert!(matches!(pick(&[], Choice::Latest), Err(NotFound::NoBuild)));
+        assert!(matches!(pick(&[], Choice::Latest, &trusted()), Err(NotFound::NoBuild)));
         let dir = scratch("pick-unusable");
         let root = dir.join("builds");
         let entries = vec![kept(&root, "2.740.0.5", false, true)];
-        assert!(matches!(pick(&entries, Choice::Latest), Err(NotFound::Unusable(_))));
+        assert!(matches!(pick(&entries, Choice::Latest, &trusted()), Err(NotFound::Unusable(_))));
     }
 
     /// **The point of ADR-054, as a test.** Nothing but the store and

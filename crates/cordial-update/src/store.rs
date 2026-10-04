@@ -445,6 +445,21 @@ fn bytes_in(dir: &Path) -> u64 {
     entries.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()
 }
 
+/// Everything under `dir`, files only, for a store view that wants to say what
+/// removing an entry frees. A walk, unlike [`list_in`]'s one-level count: an
+/// entry's extracted assets are most of its disk after the first launch, and a
+/// number that left them out would under-report what a Remove gives back.
+pub fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(read) = std::fs::read_dir(dir) else { return 0 };
+    read.flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => tree_bytes(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// The Cordial version that last loaded the build in `dir`.
 pub fn loaded_by(dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(dir.join(LOADED_BY)).ok()?;

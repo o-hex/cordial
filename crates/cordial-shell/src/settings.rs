@@ -381,19 +381,40 @@ fn build_subtitle(latest: Option<&cordial_update::store::Entry>, overridden: boo
 /// and forgotten. **Import from Sober is offered only when Sober's directory
 /// holds a build the store does not**, and nothing on the page says Cordial
 /// depends on Sober.
-fn build_build_row(window: &gtk::Window) -> (adw::ActionRow, Rc<crate::download_progress::Meter>) {
+fn build_build_row(
+    window: &gtk::Window,
+    on_changed: Rc<dyn Fn()>,
+) -> (Vec<adw::ActionRow>, Rc<crate::download_progress::Meter>) {
     let row = adw::ActionRow::builder().title("Roblox build").build();
     row.set_subtitle_lines(4);
 
+    // Three rows, not three buttons on one: a row's suffixes are not given the
+    // width they ask for before its title and subtitle are, and with three
+    // buttons beside them the build's own line wrapped to one word a row.
     let download = gtk::Button::with_label("Download Roblox");
     download.set_valign(gtk::Align::Center);
-    let import_sober = gtk::Button::with_label("Import from Sober…");
-    import_sober.set_valign(gtk::Align::Center);
-    let import_file = gtk::Button::with_label("Import from a file…");
-    import_file.set_valign(gtk::Align::Center);
-    row.add_suffix(&import_sober);
-    row.add_suffix(&import_file);
     row.add_suffix(&download);
+
+    let file_row = adw::ActionRow::builder()
+        .title("Import from a file")
+        .subtitle("Copy an APK you already have into Cordial. It is checked like a download.")
+        .build();
+    file_row.set_subtitle_lines(3);
+    let import_file = gtk::Button::with_label("Import…");
+    import_file.set_valign(gtk::Align::Center);
+    file_row.add_suffix(&import_file);
+
+    let sober_row = adw::ActionRow::builder()
+        .title("Import from Sober")
+        .subtitle(
+            "Sober has a Roblox build Cordial does not. Copying it does not change Sober's files, \
+             and Cordial does not follow Sober's updates.",
+        )
+        .build();
+    sober_row.set_subtitle_lines(3);
+    let import_sober = gtk::Button::with_label("Import…");
+    import_sober.set_valign(gtk::Align::Center);
+    sober_row.add_suffix(&import_sober);
 
     let meter = crate::download_progress::Meter::new();
     meter.widget().set_margin_top(8);
@@ -402,8 +423,8 @@ fn build_build_row(window: &gtk::Window) -> (adw::ActionRow, Rc<crate::download_
     meter.widget().set_margin_end(12);
 
     let refresh: Rc<dyn Fn()> = {
-        let (row, download, import_sober, import_file) =
-            (row.clone(), download.clone(), import_sober.clone(), import_file.clone());
+        let (row, download, import_sober, import_file, sober_row) =
+            (row.clone(), download.clone(), import_sober.clone(), import_file.clone(), sober_row.clone());
         Rc::new(move || {
             let entries = cordial_update::store::list();
             let latest = cordial_update::store::latest(&entries);
@@ -415,8 +436,10 @@ fn build_build_row(window: &gtk::Window) -> (adw::ActionRow, Rc<crate::download_
             let blocked = install::updates_blocked().is_some();
             download.set_sensitive(!blocked);
             import_file.set_sensitive(!blocked);
-            import_sober.set_visible(cordial_update::provider::import::sober_offer(&entries).is_some());
+            sober_row.set_visible(cordial_update::provider::import::sober_offer(&entries).is_some());
             import_sober.set_sensitive(!blocked);
+            // The list of what is kept changes when this row's answer does.
+            on_changed();
         })
     };
     refresh();
@@ -563,7 +586,7 @@ fn build_build_row(window: &gtk::Window) -> (adw::ActionRow, Rc<crate::download_
         });
     }
 
-    (row, meter)
+    (vec![row, file_row, sober_row], meter)
 }
 
 /// "Roblox" — where the build is.
@@ -594,8 +617,11 @@ fn build_roblox_page(
         .description("Cordial downloads Roblox and keeps its own copy.")
         .build();
 
-    let (build_row, meter) = build_build_row(parent.as_ref());
-    group.add(&build_row);
+    let (store_group, redraw_store) = crate::roblox_store::build_group(parent.as_ref());
+    let (build_rows, meter) = build_build_row(parent.as_ref(), redraw_store);
+    for row in &build_rows {
+        group.add(row);
+    }
     group.add(meter.widget());
 
     // **There is no "Engine directory" row, and that is a removal rather than
@@ -604,6 +630,9 @@ fn build_roblox_page(
     // step with it. Nobody needed to choose it, and a chosen one was used
     // as it stood and never compared with the APK.
     page.add(&group);
+    // What is kept, where each came from, who uses it. Redrawn by the row above
+    // whenever a download or an import lands.
+    page.add(&store_group);
 
     // The update settings were a group on this page, on the argument that they
     // govern the build the two rows above point at. They are a page of their own

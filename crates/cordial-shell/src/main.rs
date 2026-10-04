@@ -43,6 +43,7 @@ mod multi_instance_warning;
 mod profile_switcher;
 mod refresh_watch;
 mod report;
+mod roblox_store;
 mod roblox_versions;
 mod root_warning;
 mod settings;

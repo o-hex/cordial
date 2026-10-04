@@ -50,7 +50,10 @@ copy in `~/.local/share/cordial/builds/` (in the Flatpak,
 
 Each profile runs the newest build in the store (**Latest**) or one version you
 pinned on **Settings → Version**. The store keeps the newest build, the one
-before it, and any build a profile is pinned to.
+before it, any build a profile is pinned to and any a client is running; an
+update removes the rest. **Settings → Roblox** lists what is kept, where each
+build came from, how much disk it takes and which profiles use it, and removes a
+build that nothing needs.
 
 The engine and the game's assets are unpacked next to the build they came from,
 and there is nothing to configure for either.

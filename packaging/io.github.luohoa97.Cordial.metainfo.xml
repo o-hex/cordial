@@ -78,6 +78,19 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.24.0" date="2026-10-04">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.24.0</url>
+      <description>
+        <p>
+          Experimental VR: Roblox's Meta Quest build on your PC, in a headset,
+          started from Settings. Chat boxes now clear after Enter.
+        </p>
+        <p>
+          Settings can download Cordial's own copy of Roblox when Sober is
+          installed, and FPS Flex gets a frame rate cap.
+        </p>
+      </description>
+    </release>
     <release version="0.23.2" date="2026-10-01">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.23.2</url>
       <description>

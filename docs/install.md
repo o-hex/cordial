@@ -29,12 +29,12 @@ copy in `~/.local/share/cordial/builds/` (in the Flatpak,
 [ADR-054](adr/ADR-054-cordial-owns-its-roblox-builds.md).
 
 - **Sober is installed:** the first-run screen also offers **Copy Sober's
-  build**, and **Settings → Roblox** has **Import from Sober…** while Sober
+  build**, and **Settings → Roblox** has an **Import from Sober** row while Sober
   holds a build Cordial does not. Either copies the files into Cordial's own
   store after the same signature check. Cordial does not change Sober's files
   and does not follow its updates: from then on the build changes when you
   update it in Cordial (**Settings → Updates**), not when Sober updates.
-- **You have your own APK:** **Settings → Roblox → Import from a file…** copies
+- **You have your own APK:** **Settings → Roblox → Import from a file** copies
   it into the store the same way. Keep `base.apk` and `split_config.x86_64.apk`
   in one folder: on a split build the engine is in the split, and Cordial says
   which file it looked for if it finds none. In the Flatpak the file chooser may

@@ -17,9 +17,12 @@ translation layer, and none is planned
 The architecture is fixed when Cordial is built, so a Cordial built for aarch64
 installs and runs the aarch64 build of Roblox. Settings shows it in a read-only
 **Roblox build** row; there is no dropdown, because choosing the other
-architecture's build would change nothing Cordial can run. The extracted engine
-lives in `~/.cache/cordial/lib/<abi>`, so two architectures sharing one home
-directory do not overwrite each other.
+architecture's build would change nothing Cordial can run. Builds are kept in
+`~/.local/share/cordial/builds/<version>`, which is not keyed by architecture:
+two architectures sharing one home directory and one version number would meet
+in one directory. Cordial refuses a build whose engine differs from the one kept
+under that version, by name, rather than overwriting it (INFERRED for two
+architectures; not tried).
 
 ## aarch64
 

@@ -422,6 +422,35 @@ exactly the way `name`/`parse`/`all` are already held together by a test.
 earned: replacing a mesh is not a cosmetic change, and the user is the one
 deciding.
 
+### Built-in plugins: one question, when it is due (2026-10-05)
+
+The three rules above are about an install. A built-in has no install click, so
+its first-appearance question was asked by each plugin's row as the Settings
+window was built. A fresh profile opening Settings on *any* tab met one dialog
+per built-in stacked over it, four of them, including `fps-flex`, which ships
+off. That is the third-prompt failure rule 1 exists to prevent, with a fourth
+prompt.
+
+The rule now: the question is put only (a) while the Plugins page is the one on
+screen and Use Plugins is on, (b) about built-ins that are switched on and
+have something requested but not yet granted (`consent::builtin_due`), and
+(c) as a **single dialog** for however many are due. A built-in that ships off
+is asked when it is switched on, because that is when the answer starts to
+matter. Declining or dismissing grants nothing, and a profile is asked about a
+plugin once.
+
+**Rejected: shipping the first-party plugins' capabilities granted.**
+ADR-006 makes first-party plugins subject to the capability model, and
+`presence.set` is an outbound broadcast to other people, which is not the
+category of `SHIPS_DISABLED`'s concern. Nothing in ADR-003 or ADR-007 grants
+first-party code anything by default, so a plugin still gets a capability only
+when the user has said yes.
+
+**Rejected: one dialog per plugin, queued.** It removes the stack and keeps the
+run: three prompts in a row is answered by reflex. The cost of the single
+dialog is that Allow covers every plugin it lists; the dialog says so, and says
+how to allow only some.
+
 ## Consequences
 
 **Accepted:** `entry` becomes optional in `plugin.json`, and a manifest with

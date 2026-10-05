@@ -20,7 +20,7 @@ The "game that sends nothing" row is from the v0.13.1 release notes. This page h
 
 ## Turn it on or off
 
-The plugin is built in and starts enabled. The first time you open **Settings → Plugins** in a profile, Cordial asks whether to **Allow** what it requests: `lifecycle.read`, `presence.set`, `settings.read` and `log`. Choose **Allow**; **Not now** leaves it without those permissions, so it publishes nothing.
+The plugin is built in and starts enabled. The first time you open the **Plugins** page of Settings in a profile, Cordial asks whether to **Allow** what the built-in plugins request, in one dialog. For this plugin that is: `lifecycle.read`, `presence.set`, `settings.read` and `log`. Choose **Allow**; **Not now** leaves it without those permissions, so it publishes nothing.
 
 To stop it, switch **Discord Presence** off in **Settings → Plugins**. You can change any of its permissions there at any time. Grants belong to the profile.
 

@@ -55,8 +55,12 @@ Cordial describes each one in plain words before you do.
 | **FPS Flex** | Picks how frames are presented and caps the frame rate (60 to 240). Applies at the next launch | No: an uncapped frame rate costs heat and battery |
 | **Hide the interface** | Unlocks Roblox's shortcuts for hiding the game's interface, for screenshots and videos | Yes, after you allow it |
 
-The first time you open **Settings → Plugins**, each of these asks once for
-the capabilities it needs. Until you choose **Allow**, it does nothing.
+The first time you open the **Plugins** page in a profile, Cordial asks once,
+in a single dialog, for the capabilities the plugins that are switched on
+need. Until you choose **Allow**, they do nothing. Choose **Not now** and use
+the switches on each plugin's row to allow only some. A plugin that ships off
+asks when you switch it on. Nothing is asked while you are on another page of
+Settings. Why: [ADR-021](adr/ADR-021-everything-is-a-plugin.md).
 
 > [!WARNING]
 > **Hide the interface** works only for accounts in the Roblox group that

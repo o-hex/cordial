@@ -19,7 +19,7 @@
 //! command line. That is configuration rather than a fallback, and it belongs
 //! in the shell because the shell is what has to work when nothing else does.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1648,6 +1648,7 @@ fn build_plugin_row(
     root: &Path,
     group: &adw::PreferencesGroup,
     tier: Tier,
+    consent: Option<&BuiltinConsent>,
 ) -> adw::ExpanderRow {
     let title = if plugin.manifest.name.is_empty() {
         plugin.manifest.id.clone()
@@ -1959,113 +1960,242 @@ fn build_plugin_row(
         );
     }
 
-    if tier == Tier::BuiltIn {
-        maybe_prompt_builtin_consent(parent, plugin, profile_dir, &expander, &enable_row, &cap_rows);
+    // A built-in does not ask here. It registers, and the one object that
+    // owns the question decides when to put it, for every built-in at once.
+    if let Some(consent) = consent {
+        consent.register(BuiltinEntry {
+            plugin: plugin.clone(),
+            expander: expander.clone(),
+            enable_row: enable_row.clone(),
+            cap_rows,
+        });
     }
 
     expander
 }
 
-/// Ask a built-in plugin's first-appearance consent question, if this profile
-/// has not already been asked and there is anything to ask about.
+/// One built-in plugin's row, as the first-appearance question needs to see it.
+struct BuiltinEntry {
+    plugin: Plugin,
+    expander: adw::ExpanderRow,
+    enable_row: adw::SwitchRow,
+    cap_rows: Vec<(Capability, adw::SwitchRow)>,
+}
+
+struct ConsentState {
+    /// Weak, because the dialog owns the closures that own this state. A
+    /// strong reference back would keep Settings alive after it was closed.
+    parent: glib::WeakRef<adw::PreferencesDialog>,
+    master: adw::SwitchRow,
+    profile_dir: Option<PathBuf>,
+    entries: RefCell<Vec<BuiltinEntry>>,
+    /// Whether a question is on screen. A second one waits for the first.
+    showing: Cell<bool>,
+}
+
+/// The one owner of every built-in plugin's first-appearance consent question.
 ///
-/// **When this asks, and why not on enabling instead.** A user-installed
-/// plugin has one clear moment to ask: the install button click, which
-/// happens exactly once and starts the plugin switched off (`consent::
-/// starts_disabled`) until somebody turns it on. A built-in has no such
-/// moment and, unless it is one of `enablement::SHIPS_DISABLED`, already
-/// ships *enabled* — so tying this to the Enabled switch's off-to-on
-/// transition would never fire for the common case, because there is no such
-/// transition: the plugin was already on the first time this row was ever
-/// built, silently running with nothing granted, which is the exact bug this
-/// change exists to close. Asking the first time this profile's Plugins page
-/// renders the row is the moment that actually happens for every profile,
-/// old or new.
+/// **One owner, because each row asking for itself is what stacked six
+/// dialogs.** Every built-in row used to build its own `AlertDialog` as the
+/// page was constructed, and the page is constructed when Settings opens, on
+/// whichever tab the user came for. A fresh profile therefore met a wall of
+/// permission dialogs over the Roblox tab, for plugins it had not looked at,
+/// one of which (`fps-flex`) was not even switched on. ADR-021's own argument
+/// against the third prompt applies to the fourth: a question put that many
+/// times is answered by reflex, which is a dialog that is no longer protecting
+/// anything.
 ///
-/// **This only ever touches capabilities, never `enablement`.** Built-ins are
-/// governed by `SHIPS_DISABLED`, a decision this file does not reopen (see
-/// the commit this landed in): consent here answers "may it do X", not
-/// "does it run at all", and conflating the two would make this prompt a
-/// second, competing policy for which built-ins start off.
-fn maybe_prompt_builtin_consent(
-    parent: &adw::PreferencesDialog,
-    plugin: &Plugin,
-    profile_dir: Option<&PathBuf>,
-    expander: &adw::ExpanderRow,
-    enable_row: &adw::SwitchRow,
-    cap_rows: &[(Capability, adw::SwitchRow)],
-) {
-    // Nowhere to record having asked, and nowhere to grant into — the same
-    // posture the capability switches above already take for an
-    // unresolvable profile.
-    let Some(dir) = profile_dir else { return };
-    let seen_path = consent::seen_path_in(dir);
-    let id = plugin.manifest.id.clone();
-    if consent::has_been_asked(&seen_path, &id) {
-        return;
+/// So rows register here and nothing asks until the question is due:
+///
+/// * only while the Plugins page is the one on screen, because that is where
+///   somebody can see what is being asked about;
+/// * only while Use Plugins is on, since with it off nothing runs;
+/// * only for built-ins that are switched on ([`consent::builtin_due`]), and
+///   again when one is switched on later;
+/// * and **in a single dialog** for however many are due, never a stack and
+///   never a run of them. Allowing is still the user's click, and the dialog
+///   says which plugins it covers and how to allow only some.
+///
+/// ADR-003's default deny is untouched: grants are written only by the allow
+/// response, through the same switches the rows already have. ADR-021 records
+/// the rule and why shipping the permissions granted was rejected.
+#[derive(Clone)]
+struct BuiltinConsent(Rc<ConsentState>);
+
+impl BuiltinConsent {
+    fn new(
+        parent: &adw::PreferencesDialog,
+        master: &adw::SwitchRow,
+        profile_dir: Option<&PathBuf>,
+    ) -> Self {
+        Self(Rc::new(ConsentState {
+            parent: parent.downgrade(),
+            master: master.clone(),
+            profile_dir: profile_dir.cloned(),
+            entries: RefCell::new(Vec::new()),
+            showing: Cell::new(false),
+        }))
     }
-    // `Silent` means no code and no capabilities requested -- nothing to run
-    // and nothing it could reach. `verdict` is a pure read of the manifest,
-    // so there is nothing worth persisting for this case; the check above
-    // costs one small file read on every Settings page open, which is the
-    // same price every other row on this page already pays for grants and
-    // enablement.
-    let consent::Verdict::Ask(prompt) = consent::verdict(plugin) else { return };
 
-    let dialog = adw::AlertDialog::builder()
-        .heading(prompt.heading())
-        .body(consent_body_for_builtin(&prompt))
-        .build();
-    dialog.add_response("skip", "Not now");
-    dialog.add_response("allow", "Allow");
-    dialog.set_response_appearance("allow", adw::ResponseAppearance::Suggested);
-    // The safe answer survives Escape, exactly as it does for a user install
-    // — ADR-003's default deny has to hold even when the dialog is dismissed
-    // rather than answered.
-    dialog.set_default_response(Some("skip"));
-    dialog.set_close_response("skip");
+    fn register(&self, entry: BuiltinEntry) {
+        // Switching a built-in on is the moment its question may become due,
+        // and the only one for a plugin that ships off.
+        let weak = Rc::downgrade(&self.0);
+        entry.enable_row.connect_active_notify(move |_| offer_soon(&weak));
+        self.0.entries.borrow_mut().push(entry);
+    }
 
-    let dir = dir.clone();
-    let cap_rows: Vec<(Capability, adw::SwitchRow)> = cap_rows.to_vec();
-    let expander = expander.clone();
-    let enable_row = enable_row.clone();
-    let plugin = plugin.clone();
-    dialog.connect_response(None, move |dialog, response| {
-        if response == "allow" {
-            // Each row's own `connect_active_notify` already does exactly
-            // what accepting this prompt means -- write the grant, clear any
-            // stale denial, refresh the summary line -- so flipping the
-            // switch is the grant, not a shortcut around it. This is the
-            // same mechanism the install flow uses, reached through the row
-            // that already exists here instead of a second copy of the
-            // grants::set loop that flow needs because it has no rows yet.
-            for (_, row) in &cap_rows {
-                row.set_active(true);
-            }
-            refresh_plugin_subtitle(&expander, &plugin, Some(&dir), enable_row.is_active(), Tier::BuiltIn);
+    /// Connect the moments the question can become due. Called once, after
+    /// every row has registered.
+    fn wire(&self, parent: &adw::PreferencesDialog) {
+        // Held strongly by the dialog's own handlers, which is what keeps this
+        // state alive for exactly as long as Settings is.
+        let strong = self.clone();
+        parent.connect_visible_page_name_notify(move |_| offer_soon(&Rc::downgrade(&strong.0)));
+        // Settings opened straight onto the Plugins page names it visible
+        // before it is on screen, so the first look happens at map.
+        let strong = self.clone();
+        parent.connect_map(move |_| offer_soon(&Rc::downgrade(&strong.0)));
+        let weak = Rc::downgrade(&self.0);
+        self.0.master.connect_active_notify(move |_| offer_soon(&weak));
+    }
+
+    /// Put the question, if it is due and nothing else is on screen.
+    fn offer(&self) {
+        let state = &self.0;
+        if state.showing.get() {
+            return;
         }
-        dialog.close();
-    });
+        // Nowhere to record having asked, and nowhere to grant into: the same
+        // posture the capability switches take for an unresolvable profile.
+        let Some(dir) = &state.profile_dir else { return };
+        let Some(parent) = state.parent.upgrade() else { return };
+        if !parent.is_mapped()
+            || parent.visible_page_name().as_deref() != Some("plugins")
+            || !state.master.is_active()
+        {
+            return;
+        }
 
-    // **Recorded when it is asked, not when it is answered.**
-    //
-    // This used to run inside the response handler, which only fires if the
-    // user actually answers *this* dialog. Every built-in row presents its own
-    // prompt as the page renders, so up to four stack at once; answer the top
-    // one and close Settings, and the rest are torn down with their parent
-    // without a response, nothing is recorded, and every one of them asks
-    // again the next time Settings is opened. Reported as the prompt coming up
-    // every time even after the plugins were enabled -- which it would, since
-    // flipping a capability switch is not an answer to this dialog.
-    //
-    // "Has this profile been asked" is true the moment the question is on
-    // screen, so that is when it is written. ADR-003's default deny is
-    // untouched: grants are still only written by the "allow" branch above, so
-    // a prompt that is dismissed grants nothing and simply does not nag.
-    if let Err(e) = consent::mark_asked(&seen_path, &id) {
-        eprintln!("shell: could not record that {id} has been asked about: {e}");
+        let seen_path = consent::seen_path_in(dir);
+        let granted = grants::load(&grants::path_in(dir));
+        let none = BTreeSet::new();
+        let entries = state.entries.borrow();
+        let due: Vec<(usize, consent::Prompt)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let id = &e.plugin.manifest.id;
+                consent::builtin_due(
+                    &e.plugin,
+                    e.enable_row.is_active(),
+                    granted.get(id).unwrap_or(&none),
+                    consent::has_been_asked(&seen_path, id),
+                )
+                .map(|prompt| (i, prompt))
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+
+        let prompts: Vec<consent::Prompt> = due.iter().map(|(_, p)| p.clone()).collect();
+        let (heading, body) = builtin_consent_text(&prompts);
+        let dialog = adw::AlertDialog::builder().heading(heading).body(body).build();
+        dialog.add_response("skip", "Not now");
+        dialog.add_response("allow", "Allow");
+        dialog.set_response_appearance("allow", adw::ResponseAppearance::Suggested);
+        // The safe answer survives Escape, exactly as it does for a user
+        // install: ADR-003's default deny has to hold even when the dialog is
+        // dismissed rather than answered.
+        dialog.set_default_response(Some("skip"));
+        dialog.set_close_response("skip");
+
+        // **Recorded when it is asked, not when it is answered.** Recording in
+        // the response handler asked again on every visit whenever the user
+        // closed Settings with the question open, and flipping a capability
+        // switch is not an answer to it. A declined question grants nothing and
+        // simply does not nag.
+        let ids: Vec<&str> =
+            due.iter().map(|(i, _)| entries[*i].plugin.manifest.id.as_str()).collect();
+        for id in &ids {
+            if let Err(e) = consent::mark_asked(&seen_path, id) {
+                eprintln!("shell: could not record that {id} has been asked about: {e}");
+            }
+        }
+        println!("  shell: consent dialog presented for built-ins {ids:?}");
+
+        state.showing.set(true);
+        let indices: Vec<usize> = due.iter().map(|(i, _)| *i).collect();
+        let this = self.clone();
+        let dir = dir.clone();
+        dialog.connect_response(None, move |dialog, response| {
+            if response == "allow" {
+                // Each row's own `connect_active_notify` already does exactly
+                // what accepting means -- write the grant, clear any stale
+                // denial, refresh the summary -- so flipping the switch is the
+                // grant, not a shortcut around it.
+                let entries = this.0.entries.borrow();
+                for &i in &indices {
+                    let e = &entries[i];
+                    for (_, row) in &e.cap_rows {
+                        row.set_active(true);
+                    }
+                    refresh_plugin_subtitle(
+                        &e.expander,
+                        &e.plugin,
+                        Some(&dir),
+                        e.enable_row.is_active(),
+                        Tier::BuiltIn,
+                    );
+                }
+            }
+            this.0.showing.set(false);
+            dialog.close();
+            // Something may have been switched on while this was up.
+            offer_soon(&Rc::downgrade(&this.0));
+        });
+        drop(entries);
+        dialog.present(Some(&parent));
     }
-    dialog.present(Some(parent));
+}
+
+/// Run [`BuiltinConsent::offer`] once the handler that asked has returned, so a
+/// switch or a page change finishes before a dialog goes up over it.
+fn offer_soon(state: &std::rc::Weak<ConsentState>) {
+    let weak = state.clone();
+    glib::idle_add_local_once(move || {
+        if let Some(state) = weak.upgrade() {
+            BuiltinConsent(state).offer();
+        }
+    });
+}
+
+/// The heading and body of the first-appearance dialog for the built-ins that
+/// are due: a single plugin gets its own wording, several share one dialog.
+fn builtin_consent_text(prompts: &[consent::Prompt]) -> (String, String) {
+    if let [one] = prompts {
+        return (one.heading(), consent_body_for_builtin(one));
+    }
+    let mut body = String::new();
+    for prompt in prompts {
+        body.push_str(&prompt.name);
+        body.push('\n');
+        for effect in &prompt.effects {
+            body.push_str("• ");
+            body.push_str(effect.description);
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+    body.push_str(
+        "These come with Cordial. Each one's own Enabled switch below governs whether it runs \
+         at all, separately from this — allowing something here does not turn it on, and \
+         refusing it does not turn it off. Allow covers every plugin listed. To allow only \
+         some, choose Not now and use the switches on each plugin's row. You can change any \
+         of these permissions at any time.",
+    );
+    ("Built-in plugins will be able to:".to_string(), body)
 }
 
 /// The body of a built-in's first-appearance prompt: the same itemised
@@ -2224,6 +2354,7 @@ fn build_install_group(
                         &root,
                         &installed_group,
                         Tier::User,
+                        None,
                     );
                     installed_group.add(&new_row);
                 }
@@ -2475,6 +2606,7 @@ fn build_marketplace_entry_row(
                                         &root,
                                         &installed_group,
                                         Tier::User,
+                                        None,
                                     );
                                     installed_group.add(&new_row);
                                 }
@@ -2834,6 +2966,7 @@ fn build_plugins_page(
 
     // ---- built-in ---------------------------------------------------------
     let builtin_group = adw::PreferencesGroup::builder().title("Built-In").build();
+    let consent = BuiltinConsent::new(parent, &master, profile_dir.as_ref());
     if system.is_empty() {
         // Said rather than left as an empty group, and said without naming the
         // path: a user who has never installed Cordial from a package has no
@@ -2848,10 +2981,12 @@ fn build_plugins_page(
                 &system_root,
                 &builtin_group,
                 Tier::BuiltIn,
+                Some(&consent),
             );
             builtin_group.add(&row);
         }
     }
+    consent.wire(parent);
 
     // ---- user-installed, and the folders being developed ------------------
     //
@@ -2878,6 +3013,7 @@ fn build_plugins_page(
                     &root,
                     &user_group,
                     Tier::User,
+                    None,
                 );
                 user_group.add(&row);
             }
@@ -3096,7 +3232,7 @@ fn build_development_row(
     let (row, name): (adw::PreferencesRow, String) = match &entry.state {
         DevState::Loaded(plugin) => {
             let expander =
-                build_plugin_row(dialog, plugin, profile_dir, &plugin.dir, group, Tier::Development);
+                build_plugin_row(dialog, plugin, profile_dir, &plugin.dir, group, Tier::Development, None);
             let name = display_name(plugin);
             (expander.clone().upcast(), name)
         }
@@ -4085,6 +4221,32 @@ mod tests {
         assert!(!body.contains("starts switched off"), "{body}");
         assert!(body.contains(Capability::PresenceSet.consequence()), "{body}");
         assert!(body.contains("Enabled switch"), "{body}");
+    }
+
+    #[test]
+    fn several_due_built_ins_share_one_dialog_that_names_each_and_says_how_to_allow_some() {
+        // The stack of six was one dialog per plugin. Several due at once are
+        // one dialog now, so it has to say whose permissions it covers, or
+        // Allow would be a grant the user could not attribute, and how to
+        // allow fewer than all.
+        let ask = |json: &str| {
+            let consent::Verdict::Ask(p) = consent::verdict(&fixture(json)) else { panic!("asks") };
+            p
+        };
+        let a = ask(r#"{"id":"a","name":"Alpha","entry":"m.ts","capabilities":["presence.set"]}"#);
+        let b = ask(r#"{"id":"b","name":"Beta","entry":"m.ts","capabilities":["flags.write"]}"#);
+
+        let (heading, body) = builtin_consent_text(&[a.clone(), b]);
+        assert!(heading.starts_with("Built-in plugins"), "{heading}");
+        assert!(body.contains("Alpha") && body.contains("Beta"), "{body}");
+        assert!(body.contains(Capability::PresenceSet.consequence()), "{body}");
+        assert!(body.contains(Capability::FlagsWrite.consequence()), "{body}");
+        assert!(body.contains("Not now"), "must say how to allow only some: {body}");
+        assert!(!body.contains("starts switched off"), "{body}");
+
+        // One plugin keeps its own wording.
+        let (heading, _) = builtin_consent_text(&[a]);
+        assert_eq!(heading, "Alpha will be able to:");
     }
 
     #[test]

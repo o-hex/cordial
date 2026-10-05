@@ -1480,6 +1480,10 @@ instance of the same class was found and fixed alongside them.
   -- so `settings.rs` gained `consent_body_for_builtin` rather than reusing
   `consent_body` verbatim. Enablement (`SHIPS_DISABLED`) is untouched: this
   prompt answers "may it do X", never "does it run at all".
+  *Amended 2026-10-05:* "the first time the Plugins page is built" stacked one
+  dialog per built-in over whichever Settings tab was open. It is now one dialog,
+  put when the Plugins page is on screen, for built-ins that are switched on;
+  see ADR-021.
 - **Denials, made visible.** `Broker::denials()` is still the record, but
   nothing outside one plugin's own serving thread could ever read it -- a new
   `cordial_plugins::denials` module persists a denial to

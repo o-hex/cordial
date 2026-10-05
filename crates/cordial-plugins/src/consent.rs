@@ -138,6 +138,46 @@ pub fn starts_disabled(plugin: &Plugin) -> bool {
     plugin.has_code()
 }
 
+/// Whether a built-in's first-appearance question is due *now*, and what it
+/// says if so.
+///
+/// **Three things must all be true, and each is a way the dialog used to
+/// ambush somebody.** The plugin is switched on; this profile has not been
+/// asked about it; and something it requested is not yet granted.
+///
+/// *Switched on*, because a plugin that is not running has nothing to be
+/// silently denied. `fps-flex` ships off ([`crate::enablement::SHIPS_DISABLED`])
+/// and was asked about anyway, on a page the user had not looked at, for a
+/// plugin they had not chosen to start. It is asked when it is switched on,
+/// which is when the answer starts to matter. This is ADR-021's second consent
+/// rule run in the other direction: consent and enablement are separate acts,
+/// but the question is only worth putting once there is something to start.
+///
+/// *Something ungranted*, because asking whether to allow what is already
+/// allowed is noise. It also covers a plugin that requests nothing at all: a
+/// built-in with no capabilities has nothing to grant, and "runs code, asks for
+/// no permissions" is not a question.
+///
+/// Default deny is untouched: this only decides whether to *ask*. Nothing here
+/// writes a grant.
+pub fn builtin_due(
+    plugin: &Plugin,
+    enabled: bool,
+    granted: &BTreeSet<Capability>,
+    asked: bool,
+) -> Option<Prompt> {
+    if asked || !enabled {
+        return None;
+    }
+    if plugin.requested.iter().all(|c| granted.contains(c)) {
+        return None;
+    }
+    match verdict(plugin) {
+        Verdict::Ask(prompt) => Some(prompt),
+        Verdict::Silent => None,
+    }
+}
+
 /// Which built-in plugins a profile has already been asked about, so the
 /// question is not asked again on every visit to the Plugins page.
 ///
@@ -342,5 +382,76 @@ mod tests {
         let path = seen_path_in(&dir);
         std::fs::write(&path, "{not json").unwrap();
         assert!(!has_been_asked(&path, "discord-presence"));
+    }
+
+    /// The four plugins Cordial ships, read from the repository rather than
+    /// re-typed, so a fifth built-in or a changed capability list is tested
+    /// by the rule below and not by a fixture that has drifted from it.
+    fn shipped() -> Vec<Plugin> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        let found = manifest::discover(&root);
+        assert!(found.len() >= 4, "the built-ins did not load from {}", root.display());
+        found
+    }
+
+    fn due_ids(
+        plugins: &[Plugin],
+        enabled: impl Fn(&str) -> bool,
+        granted: &BTreeSet<Capability>,
+        asked: &BTreeSet<String>,
+    ) -> Vec<String> {
+        plugins
+            .iter()
+            .filter(|p| {
+                let id = p.manifest.id.as_str();
+                builtin_due(p, enabled(id), granted, asked.contains(id)).is_some()
+            })
+            .map(|p| p.manifest.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_fresh_profile_is_asked_only_about_the_built_ins_that_are_switched_on() {
+        // The reported bug: opening Settings on a fresh profile presented a
+        // dialog for every built-in, `fps-flex` included, which ships off.
+        let plugins = shipped();
+        let due = due_ids(
+            &plugins,
+            crate::enablement::default_for,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert!(!due.is_empty());
+        assert!(
+            !due.contains(&"fps-flex".to_string()),
+            "a built-in that ships switched off must not be asked about until it is switched on: {due:?}"
+        );
+        // Switch it on and the same question is now due, for it alone.
+        let on = due_ids(&plugins, |_| true, &BTreeSet::new(), &due.iter().cloned().collect());
+        assert_eq!(on, vec!["fps-flex".to_string()]);
+    }
+
+    #[test]
+    fn a_built_in_that_has_been_asked_is_not_asked_again_however_it_was_answered() {
+        let plugins = shipped();
+        let asked: BTreeSet<String> = plugins.iter().map(|p| p.manifest.id.clone()).collect();
+        assert!(due_ids(&plugins, |_| true, &BTreeSet::new(), &asked).is_empty());
+    }
+
+    #[test]
+    fn nothing_is_asked_about_what_is_already_allowed_or_never_requested() {
+        let p = parse(r#"{"id":"x","entry":"main.ts","capabilities":["log","presence.set"]}"#);
+        let some: BTreeSet<_> = [Capability::Log].into();
+        let all: BTreeSet<_> = [Capability::Log, Capability::PresenceSet].into();
+        assert!(builtin_due(&p, true, &some, false).is_some(), "one still ungranted");
+        assert!(builtin_due(&p, true, &all, false).is_none(), "everything already granted");
+        let quiet = parse(r#"{"id":"q","entry":"main.ts"}"#);
+        assert!(builtin_due(&quiet, true, &BTreeSet::new(), false).is_none(), "nothing to grant");
+    }
+
+    #[test]
+    fn a_switched_off_plugin_asks_nothing_whatever_it_requests() {
+        let p = parse(r#"{"id":"x","entry":"main.ts","capabilities":["flags.write"]}"#);
+        assert!(builtin_due(&p, false, &BTreeSet::new(), false).is_none());
     }
 }

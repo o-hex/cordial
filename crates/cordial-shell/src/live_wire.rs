@@ -100,6 +100,11 @@ pub enum Update {
     /// same string `CORDIAL_AUDIO_SINK` carries at launch, so a choice has one
     /// spelling whether it arrives at spawn or afterwards.
     AudioOutput(String),
+    /// The PipeWire source's `node.name` Roblox records from, or empty for the
+    /// system default; the string `CORDIAL_AUDIO_SOURCE` carries at launch. A
+    /// microphone that is recording is re-linked in place, and one that is not
+    /// is left alone: applying this never opens a capture stream.
+    AudioInput(String),
     /// Whether the client is registered with Feral GameMode's daemon.
     Gamemode(bool),
     /// Whether the client reads `/dev/input/js*` and feeds the engine pads.
@@ -134,12 +139,13 @@ pub fn parse_title_bar(word: &str) -> Option<crate::title_bar::TitleBar> {
 }
 
 /// The keys [`Update`] can carry, which are also the `shell.json` field names.
-pub const KEYS: [&str; 9] = [
+pub const KEYS: [&str; 10] = [
     "pointer_acceleration",
     "throttle",
     "close_on_leave",
     "carry_launch_ticket",
     "audio_output",
+    "audio_input",
     "gamemode",
     "gamepad",
     "title_bar",
@@ -165,6 +171,7 @@ impl Update {
             Update::CloseOnLeave(_) => "close_on_leave",
             Update::CarryLaunchTicket(_) => "carry_launch_ticket",
             Update::AudioOutput(_) => "audio_output",
+            Update::AudioInput(_) => "audio_input",
             Update::Gamemode(_) => "gamemode",
             Update::Gamepad(_) => "gamepad",
             Update::TitleBar(_) => "title_bar",
@@ -179,7 +186,7 @@ impl Update {
             Update::CloseOnLeave(b) | Update::CarryLaunchTicket(b) | Update::Gamemode(b) | Update::Gamepad(b) => {
                 Value::from(*b)
             }
-            Update::AudioOutput(name) => Value::from(name.as_str()),
+            Update::AudioOutput(name) | Update::AudioInput(name) => Value::from(name.as_str()),
             Update::TitleBar(t) => Value::from(title_bar_word(*t)),
             Update::FrameRateLimit(l) => Value::from(l.as_env()),
         }
@@ -214,6 +221,13 @@ impl Update {
                 .as_str()
                 .filter(|n| valid_sink_name(n))
                 .map(|n| Update::AudioOutput(n.to_string()))
+                .ok_or_else(bad),
+            // A source is a `node.name` like a sink is, so the same bound and
+            // the same refusal of control characters apply.
+            "audio_input" => value
+                .as_str()
+                .filter(|n| valid_sink_name(n))
+                .map(|n| Update::AudioInput(n.to_string()))
                 .ok_or_else(bad),
             _ => Err(format!("{key}: not a live setting")),
         }
@@ -324,6 +338,7 @@ mod tests {
             Update::CloseOnLeave(true),
             Update::CarryLaunchTicket(false),
             Update::AudioOutput("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()),
+            Update::AudioInput("alsa_input.usb-Headset-00.mono-fallback".to_string()),
             Update::Gamemode(false),
             Update::Gamepad(false),
             Update::TitleBar(crate::title_bar::TitleBar::Hidden),
@@ -403,6 +418,8 @@ mod tests {
             r#"{"set":{"frame_rate_limit":"9999"}}"#,
             r#"{"set":{"frame_rate_limit":144}}"#,
             r#"{"set":{"audio_output":"a\u0000b"}}"#,
+            r#"{"set":{"audio_input":false}}"#,
+            r#"{"set":{"audio_input":"a\u0000b"}}"#,
         ] {
             assert!(decode(bad).is_err(), "{bad} should be refused");
         }

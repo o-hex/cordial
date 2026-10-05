@@ -49,6 +49,7 @@
 | `present_mode` | next launch | a swapchain field; only the engine rebuilds swapchains, see below |
 | `mangohud`, `vkbasalt` | next launch | Vulkan layers load at instance creation |
 | `audio_output` | live | the playing streams are re-linked to the new sink in place; see below |
+| `audio_input` | live | an open capture stream is re-linked to the new source in place; with none open nothing is opened and the choice is used the next time Roblox records; see below |
 | `title_bar` | live | revealed, hidden or restyled on the game window in place |
 | `roblox`, `profile`, `fullscreen_accel` | next launch | built or chosen at launch |
 | `unpacked_plugins` | next launch | the reconciler never sees unpacked plugins, by design (ADR-038) |
@@ -90,6 +91,54 @@ with no `default` metadata, are **INFERRED**: the client checks for the metadata
 object and reports its absence instead of claiming the move. The client itself
 was not run for this change; the native backend and the socket handler were
 exercised separately.
+
+## Microphone
+
+`audio_input` is the output row's twin: **Settings → Audio → Microphone**, stored
+as a PipeWire source's `node.name`, launched as `CORDIAL_AUDIO_SOURCE`, and sent
+live as the `audio_input` key. Unset or empty follows the session's default
+source, which is what happened before the row existed. A chosen source that is
+not in the session when a recording opens falls back to the default and says so
+on the client's stderr; the choice is kept for when it returns.
+
+**Choosing a microphone opens nothing.** This is the rule at the top of
+`native/audio_classes.cpp` and the row is built around it. The list comes from
+`cordial_audio_sources`, which walks PipeWire's registry and copies two strings
+per node; a capture stream exists only between Roblox starting a recording and
+stopping it. A live change moves an open capture stream the way the output side
+moves a playback one (the `target.object` write into the `default` metadata) and
+otherwise stores the choice, and the reply's `notes` says there was nothing to
+move. `audio_devices.rs` has a test that reads the backend's open-capture count
+before and after listing and wants zero both times.
+
+Measured 2026-10-05 against the session's real WirePlumber with two null
+`Audio/Source` nodes made for the purpose, reading `pw-link -l` and the links in
+`pw-dump` from `audio_probe`'s `AUDIO_PROBE_SNAPSHOT` hook at the moment the
+stream was open (the OpenSL ES `record` and the AAudio `aaudio-record` commands
+reach `CaptureStream::open`; nothing signed out reaches it through the engine).
+With `CORDIAL_AUDIO_SOURCE` set the capture node was linked to that null source
+on both paths, and with it unset or empty to the session's default source, the
+control. A live change from one null source to the other, and from a null source
+to the system default, moved the one open stream each time. A name the session
+does not have fell back to the default with a warning, once per open. The
+`default.audio.source` metadata was the same before and after. The call in
+`audio_classes.cpp` (`AudioRecord` and `WebRtcAudioRecord`) shares the helper but
+has no harness here, so its use of the choice is **INFERRED** from the build.
+
+Sink monitors are not offered. PipeWire reports a monitor as a port on its
+sink, not as an `Audio/Source` node, so "record what the speakers play" is not
+reachable from this row.
+
+Four places open the microphone (`AudioRecord` and `WebRtcAudioRecord` in
+`audio_classes.cpp`, the OpenSL ES recorder, the AAudio input stream) and all
+four read the one choice, through `configured_input_device` and
+`resolve_input_target`. The comment at the top of `audio_classes.cpp` still
+says three; the AAudio input path arrived after it was written.
+
+Roblox's own in-game device list is still empty of anything useful: it is
+FMOD's, it shows one "Android audio output" driver, and filling it would mean
+patching the engine, which ADR-001 and ADR-003 rule out. This row is Cordial's
+routing and the only microphone choice there is.
 
 ## GameMode
 

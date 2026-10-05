@@ -286,6 +286,26 @@ void mark(const char* fmt, ...) {
     std::fflush(stdout);
 }
 
+/// Runs `$AUDIO_PROBE_SNAPSHOT <label>` through `sh -c` when that variable is
+/// set, and does nothing when it is not. The probe prints markers for an outside
+/// observer to line up against, but a `pw-dump` taken from another process a
+/// moment after a marker is a guess about timing; this makes the observer run at
+/// the marker, with the stream known to be open, so what it reads is the state
+/// the line above describes. It is how the microphone picker's "the stream
+/// landed on the source that was chosen" claim is read out of PipeWire's links.
+void snapshot(const char* label) {
+    const char* cmd = std::getenv("AUDIO_PROBE_SNAPSHOT");
+    if (!cmd || !*cmd) return;
+    mark("SNAPSHOT %s", label);
+    const std::string line = std::string("sh -c '") + cmd + "' probe " + label;
+    if (std::system(line.c_str()) != 0) mark("SNAPSHOT %s: the command failed", label);
+}
+
+/// Set by `--switch-source`; an empty string is "the system default". Only the
+/// OpenSL `record` command honours it.
+bool g_switch_source_set = false;
+std::string g_switch_source;
+
 SLObjectItf g_engine_obj = nullptr;
 SLEngineItf g_engine = nullptr;
 
@@ -573,7 +593,20 @@ int cmd_record(double seconds) {
     r = (*record)->SetRecordState(record, SL_RECORDSTATE_RECORDING);
     mark("MIC-OPEN SetRecordState(RECORDING) -> %u  (capture streams open: %u)", r,
          cordial::audio::active_capture_streams());
+    // Long enough for the session manager to have linked the new node.
+    sleep_ms(700);
+    snapshot("opensl-open");
     sleep_ms(static_cast<int>(seconds * 1000));
+
+    if (g_switch_source_set) {
+        // The live path the Settings row uses: re-aim the stream that is open.
+        const cordial::audio::OutputSwitch moved =
+            cordial::audio::set_input_device(g_switch_source);
+        mark("SOURCE-SWITCH to '%s': %zu stream(s) moved, note '%s'", g_switch_source.c_str(),
+             moved.moved, moved.note.c_str());
+        sleep_ms(700);
+        snapshot("opensl-switched");
+    }
 
     SLuint32 state = 0;
     (*record)->GetRecordState(record, &state);
@@ -961,6 +994,8 @@ int cmd_aaudio_record(double seconds) {
     r = aa::requestStart(stream);
     mark("MIC-OPEN requestStart -> %d  (capture streams open: %u)", r,
          cordial::audio::active_capture_streams());
+    sleep_ms(700);
+    snapshot("aaudio-open");
     if (r != 0 || cordial::audio::active_capture_streams() != 1) {
         mark("FAIL requestStart did not open exactly one capture stream");
         ok = false;
@@ -1174,6 +1209,10 @@ int main(int argc, char** argv) {
         else if (a == "--hz" && i + 1 < argc) hz = std::atof(argv[++i]);
         // Repeatable; an empty value is the system default.
         else if (a == "--switch" && i + 1 < argc) steps.push_back(argv[++i]);
+        else if (a == "--switch-source" && i + 1 < argc) {
+            g_switch_source_set = true;
+            g_switch_source = argv[++i];
+        }
     }
 
     if (cmd == "devices") return cmd_devices();
@@ -1188,6 +1227,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                   "usage: audio_probe devices|play|silence|record|record-interlock|"
                   "record-selfstop|aaudio-play|aaudio-record|aaudio-record-never "
-                  "[--seconds N] [--amplitude A] [--hz F] [--switch SINK]...\n");
+                  "[--seconds N] [--amplitude A] [--hz F] [--switch SINK]... "
+                  "[--switch-source SOURCE]\n");
     return 2;
 }

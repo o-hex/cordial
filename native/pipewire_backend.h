@@ -138,6 +138,43 @@ struct OutputSwitch {
 /// the variable behaves as before.
 OutputSwitch set_output_device(const std::string& name);
 
+/// The PipeWire source Cordial has been asked to record from, as a
+/// `node.name`; empty is the ordinary state and means "follow the session's
+/// default source", the behaviour before there was a microphone picker.
+///
+/// The input twin of [`configured_output_device`], with the same reasons: seeded
+/// once from `CORDIAL_AUDIO_SOURCE`, replaced by [`set_input_device`], one
+/// reader so a switch cannot come to mean two things in one process, and a
+/// `node.name` rather than an index or a description because it is the only one
+/// of the three that survives a replug and a rename.
+///
+/// **Reading it opens nothing.** The choice is a string. The microphone rule at
+/// the top of `audio_classes.cpp` is about streams, and a stored preference is
+/// not one.
+std::string configured_input_device();
+
+/// Change the microphone. `name` is a `node.name` as above, empty for the
+/// system default.
+///
+/// A capture stream that is open when this is called is re-linked in place by
+/// the same `target.object` metadata write [`set_output_device`] uses; one that
+/// is not open picks the choice up when it opens, which is when the microphone
+/// indicator lights and not before. **Nothing here opens a capture stream** --
+/// with none open, the answer says there was nothing to move.
+OutputSwitch set_input_device(const std::string& name);
+
+/// The node name a capture stream should actually connect to, given what the
+/// user asked for. Empty in, empty out, and no registry walk for the common
+/// case.
+///
+/// The twin of [`resolve_output_target`] and for the same reason: a source that
+/// has been unplugged must not turn into a recording that captures nothing, so
+/// an absent one falls back to the default and says so on stderr, naming it.
+/// The callers in `audio_classes.cpp` then resolve an empty answer to the
+/// default source's name as they always have; the OpenSL and AAudio callers
+/// pass it on empty, which PipeWire reads as "the default".
+std::string resolve_input_target(const std::string& requested);
+
 /// The node name a playback stream should actually connect to, given what the
 /// user asked for.
 ///
@@ -544,6 +581,13 @@ std::string choose_output_target(const std::string& requested,
                                  const std::vector<std::string>& available_sinks,
                                  bool* fell_back);
 
+/// The input twin of [`choose_output_target`]: the same rule over the list of
+/// sources instead of sinks, kept as its own name so a call site reads as what
+/// it is and a later difference between the two has somewhere to go.
+std::string choose_input_target(const std::string& requested,
+                                const std::vector<std::string>& available_sources,
+                                bool* fell_back);
+
 /// Copies from the front of `pending` into `dst[0, want)`, popping buffers
 /// as they empty (and recording their `context` in `drained_contexts`, in
 /// order) and zero-filling any shortfall. Returns the number of trailing
@@ -610,6 +654,36 @@ void cordial_audio_sinks_free(CordialAudioSink* sinks, size_t count);
 /// Called from `cordial-runtime`'s live-settings socket (ADR-044), on a thread
 /// that is neither the engine's nor PipeWire's.
 size_t cordial_audio_set_output(const char* name, char* note, size_t note_len);
+
+/// Fills `*out` with a freshly allocated array of every audio source the
+/// session has that a person would call a microphone or line input, and
+/// returns how many; the shape and ownership rules are `cordial_audio_sinks`'s,
+/// and the array goes back to `cordial_audio_sinks_free`. `is_default` marks the
+/// session's current `default.audio.source`.
+///
+/// **This opens no stream.** It is a projection of `enumerate_devices`, which
+/// walks the registry and reads properties, and the microphone rule at the top
+/// of `audio_classes.cpp` forbids anything on this path from constructing a
+/// `CaptureStream`. Sink monitors are not offered: the registry reports a
+/// monitor as a port on its sink and not as an `Audio/Source` node, so
+/// "listening to what the speakers play" is not reachable from here, which is
+/// the intended answer for a microphone row.
+size_t cordial_audio_sources(CordialAudioSink** out);
+
+/// How many capture streams this process holds open right now. Exposed so the
+/// shell's own tests can pin that listing sources opened none; see
+/// `cordial::audio::active_capture_streams`.
+unsigned cordial_audio_capture_streams(void);
+
+/// The microphone twin of `cordial_audio_set_output`: re-aims an open capture
+/// stream at `name` (null or empty for the system default), returns how many
+/// moved, and writes any explanation to `note`. With none open it moves nothing
+/// and opens nothing; the choice applies when Roblox next starts recording.
+size_t cordial_audio_set_input(const char* name, char* note, size_t note_len);
+
+/// The microphone twin of `cordial_audio_output`.
+size_t cordial_audio_input(char* out, size_t out_len);
+
 
 /// Copies the sink currently asked for (empty for the system default) into
 /// `out` as a NUL-terminated string, truncated to `out_len - 1` bytes, and

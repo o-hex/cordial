@@ -79,6 +79,7 @@ pub const CLASSIFICATION: &[(&str, Applies, &str)] = &[
     ("mangohud", Applies::NextLaunch, "a Vulkan layer, loaded at instance creation"),
     ("vkbasalt", Applies::NextLaunch, "a Vulkan layer, loaded at instance creation"),
     ("audio_output", Applies::Live, "the running streams are re-linked to the new sink in place; a host backend with no sink to move between (ALSA, OSS, PulseAudio) applies it to streams opened afterwards"),
+    ("audio_input", Applies::Live, "a recording in progress is re-linked to the new source in place; with none open nothing is opened and the choice is used the next time Roblox starts recording"),
     ("fullscreen_accel", Applies::NextLaunch, "bound when the launcher window is built; no Settings row"),
     ("marketplace_index_dir", Applies::Shell, "read when the Plugins page loads"),
     ("marketplace_public_key", Applies::Shell, "read when the Plugins page loads"),
@@ -109,6 +110,7 @@ pub fn live_updates(config: &ShellConfig) -> Vec<Update> {
         // The same string the launch environment carries, trimmed the same way,
         // and empty for "follow the default".
         Update::AudioOutput(config.audio_output.env_value().unwrap_or("").to_string()),
+        Update::AudioInput(config.audio_input.env_value().unwrap_or("").to_string()),
         Update::Gamemode(config.gamemode),
         Update::Gamepad(config.gamepad),
         Update::TitleBar(config.title_bar),
@@ -517,6 +519,27 @@ mod tests {
             changed(&live_updates(&c), &before),
             vec![Update::AudioOutput(String::new())]
         );
+    }
+
+    #[test]
+    fn the_audio_input_is_its_own_key_and_does_not_move_with_the_output() {
+        let input = |c: &ShellConfig| {
+            live_updates(c).into_iter().find(|u| u.key() == "audio_input").unwrap()
+        };
+        let mut c = ShellConfig::default();
+        assert_eq!(input(&c), Update::AudioInput(String::new()), "no choice is the empty string");
+
+        c.audio_input = shell_config::AudioOutput("  alsa_input.usb-Headset  ".into());
+        assert_eq!(input(&c), Update::AudioInput("alsa_input.usb-Headset".into()));
+
+        // Control: choosing a microphone moves that key and nothing else, in
+        // particular not the sink.
+        let before = live_updates(&ShellConfig::default());
+        assert_eq!(
+            changed(&before, &live_updates(&c)),
+            vec![Update::AudioInput("alsa_input.usb-Headset".into())]
+        );
+        assert_eq!(changed(&live_updates(&c), &before), vec![Update::AudioInput(String::new())]);
     }
 
     #[test]

@@ -47,7 +47,7 @@ use cordial_plugins::unpack;
 
 use crate::audio_devices;
 use crate::install;
-use crate::shell_config::{self, AppearanceScheme, AudioOutput, ShellConfig, ThrottleWhen};
+use crate::shell_config::{self, AppearanceScheme, AudioInput, AudioOutput, ShellConfig, ThrottleWhen};
 
 /// What a plugin asks for, and what this profile has actually given it.
 ///
@@ -1208,7 +1208,58 @@ fn build_audio_group(
         });
     }
     group.add(&row);
+    group.add(&build_microphone_row(config, config_path));
     group
+}
+
+/// The Microphone row beside the output one: which input Roblox's voice chat
+/// records from. The rows, the stored form and the "not connected" rule are the
+/// output picker's, through [`output_picker_rows`] and `AudioInput`, so the two
+/// cannot disagree about what a missing device looks like.
+///
+/// **Listing the microphones opens none.** `audio_devices::sources` walks the
+/// registry and nothing else, which `audio_devices.rs` pins with a test, so
+/// opening Settings does not light the desktop's recording indicator.
+fn build_microphone_row(
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+) -> gtk::Widget {
+    let sources = audio_devices::sources();
+    let chosen = config.borrow().audio_input.clone();
+    let (labels, names) = output_picker_rows(&sources, &chosen);
+
+    if sources.is_empty() {
+        let row = adw::ActionRow::builder()
+            .title("Microphone")
+            .subtitle("No microphones found.")
+            .sensitive(false)
+            .build();
+        return row.upcast();
+    }
+
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let model = gtk::StringList::new(&label_refs);
+    let row = adw::ComboRow::builder()
+        .title("Microphone")
+        .subtitle("Where Roblox's voice chat records from. Choosing one does not turn it on.")
+        .model(&model)
+        .selected(chosen.index_in(&names))
+        .build();
+    row.set_subtitle_lines(2);
+    row.add_suffix(&detail(
+        "The microphone is opened only while Roblox is recording, and closed again when it \
+         stops. Choosing a device here does not open it.\n\nSystem default follows your \
+         desktop's default microphone. This is Cordial's routing, not Roblox's own device \
+         list. A change takes effect straight away if you are already in voice chat.",
+    ));
+    {
+        let names = names.clone();
+        row.connect_selected_notify(move |row| {
+            config.borrow_mut().audio_input = AudioInput::from_index(row.selected(), &names);
+            persist(&config, &config_path);
+        });
+    }
+    row.upcast()
 }
 
 /// "General" — ordinary client settings.

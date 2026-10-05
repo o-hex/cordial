@@ -9,7 +9,9 @@
 //! hand-off to the pump (unlike `devctl`, which calls engine natives). The one
 //! exception is the audio sink, which is changed by the audio backend itself
 //! (`cordial_audio_set_output`): it re-links the streams PipeWire already has
-//! and never touches the engine's OpenSL ES or AAudio objects.
+//! and never touches the engine's OpenSL ES or AAudio objects. The microphone
+//! (`cordial_audio_set_input`) is the same call aimed at an open capture stream,
+//! and opens none.
 //!
 //! **What this is not.** It is not `devctl`. That socket is opt-in, drives input
 //! and captures frames, and must stay off for anyone who did not ask for it
@@ -156,6 +158,14 @@ fn apply(update: &Update) -> Option<String> {
             println!("  live: audio_output: {moved} playing stream(s) moved");
             (!note.is_empty()).then_some(note)
         }
+        // The microphone. Re-links a capture stream that is open and otherwise
+        // only stores the choice for the next one. It never opens a stream, so a
+        // change in Settings cannot light the desktop's recording indicator.
+        Update::AudioInput(name) => {
+            let (moved, note) = audio::set_input(name);
+            println!("  live: audio_input: {moved} recording stream(s) moved");
+            (!note.is_empty()).then_some(note)
+        }
         // A request to gamemoded, made on the spot. The note is whatever the
         // daemon said that was not "yes", or that it has not answered yet.
         Update::Gamemode(on) => crate::gamemode::set_enabled(*on),
@@ -192,6 +202,8 @@ fn value_word(update: &Update) -> String {
         Update::FrameRateLimit(l) => l.as_env().to_string(),
         Update::AudioOutput(name) if name.is_empty() => "the system default".to_string(),
         Update::AudioOutput(name) => name.clone(),
+        Update::AudioInput(name) if name.is_empty() => "the system default".to_string(),
+        Update::AudioInput(name) => name.clone(),
     }
 }
 
@@ -231,6 +243,8 @@ mod audio {
     extern "C" {
         fn cordial_audio_set_output(name: *const c_char, note: *mut c_char, note_len: usize) -> usize;
         fn cordial_audio_output(out: *mut c_char, out_len: usize) -> usize;
+        fn cordial_audio_set_input(name: *const c_char, note: *mut c_char, note_len: usize) -> usize;
+        fn cordial_audio_input(out: *mut c_char, out_len: usize) -> usize;
     }
 
     /// Aim playback at `name` (empty for the system default). Returns how many
@@ -250,6 +264,29 @@ mod audio {
             cordial_audio_set_output(c.as_ptr(), note.as_mut_ptr().cast::<c_char>(), note.len())
         };
         (moved, nul_terminated(&note))
+    }
+
+    /// Aim recording at `name` (empty for the system default). Returns how many
+    /// open capture streams moved, and a note when that is not the whole story:
+    /// with none open nothing is moved and nothing is opened.
+    pub fn set_input(name: &str) -> (usize, String) {
+        let Ok(c) = CString::new(name) else {
+            return (0, "the source name contains a NUL byte".to_string());
+        };
+        let mut note = vec![0u8; 512];
+        // Safety: as `set_output`.
+        let moved = unsafe {
+            cordial_audio_set_input(c.as_ptr(), note.as_mut_ptr().cast::<c_char>(), note.len())
+        };
+        (moved, nul_terminated(&note))
+    }
+
+    /// The source in force, empty for the system default.
+    pub fn current_input() -> String {
+        let mut buf = vec![0u8; 512];
+        // Safety: as `current`.
+        unsafe { cordial_audio_input(buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
+        nul_terminated(&buf)
     }
 
     /// The sink in force, empty for the system default.
@@ -304,6 +341,7 @@ fn current() -> BTreeMap<String, Value> {
     m.insert("close_on_leave".into(), Value::from(crate::game_log::current_close_on_leave()));
     m.insert("carry_launch_ticket".into(), Value::from(crate::deeplink::carry_ticket()));
     m.insert("audio_output".into(), Value::from(audio::current()));
+    m.insert("audio_input".into(), Value::from(audio::current_input()));
     m.insert("gamemode".into(), Value::from(crate::gamemode::current()));
     m.insert("gamepad".into(), Value::from(crate::android::gamepad::current_enabled()));
     m.insert(
@@ -448,6 +486,33 @@ mod tests {
         let back = set("");
         assert_eq!(back.values["audio_output"], "");
         assert_eq!(audio::current(), "");
+
+        set(&before);
+    }
+
+    #[test]
+    fn a_microphone_change_reaches_the_audio_backend_and_opens_nothing() {
+        let _g = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = audio::current_input();
+        let sink_before = audio::current();
+
+        let set = |name: &str| handle(&live_wire::encode_set(&[Update::AudioInput(name.into())]));
+        let r = set("a-source-that-does-not-exist");
+        assert!(r.ok, "{r:?}");
+        assert_eq!(r.applied, vec!["audio_input".to_string()]);
+        assert_eq!(r.values["audio_input"], "a-source-that-does-not-exist");
+        assert_eq!(audio::current_input(), "a-source-that-does-not-exist");
+        // Nothing is recording in a unit test, so nothing moved, and the reply
+        // says so rather than letting "applied" be read as "it is listening".
+        assert!(r.notes.contains_key("audio_input"), "{r:?}");
+        // The sink is a separate choice and did not follow.
+        assert_eq!(audio::current(), sink_before);
+
+        // Control: the opposite change flips it back; empty is the default.
+        assert_eq!(handle(&live_wire::encode_get()).values["audio_input"], "a-source-that-does-not-exist");
+        let back = set("");
+        assert_eq!(back.values["audio_input"], "");
+        assert_eq!(audio::current_input(), "");
 
         set(&before);
     }

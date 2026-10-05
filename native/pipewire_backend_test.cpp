@@ -316,6 +316,74 @@ void a_live_change_of_sink_is_seen_by_the_next_reader_and_says_what_it_could_not
     std::printf("ok: a_live_change_of_sink_is_seen_by_the_next_reader_and_says_what_it_could_not_do\n");
 }
 
+// ------------------------------------------------------ input device choice
+//
+// The microphone picker's three answers, which need no session, and the one
+// property of it that has a privacy cost: choosing or changing a microphone must
+// not open one.
+
+void a_chosen_source_is_the_target_a_missing_one_falls_back_and_none_is_not_a_fallback() {
+    using cordial::audio::testing::choose_input_target;
+    const std::vector<std::string> sources = {
+        "alsa_input.usb-Headset-00.mono-fallback",
+        "alsa_input.pci-0000_00_1f.3.analog-stereo",
+    };
+    bool fell_back = true;
+    assert(choose_input_target("alsa_input.usb-Headset-00.mono-fallback", sources, &fell_back) ==
+           "alsa_input.usb-Headset-00.mono-fallback");
+    assert(!fell_back);
+
+    // Unplugged since it was chosen: the default, said out loud.
+    assert(choose_input_target("alsa_input.usb-Gone", sources, &fell_back).empty());
+    assert(fell_back);
+
+    // Never chosen is the ordinary case and is not a fallback from anything.
+    assert(choose_input_target("", sources, &fell_back).empty());
+    assert(!fell_back);
+
+    // A sink's name is not a source's, and must not match one.
+    assert(choose_input_target("alsa_output.pci-0000_00_1f.3.analog-stereo", sources, &fell_back)
+               .empty());
+    assert(fell_back);
+    std::printf("ok: a_chosen_source_is_the_target_a_missing_one_falls_back_and_none_is_not_a_fallback\n");
+}
+
+/// **The microphone rule, for the picker.** Seeding the choice from the
+/// environment, changing it, reading it back and asking the shell's C ABI for
+/// the source list with a null out-pointer must all leave the process with no
+/// capture stream, and changing it with nothing recording must say there was
+/// nothing to move. `cordial_audio_sources` with a real session is held to the
+/// same count from the shell's side in `audio_devices.rs`.
+void choosing_a_microphone_opens_no_microphone() {
+    assert(cordial::audio::active_capture_streams() == 0);
+    ::setenv("CORDIAL_AUDIO_SOURCE", "source-from-the-environment", 1);
+    assert(cordial::audio::configured_input_device() == "source-from-the-environment");
+    assert(cordial::audio::active_capture_streams() == 0);
+
+    cordial::audio::OutputSwitch r = cordial::audio::set_input_device("source-b");
+    assert(cordial::audio::configured_input_device() == "source-b");
+    assert(r.moved == 0);
+    assert(!r.note.empty());
+    assert(cordial::audio::active_capture_streams() == 0);
+
+    // Control: the opposite change flips it back, and empty is the default.
+    r = cordial::audio::set_input_device("");
+    assert(cordial::audio::configured_input_device().empty());
+    assert(cordial::audio::active_capture_streams() == 0);
+
+    // The environment is read once, and the sink's choice is a separate thing.
+    assert(cordial::audio::configured_input_device().empty());
+    assert(cordial::audio::configured_output_device().empty());
+    ::unsetenv("CORDIAL_AUDIO_SOURCE");
+
+    assert(cordial_audio_sources(nullptr) == 0);
+    assert(cordial_audio_capture_streams() == 0);
+    // Resolving "no choice" walks no registry and opens nothing.
+    assert(cordial::audio::resolve_input_target("").empty());
+    assert(cordial::audio::active_capture_streams() == 0);
+    std::printf("ok: choosing_a_microphone_opens_no_microphone\n");
+}
+
 } // namespace
 
 int main() {
@@ -323,6 +391,7 @@ int main() {
     // set in the shell would otherwise fail a check that is about the code.
     ::unsetenv("CORDIAL_AUDIO_HOST");
     ::unsetenv("CORDIAL_AUDIO_SINK");
+    ::unsetenv("CORDIAL_AUDIO_SOURCE");
     a_full_queue_fills_the_buffer_exactly();
     an_empty_queue_produces_silence_not_stale_bytes();
     a_short_queue_fills_what_it_has_and_pads_the_rest_with_silence();
@@ -330,6 +399,7 @@ int main() {
     multiple_buffers_are_drained_in_order_within_one_fill();
     a_capture_stream_holds_nothing_until_it_is_opened();
     a_chosen_sink_that_is_present_is_the_target();
+    a_chosen_source_is_the_target_a_missing_one_falls_back_and_none_is_not_a_fallback();
     a_chosen_sink_that_has_gone_falls_back_to_the_default_and_says_so();
     no_choice_follows_the_default_and_is_not_a_fallback();
     an_empty_session_still_falls_back_rather_than_targeting_nothing();
@@ -339,6 +409,7 @@ int main() {
     the_factory_always_returns_a_stream();
     the_host_backend_is_read_once();
     a_live_change_of_sink_is_seen_by_the_next_reader_and_says_what_it_could_not_do();
+    choosing_a_microphone_opens_no_microphone();
     std::printf("all pipewire_backend checks passed\n");
     return 0;
 }

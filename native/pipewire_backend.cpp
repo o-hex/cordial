@@ -756,7 +756,40 @@ std::string choose_output_target(const std::string& requested,
     return {};
 }
 
+std::string choose_input_target(const std::string& requested,
+                                const std::vector<std::string>& available_sources,
+                                bool* fell_back) {
+    // The rule is identical and deliberately shared: "is the thing asked for
+    // present, and is empty a fallback" has one answer, and two copies of it is
+    // how the sink and the microphone would come to disagree.
+    return choose_output_target(requested, available_sources, fell_back);
+}
+
 } // namespace testing
+
+std::string resolve_input_target(const std::string& requested) {
+    if (requested.empty()) return {};
+
+    // Sources only, and enumeration only: this walks the registry, and the
+    // microphone rule at the top of `audio_classes.cpp` is why it must stay
+    // that. Nothing on this path may construct a `CaptureStream`.
+    std::vector<std::string> sources;
+    for (const DeviceInfo& d : enumerate_devices()) {
+        if (d.is_source) sources.push_back(d.node_name);
+    }
+
+    bool fell_back = false;
+    std::string target = testing::choose_input_target(requested, sources, &fell_back);
+    if (fell_back) {
+        std::fprintf(stderr,
+            "W/Cordial-OpenSLES         input device '%s' is not in this PipeWire session "
+            "(%zu source(s) present); falling back to the system default microphone. The "
+            "choice is kept, so replugging the device and starting voice chat again will "
+            "use it.\n",
+            requested.c_str(), sources.size());
+    }
+    return target;
+}
 
 std::string resolve_output_target(const std::string& requested) {
     if (requested.empty()) return {};
@@ -802,6 +835,10 @@ namespace {
 /// while holding this mutex, so there is no cycle to form.
 std::mutex g_live_mutex;
 std::vector<pw_stream*> g_live_streams;
+/// The capture side's own list, kept apart from the playback one so a sink
+/// change can still never reach a microphone and a microphone change can never
+/// move playback. Same mutex and the same lock order.
+std::vector<pw_stream*> g_live_capture_streams;
 
 void register_live_stream(pw_stream* stream) {
     std::lock_guard<std::mutex> lock(g_live_mutex);
@@ -813,6 +850,22 @@ void unregister_live_stream(pw_stream* stream) {
     for (size_t i = 0; i < g_live_streams.size(); ++i) {
         if (g_live_streams[i] == stream) {
             g_live_streams.erase(g_live_streams.begin() + static_cast<std::ptrdiff_t>(i));
+            return;
+        }
+    }
+}
+
+void register_live_capture(pw_stream* stream) {
+    std::lock_guard<std::mutex> lock(g_live_mutex);
+    g_live_capture_streams.push_back(stream);
+}
+
+void unregister_live_capture(pw_stream* stream) {
+    std::lock_guard<std::mutex> lock(g_live_mutex);
+    for (size_t i = 0; i < g_live_capture_streams.size(); ++i) {
+        if (g_live_capture_streams[i] == stream) {
+            g_live_capture_streams.erase(g_live_capture_streams.begin() +
+                                         static_cast<std::ptrdiff_t>(i));
             return;
         }
     }
@@ -838,6 +891,10 @@ uint32_t find_default_metadata(Session* session, pw_registry* registry, spa_hook
 
 } // namespace
 
+namespace {
+OutputSwitch retarget_streams_impl(const std::string& requested, bool capture);
+} // namespace
+
 /// Re-aims every connected output stream at `requested`. See
 /// `set_output_device` in the header for why this writes metadata rather than
 /// updating the stream's properties.
@@ -848,16 +905,31 @@ uint32_t find_default_metadata(Session* session, pw_registry* registry, spa_hook
 /// wrong, because it restores the stream's own `target.object` -- the sink it
 /// was opened on -- rather than the default.
 OutputSwitch retarget_live_streams(const std::string& requested) {
+    return retarget_streams_impl(requested, /*capture=*/false);
+}
+
+/// The microphone's version: the same metadata write, aimed at the capture
+/// streams that are open. Never opens one -- with none open it says so and
+/// returns, which is what keeps a change in Settings from lighting the
+/// microphone indicator.
+OutputSwitch retarget_live_capture(const std::string& requested) {
+    return retarget_streams_impl(requested, /*capture=*/true);
+}
+
+namespace {
+
+OutputSwitch retarget_streams_impl(const std::string& requested, bool capture) {
     OutputSwitch result;
+    const char* const noun = capture ? "capture" : "playback";
 
     // Before anything is locked: this enumerates, and enumeration takes the
     // loop lock.
     {
         std::lock_guard<std::mutex> lock(g_live_mutex);
-        if (g_live_streams.empty()) {
-            result.note =
-                "no PipeWire playback stream is open, so there was nothing to move; the "
-                "choice applies to streams opened from now on";
+        if ((capture ? g_live_capture_streams : g_live_streams).empty()) {
+            result.note = std::string("no PipeWire ") + noun +
+                          " stream is open, so there was nothing to move; the choice applies "
+                          "to streams opened from now on";
             return result;
         }
     }
@@ -866,11 +938,12 @@ OutputSwitch retarget_live_streams(const std::string& requested) {
         result.note = "no PipeWire session to ask";
         return result;
     }
-    const std::string target = resolve_output_target(requested);
+    const std::string target =
+        capture ? resolve_input_target(requested) : resolve_output_target(requested);
     const bool to_default = target.empty();
     if (!requested.empty() && to_default) {
-        result.note = "sink '" + requested +
-                      "' is not in this PipeWire session; playing on the system default "
+        result.note = std::string(capture ? "source '" : "sink '") + requested +
+                      "' is not in this PipeWire session; using the system default "
                       "instead, and the choice is kept for when it returns";
     }
 
@@ -881,7 +954,7 @@ OutputSwitch retarget_live_streams(const std::string& requested) {
     std::vector<pw_stream*> streams;
     {
         std::lock_guard<std::mutex> lock(g_live_mutex);
-        streams = g_live_streams;
+        streams = capture ? g_live_capture_streams : g_live_streams;
     }
 
     pw_registry* registry = pw_core_get_registry(session->core, PW_VERSION_REGISTRY, 0);
@@ -904,7 +977,7 @@ OutputSwitch retarget_live_streams(const std::string& requested) {
         // at all. **Saying so is the point**: a move that cannot be made must not
         // be reported as made.
         result.note = "this PipeWire session has no 'default' metadata (is a session manager "
-                      "running?); playing streams stay on their sink until the next launch";
+                      "running?); open streams stay where they are until the next launch";
     } else {
         for (pw_stream* stream : streams) {
             const uint32_t node = g_lib.stream_get_node_id(stream);
@@ -935,10 +1008,13 @@ OutputSwitch retarget_live_streams(const std::string& requested) {
     g_lib.thread_loop_unlock(session->loop);
 
     std::fprintf(stderr,
-        "I/Cordial-Audio           output sink -> %s: %zu playing stream(s) re-linked.\n",
-        to_default ? "the system default" : target.c_str(), result.moved);
+        "I/Cordial-Audio           %s %s -> %s: %zu %s stream(s) re-linked.\n",
+        capture ? "input" : "output", capture ? "source" : "sink",
+        to_default ? "the system default" : target.c_str(), result.moved, noun);
     return result;
 }
+
+} // namespace
 
 // ---------------------------------------------------------- CallbackStream
 
@@ -1367,6 +1443,7 @@ CaptureStream::~CaptureStream() {
 bool CaptureStream::open(uint32_t rate_hz, uint32_t channels, const std::string& target_node_name) {
     if (impl_->stream) return true;
     impl_->failed.store(false, std::memory_order_release);
+    const std::string chosen_at_open = configured_input_device();
 
     // Cordial has three independent owners of a `CaptureStream`:
     // `AudioRecord` and `WebRtcAudioRecord` in `audio_classes.cpp`, and
@@ -1495,16 +1572,28 @@ bool CaptureStream::open(uint32_t rate_hz, uint32_t channels, const std::string&
     }
 
     g_open_capture_streams.fetch_add(1);
+    // After the unlock, for the lock order the registry's comment sets out.
+    register_live_capture(impl_->stream);
     std::fprintf(stderr,
         "I/Cordial-OpenSLES         microphone opened: %u Hz, %u channel(s), source '%s'. "
         "%u capture stream(s) now open.\n",
         rate_hz, channels, target_node_name.empty() ? "(PipeWire default)" : target_node_name.c_str(),
         g_open_capture_streams.load());
+    // A change of microphone that landed while this stream was connecting went
+    // looking for streams and did not find this one. Ask again if the choice
+    // moved since this open began. Compared with the *choice* read at the top
+    // and not with `target_node_name`: the callers pass a resolved name, which
+    // is empty for "follow the default" and for "the chosen source is gone" and
+    // is the default's own name for two of the three, so comparing against it
+    // would move every stream on every open and warn twice about a missing one.
+    const std::string source_now = configured_input_device();
+    if (source_now != chosen_at_open) retarget_live_capture(source_now);
     return true;
 }
 
 void CaptureStream::close() {
     if (!impl_ || !impl_->stream) return;
+    unregister_live_capture(impl_->stream);
     Session* session = get_session();
     if (session) {
         g_lib.thread_loop_lock(session->loop);
@@ -1780,10 +1869,18 @@ uint32_t active_capture_streams() { return 0; }
 
 std::string resolve_output_target(const std::string&) { return {}; }
 
+std::string resolve_input_target(const std::string&) { return {}; }
+
 /// There is no stream to move and no session to ask. Said, not silently zero.
 OutputSwitch retarget_live_streams(const std::string&) {
     OutputSwitch r;
     r.note = "this build has no PipeWire support, so there is no playback to move";
+    return r;
+}
+
+OutputSwitch retarget_live_capture(const std::string&) {
+    OutputSwitch r;
+    r.note = "this build has no PipeWire support, so there is no recording to move";
     return r;
 }
 
@@ -1802,6 +1899,12 @@ std::string choose_output_target(const std::string& requested,
     }
     if (fell_back) *fell_back = true;
     return {};
+}
+
+std::string choose_input_target(const std::string& requested,
+                                const std::vector<std::string>& available_sources,
+                                bool* fell_back) {
+    return choose_output_target(requested, available_sources, fell_back);
 }
 
 } // namespace testing
@@ -1868,6 +1971,7 @@ PlaybackStream::QueueState PlaybackStream::state() const { return {0, 0}; }
 namespace cordial::audio {
 
 OutputSwitch retarget_live_streams(const std::string& requested);
+OutputSwitch retarget_live_capture(const std::string& requested);
 
 namespace {
 
@@ -1922,6 +2026,61 @@ OutputSwitch set_output_device(const std::string& name) {
                       " cannot move a stream that is already playing; the choice applies "
                       "to streams opened from now on";
     }
+    return result;
+}
+
+// ------------------------------------------------------- the input device
+//
+// The microphone's copy of the above, and kept as a copy rather than folded into
+// one generic holder because the two have different consequences: a wrong sink
+// is silence the user can hear, and a wrong source is a microphone that records
+// from somewhere nobody chose, which is the one failure here that has a
+// privacy cost.
+
+namespace {
+
+std::mutex g_input_mutex;
+std::string g_input_device;
+bool g_input_seeded = false;
+
+/// Reads `CORDIAL_AUDIO_SOURCE` the first time anybody asks. Needs
+/// `g_input_mutex`. An empty value is the same as an unset one, as for the sink.
+void seed_input_device_locked() {
+    if (g_input_seeded) return;
+    g_input_seeded = true;
+    const char* v = std::getenv("CORDIAL_AUDIO_SOURCE");
+    g_input_device = v ? v : "";
+    if (!g_input_device.empty()) {
+        // Says what was asked for and not that a microphone was opened: nothing
+        // is, until Roblox starts recording.
+        std::fprintf(stderr,
+            "I/Cordial-OpenSLES         input device: recording will be aimed at PipeWire "
+            "source '%s' (CORDIAL_AUDIO_SOURCE). Unset it to follow the system default.\n",
+            g_input_device.c_str());
+    }
+}
+
+} // namespace
+
+std::string configured_input_device() {
+    std::lock_guard<std::mutex> lock(g_input_mutex);
+    seed_input_device_locked();
+    return g_input_device;
+}
+
+OutputSwitch set_input_device(const std::string& name) {
+    {
+        std::lock_guard<std::mutex> lock(g_input_mutex);
+        seed_input_device_locked();
+        g_input_device = name;
+    }
+    std::fprintf(stderr, "I/Cordial-Audio           input device set to %s.\n",
+                 name.empty() ? "the system default" : ("'" + name + "'").c_str());
+    OutputSwitch result = retarget_live_capture(name);
+
+    // Only PipeWire's `CaptureStream` exists today (the other backends are
+    // output only), so there is no host-backend caveat to add as
+    // `set_output_device` does.
     return result;
 }
 
@@ -2124,6 +2283,55 @@ size_t cordial_audio_sinks(CordialAudioSink** out) {
     }
     *out = list;
     return count;
+}
+
+size_t cordial_audio_sources(CordialAudioSink** out) {
+    if (!out) return 0;
+    *out = nullptr;
+
+    // The same registry walk as the sinks, filtered the other way. Enumeration
+    // only: nothing here constructs a `CaptureStream`, which is the rule at the
+    // top of `audio_classes.cpp` and is pinned by the shell's own test of this
+    // call reading `cordial_audio_capture_streams` before and after.
+    std::vector<cordial::audio::DeviceInfo> devices = cordial::audio::enumerate_devices();
+
+    size_t count = 0;
+    for (const cordial::audio::DeviceInfo& d : devices) {
+        if (d.is_source && !d.node_name.empty()) ++count;
+    }
+    if (count == 0) return 0;
+
+    auto* list = static_cast<CordialAudioSink*>(std::calloc(count, sizeof(CordialAudioSink)));
+    if (!list) return 0;
+
+    size_t i = 0;
+    for (const cordial::audio::DeviceInfo& d : devices) {
+        if (!d.is_source || d.node_name.empty()) continue;
+        list[i].node_name = ::strdup(d.node_name.c_str());
+        list[i].description =
+            ::strdup(d.description.empty() ? d.node_name.c_str() : d.description.c_str());
+        list[i].is_default = d.is_default ? 1 : 0;
+        ++i;
+    }
+    *out = list;
+    return count;
+}
+
+unsigned cordial_audio_capture_streams(void) { return cordial::audio::active_capture_streams(); }
+
+size_t cordial_audio_set_input(const char* name, char* note, size_t note_len) {
+    const cordial::audio::OutputSwitch r =
+        cordial::audio::set_input_device(name ? std::string(name) : std::string());
+    if (note && note_len > 0) {
+        std::snprintf(note, note_len, "%s", r.note.c_str());
+    }
+    return r.moved;
+}
+
+size_t cordial_audio_input(char* out, size_t out_len) {
+    const std::string now = cordial::audio::configured_input_device();
+    if (out && out_len > 0) std::snprintf(out, out_len, "%s", now.c_str());
+    return now.size();
 }
 
 size_t cordial_audio_set_output(const char* name, char* note, size_t note_len) {

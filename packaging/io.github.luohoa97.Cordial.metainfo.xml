@@ -78,6 +78,16 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.25.0" date="2026-10-05">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.25.0</url>
+      <description>
+        <p>
+          Cordial keeps its own Roblox builds, and each profile runs the newest
+          or one you pin. Opening a web page in the Flatpak no longer crashes,
+          and Settings can choose the microphone.
+        </p>
+      </description>
+    </release>
     <release version="0.24.1" date="2026-10-04">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.24.1</url>
       <description>

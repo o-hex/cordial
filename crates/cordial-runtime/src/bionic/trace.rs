@@ -18,7 +18,8 @@
 //! `CORDIAL_ANDROID_TRACE=1` is the safe counterpart: the Android API has no
 //! variadic entry points, so wrapping it changes nothing.
 
-use std::ffi::{c_char, c_int, c_long, c_void, CStr};
+use super::{cstr as s, die_with};
+use std::ffi::{c_char, c_int, c_long, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -34,9 +35,13 @@ fn log(args: std::fmt::Arguments<'_>) {
         // The thread id is not decoration. Roblox runs this work on twenty-odd
         // threads, and a single interleaved sequence invites reading two
         // unrelated calls as cause and effect.
-        let tid = unsafe { libc_gettid() };
-        eprintln!("[{n:>6}] tid={tid} {args}");
+        eprintln!("[{n:>6}] tid={} {args}", current_tid());
     }
+}
+
+fn current_tid() -> c_int {
+    // SAFETY: takes no arguments and reads this thread's own id.
+    unsafe { libc_gettid() }
 }
 
 extern "C" {
@@ -44,16 +49,8 @@ extern "C" {
     fn libc_gettid() -> c_int;
 }
 
-/// SAFETY: `p` is either null or a NUL-terminated C string.
-unsafe fn s(p: *const c_char) -> String {
-    if p.is_null() {
-        "(null)".into()
-    } else {
-        // SAFETY: non-null per the check above; NUL-termination is this
-        // function's own contract, stated above.
-        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
-    }
-}
+// `s` is `super::cstr`: two copies of the null-then-`CStr` conversion for
+// diagnostics, one here and one for `__assert`, are now one in `ffi_util`.
 
 extern "C" {
     fn open64(path: *const c_char, flags: c_int, ...) -> c_int;
@@ -64,7 +61,6 @@ extern "C" {
     fn getauxval(kind: c_ulong) -> c_ulong;
     fn prctl(option: c_int, ...) -> c_int;
     fn syscall(num: c_long, ...) -> c_long;
-    fn abort() -> !;
 }
 
 #[allow(non_camel_case_types)]
@@ -132,22 +128,32 @@ extern "C" fn t_syscall(num: c_long, a: u64, b: u64, c: u64, d: u64, e: u64, f: 
     rc
 }
 
-/// The one wrapper that is worth having even without `--trace`: it turns "the
-/// process died" into "the process chose to die, here".
+/// What `abort()` prints. The one wrapper that is worth having even without
+/// `--trace`: it turns "the process died" into "the process chose to die, here".
+const ABORT_REPORT: &str = "\n*** Roblox called abort() ***";
+
+const STACK_CHK_REPORT: &str = "\n*** stack protector tripped inside Roblox ***\n    \
+     A callee wrote past its frame. If Cordial provided that callee,\n    \
+     its signature or a struct layout is wrong — see bionic::pthread.";
+
+/// What `__android_log_assert` prints, as one block.
+fn log_assert_report(tag: &str, cond: &str, msg: &str) -> String {
+    format!(
+        "\n*** Roblox log-assert ***\n    tag:       {tag}\n    condition: {cond}\n    message:   {msg}"
+    )
+}
+
+// All three end in `super::die_with`, which prints, lists the stubs hit so far
+// and calls the host's `abort` through `std::process::abort` -- the same
+// `abort(3)` the extern declaration above reached, without an `unsafe` block to
+// say so.
+
 extern "C" fn t_abort() -> ! {
-    eprintln!("\n*** Roblox called abort() ***");
-    crate::stubs::report();
-    // SAFETY: abort is noreturn and takes no arguments.
-    unsafe { abort() }
+    die_with(ABORT_REPORT)
 }
 
 extern "C" fn t_stack_chk_fail() -> ! {
-    eprintln!("\n*** stack protector tripped inside Roblox ***");
-    eprintln!("    A callee wrote past its frame. If Cordial provided that callee,");
-    eprintln!("    its signature or a struct layout is wrong — see bionic::pthread.");
-    crate::stubs::report();
-    // SAFETY: as above.
-    unsafe { abort() }
+    die_with(STACK_CHK_REPORT)
 }
 
 extern "C" fn t_android_log_assert(
@@ -156,15 +162,8 @@ extern "C" fn t_android_log_assert(
     fmt: *const c_char,
 ) -> ! {
     // SAFETY: liblog's contract is NUL-terminated strings or null.
-    unsafe {
-        eprintln!("\n*** Roblox log-assert ***");
-        eprintln!("    tag:       {}", s(tag));
-        eprintln!("    condition: {}", s(cond));
-        eprintln!("    message:   {}", s(fmt));
-    }
-    crate::stubs::report();
-    // SAFETY: as above.
-    unsafe { abort() }
+    let (tag, cond, msg) = unsafe { (s(tag), s(cond), s(fmt)) };
+    die_with(&log_assert_report(&tag, &cond, &msg))
 }
 
 /// Wrappers installed unconditionally, because a silent abort costs more time
@@ -199,4 +198,61 @@ pub fn verbose() -> Vec<(&'static str, *mut c_void)> {
         f!("prctl", t_prctl),
         f!("syscall", t_syscall),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_log_assert_prints_tag_condition_and_message_in_that_order() {
+        assert_eq!(
+            log_assert_report("RobloxEngine", "ptr != nullptr", "no device"),
+            "\n*** Roblox log-assert ***\n    tag:       RobloxEngine\n    condition: ptr != nullptr\n    message:   no device"
+        );
+    }
+
+    #[test]
+    fn the_stack_protector_report_names_the_likely_culprit() {
+        // Four lines once the banner is split: the point of the message is the
+        // pointer to `bionic::pthread`, so a reflow must not lose it.
+        assert!(STACK_CHK_REPORT.contains("stack protector tripped"));
+        assert!(STACK_CHK_REPORT.contains("bionic::pthread"));
+        assert_eq!(STACK_CHK_REPORT.lines().count(), 4);
+        assert!(STACK_CHK_REPORT.lines().skip(2).all(|l| l.starts_with("    ")), "{STACK_CHK_REPORT}");
+    }
+
+    #[test]
+    fn the_always_on_wrappers_are_exactly_the_three_that_end_the_process() {
+        let names: Vec<_> = always_on().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["abort", "__stack_chk_fail", "__android_log_assert"]);
+    }
+
+    #[test]
+    fn the_verbose_set_still_holds_the_variadic_wrappers_it_is_off_by_default_for() {
+        // `CORDIAL_TRACE=1` is unsafe because these are declared with fixed
+        // arity; if one were dropped from the table the warning in the module
+        // doc would be about nothing, and if one were converted this test is
+        // the prompt to reread it.
+        let names: Vec<_> = verbose().into_iter().map(|(n, _)| n).collect();
+        for variadic in ["open64", "openat", "prctl", "syscall"] {
+            assert!(names.contains(&variadic), "{variadic}");
+        }
+    }
+
+    #[test]
+    fn a_thread_id_is_positive() {
+        assert!(current_tid() > 0);
+    }
+
+    #[test]
+    fn logging_is_silent_until_enabled() {
+        // `log` advances the sequence only when tracing is on, so a disabled
+        // run cannot be told from one that never called it.
+        let before = SEQ.load(Ordering::Relaxed);
+        if !ENABLED.load(Ordering::Relaxed) {
+            log(format_args!("must not be counted"));
+            assert_eq!(SEQ.load(Ordering::Relaxed), before);
+        }
+    }
 }

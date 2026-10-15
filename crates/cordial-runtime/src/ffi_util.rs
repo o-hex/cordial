@@ -15,9 +15,13 @@
 //! Started on those three call sites and extended to `android/asset.rs`, whose
 //! ten entry points now validate, convert through these helpers and call safe
 //! inner functions; `bionic/signal.rs`'s `sigaction` translation went the same
-//! way and has no pointer in its layout code at all. That is a few files of the
-//! crate's ~350 `extern "C"` functions, not a rewrite of it -- the tracking
-//! issue linked from ADR-036 says which remain.
+//! way and has no pointer in its layout code at all. `bionic/pthread.rs`,
+//! `bionic/mod.rs` and `bionic/trace.rs` followed: the pthread wrappers borrow
+//! the engine's own `pthread_cond_t`/`sem_t` through [`overlay_ref`] and hand a
+//! `&BionicCond` to inner functions, and the seven hand-copied native symbol
+//! tables became one. That is a handful of files of the crate's ~350
+//! `extern "C"` functions, not a rewrite of it -- the tracking issue linked
+//! from ADR-036 says which remain.
 
 use std::ffi::{c_char, c_void, CStr};
 
@@ -106,6 +110,35 @@ pub(crate) unsafe fn drop_handle<T>(handle: *mut c_void) {
         // SAFETY: non-null, and from `into_handle::<T>` per the contract.
         drop(unsafe { Box::from_raw(handle as *mut T) });
     }
+}
+
+/// Borrow storage the *caller* allocated as an overlay type of ours, or `None`
+/// for null.
+///
+/// The libc shim in `bionic/pthread.rs` lays `BionicCond`, `BionicSem` and the
+/// like over the engine's own `pthread_cond_t` and `sem_t`. That is the same
+/// shape as a handle (a `c_void` pointer that is really a `T`) with a different
+/// owner: the engine allocated it, so there is nothing for [`drop_handle`] to
+/// free and no [`into_handle`] to come from. Shared, not mutable, because the
+/// overlays are made of atomics and a `&mut` over storage that other threads
+/// are locking is a promise nobody can keep.
+///
+/// # Safety
+/// `ptr`, if not null, must point at storage at least `size_of::<T>()` bytes
+/// long, aligned for `T`, that stays valid for the borrow, and every field of
+/// `T` must tolerate concurrent access through a shared reference.
+pub(crate) unsafe fn overlay_ref<'a, T>(ptr: *const c_void) -> Option<&'a T> {
+    // SAFETY: the contract above is the caller's; `as_ref` supplies the null check.
+    unsafe { (ptr as *const T).as_ref() }
+}
+
+/// A C string for a diagnostic, or `"(null)"`.
+///
+/// `bionic::cstr` and `bionic::trace::s` were two copies of the same
+/// null-then-`CStr::from_ptr` dance for printing an assertion's arguments;
+/// this is the pointer-free half of it, taking what [`borrow_request`] returns.
+pub(crate) fn lossy_or_null(c: Option<&CStr>) -> String {
+    c.map_or_else(|| "(null)".into(), |c| c.to_string_lossy().into_owned())
 }
 
 /// Write `value` through an out-parameter the caller may have passed as null.
@@ -199,6 +232,30 @@ mod tests {
         // SAFETY: a live handle to a `Counted`, freed exactly once.
         unsafe { drop_handle::<Counted>(h) };
         assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_overlay_borrows_caller_storage_and_null_is_nothing() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Two words of caller-owned storage, viewed as the atomic they hold.
+        let storage = [AtomicU32::new(7), AtomicU32::new(0)];
+        let p = storage.as_ptr() as *const c_void;
+        // SAFETY: `p` is live, aligned for `AtomicU32`, and atomics tolerate sharing.
+        let first = unsafe { overlay_ref::<AtomicU32>(p) }.expect("non-null borrows");
+        assert_eq!(first.load(Ordering::SeqCst), 7);
+        first.store(9, Ordering::SeqCst);
+        assert_eq!(storage[0].load(Ordering::SeqCst), 9, "the borrow is the storage, not a copy");
+        // SAFETY: null is the case under test; the helper checks before it looks.
+        assert!(unsafe { overlay_ref::<AtomicU32>(std::ptr::null()) }.is_none());
+    }
+
+    #[test]
+    fn a_null_diagnostic_string_prints_as_null_and_a_bad_one_does_not_panic() {
+        assert_eq!(lossy_or_null(None), "(null)");
+        assert_eq!(lossy_or_null(Some(c"plain")), "plain");
+        // Not UTF-8: the lossy conversion is the reason this is a `String`.
+        let bytes = CString::new(vec![b'a', 0xff, b'b']).unwrap();
+        assert_eq!(lossy_or_null(Some(bytes.as_c_str())), "a\u{fffd}b");
     }
 
     #[test]

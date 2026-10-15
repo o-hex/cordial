@@ -171,7 +171,7 @@ cordial --import-flags --sober                    # finds Sober's own config
 cordial --import-flags list.json --profile NAME --replace
 ```
 
-Flags already set are kept unless the list sets them again. `--replace` starts from empty instead. Values are checked by prefix: `FFlag` takes `True` or `False`, `FInt` a whole number, and `FLog` anything, because a log channel takes either a number or a severity and that is not visible from outside.
+Flags already set are kept unless the list sets them again. `--replace` starts from empty instead. Values are checked by prefix: `FFlag` takes `True` or `False`, `FInt` a whole number, and `FLog` anything, because a log channel takes either a number or a severity and Cordial cannot tell which one a channel wants. `python3 tools/flog_channel_shapes.py` lists the shape Roblox's own settings use for the channels they set (139 in the settings fetched on 2026-10-15); a channel they do not set is reported as `unknown`, not guessed.
 
 An entry the check refuses is skipped and named, and the rest are imported. A name with no FastFlag prefix is imported and listed, so a typo shows. The Sober path outside the Flatpak (`~/.config/sober/config.json`) is `INFERRED`; only the Flatpak's has been seen.
 

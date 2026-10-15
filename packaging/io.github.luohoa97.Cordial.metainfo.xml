@@ -78,6 +78,15 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.33.0" date="2026-10-16">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.33.0</url>
+      <description>
+        <p>
+          Controller sticks work up and down, holding two mouse buttons no
+          longer breaks the first, and two-step sign-in can finish.
+        </p>
+      </description>
+    </release>
     <release version="0.32.0" date="2026-10-16">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.32.0</url>
       <description>

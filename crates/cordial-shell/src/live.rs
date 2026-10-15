@@ -98,6 +98,8 @@ pub const CLASSIFICATION: &[(&str, Applies, &str)] = &[
     ("vkbasalt", Applies::NextLaunch, "a Vulkan layer, loaded at instance creation"),
     ("audio_output", Applies::Live, "the running streams are re-linked to the new sink in place; a host backend with no sink to move between (ALSA, OSS, PulseAudio) applies it to streams opened afterwards"),
     ("audio_input", Applies::Live, "a recording in progress is re-linked to the new source in place; with none open nothing is opened and the choice is used the next time Roblox starts recording"),
+    ("record_session", Applies::NextLaunch, "the client reads it at launch and starts the recorder then; there is no live toggle yet (ADR-059)"),
+    ("record_audio", Applies::NextLaunch, "the encoder's audio input is chosen when the recorder starts, at launch"),
     ("fullscreen_accel", Applies::NextLaunch, "bound when the launcher window is built; no Settings row"),
     ("marketplace_index_dir", Applies::Shell, "read when the Plugins page loads"),
     ("marketplace_public_key", Applies::Shell, "read when the Plugins page loads"),

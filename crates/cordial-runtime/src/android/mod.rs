@@ -27,11 +27,13 @@ pub mod input;
 pub mod looper;
 pub mod surface_params;
 pub mod system;
+pub mod text_geometry;
 pub mod vulkan;
 pub mod vulkan_etc;
 pub mod wl_dmabuf;
 pub mod wayland;
 pub mod window;
+pub mod x11_text;
 // VR only: it mirrors the guest engine's OpenXR left eye into the window.
 #[cfg(feature = "vr")]
 pub mod xr_mirror;

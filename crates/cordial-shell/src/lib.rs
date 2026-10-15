@@ -45,7 +45,9 @@ pub mod freeze_recovery;
 // Which display backend a gamescope session gets; the launcher, `--doctor` and
 // the loader all ask it, so it is here and not in any one of them.
 pub mod gamescope;
+pub mod editor;
 pub mod host_window;
+pub mod x11_editor;
 pub mod json_highlight;
 pub mod log_export;
 pub mod runtime_session;

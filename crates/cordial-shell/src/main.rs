@@ -395,14 +395,17 @@ fn start(app: &libadwaita::Application, shell: &Rc<RefCell<Option<window::Shell>
     // engine at a profile directory and the storage that has a login in it
     // is still at the pre-ADR-012 path. Skipped when there is nothing to
     // move, which is every run after the first.
+    cordial_shell::startup_watch::stage("moving a pre-profile layout");
     cordial_shell::profile::migrate_legacy_layout();
 
+    cordial_shell::startup_watch::stage("reading settings");
     let config_path = Rc::new(shell_config::path());
     let config = Rc::new(RefCell::new(shell_config::load(&config_path)));
 
     // ADR-054: before the window, because everything it draws and launches
     // reads the store, and the first launch after the upgrade has things to
     // move into it. Once, by construction -- see `migration`.
+    cordial_shell::startup_watch::stage("moving the build store");
     let migrated = migration::run(&mut config.borrow_mut());
     migrated.print();
     if migrated.config_changed() {
@@ -445,13 +448,21 @@ fn start(app: &libadwaita::Application, shell: &Rc<RefCell<Option<window::Shell>
 
     // Running games follow Settings (ADR-044). Leaked on purpose: the watch has
     // to outlive every window and dropping the guard would stop it.
+    cordial_shell::startup_watch::stage("starting the live settings watch");
     let live_watch = live::start(&config_path, &config.borrow());
     std::mem::forget(live_watch);
 
     // The offer to fetch a newer build is a dialog, and a game that was told to
     // play has nobody to answer it.
+    cordial_shell::startup_watch::stage("building the window");
+    if !playing {
+        // Armed here and not earlier: a game started from the command line
+        // shows no launcher, and a watchdog waiting for one would be wrong.
+        cordial_shell::startup_watch::arm();
+    }
     *shell.borrow_mut() =
         Some(window::build(app, config, config_path, migrated.offer_newest() && !playing));
+    cordial_shell::startup_watch::stage("built the window; waiting for GTK to map it");
     // `--place-id`: waiting as the link the next launch carries, with no banner
     // shown to anybody and no window raised.
     if let Some(link) = cli::active().and_then(|c| c.place_link()) {

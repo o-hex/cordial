@@ -1080,6 +1080,9 @@ impl HostWindow {
             .default_height(h)
             .content(&toolbar)
             .build();
+        // Tells the launcher's startup watchdog that there is nothing to
+        // report. Harmless in `cordial-run`, which never arms it.
+        window.connect_map(|_| crate::startup_watch::mapped());
 
         HostWindow {
             window,

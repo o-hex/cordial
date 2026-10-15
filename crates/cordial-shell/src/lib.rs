@@ -50,6 +50,7 @@ pub mod json_highlight;
 pub mod log_export;
 pub mod runtime_session;
 pub mod session_log;
+pub mod startup_watch;
 pub mod network;
 // What Cordial does only when the GPU is NVIDIA's, and the parsing the shell and
 // the runtime both need for it. In the library half for the reason `network`

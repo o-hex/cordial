@@ -1141,7 +1141,11 @@ Deno.test("an attachment-only message is carried to the issue as a link, with th
               content: "",
               author: { global_name: "Reporter" },
               attachments: [
-                { filename: "cordial-logs.zip", url: "https://cdn.discordapp.com/attachments/1/2/cordial-logs.zip?ex=abc", size: 20480 },
+                {
+                  filename: "cordial-logs.zip",
+                  url: "https://cdn.discordapp.com/attachments/1/2/cordial-logs.zip?ex=abc",
+                  size: 20480,
+                },
                 { filename: "evil.zip", url: "javascript:alert(1)" },
               ],
             },
@@ -1153,7 +1157,10 @@ Deno.test("an attachment-only message is carried to the issue as a link, with th
   await after!();
   const [posted] = of("comment");
   const text = posted.args[1] as string;
-  assertStringIncludes(text, "[cordial-logs.zip](https://cdn.discordapp.com/attachments/1/2/cordial-logs.zip?ex=abc) (20 KiB)");
+  assertStringIncludes(
+    text,
+    "[cordial-logs.zip](https://cdn.discordapp.com/attachments/1/2/cordial-logs.zip?ex=abc) (20 KiB)",
+  );
   assertStringIncludes(text, "expire");
   assert(!text.includes("javascript:"), "only https links are carried");
 });

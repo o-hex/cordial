@@ -59,6 +59,7 @@ mod x11_notice;
 #[cfg(feature = "webview")]
 mod webview;
 mod webview_policy;
+mod webview_captcha;
 mod window;
 use cordial_shell::window_state;
 

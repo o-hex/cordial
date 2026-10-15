@@ -251,6 +251,10 @@ Deno.test("the log archive field is the web form's alone, and every bug form ask
     // the follow-up.
     const ids = [...form.placed, ...form.dropped].map((b) => b.id);
     assert(!ids.includes("log-archive"), `${form.slug} would show the archive field in Discord`);
-    assertEquals(form.webOnly.every((b) => b.validations?.required), true, "and on the web it is required");
+    assertEquals(
+      form.webOnly.every((b) => b.validations?.required),
+      true,
+      "and on the web it is required",
+    );
   }
 });

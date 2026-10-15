@@ -183,7 +183,7 @@ const FUNCS: &[(&str, &[Ty], Ret)] = &[
     ("strtoul", &[Ptr, Ptr, I32], Ret::Int(U64)), ("strtoull", &[Ptr, Ptr, I32], Ret::Int(U64)),
     ("tolower", &[I32], Ret::Int(I32)), ("isspace", &[I32], Ret::Int(I32)),
 
-    // FORTIFY. bionic's own (`__strlen_chk`, `__strchr_chk`, `__strncpy_chk2`,
+    // FORTIFY. bionic's own (`__strlen_chk`, `__strchr_chk`, `__strrchr_chk`, `__strncpy_chk2`,
     // `__write_chk`, `__readlink_chk`, `__fread_chk`) are Cordial's; the rest
     // glibc exports under the same names and contracts.
     ("__memcpy_chk", &[Ptr, Ptr, U64, U64], Ret::Int(Ptr)),
@@ -193,6 +193,7 @@ const FUNCS: &[(&str, &[Ty], Ret)] = &[
     ("__strncpy_chk", &[Ptr, Ptr, U64, U64], Ret::Int(Ptr)),
     ("__strncpy_chk2", &[Ptr, Ptr, U64, U64, U64], Ret::Int(Ptr)),
     ("__strlen_chk", &[Ptr, U64], Ret::Int(U64)), ("__strchr_chk", &[Ptr, I32, U64], Ret::Int(Ptr)),
+    ("__strrchr_chk", &[Ptr, I32, U64], Ret::Int(Ptr)),
     ("__read_chk", &[I32, Ptr, U64, U64], Ret::Int(I64)),
     ("__write_chk", &[I32, Ptr, U64, U64], Ret::Int(I64)),
     ("__readlink_chk", &[Ptr, Ptr, U64, U64], Ret::Int(I64)),

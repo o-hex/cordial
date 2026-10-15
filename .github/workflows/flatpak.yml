@@ -56,21 +56,37 @@
 # and in packaging/cordial.flatpakrepo's own comment.
 #
 # The one part of this worth writing down at length: **GitHub Pages has no
-# incremental publish.** `deploy` below replaces the whole site on every run
-# with whatever `build` produced, and `build` hands flatpak-builder a
-# repository that starts empty -- there is nothing in this workflow that
-# would carry `stable` from one run to the next on its own. Left alone, the
-# very first ordinary push to main after a release would publish a site with
-# `master` and no `stable` at all, deleting the release channel out from under
-# everyone on it. "Carry the stable channel forward, or point it at this
-# release" is the step that stops that: before the summary is rewritten, it
-# pulls the currently-published `stable` ref back out of the live site (the
-# one this same job is about to replace) into the local repository, so an
-# ordinary push carries it forward unchanged and only a tagged commit moves
-# it. Verified against the real published repository on 2026-09-16 -- see
-# that step's own comment for what a repository with no `stable` yet does
-# instead, and see "Check whether this commit carries a release tag" for how
-# a push to main is told apart from a push that also carries a tag.
+# incremental publish, so `stable` has to be re-supplied by every deployment,
+# and whichever deployment finishes last is the site.** `build` hands
+# flatpak-builder a repository that starts empty and only ever exports
+# `master`; nothing carries `stable` from one run to the next except the
+# `merge` job copying it out of the live site before it uploads the new one.
+#
+# That copy used to happen in `build`, at the start of a run, together with the
+# question "does this commit carry a release tag?", and both were answered too
+# early. On 2026-10-15, for 0.28.0: the run for the release commit asked about
+# the tag in its first minute, before the tag existed, and published no stable;
+# a rerun fixed that and deployed stable=0.28.0 at 06:23:12; and the run for
+# the next commit, started at 06:08, had pulled the then-live stable (0.27.0)
+# when it began and deployed it at 06:23:41, thirty seconds later. Stable went
+# back a release with every job green.
+#
+# The rule now: **stable is decided in `merge`, after every build has
+# finished, from the live site as it is at that moment, by
+# packaging/flatpak-stable.sh, and `merge` holds the `flatpak-pages`
+# concurrency group from that read until `deploy-pages` returns.** That makes
+# the read-then-publish sequence one critical section, so a later deployment
+# starts from what the earlier one published, and the script refuses to move
+# stable to a lower version than the live one in any case. The tag question is
+# asked in the same job, against the remote, minutes after the push. The
+# script's own header says what it does for a tagged and an untagged commit.
+#
+# What this does not cover: GitHub keeps one pending run per concurrency
+# group and cancels the rest, so a tagged main run that is still queued when
+# two more pushes arrive is dropped, and the next run carries the old stable
+# forward. The script warns when the newest tag below the commit is ahead of
+# the stable it publishes, so that case is visible rather than silent; the
+# remedy is `gh run rerun` on the dropped run.
 
 name: Flatpak
 
@@ -113,7 +129,7 @@ permissions:
 
 # **The `flatpak-pages` concurrency group used to live here, at workflow level,
 # and that was the bug that shipped two releases with no Flatpak attached.**
-# It is now on the `deploy` job alone. What follows is why, because the comment
+# It is now on the `merge` job alone, which deploys. What follows is why, because the comment
 # it replaces argued the opposite and argued it from a real observation.
 #
 # The original reasoning: two runs exporting into the same Pages deployment
@@ -141,8 +157,9 @@ permissions:
 # Why the build is safe unserialised: each run exports into `--repo=repo`, a
 # fresh directory in its own workspace, and never fetches the published tree.
 # Two builds share no state. The `publish` job attaches to the release named by
-# its own tag, so two of those cannot collide either. The deployment is the only
-# shared resource in the file, and it is now the only thing queued on.
+# its own tag, so two of those cannot collide either. The deployment, and the
+# read of the live site that precedes it, are the only shared resources in the
+# file, and they are the only thing queued on.
 #
 # `timeout-minutes: 45` on the build job stays, but it is no longer load-bearing
 # for the queue: a stuck build cannot hold a group it is not in.
@@ -190,8 +207,8 @@ env:
   MANIFEST: packaging/io.github.luohoa97.Cordial.yml
   # Must name the same tree as Url in packaging/cordial.flatpakrepo -- see
   # that file's own comment for why it is not derived from github.repository.
-  # "Carry the stable channel forward" below reads this exact repository back
-  # in mid-build, so a rename here with no matching rename there would make
+  # packaging/flatpak-stable.sh reads this exact repository back during the
+  # `merge` job, so a rename here with no matching rename there would make
   # that step silently pull from the wrong tree, or from nothing, rather than
   # fail loudly.
   PAGES_REPO_URL: https://luohoa97.github.io/cordial/repo/
@@ -212,8 +229,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # A ceiling, because there is a queue behind this.
     #
-    # GitHub's default is six hours, and the concurrency group above means one
-    # stuck run holds every later one behind it. That is not hypothetical: a run
+    # GitHub's default is six hours, and a build that never finishes keeps
+    # its own `merge`, and the deploy, waiting. That is not hypothetical: a run
     # hung in `apt-get` on `Install flatpak` for twenty-eight minutes and had to
     # be cancelled by hand, by which time two queued runs had been superseded and
     # dropped. Six hours of that would have looked exactly like CI being broken.
@@ -228,24 +245,20 @@ jobs:
       # sources by commit and skips them out of the `dir` source, so a recursive checkout would only be
       # copied in and then thrown away.
       #
-      # fetch-tags: true is for "Check whether this commit carries a release
-      # tag" below, and without it that step finds nothing regardless of
-      # whether the commit is tagged. actions/checkout@v4's own default is
-      # fetch-depth: 1 *and* fetch-tags: false -- confirmed by reading its
-      # action.yml -- so the shallow clone this job ran with before had no
-      # tag refs in it at all. Replaying its git commands locally against
-      # this repository's real v0.16.0 tag showed the difference directly:
-      # with the defaults, `git tag --points-at HEAD` on that commit finds
-      # nothing; adding fetch-tags finds `v0.16.0`, and the extra fetch is
-      # small -- tag refs only, no extra commit history -- so fetch-depth
-      # stays at its default of 1 rather than growing to 0.
+      # fetch-tags is kept as it was, but it no longer serves the release
+      # decision: this job used to ask `git tag --points-at HEAD` whether the
+      # commit was tagged, and that was the first half of the 2026-10-15 stable
+      # race (see the header), because the tag did not exist yet when a
+      # branch-push run reached it. `merge` asks the remote instead, late.
+      # What may still read the tags is crates/cordial-shell/build.rs, whose
+      # `git describe --tags --exact-match` decides whether a release build
+      # shows its commit; whether that runs inside the sandboxed build at all
+      # is INFERRED, so the setting stays.
       #
       # **Except on a tag push, where fetch-tags breaks the checkout itself**:
       # v0.18.0's tag run failed both builds with "Cannot fetch both <sha> and
       # refs/tags/v0.18.0 to refs/tags/v0.18.0", because checkout already
       # fetches the triggering tag and fetch-tags asks for it a second time.
-      # On a tag run the tag is present without it, so the step below still
-      # finds it; only a push to main needs the extra tag fetch.
       - uses: actions/checkout@v4
         with:
           submodules: false
@@ -259,31 +272,6 @@ jobs:
       # `$ARCH` / `${{ env.ARCH }}` without re-deriving it.
       - name: Read this runner's architecture the way OSTree spells it
         run: echo "ARCH=$(uname -m)" >> "$GITHUB_ENV"
-
-      # A push to main can carry a release tag on the same commit: the release
-      # choreography here pushes main and the v* tag together
-      # (`git push origin main <tag>`), so by the time this job's checkout
-      # runs, both refs already exist server-side even though the *event*
-      # that started this run was the branch push, not the tag. Only main
-      # pushes reach `deploy` below -- a tag push's own ref is
-      # refs/tags/v..., which that job's condition never matches -- so this
-      # only needs to run, and only matters, here.
-      #
-      # `head -1` rather than trusting there is exactly one: two tags on the
-      # same commit is possible (a hotfix re-tagged, say) and this only needs
-      # one name to act on.
-      - name: Check whether this commit carries a release tag
-        if: github.ref == 'refs/heads/main'
-        id: release
-        run: |
-          set -euo pipefail
-          tag=$(git tag --points-at HEAD | grep '^v' | head -1 || true)
-          if [ -n "$tag" ]; then
-            echo "this commit carries $tag; stable will point at this build"
-          else
-            echo "no v* tag on this commit; stable is carried forward unchanged"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       # The runner ships with about 25 GB free and a lot of it is Android SDKs
       # and dotnet nobody here needs. The Flatpak build carries the runtime, the
@@ -475,63 +463,6 @@ jobs:
           ostree --repo=repo refs
           ostree --repo=repo refs --delete "runtime/$APP_ID.Debug/$ARCH/master" || true
 
-      # See the header comment for why this exists at all: GitHub Pages
-      # replaces the whole site on every deploy, flatpak-builder only ever
-      # exports `master` into a repository that starts this run empty, and
-      # without this step `stable` would vanish from the published tree on
-      # the very next ordinary push to main.
-      #
-      # --no-gpg-verify on this remote is about the pull, not the republish.
-      # The objects it fetches were already built and signed by this same
-      # workflow on an earlier run; re-verifying them here buys nothing, and a
-      # signing-key rotation would otherwise fail this step on old objects it
-      # has no actual reason to distrust. The repository this job publishes is
-      # signed exactly as it already was, in the step below.
-      #
-      # The first run to ever reach this path -- before any tagged commit has
-      # gone through it -- has no `stable` ref on the live site to pull, and
-      # `ostree pull` fails with "No such branch ... in repository summary".
-      # Verified locally against a repository missing the ref. That failure
-      # is expected and left non-fatal: `stable` simply does not exist yet,
-      # "Update the repository summary" below only sets it as the default
-      # branch once it does, and the first tagged build to pass through this
-      # step is what creates it.
-      - name: Carry the stable channel forward, or point it at this release
-        if: github.ref == 'refs/heads/main'
-        run: |
-          set -euo pipefail
-          stable_ref="app/$APP_ID/$ARCH/stable"
-          master_ref="app/$APP_ID/$ARCH/master"
-          ostree --repo=repo remote add --no-gpg-verify pages-live "$PAGES_REPO_URL"
-          had_stable=true
-          ostree --repo=repo pull pages-live "$stable_ref" || had_stable=false
-          if [ -n "${{ steps.release.outputs.tag }}" ]; then
-            echo "tagged build (${{ steps.release.outputs.tag }}): stable now points at this commit"
-            # A new commit, not a second name for master's. Every commit
-            # flatpak-builder exports carries ostree.ref-binding naming the
-            # one ref it was built for, and both `flatpak install` and
-            # `ostree pull` refuse a ref whose commit does not list it:
-            # "Commit has no requested ref ...stable in ref binding metadata
-            # (...master)". An alias made with `refs --create` broke every
-            # stable install from v0.17.0's tag, and then deleted stable
-            # outright on the next push, because the carry-forward pull
-            # below hit the same check. Reproduced and fixed against the
-            # live repository's master commit.
-            commit_args=(--no-update-summary --src-ref="$master_ref")
-            if [ "${{ steps.gpg.outputs.signing }}" = "true" ]; then
-              commit_args+=(--gpg-homedir="${{ steps.gpg.outputs.gpghome }}"
-                            --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}")
-            fi
-            flatpak build-commit-from "${commit_args[@]}" repo "$stable_ref"
-          elif [ "$had_stable" = "true" ]; then
-            echo "not tagged: carrying the existing stable ref forward unchanged"
-            ostree --repo=repo refs --create="$stable_ref" "pages-live:$stable_ref" --force
-            ostree --repo=repo refs --delete "pages-live:$stable_ref"
-          else
-            echo "not tagged and no stable ref published yet: nothing to carry forward"
-          fi
-          ostree --repo=repo remote delete pages-live
-
       # Run here, per architecture, on this leg's own single-arch `repo` --
       # not only in `merge` below -- because the single-file bundle two steps
       # from now is built from this local repo before the merge job ever
@@ -547,20 +478,6 @@ jobs:
           if [ "${{ steps.gpg.outputs.signing }}" = "true" ]; then
             args+=(--gpg-homedir="${{ steps.gpg.outputs.gpghome }}"
                    --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}")
-          fi
-          # A plain `flatpak install` with no branch named follows this,
-          # rather than defaulting to master -- verified locally against
-          # flatpak 1.18.0 / libostree 2026.2: `build-update-repo
-          # --default-branch=X` writes xa.default-branch into the summary,
-          # and `flatpak remote-info` and `flatpak install` against a test
-          # repository built the same way both resolved to X with no branch
-          # named. Guarded on the ref actually existing in this run's
-          # repository: the bootstrap case in the step above can leave none
-          # to point at, and setting a default branch that does not exist
-          # would break every install, not just new ones, rather than
-          # printing the "No such branch" this is meant to avoid.
-          if ostree --repo=repo rev-parse "app/$APP_ID/$ARCH/stable" >/dev/null 2>&1; then
-            args+=(--default-branch=stable)
           fi
           # Without --prune and the summary rewrite the repository has objects
           # and no summary, and `flatpak install` answers "No remote refs
@@ -652,7 +569,43 @@ jobs:
     # runner here, or to do this twice.
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Includes the wait for the Pages deployment now, which is a few minutes.
+    timeout-minutes: 40
+    # **This job both decides `stable` and deploys, and holds this group for
+    # both.** They were two jobs (`merge`, then `deploy`, with the group on
+    # `deploy` alone), and that is what let run B's `merge` read the live
+    # channel while run A's `deploy` was still pending: a group serialises
+    # jobs, not the gap between two of them. A job holds a group only while
+    # it runs, so the read of the live site and the publish that replaces it
+    # have to be steps of the same job. Pull requests and manual runs off
+    # main get a group of their own and never queue behind a deploy; they do
+    # not deploy.
+    #
+    # Queued, not cancelled in progress: cancelling a half-finished deploy is
+    # worse than waiting. A *pending* run displaced by a newer push is
+    # cancelled by GitHub regardless, which is fine for a tree (the newer one
+    # is the one anyone wants) and is the one hole for a release; the header
+    # comment says what the script does about it.
+    concurrency:
+      group: ${{ github.ref == 'refs/heads/main' && 'flatpak-pages' || format('flatpak-merge-{0}', github.run_id) }}
+      cancel-in-progress: false
+    # Only a deploying run enters the environment: its deployment branch
+    # policy names `main` and nothing else, so a pull request or a branch run
+    # that named it would be refused. An empty name is no environment.
+    # INFERRED: that an empty expression is accepted here, and `url:` with
+    # it, was not documented anywhere that was read; the dispatch run from a
+    # branch is what shows it (see the commit).
+    environment:
+      name: ${{ (github.ref == 'refs/heads/main' && vars.PUBLISH_PAGES == 'true') && 'github-pages' || '' }}
+      url: ${{ steps.deployment.outputs.page_url }}
+    # A job-level block replaces the workflow's, so the two it needs from
+    # there are repeated: contents for checkout, actions for the apt, dnf and
+    # pacman artefacts of other workflows' runs.
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
     steps:
       # Only for the files "Assemble the Pages tree" below reads: the site,
       # the icons, and the two static repo-definition files. Same reasoning
@@ -667,6 +620,7 @@ jobs:
             packaging/banner.svg
             packaging/cordial.repo
             packaging/cordial.flatpakrepo
+            packaging/flatpak-stable.sh
           sparse-checkout-cone-mode: false
 
       - name: Install ostree and flatpak
@@ -762,6 +716,60 @@ jobs:
           echo "==> refs in the merged repo:"
           ostree --repo=merged refs
 
+      # Asked here, against the remote, because the answer has to be read
+      # after the tag exists and the release choreography pushes `main` and
+      # the tag together (`git push origin main <tag>`): a run started by the
+      # branch push can be minutes ahead of the tag ref, and the build job
+      # used to ask in its first minute. By now every build has finished.
+      # Only `main` can publish, so only `main` asks; elsewhere the answer is
+      # empty and the script below is a read-only rehearsal.
+      #
+      # `ls-remote` rather than a fetch: a tag object is annotated or not
+      # depending on how it was made, and `^{}` lines carry the commit either
+      # way. Two tags on one commit are possible; the highest wins.
+      #
+      # `newest` is only for the warning: the newest tag that is an ancestor of
+      # this commit, by the compare API (`ahead` or `identical` means the tag
+      # is behind or at this commit), looking at the five highest tags.
+      - name: Work out which release tag this commit carries
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          lines=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY.git" 'refs/tags/v*')
+          names=$(awk '{sub("refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $1, $2}' <<<"$lines")
+          tag=""
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            tag=$(awk -v sha="$GITHUB_SHA" '$1 == sha {print $2}' <<<"$names" | sort -Vu | tail -n 1)
+          fi
+          newest=""
+          while read -r t; do
+            [ -n "$t" ] || continue
+            st=$(gh api "repos/$GITHUB_REPOSITORY/compare/$t...$GITHUB_SHA" --jq .status 2>/dev/null || true)
+            case "$st" in
+              ahead|identical) newest=$t; break ;;
+            esac
+          done < <(awk '{print $2}' <<<"$names" | sort -Vru | sed -n 1,5p)
+          echo "this commit carries: ${tag:-no v* tag}; newest tag at or below it: ${newest:-none}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "newest=$newest" >> "$GITHUB_OUTPUT"
+
+      # The whole decision, and why it lives here, is in the header comment and
+      # in the script's own. --no-gpg-verify on its pull is about the pull,
+      # not the republish: the objects it fetches were built and signed by
+      # this workflow on an earlier run, re-verifying them buys nothing, and a
+      # signing-key rotation would otherwise fail this step on old objects it
+      # has no reason to distrust. What is published is signed in the next step.
+      - name: Decide the stable channel
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          NEWEST_TAG: ${{ steps.release.outputs.newest }}
+          FLATPAK_GPG_HOME: ${{ steps.gpg.outputs.gpghome }}
+          FLATPAK_GPG_KEY_ID: ${{ steps.gpg.outputs.signing == 'true' && secrets.FLATPAK_GPG_KEY_ID || '' }}
+        run: bash packaging/flatpak-stable.sh merged
+
       # Regenerates the summary and appstream branch over the *merged* tree,
       # so the one that actually gets published describes both
       # architectures -- each leg's own run of this same command in `build`
@@ -772,7 +780,12 @@ jobs:
       # bare `flatpak install` resolves the branch name from this summary and
       # then resolves the architecture itself from the installing host, so
       # this guard only has to answer "does a stable channel exist yet",
-      # not "for which architecture".
+      # not "for which architecture". Guarded on the ref existing at all
+      # because a default branch that does not exist breaks every install,
+      # not just new ones. Verified locally against flatpak 1.18.0 / libostree
+      # 2026.2: `build-update-repo --default-branch=X` writes
+      # xa.default-branch into the summary, and `flatpak remote-info` and
+      # `flatpak install` with no branch named both resolved to X.
       - name: Update the merged repository's summary and appstream branch
         run: |
           set -euo pipefail
@@ -1053,6 +1066,30 @@ jobs:
         with:
           path: pages
 
+      # Two gates on purpose. The ref gate keeps pull requests from publishing;
+      # the variable gate keeps *anything* from publishing until someone sets it,
+      # which is the point at which they have also turned Pages on.
+      # Tags are deliberately NOT listed, and that is a correction rather than a
+      # restriction. This condition used to invite them, and every tagged release
+      # then failed here after `build` had already succeeded: the `github-pages`
+      # environment carries a deployment branch policy naming `main` and nothing
+      # else, so a `v*` ref is refused by the environment no matter what this
+      # file says. v0.6.0 is the run that showed it -- build green, deploy red,
+      # for a reason invisible in the workflow.
+      #
+      # Publishing from `main` is not a workaround: a release commit is on main
+      # too, so tagging still publishes, one run earlier. If tagged deploys are
+      # ever wanted, the fix is a `v*` tag policy on the environment in repository
+      # settings, and this condition should only start naming tags once that
+      # exists -- a workflow that promises what the environment forbids is how
+      # this stayed hidden.
+      #
+      # This was the separate `deploy` job; see `concurrency:` at the top of
+      # this one for why it is a step now.
+      - id: deployment
+        if: vars.PUBLISH_PAGES == 'true' && github.ref == 'refs/heads/main'
+        uses: actions/deploy-pages@v4
+
   publish:
     name: Attach to the release
     # Only needs the bundle, which "Upload the bundle as a workflow artefact"
@@ -1083,44 +1120,3 @@ jobs:
       artifact_pattern: cordial-flatpak-bundle-*
       file_globs: '*.flatpak'
       expected_count: 2
-
-  deploy:
-    needs: merge
-    # Two gates on purpose. The ref gate keeps pull requests from publishing;
-    # the variable gate keeps *anything* from publishing until someone sets it,
-    # which is the point at which they have also turned Pages on.
-    # Tags are deliberately NOT listed, and that is a correction rather than a
-    # restriction. This condition used to invite them, and every tagged release
-    # then failed here after `build` had already succeeded: the `github-pages`
-    # environment carries a deployment branch policy naming `main` and nothing
-    # else, so a `v*` ref is refused by the environment no matter what this
-    # file says. v0.6.0 is the run that showed it -- build green, deploy red,
-    # for a reason invisible in the workflow.
-    #
-    # Publishing from `main` is not a workaround: a release commit is on main
-    # too, so tagging still publishes, one run earlier. If tagged deploys are
-    # ever wanted, the fix is a `v*` tag policy on the environment in repository
-    # settings, and this condition should only start naming tags once that
-    # exists -- a workflow that promises what the environment forbids is how
-    # this stayed hidden.
-    if: >-
-      vars.PUBLISH_PAGES == 'true' && github.ref == 'refs/heads/main'
-    # The one genuinely shared resource in this workflow: two deployments to the
-    # same Pages site race, and a half-written site is worse than a queued one.
-    # Scoped to this job rather than the workflow -- see the long note above the
-    # `permissions:` block for the two releases that cost. Queued rather than
-    # cancelled in progress; if a newer deploy displaces an older *pending* one
-    # that is correct here, because the newer tree is the one anyone wants.
-    concurrency:
-      group: flatpak-pages
-      cancel-in-progress: false
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    permissions:
-      pages: write
-      id-token: write
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4

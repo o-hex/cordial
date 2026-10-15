@@ -183,34 +183,38 @@ accurate. The parts that matter to a new maintainer:
 - **The Flatpak `stable` channel is the exception, and it is published by the
   main-branch run, not the tag run.** The `github-pages` environment has a
   deployment branch policy naming `main` only, so a tagged deploy is refused.
-  The step "Check whether this commit carries a release tag" in
-  `.github/workflows/flatpak.yml` looks for a `v*` tag on the commit the
-  `main` push built. If there is one, `stable` is pointed at that build. If
-  not, the currently published `stable` is carried forward. So push `main` and
+  The `merge` job asks the remote whether a `v*` tag sits on the commit it
+  built (step "Work out which release tag this commit carries"), late, after
+  every build has finished, and `packaging/flatpak-stable.sh` then points
+  `stable` at that build or carries the live one forward. So push `main` and
   the tag together, and do not expect `stable` to move from a tag pushed alone.
-  Do not fix this by gating the deploy on tags; v0.6.0 is the run that showed
-  why.
+  The script never moves `stable` to a lower version than the one live. Do not
+  fix this by gating the deploy on tags; v0.6.0 is the run that showed why.
+  If a run warns that the newest tag is ahead of `stable`, the run that built
+  that tag was dropped from the queue; `gh run rerun` it.
 - **Do not push to `main` again while the release runs are going.** Each push
   cancels the previous run through its concurrency group, and a list full of
   `cancelled` reads like breakage.
 
 ### The Flatpak pipeline
 
-`.github/workflows/flatpak.yml`, four jobs. `build` is a matrix of
+`.github/workflows/flatpak.yml`, three jobs. `build` is a matrix of
 `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm` (aarch64), each producing its
-own OSTree repository and a bundle, and is where `stable` is carried forward or
-pointed at a tagged build ("Carry the stable channel forward, or point it at
-this release"). `merge` combines the two repositories, rewrites and signs the
-summary, and assembles the Pages tree. `deploy` needs `merge`,
-runs only on `main`, and only when the repository variable `PUBLISH_PAGES` is
-`true`; it replaces the whole Pages site, which also carries `/apt/`, `/rpm/`
-and `/arch/`, assembled from the latest successful `apt.yml`, `yum.yml` and
-`pacman.yml` runs, so those trees lag by one push. `publish` runs on tags and
-attaches the bundles through `attach-to-release.yml`.
+own OSTree repository and a bundle. `merge` combines the two repositories,
+decides `stable` from the live site (`packaging/flatpak-stable.sh`), rewrites
+and signs the summary, assembles the Pages tree and, on `main` with the
+repository variable `PUBLISH_PAGES` set to `true`, deploys it. It holds the
+`flatpak-pages` concurrency group for all of that, so the read of the live
+site and the replacement of it are one critical section. The Pages site also
+carries `/apt/`, `/rpm/` and `/arch/`, assembled from the latest successful
+`apt.yml`, `yum.yml` and `pacman.yml` runs, so those trees lag by one push.
+`publish` runs on tags and attaches the bundles through `attach-to-release.yml`.
 
 Pages has no incremental publish, which is why carrying `stable` forward is a
 step at all: without it the first ordinary push after a release would delete
-the release channel.
+the release channel. It used to happen in `build` at the start of a run, and on
+2026-10-15 a run that began before 0.28.0 deployed thirty seconds after the
+0.28.0 run and put `stable` back at 0.27.0.
 
 Two failures on 2026-09-29, both fixed on `main` and both worth knowing because
 neither showed as a code problem:

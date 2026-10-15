@@ -21,6 +21,75 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## #63 reproduced on demand: the engine records a failed Vulkan call before its device exists, 2026-10-15
+
+The `SIGSEGV` at `libroblox.so+0x29b4349`, fault address `0x5a0`, "seen 2/11,
+not reproduced since" (#63), reproduced unaided twice in 65 launches under gdb
+and once in 10 without it, always on a headless sway using the pixman renderer,
+and then in both attempts once the cause below was forced.
+
+What the crashing function is: in 2.738.0.1397 it is the recorder behind the
+engine's `VULKAN ERROR: %s returned %d` path. It keeps a short history
+(`Call`, `Error`, `PrevError`, `FrameIndex`, `History`) and reads a global
+pointer to the graphics device, `+0x5a0`, to do it. That pointer is stored
+once the Vulkan device is created and zeroed when it is torn down. The
+recorder runs only in processes whose per-process sampling draw (a value
+computed once and cached, `% 10000`) comes up under a threshold, which is why
+it is an intermittent crash and not a constant one.
+
+What triggers it here: the first `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` of
+every launch returns `VK_ERROR_SURFACE_LOST_KHR` when the compositor
+advertises no `zwp_linux_dmabuf` (sway and cage on pixman, weston headless).
+`VULKAN ERROR ... -1000000000` is in 77 of 77 engine logs from that
+configuration and in none from KWin or from sway with the GLES renderer. The
+engine goes on and the next query works; only a sampled process falls over,
+in the recorder, because the device pointer is still null at that moment.
+
+Control: the draw was forced to zero in the loaded library's data (gdb, at the
+linker's `mcpelauncher_linker_notifylldb`, which is the only way this was
+touched and only to reproduce). Software-rendered sway: crashed at the same
+address on the first run, both times. Sway on `WLR_RENDERER=gles2`, which does
+advertise dmabuf: 3 of 3 clean and Landing reached.
+
+**What did not work, so nobody repeats it:** retrying the failed query in the
+Vulkan interposer. Forty retries ten milliseconds apart (400 ms) still got
+`SURFACE_LOST` and the forced-draw run still crashed. Whatever makes the first
+query fail is not gone after 400 ms. The engine creates its Vulkan device twice
+per launch, and the first query comes before "surface handed to the engine" in
+Cordial's own log (INFERRED that this ordering is why it fails). Nothing was
+committed for it.
+
+**Not established:** that this is what the original 2/11 was. Those runs were
+on X11 (`CORDIAL_X11=1`) on a machine with dmabuf, so some other first Vulkan
+call may have failed there; the crash site is the same. Not established either
+that any user outside a software-rendered compositor can meet it. And the two
+Vulkan results (`SURFACE_LOST` on dmabuf-less compositors, the recorder's null
+read) are measurements on 2.738; 2.742 was not checked for the second.
+
+**#35's `DeviceUtils` is corrected the same day.** The class is in none of the
+three dex files of 2.742.0.1059, and a gdb log of every `FindClass` and
+`GetMethodID` the engine makes in a run never contains it, though the engine
+logs `Failed to find class 'DeviceUtils'` three times. It is not an unanswered
+Android expectation; see the comment on `DeviceUtils` in `native/init_params.cpp`.
+
+## The launcher says what it was doing when its window does not appear, 2026-10-15
+
+For #38 and #88: a launcher that "starts, uses a core and never shows a window"
+printed nothing, and the one WAYLAND_DEBUG trace from COSMIC stops right after
+GTK binds `xdg_wm_base`, which is also where a healthy run is about to do its
+portal and accessibility-bus calls. Nested sway, KWin (`--virtual`), weston
+(headless), cage and Hyprland all mapped the launcher, so it is not those
+compositors' protocol sets. KWin and Hyprland advertised dmabuf in those
+runs; sway (pixman), weston headless and cage did not.
+
+`startup_watch` records the step `start()` has reached and, if no window has
+mapped after 20 s, prints one paragraph: that step, whether the main thread was
+spinning or waiting, and the variables that choose a backend and renderer.
+Provoked by stopping the compositor after GTK bound `xdg_wm_base`: it printed
+once, naming "built the window; waiting for GTK to map it" and "0% busy". With
+the compositor running it printed nothing. **Not observed:** the spinning case,
+which is what the reporters describe and which this machine cannot produce.
+
 ## Pending in-game verification: held mouse buttons across toplevel locks, 2026-10-07
 
 The click gate added for Hyprland accepts a confirmed toplevel lock, but

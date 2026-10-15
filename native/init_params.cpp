@@ -757,37 +757,34 @@ public:
 
 /// `com.roblox.platform.util.DeviceUtils`
 ///
-/// **The engine asks for this and no dex in the APK declares it.** Every run
-/// logs `getViewportDisplaySize: Failed to find class 'DeviceUtils'` twice,
-/// healthy or not -- confirmed on a 2.737.0.1584 run that reached the Landing
-/// page at 60 fps, which is also what rules it out as the cause of the crashes
-/// in #34 and #35 that were attributed to it.
+/// **This is not an Android expectation Cordial fails to answer: no dex in the
+/// shipping APK declares the class.** Checked 2026-10-15 against all three dex
+/// files of 2.742.0.1059 -- neither `DeviceUtils` nor
+/// `getScreenPhysicalSizeInMillimeters` occurs in any of them. So the engine's
+/// `getViewportDisplaySize: Failed to find class 'DeviceUtils'`, logged three
+/// times on every run, healthy or not, is what a real device would log as well
+/// (INFERRED: there is nothing for it to find, and the trace has no FLog
+/// lines to compare). It is also what rules it out as the cause of the crashes
+/// in #34 and #35, which were attributed to it.
 ///
-/// So this is the `broken_feature` shape rather than a crash: an Android
-/// expectation nobody answers, leaving the engine without the display's
-/// physical size. The contract is read from the strings in `libroblox.so`,
-/// which carry the whole call in sequence -- find the class, find the static
-/// method, get the `Point` class, get the `x` and `y` field ids, then
-/// `(in millimeters): x = {}, y = {}`.
+/// **And the engine never asks jnivm for it.** A gdb session on 2.742.0.1059
+/// that logged every call to both `FindClass` instantiations and every
+/// `GetMethodID` showed about 35 distinct class names, none of them this one,
+/// and no lookup of `getScreenPhysicalSizeInMillimeters`, though the error was
+/// logged three times in the same run. That fits registering the class never
+/// changing the log; how the failing lookup is made is not known (INFERRED
+/// that it does not go through `FindClass` at all). The earlier note here that
+/// jnivm "holds the class and the engine's FindClass does not reach it" had
+/// the right observation and a wrong picture of where the lookup is.
 ///
-/// **Registered, and the engine still does not find it. Measured, not
-/// assumed.** A probe in `Register` prints; a probe in the getter never does;
-/// the engine goes on logging `Failed to find class 'DeviceUtils'` on a run
-/// that reaches the Landing page at 60 fps. So jnivm holds the class under
-/// exactly the name the engine's own strings carry -- there is no other
-/// spelling of it in the binary, bare or qualified -- and the engine's
-/// `FindClass` does not reach it.
+/// The engine's string for the method is `(Landroid/content/Context;)
+/// Landroid/graphics/Point;`, so the hook below, which takes no argument, would
+/// not match it even if the lookup were ever reached.
 ///
-/// That is where this stops, and the remaining question is about jnivm's
-/// lookup rather than about the contract: other Cordial classes are found, so
-/// something distinguishes this path. `--dump-classes` would name what the
-/// engine asked for and did not produce a file on the run that tried it.
-///
-/// Kept rather than reverted because the contract below is read off the
-/// engine's own strings and is right whatever the lookup turns out to need,
-/// and because returning null costs nothing while it is unreachable. What must
-/// not happen is somebody reading this as working: **the getter has never been
-/// observed to run.**
+/// Kept, because the contract is read off the engine's own strings and costs
+/// nothing while unreachable. What must not happen is somebody reading it as
+/// working or as a gap: **the getter has never been observed to run, and
+/// nothing in the APK would run it either.**
 ///
 /// **Null when the size is unknown, never a guess.** The engine has a distinct
 /// handler for `returned null`, so admitting ignorance is a state it already

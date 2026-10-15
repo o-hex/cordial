@@ -171,9 +171,17 @@ cordial --import-flags --sober                    # finds Sober's own config
 cordial --import-flags list.json --profile NAME --replace
 ```
 
-Flags already set are kept unless the list sets them again. `--replace` starts from empty instead. Values are checked by prefix: `FFlag` takes `True` or `False`, `FInt` a whole number, and `FLog` anything, because a log channel takes either a number or a severity and Cordial cannot tell which one a channel wants. `python3 tools/flog_channel_shapes.py` lists the shape Roblox's own settings use for the channels they set (139 in the settings fetched on 2026-10-15); a channel they do not set is reported as `unknown`, not guessed.
+Flags already set are kept unless the list sets them again. `--replace` starts from empty instead. Values are checked by prefix: `FFlag` takes `True` or `False`, `FInt` a whole number, and `FLog` anything, because a log channel takes either a number or a severity and Cordial cannot tell which one a channel wants.
 
 An entry the check refuses is skipped and named, and the rest are imported. A name with no FastFlag prefix is imported and listed, so a typo shows. The Sober path outside the Flatpak (`~/.config/sober/config.json`) is `INFERRED`; only the Flatpak's has been seen.
+
+## Log channels: use a severity name
+
+A `FLog` or `DFLog` channel takes a bare number (`"6"`) or a severity name (`"Verbose"`, `"Warning,6"`), and a number given to a channel that wants a name does not fail: the channel goes silent, so an empty log is not evidence the channel is quiet. **When you do not know which a channel takes, write `"Verbose"`.** Across 177 channels the engine logged under it in a signed-out launch of 2.738.0.1397, every one kept logging with it, and 66 of them (`FLogNativeDM` among them) went quiet when given a bare number.
+
+Look a channel up in [`docs/analysis/flog-channel-shapes.tsv`](https://github.com/luohoa97/cordial/blob/main/docs/analysis/flog-channel-shapes.tsv): `either` kept logging under both, `severity-only` went quiet under a number, and `unscored` is the 644 the landing page never reached, which tells you nothing. When an override in your `flags.json` gives a number to a channel known to need a name, the client log says so at launch (`flags: FLogNativeDM="100" is a bare number, ...`). Channels with no evidence are not warned about.
+
+`python3 tools/flog_channel_shapes.py` prints the shape Roblox's own settings use for the channels they set (139 in the settings fetched on 2026-10-15). Five of them are given a number there and still went quiet under one, so that document is a hint and not the rule. To repeat the measurement on a new build, `tools/flog_channel_survey.py` documents the three launches it takes.
 
 ## If the interface looks coarse
 

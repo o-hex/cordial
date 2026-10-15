@@ -440,6 +440,10 @@ fn apply_overrides(doc: String) -> String {
     match merge(&doc, roblox_overrides(&resolved)) {
         Ok((merged, _)) => {
             crate::flags::report(&resolved);
+            // Once per launch, from the document the engine would have received
+            // without the overrides: a number on a channel that wants a name
+            // silences it without an error (issue #13).
+            crate::flog_shape::report(&doc, &roblox_overrides(&resolved));
             merged
         }
         Err(why) => {

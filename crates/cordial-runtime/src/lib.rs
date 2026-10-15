@@ -40,6 +40,7 @@ pub mod elf;
 // for them. See ADR-036.
 mod ffi_util;
 pub mod flag_reapply;
+mod flog_shape;
 pub mod flags;
 pub mod graphics;
 // The arm64 guest's half of the runtime, behind the `vr` feature (Cargo.toml

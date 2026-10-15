@@ -78,6 +78,15 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.31.0" date="2026-10-16">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.31.0</url>
+      <description>
+        <p>
+          Movement keys work as soon as you join a game, and a launcher that
+          never shows its window says where it is stuck.
+        </p>
+      </description>
+    </release>
     <release version="0.30.0" date="2026-10-15">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.30.0</url>
       <description>

@@ -64,7 +64,6 @@ Servers list, and joining a private server (0.19.0).
 | | |
 |---|---|
 | Roblox can stop drawing on the loading screen after sign-in (the launcher restarts it, up to twice) | [#92](https://github.com/luohoa97/cordial/issues/92) |
-| Movement keys can be dead after joining a game until the mouse moves | [#29](https://github.com/luohoa97/cordial/issues/29) |
 | No window on some COSMIC, KWin and wlroots setups (it opens on KWin on a Steam Deck) | [#38](https://github.com/luohoa97/cordial/issues/38) |
 | On X11, typed text is sent but not drawn: the text editor exists only on Wayland | [#86](https://github.com/luohoa97/cordial/issues/86) |
 

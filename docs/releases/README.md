@@ -73,3 +73,10 @@ If `Publish Arch packaging` does refuse a tag after the fact, fix `pkgver` on
 checks out the ref it is dispatched on, so a corrected `main` satisfies it
 without moving the tag. Moving a published tag is not the answer — workflows are
 usually still building against it.
+
+## The docs site lists releases by itself
+
+`tools/docs-site/build.py` publishes every `vX.Y.Z.md` in this directory, newest
+first, so a new release note needs no edit to `docs/docs.json`. The list there
+once stopped at v0.23.2 while v0.24.0 to v0.27.0 shipped, and the site's newest
+release note was four versions old.

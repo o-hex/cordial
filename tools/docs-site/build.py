@@ -39,8 +39,29 @@ LINK = re.compile(r"(!?\[[^\]]*\]\()([^)\s]+)(\))")
 FENCE = re.compile(r"^\s*(```|~~~)")
 
 
-def published_pages():
+def load_config():
+    """docs.json, with the Releases group rebuilt from docs/releases/.
+
+    The list used to be maintained by hand and stopped at v0.23.2 while
+    v0.24.0 to v0.27.0 shipped, so the site's newest release note was four
+    versions old. Every docs/releases/vX.Y.Z.md is published, newest first,
+    so cutting a release needs no edit to docs.json.
+    """
     cfg = json.load(open(os.path.join(DOCS, "docs.json")))
+    found = []
+    for name in os.listdir(os.path.join(DOCS, "releases")):
+        m = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)\.mdx?", name)
+        if m:
+            found.append((tuple(map(int, m.groups())), "releases/" + name.rsplit(".", 1)[0]))
+    found.sort(reverse=True)
+    for group in cfg["navigation"]["groups"]:
+        if group.get("group") == "Releases":
+            group["pages"] = [page for _, page in found]
+            return cfg
+    raise SystemExit("docs.json has no Releases group to fill from docs/releases/")
+
+
+def published_pages(cfg):
     pages = set()
 
     def walk(node):
@@ -194,7 +215,8 @@ def main():
     if os.path.exists(out):
         shutil.rmtree(out)
     os.makedirs(out)
-    pages = published_pages()
+    cfg = load_config()
+    pages = published_pages(cfg)
     assets = set()
     for page in sorted(pages):
         rel = page_file(page)
@@ -209,7 +231,9 @@ def main():
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         has_front = bool(lines) and lines[0].strip() == "---"
         open(dest, "w").write("\n".join(lines) if has_front else components(lines, rel.endswith(".md")))
-    shutil.copy(os.path.join(DOCS, "docs.json"), out)
+    with open(os.path.join(out, "docs.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
     for extra in ["logo"]:
         shutil.copytree(os.path.join(DOCS, extra), os.path.join(out, extra))
     for asset in sorted(assets):

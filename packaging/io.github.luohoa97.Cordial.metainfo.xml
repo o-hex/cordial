@@ -78,6 +78,15 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.29.0" date="2026-10-15">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.29.0</url>
+      <description>
+        <p>
+          Gameplay can be recorded to a video file, the camera no longer spins
+          on X11, and Enter sends chat again.
+        </p>
+      </description>
+    </release>
     <release version="0.28.0" date="2026-10-15">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.28.0</url>
       <description>

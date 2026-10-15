@@ -71,7 +71,6 @@ Servers list, and joining a private server (0.19.0). The reporter of
 | Client can hang on exit | [#52](https://github.com/luohoa97/cordial/issues/52) |
 | Hyprland: a right-button camera drag does not lock the cursor, so it drifts | [#56](https://github.com/luohoa97/cordial/issues/56), [#105](https://github.com/luohoa97/cordial/issues/105) |
 | Camera-sensitivity text box glitches the client | [#53](https://github.com/luohoa97/cordial/issues/53) |
-| X11 camera can snap through a large angle after a stall or as a camera drag starts (fixed on `main`, not yet in a release) | [#41](https://github.com/luohoa97/cordial/issues/41) |
 
 Controller buttons and sticks work on common pads; the brand of glyph Roblox
 draws may be wrong, and a pad with an unusual layout may have a stick misread

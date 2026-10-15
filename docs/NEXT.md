@@ -110,6 +110,42 @@ three dex files of 2.742.0.1059, and a gdb log of every `FindClass` and
 logs `Failed to find class 'DeviceUtils'` three times. It is not an unanswered
 Android expectation; see the comment on `DeviceUtils` in `native/init_params.cpp`.
 
+## #63: why the surface is lost, and what Cordial does about it, 2026-10-15
+
+Corrections to the section above, from reading Mesa's WSI and a bare Vulkan
+probe with no Roblox in the process. The query does not fail "first" and the
+ordering against "surface handed to the engine" is not the cause (that line was
+labelled INFERRED and is wrong): a hardware Vulkan device cannot present to a
+Wayland compositor with no `zwp_linux_dmabuf_v1`, because Mesa binds `wl_shm`
+only for software devices (`wsi_common_wayland.c`, `registry_handle_global`
+and the `!wl_dmabuf && !wl_shm` test in `wsi_wl_display_init`). The engine
+fails on both of its two device creations per launch (2 `VULKAN ERROR` lines
+in every engine log, not 1). Cordial now withholds Vulkan there; see
+[ADR-060](adr/ADR-060-vulkan-is-withheld-where-the-compositor-has-no-dmabuf.md).
+
+Measured on the 2.738 engine, unsigned, nested headless sway, `cordial-run`
+from a clean tree, 10 launches an arm:
+
+| arm | compositor | `VULKAN ERROR ... -1000000000` per launch | SIGSEGV |
+|---|---|---|---|
+| before | sway pixman | 2 (1 where it crashed) | 3 of 10, then 0 of 10; 1 of 4 in a screenshot run |
+| after | sway pixman | 0 | 0 of 10 |
+| after, `CORDIAL_FORCE_VULKAN_WITHOUT_DMABUF=1` | sway pixman | 2 | 0 of 10 |
+| after | sway gles2 | 0 | 0 of 10 |
+
+The three crashes in the first run were all `libroblox.so+0x29b4349`, fault
+address `0x5a0`, with no gdb and nothing forced. The crash is a random draw per
+process, so a clean arm is weak evidence by itself; the evidence is the error
+line going from 2 a launch to 0 while the forced control puts it back.
+On pixman sway the client now draws the landing screen on OpenGL ES; on Vulkan
+it drew nothing.
+
+**Not established:** that the 2 of 11 on X11 were this (they were on a machine
+with dmabuf); behaviour on a compositor that advertises dmabuf but whose
+hardware device cannot import it; GTK's own renderer, which also reports
+`VK_ERROR_SURFACE_LOST_KHR` on pixman sway (four `Gdk-WARNING` lines a launch)
+before falling back, and which the shell's renderer choice does not account for.
+
 ## The launcher says what it was doing when its window does not appear, 2026-10-15
 
 For #38 and #88: a launcher that "starts, uses a core and never shows a window"

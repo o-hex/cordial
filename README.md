@@ -69,7 +69,7 @@ Servers list, and joining a private server (0.19.0). The reporter of
 | Touchscreen input crashes immediately | [#36](https://github.com/luohoa97/cordial/issues/36) |
 | SIGSEGV on launch on some machines | [#35](https://github.com/luohoa97/cordial/issues/35) |
 | Client can hang on exit | [#52](https://github.com/luohoa97/cordial/issues/52) |
-| Pointer lock unconfirmed on Hyprland, cursor drifts | [#56](https://github.com/luohoa97/cordial/issues/56) |
+| Hyprland: a right-button camera drag does not lock the cursor, so it drifts | [#56](https://github.com/luohoa97/cordial/issues/56), [#105](https://github.com/luohoa97/cordial/issues/105) |
 | Camera-sensitivity text box glitches the client | [#53](https://github.com/luohoa97/cordial/issues/53) |
 | X11 camera snaps 180 degrees | [#41](https://github.com/luohoa97/cordial/issues/41) |
 

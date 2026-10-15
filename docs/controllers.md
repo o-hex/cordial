@@ -37,15 +37,29 @@ Cordial prints the value it used at launch, once, the first time it sees a pad.
 
 ## If a stick or button does the wrong thing
 
-Cordial works out which stick and button is which from what the kernel says your pad has, so a pad with digital triggers or no analogue ones should be read correctly. If one still is not, open an issue with these three lines from a terminal (use `js1` and so on for another pad):
+Cordial works out which stick and button is which from what the kernel says your pad has. A pad whose D-pad is four buttons rather than a hat (the AYN Odin pads) gets its D-pad, a pad with digital triggers is read correctly, and a four-axis pad (X, Y, Z, RZ) has its right stick on Z and RZ. A DualShock 4 on the older `hid-sony` driver is recognised by its ids and has its right stick on Z and RZ too.
+
+If a stick is still on the wrong axis, you can say which axis is which for this run with `CORDIAL_GAMEPAD_AXES`, as `linux=android` pairs:
+
+```bash
+CORDIAL_GAMEPAD_AXES=z=rz,rz=z cordial         # Z and RZ become the right stick
+CORDIAL_GAMEPAD_AXES=rx=ltrigger,ry=rtrigger,z=z,rz=rz cordial
+```
+
+The left side is the axis the pad declares (`x y z rx ry rz hat0x hat0y`), the right is what Roblox is told (`x y z rx ry rz hat_x hat_y ltrigger rtrigger`, or `none` to drop it). It applies to every pad, and a pair Cordial cannot read is named in the log and ignored. If something works, open an issue with the pad's name and the line, and it becomes an entry in Cordial's own table.
+
+If none of that helps, open an issue with these lines from a terminal (use `js1` and so on for another pad):
 
 ```bash
 cat /sys/class/input/js0/device/name
 cat /sys/class/input/js0/device/capabilities/abs
 cat /sys/class/input/js0/device/capabilities/key
+cat /sys/class/input/js0/device/id/{vendor,product,version}
 ```
 
 Starting Cordial with `CORDIAL_TRACE_GAMEPAD=1` also prints the Android code each axis and button was given.
+
+**INFERRED:** the Odin 3 and DualShock 4 mappings come from Android's key layout and SDL's controller database, not from a pad plugged into the machine that wrote this. The table is `QUIRKS` in `crates/cordial-runtime/src/android/gamepad.rs`.
 
 ## Rumble
 

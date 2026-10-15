@@ -21,6 +21,44 @@ This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
 
+## #86: a multi-line box's text took the theme's colour, and typed text now has a photograph, 2026-10-15
+
+`tools/text-input-e2e.py --visibility MODES` types twelve characters into a
+synthetic box (`fakefocus`) and photographs the *compositor's* output with
+`grim`, because `cordial_textbox` reports what the field holds and
+`cordial_screenshot` cannot see a GTK widget. It asserts the typed text changed
+pixels where the editor is and that the ink is the box's own #d5d5dd. Nested
+sway 1.11, signed out, 1280x800, Cordial 0.29.0, windowed, fullscreen, tiled
+after fullscreen and floating, every case single-line and multi-line.
+
+**Found: the multi-line editor ignored the engine's text colour.** A
+`GtkTextView` draws in its own node's colour and the rule named only its `text`
+child. Under the light theme (`ADW_DEBUG_COLOR_SCHEME=prefer-light`) the text
+was near-black on a dark game, in a box holding every character: the symptom
+in #86. Before: 0 of the 4 multi-line cases drew any #d5d5dd, single-line 4 of
+4. After the one-line selector fix every assertion passed: 48 of 48 in the
+default, light and dark themes, with the title bar hidden and at output scale
+1.5; output scale 2 and `GSK_RENDERER` ngl, cairo and vulkan passed an earlier
+form of the harness, before it also checked the editor was placed from engine
+geometry. **Not shown**: that the in-game chat box reports
+`multiline=1`; no real chat spec has been captured here, and a single-line box
+was never affected.
+
+**Controls that fail, as they should.** `CORDIAL_VISIBILITY_ANCHOR=off` fails
+all 8 fullscreen and tiled-after-fullscreen assertions (ADR-056, the Sober
+#1026 shape). No Vulkan with `GSK_RENDERER=ngl` (GTK's GL renderer beside the
+engine's GLES, ADR-047) fails every case; with no Vulkan and nothing set, GTK is
+put on cairo and the text shows. The 0.29.0 binary, run again after the fix
+for comparison, fails its 4 multi-line colour assertions and nothing else.
+
+**Open: the X11 backend has no editor at all.** `window.rs` never builds the
+GTK editor, so on an X11 session typed text reaches the engine and is not drawn
+(ADR-024 describes the work; the paragraph at the top of this file said so on
+2026-08-26). Read from the code and from this file, **not run**: an attempt to
+start Xwayland in the nested sway failed (`/tmp/.X11-unix not owned by root or
+us`) and no other X11 screenshot route was set up. The launcher's X11 banner
+and the install page say "buggy" and "works too" and do not say this.
+
 ## #63 reproduced on demand: the engine records a failed Vulkan call before its device exists, 2026-10-15
 
 The `SIGSEGV` at `libroblox.so+0x29b4349`, fault address `0x5a0`, "seen 2/11,

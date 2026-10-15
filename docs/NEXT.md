@@ -10,8 +10,9 @@ the second verified by composited screenshot on 2026-08-25 — reaches the Home
 page as a signed-in user, plays, takes mouse and keyboard, opens the
 in-experience web view with its JS bridge round-tripping, and puts sound out
 through PipeWire or PulseAudio. Wayland is the backend; X11 is supported again
-under [ADR-024](adr/ADR-024-x11-is-supported-again.md) but has no editor widget
-yet, so typing there is invisible.
+under [ADR-024](adr/ADR-024-x11-is-supported-again.md) and, since 2026-10-16,
+has an editor of its own ([ADR-062](adr/ADR-062-the-x11-editor-is-an-override-redirect-window.md)),
+so typing there is drawn.
 
 What is actually blocking is further down and is much narrower than "sign-in":
 a startup freeze on roughly a third of launches, and the canvas going black
@@ -129,13 +130,74 @@ engine's GLES, ADR-047) fails every case; with no Vulkan and nothing set, GTK is
 put on cairo and the text shows. The 0.29.0 binary, run again after the fix
 for comparison, fails its 4 multi-line colour assertions and nothing else.
 
-**Open: the X11 backend has no editor at all.** `window.rs` never builds the
-GTK editor, so on an X11 session typed text reaches the engine and is not drawn
-(ADR-024 describes the work; the paragraph at the top of this file said so on
-2026-08-26). Read from the code and from this file, **not run**: an attempt to
-start Xwayland in the nested sway failed (`/tmp/.X11-unix not owned by root or
-us`) and no other X11 screenshot route was set up. The launcher's X11 banner
-and the install page say "buggy" and "works too" and do not say this.
+**Was open, and is closed on 2026-10-16: the X11 backend had no editor at all.**
+See the next section. The paragraph that stood here said it was read from the
+code and not run; it is now run.
+
+## #86 on X11: the editor exists, and typed text is photographed there too, 2026-10-16
+
+[ADR-062](adr/ADR-062-the-x11-editor-is-an-override-redirect-window.md) is the
+design: the engine's X window is left alone, and the editor is a small GTK window
+made override-redirect, laid over the focused box and given X keyboard focus.
+`tools/text-input-e2e.py --x11` runs 66 assertions against it on a private X
+server, typing with XTest on that server only and photographing it with
+ImageMagick (or grim, for Xwayland), signed out, 1280x800, GLES
+(`CORDIAL_NO_VULKAN=1`; the Vulkan client has crashed on Xvfb's software GL and
+was not used). Each run starts with the real sign-in fields (clicked, typed with
+dummy strings, never submitted) and then a synthetic box (`fakefocus`).
+
+| Window manager | Compositing | Result |
+|---|---|---|
+| openbox | no (editor opaque) | 66 of 66 |
+| xfwm4 `--compositor=off` | no | 66 of 66 |
+| xfwm4 `--compositor=on` | yes (editor transparent) | 66 of 66 |
+| icewm | no | 66 of 66 |
+| sway's own Xwayland | yes | 66 of 66 |
+
+Control, same session shape, `CORDIAL_X11_EDITOR=off`: 7 of 22 assertions fail
+and they are exactly the ones about the editor -- the typed characters are not
+visible (0 changed pixels where openbox's run changed 812), select-all and
+non-ASCII text are not handled, and a multi-line Return is not a newline. The
+readback (`cordial_textbox` says the field holds twelve characters) passes in
+both arms, which is the point: it is what "sent but not drawn" looked like.
+
+**What this found that the code did not say.**
+
+- `xwininfo -tree` lists children *topmost first*, so the first version of the
+  assertion that the editor is above the game read the stack upside down and
+  failed against a correct one.
+- ImageMagick's `import` writes 16-bit PPM; parsed as 8 it is a photograph of
+  diagonal stripes, in which no text was ever visible.
+- A transparent GTK window on an X server with no compositor is drawn **black**,
+  so the editor is opaque there and its colour is read from the pixels it is
+  about to cover (`x11_editor::opaque_background`). That is `INFERRED` as a
+  match for the box: it was a dark sampled field over a dark landing page in
+  every run here, and a light box was only ever tested by the unit tests.
+- Under Xwayland the first XTest key after a window is first mapped is lost, in
+  `xev` as well, so it is the instrument; the harness sends one `Shift_L` first.
+  Real keyboard events were not measured there (a headless sway has none).
+- `xdotool type` of a character the keymap lacks remaps a spare keycode for one
+  key press, and GTK sometimes sees the key first: the same string lost its `é`
+  in one run and its `ü` in another. The harness now binds `é ü ï` to keycodes
+  250 to 252 up front and sends them as keysyms. Keycodes 200 to 202 carry a
+  modifier in the default keymap, and `ï` there arrived as Ctrl+ï and was
+  dropped, correctly.
+- After a resize or a fullscreen change the editor sits in the fallback bar
+  until the engine reports the box again. That is `text_geometry`'s stale-
+  rectangle rule, which is Wayland's rule and was copied, not invented; a real
+  sign-in field in fullscreen showed it.
+
+**Not established.** KWin, Mutter's X11 mode, a tiling window manager, gamescope
+(which opens X11 clients, ADR-058), a composing input method, a light-coloured
+box (only the dark sign-in fields were run), Vulkan, a box near a screen edge on
+a desktop that clamps unmanaged windows, and a real in-experience chat box (no
+signed-in run was made). `GDK_SCALE=2` was run on openbox: 39 of 39 on the
+sign-in, single-line and multi-line cases, with the editor one pixel up and left
+of the box, because GDK keeps a window on its own logical grid.
+
+**Two editors until `HostWindow` adopts `editor::EditorCore`** and
+`wayland.rs` adopts `text_geometry::Resolver`. Both are deletions from files
+other work was editing; neither is done.
 
 ## #63 reproduced on demand: the engine records a failed Vulkan call before its device exists, 2026-10-15
 

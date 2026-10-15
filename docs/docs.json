@@ -162,7 +162,8 @@
           "adr/ADR-056-the-host-window-keeps-one-pixel-the-engine-does-not-cover",
           "adr/ADR-059-recording-is-the-swapchain-read-on-a-timer-handed-to-ffmpeg",
           "adr/ADR-060-hyprland-takes-the-camera-button-when-the-lock-activates",
-          "adr/ADR-061-vulkan-is-withheld-where-the-compositor-has-no-dmabuf"
+          "adr/ADR-061-vulkan-is-withheld-where-the-compositor-has-no-dmabuf",
+          "adr/ADR-062-the-x11-editor-is-an-override-redirect-window"
         ]
       }
     ]

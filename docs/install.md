@@ -12,9 +12,12 @@ problems reported with the other formats come from those libraries differing.
 
 - **x86-64 Linux, or aarch64.** Nothing has been run on real ARM64 hardware;
   [`multiarch.md`](multiarch.md) says what has been checked.
-- **A Wayland session.** X11 works too
-  ([ADR-024](adr/ADR-024-x11-is-supported-again.md)), but on X11 what you type
-  into a text box is sent without being shown; Wayland is the primary backend.
+- **A Wayland session.** Wayland is the primary backend. X11 works too
+  ([ADR-024](adr/ADR-024-x11-is-supported-again.md)) and is the rougher one:
+  what you type into a text box is drawn by a small window laid over the box
+  ([ADR-062](adr/ADR-062-the-x11-editor-is-an-override-redirect-window.md)),
+  which has been tried under openbox, xfwm4, icewm and Xwayland, and not under
+  KWin, Mutter's X11 mode or a tiling window manager.
 - **Roblox's official Android client, which you supply.** Cordial ships no
   Roblox code, APK or assets.
 

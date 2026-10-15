@@ -65,7 +65,6 @@ Servers list, and joining a private server (0.19.0).
 |---|---|
 | Roblox can stop drawing on the loading screen after sign-in (the launcher restarts it, up to twice) | [#92](https://github.com/luohoa97/cordial/issues/92) |
 | No window on some COSMIC, KWin and wlroots setups (it opens on KWin on a Steam Deck) | [#38](https://github.com/luohoa97/cordial/issues/38) |
-| On X11, typed text is sent but not drawn: the text editor exists only on Wayland | [#86](https://github.com/luohoa97/cordial/issues/86) |
 
 Controller buttons and sticks work on common pads; the brand of glyph Roblox
 draws may be wrong, and a pad with an unusual layout may have a stick misread

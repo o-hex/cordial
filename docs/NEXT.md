@@ -164,6 +164,27 @@ once, naming "built the window; waiting for GTK to map it" and "0% busy". With
 the compositor running it printed nothing. **Not observed:** the spinning case,
 which is what the reporters describe and which this machine cannot produce.
 
+## The stall report now carries the main thread's stack, 2026-10-15
+
+For #38 and #88. Nested cosmic-comp 1.10, labwc 0.9.6, river 0.3.17, Wayfire
+0.10.1 and Mango 0.18.1 (built from its main branch) each mapped the 0.30.0
+launcher (`get_toplevel` once, configure acked, a buffer attached), in
+addition to the five compositors measured earlier. So no compositor named in
+those reports reproduces it here. What cannot be ruled out from here is the
+machine: the reporters' Mesa, driver and Flatpak sandbox.
+
+The stall paragraph said the main thread was spinning or waiting but not
+where. It now adds the stack, taken by signalling the main thread, so a
+Flatpak user with no gdb in the sandbox can paste it. Provoked by stopping a
+nested labwc (SIGSTOP) after GTK bound `xdg_wm_base`: the paragraph named
+`wl_display_dispatch_queue` under `libVkLayer_MESA_device_select` under
+`vkEnumeratePhysicalDevices`, i.e. GTK's Vulkan device enumeration waiting on
+the compositor. **That is what a stopped compositor does, not what the
+reporters have;** it shows the capture works and that Vulkan enumeration on
+Wayland is a place the launcher can wait before it creates a toplevel.
+**INFERRED**, not measured on a reporter's machine: that this is where theirs
+stops. `NODEVICE_SELECT=1` is Mesa's switch for that layer and is untried.
+
 ## Pending in-game verification: held mouse buttons across toplevel locks, 2026-10-07
 
 The click gate added for Hyprland accepts a confirmed toplevel lock, but

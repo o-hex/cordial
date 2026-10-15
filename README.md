@@ -208,6 +208,9 @@ Flatpak extension, the generated config's path and its toggle key are all in
 MangoHud's Vulkan layer is installed. Install routes and what it shows:
 [`docs/mangohud.md`](docs/mangohud.md).
 
+**PartyDeck and gamescope.** Several windows side by side, one profile each,
+started with `cordial --profile P1 --play`: [`docs/partydeck.md`](docs/partydeck.md).
+
 **NVIDIA graphics** have not been tested on NVIDIA hardware. What is known from
 people running the same engine, what Cordial does about it, and the Flatpak
 driver-extension trap: [`docs/nvidia.md`](docs/nvidia.md).

@@ -73,7 +73,8 @@ draws may be wrong, and a pad with an unusual layout may have a stick misread
 ([`docs/controllers.md`](docs/controllers.md)). No force feedback.
 
 Roblox's own Record Video button does nothing on Android. Cordial can record
-the session itself, with `ffmpeg`: [`docs/recording.md`](docs/recording.md).
+the session itself, with `ffmpeg`, with or without the game's own sound. Press
+F9 in the game window to start and stop ([`docs/recording.md`](docs/recording.md)).
 
 Frame-rate numbers are not quoted here because the two measurements in this
 repo contradict each other; see [`docs/status.md`](docs/status.md).

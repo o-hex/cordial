@@ -1573,12 +1573,12 @@ fn build_general_page(
     }
     group.add(&gamepad);
 
-    // Two switches, because the sound is a separate decision: it is everything
-    // the default output is playing, so a call on another desktop would be in
-    // the file. Both take effect at the next launch.
+    // Two switches, because the sound is a separate decision. The first records
+    // every session from its first frame; F9 in the game window starts and stops
+    // a recording whether or not it is on. Both are read at launch.
     let record = adw::SwitchRow::builder()
         .title("Record gameplay")
-        .subtitle("Saves each session as a video. Applies the next time Cordial starts.")
+        .subtitle("Saves each session as a video. F9 in the game starts and stops one at any time.")
         .active(config.borrow().record_session)
         .build();
     record.set_subtitle_lines(2);
@@ -1586,7 +1586,10 @@ fn build_general_page(
         "Needs ffmpeg. Files go to Videos/Cordial, or to the profile's recordings \
          folder inside the Flatpak, which cannot see Videos.\n\nThe engine's own \
          Record Video button does nothing on Android, so this reads the frames \
-         Cordial presents. It costs a few milliseconds per captured frame.",
+         Cordial presents. It costs a few milliseconds per captured frame.\n\n\
+         F9 in the game window starts and stops a recording, and the window \
+         title shows REC while one runs. CORDIAL_RECORD_KEY changes the key, or \
+         turns it off with the value off.",
     ));
     {
         let config = config.clone();
@@ -1599,7 +1602,7 @@ fn build_general_page(
     group.add(&record);
     let record_audio = adw::SwitchRow::builder()
         .title("Record sound too")
-        .subtitle("Everything you can hear, not only the game.")
+        .subtitle("The game's own sound. Other programs are not recorded.")
         .active(config.borrow().record_audio)
         .build();
     {

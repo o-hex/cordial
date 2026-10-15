@@ -1,4 +1,4 @@
-# ADR-060: Vulkan is withheld where the compositor has no dmabuf
+# ADR-061: Vulkan is withheld where the compositor has no dmabuf
 
 **Status:** accepted
 **Date:** 2026-10-15

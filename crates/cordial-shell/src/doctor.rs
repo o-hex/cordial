@@ -471,7 +471,9 @@ pub fn vulkan_devices(
             if real.is_empty() {
                 let names = devices.iter().map(|d| d.name.clone()).collect::<Vec<_>>().join(", ");
                 let mut fix = String::from(
-                    "Vulkan works, but only on the CPU, so Roblox would render in software and be very slow. ",
+                    "Vulkan works, but only on the CPU, and Roblox skips a CPU Vulkan device and draws with \
+                     OpenGL ES instead. That is fast if OpenGL can reach the GPU and slow if it cannot, which \
+                     this check does not measure. ",
                 );
                 let kernel = kernel_gpu_names(kernel_gpus);
                 if kernel.is_empty() {
@@ -1294,6 +1296,9 @@ mod tests {
         assert_eq!(with_gpu[0].level, Level::Warn);
         assert!(with_gpu[0].what.contains("llvmpipe"), "{:?}", with_gpu[0]);
         assert!(with_gpu[0].fix.contains("NVIDIA GPU") && with_gpu[0].fix.contains("not being used"), "{:?}", with_gpu[0]);
+        // Roblox does not render on the CPU Vulkan device (it logs "is emulated,
+        // skipping" and takes OpenGL ES), so the line must not say it does.
+        assert!(with_gpu[0].fix.contains("OpenGL ES") && !with_gpu[0].fix.contains("render in software"), "{:?}", with_gpu[0]);
 
         // With no GPU seen by the kernel, it does not claim one.
         let without = vulkan_devices(Some(&devices), &[], false, &FlatpakGl::NotFlatpak);

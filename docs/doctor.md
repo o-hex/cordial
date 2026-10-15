@@ -30,7 +30,7 @@ one line with a level, and anything that is not `ok` says what to do about it.
 | Build | "Official build" when the project's own release workflows made it, otherwise "Unofficial build from" and the git remote. A hint for whoever reads a report, not a check: a fork can set the same stamp, and nothing behaves differently because of it |
 | Whether it can run | `cordial-run` beside the launcher, not running as root, the Roblox archive the launcher would use and its version, and (not with `--offline`, never on the report screen) whether a newer build is on offer |
 | Wayland or X11 | The game opens on X11 when `WAYLAND_DISPLAY` is unset or `CORDIAL_X11` is set. X11 is a `warn` because it is the rougher backend |
-| The GPU | Vendor, device and driver, from asking Vulkan rather than the files on disk. A machine whose only Vulkan device is a CPU renderer (llvmpipe) is a `warn`: Vulkan works and the GPU is not used |
+| The GPU | Vendor, device and driver, from asking Vulkan rather than the files on disk. A machine whose only Vulkan device is a CPU renderer (llvmpipe) is a `warn`: Vulkan works and the GPU is not used for it. Roblox skips that device and draws with OpenGL ES instead, which is fast only if OpenGL reaches the GPU |
 | NVIDIA | Only when Vulkan lists an NVIDIA GPU: the driver series, whether a Flatpak's GL extension matches the host driver, and whether `nvidia-drm` has `modeset` on. See below |
 | Other host pieces | Vulkan driver files, sound sockets (PipeWire or PulseAudio), a keyring, GameMode when the setting is on, and whether the website's Play button opens Cordial |
 | Deno | Needed by plugins that run code. Only a note when absent |

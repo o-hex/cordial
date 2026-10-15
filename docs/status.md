@@ -21,7 +21,7 @@ expecting rough edges. What changed release by release is on the
 | Loading into an experience | Works | World, avatar and UI render, signed in |
 | Engine content store | Works | `RbxStorage` is a real SQLite database; cache hits rise across launches, so assets are not refetched every session |
 | Clean shutdown | Works | Full pause, stop and destroy sequence, seen in the engine's own log |
-| Signing in | Works | Through Quick Sign-in, a code flow that needs no typing |
+| Signing in | Works | Through Quick Sign-in, a code flow that needs no typing. A password followed by a two-step code stalled on the verification window ([#83](https://github.com/luohoa97/cordial/issues/83)); the window now gets the app's native bridge, `INFERRED` to fix it and not yet seen with a real code ([ADR-063](adr/ADR-063-sign-in-challenge-windows-get-the-native-bridge.md)) |
 | Staying signed in | Works | Cookies and identity are kept in the desktop keyring, not a file |
 | Profiles | Works | A menu in the header bar; creates and deletes one, and marks a profile another window holds |
 | Two accounts at once | Works | Two profiles, two instances, side by side; budget about 1.5 GB of memory each ([ADR-012](adr/ADR-012-profiles-and-instances.md)) |

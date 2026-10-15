@@ -164,7 +164,7 @@
           "adr/ADR-060-hyprland-takes-the-camera-button-when-the-lock-activates",
           "adr/ADR-061-vulkan-is-withheld-where-the-compositor-has-no-dmabuf",
           "adr/ADR-062-the-x11-editor-is-an-override-redirect-window",
-          "adr/ADR-063-a-gamepad-axis-call-is-a-stick-not-an-axis"
+          "adr/ADR-064-a-gamepad-axis-call-is-a-stick-not-an-axis"
         ]
       }
     ]

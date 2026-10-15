@@ -5138,6 +5138,11 @@ fn main() -> ExitCode {
                                                     cordial_runtime::game_launch::arm(|name| lib.symbol(name), &apk_path, width, height);
                                                 }
                                                 install_webview_presenter();
+                                                // The sign-in security check arrives as
+                                                // an app-bridge notification, not an
+                                                // `openWindow`, and uses the presenter
+                                                // just installed.
+                                                cordial_runtime::webview::install_app_bridge_sink();
 
                                                 // A dev-only trigger, in the same family as
                                                 // `CORDIAL_TRACE_PATHS`: off by default, out of the
@@ -5162,6 +5167,13 @@ fn main() -> ExitCode {
                                                          openWindow request for {url}"
                                                     );
                                                     cordial_runtime::webview::dev_trigger_open_window(url);
+                                                }
+                                                // Same family: the sign-up security check
+                                                // through the real app-bridge hook, because
+                                                // a sign-in check needs credentials.
+                                                if let Ok(kind) = std::env::var("CORDIAL_WEBVIEW_TEST_CAPTCHA") {
+                                                    println!("  webview: CORDIAL_WEBVIEW_TEST_CAPTCHA set; sending OPEN_CAPTCHA_VIEW");
+                                                    cordial_runtime::webview::dev_trigger_captcha(&kind);
                                                 }
 
                                                 cordial_runtime::android::looper::pump(

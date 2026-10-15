@@ -99,6 +99,7 @@ pub mod gtk_renderer;
 pub mod vulkan_probe;
 pub mod window_state;
 pub mod webview_policy;
+pub mod webview_captcha;
 #[cfg(feature = "webview")]
 pub mod webview;
 

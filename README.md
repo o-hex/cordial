@@ -57,20 +57,17 @@ Experimental. Full table in [`docs/status.md`](docs/status.md).
 **Works:** loading an experience, sign-in, keyboard and mouse, camera, text
 entry with IME preedit, audio, voice chat, pointer capture, fullscreen, two
 accounts side by side, asset overlays, joining a public server from a game's
-Servers list, and joining a private server (0.19.0). The reporter of
-[#40](https://github.com/luohoa97/cordial/issues/40) has not yet confirmed it.
+Servers list, and joining a private server (0.19.0).
 
 **Known broken**, with issue numbers:
 
 | | |
 |---|---|
+| Roblox can stop drawing on the loading screen after sign-in (the launcher restarts it, up to twice) | [#92](https://github.com/luohoa97/cordial/issues/92) |
+| Movement keys can be dead after joining a game until the mouse moves | [#29](https://github.com/luohoa97/cordial/issues/29) |
 | No window on some COSMIC, KWin and wlroots setups (it opens on KWin on a Steam Deck) | [#38](https://github.com/luohoa97/cordial/issues/38) |
-| Fullscreen freezes; exiting it crashes | [#39](https://github.com/luohoa97/cordial/issues/39) |
-| Touchscreen input crashes immediately | [#36](https://github.com/luohoa97/cordial/issues/36) |
-| SIGSEGV on launch on some machines | [#35](https://github.com/luohoa97/cordial/issues/35) |
-| Client can hang on exit | [#52](https://github.com/luohoa97/cordial/issues/52) |
-| Hyprland: a right-button camera drag does not lock the cursor, so it drifts | [#56](https://github.com/luohoa97/cordial/issues/56), [#105](https://github.com/luohoa97/cordial/issues/105) |
-| Camera-sensitivity text box glitches the client | [#53](https://github.com/luohoa97/cordial/issues/53) |
+| An occasional crash right after start on compositors without GPU buffer sharing | [#63](https://github.com/luohoa97/cordial/issues/63) |
+| Hyprland: the cursor moves while you drag the camera | [#56](https://github.com/luohoa97/cordial/issues/56) |
 
 Controller buttons and sticks work on common pads; the brand of glyph Roblox
 draws may be wrong, and a pad with an unusual layout may have a stick misread

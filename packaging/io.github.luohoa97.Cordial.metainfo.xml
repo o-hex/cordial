@@ -78,6 +78,16 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.28.0" date="2026-10-15">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.28.0</url>
+      <description>
+        <p>
+          Cordial can be started straight into a game by another program, runs
+          inside gamescope and under PartyDeck, and controllers reach the
+          Flatpak.
+        </p>
+      </description>
+    </release>
     <release version="0.27.0" date="2026-10-08">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.27.0</url>
       <description>

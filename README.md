@@ -73,8 +73,9 @@ Servers list, and joining a private server (0.19.0). The reporter of
 | Camera-sensitivity text box glitches the client | [#53](https://github.com/luohoa97/cordial/issues/53) |
 | X11 camera snaps 180 degrees | [#41](https://github.com/luohoa97/cordial/issues/41) |
 
-Controller buttons and sticks work; the brand of glyph Roblox draws may be
-wrong ([`docs/controllers.md`](docs/controllers.md)). No force feedback.
+Controller buttons and sticks work on common pads; the brand of glyph Roblox
+draws may be wrong, and a pad with an unusual layout may have a stick misread
+([`docs/controllers.md`](docs/controllers.md)). No force feedback.
 
 Frame-rate numbers are not quoted here because the two measurements in this
 repo contradict each other; see [`docs/status.md`](docs/status.md).

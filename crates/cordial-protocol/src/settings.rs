@@ -139,12 +139,17 @@ impl TitleBar {
 /// since before this row existed. What was missing was a way to raise the
 /// *engine's* own cap and have it stay raised.
 ///
-/// **There is no "Unlimited", and nothing above 240.** An earlier draft sent
-/// 9999, a number nothing had been measured near. A contributor then tried
-/// raising the engine's frame-rate settings to 1000 on a 144 Hz monitor and the
-/// frame rate still held at 240, so 240 is where the engine stops (reported in
-/// the FPS Flex pull request; not reproduced here, this project has no monitor
-/// that fast). A choice above 240 would be a row that does nothing.
+/// **There is no "Unlimited".** An earlier draft sent 9999, a number nothing
+/// had been measured near. Rows stop at 480 because a number has to be written
+/// down to be offered, not because 480 is where the engine stops.
+///
+/// **The old ceiling of 240 was hearsay, and a user asked for it to go.** A
+/// contributor reported that raising the engine's frame-rate settings to 1000
+/// on a 144 Hz monitor still held at 240 (FPS Flex pull request; never
+/// reproduced here, this project has no monitor that fast). 360 and 480 are
+/// offered so that someone with a display that fast can find out; whether the
+/// engine honours them is `INFERRED` until one of them reports. A number
+/// outside the rows still works through `flags.json` or `CORDIAL_FRAME_RATE_LIMIT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FrameRateLimit {
@@ -161,16 +166,20 @@ pub enum FrameRateLimit {
     /// stops anyway.
     #[serde(alias = "unlimited")]
     Cap240,
+    Cap360,
+    Cap480,
 }
 
 impl FrameRateLimit {
-    pub const ALL: [FrameRateLimit; 6] = [
+    pub const ALL: [FrameRateLimit; 8] = [
         FrameRateLimit::Display,
         FrameRateLimit::Cap90,
         FrameRateLimit::Cap120,
         FrameRateLimit::Cap144,
         FrameRateLimit::Cap165,
         FrameRateLimit::Cap240,
+        FrameRateLimit::Cap360,
+        FrameRateLimit::Cap480,
     ];
 
     /// Order matches the `AdwComboRow` model in `settings.rs`, as
@@ -194,6 +203,8 @@ impl FrameRateLimit {
             FrameRateLimit::Cap144 => "144",
             FrameRateLimit::Cap165 => "165",
             FrameRateLimit::Cap240 => "240",
+            FrameRateLimit::Cap360 => "360",
+            FrameRateLimit::Cap480 => "480",
         }
     }
 
@@ -209,6 +220,8 @@ impl FrameRateLimit {
             FrameRateLimit::Cap144 => "144 fps",
             FrameRateLimit::Cap165 => "165 fps",
             FrameRateLimit::Cap240 => "240 fps",
+            FrameRateLimit::Cap360 => "360 fps",
+            FrameRateLimit::Cap480 => "480 fps",
         }
     }
 }

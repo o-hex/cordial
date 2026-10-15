@@ -1367,13 +1367,15 @@ mod tests {
             (FrameRateLimit::Cap144, "144"),
             (FrameRateLimit::Cap165, "165"),
             (FrameRateLimit::Cap240, "240"),
+            (FrameRateLimit::Cap360, "360"),
+            (FrameRateLimit::Cap480, "480"),
         ] {
             assert_eq!(mode.as_env(), spelling);
             assert_eq!(FrameRateLimit::parse(spelling), Some(mode));
         }
         assert_eq!(FrameRateLimit::parse("unlimited"), None, "there is no unlimited choice");
         assert_eq!(FrameRateLimit::parse("9999"), None);
-        assert_eq!(FrameRateLimit::parse("360"), None, "the engine stops at 240");
+        assert_eq!(FrameRateLimit::parse("1000"), None, "rows stop at 480");
         assert_eq!(FrameRateLimit::parse(""), None);
     }
 

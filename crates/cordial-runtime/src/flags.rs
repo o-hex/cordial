@@ -763,11 +763,32 @@ pub fn frame_rate_limit_flags(choice: FrameRateLimit) -> Vec<(String, String)> {
     }
 }
 
-/// The layer [`frame_rate_limit`]'s choice contributes, empty on `Display`.
+/// [`frame_rate_limit_flags`] with the display's rate in hand, so that
+/// [`FrameRateLimit::Display`] can mean what it says.
+///
+/// **Display used to set nothing and the engine did not follow the display.**
+/// On a 120 Hz output with `nativePassCurrentDisplayRefreshRate 120` in the log
+/// (`refresh.rs`), a 2.742 client sat at 60 until a number was chosen by hand;
+/// the engine takes the rate as information, and its scheduler target is a
+/// separate flag. Above 60 the target is now the rate itself; at 60 or below,
+/// or before the rate is known, it is still nothing.
+pub fn frame_rate_limit_flags_for(choice: FrameRateLimit, display_hz: Option<f32>) -> Vec<(String, String)> {
+    match choice {
+        FrameRateLimit::Display => match crate::refresh::target_fps_for(display_hz) {
+            Some(fps) => vec![("DFIntTaskSchedulerTargetFps".to_string(), fps.to_string())],
+            None => Vec::new(),
+        },
+        FrameRateLimit::Cap(_) => frame_rate_limit_flags(choice),
+    }
+}
+
+/// The layer [`frame_rate_limit`]'s choice contributes, empty on `Display`
+/// until the display's rate is known and above 60.
 /// Above the plugins and below the user's own `flags.json`; see [`collect`].
 fn frame_rate_limit_layer() -> Layer {
     let choice = frame_rate_limit();
-    let values: BTreeMap<String, String> = frame_rate_limit_flags(choice).into_iter().collect();
+    let values: BTreeMap<String, String> =
+        frame_rate_limit_flags_for(choice, crate::refresh::announced()).into_iter().collect();
     if !values.is_empty() {
         println!("  flags: frame rate limit set to {} ({} flag(s))", choice.label(), values.len());
     }
@@ -1591,6 +1612,24 @@ mod frame_rate_limit_tests {
     fn display_is_the_default_and_sets_nothing() {
         assert_eq!(FrameRateLimit::default(), FrameRateLimit::Display);
         assert!(frame_rate_limit_flags(FrameRateLimit::Display).is_empty());
+    }
+
+    #[test]
+    fn display_follows_a_fast_display_and_leaves_a_sixty_hertz_one_alone() {
+        let target = |hz| frame_rate_limit_flags_for(FrameRateLimit::Display, hz);
+        assert_eq!(
+            target(Some(120.0)),
+            vec![("DFIntTaskSchedulerTargetFps".to_string(), "120".to_string())],
+            "a 120 Hz output must not stay at the engine's 60"
+        );
+        // Controls: nothing to raise, or nothing known.
+        assert!(target(Some(60.0)).is_empty());
+        assert!(target(None).is_empty());
+        // A number chosen by hand is not overridden by the display.
+        assert_eq!(
+            frame_rate_limit_flags_for(FrameRateLimit::Cap(90), Some(144.0)),
+            vec![("DFIntTaskSchedulerTargetFps".to_string(), "90".to_string())]
+        );
     }
 
     #[test]

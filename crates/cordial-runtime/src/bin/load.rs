@@ -1254,6 +1254,14 @@ fn wire_refresh_rate(lib: linker::Library) {
             let current = cordial_runtime::refresh::current_for(&outputs);
             if cordial_runtime::refresh::worth_announcing(previous_current.get(), current) {
                 if let Some(hz) = current {
+                    // The engine takes the rate as information and still runs
+                    // at 60; "Display refresh" is the scheduler target set to
+                    // it (`flags::frame_rate_limit_flags_for`). Recorded
+                    // before the re-apply below so the document it builds
+                    // already carries it, and requested here because the
+                    // launch-time document was built before any rate was known.
+                    cordial_runtime::refresh::note_announced(hz);
+                    cordial_runtime::flag_reapply::request_apply();
                     // SAFETY: `current_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
                     match unsafe { linker::game_activity::pass_current_refresh_rate(current_native, hz) } {
                         Ok(()) => println!("  refresh: nativePassCurrentDisplayRefreshRate {hz}"),

@@ -1491,10 +1491,11 @@ fn build_general_page(
     // Order has to match FrameRateLimit::index/from_index, so the model is
     // built from `ALL` rather than listed a second time.
     //
-    // Display refresh first and the default: it sets nothing, which is what
-    // every earlier Cordial did, and there is no recommendation to put first --
-    // nothing on this project's hardware has measured a cap above 60, because
-    // the only output it has measured on is a 60 Hz one.
+    // Display refresh first and the default: on a 60 Hz output it sets nothing,
+    // and above 60 it holds the engine's target at the display's rate (it did
+    // not follow the display by itself). There is no recommendation to put
+    // first -- nothing on this project's hardware has measured a cap above 60,
+    // because the only output it has measured on is a 60 Hz one.
     let frame_rate_labels: Vec<&str> =
         crate::shell_config::FrameRateLimit::ALL.iter().map(|c| c.row_label()).collect();
     let frame_rate_model = gtk::StringList::new(&frame_rate_labels);
@@ -1507,7 +1508,8 @@ fn build_general_page(
         // are in `cordial_runtime::flag_reapply`.
         .subtitle(
             "Holds the engine's frame cap at this value. A value above your display's refresh \
-             needs a monitor that fast. Going back to Display refresh takes up to two minutes.",
+             needs a monitor that fast. Display refresh follows your monitor's rate. Going back to \
+             it can take up to two minutes.",
         )
         .model(&frame_rate_model)
         .selected(config.borrow().frame_rate_limit.index())

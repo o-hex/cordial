@@ -214,8 +214,8 @@ driver-extension trap: [`docs/nvidia.md`](docs/nvidia.md).
 **Profiles** are picked from the button at the left of the header bar. Its menu also holds New Profile… and
 Delete Profile…, which removes the shown one, its keyring sign-in included, after a confirmation.
 
-**Frame rate limit**, under Settings → Graphics, holds the engine's own frame cap at 90 to 240 fps in a running
-game; Display refresh (the default) sets nothing. Any FastFlag you set now also stays set across Roblox's
+**Frame rate limit**, under Settings → Graphics, holds the engine's own frame cap at 90 to 480 fps in a running
+game; Display refresh (the default) follows your monitor's rate above 60 Hz. Any FastFlag you set now also stays set across Roblox's
 two-minute settings refresh. Details: [`docs/fastflags.md`](docs/fastflags.md).
 
 **Separate data roots** per instance come from `XDG_DATA_HOME`, which moves both

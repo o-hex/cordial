@@ -154,10 +154,12 @@ The Android client has no frame-rate row in its own menu, so there are two separ
 
 Neither replaces the other. Frame pacing on FIFO caps you at your panel's rate whatever the limit says. Frame pacing applies at the next launch.
 
-**Frame rate limit** offers Display refresh (sets nothing), or 90, 120, 144, 165 or 240. A new cap takes effect in a running game at once. Going back to Display refresh takes up to two minutes, because the engine does not unset a flag that Roblox's settings leave out.
+**Frame rate limit** offers Display refresh, or 90, 120, 144, 165, 240, 360 or 480. Display refresh holds the engine's target at your monitor's rate when that is above 60 Hz, and sets nothing on a 60 Hz monitor. A new cap takes effect in a running game at once. Going back to Display refresh from a cap takes up to two minutes on a 60 Hz monitor, because the engine does not unset a flag that Roblox's settings leave out.
+
+For a number the row does not offer, set `DFIntTaskSchedulerTargetFps` in the FastFlags editor; your own flags beat the row. Whether the engine honours a target above 240 has not been measured here: 360 and 480 are `INFERRED` to work until someone with a monitor that fast says otherwise.
 
 > [!WARNING]
-> Do not pick a cap above your display's refresh. On a 60 Hz output a cap of 90 presented about 31 frames a second and 240 about 36, against 57 to 60 with nothing set. That is one headless environment, and on a fast monitor the opposite holds: on a 240 Hz output with an NVIDIA GPU, `DFIntTaskSchedulerTargetFps=240` presented 216-232 frames a second against a flat 59.9 with the engine's own target (measured 2026-10-03). Nothing above 240 is offered because a contributor reports the engine stops there.
+> Do not pick a cap above your display's refresh. On a 60 Hz output a cap of 90 presented about 31 frames a second and 240 about 36, against 57 to 60 with nothing set. That is one headless environment, and on a fast monitor the opposite holds: on a 240 Hz output with an NVIDIA GPU, `DFIntTaskSchedulerTargetFps=240` presented 216-232 frames a second against a flat 59.9 with the engine's own target (measured 2026-10-03). A contributor reported that the engine stopped at 240 when asked for 1000; that was not reproduced, and 360 and 480 are offered so it can be checked.
 
 ## Import a list from another launcher
 

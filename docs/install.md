@@ -13,8 +13,8 @@ problems reported with the other formats come from those libraries differing.
 - **x86-64 Linux, or aarch64.** Nothing has been run on real ARM64 hardware;
   [`multiarch.md`](multiarch.md) says what has been checked.
 - **A Wayland session.** X11 works too
-  ([ADR-024](adr/ADR-024-x11-is-supported-again.md)); Wayland is the primary
-  backend.
+  ([ADR-024](adr/ADR-024-x11-is-supported-again.md)), but on X11 what you type
+  into a text box is sent without being shown; Wayland is the primary backend.
 - **Roblox's official Android client, which you supply.** Cordial ships no
   Roblox code, APK or assets.
 

@@ -105,6 +105,8 @@ pub struct Env {
     pub session_type: Option<String>,
     pub runtime_dir: Option<PathBuf>,
     pub in_flatpak: bool,
+    /// `GAMESCOPE_WAYLAND_DISPLAY`, which only a gamescope session exports.
+    pub gamescope: Option<String>,
 }
 
 impl Env {
@@ -118,7 +120,19 @@ impl Env {
             session_type: var("XDG_SESSION_TYPE"),
             runtime_dir: std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
             in_flatpak: Path::new("/.flatpak-info").exists(),
+            gamescope: var(crate::gamescope::MARKER),
         }
+    }
+
+    /// Whether there is a Wayland compositor the game can embed into: the
+    /// loader's own question ([`crate::gamescope::wayland_usable`]), asked of
+    /// this environment.
+    pub fn wayland_usable(&self) -> bool {
+        crate::gamescope::wayland_usable(
+            self.wayland_display.as_deref(),
+            self.display.as_deref(),
+            self.gamescope.as_deref(),
+        )
     }
 }
 
@@ -300,7 +314,7 @@ pub fn session(env: &Env) -> Check {
         );
     }
 
-    if !uses_x11(env.cordial_x11, env.wayland_display.is_some()) {
+    if !uses_x11(env.cordial_x11, env.wayland_usable()) {
         let mut what = "the game opens on Wayland".to_string();
         if env.gdk_backend.as_deref() == Some("x11") {
             what.push_str(" (the launcher window itself runs on X11 because GDK_BACKEND=x11)");
@@ -316,6 +330,18 @@ pub fn session(env: &Env) -> Check {
             Level::Warn,
             "the game opens on X11 because CORDIAL_X11 is set",
             "X11 is the rougher backend, and Wayland gets the fixes first. Unset CORDIAL_X11 to use Wayland.",
+        )
+    } else if crate::gamescope::inside(env.gamescope.as_deref()) {
+        // Before the "Wayland session that lost its variable" case, because
+        // gamescope exports `XDG_SESSION_TYPE=wayland` with --expose-wayland
+        // and an empty `WAYLAND_DISPLAY` without it, and either would
+        // otherwise be given that advice (ADR-058).
+        check(
+            Level::Warn,
+            "this is inside gamescope, so the game opens on X11 through the Xwayland it provides",
+            "gamescope's own Wayland server cannot host the game's surface, and X11 has no in-app \
+             web views, so sign each profile in once from a normal Cordial window and launch \
+             it here afterwards.",
         )
     } else if env.session_type.as_deref() == Some("wayland") {
         check(
@@ -544,7 +570,7 @@ impl NvidiaHost {
     pub fn read_with(env: &Env, gl_dir: &Path, modeset_path: &Path) -> NvidiaHost {
         NvidiaHost {
             in_flatpak: env.in_flatpak,
-            uses_x11: uses_x11(env.cordial_x11, env.wayland_display.is_some()),
+            uses_x11: uses_x11(env.cordial_x11, env.wayland_usable()),
             kernel_module: nvidia::host_driver_version(),
             sandbox_extensions: nvidia::sandbox_extension_versions(gl_dir),
             modeset: std::fs::read_to_string(modeset_path).ok(),
@@ -1192,6 +1218,35 @@ mod tests {
         // A Wayland session that lost its socket variable is a different fix.
         let dropped = Env { display: Some(":0".into()), session_type: Some("wayland".into()), ..Env::default() };
         assert!(session(&dropped).what.contains("WAYLAND_DISPLAY is not set"));
+    }
+
+    #[test]
+    fn inside_gamescope_the_game_is_x11_whichever_way_wayland_display_is_set() {
+        // Without --expose-wayland: set, and empty. Measured 2026-10-15.
+        let blank = Env {
+            wayland_display: None,
+            display: Some(":2".into()),
+            session_type: Some("x11".into()),
+            gamescope: Some("gamescope-0".into()),
+            ..Env::default()
+        };
+        let c = session(&blank);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.what.contains("gamescope"), "{c:?}");
+
+        // With it: a real socket that cannot host the subsurface.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gamescope-0"), "").unwrap();
+        let exposed = Env {
+            wayland_display: Some("gamescope-0".into()),
+            runtime_dir: Some(dir.path().to_path_buf()),
+            session_type: Some("wayland".into()),
+            ..blank.clone()
+        };
+        let c = session(&exposed);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.what.contains("gamescope") && !c.what.contains("lost"), "{c:?}");
+        assert!(NvidiaHost::read_with(&exposed, Path::new("/nonexistent"), Path::new("/nonexistent")).uses_x11);
     }
 
     #[test]

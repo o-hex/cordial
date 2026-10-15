@@ -39,9 +39,11 @@ pub fn uses_x11(cordial_x11_set: bool, wayland_display_set: bool) -> bool {
 
 /// [`uses_x11`] for this process.
 pub fn running_on_x11() -> bool {
+    // "Is there a compositor" is the library's rule, not "is the variable set":
+    // gamescope exports an empty one (ADR-058).
     uses_x11(
         std::env::var_os("CORDIAL_X11").is_some(),
-        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        cordial_shell::gamescope::wayland_usable_here(),
     )
 }
 

@@ -42,6 +42,9 @@ pub mod branding;
 pub mod doctor;
 pub mod frame_rate_limit;
 pub mod freeze_recovery;
+// Which display backend a gamescope session gets; the launcher, `--doctor` and
+// the loader all ask it, so it is here and not in any one of them.
+pub mod gamescope;
 pub mod host_window;
 pub mod json_highlight;
 pub mod log_export;

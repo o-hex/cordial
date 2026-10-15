@@ -67,7 +67,6 @@ Servers list, and joining a private server (0.19.0).
 | Movement keys can be dead after joining a game until the mouse moves | [#29](https://github.com/luohoa97/cordial/issues/29) |
 | No window on some COSMIC, KWin and wlroots setups (it opens on KWin on a Steam Deck) | [#38](https://github.com/luohoa97/cordial/issues/38) |
 | An occasional crash right after start on compositors without GPU buffer sharing | [#63](https://github.com/luohoa97/cordial/issues/63) |
-| Hyprland: the cursor moves while you drag the camera | [#56](https://github.com/luohoa97/cordial/issues/56) |
 
 Controller buttons and sticks work on common pads; the brand of glyph Roblox
 draws may be wrong, and a pad with an unusual layout may have a stick misread

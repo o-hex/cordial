@@ -160,7 +160,8 @@
           "adr/ADR-054-cordial-owns-its-roblox-builds",
           "adr/ADR-055-the-launcher-and-the-runtime-are-two-programs",
           "adr/ADR-056-the-host-window-keeps-one-pixel-the-engine-does-not-cover",
-          "adr/ADR-059-recording-is-the-swapchain-read-on-a-timer-handed-to-ffmpeg"
+          "adr/ADR-059-recording-is-the-swapchain-read-on-a-timer-handed-to-ffmpeg",
+          "adr/ADR-060-hyprland-takes-the-camera-button-when-the-lock-activates"
         ]
       }
     ]

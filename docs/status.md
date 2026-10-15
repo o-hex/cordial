@@ -27,7 +27,7 @@ expecting rough edges. What changed release by release is on the
 | Two accounts at once | Works | Two profiles, two instances, side by side; budget about 1.5 GB of memory each ([ADR-012](adr/ADR-012-profiles-and-instances.md)) |
 | Keyboard in an experience | Works | WASD, space, the lot |
 | Mouse: navigation, buttons, focus | Works | |
-| Mouse: turning the camera | Works | Right-drag, using the compositor's unaccelerated delta, so sensitivity does not depend on your desktop mouse settings |
+| Mouse: turning the camera | Works | Right-drag, using the compositor's unaccelerated delta, so sensitivity does not depend on your desktop mouse settings. The pointer lock holds the cursor still during the drag; on Hyprland that needs a workaround for the compositor dropping the button ([ADR-060](adr/ADR-060-hyprland-takes-the-camera-button-when-the-lock-activates.md)), and `CORDIAL_DRAG_LOCK=0` turns it off |
 | Scroll wheel | Works | |
 | Pointer capture in first person | Works | The cursor stays in the window |
 | Typing into text fields | Works | A GTK overlay draws the focused Android field live, with caret movement and Wayland IME preedit |

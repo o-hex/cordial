@@ -1573,6 +1573,45 @@ fn build_general_page(
     }
     group.add(&gamepad);
 
+    // Two switches, because the sound is a separate decision: it is everything
+    // the default output is playing, so a call on another desktop would be in
+    // the file. Both take effect at the next launch.
+    let record = adw::SwitchRow::builder()
+        .title("Record gameplay")
+        .subtitle("Saves each session as a video. Applies the next time Cordial starts.")
+        .active(config.borrow().record_session)
+        .build();
+    record.set_subtitle_lines(2);
+    record.add_suffix(&detail(
+        "Needs ffmpeg. Files go to Videos/Cordial, or to the profile's recordings \
+         folder inside the Flatpak, which cannot see Videos.\n\nThe engine's own \
+         Record Video button does nothing on Android, so this reads the frames \
+         Cordial presents. It costs a few milliseconds per captured frame.",
+    ));
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        record.connect_active_notify(move |row| {
+            config.borrow_mut().record_session = row.is_active();
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&record);
+    let record_audio = adw::SwitchRow::builder()
+        .title("Record sound too")
+        .subtitle("Everything you can hear, not only the game.")
+        .active(config.borrow().record_audio)
+        .build();
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        record_audio.connect_active_notify(move |row| {
+            config.borrow_mut().record_audio = row.is_active();
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&record_audio);
+
     page.add(&group);
     page.add(&build_audio_group(config.clone(), config_path.clone()));
     page.add(&build_performance_group(config.clone(), config_path.clone()));

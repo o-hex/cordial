@@ -351,6 +351,7 @@ dependencies = [
  "cordial-update",
  "gtk4",
  "libadwaita",
+ "libc",
  "libmimalloc-sys",
  "serde_json",
  "ureq",

@@ -14,6 +14,7 @@ order a newcomer would want it.
 | [`install.md`](install.md) | Full install detail: every package format, signing and repository trust, building from source |
 | [`fastflags.md`](fastflags.md) | Overriding Roblox's FastFlags, and how layering between user/plugin/base works |
 | [`controllers.md`](controllers.md) | Why controller button glyphs may show the wrong brand |
+| [`recording.md`](recording.md) | Saving a session as a video |
 | [`rich-presence.md`](rich-presence.md) | The bundled Discord Rich Presence plugin: what it does, and what is not wired up yet |
 | [`shaders.md`](shaders.md) | The vkBasalt switch: sharpening and anti-aliasing over the game, and its config file |
 | [`mangohud.md`](mangohud.md) | The MangoHUD switch: what it shows, and how to install the layer |

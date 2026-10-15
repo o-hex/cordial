@@ -30,6 +30,7 @@
           "title-bar",
           "controllers",
           "partydeck",
+          "recording",
           "rich-presence",
           "nvidia",
           "vr"
@@ -158,7 +159,8 @@
           "adr/ADR-053-vr-is-a-mode-of-the-android-runtime",
           "adr/ADR-054-cordial-owns-its-roblox-builds",
           "adr/ADR-055-the-launcher-and-the-runtime-are-two-programs",
-          "adr/ADR-056-the-host-window-keeps-one-pixel-the-engine-does-not-cover"
+          "adr/ADR-056-the-host-window-keeps-one-pixel-the-engine-does-not-cover",
+          "adr/ADR-059-recording-is-the-swapchain-read-on-a-timer-handed-to-ffmpeg"
         ]
       }
     ]

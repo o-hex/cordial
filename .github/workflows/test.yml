@@ -116,3 +116,15 @@ jobs:
       - name: deno lint and fmt
         working-directory: tools/discord-bridge
         run: deno lint && deno fmt --check
+
+  # The scripts the workflows run are Python with no build step, so they get
+  # their own cheap job rather than waiting behind the Rust build. The Discord
+  # release announcer lives here: a release nobody is told about is the
+  # failure CLAUDE.md names, and this is what stands between a bad edit to it
+  # and the next release.
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests for .github/scripts
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v

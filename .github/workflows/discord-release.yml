@@ -6,48 +6,20 @@
 # the README and is where people actually ask for help, so it is where a new
 # version should turn up without anyone remembering to paste a link.
 #
-# This runs `releasify`, which is a third-party action, and the rest of this
-# header is what was checked before handing it a webhook.
+# The post is built and sent by .github/scripts/discord_release.py, which has
+# unit tests. It used to be a third-party action, `tenedev/releasify-action`,
+# replaced on 2026-10-15 because that repository disappeared and the v0.28.0
+# and v0.29.0 announcements failed with "Unable to resolve action".
 #
-# **It is pinned to a commit, not to `@v1`, and that is not boilerplate here.**
-# `tenedev/releasify-action` is archived, has no stars, and was renamed from
-# `teneplaysofficial` after its README was written. An archived repository
-# cannot receive a fix, but it can still have its tags moved by whoever holds
-# the account, and `@v1` and `@v1.0.1` today both resolve to
-# bfade1fe75a8a4e8faafbc31c257e44ebfbe8352. Pinning the commit is what makes
-# "archived" a stable fact rather than an unmaintained moving target. The
-# licence is MIT and its one source file does exactly one thing: POST a Discord
-# embed. Nothing else in it reads a secret or the network.
-#
-# **Following its own README posts an announcement with nothing in it, and that
-# is measured rather than suspected.** The action reads the release out of
-# `process.env.GITHUB_EVENT`. No such variable exists -- Actions sets
-# `GITHUB_EVENT_PATH`, a path to a file -- and the bundled `dist/index.js`
-# (sha256 0c1b00d8..., confirmed identical at the pinned commit) never mentions
-# `GITHUB_EVENT_PATH` at all. Run against the pinned bundle with its documented
-# workflow, the payload it builds is:
-#
-#     content     : "New Release: `v?.?` in `luohoa97/cordial`"
-#     description : "_No release notes provided._"
-#     author.name : "unknown"
-#     Compare Changes: .../compare/main...v?.?
-#
-# Every field falls through to a default, including a compare link that 404s.
-# Supplying `GITHUB_EVENT` ourselves fixes all of it in the same run -- same
-# bundle, same inputs, tag, notes, author, assets and timestamp all correct.
-# So the `env:` on the final step is load-bearing; deleting it does not break
-# the job, it makes the job succeed at announcing nothing, which is the failure
-# mode this repository's own rule about instruments is about.
-#
-# **That we build the event is also what lets us fit Discord's limits.** An
-# embed description is capped at 4096 characters and the whole embed at 6000.
-# Cordial's release notes are long on purpose -- they carry a what-is-broken
-# section -- and four of the last five were over the cap: v0.12.1 5,376,
-# v0.12.0 6,593, v0.11.0 9,657, v0.9.0 5,064. Discord answers an over-length
-# embed with a 400 and posts nothing, and the action logs the status code
-# without failing the step, so the whole thing would have gone green while the
-# server stayed silent. The trim happens in the script below, before the action
-# sees anything.
+# **Discord's limits are applied before sending, and any non-2xx answer fails
+# the step.** An embed description is capped at 4096 characters and the whole
+# embed at 6000. Cordial's release notes are long on purpose -- they carry a
+# what-is-broken section -- and four of the last five were over the cap:
+# v0.12.1 5,376, v0.12.0 6,593, v0.11.0 9,657, v0.9.0 5,064. Discord answers an
+# over-length embed with a 400 and posts nothing, and the old action logged the
+# status code without failing the step, so the whole thing went green while the
+# server stayed silent. The script trims the notes to fit, and prints Discord's
+# error body (never the webhook URL) if it is refused anyway.
 #
 # No thumbnail or avatar is set. The only icons this project ships are SVG
 # (packaging/icons/hicolor/scalable/), Discord does not render SVG in an embed,
@@ -196,41 +168,32 @@ jobs:
           test -s release.json
 
       - name: Fetch the release history, for the compare link
-        # The action builds Compare Changes as
-        # `compare/{target_commitish}...{tag}`, and target_commitish is the
-        # branch the release was cut from -- always "main" here -- so the link
-        # read `compare/main...v0.12.1`, which answers "what is in the release
-        # that is not on main". That is nothing once the tag is an ancestor of
-        # main, and after that it is a list of commits main has *reverted*. The
-        # question a reader actually has is what changed since the last
-        # release, so the previous tag belongs on the left of the three dots.
+        # The Compare Changes link answers "what changed since the last
+        # release", so the previous tag goes on the left of the three dots. A
+        # link of the form `compare/main...v0.12.1` answers "what is in the
+        # release that is not on main", which is nothing once the tag is an
+        # ancestor of main.
         #
         # Only the fetch happens here; picking the previous tag out of the list
         # is the script's job, where it is a tested function rather than a
         # second copy of the same logic in a shell heredoc.
         #
-        # Failing soft: with no usable history the script leaves the action's
-        # own default alone rather than emitting `compare/...v1.0.0`.
+        # Failing soft: with no usable history the script leaves the field out
+        # rather than emitting `compare/...v1.0.0`.
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -uo pipefail
           if ! gh api "repos/${REPO}/releases?per_page=100" > releases.json 2>/dev/null; then
-            echo "::warning::could not list releases; the compare link will use the action's default"
+            echo "::warning::could not list releases; the announcement will have no compare link"
             echo '[]' > releases.json
           fi
 
-      - name: Assemble the release event, trimmed to Discord's limits
-        id: event
-        env:
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python3 .github/scripts/discord-release-event.py release.json releases.json >> "$GITHUB_OUTPUT"
-
       - name: Work out who to ping, and say so when the answer is nobody
         # **`@updates` typed as text pings nobody**, and that is the whole
-        # reason this step exists rather than a literal string in the `with:`
-        # block below. Discord only turns a role into a notification when the
+        # reason this step exists rather than a literal string in the post step
+        # below. Discord only turns a role into a notification when the
         # content carries `<@&ROLE_ID>`; anything else -- including the role's
         # own name with an at sign in front of it -- renders as grey text that
         # looks exactly like a working mention to whoever wrote it and reaches
@@ -259,16 +222,14 @@ jobs:
           echo "value=$raw" >> "$GITHUB_OUTPUT"
 
       - name: Post it
-        uses: tenedev/releasify-action@bfade1fe75a8a4e8faafbc31c257e44ebfbe8352 # v1.0.1
+        # The webhook is the only authority this step has, and it is passed in
+        # the environment so it never appears in a command line. The script
+        # prints Discord's status line, or its error body, and nothing else
+        # about the request.
         env:
-          # See the header. Without this the action announces `v?.?` with no
-          # notes, and does it successfully.
-          GITHUB_EVENT: ${{ steps.event.outputs.event }}
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK }}
-          username: Cordial
-          color: '#5865F2'
-          footer: Cordial loads Roblox natively on Linux
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           # Checked and warned about in the step above rather than read raw,
           # because the way this goes wrong is silent.
-          mention: ${{ steps.mention.outputs.value }}
+          DISCORD_RELEASE_MENTION: ${{ steps.mention.outputs.value }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 .github/scripts/discord_release.py release.json releases.json

@@ -27,6 +27,7 @@
 
 mod audio_devices;
 mod chooser;
+mod cli;
 mod crash;
 mod deep_link;
 mod browser_account;
@@ -150,11 +151,19 @@ fn main() -> libadwaita::glib::ExitCode {
         println!(
             "cordial {version}\n\
              \n\
-             Usage: cordial [ROBLOX-LINK]\n\
+             Usage: cordial [OPTIONS] [ROBLOX-LINK]\n\
              \n\
              With no arguments it opens the launcher. A `roblox-player:` or\n\
              `roblox:` link joins that experience, which is what your browser\n\
              hands over when you press Play on the website.\n\
+             \n\
+             To start a game from another program, as PartyDeck does, give it a\n\
+             profile and --play: `cordial --profile P2 --play --fullscreen`.\n\
+             Each such invocation is a Cordial of its own, so several can run at\n\
+             once, one profile each. Inside gamescope see docs/partydeck.md.\n\
+             \n\
+             Starting a game:\n\
+             {game_options}\
              \n\
              Options:\n\
              \x20 --diagnostics  Print which Cordial and Roblox build this is, the\n\
@@ -179,10 +188,40 @@ fn main() -> libadwaita::glib::ExitCode {
              \n\
              {notice}",
             version = cordial_shell::version::full(),
+            game_options = cli::HELP,
             notice = cordial_shell::version::NOTICE,
         );
         return libadwaita::glib::ExitCode::SUCCESS;
     }
+
+    // Parsed before the `GApplication` exists, and for a reason of the same
+    // family as the flags above: whether this process is allowed to be a
+    // `GApplication` of the usual kind is decided by it. An instance that was
+    // told to play is *not* forwarded to a launcher that is already open --
+    // that is the single-instance behaviour doing the opposite of what a
+    // launcher of several games needs (ADR-058).
+    let command_line = match cli::parse(&flags) {
+        Ok(c) => c,
+        Err(message) => {
+            eprintln!("cordial: {message}");
+            return libadwaita::glib::ExitCode::from(2);
+        }
+    };
+    // Checked here, against the defaults, rather than when the first launch
+    // reads them: a typo in `--set` should be the first thing a caller hears,
+    // not the last thing a game that already started never mentions.
+    if let Err(message) = shell_config::with_overrides(&shell_config::ShellConfig::default(), &command_line.settings) {
+        eprintln!("cordial: --set: {message}");
+        return libadwaita::glib::ExitCode::from(2);
+    }
+    // For the client, which reads it. Set on this process's own environment
+    // because the launcher hands its environment on unchanged (`launch.rs` adds
+    // to it and never clears it), and before any thread exists to race it.
+    if command_line.fullscreen {
+        std::env::set_var("CORDIAL_FULLSCREEN", "1");
+    }
+    let instance = command_line.is_instance();
+    cli::install(command_line);
 
     // From here on this process shows a window, and the log export (Report a
     // Problem -> Save logs) wants what it has printed. After every flag that
@@ -206,10 +245,20 @@ fn main() -> libadwaita::glib::ExitCode {
     // `org.freedesktop.Application.Open` over D-Bus hands over URIs and never
     // an `argv`, and a link arriving that way is better carried in GIO's
     // spelling than dropped.
-    let app = libadwaita::Application::builder()
-        .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::HANDLES_COMMAND_LINE)
-        .build();
+    //
+    // **`NON_UNIQUE` for an invocation that was told to run a game** (ADR-058).
+    // A `GApplication` registered on the bus under a fixed name sends every
+    // later invocation to the first and exits, which is exactly right for a link
+    // clicked on a website and exactly wrong for a program starting four games
+    // side by side: the second `--profile P2 --play` would have been swallowed
+    // by the first window and the user left with one game and no error. A
+    // non-unique application does not claim the name at all, so the
+    // launcher the user has open keeps it.
+    let mut app_flags = gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::HANDLES_COMMAND_LINE;
+    if instance {
+        app_flags |= gio::ApplicationFlags::NON_UNIQUE;
+    }
+    let app = libadwaita::Application::builder().application_id(APP_ID).flags(app_flags).build();
 
     // The shell, once there is one. A link that arrives while Cordial is
     // already up is the ordinary case — somebody clicks Play on the website
@@ -221,6 +270,10 @@ fn main() -> libadwaita::glib::ExitCode {
         let shell = shell.clone();
         app.connect_activate(move |app| {
             start(app, &shell);
+            // A game started from the command line has no launcher to show.
+            if cli::playing() {
+                return;
+            }
             if let Some(shell) = shell.borrow().as_ref() {
                 shell.present();
             }
@@ -233,19 +286,31 @@ fn main() -> libadwaita::glib::ExitCode {
         let shell = shell.clone();
         app.connect_command_line(move |app, command_line| {
             start(app, &shell);
-            let mut links = 0;
-            for argument in command_line.arguments().into_iter().skip(1) {
-                // Lossy is safe here rather than convenient: anything that was
-                // not valid UTF-8 comes out with replacement characters, which
-                // `accept` refuses along with everything else that is not
-                // printable ASCII.
-                queue(&shell, &argument.to_string_lossy());
-                links += 1;
+            // Lossy is safe here rather than convenient: anything that was not
+            // valid UTF-8 comes out with replacement characters, which `accept`
+            // refuses along with everything else that is not printable ASCII.
+            let arguments: Vec<String> =
+                command_line.arguments().into_iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+            // The same grammar `main` read, so a remote invocation's options are
+            // not mistaken for links. Its own options are not acted on: they
+            // belong to a process that is not this one, and a launcher asked to
+            // adopt another invocation's profile would be the single-instance
+            // behaviour this flag family exists to avoid.
+            let links = match cli::parse(&arguments) {
+                Ok(parsed) => parsed.links,
+                Err(message) => {
+                    println!("  shell: ignoring the command line: {message}");
+                    Vec::new()
+                }
+            };
+            for link in &links {
+                queue(&shell, link);
             }
+            let links = links.len();
             // A second invocation with nothing on it is somebody starting
             // Cordial again — from the desktop icon, most likely — and what
             // they want is the window they already have, in front.
-            if links == 0 {
+            if links == 0 && !cli::playing() {
                 if let Some(shell) = shell.borrow().as_ref() {
                     shell.present();
                 }
@@ -268,7 +333,14 @@ fn main() -> libadwaita::glib::ExitCode {
         });
     }
 
-    app.run()
+    let code = app.run();
+    // What a game started from the command line failed at, if it did: a launcher
+    // that could not start the client says so on stderr and exits with it, where
+    // the interactive one raises a dialog (`window.rs`, `cli::set_status`).
+    match cli::status() {
+        0 => code,
+        status => libadwaita::glib::ExitCode::from(status),
+    }
 }
 
 /// Check a link and hand it to the window, or say why not.
@@ -281,7 +353,14 @@ fn queue(shell: &Rc<RefCell<Option<window::Shell>>>, raw: &str) {
         Ok(url) => match shell.borrow().as_ref() {
             Some(shell) => {
                 println!("  shell: received Roblox link");
-                shell.queue_join(url);
+                // A game started from the command line has no picker to fall
+                // back to, so the browser account routing that might need one
+                // is skipped: the profile was named.
+                if cli::playing() {
+                    shell.queue_quietly(url);
+                } else {
+                    shell.queue_join(url);
+                }
             }
             // `start` built the window immediately above, so this is
             // unreachable rather than merely unlikely — and said out loud,
@@ -332,6 +411,33 @@ fn start(app: &libadwaita::Application, shell: &Rc<RefCell<Option<window::Shell>
         }
     }
 
+    // The command line, over what was just read from disk. After the migration's
+    // own save above, which is the one write this process may make: from here on
+    // `shell_config::save` does nothing, so what was asked for one run is not
+    // left behind as what the next ordinary launch does.
+    let playing = cli::playing();
+    if let Some(command_line) = cli::active() {
+        if command_line.profile.is_some() || command_line.play || !command_line.settings.is_empty() {
+            shell_config::hold_unsaved(command_line.settings.clone());
+            let changed = shell_config::with_overrides(&config.borrow(), &command_line.settings);
+            if let Ok(changed) = changed {
+                *config.borrow_mut() = changed;
+            }
+            if let Some(profile) = &command_line.profile {
+                config.borrow_mut().profile = profile.clone();
+                // Said once and not refused: a profile that does not exist yet is
+                // a new account, which is a fair thing to start. But a typo makes
+                // one too, and under gamescope there is no sign-in to recover
+                // with (docs/partydeck.md), so the console is told.
+                if !cordial_shell::profile::list().iter().any(|p| p == profile) {
+                    eprintln!(
+                        "cordial: profile {profile:?} does not exist yet, so it starts signed out"
+                    );
+                }
+            }
+        }
+    }
+
     // Applied before the window exists so the very first paint already
     // matches whatever the user last chose in Appearance, rather than
     // flashing the libadwaita default and then correcting itself.
@@ -342,7 +448,15 @@ fn start(app: &libadwaita::Application, shell: &Rc<RefCell<Option<window::Shell>
     let live_watch = live::start(&config_path, &config.borrow());
     std::mem::forget(live_watch);
 
-    *shell.borrow_mut() = Some(window::build(app, config, config_path, migrated.offer_newest()));
+    // The offer to fetch a newer build is a dialog, and a game that was told to
+    // play has nobody to answer it.
+    *shell.borrow_mut() =
+        Some(window::build(app, config, config_path, migrated.offer_newest() && !playing));
+    // `--place-id`: waiting as the link the next launch carries, with no banner
+    // shown to anybody and no window raised.
+    if let Some(link) = cli::active().and_then(|c| c.place_link()) {
+        queue(shell, &link);
+    }
 }
 
 /// `cordial --import-quest-apk FILE`. Exit 0 when filed (or already held), 1

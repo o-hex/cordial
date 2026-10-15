@@ -218,6 +218,14 @@ impl Shell {
         }
     }
 
+    /// Hold a link for the next launch and show nothing: no banner anybody
+    /// sees, no window raised, no account lookup. For a game started from the
+    /// command line, where the profile was named and there is no picker to fall
+    /// back to (ADR-058).
+    pub fn queue_quietly(&self, url: String) {
+        self.join.queue(url);
+    }
+
     /// Bring the launcher forward, for a second invocation carrying nothing.
     pub fn present(&self) {
         self.window.present();

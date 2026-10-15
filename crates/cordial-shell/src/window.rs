@@ -685,7 +685,13 @@ pub fn build(
     // may put a dialog up, and doing that before the window has been presented
     // gives a modal with nothing behind it. 400ms matches the deep-link path
     // just below, which had the same problem first.
-    if std::env::var_os("CORDIAL_AUTOSTART").is_some() {
+    //
+    // `cordial --play` is the same action without the environment variable, and
+    // the same reasoning: it goes through `win.launch` so that what a program
+    // starts is what the button starts (ADR-058). The window is never
+    // presented in that case -- see `cli::playing` -- so the launch has no
+    // starting dialog to show and a failure leaves through the exit status.
+    if std::env::var_os("CORDIAL_AUTOSTART").is_some() || crate::cli::playing() {
         let window = window.clone();
         glib::timeout_add_local_once(Duration::from_millis(400), move || {
             WidgetExt::activate_action(&window, "win.launch", None).ok();
@@ -1035,7 +1041,11 @@ fn activate_roblox(
     // holder, and this warning is only about a launch that would put two
     // different profiles up at once.
     let target_profile = config.borrow().profile.clone();
-    if !config.borrow().multi_instance_warning_seen
+    // Not asked of a game that was started on purpose from the command line:
+    // somebody who typed `--profile P2 --play` while P1 runs has just answered
+    // it, and the dialog would be a modal on a window nobody can see.
+    if !crate::cli::playing()
+        && !config.borrow().multi_instance_warning_seen
         && profile::other_profile_is_running(&target_profile)
     {
         window.present();
@@ -1054,6 +1064,20 @@ fn activate_roblox(
     launch_now_tracked(window, toasts, config, join, lifecycle, mode);
 }
 
+/// How a game started from the command line says it could not start: a line on
+/// stderr and an exit status, where the interactive launcher raises a dialog on a
+/// window the caller never saw.
+///
+/// The caller is a program (ADR-058) and has no way to read a dialog, so a
+/// dialog here would be a game that neither starts nor fails.
+fn give_up(window: &gtk::Window, message: &str, status: u8) {
+    eprintln!("cordial: {message}");
+    crate::cli::set_status(status);
+    if let Some(app) = window.application() {
+        app.quit();
+    }
+}
+
 /// The launch itself, once anything that had to be asked has been.
 fn launch_now_tracked(
     window: &gtk::Window,
@@ -1066,10 +1090,18 @@ fn launch_now_tracked(
     match try_launch_tracked(window, config, join, lifecycle, mode) {
         Outcome::Started => {}
         Outcome::Failed(message) => {
+            if crate::cli::playing() {
+                return give_up(window, &message, 1);
+            }
             window.present();
             alert(window, "Roblox could not start", &message);
         }
         Outcome::ProfileBusy(name, holder) => {
+            if crate::cli::playing() {
+                // 3, as `cordial-run` exits for the same refusal.
+                let refusal = profile::Error::Busy(name, holder);
+                return give_up(window, &refusal.to_string(), 3);
+            }
             window.present();
             profile_busy(window, toasts, config, join, lifecycle, mode, &name, holder)
         }
@@ -1080,6 +1112,14 @@ fn launch_now_tracked(
             );
         }
         Outcome::NoBuild => {
+            if crate::cli::playing() {
+                return give_up(
+                    window,
+                    "there is no Roblox build to run; start Cordial once without --play to \
+                     download one, or set CORDIAL_APK",
+                    4,
+                );
+            }
             window.present();
             let window = window.clone();
             let config = config.clone();
@@ -1482,6 +1522,18 @@ fn start_attempt(
             join.peek().is_some(),
         );
         match presentation {
+            ExitPresentation::Crash if crate::cli::playing() => {
+                // Nobody is looking at a window that was never shown. What the
+                // crash page would have quoted goes to stderr instead, and the
+                // exit status says it was not a clean exit.
+                println!("  shell: the client {status}");
+                eprintln!("cordial: the game {status}\n{output}");
+                crate::cli::set_status(status.code().map_or(1, |c| c.clamp(1, 255) as u8));
+                window.close();
+                if let Some(app) = window.application() {
+                    app.quit();
+                }
+            }
             ExitPresentation::Crash => {
                 println!("  shell: the client {status}; showing the crash page");
                 window.present();

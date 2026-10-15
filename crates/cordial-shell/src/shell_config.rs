@@ -969,6 +969,10 @@ pub fn path() -> PathBuf {
 /// most people never open settings — and a malformed one is reported and
 /// treated the same as missing, per the module docs above.
 pub fn load(path: &Path) -> ShellConfig {
+    with_command_line(load_file(path))
+}
+
+fn load_file(path: &Path) -> ShellConfig {
     let Ok(text) = std::fs::read_to_string(path) else {
         return ShellConfig::default();
     };
@@ -981,7 +985,100 @@ pub fn load(path: &Path) -> ShellConfig {
     }
 }
 
+/// `--set KEY=VALUE` from the command line, once there is one, and the fact that
+/// nothing this process does is allowed to reach `shell.json`.
+///
+/// **Applied inside [`load`] and not only to the in-memory config `main` holds,
+/// because `launch::spawn` and `live` each read the file themselves** -- the
+/// comment in `launch.rs` says so and asks for a `&ShellConfig` to be handed in
+/// instead. Until it is, a setting applied only to the copy in `main` would show
+/// in the window and be absent from the client the window starts, which is a
+/// setting that works in every test and in no launch.
+static COMMAND_LINE: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+/// Make `settings` win over `shell.json` for the rest of this process, and make
+/// [`save`] a no-op.
+///
+/// Both halves are one decision. A process that was told `--profile P2` or
+/// `--set present_mode=fifo` was told it for one run, and the next ordinary
+/// launch must find the user's settings where they left them -- which is also
+/// why a second instance started by another program (ADR-058) cannot be allowed
+/// to write `shell.json` at all: two of them would race to leave their own
+/// profile in it.
+pub fn hold_unsaved(settings: Vec<(String, String)>) {
+    let _ = COMMAND_LINE.set(settings);
+}
+
+fn with_command_line(config: ShellConfig) -> ShellConfig {
+    let Some(settings) = COMMAND_LINE.get() else {
+        return config;
+    };
+    // Already validated by `main` before this process went any further; a
+    // failure here would be a setting that parsed once and does not now, and the
+    // file's value is the safe thing to fall back on.
+    with_overrides(&config, settings).unwrap_or(config)
+}
+
+/// Whether [`hold_unsaved`] has been called.
+fn unsaved() -> bool {
+    COMMAND_LINE.get().is_some()
+}
+
+/// The names `--set` accepts: every setting `shell.json` stores, as it spells it.
+pub fn setting_keys() -> Vec<String> {
+    match serde_json::to_value(ShellConfig::default()) {
+        Ok(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `config` with one setting changed, from the text a person typed.
+///
+/// The value is read as JSON first (`true`, `30`, `"x"`) and as a bare string
+/// when that is not JSON or is not what the setting holds, so `present_mode=fifo`
+/// and `audio_output=123` both do what they look like. The result is built by
+/// deserialising the whole document again, which is what makes the type check
+/// the one `shell.json` itself gets and not a second set of rules.
+pub fn with_override(config: &ShellConfig, key: &str, raw: &str) -> Result<ShellConfig, String> {
+    use serde_json::Value;
+    let Ok(Value::Object(doc)) = serde_json::to_value(config) else {
+        return Err("the settings could not be read back".into());
+    };
+    if key == "profile" {
+        return Err("the profile is chosen with --profile NAME, not --set".into());
+    }
+    if !doc.contains_key(key) {
+        return Err(format!(
+            "{key:?} is not a setting; the settings are {}",
+            setting_keys().join(", ")
+        ));
+    }
+    let candidates = [serde_json::from_str::<Value>(raw).ok(), Some(Value::String(raw.to_string()))];
+    let mut last = String::new();
+    for value in candidates.into_iter().flatten() {
+        let mut trial = doc.clone();
+        trial.insert(key.to_string(), value);
+        match serde_json::from_value::<ShellConfig>(Value::Object(trial)) {
+            Ok(changed) => return Ok(changed),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(format!("{key}={raw}: {last}"))
+}
+
+/// [`with_override`] for each in turn.
+pub fn with_overrides(config: &ShellConfig, settings: &[(String, String)]) -> Result<ShellConfig, String> {
+    let mut config = config.clone();
+    for (key, raw) in settings {
+        config = with_override(&config, key, raw)?;
+    }
+    Ok(config)
+}
+
 pub fn save(path: &Path, config: &ShellConfig) -> std::io::Result<()> {
+    if unsaved() {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1011,6 +1108,48 @@ mod tests {
         assert_eq!(ThrottleWhen::Visible.as_str(), "visible");
         assert_eq!(ThrottleWhen::Unfocused.as_str(), "unfocused");
         assert_eq!(ThrottleWhen::Off.as_str(), "off");
+    }
+
+    #[test]
+    fn a_setting_is_typed_the_way_shell_json_types_it() {
+        let base = ShellConfig::default();
+        // A bool, an enum spelled as its stored word, and a plain string.
+        assert!(with_override(&base, "mangohud", "true").unwrap().mangohud);
+        assert_eq!(with_override(&base, "present_mode", "fifo").unwrap().present_mode, PresentMode::Fifo);
+        assert_eq!(with_override(&base, "graphics", "vulkan").unwrap().graphics, "vulkan");
+        // A string setting that happens to look like a number is still a string.
+        assert_eq!(with_override(&base, "graphics", "123").unwrap().graphics, "123");
+        // Nothing else about the config moves.
+        let changed = with_override(&base, "mangohud", "true").unwrap();
+        assert_eq!(ShellConfig { mangohud: false, ..changed }.profile, base.profile);
+    }
+
+    #[test]
+    fn a_wrong_value_or_name_is_refused_with_what_would_have_been_right() {
+        let base = ShellConfig::default();
+        let e = with_override(&base, "mangohud", "yes").unwrap_err();
+        assert!(e.contains("mangohud=yes"), "{e}");
+        let e = with_override(&base, "present_mode", "warp").unwrap_err();
+        assert!(e.contains("fifo"), "serde names the variants it knows: {e}");
+        let e = with_override(&base, "mangohood", "true").unwrap_err();
+        assert!(e.contains("mangohud") && e.contains("present_mode"), "the valid names are listed: {e}");
+        // The profile has a flag of its own, with its own validation.
+        assert!(with_override(&base, "profile", "x").unwrap_err().contains("--profile"));
+    }
+
+    #[test]
+    fn every_listed_setting_can_be_set_to_its_own_default() {
+        // The listing and the setter must agree on what a setting is, or `--set`
+        // would advertise keys it then refuses.
+        let base = ShellConfig::default();
+        let doc = serde_json::to_value(&base).unwrap();
+        for key in setting_keys() {
+            if key == "profile" {
+                continue;
+            }
+            let raw = serde_json::to_string(&doc[&key]).unwrap();
+            with_override(&base, &key, &raw).unwrap_or_else(|e| panic!("{key}: {e}"));
+        }
     }
 
     #[test]

@@ -100,6 +100,33 @@ inquiry and the 2026-10-04 "delay `initialize`" lever are both about this post c
 delaying it on the pump thread is harmful, not a lever. `docs/analysis/startup-freeze-capture.md`
 describes only the first regime.
 
+### Round 2, cache-miss only, 2026-10-16: 16 launches, no freeze in either arm
+
+Sixteen signed-in `CordialTest` launches (150 s or more apart, flag cache set aside
+before each, every one `cachedUserId` set, `Home` reached, no `DID_LOG_OUT`, a Home
+screenshot at the end of each), alternating the post made from its own thread
+(`CORDIAL_POST_ASYNC=1`, the 250 ms default timing, 8 launches, the arm round 1 never
+ran) with the default (8). **Frozen: 0 of 8 and 0 of 8, and all sixteen presented 85 to
+129 frames at 14 s and kept going.** So the default-flip rule (own-thread 0, default 2
+or more) was not met and the default stays as it is.
+
+Why it says nothing about the post's thread: in all sixteen the first render step
+landed 24 to 46 ms *before* the post (Home at 0.46 to 0.50 s, step at Home + 26 ms, post
+at Home + 50 to 70 ms; one slow launch had Home at 0.97 s and the same spacing). The
+freeze window, the step between the post and the end of the teardown, never opened, and
+the post's time does not depend on which thread makes it, so the own-thread arm cannot
+have avoided a window the default arm also missed. Round 1's frozen launch had the post
+15 ms after Home, with Home at 1.05 s. If the freeze rate is near the 1 in 3 round 1 saw,
+0 of 8 default launches would happen about 4 times in 100; if it is nearer 1 in 6 or less,
+about a quarter of the time, so these counts do not separate a rate that low from zero.
+**What would**: a way to place the post at Home + 0 to 20 ms on demand (a launch hold
+that releases on the engine's `Home` announcement without the extra margin, from the own
+thread) so the window opens in every launch, then compare the default placement with a
+post held until the step has run.
+
+`CORDIAL_POST_ASYNC` is read with `var_os(..).is_some()`, so `CORDIAL_POST_ASYNC=0` turns
+it on. Fix that before it is ever made the default.
+
 ## #86: a multi-line box's text took the theme's colour, and typed text now has a photograph, 2026-10-15
 
 `tools/text-input-e2e.py --visibility MODES` types twelve characters into a

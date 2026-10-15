@@ -44,6 +44,8 @@
 // so the join watchdog does not have to know which of them a given build calls.
 extern "C" void cordial_note_game_loaded(long long place_id);
 extern "C" void cordial_note_experience_start(void);
+extern "C" void cordial_note_home_ready(void);
+extern "C" void cordial_note_flags_failed(void);
 
 namespace cordial {
 class Surface;
@@ -1274,6 +1276,7 @@ public:
 class NativeHelper : public Object {
 public:
     static void onFlagsFailed(ENV*, Object*) {
+        cordial_note_flags_failed();
         fprintf(stderr,
             "[roblox] flags: engine reported onFlagsFailed (the flag data did "
             "load, and this blocks neither startup nor the content store — "
@@ -1297,6 +1300,7 @@ public:
     }
     static void onAppReady(ENV*, Object*, std::shared_ptr<String> s) {
         fprintf(stderr, "[roblox] app ready: %s\n", s ? s->c_str() : "");
+        if (s && std::string(s->c_str()) == "Home") cordial_note_home_ready();
     }
 
     // The experience lifecycle, which the engine has been announcing to nobody.

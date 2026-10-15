@@ -102,7 +102,7 @@ Cordial cannot tell you in advance that your build is too old, and no "too old" 
 <details>
 <summary>WiVRn, adb and other runtimes under Flatpak</summary>
 
-VR in the Flatpak is meant for **WiVRn installed as a Flatpak** and needs nothing from you. Cordial's Flatpak can read WiVRn's install and reach its server, and brings its own OpenXR loader. Checked so far: it finds WiVRn, sees its server running and loads its runtime library. **A whole VR session from the Flatpak has not been run yet.**
+VR in the Flatpak is meant for **WiVRn installed as a Flatpak** and needs nothing from you. Cordial's Flatpak can read WiVRn's install and reach its server, and brings its own OpenXR loader. Checked so far: it finds WiVRn, sees its server running and loads its runtime library. Nobody here has run a whole session from the Flatpak, but one user reports ([#111](https://github.com/luohoa97/cordial/issues/111)) playing Roblox in VR from it on Gentoo with a Pico 4 over WiVRn and an NVIDIA GTX 1650 on Cordial 0.27.0, with no stutter or audio trouble they noticed. They did not measure the frame rate.
 
 **Getting Roblox off your Quest.** The Flatpak has no `adb`. With the headset connected and allowed, run these in a terminal, then choose **I Have the APK File** with the file it copied:
 
@@ -127,7 +127,7 @@ flatpak override --user io.github.luohoa97.Cordial \
 
 ## What is broken or untested
 
-- **Sound** goes to the same audio output as the normal game. It has been checked with Cordial's own counters, not by ear in a game, and the microphone in VR has not been tried.
+- **Sound** goes to the same audio output as the normal game. It has been checked with Cordial's own counters, and one user reports it sounding fine in a game ([#111](https://github.com/luohoa97/cordial/issues/111)). The microphone in VR has not been tried.
 - **Typing** into a text box reaches it, checked through Cordial's own control socket. Typing on a real keyboard while in VR has not been checked.
 - **Controller vibration** can buzz on and on with WiVRn 26.9. That is a bug in WiVRn's headset app, fixed in WiVRn's pull request #1131, which no release carries yet.
 - **Leaving a game** from the Roblox menu brings the menu back on Monado. The in-game Leave button has been exercised only partly.

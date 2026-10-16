@@ -1784,7 +1784,7 @@ enum DiskMoment {
 
 fn main() -> ExitCode {
     // Before anything can create the engine's log: the post gate reads only a
-    // log that was not modified before this (ADR-063).
+    // log that was not modified before this (ADR-065).
     cordial_runtime::post_gate::note_start();
     // What `cordial_shell::gtk_renderer` runs in a child of this binary to ask
     // Vulkan for its devices without loading a driver into the client. First,
@@ -4853,7 +4853,7 @@ fn main() -> ExitCode {
                                                     .map_or(Some(250), |v| {
                                                         if v == "off" { None } else { v.parse::<u64>().ok() }
                                                     });
-                                                // `CORDIAL_POST_GATE` (ADR-063, #92) holds the post, on a
+                                                // `CORDIAL_POST_GATE` (ADR-065, #92) holds the post, on a
                                                 // launch the engine is waiting for it on, until the engine's log
                                                 // shows its first render step. It needs the thread below, so it
                                                 // implies it.

@@ -6,7 +6,7 @@
 //! that call landing *before* the render job's first step
 //! (`stepDataModelJob: No DM yet`) and the first app's teardown still being
 //! under way when the step arrives; a call that lands after the step has never
-//! frozen (docs/NEXT.md, ADR-063).
+//! frozen (docs/NEXT.md, ADR-065).
 //!
 //! Which side of the step the call falls on used to be an accident of the
 //! clock: Home arrives at a different time every launch and the call is made a

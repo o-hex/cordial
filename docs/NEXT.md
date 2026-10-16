@@ -132,7 +132,7 @@ it on; fixed on 2026-10-16 (it is a switch now).
 Sixteen more signed-in `CordialTest` launches (flag cache set aside before each, 155 s
 apart, all `cachedUserId` set, `Home` reached, no `DID_LOG_OUT`, `post gate` lines and
 engine logs in `~/.cache/cordial-handoff/signed-2026-10-16-round3/`). The decision is
-[ADR-063](adr/ADR-063-the-late-post-waits-for-the-first-render-step.md).
+[ADR-065](adr/ADR-065-the-late-post-waits-for-the-first-render-step.md).
 
 **What the gate is.** The post is made from a thread of its own, after the usual 250 ms,
 and waits until the engine's own log shows `stepDataModelJob: No DM yet` (the render job's

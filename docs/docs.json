@@ -165,7 +165,8 @@
           "adr/ADR-061-vulkan-is-withheld-where-the-compositor-has-no-dmabuf",
           "adr/ADR-062-the-x11-editor-is-an-override-redirect-window",
           "adr/ADR-063-sign-in-challenge-windows-get-the-native-bridge",
-          "adr/ADR-064-a-gamepad-axis-call-is-a-stick-not-an-axis"
+          "adr/ADR-064-a-gamepad-axis-call-is-a-stick-not-an-axis",
+          "adr/ADR-065-the-late-post-waits-for-the-first-render-step"
         ]
       }
     ]

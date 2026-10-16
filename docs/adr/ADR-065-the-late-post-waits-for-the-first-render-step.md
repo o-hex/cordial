@@ -1,4 +1,4 @@
-# ADR-063: The late post waits for the engine's first render step
+# ADR-065: The late post waits for the engine's first render step
 
 **Status:** accepted
 **Date:** 2026-10-16

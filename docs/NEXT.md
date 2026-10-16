@@ -188,6 +188,51 @@ alone). Any machine but this one. One signed-out launch in about thirteen stoppe
 during the audio-backend probe, before the engine was loaded, with the gate not yet
 involved; unexplained.
 
+### Round 4, 2026-10-16: the gate holds under load, 0 of 10 against 3 of 3
+
+Sixteen more signed-in `CordialTest` launches (Roblox 2.742.0.1059, nested headless sway,
+build 7531f17 with the gate on by default, flag cache set aside before each, 155 s or
+more apart, every one `cachedUserId` set, `Home` reached, no `DID_LOG_OUT`, a Home
+screenshot after each healthy one). **Every launch ran under round 3's load**: client
+and `stress-ng --cpu 2 --timeout 25s` both on `taskset -c 0,1`. Gate-off arms used round
+3's forcing knobs (`CORDIAL_POST_ASYNC=1 CORDIAL_LATE_POST_MS=20
+CORDIAL_POST_AFTER_HOME_MS=15`); the gate-on arm used the same knobs plus the gate.
+Logs and scripts: `~/.cache/cordial-handoff/signed-2026-10-16-round4/`.
+
+| Arm | Post vs step | Launches | Frozen |
+|---|---|---|---|
+| gate on, forced early timing (Y) | 10 to 12 ms after | Y01-Y10 | 0 of 10 |
+| gate off, forced early timing (X) | 9, 18 and 14 ms before | X01-X03 | 3 of 3 |
+| gate off, default timing, no knobs (Z) | 4 ms before | Z01 | 1 of 1 |
+| gate off, post held to Home + 45 ms, after the step (W) | 17 and 18 ms after | W01, W02 | 0 of 2 |
+
+Fisher exact, one-sided, Y 0 of 10 against X 3 of 3: p = 0.0035 (0.0010 against X and Z
+together, 4 of 4). Adding round 3's two loaded gate-off launches, gate off with the post
+before the step is 6 of 6 frozen under this load and gate on is 0 of 13; unloaded, the
+same forcing froze 1 of 5 in round 3, so on this machine the load is what makes the
+window deadly. Every frozen launch had `Forcing finalize` and no
+`~UgcExperienceController`, presents fixed at 1 at 14, 22 and 30 s: the round-1
+signature. Every launch with the post after the step (Y and W, 12 of 12) presented 85 to
+132 frames at 14 s and kept climbing.
+
+**W is the control round 3 lacked.** Gate off, same load, the post made after the step
+by a timer instead of by the gate: 0 of 2. So the load does not freeze a launch by
+itself; it needs the post ahead of the step, and the gate is what puts it behind.
+
+**Z is a finding about the default, not a control.** With no knobs and the gate off (the
+0.33.0 behaviour), the post is made 250 ms after the handoff on the pump thread. Under
+the load Home came at 0.716 s, the post at 0.7435 and the step at 0.7477: the window
+opened by itself and the launch froze. One launch, so it is not a rate; it is the first
+frozen launch on the old default in these rounds with an ordinary Home time (0.72 s), and it is the
+shape the gate was written for. `INFERRED`: a user on a busy or slow machine meets this
+timing without any knob.
+
+**What was not seen.** No gate-on launch froze, so there is no engine log for a freeze
+past the gate and no backtrace to take; the "order was safe and the cause is elsewhere"
+case in ADR-065 is not yet observed. Nothing here is a signed-in cache-hit launch, a
+second machine, or an unloaded launch at the default timing with the gate off (round 2:
+0 of 8). The gate's cost was 12 to 18 ms of waiting after the 20 ms delay.
+
 ## #86: a multi-line box's text took the theme's colour, and typed text now has a photograph, 2026-10-15
 
 `tools/text-input-e2e.py --visibility MODES` types twelve characters into a

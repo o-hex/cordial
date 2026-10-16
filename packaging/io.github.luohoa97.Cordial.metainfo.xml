@@ -78,6 +78,14 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.34.0" date="2026-10-16">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.34.0</url>
+      <description>
+        <p>
+          A fix for Roblox freezing on the loading screen after sign-in.
+        </p>
+      </description>
+    </release>
     <release version="0.33.0" date="2026-10-16">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.33.0</url>
       <description>

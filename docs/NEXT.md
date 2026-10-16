@@ -124,8 +124,69 @@ that releases on the engine's `Home` announcement without the extra margin, from
 thread) so the window opens in every launch, then compare the default placement with a
 post held until the step has run.
 
-`CORDIAL_POST_ASYNC` is read with `var_os(..).is_some()`, so `CORDIAL_POST_ASYNC=0` turns
-it on. Fix that before it is ever made the default.
+`CORDIAL_POST_ASYNC` was read with `var_os(..).is_some()`, so `CORDIAL_POST_ASYNC=0` turned
+it on; fixed on 2026-10-16 (it is a switch now).
+
+### Round 3, 2026-10-16: the window opened, and the gate is the default
+
+Sixteen more signed-in `CordialTest` launches (flag cache set aside before each, 155 s
+apart, all `cachedUserId` set, `Home` reached, no `DID_LOG_OUT`, `post gate` lines and
+engine logs in `~/.cache/cordial-handoff/signed-2026-10-16-round3/`). The decision is
+[ADR-063](adr/ADR-063-the-late-post-waits-for-the-first-render-step.md).
+
+**What the gate is.** The post is made from a thread of its own, after the usual 250 ms,
+and waits until the engine's own log shows `stepDataModelJob: No DM yet` (the render job's
+first step), then 10 ms more, then posts; 3 s and it posts anyway. The marker is read
+from `appData/logs/*_Player_*.log`, because FLog lines never pass through liblog: of 395
+lines of Cordial's stderr in a signed-in launch none was a render step. Only on the
+cache-miss path (`onFlagsFailed` seen); `CORDIAL_POST_GATE=0` turns it off.
+
+**Making the window open took three tries.** Gate off, own thread, post held to Home
+(`CORDIAL_POST_AFTER_HOME_MS=0`): the 250 ms sleep before the hold had already passed
+Home in 4 of 5, so the post landed at Home + 42 to 50 ms, after the step at Home + 28:
+the safe order, not the window (X01 was the exception: slow start, Home at 1.03 s,
+post at Home + 22, step 6 ms after it, **frozen**). Adding `CORDIAL_LATE_POST_MS=20`
+put the post at Home + 0.2 ms, 27 to 30 ms before the step (X04, X05): healthy. At
+Home + 15 ms, 13 ms before the step, the same geometry as round 1's frozen launch
+(X06, X07): healthy. **The same Home + 15 ms under `taskset -c 0,1` with
+`stress-ng --cpu 2 --timeout 25s` on the same two cores: frozen both times** (X08, X09,
+presents 1 and 1, `Forcing finalize` with no `~UgcExperienceController`, the round-1
+signature).
+
+| Arm | Post vs step | Launches | Frozen |
+|---|---|---|---|
+| gate off, post before the step, no load | 6 and 27-30 ms before, Home + 0 to 22 | X01, X04-X07 | 1 of 5 |
+| gate off, post before the step, 2-core load | 13 ms before, Home + 15 | X08, X09 | 2 of 2 |
+| gate off, post after the step (the old accident) | 14-23 ms after | X02, X03 | 0 of 2 |
+| gate on, same timing knobs, no load | 10-18 ms after | Y01, Y02, Y04, Y05 | 0 of 4 |
+| gate on, same knobs, 2-core load | 10-11 ms after | Y06, Y07, Y08 | 0 of 3 |
+
+Y01 and Y02 found the step already in the log (the gate waited 0 ms); Y04-Y08 waited 27,
+27, 15, 14 and 16 ms. **Frozen: gate off 3 of 9, gate on 0 of 7**; at the forced timing
+under load 2 of 2 against 0 of 3. The prediction in round 2 ("if the window opens, the
+gate closes it") held in every launch, and it is **not a significant count**: a
+Fisher exact test of 3 of 9 against 0 of 7 gives p = 0.15 one-sided (0.21 two-sided), and 2 of 2
+against 0 of 3 gives p = 0.10. What carries the claim is that the order is now guaranteed by
+construction and was observed in all seven gate-on launches, not the counts.
+
+**What the window is not.** Post-before-step is necessary in every frozen launch seen
+(L01, X01, X08, X09) and is not sufficient: 4 of 5 launches with the post before the step
+and no load were healthy, and in every one of them `Bind workspace now` followed
+`getFlags: success` by 1 to 2 ms, the signature the 56-log corpus had called the freeze.
+So that signature is the window opening, not the freeze. What decides it afterwards is
+not in the engine log: X08's `Forcing finalize` came 41 ms after `startLuaApp_`, as in a
+healthy launch, and `~UgcExperienceController` never followed. Load made it likelier
+(2 of 2); the slow start of X01 and L01 (Home near 1 s) is a second occasion and is not
+understood, since the loaded launches had Home at 0.53 s. `INFERRED`: a race between
+the first app's teardown and the render job's bind that wider thread timing resolves the
+wrong way.
+
+**Not measured.** The gate on a *signed-in cache-hit* launch (own thread, post ignored):
+five signed-out cache-hit launches logged `post gate: not needed` and were healthy
+(780 presents at 30 s). Load on the gate-off, post-after-step arm (no control for load
+alone). Any machine but this one. One signed-out launch in about thirteen stopped
+during the audio-backend probe, before the engine was loaded, with the gate not yet
+involved; unexplained.
 
 ## #86: a multi-line box's text took the theme's colour, and typed text now has a photograph, 2026-10-15
 

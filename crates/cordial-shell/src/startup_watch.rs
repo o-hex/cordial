@@ -104,31 +104,28 @@ pub fn stalled_report(
 
 /// Deepest stack the capture keeps. The interesting frames are the innermost
 /// ones; a GTK main loop is fifteen frames deep before it reaches anything.
+#[cfg(not(target_os = "android"))]
 const MAX_FRAMES: usize = 32;
+#[cfg(not(target_os = "android"))]
 static FRAMES: [AtomicUsize; MAX_FRAMES] = [const { AtomicUsize::new(0) }; MAX_FRAMES];
+#[cfg(not(target_os = "android"))]
 static FRAME_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(target_os = "android"))]
 static CAPTURED: AtomicBool = AtomicBool::new(false);
 
-/// Runs on the thread being inspected. Writes only into the statics above;
-/// `backtrace` is called once from a normal context before the signal is sent,
-/// so the lazy load of libgcc it does is not done under a handler.
+#[cfg(not(target_os = "android"))]
 extern "C" fn on_capture_signal(_: libc::c_int) {
-    #[cfg(not(target_os = "android"))]
-    {
-        let mut buf = [std::ptr::null_mut::<libc::c_void>(); MAX_FRAMES];
-        // SAFETY: `buf` holds MAX_FRAMES pointers and MAX_FRAMES is passed as its size.
-        let n = unsafe { libc::backtrace(buf.as_mut_ptr(), MAX_FRAMES as libc::c_int) }.max(0) as usize;
-        for (slot, frame) in FRAMES.iter().zip(buf.iter()).take(n) {
-            slot.store(*frame as usize, Ordering::Relaxed);
-        }
-        FRAME_COUNT.store(n, Ordering::Relaxed);
-        CAPTURED.store(true, Ordering::Release);
+    let mut buf = [std::ptr::null_mut::<libc::c_void>(); MAX_FRAMES];
+    // SAFETY: `buf` holds MAX_FRAMES pointers and MAX_FRAMES is passed as its size.
+    let n = unsafe { libc::backtrace(buf.as_mut_ptr(), MAX_FRAMES as libc::c_int) }.max(0) as usize;
+    for (slot, frame) in FRAMES.iter().zip(buf.iter()).take(n) {
+        slot.store(*frame as usize, Ordering::Relaxed);
     }
+    FRAME_COUNT.store(n, Ordering::Relaxed);
+    CAPTURED.store(true, Ordering::Release);
 }
 
-/// One address as `module+0xoffset (symbol+0xoffset)`. A stripped or static
-/// frame has the first part only, which is still enough to look up against the
-/// release's debug info.
+#[cfg(not(target_os = "android"))]
 fn describe_frame(addr: usize) -> String {
     // A return address points after the call; looking up the byte before it
     // keeps a call at the end of a function attributed to that function.

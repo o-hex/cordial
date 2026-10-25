@@ -16,8 +16,20 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Restore Build Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo_cache
+            target
+          key: termux-build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            termux-build-${{ runner.os }}-
+
       - name: Grant workspace permissions to container
-        run: chmod -R 777 "${{ github.workspace }}"
+        run: |
+          mkdir -p .cargo_cache target
+          chmod -R 777 "${{ github.workspace }}"
 
       - name: Build inside Termux Docker container
         run: |
@@ -28,6 +40,7 @@ jobs:
             bash -c "
               set -euo pipefail
               export DEBIAN_FRONTEND=noninteractive
+              export CARGO_HOME=/workspace/.cargo_cache
               
               echo 'Updating and enabling repositories...'
               pkg update -y
@@ -55,8 +68,12 @@ jobs:
               # Extract debug symbols then strip binaries
               objcopy --only-keep-debug dist/termux/cordial-run dist/termux/cordial-run.dbg 2>/dev/null || true
               strip --strip-unneeded dist/termux/cordial-run dist/termux/cordial-shell 2>/dev/null || true
-              chmod -R 777 dist
+              chmod -R 777 dist .cargo_cache target 2>/dev/null || true
             "
+
+      - name: Ensure post-build cache permissions
+        if: always()
+        run: sudo chmod -R 777 .cargo_cache target dist 2>/dev/null || true
 
       - name: Upload Termux Binaries
         uses: actions/upload-artifact@v4

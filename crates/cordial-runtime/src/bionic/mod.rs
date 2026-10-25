@@ -349,8 +349,8 @@ extern "C" fn bionic_errno() -> *mut c_int {
 
 /// Set this thread's `errno`.
 fn set_errno(value: c_int) {
-    // SAFETY: glibc's per-thread errno slot, valid for this thread's lifetime.
-    unsafe { *__errno_location() = value };
+    // SAFETY: per-thread errno slot, valid for this thread's lifetime.
+    unsafe { *bionic_errno() = value };
 }
 
 /// An argument string for a diagnostic.

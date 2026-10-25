@@ -268,7 +268,7 @@ fn track_held_key(held: &mut Vec<(i32, i32)>, down: bool, key: (i32, i32)) {
 /// when the queue is empty -- in which case the release is real, because a
 /// repeat's press is written to the connection with it.
 fn is_autorepeat_pair(release: (c_ulong, c_uint), next: Option<(c_int, c_ulong, c_uint)>) -> bool {
-    matches!(next, Some((KEY_PRESS, time, key)) if time == release.0 && key == release.1)
+    matches!(next, Some((KEY_PRESS, time, key)) if (time == release.0 || time.abs_diff(release.0) <= 2) && key == release.1)
 }
 
 /// Whether this press is a repeat of a key the engine already holds down.
@@ -291,6 +291,7 @@ struct PointerLockState {
     locked: bool,
     suppressed: bool,
     ignore_next_warp: bool,
+    needs_warp: bool,
     /// Where the last locked `MotionNotify` put the pointer. Deltas are taken
     /// from this and not from the centre: see
     /// [`PointerLockState::locked_motion`].
@@ -342,6 +343,7 @@ impl PointerLockState {
             locked: false,
             suppressed: false,
             ignore_next_warp: false,
+            needs_warp: false,
             last: (0, 0),
             centre: (0, 0),
             saved_root: None,
@@ -1070,6 +1072,7 @@ impl HostWindow {
 
             state.locked = true;
             state.ignore_next_warp = true;
+            state.needs_warp = false;
             state.last = centre;
             state.centre = centre;
             state.saved_root = saved_root;
@@ -1155,6 +1158,7 @@ impl HostWindow {
 
             state.locked = false;
             state.ignore_next_warp = false;
+            state.needs_warp = false;
             state.centre = (0, 0);
 
             (was_locked, saved_root)
@@ -1564,11 +1568,12 @@ impl HostWindow {
                 // The relative delta is still delivered through Roblox's
                 // NativeInputInterface path for camera rotation.
                 if dx != 0 || dy != 0 {
+                    state.needs_warp = true;
                     drop(state);
 
                     if super::input::trace_mouse() {
                         eprintln!(
-                            "[cordial] X11 pointer lock: motion at ({}, {}) -> delta ({dx}, {dy}), re-warping to ({cx}, {cy})",
+                            "[cordial] X11 pointer lock: motion at ({}, {}) -> delta ({dx}, {dy})",
                             ev.x, ev.y
                         );
                     }
@@ -1579,29 +1584,6 @@ impl HostWindow {
                         dx as f32,
                         dy as f32,
                     );
-
-                    let mut state = self
-                        .pointer_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-
-                    state.ignore_next_warp = true;
-                    drop(state);
-
-                    unsafe {
-                        (self.xlib.warp_pointer)(
-                            self.display,
-                            0,
-                            self.window,
-                            0,
-                            0,
-                            0,
-                            0,
-                            cx,
-                            cy,
-                        );
-                        (self.xlib.flush)(self.display);
-                    }
                 }
 
                 return;
@@ -1629,16 +1611,15 @@ impl HostWindow {
     }
 
     /// Whether the KeyRelease in `buf` is the first half of an auto-repeat the
-    /// server did not mark as one. Only ever true when detectable auto-repeat
-    /// was refused, and only after `pending` has said there is a following
-    /// event to look at, so `XPeekEvent` cannot block the pump.
+    /// server reported as a release-press pair.
     fn release_is_autorepeat(&self, buf: &[u8; 256]) -> bool {
-        if self.detectable_autorepeat {
-            return false;
-        }
-        // SAFETY: `XPending` only reads the connection's own queue.
+        // If nothing is pending in Xlib's client queue, check if socket has data
         if unsafe { (self.xlib.pending)(self.display) } <= 0 {
-            return false;
+            let mut pfd = PollFd { fd: self.conn_fd, events: POLLIN, revents: 0 };
+            let ready = unsafe { poll(&mut pfd as *mut PollFd as *mut c_void, 1, 0) };
+            if ready <= 0 {
+                return false;
+            }
         }
         let mut peek = [0u8; 256];
         // SAFETY: an event is queued, so this returns at once; `peek` is
@@ -1873,18 +1854,22 @@ impl HostWindow {
             report_keyboard_state((gw, gh));
         }
 
-        let mut pfd = PollFd { fd: self.conn_fd, events: POLLIN, revents: 0 };
-        // SAFETY: `pfd` is a live array of length 1; a 0ms timeout makes this a
-        // pure non-blocking check.
-        let ready = unsafe { poll(&mut pfd as *mut PollFd as *mut c_void, 1, 0) };
-        if ready <= 0 {
-            return;
+        // Drain any events already sitting in Xlib's client queue.
+        // Only if the queue is empty do we poll the connection socket.
+        if unsafe { (self.xlib.pending)(self.display) } <= 0 {
+            let mut pfd = PollFd { fd: self.conn_fd, events: POLLIN, revents: 0 };
+            // SAFETY: `pfd` is a live array of length 1; a 0ms timeout makes this a
+            // pure non-blocking check.
+            let ready = unsafe { poll(&mut pfd as *mut PollFd as *mut c_void, 1, 0) };
+            if ready <= 0 {
+                return;
+            }
         }
 
         // Bounded so a burst of queued motion events cannot turn one drain
         // call into unbounded work inside the render loop's own timing
         // budget.
-        const MAX_EVENTS_PER_DRAIN: usize = 64;
+        const MAX_EVENTS_PER_DRAIN: usize = 256;
         for _ in 0..MAX_EVENTS_PER_DRAIN {
             // SAFETY: `self.display` is open; reached only after `poll` above
             // found the connection readable (or a previous iteration left
@@ -1991,6 +1976,38 @@ impl HostWindow {
         }
 
         self.sync_pointer_lock();
+
+        // Recentring: if the locked pointer moved away from centre during this drain,
+        // warp it back to centre ONCE per drain cycle rather than on every single sub-pixel packet.
+        // This avoids flooding the X11 connection socket with hundreds of warp roundtrips per second.
+        {
+            let mut state = self
+                .pointer_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            if state.locked && state.needs_warp {
+                state.needs_warp = false;
+                state.ignore_next_warp = true;
+                let (cx, cy) = state.centre;
+                drop(state);
+
+                unsafe {
+                    (self.xlib.warp_pointer)(
+                        self.display,
+                        0,
+                        self.window,
+                        0,
+                        0,
+                        0,
+                        0,
+                        cx,
+                        cy,
+                    );
+                    (self.xlib.flush)(self.display);
+                }
+            }
+        }
     }
 
     /// The window changed size. Update what the engine is told about it.

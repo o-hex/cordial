@@ -1427,8 +1427,16 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
             // plain JNI natives each verb also drives do not take one.
             crate::devctl::apply_queued(0);
         }
+        static POLL_TIMEOUT_OVERRIDE: std::sync::OnceLock<Option<c_int>> = std::sync::OnceLock::new();
+        let timeout = POLL_TIMEOUT_OVERRIDE
+            .get_or_init(|| {
+                std::env::var("CORDIAL_POLL_TIMEOUT")
+                    .ok()
+                    .and_then(|v| v.parse::<c_int>().ok())
+            })
+            .unwrap_or(if watching { 5 } else { 1 });
         looper_poll_once(
-            if watching { 50 } else { 8 },
+            timeout,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),

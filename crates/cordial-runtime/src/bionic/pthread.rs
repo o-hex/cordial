@@ -1188,6 +1188,10 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
 }
 
 fn overrides_with(bypass_cond: bool) -> Vec<(&'static str, *mut c_void)> {
+    #[cfg(target_os = "android")]
+    {
+        return Vec::new();
+    }
     macro_rules! f {
         ($name:literal, $fn:expr) => {
             ($name, $fn as *const () as *mut c_void)

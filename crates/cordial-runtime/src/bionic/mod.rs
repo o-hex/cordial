@@ -720,6 +720,7 @@ const PATHCONF_MAP: &[(c_int, c_int)] = &[
 /// question without complaint. The path is passed through untouched: a caller
 /// asking about `/system` would want `system_paths.cpp`'s redirection, but
 /// nothing has been seen to, and redirecting on a guess is worse than not.
+#[cfg(not(target_os = "android"))]
 extern "C" fn bionic_pathconf(path: *const c_char, name: c_int) -> i64 {
     match pathconf_selector(name) {
         // SAFETY: `path` is the caller's C string, forwarded as-is to the host
@@ -731,6 +732,11 @@ extern "C" fn bionic_pathconf(path: *const c_char, name: c_int) -> i64 {
             -1
         }
     }
+}
+
+#[cfg(target_os = "android")]
+extern "C" fn bionic_pathconf(path: *const c_char, name: c_int) -> i64 {
+    unsafe { host_pathconf(path, name) }
 }
 
 /// glibc's `_PC_*` for a bionic one, or `None` if bionic defines no such selector.

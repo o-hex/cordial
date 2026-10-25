@@ -251,21 +251,28 @@ extern "C" fn b_sigaction(
 }
 
 pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
-    macro_rules! f {
-        ($name:literal, $fn:expr) => {
-            ($name, $fn as *const () as *mut c_void)
-        };
+    #[cfg(target_os = "android")]
+    {
+        return Vec::new();
     }
-    vec![
-        f!("sigemptyset", b_sigemptyset),
-        f!("sigfillset", b_sigfillset),
-        f!("sigaddset", b_sigaddset),
-        f!("sigdelset", b_sigdelset),
-        f!("sigismember", b_sigismember),
-        f!("sigprocmask", b_sigprocmask),
-        f!("pthread_sigmask", b_pthread_sigmask),
-        f!("sigaction", b_sigaction),
-    ]
+    #[cfg(not(target_os = "android"))]
+    {
+        macro_rules! f {
+            ($name:literal, $fn:expr) => {
+                ($name, $fn as *const () as *mut c_void)
+            };
+        }
+        vec![
+            f!("sigemptyset", b_sigemptyset),
+            f!("sigfillset", b_sigfillset),
+            f!("sigaddset", b_sigaddset),
+            f!("sigdelset", b_sigdelset),
+            f!("sigismember", b_sigismember),
+            f!("sigprocmask", b_sigprocmask),
+            f!("pthread_sigmask", b_pthread_sigmask),
+            f!("sigaction", b_sigaction),
+        ]
+    }
 }
 
 #[cfg(test)]

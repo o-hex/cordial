@@ -7,13 +7,19 @@
 //! nativePassCurrentDisplayRefreshRate(F)V  the one in force now
 //! ```
 //!
-//! Cordial has never called either, so the engine has been running with whatever
-//! it assumes when the application says nothing. AGENTS.md records that with
-//! input flowing the frame rate is a hard FIFO vsync lock to the output's
-//! refresh — 60 Hz gives 60, a 50 Hz monitor gives 49.4 even in fullscreen at
-//! four times the pixels. **Whether telling it changes anything is untested.**
-//! This is the one place a client gets to speak about refresh and ours has been
-//! silent, which is worth fixing whether or not it moves the number.
+//! **Cordial had never called either, and now calls both.** For most of this
+//! module's life the engine ran with whatever it assumes when the application
+//! says nothing, and AGENTS.md's note that the frame rate is a hard FIFO vsync
+//! lock to the output's refresh — 60 Hz gives 60, a 50 Hz monitor gives 49.4
+//! even in fullscreen — was written against that silence. `bin/load.rs`'s
+//! `wire_refresh_rate` now resolves both natives and calls them: once at
+//! startup and again whenever GDK's monitor list changes (a hotplug, or the
+//! window landing on a different output), using the policy this module
+//! decides and `crate::android::wayland::current()` for which output the
+//! engine's own window is mostly on. **Whether telling it changes the frame
+//! rate is still untested** — `wire_refresh_rate`'s own doc comment says so in
+//! full and marks the two-monitor path `UNVERIFIED` pending a machine that has
+//! one.
 //!
 //! ## A window can be on two outputs at once, and Wayland means it
 //!
@@ -39,6 +45,41 @@
 //! been wrong before about exactly this class of thing. If it turns out a
 //! spanning window is paced by the slower output, `current_for` is the one
 //! function that has to change.
+
+/// The rate Cordial last told the engine is in force, in hundredths of a hertz
+/// so it fits an atomic. Zero is "never told". Read by `flags.rs`, which is
+/// the other half of the Display refresh choice: telling the engine the rate
+/// does not make it run at that rate (Roblox 2.742 stayed at 60 on a 120 Hz
+/// output with `nativePassCurrentDisplayRefreshRate 120` in the log), so the
+/// frame-rate layer has to ask for it.
+static ANNOUNCED_CENTIHZ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Records the rate just announced to the engine.
+pub fn note_announced(hz: f32) {
+    let centi = (hz * 100.0).round().clamp(0.0, u32::MAX as f32) as u32;
+    ANNOUNCED_CENTIHZ.store(centi, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The rate last announced, or `None` before the first announcement.
+pub fn announced() -> Option<f32> {
+    match ANNOUNCED_CENTIHZ.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        centi => Some(centi as f32 / 100.0),
+    }
+}
+
+/// The engine's scheduler target for "follow the display", given the display's
+/// rate: the rate itself, rounded to a whole number, when it is above the 60
+/// the engine runs at on its own, and nothing otherwise.
+///
+/// Nothing at or below 60 because there is nothing to raise, and because
+/// 59.94 or 50 Hz outputs would otherwise be handed a cap that differs from
+/// the engine's own for no gain.
+pub fn target_fps_for(hz: Option<f32>) -> Option<u32> {
+    let hz = hz.filter(|hz| plausible(*hz))?;
+    let fps = hz.round() as u32;
+    (fps > 60).then_some(fps)
+}
 
 /// One output, as much of it as this decision needs.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -117,6 +158,18 @@ pub fn worth_announcing(previous: Option<f32>, now: Option<f32>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn following_the_display_asks_for_its_rate_only_above_sixty() {
+        assert_eq!(target_fps_for(Some(120.0)), Some(120));
+        assert_eq!(target_fps_for(Some(119.88)), Some(120), "NTSC-style rates round to the mode's name");
+        assert_eq!(target_fps_for(Some(143.98)), Some(144));
+        assert_eq!(target_fps_for(Some(60.0)), None, "the engine already runs at 60");
+        assert_eq!(target_fps_for(Some(59.94)), None);
+        assert_eq!(target_fps_for(Some(50.0)), None);
+        assert_eq!(target_fps_for(Some(0.0)), None, "GDK's unknown is not a display");
+        assert_eq!(target_fps_for(None), None);
+    }
 
     fn out(hz: f32, current: bool) -> Output {
         Output { hz, current }

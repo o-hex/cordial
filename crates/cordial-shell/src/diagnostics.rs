@@ -87,6 +87,11 @@ fn install_method() -> String {
     if shown.contains("/target/") || shown.contains("/target-") {
         return "cargo (built from a checkout)".into();
     }
+    // The flake's package, or a nixpkgs one. No package manager below owns a
+    // store path, so the first Nix build reported `unknown`.
+    if shown.starts_with("/nix/store/") {
+        return "nix".into();
+    }
 
     // Ask whichever package manager is present who owns the running binary.
     // A subprocess each, bounded by there being at most three and by the first
@@ -172,9 +177,7 @@ fn session() -> String {
 /// binary)` at every launch the whole time. The diagnostics block was the one
 /// place that did not look.
 ///
-/// It matters more than a missing field usually would. Cordial adopts Sober's
-/// APK when it finds one, so a large share of users are on a build Cordial did
-/// not fetch -- and for them the block said `unknown` for exactly the field
+/// It matters more than a missing field usually would: the version is the field
 /// that identifies whether their engine is one Cordial can start. Issue #32 is
 /// three exchanges long because of it: the reporter's crash turned on which
 /// build they had, and the block they were asked for could not say.
@@ -184,8 +187,29 @@ fn session() -> String {
 /// that will actually be loaded, which is the stronger evidence of the two;
 /// and `unknown` now means there is genuinely no library to look at, not that
 /// nobody tried.
+///
+/// **It reads the store now**, because a launch does (ADR-054): the build a
+/// profile on Latest runs is the newest entry that holds its archives and has a
+/// recorded signer, and how it arrived is a record on disk. `CORDIAL_APK` is
+/// said when it is set, since the store then says nothing about what runs.
 fn roblox() -> String {
-    roblox_in(&crate::install::engine_cache())
+    if let Some(apk) = crate::install::override_apk() {
+        let engine = roblox_in(&crate::install::engine_cache());
+        return format!("{engine}, CORDIAL_APK override ({})", apk.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+    }
+    roblox_from(&cordial_update::store::list())
+}
+
+/// Split from [`roblox`] so the branches are testable without a store.
+fn roblox_from(entries: &[cordial_update::store::Entry]) -> String {
+    match cordial_update::store::latest(entries) {
+        Some(e) => {
+            let how = e.provenance.map(|p| p.label()).unwrap_or_else(|| "source not recorded".into());
+            format!("{} ({how})", e.version)
+        }
+        None if entries.is_empty() => "none (nothing in Cordial's store yet)".into(),
+        None => "none runnable (the store holds builds without an APK or a checked signature)".into(),
+    }
 }
 
 /// Split from [`roblox`] so the three branches are testable without an engine
@@ -200,6 +224,19 @@ fn roblox_in(dir: &std::path::Path) -> String {
         Some(v) => format!("{v} (read from the extracted library)"),
         None => "unknown (no extracted library to read a version from)".into(),
     }
+}
+
+/// The Quest build, the OpenXR runtime "Play in VR" would use, and WiVRn's
+/// server when that is the runtime (ADR-053).
+fn vr() -> String {
+    if !cordial_shell::vr::COMPILED_IN {
+        return "not in this build (built without the `vr` feature)".into();
+    }
+    if !cordial_shell::vr::HOST_SUPPORTED {
+        return "not available on this architecture".into();
+    }
+    let config = crate::shell_config::load(&crate::shell_config::path());
+    cordial_shell::vr::Readiness::gather(config.vr_openxr_runtime.as_deref()).summary()
 }
 
 /// The whole block, ready to paste into an issue.
@@ -221,15 +258,37 @@ pub fn report() -> String {
         // scanning room to say nothing the reader lacks.
         ("Licence", "GPL-3.0-or-later".into()),
         ("Install", install_method()),
+        // Whether the release workflows built this or somebody else did. A
+        // hint for triage and nothing more; see `version::Origin`, and it names
+        // a public repository, never a path.
+        ("Build", cordial_shell::version::origin().text()),
         ("Roblox", roblox()),
         ("System", uname()),
         ("Distro", distro()),
         ("Session", session()),
+        // The NVIDIA kernel module and, in a Flatpak, whether the sandbox has
+        // the userspace driver that goes with it. Always present, and says so
+        // when there is no NVIDIA module: a mismatched Flatpak extension is the
+        // best-attested NVIDIA failure this project has a record of, and it
+        // looks like "no supported graphics device" until somebody asks.
+        ("Graphics", cordial_shell::nvidia::graphics_line()),
+        // Always present, like Graphics: "no Quest build" is itself the
+        // answer to most VR reports. Names, never paths -- a Flatpak manifest
+        // path is fine, a home-directory one is a person's name.
+        ("VR", vr()),
     ];
     for (label, value) in rows {
         out.push_str(&format!("{label:<9} {value}\n"));
     }
     out
+}
+
+/// [`report`] with the doctor's checks under it, for the report screen's Copy
+/// and Save. The checks are rendered by `doctor::render`, which puts the home
+/// directory as `~` and names no profile, so the whole is still safe to paste
+/// in public.
+pub fn with_checks(block: &str, checks: &[cordial_shell::doctor::Check]) -> String {
+    format!("{block}\nChecks\n{}", cordial_shell::doctor::render(checks))
 }
 
 #[cfg(test)]
@@ -247,8 +306,8 @@ mod tests {
         // literal that have to be remembered together: the literal was 6 when
         // a seventh row was added, and the failure it produced said nothing
         // about which row was new.
-        const LABELS: [&str; 7] =
-            ["Cordial", "Licence", "Install", "Roblox", "System", "Distro", "Session"];
+        const LABELS: [&str; 10] =
+            ["Cordial", "Licence", "Install", "Build", "Roblox", "System", "Distro", "Session", "Graphics", "VR"];
         let text = report();
         for label in LABELS {
             let line = text
@@ -281,6 +340,18 @@ mod tests {
         }
     }
 
+    /// The copied text is the block and then the checks, and the block is
+    /// unchanged: `--diagnostics` and the templates read it by its labels.
+    #[test]
+    fn the_checks_follow_the_block_without_changing_it() {
+        use cordial_shell::doctor::{check, Level};
+        let block = report();
+        let full = with_checks(&block, &[check(Level::Warn, "odd", "do this")]);
+        assert!(full.starts_with(&block));
+        assert!(full.contains("\nChecks\nwarn  odd\n      do this\n"), "{full}");
+        assert!(full.trim_end().ends_with("1 warning; Roblox should still start."), "{full}");
+    }
+
     /// An unreadable `os-release` is `unknown`, not a panic and not a blank.
     #[test]
     fn a_missing_field_says_unknown_rather_than_nothing() {
@@ -295,7 +366,7 @@ mod tests {
 
 #[cfg(test)]
 mod roblox_version_tests {
-    use super::roblox_in;
+    use super::{roblox_from, roblox_in};
 
     /// A directory with neither a record nor a library is the only case that
     /// may still say "unknown", and it must say *why* -- the old wording
@@ -324,5 +395,31 @@ mod roblox_version_tests {
         cordial_update::cache::record_version(&dir, "2.736.0.1408").expect("record");
         assert_eq!(roblox_in(&dir), "2.736.0.1408 (fetched by Cordial)");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn kept(version: &str, runnable: bool, source: Option<cordial_update::store::Source>) -> cordial_update::store::Entry {
+        cordial_update::store::Entry {
+            version: version.into(),
+            dir: std::path::PathBuf::from("/x").join(version),
+            loaded_by: None,
+            bytes: 0,
+            complete: runnable,
+            content_hash: None,
+            signer: runnable.then(|| "ab".repeat(32)),
+            provenance: source.map(|source| cordial_update::store::Provenance { source, at: Some(1_791_081_816) }),
+            version_code: None,
+        }
+    }
+
+    /// The report names the build a profile on Latest runs and how it came,
+    /// and says plainly when there is none, which are different claims.
+    #[test]
+    fn the_report_names_the_latest_runnable_build_and_how_it_arrived() {
+        use cordial_update::store::Source;
+        let both = [kept("2.736.0.1408", true, Some(Source::Sober)), kept("2.738.0.1397", true, Some(Source::Mirror))];
+        assert_eq!(roblox_from(&both), "2.738.0.1397 (Downloaded on 4 Oct 2026)");
+        assert_eq!(roblox_from(&[kept("2.736.0.1408", true, None)]), "2.736.0.1408 (source not recorded)");
+        assert!(roblox_from(&[]).starts_with("none (nothing"));
+        assert!(roblox_from(&[kept("2.740.0.1", false, None)]).starts_with("none runnable"));
     }
 }

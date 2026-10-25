@@ -213,9 +213,10 @@ export CORDIAL_GIT_SHA="$CORDIAL_SHORTHASH"
 # for the shape of the bug that taught this project to say so at every
 # callsite: with only one crate's feature on, the linker collects
 # webview::open silently and the binary carries no WebKitGTK, with no error
-# anywhere in the build.
+# anywhere in the build. `cordial-runtime/vr` is Play in VR (ADR-053), and
+# why the build needs Boost's headers.
 cargo build --release --locked \
-    --features cordial-shell/webview,cordial-runtime/webview
+    --features cordial-shell/webview,cordial-runtime/webview,cordial-runtime/vr
 
 readelf -d "$target_dir/release/cordial-run" | grep -qi webkit || {
     echo "cordial-run linked no WebKitGTK; the webview features did not take" >&2
@@ -283,6 +284,14 @@ install -Dm644 third_party/mcpelauncher-linker/LICENSE "$licdir/mcpelauncher-lin
 install -Dm644 third_party/mcpelauncher-linker/core/NOTICE "$licdir/aosp-NOTICE.txt"
 install -Dm644 third_party/libjnivm/LICENSE "$licdir/libjnivm-MIT.txt"
 install -Dm644 third_party/mocktail-webview/LICENSE "$licdir/mocktail-webview-Apache-2.0.txt"
+# dynarmic and its compiled-in externals, the VR mode's translator (x86-64).
+install -Dm644 third_party/dynarmic/LICENSE.txt "$licdir/dynarmic-0BSD.txt"
+install -Dm644 third_party/dynarmic/externals/fmt/LICENSE "$licdir/fmt-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/mcl/LICENSE "$licdir/mcl-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/robin-map/LICENSE "$licdir/robin-map-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/xbyak/COPYRIGHT "$licdir/xbyak-BSD-3-Clause.txt"
+install -Dm644 third_party/dynarmic/externals/zydis/LICENSE "$licdir/zydis-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/zycore/LICENSE "$licdir/zycore-MIT.txt"
 # bwrap and xdg-dbus-proxy are whole programs this AppImage now redistributes,
 # not libraries swept up by a dependency walk, so their licences travel with
 # them. Both are LGPL and both ship a COPYING under /usr/share/licenses.

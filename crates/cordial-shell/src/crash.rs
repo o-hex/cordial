@@ -79,6 +79,14 @@ pub fn is_crash(status: &std::process::ExitStatus, output: &str) -> bool {
         return true;
     }
 
+    // The teardown watchdog (issue #52) exits 124 after the user has already
+    // closed the game and cookies are saved: a hang on the way out, not a crash
+    // worth a page. It says so on stderr, and that line is required too, so a
+    // stray 124 from anything else still reaches the crash page.
+    if status.code() == Some(124) && output.contains("shutdown sequence has not returned") {
+        return false;
+    }
+
     // The exact spacing in Xlib's `XIO` line varies between versions, while
     // the connection-loss wording is stable. Keep this as a marker check
     // rather than special-casing exit code 1: a loader failure also returns 1
@@ -101,6 +109,50 @@ pub fn describe(status: &std::process::ExitStatus) -> String {
     }
 }
 
+/// How long a pinned profile's client may run before an exit stops looking
+/// like Roblox refusing an old build. **INFERRED**: nobody has captured what
+/// the engine shows when the server refuses a client for being too old, only
+/// that it does and that Cordial cannot ask the minimum (`version.rs`). Sixty
+/// seconds covers loading and a join attempt; the hint's own wording is
+/// conditional, so a long window costs a sentence and not a wrong claim.
+pub const PINNED_HINT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The one line a crash page adds for a pinned profile that stopped soon after
+/// it started, or `None`. Roblox enforces a minimum client version server-side
+/// and Cordial cannot see it, so this says what to try and not what happened.
+pub fn pinned_hint(pinned: bool, ran_for: std::time::Duration) -> Option<&'static str> {
+    (pinned && ran_for < PINNED_HINT_WINDOW)
+        .then_some("This profile is pinned. If Roblox asked you to update, choose Latest.")
+}
+
+/// The line under the title: what happened, and -- only when the client's own
+/// output and the machine both say it applies -- a hint about the NVIDIA driver.
+///
+/// Both hints are silent unless the client reported that it rendered on an
+/// NVIDIA device (`cordial_shell::nvidia::crash_hint` reads that from the
+/// output) or the Flatpak is missing the driver the host runs, which is a fact
+/// about the install and not a guess about the crash. Each says "may". The
+/// wording, the evidence and the tests live in `cordial_shell::nvidia`.
+fn description(
+    status: &std::process::ExitStatus,
+    output: &str,
+    command_line: &str,
+    pinned_hint: Option<&str>,
+) -> String {
+    let mut text = describe(status);
+    let extra = [
+        cordial_shell::nvidia::crash_hint(output),
+        cordial_shell::nvidia::flatpak_gl_here().advice(),
+        cordial_shell::vr::crash_hint(command_line),
+        pinned_hint.map(str::to_string),
+    ];
+    for hint in extra.into_iter().flatten() {
+        text.push_str("\n\n");
+        text.push_str(&hint);
+    }
+    text
+}
+
 /// Show the crash, transient for `parent`.
 ///
 /// `output` is what the client last printed, already redacted; `command_line`
@@ -111,11 +163,12 @@ pub fn present(
     status: &std::process::ExitStatus,
     command_line: &str,
     output: &str,
+    pinned_hint: Option<&str>,
 ) {
     let status_page = adw::StatusPage::builder()
         .icon_name("dialog-error-symbolic")
         .title("Roblox stopped unexpectedly")
-        .description(describe(status))
+        .description(description(status, output, command_line, pinned_hint))
         .build();
 
     let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -271,6 +324,15 @@ mod tests {
     }
 
     #[test]
+    fn the_teardown_watchdog_exit_is_not_a_crash_but_a_bare_124_is() {
+        let status = ExitStatus::from_raw(124 << 8);
+        let line = "[android] the engine's shutdown sequence has not returned after 10s; \
+                    exiting without it, with status 124 (issue #52).";
+        assert!(!is_crash(&status, line));
+        assert!(is_crash(&status, "something else exited 124"));
+    }
+
+    #[test]
     fn an_x11_connection_loss_is_not_an_engine_crash() {
         let status = ExitStatus::from_raw(1 << 8);
         assert!(!is_crash(
@@ -295,5 +357,16 @@ mod tests {
             &status,
             "X connection to :1 broken (explicit kill or server shutdown)."
         ));
+    }
+
+    /// Only a pinned profile, and only for an exit soon after the start.
+    #[test]
+    fn the_pinned_hint_is_for_a_pinned_profile_that_stopped_early() {
+        use std::time::Duration;
+        let said = pinned_hint(true, Duration::from_secs(8)).expect("pinned and early");
+        assert!(said.contains("pinned") && said.contains("choose Latest"), "{said}");
+        assert!(said.contains("If Roblox asked"), "it must not claim what it did not see: {said}");
+        assert_eq!(pinned_hint(false, Duration::from_secs(8)), None, "following Latest");
+        assert_eq!(pinned_hint(true, Duration::from_secs(600)), None, "a long session is not this");
     }
 }

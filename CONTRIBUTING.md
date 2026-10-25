@@ -121,6 +121,17 @@ to Apache-2.0, to dual-licence, to carve out an exception for one downstream —
 are declined, and the issue is closed with a link to this section rather than
 argued out.
 
+There is **one exception, and it is named so that it is not an opening**:
+`crates/cordial-protocol` is `MIT OR Apache-2.0`. It is the interface other
+runtimes and launchers implement (the message types, the codec, the manifest type
+and the conformance cases, with nothing of the client in it), and a protocol
+crate that a program under another licence cannot link is not doing its job.
+Contributions to that directory are under that licence, which the crate's
+`Cargo.toml` and its two licence files state. Everything else in the repository, every other crate included, is still
+GPL-3.0-or-later. A request to move a second crate or the client itself is the
+request this section declines. Why, and what the crate may not grow into:
+[ADR-055](docs/adr/ADR-055-the-launcher-and-the-runtime-are-two-programs.md).
+
 That is a rule, not a verdict on whoever asked. The argument has no new form
 left: it has been had, the answer has not moved, and each fresh round costs an
 evening that would otherwise go on the client. A maintainer closing one of these
@@ -183,6 +194,19 @@ sudo dnf install gtk4-devel libadwaita-devel      # Fedora
 sudo apt install libgtk-4-dev libadwaita-1-dev    # Debian/Ubuntu
 sudo pacman -S gtk4 libadwaita                    # Arch
 ```
+
+Play in VR is the `vr` feature: off in a plain `cargo build`, on in every
+package, and turned on with `--features cordial-runtime/vr`. Nothing in the
+next paragraph is needed without it.
+
+On x86-64 the VR mode's translator, dynarmic (`third_party/dynarmic`, a
+submodule with submodules of its own, which `--recursive` fetches), also needs
+Boost's headers: `boost-devel`, `libboost-dev` or `boost`. `cargo test` with it builds a
+small arm64 test image for `crates/cordial-guest` and needs `lld` and `llvm`
+for it; without them the tests that run it are ignored, and a build warning
+says why. The build compiles the loader and dynarmic with `patches/0005`--`0008`
+applied, in a copy under `target/`, and leaves the submodules untouched
+([`patches/README.md`](patches/README.md)).
 
 ```bash
 git clone --recursive https://github.com/luohoa97/cordial
@@ -251,26 +275,48 @@ Users install the Flatpak; this is a contributor's shell.
 The per-distro lists above stay first-class. Most contributors do not have Nix
 and should not need it.
 
-**The flake has still not been built successfully by anyone, and this is now
-measured rather than `INFERRED`.** Run on the developer's Fedora Atomic host on
-2026-08-06, `nix develop` fails before evaluating anything:
+**What has been run, as of 2026-10-01.** `packages.default` was built from this
+tree on the developer's Fedora Atomic host and the result inspected, but not
+launched into a game. `cordial --help` and `cordial --diagnostics` ran from the
+built output, `ldd` on both binaries reports nothing `not found`, and
+`readelf -d` shows `cordial-run` linked WebKitGTK. The PipeWire, ALSA and
+PulseAudio backends are compiled in. `cargo test` is not run by the Nix build.
+Nobody has run the `devShells.default` shell end to end, and the remote form,
+`nix run "github:luohoa97/cordial?submodules=1"`, is `INFERRED` from the local
+build and has not been tried against a pushed commit.
+
+Two things the first build found. `eachDefaultSystem` evaluates x86_64-darwin,
+which current nixpkgs refuses to evaluate, so the flake lists Linux systems
+only. And `cargoBuildFeatures` is overwritten by nixpkgs' `buildFeatures`, so
+the first package built cleanly with no web view; the flake now sets
+`buildFeatures` and fails the build if `cordial-run` links no WebKitGTK.
+
+**The submodules need `?submodules=1`.** Flakes do not fetch them otherwise;
+from a checkout use `nix build '.?submodules=1#cordial'`. The package installs
+the same files as the AUR package, puts `deno` on the wrapper's `PATH`, and
+reports `Install unknown` in `cordial --diagnostics`, because nothing there
+recognises a `/nix/store` path yet.
+
+On an ostree host `nix` has no writable store to start with, and a bare
+`nix develop` fails with
 
 ```text
 error: creating directory "/nix/store/.links": Read-only file system
 ```
 
-`findmnt /nix` reports no mount at all — `/nix` is inside the read-only
-composefs image, `/nix/store` is not writable, and `nix-daemon` is inactive.
-Nix itself is present and working (`nix-core-2.34.8-1.fc44`); it has nowhere to
-put a store.
+`/nix` is inside the read-only composefs image and `nix-daemon` is inactive. The
+Determinate Systems installer handles ostree, or a systemd mount unit can bind a
+writable directory over `/nix`. **Neither is needed to build**: a store under
+your home directory works with no change to the host, and is how the build above
+was done:
 
-So on an ostree host the store must be made writable first — the Determinate
-Systems installer handles ostree, or a systemd mount unit can bind a writable
-directory over `/nix`. **That is a larger change to the host than installing the
-one devel package Nix was reached for in order to avoid**, which is worth
-weighing before going down this road.
+```bash
+nix --store "local?root=$HOME/.cache/cordial-nix" build '.?submodules=1#cordial' -L
+```
 
-If you are the first to build the flake successfully, say so and replace this.
+The binaries it produces point at `/nix/store`, which only exists inside that
+store's namespace, so run them with `nix --store ... shell <store path>` rather
+than directly.
 
 `webkitgtk6.0-devel` (`libwebkitgtk-6.0-dev` on Debian/Ubuntu) will be needed by
 whoever picks up the web view — Marketplace, Profile, Communities and most
@@ -288,7 +334,8 @@ Before opening a pull request:
 - the client still launches — repeatedly, not once
 - your commit message says what you **measured**, not just what you changed
 
-Licensed GPL-3.0-or-later. By contributing you agree your work ships under it.
+Licensed GPL-3.0-or-later. By contributing you agree your work ships under it,
+except in `crates/cordial-protocol`, where it ships under `MIT OR Apache-2.0`.
 Third-party notices live in
 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) and must be kept accurate;
 MIT and Apache-2.0 obligations are satisfied only while those notices travel

@@ -36,6 +36,7 @@ use crate::settings;
 use crate::shell_config::ShellConfig;
 use crate::updater;
 use crate::window_state;
+use cordial_shell::freeze_recovery;
 use cordial_shell::host_window::HostWindow;
 use cordial_shell::profile;
 
@@ -102,6 +103,17 @@ const fn exit_presentation(
 /// ordering argument.
 const EARLY_EXIT_CHECK: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long the "Roblox got stuck starting" line stays up on a restart.
+const RECOVERY_NOTICE: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// How often a new client's log is read for the startup freeze (#92). Once a
+/// second is far more often than a five-second verdict needs, and the reading
+/// stops at the first decision, which a healthy start reaches in a few seconds.
+const FREEZE_POLL: Duration = Duration::from_secs(1);
+
+/// How long a stopped client has to exit on `SIGTERM` before it is killed.
+const FREEZE_KILL_AFTER: Duration = Duration::from_secs(5);
+
 /// The dialog shown while the client starts.
 ///
 /// Roblox takes a while to get from a launch to a window of its own, and until
@@ -119,7 +131,19 @@ const EARLY_EXIT_CHECK: std::time::Duration = std::time::Duration::from_secs(3);
 /// it is customised by pointing at a file, never by shipping alternatives:
 /// Roblox's own icons are their assets, and AGENTS.md rules out vendoring any
 /// of them however small.
+#[cfg(test)]
 fn starting_dialog(parent: &gtk::Window, profile: &str, joining: bool) -> Option<gtk::Window> {
+    starting_dialog_with(parent, profile, joining, None)
+}
+
+/// [`starting_dialog`] with a line of its own in place of the usual title, which
+/// is what a restart after a startup freeze (#92) uses to say what happened.
+fn starting_dialog_with(
+    parent: &gtk::Window,
+    profile: &str,
+    joining: bool,
+    notice: Option<&str>,
+) -> Option<gtk::Window> {
     // Browser auto-launch has no launcher surface or progress animation.
     if !parent.is_visible() {
         return None;
@@ -134,9 +158,10 @@ fn starting_dialog(parent: &gtk::Window, profile: &str, joining: bool) -> Option
     icon.set_pixel_size(72);
     content.append(&icon);
 
-    let title = gtk::Label::new(Some(&match joining {
-        true => format!("Starting Roblox on {profile}, joining the link"),
-        false => format!("Starting Roblox on {profile}"),
+    let title = gtk::Label::new(Some(&match (notice, joining) {
+        (Some(notice), _) => notice.to_owned(),
+        (None, true) => format!("Starting Roblox on {profile}, joining the link"),
+        (None, false) => format!("Starting Roblox on {profile}"),
     }));
     title.add_css_class("title-4");
     title.set_wrap(true);
@@ -195,6 +220,7 @@ pub fn build(
     app: &adw::Application,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
+    offer_newest: bool,
 ) -> Shell {
     // T1: the chooser core paints before the plugin host is up. One entry, and
     // it starts the client — see `chooser.rs` on why the second one went.
@@ -217,7 +243,7 @@ pub fn build(
         chooser::build(&source, move |id| {
             let Some(window) = toasts.root().and_downcast::<gtk::Window>() else { return };
             match id {
-                chooser::ROBLOX => activate_roblox(&window, &toasts, &config, &join, &lifecycle),
+                chooser::ROBLOX => activate_roblox(&window, &toasts, &config, &join, &lifecycle, Mode::Phone),
                 // Unreachable while there is one entry, and deliberately loud
                 // rather than ignored: the moment plugin-contributed entries
                 // exist, an id core does not know how to launch is a bug in the
@@ -228,21 +254,29 @@ pub fn build(
         })
     };
 
-    // Directly above the Launch button, and that position is the whole argument:
-    // the profile is a launch parameter — which of these do I start — rather
-    // than an ambient identity, so it belongs beside the button it governs. It
-    // was an avatar in the top-right corner first; see `profile_switcher.rs` for
-    // why that was a browser convention borrowed into an application that is not
-    // one.
+    // The header bar's start, as a labelled menu button; `profile_switcher.rs`
+    // has the reasoning, which reverses this window's earlier answer. What used
+    // to be a row above the Launch button is a button and a caption now, and
+    // the caption is empty and hidden unless the profile has something to say
+    // that changes what pressing Roblox does.
     let switcher = profile_switcher::build(config.clone(), config_path.clone());
-    let _profile_row = switcher.group.clone();
-    let profile_combo = switcher.row.clone();
+    let profile_button = switcher.button.clone();
     let refresh_profile_row = switcher.refresh.clone();
 
-    // Centred Roblox launch button (single player, no multi-accounting).
-    let column = gtk::Box::new(gtk::Orientation::Vertical, 24);
+    // One control, centred, and the empty space around it is the point.
+    //
+    // This was a stack of two `AdwPreferencesGroup`s pinned to the top of the
+    // window, then a profile row over the button, and each read as a form that
+    // had run out of fields. The width clamp is tighter than the 480 the groups
+    // used because a pill button stretched to a launcher's full width looks
+    // like a preferences page whatever is in it.
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 12);
     column.set_valign(gtk::Align::Center);
+    // The Roblox button and nothing under it but the profile's caption, which
+    // is hidden in the ordinary case. VR is started from Settings → VR
+    // (ADR-053, decision 7): the launcher stays one button.
     column.append(&chooser_widget);
+    column.append(&switcher.note);
 
     let clamp = adw::Clamp::builder().maximum_size(360).child(&column).build();
     clamp.set_margin_top(24);
@@ -257,6 +291,10 @@ pub fn build(
     // is why the launcher looks the same as it always did on every run where no
     // link arrives.
     let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    // Above the join banner: it is about the whole session and standing, where
+    // a queued join is about one click. Not revealed on Wayland, so the
+    // launcher there is unchanged.
+    body.append(&crate::x11_notice::build(crate::x11_notice::running_on_x11()));
     body.append(join.banner());
     body.append(&clamp);
     toasts.set_child(Some(&body));
@@ -326,7 +364,9 @@ pub fn build(
     // parameter type mismatch" and does nothing, which is what the header-bar
     // button this replaced had to be wired around.
     primary_menu.append(Some("_Preferences"), Some("win.settings::"));
-    primary_menu.append(Some("_Report a Problem"), Some("win.settings::report"));
+    // The one report screen. The About dialog and the launcher's X11 notice
+    // open the same thing; see `report.rs`.
+    primary_menu.append(Some("_Report a Problem"), Some(crate::x11_notice::REPORT_ACTION));
     primary_menu.append(Some("_About Cordial"), Some("win.about"));
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
@@ -335,6 +375,9 @@ pub fn build(
         .primary(true)
         .build();
     host.header().pack_end(&menu_button);
+    // The profile, at the start of the header bar, opposite the menu: the
+    // context the window is acting in, rather than an action on it.
+    host.header().pack_start(&profile_button);
 
     let window = host.window().clone();
     // `HostWindow` is deliberately application-less — the runtime has no
@@ -358,6 +401,40 @@ pub fn build(
     // worth a button whether or not anything newer exists.
     let update_button = updater::header_button(&window, config.clone());
     host.header().pack_end(&update_button);
+
+    // ADR-054, decision 4. Sober's build was just copied into Cordial's store
+    // by the migration, and from here its updates move when Cordial's Updates
+    // run -- which does not download unasked on a metered connection (ADR-015)
+    // -- instead of whenever Sober's app updated. Roblox refusing the old
+    // build would then look, to this user, like Cordial breaking, so the one
+    // launch that did the copy asks once whether to fetch the newest. Not
+    // remembered anywhere: `offer_newest` is only true on the run that did the
+    // copy, and the migration cannot do it twice.
+    if offer_newest {
+        let window = window.clone();
+        let update_button = update_button.clone();
+        glib::idle_add_local_once(move || {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Cordial now keeps its own copy of Roblox")
+                .body(
+                    "Cordial copied the Roblox build Sober had. From now on it changes when you \
+                     update it here, not when Sober does. Roblox refuses builds that are too \
+                     old, so check now whether there is a newer one.",
+                )
+                .build();
+            dialog.add_response("later", "Not Now");
+            dialog.add_response("check", "Check for Updates");
+            dialog.set_response_appearance("check", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("check"));
+            dialog.set_close_response("later");
+            dialog.connect_response(None, move |_, response| {
+                if response == "check" {
+                    update_button.emit_clicked();
+                }
+            });
+            dialog.present(Some(&window));
+        });
+    }
 
 
     // An action rather than only a button handler, because the header bar is no
@@ -430,32 +507,27 @@ pub fn build(
         // narrow screen instead of a floating box too wide to fit.
         settings.present(Some(&window_for_settings));
     });
-    // The same arrangement for the profile row: a launch refused because the
+    // The same arrangement for the profile button: a launch refused because the
     // profile is busy has to be able to reach the control that chooses another
-    // one. It is in this window rather than behind a button now, so the action
-    // only has to move the focus there.
+    // one. It is in this window's header bar, so the action only has to open
+    // its menu.
     let profile_action = gtk::gio::SimpleAction::new("profile", None);
-    // **Open the list, do not merely focus the container.** This called
-    // `grab_focus()` on the `PreferencesGroup`, which is a box around the row:
-    // nothing visible happened, so pressing "Choose a Profile" on the
-    // profile-busy dialog looked exactly like pressing "Cancel". Reported on
-    // 2026-08-28 as the two buttons doing the same thing -- and from outside
-    // the process they did, since the only difference was where keyboard focus
-    // landed behind a dialog that was disappearing.
+    // **Open the menu, do not merely focus the button.** The action once called
+    // `grab_focus()` on a container around the old row: nothing visible
+    // happened, so pressing "Choose a Profile" on the profile-busy dialog
+    // looked exactly like pressing "Cancel". Reported on 2026-08-28 as the two
+    // buttons doing the same thing -- and from outside the process they did,
+    // since the only difference was where keyboard focus landed behind a dialog
+    // that was disappearing.
     //
     // Deferred to an idle callback because the usual caller is that dialog's
     // response handler, and the dialog is still tearing down when it fires; a
     // popover asked to open underneath a closing modal does not.
-    let profile_combo_for_action = profile_combo.clone();
+    let profile_button_for_action = profile_button.clone();
     profile_action.connect_activate(move |_, _| {
-        let row = profile_combo_for_action.clone();
-        row.grab_focus();
-        glib::idle_add_local_once(move || {
-            // Disambiguated: `WidgetExt` and `ListBoxRowExt` both offer an
-            // `activate`, and the one that opens an `AdwComboRow`'s list is the
-            // row's, which is what a keyboard Enter on it does.
-            gtk::prelude::WidgetExt::activate(&row);
-        });
+        let button = profile_button_for_action.clone();
+        button.grab_focus();
+        glib::idle_add_local_once(move || button.popup());
     });
 
     // Fullscreen, on F11, because until now there was no way for a user to ask
@@ -495,7 +567,7 @@ pub fn build(
     {
         let window = window.clone();
         let toasts = toasts.clone();
-        let config = config_for_launch;
+        let config = config_for_launch.clone();
         let join = join.clone();
         let lifecycle = lifecycle.clone();
         launch_action.connect_activate(move |_, _| {
@@ -505,25 +577,51 @@ pub fn build(
             // confirmation, build discovery or profile acquisition can return,
             // while retaining the URL for a manual retry if any of them does.
             join.invalidate_lookup(&config.borrow().profile);
-            activate_roblox(&window.clone().upcast(), &toasts, &config, &join, &lifecycle);
+            activate_roblox(&window.clone().upcast(), &toasts, &config, &join, &lifecycle, Mode::Phone);
         });
     }
 
-    // **About, with the diagnostics block as its Troubleshooting section.**
+    // "Play in VR", as an action: the same call Settings → VR's button makes,
+    // reachable by name, so the page does not hold the window's internals and
+    // there is still one launch path.
+    let launch_vr_action = gtk::gio::SimpleAction::new("launch-vr", None);
+    {
+        let window = window.clone();
+        let toasts = toasts.clone();
+        let config = config_for_launch.clone();
+        let join = join.clone();
+        let lifecycle = lifecycle.clone();
+        launch_vr_action.connect_activate(move |_, _| {
+            activate_roblox(&window.clone().upcast(), &toasts, &config, &join, &lifecycle, Mode::Vr);
+        });
+    }
+
+    // **The report screen, and the only place the diagnostics block lives.**
     //
-    // `AdwAboutDialog` carries a Troubleshooting page with a copy button and a
-    // "Save as" built in, and `debug_info` is what fills it. That is the same
-    // text `Settings -> Report a Problem` shows and `--diagnostics` prints, from
-    // the one function, so the three can never drift.
-    //
-    // It is here because three separate reporters could not find the block at
-    // all. One typed `flatpak run cordial --diagnostic` and got "Invalid id";
-    // another ran `cordial --diagnostics`, got "command not found", and wrote
-    // *that* into the diagnostics field of their report. Settings -> Report a
-    // Problem is not where anyone looks for it. About -> Troubleshooting is.
+    // The primary menu, the launcher's X11 notice and the About dialog's issue
+    // row all come here. There used to be two copies of the block -- a page in
+    // Settings and the About dialog's Troubleshooting page -- and a reporter who
+    // found one did not know about the other. Three separate reporters could
+    // not find the block at all: one typed `flatpak run cordial --diagnostic`
+    // and got "Invalid id", another ran `cordial --diagnostics`, got "command
+    // not found", and wrote *that* into the diagnostics field of their report.
+    // A menu entry named for what they are trying to do is where they look.
+    let report_action = gtk::gio::SimpleAction::new("report", None);
+    {
+        let window = window.clone();
+        let config = config_for_launch.clone();
+        report_action.connect_activate(move |_, _| crate::report::present(&window, &config));
+    }
+
+    // About: what this is, who made it, and where to get help. It no longer
+    // carries the diagnostics block itself -- `debug_info` is what filled the
+    // Troubleshooting page, and that page duplicated the report screen. The
+    // issue row below opens the report screen instead of the web form, because
+    // the form asks for the block and this is where it is copied from.
     let about_action = gtk::gio::SimpleAction::new("about", None);
     {
         let window = window.clone();
+        let config = config_for_launch.clone();
         about_action.connect_activate(move |_, _| {
             let dialog = adw::AboutDialog::builder()
                 .application_name(cordial_shell::branding::current().name())
@@ -531,7 +629,7 @@ pub fn build(
                 .version(cordial_shell::version::full())
                 .developer_name("The Cordial contributors")
                 .website("https://github.com/luohoa97/cordial")
-                .issue_url("https://github.com/luohoa97/cordial/issues/new/choose")
+                .issue_url(ABOUT_REPORT_LINK)
                 // The Discord, under libadwaita's own "Support Questions"
                 // heading, because that is where support actually happens and
                 // it was reachable from nowhere in the application. `README`
@@ -549,16 +647,27 @@ pub fn build(
                 // assumed -- a licence stated wrongly in an About dialog is
                 // worse than one not stated at all, because it is believed.
                 .license_type(gtk::License::Gpl30)
-                .debug_info(crate::diagnostics::report())
-                .debug_info_filename("cordial-diagnostics.txt")
                 .build();
+            // Stacked over the About dialog rather than the launcher, so closing
+            // it lands back on About.
+            let config = config.clone();
+            dialog.connect_activate_link(move |about, uri| {
+                if uri != ABOUT_REPORT_LINK {
+                    // Not ours: let libadwaita open it as it always did.
+                    return false;
+                }
+                crate::report::present(about, &config);
+                true
+            });
             dialog.present(Some(&window));
         });
     }
 
     let actions = gtk::gio::SimpleActionGroup::new();
     actions.add_action(&about_action);
+    actions.add_action(&report_action);
     actions.add_action(&launch_action);
+    actions.add_action(&launch_vr_action);
     actions.add_action(&settings_action);
     actions.add_action(&profile_action);
     actions.add_action(&fullscreen_action);
@@ -576,7 +685,13 @@ pub fn build(
     // may put a dialog up, and doing that before the window has been presented
     // gives a modal with nothing behind it. 400ms matches the deep-link path
     // just below, which had the same problem first.
-    if std::env::var_os("CORDIAL_AUTOSTART").is_some() {
+    //
+    // `cordial --play` is the same action without the environment variable, and
+    // the same reasoning: it goes through `win.launch` so that what a program
+    // starts is what the button starts (ADR-058). The window is never
+    // presented in that case -- see `cli::playing` -- so the launch has no
+    // starting dialog to show and a failure leaves through the exit status.
+    if std::env::var_os("CORDIAL_AUTOSTART").is_some() || crate::cli::playing() {
         let window = window.clone();
         glib::timeout_add_local_once(Duration::from_millis(400), move || {
             WidgetExt::activate_action(&window, "win.launch", None).ok();
@@ -604,8 +719,8 @@ pub fn build(
     // Save the fullscreen state the moment it changes, against whichever
     // profile is selected *at that moment* -- read fresh from `config` in
     // every handler below rather than captured once, so that switching the
-    // profile row and then pressing F11 saves against the row's new choice
-    // and not the one this window opened with. `window_state.rs`'s own header
+    // profile and then pressing F11 saves against the new choice and not the
+    // one this window opened with. `window_state.rs`'s own header
     // is the reasoning for why this happens unconditionally and why that is
     // safe for this window specifically -- it does not carry over to the
     // engine's own window without re-deriving it.
@@ -673,7 +788,7 @@ pub fn build(
     }
 
     // Focus starts on the thing the window is for, so that a keyboard launches
-    // with Return and nothing else. Left alone it lands on the profile row,
+    // with Return and nothing else. Left alone it lands on the profile button,
     // which is the first focusable widget and the one control here that is not
     // the point. GTK only *draws* a focus ring once a key has been pressed, so
     // this costs nothing visually on a window nobody types into.
@@ -707,6 +822,12 @@ pub fn build(
 
     browser_shell
 }
+
+/// The address the About dialog's issue row carries, which `connect_activate_link`
+/// intercepts and turns into the report screen. Not a scheme anything else
+/// handles, so a row the interception somehow missed fails visibly in the
+/// portal rather than opening a page that is not the one described.
+const ABOUT_REPORT_LINK: &str = "cordial-internal:report";
 
 /// How long to wait after the last `notify::default-width`/`default-height`
 /// before writing the settled size to disk. Long enough that an interactive
@@ -756,7 +877,7 @@ fn initial_size(state: &window_state::WindowState) -> (i32, i32) {
 /// `config` currently names.
 ///
 /// Read-modify-write against the file rather than an in-memory cache, so that
-/// switching the profile row and then resizing, or the reverse, never writes
+/// switching the profile and then resizing, or the reverse, never writes
 /// one profile's geometry into another's record. The cost is a read on every
 /// toggle; `window.json` is a few dozen bytes and this fires on a keypress, not
 /// in a loop.
@@ -812,7 +933,7 @@ fn persist_window_size(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) 
     }
 }
 
-/// `CORDIAL_SHELL_PRESENT=settings,settings=updates,update,launch,maximise,fullscreen`
+/// `CORDIAL_SHELL_PRESENT=settings,settings=updates,update,report,about,launch,launch-vr,maximise,fullscreen`
 /// opens those windows at startup and puts the launcher into those states.
 ///
 /// A test seam, and it exists because there is no other way to photograph these
@@ -827,7 +948,7 @@ fn persist_window_size(config: &Rc<RefCell<ShellConfig>>, window: &adw::Window) 
 /// **`settings=<page>` opens Settings on a named page**, which is the same
 /// problem one level down: the window has five tabs and a photograph of it shows
 /// one. The names are the `name` each `AdwPreferencesPage` is built with —
-/// `roblox`, `updates`, `version`, `general`, `plugins`, `report` — and an unknown one
+/// `roblox`, `updates`, `version`, `vr`, `general`, `plugins`, `fastflags` — and an unknown one
 /// is libadwaita's warning to answer, not this function's, because a name that
 /// silently fell back to the first page would produce a screenshot captioned as
 /// something it is not.
@@ -852,8 +973,17 @@ fn open_on_start(window: &adw::Window, update_button: &gtk::Button) {
                     let _ = window.activate_action("win.settings", Some(&page.to_variant()));
                 }
                 "update" => update_button.emit_clicked(),
+                "report" => {
+                    let _ = window.activate_action("win.report", None);
+                }
+                "about" => {
+                    let _ = window.activate_action("win.about", None);
+                }
                 "launch" => {
                     let _ = window.activate_action("win.launch", None);
+                }
+                "launch-vr" => {
+                    let _ = window.activate_action("win.launch-vr", None);
                 }
                 // Same seam, for the same reason, one property further: a
                 // window-state round trip cannot be checked without putting the
@@ -863,6 +993,8 @@ fn open_on_start(window: &adw::Window, update_button: &gtk::Button) {
                 "fullscreen" => {
                     let _ = window.activate_action("win.fullscreen", None);
                 }
+                // Read by Settings → VR itself, once that page exists.
+                "vr-pull" => {}
                 other => println!("  shell: CORDIAL_SHELL_PRESENT does not know {other:?}"),
             }
         }
@@ -881,6 +1013,7 @@ fn activate_roblox(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
     lifecycle: &LaunchLifecycle,
+    mode: Mode,
 ) {
     // Root gets one warning before it costs an hour. See `root_warning`: no
     // session bus means no PipeWire, and the engine calls `abort()` at
@@ -895,7 +1028,7 @@ fn activate_roblox(
         let join = join.clone();
         let lifecycle = lifecycle.clone();
         root_warning::confirm(&window.clone(), move || {
-            launch_now_tracked(&window, &toasts, &config, &join, &lifecycle);
+            launch_now_tracked(&window, &toasts, &config, &join, &lifecycle, mode);
         });
         return;
     }
@@ -908,7 +1041,11 @@ fn activate_roblox(
     // holder, and this warning is only about a launch that would put two
     // different profiles up at once.
     let target_profile = config.borrow().profile.clone();
-    if !config.borrow().multi_instance_warning_seen
+    // Not asked of a game that was started on purpose from the command line:
+    // somebody who typed `--profile P2 --play` while P1 runs has just answered
+    // it, and the dialog would be a modal on a window nobody can see.
+    if !crate::cli::playing()
+        && !config.borrow().multi_instance_warning_seen
         && profile::other_profile_is_running(&target_profile)
     {
         window.present();
@@ -919,12 +1056,26 @@ fn activate_roblox(
         let join = join.clone();
         let lifecycle = lifecycle.clone();
         multi_instance_warning::confirm(&window.clone(), &config_for_dialog, move || {
-            launch_now_tracked(&window, &toasts, &config, &join, &lifecycle);
+            launch_now_tracked(&window, &toasts, &config, &join, &lifecycle, mode);
         });
         return;
     }
 
-    launch_now_tracked(window, toasts, config, join, lifecycle);
+    launch_now_tracked(window, toasts, config, join, lifecycle, mode);
+}
+
+/// How a game started from the command line says it could not start: a line on
+/// stderr and an exit status, where the interactive launcher raises a dialog on a
+/// window the caller never saw.
+///
+/// The caller is a program (ADR-058) and has no way to read a dialog, so a
+/// dialog here would be a game that neither starts nor fails.
+fn give_up(window: &gtk::Window, message: &str, status: u8) {
+    eprintln!("cordial: {message}");
+    crate::cli::set_status(status);
+    if let Some(app) = window.application() {
+        app.quit();
+    }
 }
 
 /// The launch itself, once anything that had to be asked has been.
@@ -934,24 +1085,41 @@ fn launch_now_tracked(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
     lifecycle: &LaunchLifecycle,
+    mode: Mode,
 ) {
-    match try_launch_tracked(window, config, join, lifecycle) {
+    match try_launch_tracked(window, config, join, lifecycle, mode) {
         Outcome::Started => {}
         Outcome::Failed(message) => {
+            if crate::cli::playing() {
+                return give_up(window, &message, 1);
+            }
             window.present();
             alert(window, "Roblox could not start", &message);
         }
         Outcome::ProfileBusy(name, holder) => {
+            if crate::cli::playing() {
+                // 3, as `cordial-run` exits for the same refusal.
+                let refusal = profile::Error::Busy(name, holder);
+                return give_up(window, &refusal.to_string(), 3);
+            }
             window.present();
-            profile_busy(window, toasts, config, join, lifecycle, &name, holder)
+            profile_busy(window, toasts, config, join, lifecycle, mode, &name, holder)
         }
         Outcome::ProfileChanged => {
             window.present();
             join.banner().set_title(
-                "Roblox link waiting — press Roblox to join",
+                "Roblox link waiting — the matched profile changed; choose a profile and press Roblox",
             );
         }
         Outcome::NoBuild => {
+            if crate::cli::playing() {
+                return give_up(
+                    window,
+                    "there is no Roblox build to run; start Cordial once without --play to \
+                     download one, or set CORDIAL_APK",
+                    4,
+                );
+            }
             window.present();
             let window = window.clone();
             let config = config.clone();
@@ -961,7 +1129,7 @@ fn launch_now_tracked(
                 // Returning whether it worked is what lets the instructions
                 // window stay up while the user is still following them.
                 matches!(
-                    try_launch_tracked(&window, &config, &join, &lifecycle),
+                    try_launch_tracked(&window, &config, &join, &lifecycle, mode),
                     Outcome::Started
                 )
             });
@@ -976,7 +1144,17 @@ fn launch_now(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
 ) {
-    launch_now_tracked(window, toasts, config, join, &LaunchLifecycle::default());
+    launch_now_tracked(window, toasts, config, join, &LaunchLifecycle::default(), Mode::Phone);
+}
+
+/// Which build a press of a launch control starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The phone build, through GameActivity: the Roblox button.
+    Phone,
+    /// The Quest build, under the translator, in an OpenXR session: "Play in
+    /// VR" (ADR-053).
+    Vr,
 }
 
 enum Outcome {
@@ -1006,37 +1184,97 @@ fn try_launch_tracked(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
     lifecycle: &LaunchLifecycle,
+    mode: Mode,
 ) -> Outcome {
-    let (roblox, profile_name) = {
-        let config = config.borrow();
-        (config.roblox.clone(), config.profile.clone())
-    };
+    let profile_name = config.borrow().profile.clone();
 
-    let build = match install::locate(&roblox) {
-        Ok(build) => build,
-        Err(NotFound::NoBuild) => return Outcome::NoBuild,
-        Err(NotFound::Unusable(message)) => return Outcome::Failed(message),
-    };
+    // "Play in VR" takes the Quest build the user imported, and nothing
+    // about the phone build -- its location, its pin, the instructions for
+    // getting one -- applies to it. Re-checked here rather than trusted from
+    // the button, because the button's state was gathered when it was drawn.
+    if mode == Mode::Vr {
+        // A build without the `vr` feature has no Settings page to reach this
+        // from, but `win.launch-vr` is still a named action, so say why rather
+        // than start a client that would refuse `--guest-arm64`.
+        if !cordial_shell::vr::HOST_SUPPORTED {
+            return Outcome::Failed("This build of Cordial has no VR support.".into());
+        }
+        let readiness = cordial_shell::vr::Readiness::gather(config.borrow().vr_openxr_runtime.as_deref());
+        if !readiness.ready() {
+            return Outcome::Failed(readiness.missing().join("\n\n"));
+        }
+        let entry = readiness.quest_build.clone().expect("ready means a Quest build is present");
+        let Some(apk) = entry.base_apk() else {
+            return Outcome::Failed(format!("The Quest build in {} has no APK beside it.", entry.dir.display()));
+        };
+        let build = install::Build { apk, lib_dir: entry.dir.clone() };
+        let vr = Some(launch::VrLaunch { openxr_runtime: readiness.manifest_for_launch() });
+        return start(window, join, lifecycle, &profile_name, build, vr);
+    }
 
-    // A profile that names a Roblox version gets that one, whatever the current
-    // build is. Applied after `locate` rather than inside it, because `locate`
-    // answers "what build is on this machine" and has no business knowing about
-    // profiles -- and because a pin that cannot be honoured must refuse the
-    // launch rather than quietly hand back the build it was pinned away from.
+    // The profile's choice against the store: Latest unless it is pinned, and a
+    // pin that cannot be honoured refuses the launch rather than quietly
+    // handing back the build it was pinned away from. `CORDIAL_APK`, the
+    // developer override, is answered first inside `resolve`.
     let build = match profile::dir(&profile_name)
         .map_err(NotFound::Unusable)
-        .and_then(|d| install::apply_pin(build, &d))
+        .and_then(|d| install::resolve(&d))
     {
         Ok(build) => build,
         Err(NotFound::NoBuild) => return Outcome::NoBuild,
         Err(NotFound::Unusable(message)) => return Outcome::Failed(message),
     };
+    start(window, join, lifecycle, &profile_name, build, None)
+}
 
+/// From the profile's claim to a running client, for either build.
+fn start(
+    window: &gtk::Window,
+    join: &PendingJoin,
+    lifecycle: &LaunchLifecycle,
+    profile_name: &str,
+    build: install::Build,
+    vr: Option<launch::VrLaunch>,
+) -> Outcome {
+    start_attempt(window, join, lifecycle, profile_name, build, vr, Attempt::first())
+}
+
+/// Where a press of Play is in the freeze recovery (#92), and what a restart
+/// has to carry over from the launch it replaces.
+///
+/// A relaunch is an ordinary launch of the same profile, but the link and the
+/// account routing it started with were consumed by the first spawn, so the
+/// restart is handed them rather than reading a `PendingJoin` that is empty by
+/// then.
+#[derive(Clone)]
+struct Attempt {
+    restarts: u32,
+    carried: Option<(Option<String>, Option<cordial_shell::secrets::Store>)>,
+}
+
+impl Attempt {
+    fn first() -> Self {
+        Attempt { restarts: 0, carried: None }
+    }
+}
+
+fn start_attempt(
+    window: &gtk::Window,
+    join: &PendingJoin,
+    lifecycle: &LaunchLifecycle,
+    profile_name: &str,
+    build: install::Build,
+    vr: Option<launch::VrLaunch>,
+    attempt: Attempt,
+) -> Outcome {
     // ADR-012's claim, taken before the process exists so that a refusal
     // costs nothing. A second window on one profile is two processes writing
     // one cookie store; the message names the profile because "already open"
     // on its own does not tell anyone which one to close.
-    let claim = match profile::acquire(&profile_name) {
+    // One lock for both builds: the Quest build's storage lives inside the
+    // same profile directory, so a VR launch and an ordinary one on one
+    // profile contend for the same `.lock` (ADR-053).
+    let claim = match profile::acquire(profile_name) {
         Ok(claim) => claim,
         Err(profile::Error::Busy(name, holder)) => return Outcome::ProfileBusy(name, holder),
         Err(e) => return Outcome::Failed(e.to_string()),
@@ -1047,18 +1285,26 @@ fn try_launch_tracked(
     // saved values changed in between, the name no longer identifies the
     // session that was authenticated. Returning drops the claim before manual
     // recovery.
-    let secret_store = match join.matched_store_if_current(&profile_name, claim.profile_dir()) {
-        Ok(store) => store,
-        Err(()) => {
-            join.clear_profile_match();
-            return Outcome::ProfileChanged;
-        }
+    let secret_store = match &attempt.carried {
+        Some((_, store)) => *store,
+        None => match join.matched_store_if_current(profile_name, claim.profile_dir()) {
+            Ok(store) => store,
+            Err(()) => {
+                join.clear_profile_match();
+                return Outcome::ProfileChanged;
+            }
+        },
     };
 
     // Read rather than taken: everything above this can still refuse, and a
     // busy profile that also cost the user their link would be two failures for
     // one press. It is cleared below, once there is a process holding it.
-    let url = join.peek();
+    let url = match &attempt.carried {
+        Some((url, _)) => url.clone(),
+        None => join.peek(),
+    };
+    let relaunch = (url.clone(), secret_store, vr.clone());
+    let freeze_watch = freeze_watch_for(claim.profile_dir(), vr.is_some());
     let instance = match launch::spawn(
         &build,
         claim,
@@ -1066,15 +1312,39 @@ fn try_launch_tracked(
             run_seconds: run_seconds_override(),
             join_url: url.as_deref(),
             secret_store,
+            vr,
         },
     ) {
         Ok(instance) => instance,
         Err(message) => return Outcome::Failed(message),
     };
+    let started_at = std::time::Instant::now();
+    let pinned = profile::dir(profile_name).ok().and_then(|d| profile::pinned_version(&d)).is_some();
     join.clear();
+    // What this profile's client is running, for the Version page's warning
+    // about moving it to an older build. Only a store entry is recorded: the
+    // `CORDIAL_APK` override and the Quest build are not versions of the store.
+    if let Some(entry) = cordial_update::store::entry_at(&build.lib_dir) {
+        if let Some(version) = entry.file_name().and_then(|n| n.to_str()) {
+            if let Ok(dir) = profile::dir(profile_name) {
+                if let Err(e) = profile::record_last_roblox_version(&dir, version) {
+                    println!("  shell: could not record the build {profile_name:?} last ran: {e}");
+                }
+            }
+        }
+    }
     lifecycle.client_started();
+    // From here Settings changes reach this client as well as the next launch:
+    // see `live`. Registered with the values its environment carried, so a
+    // change made while it loads is sent once its socket exists.
+    if let Some(session) = instance.session.clone() {
+        crate::live::register(instance.pid(), session, instance.launched_with.clone());
+    }
 
-    let starting = starting_dialog(&window, &profile_name, url.is_some());
+    let notice = (attempt.restarts > 0).then(|| {
+        freeze_recovery::status_line(attempt.restarts + 1, freeze_recovery::MAX_RESTARTS + 1)
+    });
+    let starting = starting_dialog_with(&window, &profile_name, url.is_some(), notice.as_deref());
 
     // **`SIGCHLD`, not a clock.** This was `timeout_add_local` at 500 ms for
     // the whole session -- two wakeups a second, forever, to ask a question
@@ -1103,7 +1373,10 @@ fn try_launch_tracked(
     let dialog_closed = Rc::new(Cell::new(starting.is_none()));
     if let Some(starting) = starting.clone() {
         let dialog_closed = dialog_closed.clone();
-        glib::timeout_add_local_once(EARLY_EXIT_CHECK, move || {
+        // A restart's status line is the only thing the user is told, so it
+        // stays up long enough to be read rather than for the early-exit check.
+        let linger = if notice.is_some() { RECOVERY_NOTICE } else { EARLY_EXIT_CHECK };
+        glib::timeout_add_local_once(linger, move || {
             if !dialog_closed.replace(true) {
                 starting.close();
             }
@@ -1139,11 +1412,20 @@ fn try_launch_tracked(
     // marker process that outlived the sandbox's own main process.
     let hold = window.application().map(|app| app.hold());
 
+    let freeze = FreezeState::default();
+    if let Some(supervisor) = freeze_watch {
+        watch_for_freeze(window, instance.pid(), supervisor, freeze.clone());
+    }
+    let build_again = build.clone();
+    let profile_again = profile_name.to_owned();
+
     let window = window.clone();
     let join = join.clone();
     let lifecycle = lifecycle.clone();
     let pid = glib::Pid(instance.pid() as i32);
     glib::child_watch_add_local(pid, move |_, wait_status| {
+        crate::live::unregister(pid.0 as u32);
+        freeze.exited.set(true);
         // Named rather than left to the closure's drop, because *when* it is
         // released is the whole point: the application must not quit before
         // the crash page below has been put on screen.
@@ -1165,6 +1447,55 @@ fn try_launch_tracked(
         // once the child has exited, and until then the only thing this check
         // costs is the branch.
         if window.application().is_none() {
+            return;
+        }
+        // A client the shell stopped because it froze at startup (#92) is not a
+        // crash and not a clean exit, and showing either would hide what
+        // happened. It is reaped by now, so the profile's lock went with it and
+        // the relaunch below is an ordinary launch that can take it.
+        if freeze.stopped.get() {
+            match freeze_recovery::after_freeze(attempt.restarts) {
+                freeze_recovery::Next::Restart { attempt: n, of } => {
+                    println!(
+                        "  shell: {} Launching attempt {n} of {of}.",
+                        freeze_recovery::status_line(n, of)
+                    );
+                    let (url, store, vr) = relaunch.clone();
+                    let next = Attempt { restarts: attempt.restarts + 1, carried: Some((url, store)) };
+                    match start_attempt(
+                        &window,
+                        &join,
+                        &lifecycle,
+                        &profile_again,
+                        build_again.clone(),
+                        vr,
+                        next,
+                    ) {
+                        Outcome::Started => {}
+                        Outcome::Failed(message) => {
+                            window.present();
+                            alert(&window, "Roblox could not start", &message);
+                        }
+                        _ => {
+                            window.present();
+                            alert(
+                                &window,
+                                "Roblox could not restart",
+                                "The profile was still in use when Cordial tried to start it again. \
+                                 Press Roblox to try once more.",
+                            );
+                        }
+                    }
+                }
+                freeze_recovery::Next::GiveUp => {
+                    println!(
+                        "  shell: the client froze at startup {} times; giving up",
+                        attempt.restarts + 1
+                    );
+                    window.present();
+                    alert(&window, freeze_recovery::GIVE_UP_HEADING, &freeze_recovery::give_up_body());
+                }
+            }
             return;
         }
         // GLib hands back the raw `waitpid` status, which is exactly what
@@ -1191,10 +1522,28 @@ fn try_launch_tracked(
             join.peek().is_some(),
         );
         match presentation {
+            ExitPresentation::Crash if crate::cli::playing() => {
+                // Nobody is looking at a window that was never shown. What the
+                // crash page would have quoted goes to stderr instead, and the
+                // exit status says it was not a clean exit.
+                println!("  shell: the client {status}");
+                eprintln!("cordial: the game {status}\n{output}");
+                crate::cli::set_status(status.code().map_or(1, |c| c.clamp(1, 255) as u8));
+                window.close();
+                if let Some(app) = window.application() {
+                    app.quit();
+                }
+            }
             ExitPresentation::Crash => {
                 println!("  shell: the client {status}; showing the crash page");
                 window.present();
-                crash::present(&window, &status, &instance.command_line, &output);
+                crash::present(
+                    &window,
+                    &status,
+                    &instance.command_line,
+                    &output,
+                    crash::pinned_hint(pinned, started_at.elapsed()),
+                );
             }
             ExitPresentation::Close => {
                 println!("  shell: the client exited cleanly ({status}); no crash page");
@@ -1222,6 +1571,83 @@ fn try_launch_tracked(
     Outcome::Started
 }
 
+/// Shared between the poll that notices a startup freeze and the child watch
+/// that finds the client gone. Both run on the GTK main context, one at a time,
+/// so `Cell`s are enough.
+#[derive(Clone, Default)]
+struct FreezeState {
+    exited: Rc<Cell<bool>>,
+    /// Set by the poll when it has told the client to stop, so the child watch
+    /// restarts it instead of showing a crash page for a `SIGTERM`.
+    stopped: Rc<Cell<bool>>,
+}
+
+/// The watcher for a client about to start, unless the recovery is switched off
+/// with `CORDIAL_NO_FREEZE_RESTART=1`.
+fn freeze_watch_for(profile_dir: &std::path::Path, vr: bool) -> Option<freeze_recovery::Supervisor> {
+    if !freeze_recovery::enabled(std::env::var("CORDIAL_NO_FREEZE_RESTART").ok().as_deref()) {
+        return None;
+    }
+    let build = if vr { profile::Build::Quest } else { profile::Build::Phone };
+    Some(freeze_recovery::Supervisor::new(freeze_recovery::logs_dir(profile_dir, build)))
+}
+
+/// Read the new client's engine log until it is clearly healthy, clearly
+/// frozen, or clearly never going to say (#92), and stop a frozen one.
+///
+/// A launcher whose window has gone is not watched: with nothing to show the
+/// user and nothing to relaunch from, killing their client would only lose it.
+fn watch_for_freeze(
+    window: &gtk::Window,
+    pid: u32,
+    mut supervisor: freeze_recovery::Supervisor,
+    state: FreezeState,
+) {
+    let window = window.clone();
+    glib::timeout_add_local(FREEZE_POLL, move || {
+        if state.exited.get() || window.application().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        if supervisor.timed_out() {
+            println!(
+                "  shell: no finalize in the client's log after {}s; not watching for a freeze (#92)",
+                freeze_recovery::WATCH_FOR.as_secs()
+            );
+            return glib::ControlFlow::Break;
+        }
+        match supervisor.poll() {
+            freeze_recovery::Verdict::Undecided => glib::ControlFlow::Continue,
+            freeze_recovery::Verdict::Healthy => {
+                println!(
+                    "  shell: the client (pid {pid}) got past its first finalize; not a startup freeze (#92)"
+                );
+                glib::ControlFlow::Break
+            }
+            freeze_recovery::Verdict::Frozen => {
+                println!(
+                    "  shell: the client (pid {pid}) logged `Forcing finalize` with no render view \
+                     released and no controller teardown for {}s: stuck starting (#92); stopping it",
+                    freeze_recovery::FROZEN_AFTER.as_secs()
+                );
+                match freeze_recovery::terminate(pid) {
+                    Ok(()) => {
+                        state.stopped.set(true);
+                        let exited = state.exited.clone();
+                        glib::timeout_add_local_once(FREEZE_KILL_AFTER, move || {
+                            if !exited.get() {
+                                println!("  shell: the stuck client (pid {pid}) ignored SIGTERM; killing it");
+                                let _ = freeze_recovery::kill(pid);
+                            }
+                        });
+                    }
+                    Err(e) => println!("  shell: could not stop the stuck client: {e}"),
+                }
+                glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
 /// Shorten a session, for testing. `--run` is a hard timer in `cordial-run` and
 /// the launcher's own default is a day, which is unhelpful when what is being
 /// checked is that a launch happens at all.
@@ -1236,9 +1662,9 @@ fn run_seconds_override() -> Option<u64> {
 /// double-clicking the launcher — so the dialog names the profile, says what is
 /// true, and offers the only action that helps: choosing a different one.
 ///
-/// It used to point at a text field in Settings. It now moves the focus to the
-/// profile row above the Launch button, which already shows the profile this
-/// dialog is about as unavailable.
+/// It used to point at a text field in Settings. It now opens the profile
+/// menu in the header bar, which marks the profile this dialog is about as
+/// opened in another window.
 /// The refusal a held profile earns, written so somebody can act on it.
 ///
 /// **The old wording said "close the window that already has it" and that was
@@ -1259,6 +1685,7 @@ fn profile_busy(
     config: &Rc<RefCell<ShellConfig>>,
     join: &PendingJoin,
     lifecycle: &LaunchLifecycle,
+    mode: Mode,
     name: &str,
     holder: Option<profile::Holder>,
 ) {
@@ -1282,12 +1709,14 @@ fn profile_busy(
     // client. Reported as the dialog having three buttons, two of which appear
     // to do the same thing. They never did: this one only dismisses.
     dialog.add_response("cancel", "Cancel");
+    dialog.add_response("profile", "Choose a Profile");
     if ours.is_some() {
         dialog.add_response("stop", "Close It and Launch");
         dialog.set_response_appearance("stop", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("stop"));
     } else {
-        dialog.set_default_response(Some("cancel"));
+        dialog.set_response_appearance("profile", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("profile"));
     }
 
     let parent_window = parent.clone();
@@ -1297,6 +1726,12 @@ fn profile_busy(
     let lifecycle = lifecycle.clone();
     dialog.connect_response(None, move |_, response| {
         match response {
+        // The switcher is the header bar's profile button; activating the
+        // window's action rather than building a second chooser here keeps one
+        // construction site.
+        "profile" => {
+            let _ = parent_window.activate_action("win.profile", None);
+        }
         "stop" => {
             if let Some(h) = ours.clone() {
                 close_then_launch(
@@ -1305,6 +1740,7 @@ fn profile_busy(
                     config.clone(),
                     join.clone(),
                     lifecycle.clone(),
+                    mode,
                     h,
                 );
             }
@@ -1365,6 +1801,7 @@ fn close_then_launch(
     config: Rc<RefCell<ShellConfig>>,
     join: PendingJoin,
     lifecycle: LaunchLifecycle,
+    mode: Mode,
     holder: profile::Holder,
 ) {
     if let Err(message) = holder.ask_to_stop() {
@@ -1382,7 +1819,7 @@ fn close_then_launch(
 
     glib::timeout_add_local(STOP_POLL, move || {
         if holder.has_exited() {
-            activate_roblox(&window, &toasts, &config, &join, &lifecycle);
+            activate_roblox(&window, &toasts, &config, &join, &lifecycle, mode);
             return glib::ControlFlow::Break;
         }
         waited.set(waited.get() + STOP_POLL);

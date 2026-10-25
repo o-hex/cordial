@@ -127,3 +127,38 @@ Evidence that gameplay-affecting overlay substitution is being used at scale
 for cheating, in a way that changes the calculus Sober and Bloxstrap have
 already made, would be grounds to revisit the "no special handling" stance
 above. Nothing else is expected to.
+
+## Notes moved from docs/plugin-api.md (2026-10-02)
+
+### Writes, and gameplay-affecting substitution
+
+**Cannot, ever, by design:** writes. A write is never redirected. ADR-010's whole
+claim is that nothing is written into the APK or into anything extracted from it,
+and handing the engine a writable descriptor onto a plugin's file would make the
+overlay a place the engine can scribble — neither non-destructive nor anything the
+plugin's author agreed to. Reads resolve to the overlay; writes go to the
+original.
+
+**Cannot:** anything outside the asset tree. The overlay is not a general
+filesystem redirect, which is the same line ADR-007 draws between an effect and a
+channel.
+
+### What Cordial does not do about it
+
+**Gameplay-affecting substitution is possible and Cordial builds no detection for
+it.** Replacing a collision or hitbox mesh with a smaller or absent one is a
+substantive advantage rather than a cosmetic change, and nothing "non-destructive"
+implies catches it. ADR-010 documents this as the user's own responsibility — the
+same posture Sober and Bloxstrap both take — and builds no content inspection, no
+allow-list of "safe" asset types, and no attempt to tell a texture from a mesh.
+Maintaining a classifier for every asset type Roblox ships, forever, and getting
+it wrong silently, is worse than an honest warning. The capability's own consent
+text says so to the user in as many words.
+
+### Why interception rather than a mount
+
+The assets are zip entries inside
+`base.apk`, so overlayfs has nothing to overlay without extracting the whole
+archive first, and Flatpak cannot mount overlayfs unprivileged in any case.
+Interception also yields diagnostics a mount cannot: `--check-overlays` and the
+shadow report that names which layer won a contested file.

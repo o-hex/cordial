@@ -10,8 +10,9 @@ the second verified by composited screenshot on 2026-08-25 — reaches the Home
 page as a signed-in user, plays, takes mouse and keyboard, opens the
 in-experience web view with its JS bridge round-tripping, and puts sound out
 through PipeWire or PulseAudio. Wayland is the backend; X11 is supported again
-under [ADR-024](adr/ADR-024-x11-is-supported-again.md) but has no editor widget
-yet, so typing there is invisible.
+under [ADR-024](adr/ADR-024-x11-is-supported-again.md) and, since 2026-10-16,
+has an editor of its own ([ADR-062](adr/ADR-062-the-x11-editor-is-an-override-redirect-window.md)),
+so typing there is drawn.
 
 What is actually blocking is further down and is much narrower than "sign-in":
 a startup freeze on roughly a third of launches, and the canvas going black
@@ -20,6 +21,893 @@ when a TextBox focuses inside an experience.
 This file is the handover. It says what is blocking, how to work on it, and —
 the part worth reading even if you are in a hurry — **what has already been
 ruled out**.
+
+## #92: two startup regimes, a stall that is Cordial's own sleep, and the freeze's window, 2026-10-16
+
+Fourteen signed-in launches of `CordialTest` (Roblox 2.742.0.1059, nested headless
+sway, 150 s or more apart, every one with `cachedUserId` set, `Home` reached and no
+`DID_LOG_OUT`), run in place on the Flatpak profile data. Raw logs and backtraces:
+`~/.cache/cordial-handoff/signed-2026-10-16/`.
+
+**Which regime a launch is in depends on the engine's flag cache, and this
+confounded the first four launches.** With no usable `flag_cache.dat` in
+`<profile>/data/cache/cache/` the engine answers Cordial's bootstrap with
+`onFlagsFailed` twice, waits in state 11 for the post-settings call, fetches the flags
+from the CDN when that call arrives (`getFlags: flag cache miss`), and only then runs
+`startLuaApp_` and the teardown whose wait is the classic freeze. With a valid cache
+it answers `onFlagsLoaded` straight away, never logs `getFlags`, and starts its own
+Lua app at the first `onStart` (`initEngine_` in the same millisecond, state 7), so
+the post that Cordial makes 250 ms later is logged `ignoring call in state:7`. Every
+launch writes the cache about a second in, so back-to-back launches are mostly in the
+second regime and a launch after six hours or after a client that never wrote it is in
+the first. The 2026-10-04 logs are all first-regime, so this is new on 2.742 or was
+simply not looked for. Launches 2 to 6 alternated between the regimes, tracking whether the
+previous run had written the file; the delayed-post arms I interleaved landed on the
+same parity, which made "delayed post" look like a cause of the stall below that
+it is only the occasion of.
+
+**The stall at four presents is Cordial's own sleep.** In the second regime,
+`CORDIAL_LATE_POST_MS=1200` and a post held until Home (+80 ms) left the client
+presenting exactly four frames and nothing after, 3 launches of 3, and so did one
+first-regime launch whose post was held 80 ms: 4 of 4 launches with the pump thread
+asleep for 330 ms or more, against 0 of 6 at the unmodified 250 ms (two first-regime,
+four second-regime) that stalled this way. `cordial_backtrace` on two of them
+(`L02.bt1.txt`, `L11.bt1.txt`) shows the engine's render thread in
+`vkAcquireNextImageKHR` -> `wsi_wl_swapchain_acquire_next_image_explicit` ->
+`wsi_drm_wait_for_explicit_sync_release` -> `drmSyncobjTimelineWait`: four swapchain
+images presented, none ever released by the compositor. The late post in `load.rs`
+sleeps on the thread that goes on to pump the looper and the window's GTK main loop,
+so for those 330 ms and more nothing ran it. **Control: the same delay with the post
+made from a thread of its own (`CORDIAL_POST_ASYNC=1 CORDIAL_LATE_POST_MS=1200`, same
+regime) presented 75, 83, 91 at 14, 22, 30 s.** One launch each, so this is a
+demonstration that the thread decides it, not a rate. Whether the default 250 ms
+sleep ever stalls a slower machine is not measured; 0 of 6 here. `INFERRED`: the
+release is owed to a Wayland round trip the blocked thread should have made.
+
+**The classic freeze has a window, and an early post is outside it.** Fresh specimen
+(launch 1, first regime): `Forcing finalize` 1.309 s, no `~UgcExperienceController()`,
+presents fixed at 1 for 139 s, three backtraces over 66 s, identical in their top frames (the spinning
+AGDK thread at 1.16 billion polls, `events=9`, the finalize thread parked), all as
+documented above. Its order: Home 1.046, throttle restored 1.057, the post at 1.061,
+the render job's first step ("No DM yet" then "Bind workspace now") at 1.076. In the
+two healthy first-regime launches that followed the first step came before the post
+(0.568 against 0.611 and 0.543 against 0.577), and in the corpus of 56 engine logs the
+bind lands 2-9 ms after `getFlags: success` in 16 of 19 frozen and 1 of 19 healthy.
+So: the first render step landing between the post and the end of the teardown is the
+freeze. Held out of that window both ways: a post held until Home + 80 ms from its own
+thread (`CORDIAL_POST_ASYNC=1 CORDIAL_POST_AFTER_HOME_MS=80`, first regime) logged
+step 0.570, post 0.690, healthy; a post 20 ms after the handoff
+(`CORDIAL_POST_ASYNC=1 CORDIAL_LATE_POST_MS=20`, first regime) finished its teardown at
+0.47 s, before Home (0.81) and the step (0.74), healthy, and did not crash, which the
+comment on `CORDIAL_LATE_POST_MS` says a zero delay does.
+
+**Counts, first regime only, since only it can freeze:** default 1 frozen of 3 (launches
+1, 3, 5); post made from its own thread, held or early, 0 of 2. Second regime: default
+0 of 4, the held-on-the-pump-thread launches excluded as stalled above. A rate cannot be read
+from this and nothing here claims one. Both knobs are off by default and
+`CORDIAL_POST_AFTER_HOME_MS` does nothing in the second regime (it logs
+`post not held`), because there the post is ignored.
+
+**What was not done:** no launch at the 250 ms default with the post made from its own
+thread, so "make it asynchronous by default" is unmeasured; no second place or machine
+(the Mesa/Intel stack and nested sway are this host's); the stall was never seen on
+the host session; the flag cache was set aside (`flag_cache.dat` renamed, rebuilt by the
+engine within the launch) for the last three first-regime launches. The first-regime
+launches are 1, 3, 5, 11, 13 and 14; the others are second-regime.
+
+**Corrections.** The 2026-09-17 entry's "Re-issue the app-bridge start..." line of
+inquiry and the 2026-10-04 "delay `initialize`" lever are both about this post call:
+delaying it on the pump thread is harmful, not a lever. `docs/analysis/startup-freeze-capture.md`
+describes only the first regime.
+
+### Round 2, cache-miss only, 2026-10-16: 16 launches, no freeze in either arm
+
+Sixteen signed-in `CordialTest` launches (150 s or more apart, flag cache set aside
+before each, every one `cachedUserId` set, `Home` reached, no `DID_LOG_OUT`, a Home
+screenshot at the end of each), alternating the post made from its own thread
+(`CORDIAL_POST_ASYNC=1`, the 250 ms default timing, 8 launches, the arm round 1 never
+ran) with the default (8). **Frozen: 0 of 8 and 0 of 8, and all sixteen presented 85 to
+129 frames at 14 s and kept going.** So the default-flip rule (own-thread 0, default 2
+or more) was not met and the default stays as it is.
+
+Why it says nothing about the post's thread: in all sixteen the first render step
+landed 24 to 46 ms *before* the post (Home at 0.46 to 0.50 s, step at Home + 26 ms, post
+at Home + 50 to 70 ms; one slow launch had Home at 0.97 s and the same spacing). The
+freeze window, the step between the post and the end of the teardown, never opened, and
+the post's time does not depend on which thread makes it, so the own-thread arm cannot
+have avoided a window the default arm also missed. Round 1's frozen launch had the post
+15 ms after Home, with Home at 1.05 s. If the freeze rate is near the 1 in 3 round 1 saw,
+0 of 8 default launches would happen about 4 times in 100; if it is nearer 1 in 6 or less,
+about a quarter of the time, so these counts do not separate a rate that low from zero.
+**What would**: a way to place the post at Home + 0 to 20 ms on demand (a launch hold
+that releases on the engine's `Home` announcement without the extra margin, from the own
+thread) so the window opens in every launch, then compare the default placement with a
+post held until the step has run.
+
+`CORDIAL_POST_ASYNC` was read with `var_os(..).is_some()`, so `CORDIAL_POST_ASYNC=0` turned
+it on; fixed on 2026-10-16 (it is a switch now).
+
+### Round 3, 2026-10-16: the window opened, and the gate is the default
+
+Sixteen more signed-in `CordialTest` launches (flag cache set aside before each, 155 s
+apart, all `cachedUserId` set, `Home` reached, no `DID_LOG_OUT`, `post gate` lines and
+engine logs in `~/.cache/cordial-handoff/signed-2026-10-16-round3/`). The decision is
+[ADR-065](adr/ADR-065-the-late-post-waits-for-the-first-render-step.md).
+
+**What the gate is.** The post is made from a thread of its own, after the usual 250 ms,
+and waits until the engine's own log shows `stepDataModelJob: No DM yet` (the render job's
+first step), then 10 ms more, then posts; 3 s and it posts anyway. The marker is read
+from `appData/logs/*_Player_*.log`, because FLog lines never pass through liblog: of 395
+lines of Cordial's stderr in a signed-in launch none was a render step. Only on the
+cache-miss path (`onFlagsFailed` seen); `CORDIAL_POST_GATE=0` turns it off.
+
+**Making the window open took three tries.** Gate off, own thread, post held to Home
+(`CORDIAL_POST_AFTER_HOME_MS=0`): the 250 ms sleep before the hold had already passed
+Home in 4 of 5, so the post landed at Home + 42 to 50 ms, after the step at Home + 28:
+the safe order, not the window (X01 was the exception: slow start, Home at 1.03 s,
+post at Home + 22, step 6 ms after it, **frozen**). Adding `CORDIAL_LATE_POST_MS=20`
+put the post at Home + 0.2 ms, 27 to 30 ms before the step (X04, X05): healthy. At
+Home + 15 ms, 13 ms before the step, the same geometry as round 1's frozen launch
+(X06, X07): healthy. **The same Home + 15 ms under `taskset -c 0,1` with
+`stress-ng --cpu 2 --timeout 25s` on the same two cores: frozen both times** (X08, X09,
+presents 1 and 1, `Forcing finalize` with no `~UgcExperienceController`, the round-1
+signature).
+
+| Arm | Post vs step | Launches | Frozen |
+|---|---|---|---|
+| gate off, post before the step, no load | 6 and 27-30 ms before, Home + 0 to 22 | X01, X04-X07 | 1 of 5 |
+| gate off, post before the step, 2-core load | 13 ms before, Home + 15 | X08, X09 | 2 of 2 |
+| gate off, post after the step (the old accident) | 14-23 ms after | X02, X03 | 0 of 2 |
+| gate on, same timing knobs, no load | 10-18 ms after | Y01, Y02, Y04, Y05 | 0 of 4 |
+| gate on, same knobs, 2-core load | 10-11 ms after | Y06, Y07, Y08 | 0 of 3 |
+
+Y01 and Y02 found the step already in the log (the gate waited 0 ms); Y04-Y08 waited 27,
+27, 15, 14 and 16 ms. **Frozen: gate off 3 of 9, gate on 0 of 7**; at the forced timing
+under load 2 of 2 against 0 of 3. The prediction in round 2 ("if the window opens, the
+gate closes it") held in every launch, and it is **not a significant count**: a
+Fisher exact test of 3 of 9 against 0 of 7 gives p = 0.15 one-sided (0.21 two-sided), and 2 of 2
+against 0 of 3 gives p = 0.10. What carries the claim is that the order is now guaranteed by
+construction and was observed in all seven gate-on launches, not the counts.
+
+**What the window is not.** Post-before-step is necessary in every frozen launch seen
+(L01, X01, X08, X09) and is not sufficient: 4 of 5 launches with the post before the step
+and no load were healthy, and in every one of them `Bind workspace now` followed
+`getFlags: success` by 1 to 2 ms, the signature the 56-log corpus had called the freeze.
+So that signature is the window opening, not the freeze. What decides it afterwards is
+not in the engine log: X08's `Forcing finalize` came 41 ms after `startLuaApp_`, as in a
+healthy launch, and `~UgcExperienceController` never followed. Load made it likelier
+(2 of 2); the slow start of X01 and L01 (Home near 1 s) is a second occasion and is not
+understood, since the loaded launches had Home at 0.53 s. `INFERRED`: a race between
+the first app's teardown and the render job's bind that wider thread timing resolves the
+wrong way.
+
+**Not measured.** The gate on a *signed-in cache-hit* launch (own thread, post ignored):
+five signed-out cache-hit launches logged `post gate: not needed` and were healthy
+(780 presents at 30 s). Load on the gate-off, post-after-step arm (no control for load
+alone). Any machine but this one. One signed-out launch in about thirteen stopped
+during the audio-backend probe, before the engine was loaded, with the gate not yet
+involved; unexplained.
+
+### Round 4, 2026-10-16: the gate holds under load, 0 of 10 against 3 of 3
+
+Sixteen more signed-in `CordialTest` launches (Roblox 2.742.0.1059, nested headless sway,
+build 7531f17 with the gate on by default, flag cache set aside before each, 155 s or
+more apart, every one `cachedUserId` set, `Home` reached, no `DID_LOG_OUT`, a Home
+screenshot after each healthy one). **Every launch ran under round 3's load**: client
+and `stress-ng --cpu 2 --timeout 25s` both on `taskset -c 0,1`. Gate-off arms used round
+3's forcing knobs (`CORDIAL_POST_ASYNC=1 CORDIAL_LATE_POST_MS=20
+CORDIAL_POST_AFTER_HOME_MS=15`); the gate-on arm used the same knobs plus the gate.
+Logs and scripts: `~/.cache/cordial-handoff/signed-2026-10-16-round4/`.
+
+| Arm | Post vs step | Launches | Frozen |
+|---|---|---|---|
+| gate on, forced early timing (Y) | 10 to 12 ms after | Y01-Y10 | 0 of 10 |
+| gate off, forced early timing (X) | 9, 18 and 14 ms before | X01-X03 | 3 of 3 |
+| gate off, default timing, no knobs (Z) | 4 ms before | Z01 | 1 of 1 |
+| gate off, post held to Home + 45 ms, after the step (W) | 17 and 18 ms after | W01, W02 | 0 of 2 |
+
+Fisher exact, one-sided, Y 0 of 10 against X 3 of 3: p = 0.0035 (0.0010 against X and Z
+together, 4 of 4). Adding round 3's two loaded gate-off launches, gate off with the post
+before the step is 6 of 6 frozen under this load and gate on is 0 of 13; unloaded, the
+same forcing froze 1 of 5 in round 3, so on this machine the load is what makes the
+window deadly. Every frozen launch had `Forcing finalize` and no
+`~UgcExperienceController`, presents fixed at 1 at 14, 22 and 30 s: the round-1
+signature. Every launch with the post after the step (Y and W, 12 of 12) presented 85 to
+132 frames at 14 s and kept climbing.
+
+**W is the control round 3 lacked.** Gate off, same load, the post made after the step
+by a timer instead of by the gate: 0 of 2. So the load does not freeze a launch by
+itself; it needs the post ahead of the step, and the gate is what puts it behind.
+
+**Z is a finding about the default, not a control.** With no knobs and the gate off (the
+0.33.0 behaviour), the post is made 250 ms after the handoff on the pump thread. Under
+the load Home came at 0.716 s, the post at 0.7435 and the step at 0.7477: the window
+opened by itself and the launch froze. One launch, so it is not a rate; it is the first
+frozen launch on the old default in these rounds with an ordinary Home time (0.72 s), and it is the
+shape the gate was written for. `INFERRED`: a user on a busy or slow machine meets this
+timing without any knob.
+
+**What was not seen.** No gate-on launch froze, so there is no engine log for a freeze
+past the gate and no backtrace to take; the "order was safe and the cause is elsewhere"
+case in ADR-065 is not yet observed. Nothing here is a signed-in cache-hit launch, a
+second machine, or an unloaded launch at the default timing with the gate off (round 2:
+0 of 8). The gate's cost was 12 to 18 ms of waiting after the 20 ms delay.
+
+## #86: a multi-line box's text took the theme's colour, and typed text now has a photograph, 2026-10-15
+
+`tools/text-input-e2e.py --visibility MODES` types twelve characters into a
+synthetic box (`fakefocus`) and photographs the *compositor's* output with
+`grim`, because `cordial_textbox` reports what the field holds and
+`cordial_screenshot` cannot see a GTK widget. It asserts the typed text changed
+pixels where the editor is and that the ink is the box's own #d5d5dd. Nested
+sway 1.11, signed out, 1280x800, Cordial 0.29.0, windowed, fullscreen, tiled
+after fullscreen and floating, every case single-line and multi-line.
+
+**Found: the multi-line editor ignored the engine's text colour.** A
+`GtkTextView` draws in its own node's colour and the rule named only its `text`
+child. Under the light theme (`ADW_DEBUG_COLOR_SCHEME=prefer-light`) the text
+was near-black on a dark game, in a box holding every character: the symptom
+in #86. Before: 0 of the 4 multi-line cases drew any #d5d5dd, single-line 4 of
+4. After the one-line selector fix every assertion passed: 48 of 48 in the
+default, light and dark themes, with the title bar hidden and at output scale
+1.5; output scale 2 and `GSK_RENDERER` ngl, cairo and vulkan passed an earlier
+form of the harness, before it also checked the editor was placed from engine
+geometry. **Not shown**: that the in-game chat box reports
+`multiline=1`; no real chat spec has been captured here, and a single-line box
+was never affected.
+
+**Controls that fail, as they should.** `CORDIAL_VISIBILITY_ANCHOR=off` fails
+all 8 fullscreen and tiled-after-fullscreen assertions (ADR-056, the Sober
+#1026 shape). No Vulkan with `GSK_RENDERER=ngl` (GTK's GL renderer beside the
+engine's GLES, ADR-047) fails every case; with no Vulkan and nothing set, GTK is
+put on cairo and the text shows. The 0.29.0 binary, run again after the fix
+for comparison, fails its 4 multi-line colour assertions and nothing else.
+
+**Was open, and is closed on 2026-10-16: the X11 backend had no editor at all.**
+See the next section. The paragraph that stood here said it was read from the
+code and not run; it is now run.
+
+## #86 on X11: the editor exists, and typed text is photographed there too, 2026-10-16
+
+[ADR-062](adr/ADR-062-the-x11-editor-is-an-override-redirect-window.md) is the
+design: the engine's X window is left alone, and the editor is a small GTK window
+made override-redirect, laid over the focused box and given X keyboard focus.
+`tools/text-input-e2e.py --x11` runs 66 assertions against it on a private X
+server, typing with XTest on that server only and photographing it with
+ImageMagick (or grim, for Xwayland), signed out, 1280x800, GLES
+(`CORDIAL_NO_VULKAN=1`; the Vulkan client has crashed on Xvfb's software GL and
+was not used). Each run starts with the real sign-in fields (clicked, typed with
+dummy strings, never submitted) and then a synthetic box (`fakefocus`).
+
+| Window manager | Compositing | Result |
+|---|---|---|
+| openbox | no (editor opaque) | 66 of 66 |
+| xfwm4 `--compositor=off` | no | 66 of 66 |
+| xfwm4 `--compositor=on` | yes (editor transparent) | 66 of 66 |
+| icewm | no | 66 of 66 |
+| sway's own Xwayland | yes | 66 of 66 |
+
+Control, same session shape, `CORDIAL_X11_EDITOR=off`: 7 of 22 assertions fail
+and they are exactly the ones about the editor -- the typed characters are not
+visible (0 changed pixels where openbox's run changed 812), select-all and
+non-ASCII text are not handled, and a multi-line Return is not a newline. The
+readback (`cordial_textbox` says the field holds twelve characters) passes in
+both arms, which is the point: it is what "sent but not drawn" looked like.
+
+**What this found that the code did not say.**
+
+- `xwininfo -tree` lists children *topmost first*, so the first version of the
+  assertion that the editor is above the game read the stack upside down and
+  failed against a correct one.
+- ImageMagick's `import` writes 16-bit PPM; parsed as 8 it is a photograph of
+  diagonal stripes, in which no text was ever visible.
+- A transparent GTK window on an X server with no compositor is drawn **black**,
+  so the editor is opaque there and its colour is read from the pixels it is
+  about to cover (`x11_editor::opaque_background`). That is `INFERRED` as a
+  match for the box: it was a dark sampled field over a dark landing page in
+  every run here, and a light box was only ever tested by the unit tests.
+- Under Xwayland the first XTest key after a window is first mapped is lost, in
+  `xev` as well, so it is the instrument; the harness sends one `Shift_L` first.
+  Real keyboard events were not measured there (a headless sway has none).
+- `xdotool type` of a character the keymap lacks remaps a spare keycode for one
+  key press, and GTK sometimes sees the key first: the same string lost its `é`
+  in one run and its `ü` in another. The harness now binds `é ü ï` to keycodes
+  250 to 252 up front and sends them as keysyms. Keycodes 200 to 202 carry a
+  modifier in the default keymap, and `ï` there arrived as Ctrl+ï and was
+  dropped, correctly.
+- After a resize or a fullscreen change the editor sits in the fallback bar
+  until the engine reports the box again. That is `text_geometry`'s stale-
+  rectangle rule, which is Wayland's rule and was copied, not invented; a real
+  sign-in field in fullscreen showed it.
+
+**Not established.** KWin, Mutter's X11 mode, a tiling window manager, gamescope
+(which opens X11 clients, ADR-058), a composing input method, a light-coloured
+box (only the dark sign-in fields were run), Vulkan, a box near a screen edge on
+a desktop that clamps unmanaged windows, and a real in-experience chat box (no
+signed-in run was made). `GDK_SCALE=2` was run on openbox: 39 of 39 on the
+sign-in, single-line and multi-line cases, with the editor one pixel up and left
+of the box, because GDK keeps a window on its own logical grid.
+
+**Two editors until `HostWindow` adopts `editor::EditorCore`** and
+`wayland.rs` adopts `text_geometry::Resolver`. Both are deletions from files
+other work was editing; neither is done.
+
+## #63 reproduced on demand: the engine records a failed Vulkan call before its device exists, 2026-10-15
+
+The `SIGSEGV` at `libroblox.so+0x29b4349`, fault address `0x5a0`, "seen 2/11,
+not reproduced since" (#63), reproduced unaided twice in 65 launches under gdb
+and once in 10 without it, always on a headless sway using the pixman renderer,
+and then in both attempts once the cause below was forced.
+
+What the crashing function is: in 2.738.0.1397 it is the recorder behind the
+engine's `VULKAN ERROR: %s returned %d` path. It keeps a short history
+(`Call`, `Error`, `PrevError`, `FrameIndex`, `History`) and reads a global
+pointer to the graphics device, `+0x5a0`, to do it. That pointer is stored
+once the Vulkan device is created and zeroed when it is torn down. The
+recorder runs only in processes whose per-process sampling draw (a value
+computed once and cached, `% 10000`) comes up under a threshold, which is why
+it is an intermittent crash and not a constant one.
+
+What triggers it here: the first `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` of
+every launch returns `VK_ERROR_SURFACE_LOST_KHR` when the compositor
+advertises no `zwp_linux_dmabuf` (sway and cage on pixman, weston headless).
+`VULKAN ERROR ... -1000000000` is in 77 of 77 engine logs from that
+configuration and in none from KWin or from sway with the GLES renderer. The
+engine goes on and the next query works; only a sampled process falls over,
+in the recorder, because the device pointer is still null at that moment.
+
+Control: the draw was forced to zero in the loaded library's data (gdb, at the
+linker's `mcpelauncher_linker_notifylldb`, which is the only way this was
+touched and only to reproduce). Software-rendered sway: crashed at the same
+address on the first run, both times. Sway on `WLR_RENDERER=gles2`, which does
+advertise dmabuf: 3 of 3 clean and Landing reached.
+
+**What did not work, so nobody repeats it:** retrying the failed query in the
+Vulkan interposer. Forty retries ten milliseconds apart (400 ms) still got
+`SURFACE_LOST` and the forced-draw run still crashed. Whatever makes the first
+query fail is not gone after 400 ms. The engine creates its Vulkan device twice
+per launch, and the first query comes before "surface handed to the engine" in
+Cordial's own log (INFERRED that this ordering is why it fails). Nothing was
+committed for it.
+
+**Not established:** that this is what the original 2/11 was. Those runs were
+on X11 (`CORDIAL_X11=1`) on a machine with dmabuf, so some other first Vulkan
+call may have failed there; the crash site is the same. Not established either
+that any user outside a software-rendered compositor can meet it. And the two
+Vulkan results (`SURFACE_LOST` on dmabuf-less compositors, the recorder's null
+read) are measurements on 2.738; 2.742 was not checked for the second.
+
+**#35's `DeviceUtils` is corrected the same day.** The class is in none of the
+three dex files of 2.742.0.1059, and a gdb log of every `FindClass` and
+`GetMethodID` the engine makes in a run never contains it, though the engine
+logs `Failed to find class 'DeviceUtils'` three times. It is not an unanswered
+Android expectation; see the comment on `DeviceUtils` in `native/init_params.cpp`.
+
+## #63: why the surface is lost, and what Cordial does about it, 2026-10-15
+
+Corrections to the section above, from reading Mesa's WSI and a bare Vulkan
+probe with no Roblox in the process. The query does not fail "first" and the
+ordering against "surface handed to the engine" is not the cause (that line was
+labelled INFERRED and is wrong): a hardware Vulkan device cannot present to a
+Wayland compositor with no `zwp_linux_dmabuf_v1`, because Mesa binds `wl_shm`
+only for software devices (`wsi_common_wayland.c`, `registry_handle_global`
+and the `!wl_dmabuf && !wl_shm` test in `wsi_wl_display_init`). The engine
+fails on both of its two device creations per launch (2 `VULKAN ERROR` lines
+in every engine log, not 1). Cordial now withholds Vulkan there; see
+[ADR-061](adr/ADR-061-vulkan-is-withheld-where-the-compositor-has-no-dmabuf.md).
+
+Measured on the 2.738 engine, unsigned, nested headless sway, `cordial-run`
+from a clean tree, 10 launches an arm:
+
+| arm | compositor | `VULKAN ERROR ... -1000000000` per launch | SIGSEGV |
+|---|---|---|---|
+| before | sway pixman | 2 (1 where it crashed) | 3 of 10, then 0 of 10; 1 of 4 in a screenshot run |
+| after | sway pixman | 0 | 0 of 10 |
+| after, `CORDIAL_FORCE_VULKAN_WITHOUT_DMABUF=1` | sway pixman | 2 | 0 of 10 |
+| after | sway gles2 | 0 | 0 of 10 |
+
+The three crashes in the first run were all `libroblox.so+0x29b4349`, fault
+address `0x5a0`, with no gdb and nothing forced. The crash is a random draw per
+process, so a clean arm is weak evidence by itself; the evidence is the error
+line going from 2 a launch to 0 while the forced control puts it back.
+On pixman sway the client now draws the landing screen on OpenGL ES; on Vulkan
+it drew nothing.
+
+**Not established:** that the 2 of 11 on X11 were this (they were on a machine
+with dmabuf); behaviour on a compositor that advertises dmabuf but whose
+hardware device cannot import it; GTK's own renderer, which also reports
+`VK_ERROR_SURFACE_LOST_KHR` on pixman sway (four `Gdk-WARNING` lines a launch)
+before falling back, and which the shell's renderer choice does not account for.
+
+## The launcher says what it was doing when its window does not appear, 2026-10-15
+
+For #38 and #88: a launcher that "starts, uses a core and never shows a window"
+printed nothing, and the one WAYLAND_DEBUG trace from COSMIC stops right after
+GTK binds `xdg_wm_base`, which is also where a healthy run is about to do its
+portal and accessibility-bus calls. Nested sway, KWin (`--virtual`), weston
+(headless), cage and Hyprland all mapped the launcher, so it is not those
+compositors' protocol sets. KWin and Hyprland advertised dmabuf in those
+runs; sway (pixman), weston headless and cage did not.
+
+`startup_watch` records the step `start()` has reached and, if no window has
+mapped after 20 s, prints one paragraph: that step, whether the main thread was
+spinning or waiting, and the variables that choose a backend and renderer.
+Provoked by stopping the compositor after GTK bound `xdg_wm_base`: it printed
+once, naming "built the window; waiting for GTK to map it" and "0% busy". With
+the compositor running it printed nothing. **Not observed:** the spinning case,
+which is what the reporters describe and which this machine cannot produce.
+
+## The stall report now carries the main thread's stack, 2026-10-15
+
+For #38 and #88. Nested cosmic-comp 1.10, labwc 0.9.6, river 0.3.17, Wayfire
+0.10.1 and Mango 0.18.1 (built from its main branch) each mapped the 0.30.0
+launcher (`get_toplevel` once, configure acked, a buffer attached), in
+addition to the five compositors measured earlier. So no compositor named in
+those reports reproduces it here. What cannot be ruled out from here is the
+machine: the reporters' Mesa, driver and Flatpak sandbox.
+
+The stall paragraph said the main thread was spinning or waiting but not
+where. It now adds the stack, taken by signalling the main thread, so a
+Flatpak user with no gdb in the sandbox can paste it. Provoked by stopping a
+nested labwc (SIGSTOP) after GTK bound `xdg_wm_base`: the paragraph named
+`wl_display_dispatch_queue` under `libVkLayer_MESA_device_select` under
+`vkEnumeratePhysicalDevices`, i.e. GTK's Vulkan device enumeration waiting on
+the compositor. **That is what a stopped compositor does, not what the
+reporters have;** it shows the capture works and that Vulkan enumeration on
+Wayland is a place the launcher can wait before it creates a toplevel.
+**INFERRED**, not measured on a reporter's machine: that this is where theirs
+stops. `NODEVICE_SELECT=1` is Mesa's switch for that layer and is untried.
+
+## Pending in-game verification: held mouse buttons across toplevel locks, 2026-10-07
+
+The click gate added for Hyprland accepts a confirmed toplevel lock, but
+`pointer_leave` still released every held button immediately, and camera drags
+still required canvas focus. Both disagreed with that gate. Held buttons are
+now reconciled after dispatching pending Wayland events, so a canvas-to-lock
+handoff within that batch preserves them. Right and middle drags also recognise
+a confirmed lock. Real releases follow accepted presses even after ownership
+changes; unmatched releases and duplicate presses are discarded.
+
+**INFERRED** as an explanation for intermittent shooting loss. This is not a
+claim that Hyprland delivers the relevant events in one batch, or that the
+reported game symptom is fixed. If confirmation arrives in a later batch, the
+buttons can still be released. Repeat in an experience with
+`CORDIAL_TRACE_MOUSE=1`, holding fire while toggling shift lock and aiming,
+then losing and regaining window focus. Compare against the build before this
+change; record `nativePassMouseButton` and lock transitions alongside the
+visible behaviour. The MCP click verb bypasses these Wayland handlers and
+cannot test this change.
+
+The button-routing regression test passes; restoring the old ownership gate
+makes it fail on the secondary-button release after focus changes. This
+control checks routing, not compositor event ordering or engine behaviour.
+
+## Cordial picks GTK's cairo renderer itself when Vulkan is not working, 2026-10-01
+
+The remaining half of #53. `cordial_shell::gtk_renderer` decides from the Vulkan
+probe, started in `cordial-run`'s `main` and collected in `wayland::open` before
+GTK realises the window, so a healthy machine waits 0-10 ms (the probe is about
+60 ms and runs while the engine loads). No loader, `vkCreateInstance` failing, no
+devices or only a CPU renderer sets `GSK_RENDERER=cairo`; a user's own value is
+never touched or probed; a probe that hangs or crashes changes nothing.
+`CORDIAL_GRAPHICS=gles` with working Vulkan is deliberately **not** a trigger:
+GTK stayed on Vulkan and presented. On the #53 reproduction (nested KWin, no
+Vulkan, `fakefocus` x3) the user-set `ngl` control lowered 0 of 3 and the
+automatic choice 3 of 3 under presented frames. **Not observed**: the editor
+being drawn, which no capture here can see; and anything on the reporter's own
+machine. See ADR-047.
+
+## Fixed in part: the grey screen of #53 reproduces with no Vulkan, and the restack is now gated, 2026-09-30
+
+Nested KWin, `VK_ICD_FILENAMES=/nonexistent`, signed out, `fakefocus`: the engine
+falls back to GLES3, GTK to its GL renderer, and GTK then never attaches a buffer
+to the window surface again (`gdk_gl_context_make_current() failed` every 15 s,
+`repaint_now: no GTK frame landed within 40ms`). The old ordering lowered the
+canvas regardless, three times out of three, over the last opaque buffer. With
+Vulkan present, or with `GSK_RENDERER=cairo`, GTK presents and nothing is wrong.
+The restack now waits for a presented GTK frame and otherwise keeps the canvas
+above; see ADR-047. **The editor was still invisible in that configuration**;
+choosing cairo automatically was done on 2026-10-01 (entry above). This also
+corrects the 2026-09-23 note that forcing `repaint_now`'s miss did not reproduce
+it: that forced the timeout on a GTK that then painted late,
+which is not the same as a GTK that never presents. `after-paint` is not
+evidence of a commit; it fired on a frame with no attach behind it.
+
+## Open: two frozen specimens at last, one with the condition-variable wrapper removed; the network is not what they wait on, 2026-09-30
+
+Build `Cordial 0.20.1 (bb5620b54-dirty)` (the dirt is the `third_party/mcpelauncher-linker`
+submodule marker), signed-in `CordialTest` on a nested headless sway, three
+launches from 11:04 before the round was stopped early (a third of the 16 budgeted).
+`tools/freeze-capture.py` ran against both frozen clients before anything else
+attached, again five minutes later, and both stayed frozen throughout.
+
+| run | arm | client | verdict | presents at 1/3/5/7/9/11 s |
+|---|---|---|---|---|
+| r01 | control | free | healthy, Home | 0 / 2 / 67 / 78 |
+| r02 | `CORDIAL_COND_PASSTHROUGH=1` | free | **frozen** | 0 / 2 / 2 / 2 / 2 / 2 |
+| r03 | control | core 0 + one busy loop | **frozen** | 0 / 1 / 1 / 1 / 1 / 1 |
+
+**The wrapper is not necessary.** r02 froze with `pthread_cond_*` handed straight
+to glibc: `wrappers.txt` found zero wrappers in it, and the freeze is otherwise
+the same shape as the control's -- `Forcing finalize`, no `~UgcExperienceController`,
+`sync cookies from engine`, `presents` fixed. One frozen passthrough client is
+enough for that claim; it says nothing about the rate (1 of 1 there, 1 of 2
+controls).
+
+**The finalize thread is in the engine's own park in both, not in a cond wrap.** The
+thread that logs `Forcing finalize` (log id `9996c6c0` / `527fc6c0`, mapped to its
+LWP through gdb's `Thread 0x...`), in both clients:
+
+```
+r02 (P) tid 328193  futex 0x7fe90be8cf0c  op=0x89 val=0x4  timeout NULL  raw syscall() frame
+r03 (C) tid 352125  futex 0x7fc5ae9fa50c  op=0x89 val=0x3  timeout NULL  raw syscall() frame
+```
+
+Both addresses are in the anonymous rw region shared with the `RBX Worker` parkers
+(the same 128-byte-stride array), neither inside a Cordial cond backing (in r03,
+where 90 wrappers exist, `wrappers.txt` says so by name). The word and
+the value did not change across the five minutes in either. So this is `0x89`, not
+the `0x189` a healthy gdb-launched run showed (a glibc cond wait), and it is the
+same park an idle worker sits in: **INFERRED** that this thread may be idle rather than
+waiting *for* anything, i.e. that the missing thing is a task or continuation nobody
+posted, not a wake nobody sent.
+
+**No lost wakeup in the Cordial wrappers.** In r03, 90 wrappers, none duplicated, and
+conds with waiters (4 in the first capture; 6, 29 and 1 in the second) all with
+`g_signals = 0` -- an idle pool. The
+tool's old tag ("waiters/signals non-zero") fired on those and on three conds in the healthy
+r01, so it over-reported; `freeze-capture.py` now flags waiters only beside pending
+signals, and none of the three captures has one.
+
+**The 1 ms `HttpClient` poll is the LAN websocket, and the freeze does not wait on it.**
+In both, the poll is `poll(nfds=2, timeout=1)` with `fd=90`/`92` at `events=0x4`
+(`POLLOUT`), and `ss -tnpei` gives that socket as `SYN-SENT` to `10.110.101.222:5052`.
+That is the websocket that times out at 60 s in every run, healthy ones and Sober
+included (`docs/HANDOVER.md` row for `10.110.101.222:5052`); the healthy r01 also had
+two of them in `SYN-SENT`. It ended in `Connection timed out after 59999 ms` at 61.1 s
+in r02 (61.2 s in r03) and the poll went back to `poll(1 eventfd, 69 s)`; the client
+stayed frozen. **This retires the 2026-09-29 reading that in a frozen client curl believes
+one transfer is still in flight for minutes.**
+
+**The engine's HTTP layer is alive in a frozen client.** In r02 the same `HttpClient`
+thread (`8bfff6c0`, the one that logged `sync cookies from engine`) completed the
+settings refresh at 120, 240 and 360 s (`Settings Date header`, `writeFlagCache`,
+`DynamicFastVariableReloader finished flag fetch`), and `HttpThreadPool`/`Main`
+cond values moved between the two captures. Nothing is stuck in networking, the
+cookie callback, the getaddrinfo shim or the trust store: every one of them is
+demonstrably exercised after the freeze started.
+
+**Where the chain ends.** One `Main`-named engine thread parked in the engine's own
+futex park since 1.4 s, every worker idle in the same park, the HTTP thread
+serving requests, the AGDK thread spinning as documented. Nothing Cordial answers is
+implicated by this evidence, so no fix is made: a toggle would be a guess. Not
+done, and not authorised this round: the `shutdown(fd)` poke (moot now -- the socket
+it was meant for is the benign websocket) and anything that calls into the process.
+
+**Also settled cheaply.** The `client settings ... (engine document, fetched)` line in the
+healthy r01 against `(cache)` in both frozen runs is `MAX_AGE` (six hours): r01 was the
+first launch in thirteen hours. Not a discriminator; every earlier back-to-back round was
+all-cache.
+
+**Not done.** Thirteen of the sixteen budgeted launches were not made (stopped at three
+by request), so there is no per-arm rate: control 1 frozen of 2, passthrough 1 of 1.
+`devctl.txt` in r02's capture says connection refused, because `freeze-capture.py` reads
+`XDG_DATA_HOME` and the harness had not exported it; r03 onwards has it. The captures are
+in `~/.cache/cordial-handoff/freeze-round7/`.
+
+## Open: eight launches, no frozen specimen; the engine's condition variables were Cordial's all along, and two "frozen" signatures are also healthy, 2026-09-29 (late)
+
+Eight signed-in `CordialTest` launches, 21:01-21:29 local, nested headless sway,
+client pinned to core 0 with one or two busy loops on the same core (the
+amplification the 2026-09-28 entries used), each at least 150 s after the
+last, `tools/freeze-capture.py` run against every one after a 30-100 s hold.
+Every run had `cachedUserId` set, `DID_LOG_IN`, no `DID_LOG_OUT`, and reached
+`HOME_PAGE_INTERACTIVE`. **0 of 8 frozen** -- the same all-healthy stretch
+the 2026-09-29 entry below had (0 of 8), now 0 of 16 across two sessions -- the trough
+the earlier entries describe -- and this round did not photograph the thing it
+was built to.
+
+| run | env | presents at 20/26/32 s |
+|---|---|---|
+| C1 | control, 1 busy loop | 79 / 85 / 91 |
+| T1 | `CORDIAL_COND_PASSTHROUGH=1`, 1 loop | 102 / 108 / 114 |
+| C2, T2 | control, passthrough; 2 loops | 91 / 97 / 103, both |
+| C3, C4 | control, 2 loops | 88 / 94 / 100, 90 / 96 / 102 |
+| C5, C6 | control, 2 loops | 103 / 110 / 116, 100 / 106 / 112 |
+
+Two runs is not an A/B for the passthrough switch and nothing here claims it is.
+That makes 26 signed-in launches today, counting the 18 before this session.
+
+**What Cordial owns on the HTTP path.** The earlier entries treated everything
+but `getaddrinfo` as the host's libc. Read from the override tables and the
+engine's import list (`readelf --dyn-syms`), the Cordial-answered pieces are:
+
+- **`pthread_cond_*` (all six the engine imports).** `bionic/pthread.rs` puts a
+  128-byte heap glibc condition variable behind every engine `pthread_cond_t`
+  with a lazy-init state machine in front. Every `HttpClient`, `HttpThreadPool`
+  and `RBX Worker` wait passes through it. **The 2026-09-29 "waker" -- an
+  `HttpClient` thread's `pthread_cond_broadcast` at `libroblox.so+0x241a6d8` --
+  is this wrapper tail-calling glibc** (a `jmp` in the built binary, which is why
+  the frame above glibc's was libroblox), so it was Cordial's code on that path
+  and not "the host's libcurl/TCP stack". `sem_*` likewise (`sem_t` is 16 bytes in
+  bionic and 32 in glibc). `pthread_mutex_*` and `pthread_attr_*` are not
+  wrapped on x86_64.
+- **`getaddrinfo`/`freeaddrinfo`** (`native/netdb_compat.cpp`): translates bionic's
+  `AI_*` bits and `EAI_*` numbers, swaps the two pointers in `struct addrinfo`,
+  copies the list. No shared state, no lock. One A record (128.116.51.3) on this
+  host, IPv4 only.
+- **Path calls** (`native/system_paths.cpp`): `/system` remap, and
+  `realpath(path, NULL)` refused with `ENOTSUP` (the CA-bundle path, once per
+  connection on an `HttpClient` thread). Deterministic.
+- **The trust store**: `exe/cacert.pem` symlinked to the extracted APK asset in
+  `load.rs::enter_run_dir`.
+- **Cookies**: the engine calls `OnSetCookieHandler::onSetCookie` (jnivm, then a
+  mutex and an atomic in `cookies.rs`) from its HTTP thread; the restore
+  (`nativeSetMultipleCookies`) and the first jar read-back run on Cordial's main
+  thread, the read-back at the first pump iteration of every run.
+- **Small ones**: `__system_property_get`, `sysconf`, `__errno`, the FORTIFY
+  forwards (`__poll_chk` and friends), signal-mask translation, the
+  `vasprintf`/`getcwd(NULL)` refusals. No `[alloc]` refusal fired in eight
+  runs, and the only stubs called were the two ZSTD ones.
+- **Not Cordial's**: `socket`, `connect`, `poll`, `epoll_*`, `select`,
+  `eventfd`, `fcntl`, `ioctl`, `getsockopt`, `send*`/`recv*` go to glibc.
+  `__FD_SET_chk`/`__FD_CLR_chk`/`__FD_ISSET_chk` are stubs returning 0 and were
+  not called in any of the eight runs.
+
+**Checks made on those, all passing, none finding a defect.** `cargo test`
+now has (a) `first_use_race_never_loses_a_wakeup`: 12,000 rounds of a fresh
+all-zero cond and mutex, four workers, waiter and signaller racing the wrapper's
+lazy init; a control that makes `pthread_cond_broadcast` a no-op fails it at the
+60 s watchdog, so it can see a lost wakeup; (b) three `netdb_tests` through the
+override table (bionic layout, `EAI_NONAME` as 8, 2,400 lookups on eight
+threads). In the six control clients `tools/freeze-capture.py` decoded 92-94 live
+wrappers each (none in the two passthrough clients, as it should be): none
+referenced twice, none with waiters beside pending `g_signals`. That is the baseline a frozen client should be compared with.
+
+**Two frozen-state signatures are healthy too, and one earlier claim needs
+retracting.**
+
+- *The looper census.* `devctl loopers` on all eight healthy clients reads
+  `fds=1 [31:1:-]`, `events=9` (seven) or `6` (one), `since_event` equal to the
+  process age, 315-484 million polls. The "spinning thread that has only seen
+  nine events" in `docs/analysis/startup-freeze-capture.md` and in the
+  2026-09-28 entries is what a healthy client looks like a minute in. Corrected
+  in that file.
+- *`CLOSE-WAIT`.* A healthy client's connection pool decays from 50 to 9
+  `ESTAB` over three minutes and reaps what the server closes (`C4`, sampled
+  every 30 s: one transient `CLOSE-WAIT` at 212 s, gone by 242 s). Sockets sitting
+  in `CLOSE-WAIT` in a frozen client are ones nobody reaped; that says its network
+  thread was not doing housekeeping, or was occupied, and is weaker than the
+  2026-09-29 entry's "evidence of an actual stuck network completion".
+  `INFERRED`: how long the frozen client's had sat there was not recorded.
+
+**A new observation from the two old frozen captures that is not in any entry.**
+In both `ctrl2` and `ctrl7` an `HttpClient` thread is inside `poll(nfds=2,
+timeout=1)`: one syscall record each, and in `ctrl2` the same thread in `poll`
+at both gdb samples 83 s apart, having used about 1% of a core (0.57 s of CPU
+in the first minute, a 1 ms loop rather than a spin). In the six healthy clients held 100 s or more an idle `HttpClient`
+sits in `poll(1 eventfd, 28-69 s)`, and the 1 ms form appears only while
+transfers are running (`h2/F1` at 26 s: three fds; `C5` and `C6` at 60 s: three
+and seven).
+So in a frozen client curl believes **one transfer is still in flight, for
+minutes**. Which socket, and its state, is exactly what nobody recorded;
+`freeze-capture.py` now takes the fd array (many snapshots, because the loop
+rewrites it every millisecond) and the `tcp_info` row beside it.
+
+**What the healthy logs say about the wait, and what they refute.** In every
+healthy run `Forcing finalize` to `~UgcExperienceController` takes 48-104 ms
+(eight runs), with the finalize thread's log silent in between; in two of the eight it resumes 0.4 and
+3.3 ms after a `PerformanceControlIXP` line on another thread, in the other six
+there is no such line near it. A model that
+the wait is teardown of the first Lua app's aborted HTTP requests does **not**
+survive: `Http request aborted` warnings fall inside that window in four runs
+and outside it in four, with the same wait either way. Nothing here says what
+that thread is waiting for. The frozen `ctrl7` has the `PerformanceControlIXP`
+line and no thread ever ends the wait.
+
+**A discrepancy between the two kinds of specimen, not yet explained.** The
+2026-09-28 reading of the `syscall()` futex wait as a generic pool primitive
+stands, but the finalize thread in a *healthy* gdb-launched run (`rootcause4/F1`)
+was seen in a glibc condition wait (`op 0x189`, an address in a
+glibc thread arena, i.e. one of Cordial's backing objects), while in both frozen
+specimens it is in the engine's own `syscall(SYS_futex)` park (`op 0x89`, a
+128-byte-stride array). Those are different waits, and no run has yet shown
+which one precedes which.
+
+**Cookie read-back timing, checked and dropped.** The first read-back on Cordial's
+main thread lands in the same 40 ms as the engine's `sync cookies from engine`
+line, and in one frozen run (`ctrl7`) inside it. Across the runs with both
+timestamps it overlaps in 1 of 3 frozen and 1 of 17 healthy (`T2`), and `ctrl2`
+and `B` froze with the engine's line 230-430 ms *after* the read-back. It is
+neither required nor sufficient. It was not tested with a switch, and there is
+not one.
+
+**Not done, and how to finish it.** `CORDIAL_COND_PASSTHROUGH=1` (x86_64,
+`--host-libc`) removes the condition-variable wrapper for a same-binary A/B; a
+freeze *with* it on would settle that the wrapper is not necessary, and only a
+freeze will. `tools/freeze-capture.py PID OUTDIR` is written and has been run on
+eight healthy clients and a dummy process, never on a frozen one. After
+photographing a frozen client the useful poke, untested and not in the
+repository, is `shutdown(fd, SHUT_RDWR)` from gdb on the socket the `HttpClient`
+poll names: if startup resumes, the finalize thread was waiting on that
+transfer. Spend a launch on it only with a specimen already captured.
+
+## Open: the double Lua-app cycle is not a Cordial-side call, and a stale comment said otherwise for a month, 2026-09-29
+
+Tasked with H1 ("does Cordial order or answer something differently from real
+Android, causing a second Lua-app cycle that real Android doesn't take"), this
+round checked the claim mechanically rather than re-guessing it, on existing
+captures where possible so no launch budget was spent proving it.
+
+**`docs/traces/waydroid-roblox-startup.log.gz` cannot answer this.** It is a
+signed-out capture (`onAppReady: Landing`, never `RootSwitchNavigator`, never
+`DID_LOG_IN`) taken on 2026-07-31. The "real Android and Sober essentially
+never take the forcing-finalize path" claim two sections down is sourced to a
+*Sober* comparison (`$S/sober-comparison.md`, a different session, 0/17), not
+to this trace, and the distinction matters: a signed-out Android capture
+saying nothing about `Forcing finalize` is not evidence either way about a
+signed-in engine's own internal retry, because the signed-out path never
+reaches the code in question at all. Whoever next wants the real-Android side
+of this comparison needs a **signed-in** waydroid capture, which does not
+exist yet.
+
+**Cordial issues `nativeAppBridgeStartLuaAppDM` exactly once per default
+launch, confirmed from `crates/cordial-runtime/src/bin/load.rs` and from a
+live log** (`$S/rootcause4/F1/stdout.log`, a healthy run,
+`CORDIAL_STARTUP_RETRY` unset): the string `Lua app DataModel started`
+appears once. The engine's own log for that same run nonetheless shows the
+`gameLoadedCallback`/`APP_READY PlatformAccountRouter/Startup/Home/
+RootSwitchNavigator` sequence **twice**, with `DID_LOG_IN` only after the
+second pass — exactly the "0-old" 2026-08-24 finding two thousand lines below,
+reconfirmed on today's binary. `looper::STARTUP_RECOVERY`, the only Cordial
+code that would re-issue the call, is gated behind `startup_retry_enabled()`
+(`CORDIAL_STARTUP_RETRY`, off by default and "must stay off" per its own
+comment) and never fires in these runs. **This settles the strongest form of
+H1: the second cycle is not caused by Cordial calling into the engine twice.**
+It leaves open the softer form — an ordering or answer difference that
+changes whether the engine's *own* internal retry succeeds — which is the
+open question the rest of this file already tracks and this round did not
+move further (see below).
+
+**`~/Projects/mocktail`'s own handling of this exact native call is
+corroborating, not decisive.** `src/legacy/legacy_runtime.cc` wraps every
+call to `nativeAppBridgeStartLuaAppDM` (three mutually-exclusive env-selected
+calling positions: before `StartApp`, inline, or after it — not three
+sequential retries) in `sigsetjmp`/`siglongjmp` recovery tied to a
+`g_stage6_empty_gl_helper_returns` counter, and a large SIGSEGV-handler-based
+patch mechanism for a "Stage6 GL" null-deref loop nearby. That mechanism is
+about GLES/EGL scratch-queue null derefs during rendering setup, a different
+subsystem from Cordial's Vulkan path and from the `UgcExperienceController`/
+finalize wait this file's other entries have localised — so it is **not** the
+same bug, and should not be cited as one. What it does show is that a second,
+independent from-scratch Android-native-loader project needed heavyweight
+crash recovery around this same native call regardless of *which* position it
+called it from, which is mild supporting evidence that the engine's own
+bootstrap machinery is fragile off real Android generally, not that a
+particular Cordial ordering is the lever. No ordering guidance was found to
+adapt from mocktail's cookie/identity restore path either — it stores cookies
+in a plain file (`auth_runtime_composition.cc`) rather than facing the
+keyring-timing questions Cordial's own cookie restore comments already
+resolved (see `crates/cordial-runtime/src/bin/load.rs`'s `CORDIAL_COOKIE_PROBE`
+comment).
+
+**A stale comment was found and fixed.** The `CORDIAL_BRIDGE_DELAY_MS` comment
+in `load.rs` (added around the 2026-08-24/25 timing investigation) stated as
+established fact that "a run that freezes reaches every startup milestone
+earlier than one that does not" and that load reduced the freeze rate. Both
+claims are retracted a few hundred lines below in this same file ("RETRACTED:
+frozen runs are not the fast ones", "Load is not it") on larger, interleaved
+samples — the apparent gap was Simpson's paradox from pooling `LOAD` arms
+that themselves shift startup speed, and the freeze rate drifts in
+minutes-long bursts independent of code. The comment had been repeating the
+retracted claim as fact for over a month, through four further investigation
+rounds, and it was handed to this round's brief as an "established" fact
+verbatim. Fixed in this round's commit; the knob itself is kept, unchanged,
+as a cheap lever for a future timing idea. **This is the failure mode
+AGENTS.md's documentation section warns about, not a one-off: a comment that
+lies costs more than no comment, and it costs more the longer it survives
+being asked about.**
+
+**H2 (the CLOSE-WAIT socket ownership question) got no signal this round.**
+Eight signed-in `CordialTest` launches, spaced >=90s apart, all confirmed
+signed in (`cachedUserId:11400949329` restored, no `DID_LOG_OUT`, presents
+growing on a `devctl info` pair taken 6s apart) and all reached
+`HOME_PAGE_INTERACTIVE` — 0/8 frozen, an all-healthy burst of the kind this
+file's "Load is not it" section already documents happening independent of
+any code change. No new evidence on which thread owns the `CLOSE-WAIT`
+sockets' epoll registration; the question stands as the 2026-09-29 entry
+below left it. A capture-ready harness for it
+(`ss -tnpe` + per-fd `/proc/<pid>/fdinfo` + per-thread
+`/proc/<pid>/task/*/syscall`, triggered on a `devctl info` pair showing
+presents flat and `sync cookies from engine` already logged) exists for next
+time but was never exercised against a frozen specimen.
+
+## Open: programmatic `CaptureFocus` is not a Cordial-side click gate; the specimen game does not use `TextBox`, 2026-09-28
+
+A report that `TextBox:CaptureFocus()` does nothing on Cordial — a game that
+focuses its own box gets no editor, so typing is silent, while clicking the
+same box works — was investigated for a click-dependent condition in
+`android_classes.cpp`, `android/input.rs`, `android/wayland.rs` and
+`cordial_shell::host_window`. **None was found.** `cordial_textbox_focused`
+(the function both `showKeyboard`'s hook and devctl's `fakefocus` call) sets
+`g_textbox_handle`/`g_textbox_generation` unconditionally; `sync_text_overlay`,
+`sync_ime_focus` and `resolve_textbox_geometry` all key off
+`textbox_generation()`/`focused_textbox()`, with no read of pointer state
+anywhere in the chain. `fakefocus` proves this directly: it calls
+`cordial_textbox_test_focus` → `cordial_textbox_focused`, the exact entry
+point `showKeyboard` uses, with no click involved, and on a live signed-in
+CordialTest run (2026-09-28) it drew a correctly-placed, typeable editor
+(`devctl textbox` reported `placed=engine`, `settext` landed and read back).
+mocktail's `RobloxTextEditor::BeginFocusSession` takes whatever
+`gameActivity_showKeyboard` hands it the same way, with no gate.
+
+Type Race (placeId 7232779505), picked as an obvious CaptureFocus specimen,
+turned out not to be one: across a full ready-up-to-round-end cycle, `devctl
+textbox` never reported a focus and no `textbox focused` line appeared in the
+`CORDIAL_TRACE_TEXT=1` log, yet `pass_key_event` traces show injected evdev
+keys reaching the engine and, after some latency, the on-screen character
+counter did advance. That is the shape of `UserInputService.InputBegan`
+reading keys directly, not a focused `TextBox` — this game answers a
+different question than the one asked. Sober #723, "glViewTextBoxFocused()
+does not focus if forced" (Word Bomb, Spelling Bee), is the on-point upstream
+report for a game that *does* use a forced-focus TextBox: engine-side
+connect/disconnect race, closed `COMPLETED` but with no confirmation the fix
+reached this APK's build. If it reproduces here, ADR-001/ADR-003 rule out a
+Cordial-side correction (the race is the engine's own), and the finding would
+be "faithfully reproduced," not a platform bug.
+
+**Not fixed, because no cause was found to fix.** Whoever picks this up next
+should find a game confirmed to call `CaptureFocus()` on a real `TextBox`
+(not `InputBegan`) and watch `showKeyboard`/`hideKeyboard` under
+`CORDIAL_TRACE_TEXT=1` — a `showKeyboard` that never arrives points at a
+platform gap here; a `showKeyboard` immediately followed by `hideKeyboard`
+for the same handle matches Sober #723 and is upstream.
+
+**Also found, not fixed (out of scope this session, `devctl.rs` was another
+agent's file):** `devctl.rs`'s `fakefocus` verb mis-parses its optional
+trailing text. The handler calls `line.splitn(6, char::is_whitespace).nth(5)`
+to find the text after `fakefocus <multiline> <x> <y> <w> <h>`, but that is
+six tokens (including the verb itself), so `splitn(6)` only skips five and
+the `h` value leaks into the start of the text
+(`fakefocus 1 200 200 600 200 Line one...` reads back as text `"200 Line
+one..."`, confirmed live). Geometry and `multiline` parse correctly; only the
+convenience trailing-text argument is affected. Should be
+`splitn(7, ...).nth(6)`.
+
+## Open: `docs/adr/ADR-019`'s nested-weston fullscreen claim did not reproduce headless, 2026-09-28
+
+Told that nested sway does not engage GTK fullscreen but nested weston does,
+a `weston -B headless --renderer=gl -S <name> --fake-seat` instance was built
+to re-run the multi-line editor's fullscreen checks away from the
+maintainer's own session (`wayland-0`, in active use). `devctl fullscreen`
+against a CordialTest client on that display reported the command accepted
+(`info`'s `accepted` counter incremented) but the canvas extent, read back
+from `devctl info`, never changed from the windowed `960x754`, and no new
+`vkCreateSwapchainKHR` line appeared in the client log — `window.fullscreen()`
+was called (`host_window::HostWindow::set_fullscreen`) but weston's
+`desktop-shell` never sent a bigger configure. Both `weston-screenshooter`
+(hangs indefinitely, no output file, protocol most likely not enabled by
+`desktop-shell`) and `grim` (`"compositor doesn't support the screen capture
+protocol"`, expected — weston is not wlroots) failed to capture the
+compositor's own composited frame either, leaving no way to see the GTK
+chrome and confirm or refute the grey-screen bug from that side; only
+`cordial_screenshot` (the engine's own swapchain) was available, which cannot
+see the GTK overlay at all. **Real-GNOME-session verification of the
+fullscreen grey bug and the windowed/fullscreen editor-sizing checks is still
+outstanding** — this session's launch budget (5, spent partly on two repeats
+of the existing startup freeze) did not stretch to diagnosing the headless
+weston setup further. What *did* verify live, via `devctl fakefocus 1 ...`
+and `settext` on a signed-in CordialTest client (not a real game's box):
+`multiline=1` in the spec draws the `gtk::TextView` overlay, and multi-line
+text (three lines, a wrapped line) is visible and correctly placed while
+"typing" via `settext` — `grim` on the *sway* nested compositor (which does
+composite the window, unlike headless weston here) confirms this
+screenshot-side. A single Esc releasing the editor could not be tested at
+all: `fakefocus`'s synthetic handle is not a box the engine itself ever
+focused, so the engine has nothing to blur on Escape, and a real evdev key
+delivered through `devctl key`/`tap` goes straight to `nativePassKeyEvent`
+(the engine path), not through GDK to the widget — a real in-game multi-line
+`TextBox`, focused by a real click, is needed to exercise this.
 
 ## Fixed: a blank screen (signed in and signed out alike) traced to the wrong settings document, 2026-09-24
 
@@ -57,6 +945,367 @@ that recurs; whether the classic two-cycle placeholder-swap freeze (the
 symptom) is affected one way or the other by fetching the engine's own
 document instead of Cordial's — not measured, only the blank/Landing split
 was.
+
+## Open: the missing-AGDK-command theory is refuted live, and the wait is confirmed to be inside the engine, 2026-09-28
+
+Reproduced on `8c85be7` + this session's own `devctl redraw` addition, `just
+build toolbox`, signed-in `CordialTest`, nested headless sway, `taskset -c 0`
+on the client process (no separate CPU hog): one clean capture of the
+documented signature, unchanged from 2026-08-26 — `loopers` on the frozen
+client read `tid=<engine> fds=1 [31:1:-] polls=1115187357 events=9`, i.e. the
+AGDK `native_app_glue` thread spinning on `ALooper_pollOnce(timeout=0)`
+against its own command pipe (`ident=1` is `LOOPER_ID_MAIN`), nine events
+delivered, `presents` fixed at 1. `gdb thread apply all bt`, twice 90s apart,
+both show the spinning thread in `looper::looper_poll_once` at 98-100% of a
+core (`crates/cordial-runtime/src/android/looper.rs:1794`), matching the
+2026-08-26 capture exactly.
+
+**The "one missing command" theory (the `redraw` script action added in
+09d315b, never run before this session) is refuted as a recovery mechanism,
+by direct live test.** A `redraw` verb was added to `devctl` (`Cmd::Redraw` in
+`crates/cordial-runtime/src/devctl.rs`, tested by
+`devctl::tests::redraw_verb_queues_exactly_one_redraw_command`) specifically
+so the same `onSurfaceRedrawNeededNative` call the script action fires blind
+at a fixed time could instead be fired at an already-wedged client, with no
+guessing about timing. Sent once: the looper census's `events` counter went
+9 -> 10 and `since_event` reset to 0, proving the command was delivered and
+consumed — and `presents` stayed at 1. Sent ten more (`events` 10 -> 20) and
+then a `fullscreen`/`windowed` cycle, which drives a real resize and pulls in
+far more command traffic than one redraw grant (`events` on both loopers
+jumped by 67-75 in one shot): still `presents=1`, no new engine-log line, no
+`~UgcExperienceController()`. **The spinning thread accepts and processes
+every command handed to it and none of that unwedges anything.** Whatever it
+is waiting for is not "one more Android lifecycle event" — this is now a
+result, not an inference, and 09d315b's redraw action can be read as
+"attempted as a recovery, refuted" rather than merely "not yet run". Whether
+firing it *before* the wedge (rather than after) changes anything is a
+narrower, separate claim — see below.
+
+**The keyring/secrets-block theory (`freeze-root.md`, flagged there as
+"unverified by this session") does not hold either, on this capture.** The
+full 69-thread backtrace shows `cordial-secrets` (`crates/cordial-shell/src/
+secrets/keyring.rs:155`) parked in `Receiver::recv` on its own `mpmc` job
+channel — a worker idly waiting for the *next* request, indistinguishable
+from a healthy idle pool, not a thread stuck mid-transaction. No thread in
+the census (workers, `HttpClient`, `HttpThreadPool`, `RBX Worker A`-`P`,
+`gmain`, `pool-spawner`, asset cache threads) shows anything but an ordinary
+blocking wait on its own condvar/fd. There is no visible lock-ordering cycle
+anywhere Cordial's own code or the OS can see.
+
+**Where the wait actually is, confirmed rather than inferred this time**: the
+engine's own player log. Healthy and frozen runs are identical through
+`Forcing finalize experience coordinator with state 1` ->
+`UgcExperienceController: finalize: Did not finalize due to state.` (same
+millisecond in both). A healthy run then logs
+`UgcExperienceController::~UgcExperienceController()` about 48ms later — with
+nothing from Cordial's own side logged in between that could have caused it —
+followed by a second `vkCreateSwapchainKHR` at a new size, `sync cookies from
+engine`, `DID_LOG_IN`. A frozen run never logs the destructor. Both reach
+`sync cookies from engine` (1.185s healthy, 1.338s frozen — comparable), and
+then the frozen run's engine log **stops outright**: no further `FLog::` line
+of any kind, from any subsystem, for as long as the process was left running
+(228s in this capture). This confirms the "next instrument has to see into
+that gap" note from the 2026-08-24 entry below, and answers it as far as
+external instruments can: the retry that either succeeds or does not is
+private to `UgcExperienceController`/`SingleSurfaceApp` inside `libroblox.so`,
+with no OS-visible primitive (no futex, no held lock, no blocked syscall
+anywhere else in the process) standing in for whatever internal condition it
+is testing. **AGENTS.md's rule against reasoning from a disassembly is why
+this is the floor of what can be said here without further engine-side
+evidence** (a future real-Android capture that logs the same coordinator's
+internal state, or a mocktail comparison of the same class, are the two
+routes that stay inside the rules).
+
+**A small, inconclusive prevention arm**: firing `redraw` continuously every
+50ms for the first 3 seconds, from process start (rather than at a wedged
+client), interleaved with plain controls, same `taskset -c 0`: control 1/4
+FROZEN, early-redraw 0/2 FROZEN. Too few runs to read as evidence either way
+at the ~30% historical base rate — 0/2 is within noise — and it is reported
+only so nobody re-spends launches re-deriving it. Given the recovery result
+above, there is no remaining mechanistic reason to expect this would help;
+it was tried anyway because it was cheap and the timing-sensitivity note in
+09d315b's commit message had not been tested.
+
+`crates/cordial-runtime/src/devctl.rs`'s `redraw` verb is kept regardless of
+this result — it is a real diagnostic capability (ADR-019), independent of
+whether this particular hypothesis panned out.
+
+## Open: the spinning AGDK thread is not the wait; found and named the thread that is, 2026-09-28 (later)
+
+No `perf` binary exists on this host or in the `cordial` toolbox
+(`perf_event_paranoid=2` either way), so this used repeated/targeted `gdb`
+attaches and direct `/proc/<pid>/task/<tid>/{wchan,syscall}` reads instead.
+
+**The spinning AGDK thread's own behaviour is fully explained by Cordial's own
+`BACKOFF_AFTER_PRESENTS` gate and is not itself informative.**
+`crates/cordial-runtime/src/android/looper.rs:1775-1784`: once
+`glcount::QUEUE_PRESENT >= 120` (a constant, `BACKOFF_AFTER_PRESENTS`) *and*
+the poll has come back empty enough times in a row, the zero-timeout poll
+takes a `nanosleep` branch instead of `epoll_wait` — this is the documented
+idle backoff, working as designed. Sampled the same thread (by its `ident=1`
+looper registration, i.e. the AGDK `native_app_glue` command-pipe owner) on a
+healthy client with `presents` past 120: 30/30 gdb samples land in the
+`nanosleep` branch at `looper.rs:1784`. On a frozen client, where `presents`
+is stuck at 1 and never reaches 120, the same thread is permanently in the
+`epoll_wait` branch at `looper.rs:1794` instead — not because anything is
+different about *that thread*, but because the gate it reads
+(`QUEUE_PRESENT >= 120`) can never pass while presents are stuck. This closes
+off "the spinning thread is waiting for something" as a lead on its own
+terms: it is a downstream reflection of the stall, reading a Cordial-side
+counter, not a cause.
+
+**Found and named the actual blocked thread, by correlating the engine's own
+log with `gdb`'s thread list.** The engine's FLog CSV format's third field is
+a truncated hex thread-pointer (the low 32 bits of the `pthread_t`/TLS
+address printed by `gdb`, leading zero dropped). The thread that logs
+`Forcing finalize experience coordinator with state 1` /
+`UgcExperienceController: finalize: Did not finalize due to state.` /
+`Lua app running status has been updated to true` matches, on two
+independent frozen captures (`ctrl2` and `ctrl7`, different ASLR layouts),
+one specific `LWP` — generically named `"Main"`, indistinguishable by name
+from a dozen other threads, but identifiable this way with no guessing:
+
+```
+ctrl2: engine log thread id a7fc6c0  -> gdb Thread 53 (LWP 1370557) "Main"
+ctrl7: engine log thread id a16d6c0  -> gdb Thread 53 (LWP 1427306) "Main"
+```
+
+**That thread is genuinely blocked on a futex, not spinning, in both
+captures, with an identical signature:**
+
+```
+ctrl2 (LWP 1370557): syscall 202 0x7f0b67142dcc 0x89 0x3 0x0 0x0 0xffffffff 0x7f0b0a7f9dc8 ...
+ctrl7 (LWP 1427306): syscall 202 0x7fb9a4b2244c 0x89 0x3 0x0 0x0 0xffffffff 0x7fb90a16adc8 ...
+```
+
+`syscall 202` is `SYS_futex`; `0x89` is `FUTEX_WAIT_BITSET_PRIVATE`; `val=3`;
+`timeout=NULL`; `val3(bitset)=0xffffffff` — the standard shape of an
+unconditional condition-variable wait, called through a bare `syscall()`
+(gdb frame #0, not glibc's `__syscall_cancel_arch` path), meaning this is the
+engine's own bundled wait primitive, not anything routed through Cordial's
+host-libc pthread shim (`crates/cordial-runtime/src/bionic/pthread.rs` has no
+raw `futex`/`syscall(` call anywhere in it — checked directly, this is not a
+shim bug). **On `ctrl7`, the identical syscall record — same address, same
+`val`, same `val3` — was read twice, 89 seconds apart, with nothing in
+between.** Not a fast retry loop that happens to look the same on two
+snapshots: the same single syscall, unresumed, for at least 89 seconds. gdb's
+own backtrace for this thread is otherwise all bare `libroblox.so` offsets
+(`??`), so no more than this can be said about what object it is without
+disassembling the engine, which AGENTS.md forbids.
+
+**A second, independent discriminator, from the real-Android trace**: every
+`SingleSurfaceApp` init cycle logs a `Register rendering frequency during
+startup.` / `Restoring rendering frequency to normal.` pair
+(`docs/traces/waydroid-roblox-startup.log.gz:1085,1304`; this pair exists on
+real Android too and is unrelated to any freeze there, since real Android and
+Sober essentially never hit `Forcing finalize` at all). **Healthy Cordial
+runs log this pair twice** (once per init cycle, matching the two-cycle
+startup); **frozen runs log it exactly once** and never again. This is
+consistent with, not independent of, the destructor-never-fires finding
+already recorded above — cycle two's own init sequence, gated behind the
+finalize retry succeeding, never gets far enough to register its own
+frequency pair — but it is a second, cheaply-checked marker for the same
+divergence that does not need a debugger.
+
+**mocktail was checked and does not model this.** Nothing under
+`~/Projects/mocktail` references `SingleSurfaceApp`'s startup finalize path;
+its one hit for these terms (`tests/network_readiness_gate_test.sh`) is a
+game-*join* validator fixture, a different stage entirely, and its own
+`UgcExperienceController: finalized` line there is the terminal, successful
+case with no retry modelled.
+
+**Where this leaves it**: the wait is confirmed real (not a busy spin dressed
+up as one), confirmed stable across 89+ seconds with zero spurious wake, and
+confirmed to be the engine's own internal wait primitive rather than
+anything in Cordial's pthread shim. What it is waiting for, and who holds the
+other end, is not observable without either disassembling `libroblox.so`
+(ruled out) or a source-level comparison this session did not have — the
+Java/C++ classes involved (`SingleSurfaceApp`, `UgcExperienceController`) are
+Roblox's own, not documented in `docs/traces/` beyond log-line order. No fix
+is proposed this round because none of the mechanisms tried are load-bearing
+on it; shipping one anyway would be a guess. **Next measurement, if someone
+continues this**: a single, minimally-perturbing `gdb` watchpoint on the
+futex word's exact address (already known from `/proc/.../syscall`, no
+search needed) set the instant a fresh launch's PID exists, left running
+un-attached until the 0.9-1.5s divergence window, then one attach to read
+whether the word's value ever changed — this would show whether *anything*
+ever calls `FUTEX_WAKE` on it, without the repeated-attach perturbation risk
+a sampling profiler would carry over that exact window.
+
+## Open: named the wait's own code, confirmed it is generic pool machinery, 2026-09-28 (later still)
+
+**Module+offset, via `/proc/<pid>/maps`, not disassembly.** On a frozen `Main`
+thread's full `gdb bt`, every frame maps cleanly:
+
+```
+#0  libc.so.6                          (syscall())
+#1  libroblox.so+0x29c9687             executable (r-xp) -- the real caller
+#3  libc.so.6                          (a wrong gdb heuristic guess, see below)
+#4  libroblox.so+0x29d3e1c             executable (r-xp) -- plausible next frame up
+#5  anon heap, file_offset 0x2396c0    rw-p -- NOT a return address
+#6  libroblox.so+0x2e434b0             executable (r-xp) -- unreliable past this point
+#7  anon heap, file_offset 0x2000f00   rw-p -- NOT a return address
+#8  libroblox.so+0x713ab00             rw-p (DATA segment, not code) -- NOT a return address
+```
+
+Only frames #1 and #4 are trustworthy: return addresses must point into
+executable code, and #5/#7 (writable anonymous heap) and #8 (libroblox.so's
+own writable data segment) are stack-scan artefacts from a stripped binary
+with no reliable unwind info -- the same limitation AGENTS.md already
+documents for this engine's frames. **The wait is issued from
+`libroblox.so+0x29c9687`, full stop** -- not a separate `libc++_shared.so`
+(there is none; `/proc/<pid>/maps` lists exactly one Roblox-side object,
+the single 108MB `libroblox.so`, confirming the engine statically links its
+own C++ runtime), and not any Cordial binary.
+
+**Confirmed against `build.rs`, as asked: cordial-linker-sys compiles none of
+bionic's futex users.** `third_party/mcpelauncher-linker/CMakeLists.txt`'s
+`linker` target source list is `bionic/linker/*.cpp` plus a handful of the
+port's own `core/base`/`core/liblog` helpers, `bionic_call_ifunc_resolver.cpp`,
+`async_safe_log.cpp`, and `bionic/libdl/libdl.cpp` -- no
+`pthread_cond.cpp`/`pthread_mutex.cpp`/`pthread_once.cpp`/`semaphore.cpp`, and
+no `__cxa_guard` anywhere in it. Cordial's own
+`crates/cordial-runtime/src/bionic/pthread.rs` has no raw `futex`/`syscall(`
+call either (checked directly, not inferred). This wait is not something
+Cordial builds, forwards, or could have a shim bug in.
+
+**`strace -f -tt -e trace=futex` was tried first, as suggested, and rejected
+on measurement, not guess.** Wrapping the launch stalled the whole client at
+`bootstrapTheApp_:` for over 60 real seconds where an untraced run reaches
+`Home` in under two -- a demonstrated 60x-plus slowdown from tracing every
+futex call across every thread of a ~65-thread process, unusable for
+observing a race this timing-sensitive.
+
+**Switched to a `gdb` breakpoint on the wait's own return address
+(`libroblox.so+0x29c9687`), which is genuinely cheap (a static code patch,
+not a syscall trace) -- run twice, both healthy, both replicate the same
+shape**: two "RBX Worker" peers (`A`/`B` both times) wake simultaneously at
+that exact PC. This is real and repeatable, but **it is not evidence about
+the specific `Forcing finalize` thread's own wake, and saying so would have
+been the wrong conclusion.** Correlating engine-log thread IDs the same way
+as the previous entry: in both captures the thread that actually logs
+`Forcing finalize experience coordinator` is a *third*, differently-named
+`LWP` (`"Main"`, distinct from either `A` or `B`) — the breakpoint, being
+unconditioned on the futex address argument, caught the *first* thread(s) to
+resolve *any* wait through this shared code path, which fires very early
+(before `Forcing finalize` is even logged) for what is evidently a generic,
+heavily-reused "pool worker: wait for the next job" primitive — the same
+`libroblox.so+0x29c9687` PC recurred in **36 of the ~65 threads** in one
+frozen census (every plain `"RBX Worker A"`-`"P"` slot, several `"HttpClient"`
+/ `HttpThreadPool`-adjacent names, and the `"Main"`-named finalize thread
+itself), all sharing one generic wait implementation with different objects
+as arguments. Two independent replications is enough to trust the mechanism
+(shared queue, `notify`-style multi-wake), not enough — and not the right
+instrument — to name who wakes *this specific* futex.
+
+**What would actually isolate it, not attempted this round (launch budget
+exhausted at 16/16 for this task)**: a breakpoint at the wait's *call* site
+(one frame further down, where `rdi`/`rsi` still hold the raw `futex(2)`
+arguments before the kernel is entered) with a `condition` on `$rdi` equal to
+the address recovered live from `/proc/<pid>/task/<tid>/syscall` the moment
+`Forcing finalize` is seen in the engine log — or the plain hardware
+watchpoint recommended in the previous entry, which needs no call-site
+address at all and reports the writing thread directly. Both are cheap
+(static breakpoint / debug-register trap, not syscall tracing) and were not
+reached only for lack of remaining launches.
+
+**Where the chain ends, with the evidence for it**: the wait is real, stable
+(unchanged over 89+ seconds, `docs/NEXT.md`'s previous entry), issued from
+inside `libroblox.so` through a generic thread-pool primitive that Cordial
+neither implements nor can be missing a call for (confirmed against
+`build.rs`/`CMakeLists.txt` and `bionic/pthread.rs` directly), and every
+other Cordial-observable subsystem checked across three separate frozen
+captures this task (secrets/keyring, HTTP, the AGDK looper, JNI-registered
+natives) stays idle and unimplicated. **This ends inside the engine, with no
+Cordial-visible dependency identified** — which is the answer the coordinator
+asked for in that case, not a stopping point chosen for convenience.
+
+## Open: named the waker -- an HttpClient thread's `pthread_cond_broadcast` -- and found a second, simpler freeze shape, 2026-09-29
+
+Used the exact instrument the previous entry asked for: on a live launch,
+poll the new engine log for `Forcing finalize experience coordinator`,
+extract its truncated-pthread-pointer thread-id field the instant it
+appears, map it to an `LWP` via `gdb`'s thread list, read that thread's own
+`/proc/<pid>/task/<tid>/syscall` for its exact futex address, and arm **one**
+hardware watchpoint on that word (`watch *(int *) ADDR`, cheap -- a debug
+register, not a syscall trace) via a single `gdb --args` session that starts
+paused at library-load and only engages the watchpoint reactively. Detection
+to watchpoint-armed took 5-14ms in the runs that worked, and the watchpoint
+fired within 14ms of being armed both times it was in place before the
+natural resolution -- fast enough that the intervention itself does not look
+like it is racing the event, though see the "who exited before I could
+check" paragraph below for the failure mode this exposed.
+
+**Two clean, fully replicated hits, byte-identical (gdb disables ASLR for a
+process it launches itself, which is why the addresses below repeat exactly
+and is worth knowing before anyone reads too much into two runs landing on
+the same number):**
+
+```
+run 1: Thread 23 "HttpClient" hit Hardware watchpoint: *(int *) 0x7fff4c001930
+       Old value = 0 / New value = 1
+       0x00007ffff674d855 in pthread_cond_broadcast@@GLIBC_2.3.2 () from libc.so.6
+       caller: libroblox.so+0x241a6d8
+run 2: Thread 23 "HttpClient" hit Hardware watchpoint: *(int *) 0x7fff4c001930
+       Old value = 0 / New value = 1
+       0x00007ffff674d855 in pthread_cond_broadcast@@GLIBC_2.3.2 () from libc.so.6
+       caller: libroblox.so+0x241a6d8   (identical address, identical offset)
+```
+
+**The finalize thread's futex is woken by an `HttpClient` thread calling
+`pthread_cond_broadcast`.** Both runs went on to reach `Home` normally
+afterward, confirming the watchpoint's own presence did not itself prevent
+the healthy outcome it caught.
+
+**The technique has a real failure mode, and it cost several launches to
+find rather than to guess at.** In three other runs, the same thread-id
+extracted from the log matched *no* thread gdb could see, even after 30 more
+breakpoint-driven checkpoints. The likely reading: whatever thread runs this
+specific retry is a one-shot worker that exits once its task completes, and
+a *healthy* run resolves and tears that thread down faster than this
+pipeline's own detect-then-attach latency in most cases -- meaning the
+technique reliably catches the wake only when it is slow enough to still be
+in flight, which is a real form of survivorship: what gets caught skews
+toward the (still perfectly genuine) slower half of healthy resolutions.
+Labelled **INFERRED**: no run was slowed down deliberately to confirm this is
+*why* the thread was gone rather than some other cause.
+
+**A live frozen specimen, caught by accident while chasing a match, turned
+up a second, simpler failure shape that has not been on record before.**
+This run's engine log never logged `Forcing finalize experience coordinator`
+at all -- the whole retry/finalize apparatus this task has spent three
+rounds on never engaged -- and it still froze, stopping one line after `sync
+cookies from engine`, `presents` fixed at 4. The thread that logged that
+line (`HttpClient`, a different one from the waker above) is *itself*
+blocked in `pthread_cond_wait` at `libroblox.so+0x241d9dc` -- 0x3304 bytes
+(about 13KB) from the waker's own `pthread_cond_broadcast` call site above,
+consistent with both being part of the same networking module's wait/signal
+pair rather than a coincidence. **Independent, OS-level corroboration that
+this is a real stall and not merely a slow one**: `ss -tnp` on the live
+process showed three sockets to `128.116.51.3:443` sitting in `CLOSE-WAIT`
+-- the remote end already sent its close, and the local side never finished
+processing it -- while the process's two `RBX IoEvLoop 0` threads sit in an
+otherwise perfectly ordinary `epoll_wait`. Nothing here says which thread
+owns those three sockets' epoll registration, or why their close was never
+serviced; that is the next thread to pull, not a conclusion reached.
+
+**Where this leaves the chain**: the waker is named (an `HttpClient` thread,
+`pthread_cond_broadcast`, `libroblox.so+0x241a6d8`) and replicated twice.
+Recursing *its* own wait one level further landed inside the same
+networking module, on a `pthread_cond_wait` whose completion is plausibly
+gated on real socket I/O -- and a live frozen specimen shows real,
+unprocessed `CLOSE-WAIT` sockets, which is evidence of an actual stuck
+network completion, not an artefact of the debugger. **This still ends
+inside the engine and the host's own libcurl/TCP stack** (`--host-libc`
+means these calls resolve to the host's real networking libraries, which
+Cordial does not implement or intercept) **as far as this round's launch
+budget allowed tracing it.** No fix is proposed: nothing pulled on this
+thread is Cordial's to fix yet. The concrete next step is to find which
+thread owns the three `CLOSE-WAIT` sockets' epoll registration on a fresh
+frozen capture, and to check whether Cordial's own path to the host's
+resolver/TLS stack (rather than the generic host-libc forwarding this
+project already relies on) has any observable difference between the
+socket's two endpoints and a healthy run's equivalent connection.
 
 ## Open: the startup freeze has a second failure on the other side of it, 2026-09-17
 
@@ -317,8 +1566,9 @@ ADR-032 for the full account.
 there because there is no FHS -- no `/lib64/ld-linux-x86-64.so.2` for the
 interpreter to land on -- regardless of how new the host glibc is. The fix is
 the user's: `programs.appimage.enable = true` with binfmt. That belongs in the
-install documentation and is not written down yet. `flake.nix` now builds
-Cordial for them, and **has never been built**; it needs
+install documentation and is not written down yet. `flake.nix` builds
+Cordial for them (built and `--help` run on 2026-10-01, never launched into a
+game; see CONTRIBUTING.md), and it needs
 `nix run "github:luohoa97/cordial?submodules=1"`.
 
 ## Open: the gamepad-ordinal probe ran; the pre-login shell is not a readout of `gamepadType`, 2026-08-30
@@ -510,6 +1760,55 @@ pass under the new names -- 156/156 in `cordial-runtime`, 332/332 in
 `cordial-shell`, 0 failures workspace-wide, run twice (once at `-j4`, once at
 `-j2` after a memory advisory) with the same result both times.
 
+## The X-axis ordinals above were themselves backwards, corrected 2026-09-26
+
+The entry above resolved *which slot* carries `xAlignment` and applied it, but
+what it applied was `Left=0, Center=1, Right=2` -- alphabetical order, not
+Roblox's. Nothing here had ever caught it because every box this project has
+ever focused reports `0` (`Left`), which is the one ordinal the reindex below
+never moved.
+
+A maintainer report -- game-defined text boxes rendering "on the wrong side,
+from the right when it's supposed to be from the left" -- prompted checking
+the ordinals against Roblox's own published enum reference rather than
+against this project's own prior comment, which is what should have happened
+in the first place. Two independent current sources agree and give the same
+numbers: `create.roblox.com/docs/reference/engine/enums/TextXAlignment` and
+`robloxapi.github.io/ref/enum/TextXAlignment.html` both give
+`Left=0, Right=1, Center=2`. `TextYAlignment` (`Top=0, Center=1, Bottom=2`) is
+unaffected -- the same two sources confirm it matches what was already coded.
+Nothing in mocktail's constructor speaks to this either way: it settles which
+*slot* is which by declared argument order, not what each ordinal *means*,
+and that half of the reasoning above still stands.
+
+Fixed in `host_window.rs::gtk_xalign` (the single-line `gtk::Text` editor) and
+in a new `gtk_xalign`-shaped `gtk_justification` extracted from what had been
+an inline match on the same wrong ordinals in `set_multiline_overlay` (the
+multi-line `gtk::TextView` editor added since the entry above was written --
+it inherited the mistake rather than introducing a new one). Both are unit
+tested against the corrected ordinals; the old test for `gtk_xalign` asserted
+the wrong numbers just as confidently as the new one asserts the right ones,
+which is the reminder that a test proving a match arm matches itself is not
+evidence about which ordinal the arm should name -- only Roblox's own
+documentation is.
+
+**Still not measured against a live `Right`- or `Center`-styled box.** Five
+launch attempts against the signed-in `CordialTest` profile in a nested,
+headless sway (the setup `tools/text-input-e2e.py` and the multiline entry
+above both use successfully) all hit the pre-existing signed-in startup
+freeze instead of reaching a joinable state: `presents` stuck at 0 or 1 while
+`accepted` kept climbing, and a `gdb` backtrace on the fourth attempt showed
+the main thread spinning in `looper::pump` -> `epoll_wait` at over 100% CPU --
+the "pump still running, nothing presented" signature this file's own tooling
+section already names as a real hang rather than the idle throttle, not
+anything this change introduced. That bug already gates 1.0 on its own and is
+not re-investigated here. So: the chat box and any game-defined box remain
+the two surfaces most likely to exercise `Right`/`Center`, and remain
+unreached. The next session with a working signed-in launch should read
+`xAlign` off a real chat box or a restyled experience `TextBox` and confirm it
+against a `grim` composited screenshot, the same way the entry above did for
+the rectangle.
+
 ## Open: a camera sensitivity driven negative and persisted, 2026-08-30
 
 Reported on Discord: *"my camera on cordial lwk just fried itself and went to a
@@ -642,6 +1941,10 @@ instance of the same class was found and fixed alongside them.
   -- so `settings.rs` gained `consent_body_for_builtin` rather than reusing
   `consent_body` verbatim. Enablement (`SHIPS_DISABLED`) is untouched: this
   prompt answers "may it do X", never "does it run at all".
+  *Amended 2026-10-05:* "the first time the Plugins page is built" stacked one
+  dialog per built-in over whichever Settings tab was open. It is now one dialog,
+  put when the Plugins page is on screen, for built-ins that are switched on;
+  see ADR-021.
 - **Denials, made visible.** `Broker::denials()` is still the record, but
   nothing outside one plugin's own serving thread could ever read it -- a new
   `cordial_plugins::denials` module persists a denial to
@@ -1393,10 +2696,133 @@ fullscreen at exactly the output size, which is the configuration Sober #1026
 fingers: only in fullscreen, only on Wayland, "stops when either is even a pixel
 below that".
 
-The case asserts the output mode actually changed before asserting anything
-about the editor. The first version did not, passed, and reported a
-byte-identical rectangle either side -- indistinguishable from a `swaymsg` that
-silently did nothing.
+### A real multi-line editor, 2026-09-25
+
+`TextBox.MultiLine` used to be reported and nothing else -- every box, single-
+or multi-line, got the single-line `gtk::Text` above, and a genuinely
+multi-line box (Circuit Maker 2's assembler and ROM boxes, a code editor, a
+chat entry more than one line tall) had its newlines flattened and its box
+handed a widget that could only ever draw one of them. `HostWindow` now also
+carries `editor_multiline`, a `gtk::TextView` in a `gtk::ScrolledWindow`, and
+`set_text_overlay` picks between the two per-box on `TextOverlay::multiline`,
+in `crates/cordial-shell/src/host_window.rs`. Font family/weight/style/size go
+through one mutable `GtkTextTag` reapplied across the buffer on every change,
+because `gtk::TextView` has no per-widget attribute list the way `gtk::Text`
+does; horizontal alignment maps onto `set_justification`; the box's own
+rectangle is used unshrunk, always -- there is no multi-line equivalent of
+`Top`/`Bottom` anchoring a single line.
+
+**The raw-`box_h` bug this section flagged is gone structurally, not
+patched.** `vertical_placement` no longer takes a `multiline` flag or has a
+branch for it at all -- a multi-line box never reaches it, because it takes
+the new widget's own placement function (`multiline_placement`, which is
+`(box_y, box_h)` and nothing else) instead. The single-line widget can no
+longer be handed a raw, unclamped box height by a box that happens to report
+`multiline=1`, because that box no longer goes anywhere near it.
+
+**Newlines, verified end to end, including the specific gap this file used to
+flag as untested.** devctl's `paste`/`settext` (`e61ed2b`) route to
+`HostWindow::editor_multiline_paste_at_caret`/`editor_multiline_set_text` for
+a multi-line box and to `editor_paste_at_caret`/`editor_set_text` for a
+single-line one, chosen by `HostWindow::editor_multiline_active`; the two
+single-line methods now flatten an embedded `\n` to a space before inserting,
+closing "newlines into the single-line widget on Wayland are untested".
+
+**Measured, not just written.** No multi-line Roblox `TextBox` was reachable
+in the time available -- Circuit Maker 2's assembler needs a place picked and
+blueprints pasted, which a prior session already tried and could not do
+quickly, and this one did not spend the budget re-trying it. Instead:
+`cordial_linker_sys::game_activity::test_focus_textbox`, the same round trip
+`textbox_info_arrives_slot_for_slot` already used inside that crate to prove
+the fifteen-slot FFI layout, is now reachable from devctl as `fakefocus
+<0|1> <x> <y> <w> <h> [text]` (and `fakeblur`), added for exactly this gap.
+**Every reading taken through it is SYNTHETIC**: it proves the GTK side does
+what a `multiline=1` spec says, and it proves nothing about what spec shape a
+real multi-line box actually sends. With that seam, on `cordial-agent-
+multiline`, `sway`, `--game-activity`, a synthetic 400x200 `multiline=1` box:
+
+- `settext` with `"first line\nsecond line\nthird line"` (33 chars, 2
+  newlines) read back byte-identical through `textbox`, and a `grim` capture
+  shows all three lines, left-aligned, top-anchored in the placed rectangle
+  -- not filling the window.
+- `paste` with `"\nfourth line"` appended without flattening -- 45 chars, 3
+  newlines afterward -- confirming `insert_at_cursor` on the buffer keeps
+  the newline the single-line `insert_text` path would have dropped.
+- Resizing the nested output 1280x800 -> 1600x900 with the box still focused
+  left `x`/`y`/`w`/`h`, `multiline` and the text byte-identical before and
+  after, and the `grim` capture afterward still shows a small, correctly
+  sized box -- not the whole window -- which is the one failure mode this
+  section exists to rule out. As with the single-line case above, a synthetic
+  fixed-rect box proves the widget survives a resize and does not prove it
+  follows a box whose own coordinates move, and it says nothing about
+  fullscreen at exactly the output size (Sober #1026, cited above).
+- Switching the same synthetic focus to `multiline=0` and `settext`-ing
+  `"one\ntwo"` read back as `"one two"`, 7 characters, zero newlines --
+  the single-line flattening path, exercised on the real Wayland widget for
+  the first time.
+- **RETRACTED, 2026-10-04: "Enter inserting a newline in a multi-line box
+  needs no code here at all."** That was written from `fakefocus`, which has
+  no engine behind it. A real chat box ("Say something") reports
+  `multiline=1`; Enter reached the engine as a raw key, which sends the
+  message and empties its TextBox, while GDK's own keyboard object also drove
+  `gtk::TextView`'s newline binding, and the widget's change signal reported
+  `"ok\n"` back over the engine's clear.
+- **RETRACTED again, 2026-10-04: the first fix for that (swallow Return in the
+  multi-line editor, send the engine the raw key, `CORDIAL_EDITOR_GTK_ENTER`)
+  was the wrong owner.** It decided in the host that no multi-line box keeps
+  its newline, which is the engine's call per box, and it left single-line
+  boxes with a key Android never sends them. What replaced it is Android's
+  contract: the focused box is an `EditText` and consumes Enter.
+  - Multi-line: GTK inserts the newline, the text is synced like any edit, and
+    the raw key is withheld from the engine
+    (`input::editor_consumes_enter`, Wayland path only -- X11 has no editor).
+    What the engine does next arrives through `onLuaTextBoxChangedCallback`.
+  - Single-line: `gtk::Text`'s `activate` syncs the final text and calls
+    `nativeReturnPressedFromOnScreenKeyboard(handle)` (`input::return_pressed`;
+    dex prototype `(J)V`, `tools/dex_method.py` on classes2.dex), and the raw
+    key is withheld. If a build does not export the native, the raw key is left
+    alone, because it is then the only way Enter can arrive.
+  - Cordial neither blurs a box nor clears the editor on Enter. Focus and
+    clearing are the engine's, through `hideKeyboard` and the text callback.
+  - Measured, nested sway, signed out. Synthetic boxes, `tools/text-input-e2e.py
+    --only-engine-text`: 40 assertions pass; the same 40 against the old routing
+    (`--client-env` switch, since removed) fail 11, all of them the Enter ones.
+    A synthetic single-line box counts the ReturnPressed call but does not send
+    it (its handle was never issued by the engine). On the real sign-in screen,
+    Enter in the empty username field (`returnKeyType=3 manualFocusRelease=1`)
+    called the native once with the real handle (`-> Ok(())`) and the engine
+    answered by blurring that box and focusing the password field. With the old
+    raw key the same press blurred the username box and focused nothing.
+    Nothing was typed or submitted: the Sign In button is disabled while the
+    fields are empty.
+  - `INFERRED`: what a real multi-line box (a chat box) does with the newline,
+    and what a single-line box that is not the sign-in form does after
+    ReturnPressed. No capture holds either; a signed-in run is the check, with
+    `CORDIAL_TRACE_TEXT=1` and `CORDIAL_TRACE_KEYS=1` (look for `return pressed`
+    and `withheld`, then whether `textbox blurred` follows and whether
+    `engine text arrived` carries the clear). mocktail's `FinishLocked`
+    (Apache-2.0, `src/runtime/roblox_text_editor.cc`) additionally drives
+    `nativePassText(handle, text, finished=true)` and closes its own editor
+    unless `manualFocusRelease` is set, and says that mirrors `RbxKeyboard`'s
+    action listener. **Cordial now does the same** (`input::return_pressed`,
+    after the return call, for a real box whose `manualFocusRelease` is 0;
+    `CORDIAL_RETURN_PASSTEXT=0` is the control): a game's phone chat box
+    stopped sending on Enter after this commit, which the sign-in fields
+    (`manualFocusRelease=1`) could not show. `INFERRED` that it restores the
+    send -- no signed-in run has held it; look for the
+    `nativePassText(.., finished=true)` line under `CORDIAL_TRACE_TEXT=1`.
+  - Escape and an outside click still need no code here: both reach the engine
+    as ordinary input and it decides whether the box blurs.
+    `returnKeyType`/`manualFocusRelease` (slots 11/12) are read only to be
+    traced, in `input::return_pressed`.
+
+**UNVERIFIED**: everything about a real multi-line `TextBox`'s own spec --
+whether Roblox ever actually sends `multiline=1` with a masked
+`textInputType`, whether a real box's `manualFocusRelease` ever disagrees with
+the always-defer-to-the-engine behaviour above, and whether `gtk::TextView`'s
+plain `grab_focus` genuinely never selects existing contents the way a bare
+`grab_focus` on `gtk::Text` would. Find a real one (Circuit Maker 2's
+assembler is the standing lead) before trusting any of those.
 
 ## Frame pacing, measured properly, 2026-08-26
 
@@ -1458,11 +2884,12 @@ an `i6` of 0 would resolve to no font file. And 3, 4 and 5 are `SourceSans`,
 unstyled TextLabel -- so Roblox's own Android mapping does not cover Roblox's
 own default font, even though `SourceSansPro-Regular.ttf` ships in the same
 archive. That is the strongest available evidence that a fallback is mandatory
-rather than a nicety. Cordial does not paper over it with a hand-written row:
-`3 => SourceSansPro-Regular` is knowledge about Roblox's enum rather than
-something the archive says, nothing would tell us when it stopped being true,
-and it is exactly the hand-maintained table this section already said must not
-be written.
+rather than a nicety. **Superseded:** Cordial now answers 3, 4 and 5 with the
+Source Sans Pro Regular, Bold and Light files (`SOURCE_SANS_FALLBACKS` in
+`editor_font.rs`). The earlier refusal to write the ids down left a box set to
+`SourceSans` drawing in Builder Sans while `SourceSansItalic` beside it drew in
+Source Sans Pro. The family, weight and slant are still read from the file by
+fontconfig and checked against what the id means, and only id 6 may draw slanted.
 
 **"`families/BuilderSans.json` gives the family string Pango needs" is right
 for that one file and wrong in general.** Pango asks fontconfig, and fontconfig
@@ -1685,7 +3112,7 @@ Remix", placeId 6520999642) that consumed the rest of the session's budget.
 Full per-cycle numbers, screenshots and the retraction are in
 `$SCRATCHPAD/textbox.md`.
 
-## Open: the editor sits above the box on a text field's first-ever focus, 2026-09-23
+## Fixed: the editor sits above the box on a text field's first-ever focus, 2026-09-23
 
 A maintainer report: the first time a TextBox is focused after launch, the
 GTK editor overlay appears well above the real box; every later focus in the
@@ -1734,6 +3161,118 @@ whether the two connects carry different generations (two boxes) or the same
 one with changing geometry (one box, animating). Raw data:
 `$SCRATCHPAD/cordial-logs/stage6_results.json`,
 `$SCRATCHPAD/textbox.md`'s Stage 6 section.
+
+**2026-09-24: the exact next step above was run, on a different box, and came
+back clean -- the bug is not "any fresh process's first TextBox focus."**
+Nested sway (`GDK_BACKEND=wayland`, held keyboard/pointer devices, matching
+`tools/text-input-e2e.py`'s own setup), `CORDIAL_TRACE_TEXT=1`, polling
+`textbox` continuously through the whole first focus rather than stopping at
+the first non-empty reading. On the sign-in form's username field -- reached
+signed-out, on a throwaway profile that had never focused any TextBox before
+-- the first-ever focus and a second focus after a blur are **identical**:
+same handle (`140057368699008`), same geometry (`x=470 y=295.00003 w=340
+h=22`) both times, one `glViewTextBoxFocused() connect` per click, no second
+connect. This rules out a generic "first read in a fresh process is cold"
+mechanism outright: if that were the cause, this box would show it too, and
+it does not.
+
+That leaves the search-bar-then-modal pattern (Home only) as the standing
+explanation for the double connect, but it could not be tested this session:
+a throwaway signed-out profile reaches **Landing**, not **Home** -- this
+project's own established distinction -- and Landing has no bar-that-opens-
+a-modal field. The Create Account form's Birthday field looked like a
+candidate (a bar with a calendar icon, plausibly opening a picker) and was
+tried; it never calls `showKeyboard` at all (`focus` stayed `none` the whole
+poll window), so whatever widget draws it is not a `TextBox` and it answers
+nothing about this bug. Reaching Home needs a signed-in profile, `CordialTest`
+was off limits for this session (in use elsewhere), and no other profile on
+this machine was this session's to sign into -- the same shape of stop
+`docs/NEXT.md`'s 2026-08-30 "text isn't centred" entry above already
+recorded once. **Not fixed, for the same reason as before: the evidence
+needed to choose between "one box settling" and "two boxes" still points at
+Home specifically, and this session could not reach Home.** Whoever can
+should repeat exactly this test (continuous `textbox` polling,
+`CORDIAL_TRACE_TEXT=1`, watch `glViewTextBoxFocused`/`handle=` at each of the
+two connects) on the Home search bar, which is the one place the double
+connect has actually been observed.
+
+Two small, independent, verified fixes came out of this session's setup work
+and are committed alongside the real one below: `tools/text-input-e2e.py`
+hardcoded `target/release/cordial-run` with no override, which does not exist
+on a host that builds in the toolbox container (`CORDIAL_E2E_BINARY` now
+overrides it, same pattern as `CORDIAL_APK`/`CORDIAL_LIB_DIR`); and it
+hardcoded `~/.local/share/cordial` for the devctl socket, ignoring
+`XDG_DATA_HOME` entirely, so a throwaway-profile run -- exactly what
+AGENTS.md tells an agent to use -- connected to nothing
+(`ConnectionRefusedError`) while the client's real socket sat under the
+redirected directory. Both are now respected.
+
+### 2026-09-24: CordialTest, cleared for at most 3 launches, gave the answer
+
+`CordialTest` became available (the freeze investigation using it finished)
+for a strictly capped session: 3 launches, no more, given the account's use
+that day. Launch 1 (of 3) reached Home and got the reading the whole
+investigation had been missing.
+
+**It is both leads at once, not one or the other.** Clicking Home's search
+bar: first `glViewTextBoxFocused() connect`, handle `140011189334144`,
+`showKeyboard` spec `x=516 y=10 w=358 h=36` -- the bar itself, real geometry,
+immediately. 123ms later, a **second** connect, a **different** handle
+(`140010950594688`) -- the search modal the bar opens, confirmed a distinct
+native object, not the same box refocusing. Its own `showKeyboard` spec is
+`x=0 y=0 w=0 h=0`, so `resolve_textbox_geometry`'s carry-over correctly holds
+the bar's last placement ("text editor placed from the previous box, while
+this one lays out"). Then `polled_textbox_info` takes over and **this is the
+second half of it**: `nativeGetTextBoxInfo` returns a different rectangle on
+every ask for about 700ms as the modal visually grows -- `x=427 w=455`,
+`x=397 w=497`, `x=394 w=502`, dozens more steps, down to `x=332 w=592` and
+staying there. Every one of those intermediate rectangles was being committed
+and painted immediately, which is what a screenshot taken any time in that
+700ms window sees as "the editor sitting on a narrower, shifted box" -- the
+exact shape of the three fresh-launch readings from 2026-09-23 above, each
+one just a different random sample of the same live animation. `resolve_
+textbox_geometry`'s own doc comment already named the zero-spec half of this
+("the real numbers arrive about a second afterwards"); what was missing was
+that the *nonzero* answers arriving in that second are not stable either.
+
+**The fix**, `crates/cordial-runtime/src/android/wayland.rs`,
+`polled_textbox_info`: a rectangle from `nativeGetTextBoxInfo` is no longer
+committed to `usable` -- the value the editor is actually drawn from -- on
+the ask that produces it. It is held as a new `pending` field and only
+promoted once the *same* rectangle repeats on the next ask (`RawTextBoxInfo`
+already derives `PartialEq`, the same equality `sync_text_overlay`'s own
+cache check already relies on). While a rectangle is unconfirmed, `usable`
+keeps whatever was already committed, so the existing carry-over machinery
+holds the editor at the bar's position exactly as it already does for a
+zeroed spec -- one behaviour extended to a second precondition, not a new
+one invented. `property_generation` is what was making this function get
+asked dozens of times a second during the animation (see its own doc
+comment, unchanged); nothing about that changed, only what an answer has to
+do before it is trusted.
+
+**Verified, launch 3 of 3** (launch 2 hit the unrelated, already-documented
+startup freeze -- presents stuck at 2, correctly detected and aborted rather
+than scored, one launch spent for nothing): the same click sequence as the
+diagnostic launch, rebuilt binary. First focus: `x=516 w=358` (the bar) at
+100-702ms, one connect to the modal's handle with the geometry still held at
+the bar's, then a single direct jump straight to `x=332 y=10 w=592 h=36` at
+802ms and stable for the remaining 1.6s of polling -- two committed
+rectangles for the whole focus where there were previously upwards of eighty.
+Second focus: `x=332 y=10 w=592 h=36` immediately, unchanged from before this
+fix (the modal is already expanded by then, so there is nothing to confirm).
+A `grim` capture of the composited window taken after the first focus
+settled shows the GTK caret sitting inside the search box exactly where the
+box is drawn (`$SCRATCHPAD/cordial-logs/verify3_first_grim.png`).
+
+`cargo build --release` (toolbox) and `cargo test -p cordial-runtime --lib`
+(388 passed, 0 failed) are both clean against this change. `tools/text-
+input-e2e.py`'s full run was not repeated on `CordialTest` -- the 3-launch
+budget was spent on the diagnostic, one wasted to the startup freeze, and the
+fix verification, in that order, with nothing left for a fourth launch.
+That suite's own assertions (typing, the double-insert guard, suppression
+while a box has focus) are unrelated to what this change touches, but it has
+not been run end to end since this fix landed and should be, on whatever
+signed-in profile is next available.
 
 ## The one rule
 
@@ -2999,8 +4538,10 @@ IME. And the engine pushes text *out* during editing —
 `onLuaTextBoxChangedCallback(String)` and the no-argument
 `onLuaTextBoxPropertyChangedCallback()`, whose only sensible response is to
 re-read that geometry. A "properties changed" callback is only needed if Java is
-displaying the box. **Both are unimplemented in Cordial**
-(`docs/analysis/unresolved-java.md` §2c).
+displaying the box. **Both were unimplemented in Cordial** when this was written
+(`docs/analysis/unresolved-java.md` §2c); the property callback now bumps a
+counter the pump re-reads geometry on, and the text callback now carries the
+engine's text to the editor (`input::apply_engine_text`, 2026-10-04).
 
 So the shadow buffer was never the problem, and deleting it was never going to
 help: **the missing piece is a widget, not a message.** Cordial has to draw the
@@ -3946,6 +5487,15 @@ untouched and now also reports any non-success code, at the first of each and
 then at each power of ten. Across both runs and every transition: not one line.
 So "the engine ignored a suboptimal swapchain" and "Cordial ate the error" are
 both off the table — there was no error to ignore or eat.
+
+**Superseded for RADV, 2026-10-01 (PR #72).** That reading was taken on Intel
+and was right of it: no suboptimal code was ever seen to *present*. On RADV the
+status arrives at *acquire*, which this section never instrumented, and the
+engine answers it with a `PRESENT_SRC_KHR` barrier on `VK_NULL_HANDLE` that the
+driver crashes on (#39). The PR's control, one variable, was returning
+`VK_SUCCESS` for the same acquire. `vkAcquireNextImageKHR` is therefore now
+interposed, only for that one code; see `vk_acquire_next_image_khr` in
+`vulkan.rs`. Not reproduced on Intel, which does not return the status.
 
 **So the three named suspects are all disproved and the bug is not reproducible
 from `gtk_window_fullscreen`.** What is left is the difference between that call

@@ -26,25 +26,56 @@ pub fn window_title(backend: &str) -> String {
 pub mod android;
 pub mod bloxstrap_rpc;
 pub mod game_log;
+pub mod post_gate;
+pub mod gamemode;
 pub mod battery;
 pub mod browser_tracker;
 pub mod client_settings;
 pub mod cookies;
 pub mod deeplink;
+pub mod game_launch;
 pub mod devctl;
 pub mod elf;
 // Not `pub`: its two functions are the raw-pointer half of this crate's
 // message-bus entry points, and nothing outside the crate should be reaching
 // for them. See ADR-036.
 mod ffi_util;
+pub mod flag_reapply;
+mod flog_shape;
 pub mod flags;
 pub mod graphics;
+// The arm64 guest's half of the runtime, behind the `vr` feature (Cargo.toml
+// says why it is off by default) and x86-64 only, as the translator is.
+// `guest_dex` is plain Rust and keeps its tests on aarch64.
+#[cfg(feature = "vr")]
+pub mod guest_dex;
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+pub mod guest_audio;
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+pub mod guest_jni;
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+pub mod guest_libc;
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+pub mod guest_link;
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+pub mod guest_ovr;
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+pub mod guest_sys;
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+pub mod guest_vk;
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+pub mod guest_xr;
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+mod xr_runtime_pin;
 pub mod headless;
 pub mod identity;
+pub mod control;
 pub mod linking;
+pub mod live_settings;
 pub mod permissions;
 pub mod plugin_host;
 pub mod profile;
+pub mod recording;
 pub mod refresh;
 pub mod roblox_api;
 pub mod secrets;

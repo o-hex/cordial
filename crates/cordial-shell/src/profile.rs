@@ -638,26 +638,6 @@ impl std::fmt::Display for Error {
     }
 }
 
-/// Move a pre-ADR-012 layout into place, once.
-///
-/// Storage used to live at `cordial/instances/default`, which named a window
-/// and contained a login, and `cordial-run` still writes there when nobody
-/// tells it otherwise. The launcher does tell it otherwise — it points
-/// `CORDIAL_FILES_DIR` at the profile — so without this the first launch from
-/// the shell starts against an empty directory and presents as being logged out
-/// for no reason. That is precisely the class of failure ADR-012 says the
-/// migration exists to prevent, so the directory is moved rather than
-/// abandoned.
-///
-/// Runs only when the old path exists and the new one does not, so it cannot
-/// clobber a profile someone has already used.
-///
-/// **Deferred while a client is running.** The legacy layout was never locked
-/// by anything, so a rename can land underneath a live engine that is holding
-/// paths inside it — and on this developer's machine that has meant a client
-/// signed in at the time. There is nothing to ask, so the only available check
-/// is whether such a process exists at all; deferring costs one launch against
-/// an empty profile, and getting it wrong costs a session.
 /// Everything the Roblox engine keeps in `<profile>/data`, and what removing it
 /// costs.
 ///
@@ -726,6 +706,77 @@ pub fn clear_engine_data(profile_dir: &Path) -> Result<u64, String> {
     Ok(freed)
 }
 
+/// Which Roblox build an instance runs, as far as the profile's layout cares.
+///
+/// [ADR-053](../../../docs/adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md):
+/// one profile serves the phone build and the Quest build, and the two share
+/// everything that is the *account* -- the lock, the saved sign-in (keyed in
+/// the secret service by this directory's path, so it carries over with no
+/// copying), flags, plugin grants -- and keep apart what is the *engine's*:
+/// `data/` and `run/`. They are different engine versions (2.737 phone against
+/// 2.740 Quest, measured) and the Quest build writes VR state into
+/// `GlobalBasicSettings_13.xml` (`VREnabled`, `HasEverUsedVR`) that the phone
+/// build reads with other semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Build {
+    Phone,
+    Quest,
+}
+
+/// The subdirectory holding the Quest build's engine storage.
+pub const QUEST_STORAGE: &str = "quest";
+
+/// Where `build`'s engine storage hangs off `profile_dir`: the profile itself
+/// for the phone build, exactly as before, and `quest/` for the Quest build.
+///
+/// The phone build keeps the top level so an existing profile is untouched by
+/// the VR mode existing at all: nothing moves, and a profile that is never
+/// used for VR never gains a `quest/` directory.
+pub fn engine_root(profile_dir: &Path, build: Build) -> PathBuf {
+    match build {
+        Build::Phone => profile_dir.to_path_buf(),
+        Build::Quest => profile_dir.join(QUEST_STORAGE),
+    }
+}
+
+/// Move Quest storage written before [`Build`] existed into `quest/`, once.
+///
+/// Before ADR-053 a VR run wrote its engine storage to `data/` and `run/`
+/// exactly as the phone build does, so a profile used only for VR has the
+/// Quest build's settings where the phone build would now read them. This
+/// moves them, and only on evidence: `data/files/appData/GlobalBasicSettings_13.xml`
+/// recording `HasEverUsedVR` as true, which the Quest build writes and the
+/// phone build was measured not to (Sober's phone 2.737 profile reads false;
+/// every Quest profile on the machine this was written on reads true, or has
+/// no settings file at all because it never signed in, and those hold nothing
+/// worth moving). **INFERRED:** that no phone build ever writes it true.
+///
+/// Leaves a profile alone when `quest/` already exists, so it cannot clobber
+/// Quest storage somebody has used since, and when there is no evidence, so a
+/// phone profile is never touched. Called by the client with the profile lock
+/// held, before anything opens engine storage.
+pub fn migrate_quest_storage(profile_dir: &Path) -> std::io::Result<bool> {
+    let quest = engine_root(profile_dir, Build::Quest);
+    if quest.exists() || !written_by_quest_build(profile_dir) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(&quest)?;
+    for name in ["data", "run"] {
+        let from = profile_dir.join(name);
+        if from.exists() {
+            std::fs::rename(&from, quest.join(name))?;
+        }
+    }
+    Ok(true)
+}
+
+fn written_by_quest_build(profile_dir: &Path) -> bool {
+    let settings = engine_data_dir(profile_dir).join("files/appData/GlobalBasicSettings_13.xml");
+    let Ok(text) = std::fs::read_to_string(settings) else { return false };
+    // `<bool name="HasEverUsedVR">true</bool>`, the engine's own shape.
+    text.split("name=\"HasEverUsedVR\">").nth(1).is_some_and(|rest| rest.starts_with("true<"))
+}
+
 /// The Roblox version this profile is pinned to, if it names one.
 ///
 /// A plain file holding a version string, beside `flags.json` and
@@ -773,6 +824,52 @@ pub fn set_pinned_version(profile_dir: &Path, version: Option<&str>) -> Result<(
     }
 }
 
+/// The Roblox build this profile's client was last started on.
+///
+/// A plain file beside [`PIN`], written when the client is spawned. A profile
+/// recorded nothing about the build that last ran it, so moving it to an older
+/// one could not be noticed ([ADR-054](../../../docs/adr/ADR-054-cordial-owns-its-roblox-builds.md)).
+/// Per-profile `data/` is not snapshotted and is not touched by a move between
+/// builds; this only lets the Version page say what is being moved from.
+pub const LAST_BUILD: &str = "last-roblox-version";
+
+/// The build the profile last ran, if one was recorded and still reads as a
+/// version.
+pub fn last_roblox_version(profile_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(profile_dir.join(LAST_BUILD)).ok()?;
+    let trimmed = text.trim().to_string();
+    cordial_update::store::is_valid_version(&trimmed).then_some(trimmed)
+}
+
+/// Record that this profile's client was started on `version`.
+pub fn record_last_roblox_version(profile_dir: &Path, version: &str) -> Result<(), String> {
+    if !cordial_update::store::is_valid_version(version) {
+        return Err(format!("{version:?} is not a Roblox version"));
+    }
+    let path = profile_dir.join(LAST_BUILD);
+    std::fs::write(&path, version).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// What to say when a profile that last ran `last` is about to run `target`,
+/// or `None` when there is nothing to say.
+///
+/// **Only for an older build.** The same build and a newer one are the
+/// ordinary cases and a warning there would be noise. Nothing measured says a
+/// same-flavour downgrade corrupts anything -- ADR-053 measured different
+/// caches and settings keys across phone and Quest builds only -- so this is
+/// worded as what is not known, and says what clears the stored data.
+/// **INFERRED** that an older build may not understand what a newer one saved.
+pub fn downgrade_warning(last: Option<&str>, target: &str) -> Option<String> {
+    let last = last?;
+    (cordial_update::store::compare(target, last) == std::cmp::Ordering::Less).then(|| {
+        format!(
+            "This profile last ran Roblox {last}. An older build may not understand what a newer \
+             one saved. Cordial has not measured what happens; Settings, Roblox, Stored data \
+             clears it."
+        )
+    })
+}
+
 /// Every version any profile has pinned.
 ///
 /// What the store must not prune. Collected across all profiles rather than
@@ -791,6 +888,92 @@ pub fn all_pinned_versions() -> Vec<String> {
     pinned
 }
 
+/// What deleting a profile left undone, for the caller to say.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Removed {
+    /// Set when the desktop keyring could not be reached, so a session token
+    /// kept there for this profile could not be erased. The files are gone.
+    pub keyring_unreached: Option<String>,
+}
+
+/// Why a profile was not deleted.
+#[derive(Debug)]
+pub enum RemoveError {
+    /// No such profile.
+    Missing,
+    /// Open in a running client, or not usable. Deleting a profile a client is
+    /// writing to is the two-writers corruption ADR-012 exists to prevent, and
+    /// the same lock that guards a launch refuses it.
+    Claim(Error),
+    /// The saved sign-in could not be erased, so **nothing was deleted**.
+    Erase(String),
+    /// The sign-in is gone and the directory could not be removed.
+    Delete(String),
+}
+
+impl std::fmt::Display for RemoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoveError::Missing => f.write_str("there is no such profile"),
+            RemoveError::Claim(e) => write!(f, "{e}"),
+            RemoveError::Erase(e) => write!(f, "{e}. Nothing was deleted."),
+            RemoveError::Delete(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Delete a profile: its saved sign-in, settings, FastFlags, plugin grants,
+/// window state and Roblox's own data for it.
+///
+/// **The saved sign-in is erased first, from the keyring as well as the
+/// profile.** Keyring entries are keyed by the profile's directory
+/// (`secrets::attributes`), so deleting the directory alone would leave a live
+/// session token in the keyring with nothing that would ever read or remove it,
+/// and a later profile in the same place would inherit it. If either erase
+/// fails, nothing is deleted.
+///
+/// The profile's lock is taken the way a launch takes it, so a profile open in
+/// a running client is refused rather than pulled out from under it. The
+/// directory is renamed aside before it is removed, so an interrupted deletion
+/// leaves no half-profile under the old name; the leftover has a name `list`
+/// does not offer and the next attempt clears it.
+///
+/// It does not decide which profile is "current": that is a launcher setting,
+/// and the caller has to pick another.
+///
+/// Adapted from DamnShabu/stacked's `remove_profile` (GPL-3.0-or-later).
+pub fn remove(name: &str) -> Result<Removed, RemoveError> {
+    remove_with(name, || match crate::secrets::usable() {
+        Ok(()) => (crate::secrets::Store::Keyring, None),
+        Err(why) => (crate::secrets::Store::File, Some(why)),
+    })
+}
+
+/// [`remove`] with the choice of secret store made by the caller, so the file
+/// branch is testable without a session bus.
+pub fn remove_with(
+    name: &str,
+    pick_store: impl FnOnce() -> (crate::secrets::Store, Option<String>),
+) -> Result<Removed, RemoveError> {
+    if !list().iter().any(|n| n == name) {
+        return Err(RemoveError::Missing);
+    }
+    let claim = acquire(name).map_err(RemoveError::Claim)?;
+    let dir = claim.profile_dir().to_path_buf();
+    let (store, keyring_unreached) = pick_store();
+    for kind in [crate::secrets::Kind::Cookies, crate::secrets::Kind::Identity] {
+        crate::secrets::erase(store, &dir, kind)
+            .map_err(|e| RemoveError::Erase(format!("could not erase the saved {}: {e}", kind.name())))?;
+    }
+    let aside = dir.with_file_name(format!(".{name}.removing"));
+    let _ = std::fs::remove_dir_all(&aside);
+    std::fs::rename(&dir, &aside)
+        .and_then(|()| std::fs::remove_dir_all(&aside))
+        .map_err(|e| RemoveError::Delete(format!("{}: {e}", dir.display())))?;
+    drop(claim);
+    Ok(Removed { keyring_unreached })
+}
+
 /// A size for a sentence.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [(&str, u64); 3] = [("GB", 1_000_000_000), ("MB", 1_000_000), ("kB", 1_000)];
@@ -802,6 +985,26 @@ pub fn human_bytes(bytes: u64) -> String {
     format!("{bytes} bytes")
 }
 
+/// Move a pre-ADR-012 layout into place, once.
+///
+/// Storage used to live at `cordial/instances/default`, which named a window
+/// and contained a login, and `cordial-run` still writes there when nobody
+/// tells it otherwise. The launcher does tell it otherwise — it points
+/// `CORDIAL_FILES_DIR` at the profile — so without this the first launch from
+/// the shell starts against an empty directory and presents as being logged out
+/// for no reason. That is precisely the class of failure ADR-012 says the
+/// migration exists to prevent, so the directory is moved rather than
+/// abandoned.
+///
+/// Runs only when the old path exists and the new one does not, so it cannot
+/// clobber a profile someone has already used.
+///
+/// **Deferred while a client is running.** The legacy layout was never locked
+/// by anything, so a rename can land underneath a live engine that is holding
+/// paths inside it — and on this developer's machine that has meant a client
+/// signed in at the time. There is nothing to ask, so the only available check
+/// is whether such a process exists at all; deferring costs one launch against
+/// an empty profile, and getting it wrong costs a session.
 pub fn migrate_legacy_layout() -> Option<PathBuf> {
     let legacy = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -898,6 +1101,84 @@ mod tests {
         std::fs::create_dir_all(&p).unwrap();
         std::env::set_var("CORDIAL_PROFILE_ROOT", &p);
         (p, guard)
+    }
+
+    fn file_store() -> (crate::secrets::Store, Option<String>) {
+        (crate::secrets::Store::File, None)
+    }
+
+    #[test]
+    fn deleting_a_profile_removes_its_directory_and_its_saved_sign_in() {
+        let (root, _g) = scratch("remove");
+        drop(acquire("gone").unwrap());
+        drop(acquire("kept").unwrap());
+        let dir = dir("gone").unwrap();
+        std::fs::write(dir.join("cookies"), "session").unwrap();
+        std::fs::write(dir.join("identity"), "who").unwrap();
+        std::fs::create_dir_all(dir.join("data/files")).unwrap();
+        std::fs::write(dir.join("data/files/x"), "y").unwrap();
+
+        assert_eq!(remove_with("gone", file_store).unwrap(), Removed::default());
+
+        assert!(!dir.exists(), "the directory must be gone");
+        assert_eq!(list(), vec!["kept".to_string()], "only the named profile goes");
+        assert!(!root.join(".gone.removing").exists(), "no half-deleted directory is left behind");
+    }
+
+    #[test]
+    fn a_profile_that_is_open_is_refused_and_untouched() {
+        let (_root, _g) = scratch("remove-busy");
+        let running = acquire("live").unwrap();
+        std::fs::write(dir("live").unwrap().join("cookies"), "session").unwrap();
+        assert!(matches!(remove_with("live", file_store), Err(RemoveError::Claim(Error::Busy(..)))));
+        assert!(dir("live").unwrap().join("cookies").is_file(), "a refused deletion must delete nothing");
+        drop(running);
+    }
+
+    #[test]
+    fn a_profile_that_does_not_exist_is_missing_and_is_not_created() {
+        let (_root, _g) = scratch("remove-missing");
+        assert!(matches!(remove_with("nothing", file_store), Err(RemoveError::Missing)));
+        assert!(list().is_empty(), "asking to delete must not create it");
+    }
+
+    /// A previous deletion that died between the rename and the removal.
+    #[test]
+    fn an_interrupted_deletion_does_not_block_the_next() {
+        let (root, _g) = scratch("remove-leftover");
+        drop(acquire("again").unwrap());
+        std::fs::create_dir_all(root.join(".again.removing/data")).unwrap();
+        remove_with("again", file_store).unwrap();
+        assert!(!root.join(".again.removing").exists());
+        assert!(!list().contains(&"again".to_string()));
+    }
+
+    /// **Needs a session bus and a Secret Service**, and writes one entry
+    /// keyed by a scratch path into it, which the deletion removes again. Run
+    /// with `--ignored` on a desktop session; it is the branch the file tests
+    /// cannot reach.
+    #[test]
+    #[ignore = "uses the desktop's Secret Service"]
+    fn deleting_a_profile_erases_its_keyring_session() {
+        use crate::secrets::{Kind, Store};
+        if crate::secrets::usable().is_err() {
+            eprintln!("no usable Secret Service here; nothing was tested");
+            return;
+        }
+        let (_root, _g) = scratch("remove-keyring");
+        drop(acquire("signed-in").unwrap());
+        let dir = dir("signed-in").unwrap();
+        crate::secrets::save(Store::Keyring, &dir, Kind::Cookies, "a session token").unwrap();
+        assert_eq!(crate::secrets::load(Store::Keyring, &dir, Kind::Cookies).as_deref(), Some("a session token"));
+
+        remove("signed-in").unwrap();
+
+        // The directory is gone, so read the same key back through the service.
+        assert_eq!(
+            crate::secrets::load(Store::Keyring, &dir, Kind::Cookies),
+            None,
+            "the token must not outlive the profile"
+        );
     }
 
     #[test]
@@ -1367,5 +1648,93 @@ mod tests {
         }
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    fn settings_with(profile: &Path, vr_used: &str) {
+        let app = profile.join("data/files/appData");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("GlobalBasicSettings_13.xml"),
+            format!("<roblox><Item class=\"UserGameSettings\"><Properties><bool name=\"HasEverUsedVR\">{vr_used}</bool></Properties></Item></roblox>"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(profile.join("run/exe")).unwrap();
+    }
+
+    #[test]
+    fn the_phone_build_keeps_the_top_level_and_the_quest_build_its_own() {
+        let p = Path::new("/x/profiles/main");
+        assert_eq!(engine_root(p, Build::Phone), p);
+        assert_eq!(engine_root(p, Build::Quest), p.join("quest"));
+        // The login is keyed by the profile directory, which neither build
+        // changes, so both find the same saved session.
+        assert_eq!(engine_data_dir(&engine_root(p, Build::Phone)), p.join("data"));
+    }
+
+    #[test]
+    fn a_phone_profile_is_never_moved() {
+        let (root, _g) = scratch("quest-migrate-phone");
+        let profile = root.join("phone");
+        settings_with(&profile, "false");
+        assert!(!migrate_quest_storage(&profile).unwrap());
+        assert!(profile.join("data/files/appData/GlobalBasicSettings_13.xml").is_file());
+        assert!(profile.join("run/exe").is_dir());
+        assert!(!profile.join(QUEST_STORAGE).exists(), "a phone profile gained a quest/ directory");
+
+        // Nor one with no settings at all: no evidence, no move.
+        let bare = root.join("bare");
+        std::fs::create_dir_all(bare.join("data/files")).unwrap();
+        assert!(!migrate_quest_storage(&bare).unwrap());
+        assert!(bare.join("data/files").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quest_storage_from_before_the_split_moves_once_and_never_clobbers() {
+        let (root, _g) = scratch("quest-migrate-quest");
+        let profile = root.join("vr");
+        settings_with(&profile, "true");
+        std::fs::write(profile.join("flags.json"), "{}").unwrap();
+        assert!(migrate_quest_storage(&profile).unwrap());
+        let quest = engine_root(&profile, Build::Quest);
+        assert!(quest.join("data/files/appData/GlobalBasicSettings_13.xml").is_file());
+        assert!(quest.join("run/exe").is_dir());
+        assert!(!profile.join("data").exists() && !profile.join("run").exists());
+        assert!(profile.join("flags.json").is_file(), "account state stays at the profile level");
+
+        // Idempotent: a second call does nothing, and a phone build's fresh
+        // data/ written since is not taken for Quest storage.
+        settings_with(&profile, "true");
+        assert!(!migrate_quest_storage(&profile).unwrap());
+        assert!(profile.join("data").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    /// The warning is for an older build only: the same one and a newer one
+    /// are ordinary, and a profile that has recorded nothing has nothing to
+    /// warn about.
+    #[test]
+    fn a_downgrade_warns_and_nothing_else_does() {
+        let warned = downgrade_warning(Some("2.738.0.1397"), "2.736.0.1408").expect("older warns");
+        assert!(warned.contains("last ran Roblox 2.738.0.1397"), "{warned}");
+        assert!(warned.contains("Stored data"), "{warned}");
+        assert!(warned.contains("has not measured"), "it must not claim a harm nobody measured: {warned}");
+        assert_eq!(downgrade_warning(Some("2.738.0.1397"), "2.738.0.1397"), None, "the same build");
+        assert_eq!(downgrade_warning(Some("2.736.0.1408"), "2.738.0.1397"), None, "a newer build");
+        assert_eq!(downgrade_warning(None, "2.700.0.1"), None, "nothing recorded");
+        // Numeric, not textual: 2.99 is older than 2.738.
+        assert!(downgrade_warning(Some("2.738.0.1"), "2.99.0.1").is_some());
+    }
+
+    #[test]
+    fn the_last_build_round_trips_and_a_hand_edited_value_is_ignored() {
+        let (dir, _guard) = scratch("last-build");
+        assert_eq!(last_roblox_version(&dir), None);
+        record_last_roblox_version(&dir, "2.738.0.1397").unwrap();
+        assert_eq!(last_roblox_version(&dir).as_deref(), Some("2.738.0.1397"));
+        assert!(record_last_roblox_version(&dir, "../etc").is_err());
+        std::fs::write(dir.join(LAST_BUILD), "../../etc/passwd").unwrap();
+        assert_eq!(last_roblox_version(&dir), None);
     }
 }

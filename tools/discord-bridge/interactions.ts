@@ -17,8 +17,23 @@
  * first: a modal submit cannot itself open a modal, but the message it leaves
  * behind can carry a button that does.
  */
-import { Discord, EPHEMERAL, InteractionType, modalValues, ResponseType } from "./discord.ts";
-import { ACTION_ROW, BUTTON, type IssueForm, modalFor } from "./issue_forms.ts";
+import {
+  Discord,
+  EPHEMERAL,
+  InteractionType,
+  modalSelections,
+  modalValues,
+  ResponseType,
+} from "./discord.ts";
+import {
+  ACTION_ROW,
+  BUTTON,
+  droppedFor,
+  type IssueForm,
+  LABEL_SELECT_ID,
+  labelPickerComponent,
+  modalFor,
+} from "./issue_forms.ts";
 import { container, separator, text } from "./components.ts";
 import { GitHub } from "./github.ts";
 import {
@@ -28,6 +43,9 @@ import {
   reporterFromBody,
   type Submission,
 } from "./issue_body.ts";
+import { type Label, offerLabels, resolveSelection, type Who } from "./labels.ts";
+import { isModerator, type Member } from "./permissions.ts";
+import { openEditor, submitEdit } from "./edit_flow.ts";
 
 export interface Context {
   forms: () => Promise<IssueForm[]>;
@@ -35,15 +53,33 @@ export interface Context {
   discord: Discord;
   threadChannelId: string;
   repoUrl: string;
+  /**
+   * The repository's labels, cached. Absent means the label picker is simply
+   * not offered, which is also what a failed fetch looks like -- a report never
+   * waits on a classification.
+   */
+  labels?: { get(timeoutMs?: number): Promise<Label[] | null> };
+  /**
+   * `DISCORD_LABEL_PICKER=1`. **Off unless set**, because whether Discord accepts
+   * a string select inside a modal is unverified, and if it does not, *every*
+   * report dialog fails with "interaction failed" and nobody can file anything.
+   * Off, the dialogs are text-only and exactly what they were before labels.
+   */
+  labelPicker?: boolean;
+  /** What a reporter may pick; patterns, `*` the only wildcard. See `labels.ts`. */
+  reporterLabels?: string[];
+  /** Roles that count as moderators in addition to Discord's own permissions. */
+  moderatorRoleIds?: string[];
 }
 
 interface ResolvedMessage {
   content?: string;
+  attachments?: { filename?: string; url?: string; size?: number }[];
   author?: { username?: string; global_name?: string; bot?: boolean };
   id?: string;
 }
 
-interface Interaction {
+export interface Interaction {
   type: number;
   token: string;
   channel_id?: string;
@@ -55,10 +91,8 @@ interface Interaction {
     target_id?: string;
     resolved?: { messages?: Record<string, ResolvedMessage> };
   };
-  member?: {
+  member?: Member & {
     user?: { id: string; username: string; global_name?: string };
-    /** A decimal bitfield string, as Discord sends it. */
-    permissions?: string;
   };
   user?: { id: string; username: string; global_name?: string };
 }
@@ -69,6 +103,15 @@ function reporter(interaction: Interaction): Submission["reporter"] {
     id: user?.id ?? "unknown",
     tag: user?.global_name ?? user?.username ?? "someone",
   };
+}
+
+/** Who is pressing, with what Discord says about their standing in this channel. */
+function editorOf(interaction: Interaction) {
+  return { ...reporter(interaction), member: interaction.member };
+}
+
+function whoIs(context: Context, interaction: Interaction): Who {
+  return isModerator(interaction.member, context.moderatorRoleIds) ? "moderator" : "reporter";
 }
 
 const deferred = () => ({
@@ -94,6 +137,7 @@ function reporting(
   context: Context,
   token: string,
   work: () => Promise<void>,
+  outcome = "nothing was filed",
 ): () => Promise<void> {
   return async () => {
     try {
@@ -103,7 +147,7 @@ function reporting(
       console.error(`follow-up: ${why}`);
       try {
         await context.discord.editOriginal(token, {
-          content: "That did not work, and nothing was filed. You can try again — " +
+          content: `That did not work, and ${outcome}. You can try again — ` +
             "and if it keeps happening, this is worth reporting on GitHub directly:\n" +
             `\`\`\`\n${why.slice(0, 600)}\n\`\`\``,
           components: [],
@@ -161,24 +205,41 @@ export async function handle(
     if (verb === "cordial-issue-open") {
       const form = find(rest[0]);
       if (!form) return { response: ephemeral(unknownForm(rest[0])) };
-      return { response: { type: ResponseType.MODAL, data: modalFor(form, "main") } };
+      const picker = await labelPicker(context, form, interaction);
+      return { response: { type: ResponseType.MODAL, data: modalFor(form, "main", picker) } };
     }
     if (verb === "cordial-issue-extra") {
       const form = find(rest[0]);
-      if (!form || !form.dropped.length) {
+      // `:l` says the main dialog gave a slot to the label picker, which moved
+      // one more optional field into this follow-up.
+      const withPicker = rest[2] === "l";
+      if (!form || !droppedFor(form, withPicker).length) {
         return { response: ephemeral("There is nothing more to add for this form.") };
       }
-      const modal = modalFor(form, "extra") as Record<string, unknown>;
+      const modal = modalFor(form, "extra", withPicker ? true : undefined) as Record<
+        string,
+        unknown
+      >;
       // The issue number rides in the custom_id, because the submit that
       // follows arrives as a fresh interaction with no memory of this one and
       // there is deliberately nowhere to keep it.
       modal.custom_id = `cordial-issue:${form.slug}:extra:${rest[1]}`;
       return { response: { type: ResponseType.MODAL, data: modal } };
     }
+    if (verb === "cordial-edit-open") {
+      return {
+        response: await openEditor(
+          context,
+          editorOf(interaction),
+          Number(rest[0]),
+          rest[1] === undefined ? 0 : Number(rest[1]),
+        ),
+      };
+    }
     if (verb === "cordial-close" || verb === "cordial-reopen" || verb === "cordial-fixed") {
       const open = verb === "cordial-reopen";
       const completed = verb === "cordial-fixed";
-      if (completed && !canSayItIsFixed(interaction)) {
+      if (completed && !isModerator(interaction.member, context.moderatorRoleIds)) {
         return {
           response: ephemeral(
             "Only someone who helps run this server can mark an issue completed — " +
@@ -242,7 +303,44 @@ export async function handle(
         after: reporting(
           context,
           interaction.token,
-          () => fileIssue(context, interaction, form, { values, reporter: who }),
+          () =>
+            fileIssue(
+              context,
+              interaction,
+              form,
+              { values, reporter: who },
+              {
+                // The `:l` on the dialog's id is the only evidence the picker
+                // was in it; see `modalFor`.
+                withPicker: rest[2] === "l",
+                picks: modalSelections(interaction.data)[LABEL_SELECT_ID] ?? [],
+                who: whoIs(context, interaction),
+              },
+            ),
+        ),
+      };
+    }
+
+    if (verb === "cordial-edit") {
+      return {
+        response: deferred(),
+        after: reporting(
+          context,
+          interaction.token,
+          () =>
+            submitEdit(
+              context,
+              interaction,
+              editorOf(interaction),
+              {
+                number: Number(rest[0]),
+                part: Number(rest[1]),
+                hash: rest[2] ?? "",
+                withLabels: rest[3] === "l",
+              },
+              { values, selections: modalSelections(interaction.data) },
+            ),
+          "nothing was changed",
         ),
       };
     }
@@ -253,7 +351,10 @@ export async function handle(
       if (!form || !Number.isInteger(number)) {
         return { response: ephemeral("That form is no longer available.") };
       }
-      const extra = form.dropped
+      // Any field of the form the dialog filled in. The dialog only ever held
+      // the fields that did not fit the main one, so naming them again here --
+      // and getting it wrong when the label picker has moved one -- buys nothing.
+      const extra = form.fields
         .filter((b) => b.id && values[b.id]?.trim())
         .map((b) => fieldSection(b, values[b.id!]))
         .join("\n\n");
@@ -290,31 +391,6 @@ export async function handle(
   return { response: ephemeral("That control is not one this bot knows about.") };
 }
 
-/**
- * Discord permission bits that mean "this person helps run the place".
- *
- * Used only to gate **Mark as completed**, which is a claim about the project
- * rather than about the reporter's own intent -- "this is fixed" is not
- * something the person who reported it gets to assert on everyone's behalf,
- * and a tracker where it is stops being able to answer what was actually
- * fixed.
- */
-const MANAGE_MESSAGES = 1n << 13n;
-const MANAGE_THREADS = 1n << 34n;
-const ADMINISTRATOR = 1n << 3n;
-
-function canSayItIsFixed(interaction: Interaction): boolean {
-  const bits = interaction.member?.permissions;
-  if (!bits) return false;
-  let held: bigint;
-  try {
-    held = BigInt(bits);
-  } catch {
-    return false;
-  }
-  return (held & (MANAGE_MESSAGES | MANAGE_THREADS | ADMINISTRATOR)) !== 0n;
-}
-
 /** The controls that sit on an issue thread's first message. */
 function threadControls(number: number): unknown[] {
   return [{
@@ -329,8 +405,44 @@ function threadControls(number: number): unknown[] {
       { type: BUTTON, style: 3, label: "Mark as completed", custom_id: `cordial-fixed:${number}` },
       { type: BUTTON, style: 4, label: "Close it", custom_id: `cordial-close:${number}` },
       { type: BUTTON, style: 2, label: "Reopen it", custom_id: `cordial-reopen:${number}` },
+      { type: BUTTON, style: 2, label: "Edit", custom_id: `cordial-edit-open:${number}` },
     ],
   }];
+}
+
+/**
+ * The label menu for a form's dialog, or nothing.
+ *
+ * Nothing when there is no label source, when it cannot answer within the time
+ * a dialog can wait, or when there is nothing this person may pick -- in every
+ * one of which the form is simply the form it always was. The menu is
+ * decoration on a report, never a precondition for one.
+ */
+async function labelPicker(
+  context: Context,
+  form: IssueForm,
+  interaction: Interaction,
+): Promise<unknown | undefined> {
+  if (!context.labelPicker || !context.labels) return undefined;
+  const known = await context.labels.get(1200).catch(() => null);
+  if (!known) return undefined;
+  const who = whoIs(context, interaction);
+  const { offered, omitted } = offerLabels({
+    known,
+    who,
+    allow: context.reporterLabels ?? [],
+    formSlug: form.slug,
+    // The template applies these itself; offering them would only invite
+    // somebody to deselect the one label every bug report is meant to carry.
+    exclude: form.labels,
+  });
+  if (!offered.length) return undefined;
+  const note = who === "moderator"
+    ? "Optional. Any label."
+    : "Optional. Where it happens; maintainers set the rest.";
+  return labelPickerComponent(offered, {
+    description: omitted ? `${note} ${omitted} more not shown.` : note,
+  });
 }
 
 function unknownForm(slug: string): string {
@@ -353,12 +465,47 @@ async function fileIssue(
   interaction: { token: string },
   form: IssueForm,
   submission: Submission,
+  chosen: { withPicker: boolean; picks: string[]; who: Who } = {
+    withPicker: false,
+    picks: [],
+    who: "reporter",
+  },
 ): Promise<void> {
   const title = renderIssueTitle(form, submission);
+
+  // The template's own labels always apply. What the reporter picked is checked
+  // here against what they may pick, because the dialog's values are the
+  // client's word and the menu was built from a list that may have moved since.
+  // **A label problem never stops the report**: it files with what is allowed
+  // and says what it left off.
+  let labels = [...form.labels];
+  let labelNote = "";
+  // A dialog opened while the picker was on can still be submitted after it is
+  // turned off; its picks are ignored rather than applied behind the flag.
+  if (chosen.picks.length && context.labelPicker) {
+    const known = context.labels ? await context.labels.get(2000).catch(() => null) : null;
+    if (!known) {
+      labelNote = "\n\nThe label list could not be read, so no labels were added. A maintainer " +
+        "can add them.";
+    } else {
+      const { applied, rejected } = resolveSelection(
+        chosen.picks,
+        known,
+        chosen.who,
+        context.reporterLabels ?? [],
+      );
+      labels = [...new Set([...labels, ...applied])];
+      if (rejected.length) {
+        labelNote = `\n\nLeft off, because they cannot be chosen here: ${rejected.join(", ")}.`;
+      }
+      if (applied.length) labelNote = `\n\nLabels: ${applied.join(", ")}.` + labelNote;
+    }
+  }
+
   const issue = await context.github.createIssue(
     title,
     renderIssueBody(form, submission, null),
-    form.labels,
+    labels,
   );
 
   let threadId: string | null = null;
@@ -389,14 +536,17 @@ async function fileIssue(
     console.error(`thread for #${issue.number}: ${error}`);
   }
 
-  const more = form.dropped.length
+  const leftover = droppedFor(form, chosen.withPicker);
+  const more = leftover.length
     ? [{
       type: ACTION_ROW,
       components: [{
         type: BUTTON,
         style: 2,
         label: "Add the rest",
-        custom_id: `cordial-issue-extra:${form.slug}:${issue.number}`,
+        custom_id: `cordial-issue-extra:${form.slug}:${issue.number}${
+          chosen.withPicker ? ":l" : ""
+        }`,
       }],
     }]
     : [];
@@ -404,12 +554,40 @@ async function fileIssue(
   await context.discord.editOriginal(interaction.token, {
     content: `Filed as [#${issue.number}](${issue.html_url})` +
       (threadId ? ` — follow it in <#${threadId}>.` : ", but the thread could not be opened.") +
-      (form.dropped.length
-        ? `\n\nThis form has ${form.dropped.length} more optional field(s) that did not ` +
+      (leftover.length
+        ? `\n\nThis form has ${leftover.length} more optional field(s) that did not ` +
           `fit in one dialog. They help, and you can skip them.`
-        : ""),
+        : "") +
+      labelNote,
     components: more,
   });
+}
+
+/**
+ * Links to a message's attachments, as a Markdown list, or "" if it has none.
+ *
+ * **Links, not copies, and the difference is the limit of what the bridge can
+ * do.** GitHub's REST API has no way to attach a file to an issue -- the
+ * drag-and-drop on the web form uses an endpoint that needs a browser session --
+ * so a log archive cannot be uploaded to the issue from here. A Discord link
+ * works for a maintainer who reads it soon and is signed in to the server;
+ * Discord signs these URLs and they stop working after a while, which the
+ * comment says so nobody is surprised by it. The reporter can always attach the
+ * file themselves from GitHub if they make an account.
+ */
+export function attachmentLines(
+  attachments: { filename?: string; url?: string; size?: number }[] | undefined,
+): string {
+  const lines = (attachments ?? [])
+    .filter((a) => a.url && /^https:\/\//.test(a.url))
+    .map((a) => {
+      const name = (a.filename ?? "attachment").replace(/[\[\]()`]/g, "_");
+      const size = a.size ? ` (${Math.ceil(a.size / 1024)} KiB)` : "";
+      return `- [${name}](${a.url})${size}`;
+    });
+  if (!lines.length) return "";
+  return `Attached in Discord:\n\n${lines.join("\n")}\n\n` +
+    `_Discord links expire after a while; if one has stopped working, ask the reporter to send the file again._`;
 }
 
 /**
@@ -445,11 +623,11 @@ async function addMessageToIssue(context: Context, interaction: Interaction): Pr
   const target = interaction.data?.target_id;
   const message = target ? interaction.data?.resolved?.messages?.[target] : undefined;
   const text = (message?.content ?? "").trim();
-  if (!text) {
+  const files = attachmentLines(message?.attachments);
+  if (!text && !files) {
     return await say(
       `Nothing to add: that message has no text the bot can read. If it was an ` +
-        `attachment or an embed, quote the part that matters in a reply and add ` +
-        `that instead.`,
+        `embed, quote the part that matters in a reply and add that instead.`,
     );
   }
 
@@ -459,7 +637,7 @@ async function addMessageToIssue(context: Context, interaction: Interaction): Pr
     : "";
   await context.github.comment(
     number,
-    `**${author}** in Discord:\n\n${text}${link}`,
+    `**${author}** in Discord:\n\n${[text, files].filter(Boolean).join("\n\n")}${link}`,
   );
   await say(`Added to [#${number}](${context.repoUrl}/issues/${number}).`);
 }

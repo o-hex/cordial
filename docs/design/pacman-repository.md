@@ -10,8 +10,7 @@ third option neither of those has an equivalent of.
    installed with a plain `pacman -S cordial`, the same shape
    [`packaging/cordial.flatpakrepo`](../../packaging/cordial.flatpakrepo)
    gives `flatpak remote-add`. This is what §1 below covers, and it is
-   built -- but, as of this writing, not yet signed or published; see
-   "Current status" below.
+   built, signed and published; see "Current status" below.
 2. **The AUR.** Arch's own community package repository, where
    `packaging/aur/cordial/PKGBUILD` already lives and already builds --
    `release.yml`'s `arch` job runs `makepkg` against it on every push, and
@@ -38,15 +37,14 @@ scratch.
 
 ## Current status
 
-**Nobody has generated `ARCH_GPG_PRIVATE_KEY` yet, and this repository's CI
-has no such secret as of this writing.** `.github/workflows/pacman.yml`
-builds nothing until that changes, for the same reason `yum.yml` and
-`apt.yml` do not: its "Import the signing key" step exits cleanly on a
-missing secret and every step after it is skipped, so the workflow reports
-success while producing no `cordial-pacman-repo` artifact for `flatpak.yml`
-to find. `packaging/pacman/build-repo.sh` refuses outright to build an
-unsigned repository at all, for the reason given below. Until the secret
-exists, `https://luohoa97.github.io/cordial/arch/` 404s.
+**Published and signed.** On 2026-09-30 `arch/x86_64/cordial.db` was served
+with a detached `cordial.db.sig` that verified as a good signature against
+`arch/cordial-archive-keyring.asc`. No package file was fetched and `pacman -Sy`
+was not run. The `-debug` package is deliberately not in the repository: at
+over 100 MB it exceeds Pages' per-file limit
+([`pacman.yml`](../../.github/workflows/pacman.yml)). The paragraphs further down
+that speak of a missing secret or a 404 on `/arch/` describe the state before
+the key was added.
 
 ## §1. Cordial's own repository
 
@@ -207,9 +205,7 @@ importing alone is not enough for pacman to accept signatures from it.
 
 ### The key
 
-**No key exists yet.** Once `ARCH_GPG_KEY_ID` is set, this section is where
-its fingerprint goes, so `pacman-key --lsign-key` above has something to
-check against out of band from this file.
+**The key exists.** Its fingerprint is in [`docs/install.md`](../install.md); it was read from the published file on 2026-09-30 and has not been confirmed by whoever holds the key.
 
 ### Key rotation
 
@@ -229,3 +225,9 @@ repos (Arch Linux's own trusted-user review). What it fixes is the gap that
 exists without it: anyone who can write to the GitHub Pages site can serve a
 different package under the same name with no warning to an installed
 client, the same gap named for each of the other two channels.
+
+## Notes moved from docs/install.md (2026-10-02)
+
+The release-page `.pkg.tar.zst` is built by the same `makepkg` run an AUR user's own machine would do, and its cosign signature is keyless, so there is no key to add to a keyring and none to trust. On 2026-09-30 `cordial.db.sig` verified as a good signature against the published keyring; `pacman -Sy` was not run, and neither was the `pacman.conf` stanza. The `SigLevel = DatabaseRequired PackageNever` line comes from the section above, which says itself that it was reasoned from `pacman.conf(5)` rather than tried.
+
+The `cordial`, `cordial-bin` and `cordial-git` AUR packages belong to an account that is not the maintainer's (`taxin-404`). On 2026-09-30 they were copies of `packaging/aur/` from 0.17.0, fetching only from this repository, and `cordial-bin`'s checksum matched the official 0.17.0 release file.

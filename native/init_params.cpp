@@ -34,6 +34,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <map>
 #include <mutex>
@@ -42,6 +43,9 @@
 // Defined in android_classes.cpp. Both game-loaded callbacks feed one counter
 // so the join watchdog does not have to know which of them a given build calls.
 extern "C" void cordial_note_game_loaded(long long place_id);
+extern "C" void cordial_note_experience_start(void);
+extern "C" void cordial_note_home_ready(void);
+extern "C" void cordial_note_flags_failed(void);
 
 namespace cordial {
 class Surface;
@@ -212,7 +216,12 @@ std::shared_ptr<Insets> cordial_make_zero_insets(ENV* env);
 /// `CORDIAL_DEVICE_PROFILE=tablett` produced a client reporting one identity
 /// in its log while sending the other to the engine, silently. Both sides now
 /// fall back to `pc-windows-11` and both say so.
-enum class DeviceIdentity { RobloxApp, AndroidTablet, PcWindows11 };
+/// `MetaQuest` is the Quest build behind an OpenXR session (`cordial-run
+/// --guest-arm64` chooses it unless `CORDIAL_DEVICE_PROFILE` says otherwise).
+/// Under the PC identity the Quest engine was told it ran on Windows with a
+/// keyboard and mouse beside `isVrDevice`, and a game asking whether VR was
+/// on (`UserInputService.VREnabled`) got false while the headset rendered.
+enum class DeviceIdentity { RobloxApp, AndroidTablet, PcWindows11, MetaQuest };
 
 static DeviceIdentity device_identity() {
     static const DeviceIdentity v = [] {
@@ -232,13 +241,16 @@ static DeviceIdentity device_identity() {
         if (s == "pc" || s == "pc-windows-11" || s == "windows" || s == "windows-11") {
             return DeviceIdentity::PcWindows11;
         }
+        if (s == "meta-quest" || s == "quest" || s == "metaos") {
+            return DeviceIdentity::MetaQuest;
+        }
         // Reported rather than guessed at, and reported here rather than only
         // in `flags.rs`: this translation unit is the one that actually
         // reaches the engine, so a value it did not understand has to be
         // visible from a run of the client alone.
         fprintf(stderr,
                 "[cordial] CORDIAL_DEVICE_PROFILE=\"%s\" is not a device profile; using "
-                "pc-windows-11. Known: roblox-app, android-tablet, pc-windows-11\n",
+                "pc-windows-11. Known: roblox-app, android-tablet, pc-windows-11, meta-quest\n",
                 e);
         return DeviceIdentity::PcWindows11;
     }();
@@ -249,6 +261,7 @@ static const char* device_identity_label() {
     switch (device_identity()) {
         case DeviceIdentity::AndroidTablet: return "android-tablet";
         case DeviceIdentity::PcWindows11:   return "pc-windows-11";
+        case DeviceIdentity::MetaQuest:     return "meta-quest";
         case DeviceIdentity::RobloxApp:     break;
     }
     return "roblox-app";
@@ -266,6 +279,9 @@ const char* device_platform_name() {
     switch (device_identity()) {
         case DeviceIdentity::PcWindows11:   return "Windows";
         case DeviceIdentity::AndroidTablet: return "Android";
+        // One of the engine's own platform names, and the one Roblox's Quest
+        // app runs as.
+        case DeviceIdentity::MetaQuest:     return "MetaOS";
         case DeviceIdentity::RobloxApp:     break;
     }
     return "Android";
@@ -311,6 +327,12 @@ const DeviceProfile& device_profile() {
             case DeviceIdentity::AndroidTablet:
                 return DeviceProfile{"Cordial", "Cordial", "Cordial", "cordial",
                                      "cordial", "cordial", "user", "13", "33"};
+            case DeviceIdentity::MetaQuest:
+                // Cordial's own name, not a headset model: the platform name
+                // says what kind of device this is, and nothing here can say
+                // which headset is on the other end of the runtime.
+                return DeviceProfile{"Cordial", "Cordial", "Cordial VR", "cordial_vr",
+                                     "cordial_vr", "cordial", "user", "13", "33"};
             case DeviceIdentity::RobloxApp:
                 // Bare app token: no form-factor claim beyond Cordial's own
                 // name, matching the User-Agent arm that drops the device block.
@@ -322,6 +344,11 @@ const DeviceProfile& device_profile() {
     }();
     return v;
 }
+
+/// The base URL `InitParams` hands the engine. A constant of its own so the
+/// value can be read back out (`cordial_base_url`) and pinned by a test against
+/// the capture, rather than by a grep of this file.
+static constexpr const char kBaseUrl[] = "https://www.roblox.com/";
 
 /// The `User-Agent` the engine puts on every HTTP request it makes.
 ///
@@ -434,6 +461,10 @@ static std::string build_user_agent() {
                      "Hybrid()  GooglePlayStore RobloxApp/%s (GlobalDist; GooglePlayStore)",
                      ram_mb, g_width, g_height, g_width, g_height, app.c_str(), app.c_str());
             break;
+        // The Quest identity sends the bare app token too. What the real
+        // Quest app puts in its User-Agent has not been captured here, and a
+        // guessed device clause would be a claim nothing supports.
+        case DeviceIdentity::MetaQuest:
         case DeviceIdentity::RobloxApp:
             // No space before the parenthesis, matching the clause Sober's
             // own `WebViewUserAgent` carries verbatim. The real Android
@@ -490,6 +521,19 @@ extern "C" size_t cordial_build_user_agent(char* buf, size_t n) {
         buf[copy] = '\0';
     }
     return ua.size();
+}
+
+/// The base URL `InitParams.baseURL` is built with, for the test that holds it
+/// to the real client's. Same `snprintf`-style contract as
+/// `cordial_build_user_agent`: the full length is returned whether or not it fit.
+extern "C" size_t cordial_base_url(char* buf, size_t n) {
+    size_t len = std::strlen(cordial::kBaseUrl);
+    if (buf && n > 0) {
+        size_t copy = len < n - 1 ? len : n - 1;
+        std::memcpy(buf, cordial::kBaseUrl, copy);
+        buf[copy] = '\0';
+    }
+    return len;
 }
 
 namespace cordial {
@@ -716,37 +760,34 @@ public:
 
 /// `com.roblox.platform.util.DeviceUtils`
 ///
-/// **The engine asks for this and no dex in the APK declares it.** Every run
-/// logs `getViewportDisplaySize: Failed to find class 'DeviceUtils'` twice,
-/// healthy or not -- confirmed on a 2.737.0.1584 run that reached the Landing
-/// page at 60 fps, which is also what rules it out as the cause of the crashes
-/// in #34 and #35 that were attributed to it.
+/// **This is not an Android expectation Cordial fails to answer: no dex in the
+/// shipping APK declares the class.** Checked 2026-10-15 against all three dex
+/// files of 2.742.0.1059 -- neither `DeviceUtils` nor
+/// `getScreenPhysicalSizeInMillimeters` occurs in any of them. So the engine's
+/// `getViewportDisplaySize: Failed to find class 'DeviceUtils'`, logged three
+/// times on every run, healthy or not, is what a real device would log as well
+/// (INFERRED: there is nothing for it to find, and the trace has no FLog
+/// lines to compare). It is also what rules it out as the cause of the crashes
+/// in #34 and #35, which were attributed to it.
 ///
-/// So this is the `broken_feature` shape rather than a crash: an Android
-/// expectation nobody answers, leaving the engine without the display's
-/// physical size. The contract is read from the strings in `libroblox.so`,
-/// which carry the whole call in sequence -- find the class, find the static
-/// method, get the `Point` class, get the `x` and `y` field ids, then
-/// `(in millimeters): x = {}, y = {}`.
+/// **And the engine never asks jnivm for it.** A gdb session on 2.742.0.1059
+/// that logged every call to both `FindClass` instantiations and every
+/// `GetMethodID` showed about 35 distinct class names, none of them this one,
+/// and no lookup of `getScreenPhysicalSizeInMillimeters`, though the error was
+/// logged three times in the same run. That fits registering the class never
+/// changing the log; how the failing lookup is made is not known (INFERRED
+/// that it does not go through `FindClass` at all). The earlier note here that
+/// jnivm "holds the class and the engine's FindClass does not reach it" had
+/// the right observation and a wrong picture of where the lookup is.
 ///
-/// **Registered, and the engine still does not find it. Measured, not
-/// assumed.** A probe in `Register` prints; a probe in the getter never does;
-/// the engine goes on logging `Failed to find class 'DeviceUtils'` on a run
-/// that reaches the Landing page at 60 fps. So jnivm holds the class under
-/// exactly the name the engine's own strings carry -- there is no other
-/// spelling of it in the binary, bare or qualified -- and the engine's
-/// `FindClass` does not reach it.
+/// The engine's string for the method is `(Landroid/content/Context;)
+/// Landroid/graphics/Point;`, so the hook below, which takes no argument, would
+/// not match it even if the lookup were ever reached.
 ///
-/// That is where this stops, and the remaining question is about jnivm's
-/// lookup rather than about the contract: other Cordial classes are found, so
-/// something distinguishes this path. `--dump-classes` would name what the
-/// engine asked for and did not produce a file on the run that tried it.
-///
-/// Kept rather than reverted because the contract below is read off the
-/// engine's own strings and is right whatever the lookup turns out to need,
-/// and because returning null costs nothing while it is unreachable. What must
-/// not happen is somebody reading this as working: **the getter has never been
-/// observed to run.**
+/// Kept, because the contract is read off the engine's own strings and costs
+/// nothing while unreachable. What must not happen is somebody reading it as
+/// working or as a gap: **the getter has never been observed to run, and
+/// nothing in the APK would run it either.**
 ///
 /// **Null when the size is unknown, never a guess.** The engine has a distinct
 /// handler for `returned null`, so admitting ignorance is a state it already
@@ -1235,6 +1276,7 @@ public:
 class NativeHelper : public Object {
 public:
     static void onFlagsFailed(ENV*, Object*) {
+        cordial_note_flags_failed();
         fprintf(stderr,
             "[roblox] flags: engine reported onFlagsFailed (the flag data did "
             "load, and this blocks neither startup nor the content store — "
@@ -1258,6 +1300,7 @@ public:
     }
     static void onAppReady(ENV*, Object*, std::shared_ptr<String> s) {
         fprintf(stderr, "[roblox] app ready: %s\n", s ? s->c_str() : "");
+        if (s && std::string(s->c_str()) == "Home") cordial_note_home_ready();
     }
 
     // The experience lifecycle, which the engine has been announcing to nobody.
@@ -1284,6 +1327,7 @@ public:
     // announcement is to have received it.
     static void onExperienceStart(ENV*, Object*) {
         fprintf(stderr, "[roblox] experience start\n");
+        cordial_note_experience_start();
     }
     static void onGameLoaded(ENV*, Object*, jlong place_id) {
         fprintf(stderr, "[roblox] game loaded: place %lld\n",
@@ -1667,6 +1711,13 @@ public:
         // for these two when input misbehaves; they cannot be the cause.
         p->isKeyboardDevice = true;
         p->isMouseDevice = true;
+        // The headset is the input device under the Quest identity: its
+        // controllers, through OpenXR. Never read either way (above), so this
+        // keeps the identity's fields agreeing rather than changing input.
+        if (device_identity() == DeviceIdentity::MetaQuest) {
+            p->isKeyboardDevice = false;
+            p->isMouseDevice = false;
+        }
         // Was a hardcoded `false`, which was true of every machine this has
         // been developed on and false of the ones the client is for. It now
         // reports what the display backend found on the seat, with
@@ -1768,7 +1819,12 @@ public:
 
     static std::shared_ptr<InitParams> Create(ENV* env, const char* assets, int width, int height) {
         auto p = std::make_shared<InitParams>();
-        p->baseURL = S("https://www.roblox.com");
+        // Android passes no base URL (`setBaseUrl() null`) and its engine settles
+        // on `https://www.roblox.com/`, with the slash, as the capture in
+        // docs/traces/waydroid-roblox-startup.log.gz shows. Handed the bare form,
+        // this client's engine logged it without the slash (#2); with the slash
+        // the `The base url is` line matches the capture.
+        p->baseURL = S(kBaseUrl);
         p->buildVariant = S("release");
         // See `build_user_agent`. The literal that used to be here was
         // invented, and the comment beside it claimed the opposite.
@@ -1814,7 +1870,16 @@ public:
         // `pc-windows-11`. Anyone chasing mobile-tier defaults wants
         // `android-tablet`, and wants to measure it rather than assume it.
         p->isTablet = device_identity() == DeviceIdentity::AndroidTablet;
-        p->isVrDevice = false;
+        // True for the Quest build, which only ever runs here behind an
+        // OpenXR session (`cordial-run --guest-arm64` sets CORDIAL_VR_DEVICE).
+        // It is what picks the app shell's place: false loads
+        // `places/Mobile.rbxl`, whose sky is six faces of a 16x16 white
+        // image, so the VR menu floated in a white void; true loads
+        // `places/Maquettes.rbxl`, the Quest's own environment. Measured on
+        // Monado 2026-09-30, with and without `initMaquettesSDK`, which does
+        // not affect the choice. `CORDIAL_VR_DEVICE=0` is the control.
+        const char* vr = getenv("CORDIAL_VR_DEVICE");
+        p->isVrDevice = vr && strcmp(vr, "0") != 0;
         p->vrContext = AndroidActivity::Create(env);
         to_jni(env, p);
         return p;
@@ -1918,6 +1983,138 @@ public:
     }
 };
 
+/// What `cordial_appbridge_start_game` is handed: the fields of one
+/// `Game.launch` payload, already parsed on the Rust side
+/// (`crates/cordial-runtime/src/game_launch.rs`). Strings are never null; a
+/// key the payload did not carry arrives as "".
+struct StartGameFields {
+    const char* accessCode;
+    const char* callId;
+    const char* eventId;
+    const char* gameId;
+    const char* gameIdToExclude;
+    const char* gameJoinContext;
+    const char* isoContext;
+    const char* joinAttemptId;
+    const char* joinAttemptOrigin;
+    const char* launchData;
+    const char* linkCode;
+    const char* referralPage;
+    const char* reservedServerAccessCode;
+    int64_t placeId;
+    int64_t conversationId;
+    int64_t referredByPlayerId;
+    int32_t joinRequestType;
+};
+
+/// `com.roblox.engine.jni.autovalue.StartGameParams`
+///
+/// The Game half's counterpart of `StartAppParams`, for
+/// `nativeAppBridgeV2StartGameWithParam`. On Android, `ActivityNativeMain`
+/// subscribes to the app shell's `Game.launch` and an `ExperienceSession`
+/// builds one of these from the payload (docs/vr/play-button.md). The field
+/// list is the dex's own accessor list; every value comes from the payload,
+/// from the signed-in identity `StartAppParams` already carries, or from the
+/// same surface and parameter objects the app half was given.
+///
+/// Every getter names itself on stderr when the engine calls it. The call is
+/// made once per join, and which of these the engine reads is the evidence
+/// for whether the defaults below matter.
+class StartGameParams : public Object {
+public:
+    std::shared_ptr<String> accessCode, callId, eventId, gameId, gameIdToExclude, gameJoinContext,
+        isoContext, joinAttemptId, joinAttemptOrigin, launchData, linkCode, referralPage,
+        reservedServerAccessCode, username;
+    std::shared_ptr<DeviceParams> deviceParams;
+    std::shared_ptr<PlatformParams> platformParams;
+    std::shared_ptr<AppSurface> surface;
+    std::shared_ptr<AndroidActivity> vrContext;
+    jlong placeId = 0, conversationId = 0, referredByPlayerId = 0, userId = 0;
+    jint joinRequestType = 0;
+    jboolean isUnder13 = false;
+
+#define READ(name) fprintf(stderr, "[cordial] StartGameParams read: %s\n", #name)
+    std::shared_ptr<String> get_accessCode(ENV*) { READ(accessCode); return accessCode; }
+    std::shared_ptr<String> get_callId(ENV*) { READ(callId); return callId; }
+    std::shared_ptr<String> get_eventId(ENV*) { READ(eventId); return eventId; }
+    std::shared_ptr<String> get_gameId(ENV*) { READ(gameId); return gameId; }
+    std::shared_ptr<String> get_gameIdToExclude(ENV*) { READ(gameIdToExclude); return gameIdToExclude; }
+    std::shared_ptr<String> get_gameJoinContext(ENV*) { READ(gameJoinContext); return gameJoinContext; }
+    std::shared_ptr<String> get_isoContext(ENV*) { READ(isoContext); return isoContext; }
+    std::shared_ptr<String> get_joinAttemptId(ENV*) { READ(joinAttemptId); return joinAttemptId; }
+    std::shared_ptr<String> get_joinAttemptOrigin(ENV*) { READ(joinAttemptOrigin); return joinAttemptOrigin; }
+    std::shared_ptr<String> get_launchData(ENV*) { READ(launchData); return launchData; }
+    std::shared_ptr<String> get_linkCode(ENV*) { READ(linkCode); return linkCode; }
+    std::shared_ptr<String> get_referralPage(ENV*) { READ(referralPage); return referralPage; }
+    std::shared_ptr<String> get_reservedServerAccessCode(ENV*) { READ(reservedServerAccessCode); return reservedServerAccessCode; }
+    std::shared_ptr<String> get_username(ENV*) { READ(username); return username; }
+    std::shared_ptr<DeviceParams> get_deviceParams(ENV*) { READ(deviceParams); return deviceParams; }
+    std::shared_ptr<PlatformParams> get_platformParams(ENV*) { READ(platformParams); return platformParams; }
+    std::shared_ptr<AppSurface> get_surface(ENV*) { READ(surface); return surface; }
+    std::shared_ptr<AndroidActivity> get_vrContext(ENV*) { READ(vrContext); return vrContext; }
+    jlong get_placeId(ENV*) { READ(placeId); return placeId; }
+    jlong get_conversationId(ENV*) { READ(conversationId); return conversationId; }
+    jlong get_referredByPlayerId(ENV*) { READ(referredByPlayerId); return referredByPlayerId; }
+    jlong get_userId(ENV*) { READ(userId); return userId; }
+    jint get_joinRequestType(ENV*) { READ(joinRequestType); return joinRequestType; }
+    jboolean get_isUnder13(ENV*) { READ(isUnder13); return isUnder13; }
+#undef READ
+
+    static std::shared_ptr<StartGameParams> Create(ENV* env, const char* assets, int width,
+                                                   int height, const StartGameFields& f) {
+        auto p = std::make_shared<StartGameParams>();
+        p->accessCode = S(f.accessCode);
+        p->callId = S(f.callId);
+        p->eventId = S(f.eventId);
+        p->gameId = S(f.gameId);
+        p->gameIdToExclude = S(f.gameIdToExclude);
+        p->gameJoinContext = S(f.gameJoinContext);
+        p->isoContext = S(f.isoContext);
+        p->joinAttemptId = S(f.joinAttemptId);
+        p->joinAttemptOrigin = S(f.joinAttemptOrigin);
+        p->launchData = S(f.launchData);
+        p->linkCode = S(f.linkCode);
+        p->referralPage = S(f.referralPage);
+        p->reservedServerAccessCode = S(f.reservedServerAccessCode);
+        p->placeId = f.placeId;
+        p->conversationId = f.conversationId;
+        p->referredByPlayerId = f.referredByPlayerId;
+        p->joinRequestType = f.joinRequestType;
+        // The same identity source `StartAppParams` reads, so the two halves
+        // cannot disagree about who is playing.
+        p->username = S(identity_username().c_str());
+        p->userId = identity_user_id();
+        p->isUnder13 = identity_is_under13();
+        p->deviceParams = DeviceParams::Create(env, width, height);
+        p->platformParams = PlatformParams::Create(env, assets, width, height);
+        // One surface for both halves: Cordial has one window, and under XR the
+        // engine draws into OpenXR swapchains rather than into this at all.
+        p->surface = AppSurface::Create(env);
+        p->vrContext = AndroidActivity::Create(env);
+        to_jni(env, p);
+        return p;
+    }
+
+    static void Register(ENV* env) {
+        env->GetClass<StartGameParams>("com/roblox/engine/jni/autovalue/StartGameParams");
+        auto c = env->GetClass("com/roblox/engine/jni/autovalue/StartGameParams");
+#define F(name) c->HookInstance(env, #name, &StartGameParams::name)
+        F(accessCode); F(callId); F(eventId); F(gameId); F(gameIdToExclude); F(gameJoinContext);
+        F(isoContext); F(joinAttemptId); F(joinAttemptOrigin); F(launchData); F(linkCode);
+        F(referralPage); F(reservedServerAccessCode); F(username); F(deviceParams);
+        F(platformParams); F(surface); F(vrContext); F(placeId); F(conversationId);
+        F(referredByPlayerId); F(userId); F(joinRequestType); F(isUnder13);
+#undef F
+#define G(name) c->HookInstanceFunction(env, #name, &StartGameParams::get_##name)
+        G(accessCode); G(callId); G(eventId); G(gameId); G(gameIdToExclude); G(gameJoinContext);
+        G(isoContext); G(joinAttemptId); G(joinAttemptOrigin); G(launchData); G(linkCode);
+        G(referralPage); G(reservedServerAccessCode); G(username); G(deviceParams);
+        G(platformParams); G(surface); G(vrContext); G(placeId); G(conversationId);
+        G(referredByPlayerId); G(userId); G(joinRequestType); G(isUnder13);
+#undef G
+    }
+};
+
 
 
 
@@ -1989,6 +2186,7 @@ void register_init_params_classes(ENV* env) {
     PlatformParams::Register(env);
     InitParams::Register(env);
     StartAppParams::Register(env);
+    StartGameParams::Register(env);
 }
 
 } // namespace cordial
@@ -2876,6 +3074,31 @@ int cordial_appbridge_init(void* fn, const char* assets, int width, int height, 
     }
 }
 
+/// A static native taking one `android.app.Activity` on an arbitrary class:
+/// `NativeGLInterface.initMaquettesSDK(Activity)`, which the Quest app runs on
+/// its own executor thread right after `nativeAppBridgeV2StartAppWithParams`.
+int cordial_call_static_activity(void* fn, const char* class_name, char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject, jobject);
+    auto* env = cordial::process_env();
+    if (!fn || !env || !class_name) {
+        snprintf(err, err_len, "no JavaVM, or the native is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass(class_name);
+        auto activity = cordial::AndroidActivity::Create(env);
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls),
+                                   (jobject)cordial::to_jni(env, activity));
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
 /// A no-argument native on an arbitrary class.
 ///
 /// `nativeAppBridgeAppStart` lives on `NativeAppBridgeInterface`, not
@@ -2951,6 +3174,58 @@ int cordial_appbridge_start_app(void* fn, const char* assets, int width, int hei
         reinterpret_cast<Call>(fn)(env->GetJNIEnv(),
                                    (jobject)cordial::to_jni(env, cls),
                                    (jobject)cordial::to_jni(env, params));
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// `NativeGLInterface.nativeAppBridgeV2StartGameWithParam(StartGameParams)I`
+///
+/// The Game half's start: what Android's Java calls when the app shell
+/// publishes `Game.launch`. `*out` receives the native's own int result.
+int cordial_appbridge_start_game(void* fn, const char* assets, int width, int height,
+                                 const cordial::StartGameFields* fields, int* out, char* err,
+                                 size_t err_len) {
+    using Call = jint (*)(JNIEnv*, jobject, jobject);
+    auto* env = cordial::process_env();
+    if (!fn || !env || !fields) {
+        snprintf(err, err_len, "no JavaVM, or StartGameWithParam is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeGLInterface");
+        auto params = cordial::StartGameParams::Create(env, assets, width, height, *fields);
+        *out = reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls),
+                                          (jobject)cordial::to_jni(env, params));
+        return 0;
+    } catch (const std::exception& e) {
+        snprintf(err, err_len, "%s", e.what());
+        return -1;
+    } catch (...) {
+        snprintf(err, err_len, "non-standard C++ exception");
+        return -1;
+    }
+}
+
+/// `NativeGLInterface.nativeAppBridgeV2LeaveGame()V`: the Game half's
+/// leave. On Android `ExperienceSession` calls it (`ih/h0.t` in the Quest
+/// build's dex); here only the development control surface does, since what
+/// the engine publishes when the player leaves is not established.
+int cordial_appbridge_leave_game(void* fn, char* err, size_t err_len) {
+    using Call = void (*)(JNIEnv*, jobject);
+    auto* env = cordial::process_env();
+    if (!fn || !env) {
+        snprintf(err, err_len, "no JavaVM, or LeaveGame is not exported");
+        return -1;
+    }
+    try {
+        auto cls = env->GetClass("com/roblox/engine/jni/NativeGLInterface");
+        reinterpret_cast<Call>(fn)(env->GetJNIEnv(), (jobject)cordial::to_jni(env, cls));
         return 0;
     } catch (const std::exception& e) {
         snprintf(err, err_len, "%s", e.what());

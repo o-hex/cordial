@@ -84,3 +84,28 @@ of its choosing has the channel, and every narrow guarantee above evaporates.
 If Flatpak grows real per-child permission scoping, per-plugin sandboxes become
 worth revisiting for resources too broad to broker usefully. Nothing currently
 proposed needs it.
+
+## Notes moved from docs/rich-presence.md (2026-10-02)
+
+**The Discord broker, as the first plugin to use it.** The plugin never learns
+where Discord's socket is. It sends a payload (an application id, `details`,
+`state`, timestamps and image keys) and Cordial does the rest: searching
+`discord-ipc-0` through `-9` and the nested path Discord's own Flatpak uses,
+performing the handshake and writing the frames. The payload is a closed struct
+that refuses any field Discord does not define, so nothing a plugin invents
+crosses the wire, and `details` and `state` are refused past Discord's own
+128-character limit, so the author hears that from the call rather than from
+Discord quietly dropping the whole activity. A plugin cannot read Discord's state
+and cannot send anything else down the connection. Buttons and picture URLs are
+built or resolved by Cordial, never supplied by the plugin, for the same reason:
+a string that could become a link under Cordial's name and icon would be an
+arbitrary link published as Cordial.
+
+**Retracted: "nothing reaches Discord in an actual session yet".** An earlier
+version of `docs/rich-presence.md` said the client's plugin host answered
+`presence.set` with `not implemented yet` and that nothing outside a test pushed
+a lifecycle event. That stopped being true when the plugin host gained the
+presence handlers (`crates/cordial-runtime/src/plugin_host.rs`) and built-in
+plugins began to be started (v0.13.0 release notes), and the page was not updated.
+The same page also called the Discord application id a placeholder; the plugin now
+carries Cordial's own id and takes an override through its `client_id` preference.

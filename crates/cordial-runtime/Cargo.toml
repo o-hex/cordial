@@ -19,6 +19,20 @@ path = "src/bin/load.rs"
 # `WebKitWebView` -- sits behind this.
 [features]
 webview = ["cordial-shell/webview"]
+# Play in VR (ADR-053): `--guest-arm64`, the translator, the guest's Vulkan and
+# OpenXR bridges and the window mirror. Off by default because dynarmic needs
+# Boost's headers, and its tests an arm64-capable clang, lld and llvm, which a
+# checkout's `cargo build` should not; every package turns it on. It turns on
+# `cordial-shell/vr` as well, so the launcher offers VR only from a build
+# whose client can run it.
+vr = ["dep:cordial-guest", "cordial-guest/dynarmic", "cordial-shell/vr"]
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+# The arm64 guest: the Quest build's libroblox.so linked into this x86-64
+# process and run through dynarmic (docs/vr/dynarmic-design.md). x86-64 only
+# because dynarmic's A64 frontend has no arm64 host backend; the aarch64
+# build runs the engine natively instead. Optional: the `vr` feature above.
+cordial-guest = { path = "../cordial-guest", optional = true }
 
 [dependencies]
 cordial-linker-sys = { path = "../cordial-linker-sys" }
@@ -45,6 +59,10 @@ zstd = "0.13"
 # with its parent. ADR-002 already accepted core taking a GTK dependency; this
 # is where the runtime takes it too.
 cordial-shell = { path = "../cordial-shell" }
+# The wire between this runtime and the launcher (ADR-055): framing, typed
+# messages, the bounded event queue and the socket helper. `MIT OR Apache-2.0`,
+# and the one dependency here that is not GPL.
+cordial-protocol = { path = "../cordial-protocol" }
 # Only for `instr_close_window`, which is how the window-close shutdown path is
 # driven from a scripted run — see `wayland::instr_close_window`. The window
 # itself is `cordial-shell`'s and stays there; this is the one GTK *call* the
@@ -64,6 +82,9 @@ ureq = "3.3.0"
 # The client-settings document is JSON and user flag overrides have to be merged
 # into it correctly. A textual splice on a 1.2 MB document is not correctness.
 serde_json = "1"
+# `localtime_r` for a recording's file name; already in the workspace through
+# `cordial-shell`, which uses it for the same reason.
+libc = "0.2"
 # Assets live in the APK, which is a zip.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # The AT-SPI bridge (android::accessibility) speaks org.a11y.atspi.* directly
@@ -80,3 +101,7 @@ zbus = { version = "5.18.0", features = ["blocking"] }
 # `mi_option_get`/`mi_option_set`/`mi_version`, which is the shape the option
 # dump in the DFLog line implies the engine queries by.
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
+
+[dev-dependencies]
+# The shared conformance cases, run against the real server in `control`'s tests.
+cordial-protocol = { path = "../cordial-protocol", features = ["conformance"] }

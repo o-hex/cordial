@@ -112,7 +112,7 @@ use libadwaita as adw;
 use libadwaita::glib;
 use webkit6::prelude::*;
 
-use crate::webview_policy;
+use crate::{webview_captcha, webview_policy};
 
 /// The two message-handler names mocktail's bridge registers, kept identical
 /// here so a page written against either app's bridge finds the same handler
@@ -233,6 +233,57 @@ fn hybrid_launch_enabled() -> bool {
 type BridgeSink = dyn Fn(&str) + Send + Sync;
 static BRIDGE_SINK: std::sync::OnceLock<std::sync::Arc<BridgeSink>> = std::sync::OnceLock::new();
 
+/// The dialog most recently presented by [`open`], so a close that did not
+/// originate from the user's own click on it -- the engine asking on
+/// `close-window`, or `cordial_runtime::webview` deciding a join has actually
+/// started -- has something to call `.close()` on. `None` once that dialog's
+/// own `closed` signal has fired, by whichever path.
+///
+/// GTK objects are `Rc`-refcounted, not atomically, so this may only be
+/// touched from the thread that calls [`open`] -- the GTK main thread, the
+/// same one `install_webview_presenter` already re-enters via
+/// `glib::MainContext::default().invoke` before doing anything else with a
+/// dialog. That single-thread invariant is the whole justification for the
+/// `unsafe impl` below, the same shape
+/// `cordial_runtime::android::wayland::HostWindowCell` already uses for the
+/// identical reason.
+struct CurrentDialogCell(std::cell::RefCell<Option<adw::Dialog>>);
+// SAFETY: see the doc comment above -- GTK-main-thread-only by construction.
+unsafe impl Send for CurrentDialogCell {}
+unsafe impl Sync for CurrentDialogCell {}
+static CURRENT_DIALOG: CurrentDialogCell = CurrentDialogCell(std::cell::RefCell::new(None));
+
+/// Close the currently-open web window, the same way a user dismissing it
+/// would, so everything already wired to `AdwDialog`'s own `closed` signal --
+/// `load.rs`'s canvas-raise and its `report_window_closed` call to the engine
+/// -- still runs. Callers do not need a second, parallel "tell the engine it
+/// closed" step; that is the entire point of going through the same signal
+/// rather than reaching for a lower-level teardown.
+///
+/// Must be called from the GTK main thread, same as [`open`] itself --
+/// callers re-enter it via `glib::MainContext::default().invoke` first.
+///
+/// Returns `false`, and says why, both when there was nothing open to close
+/// and when `AdwDialog::close` itself declined the request -- either is worth
+/// seeing rather than folding into a single silent no-op, the discipline this
+/// whole module holds itself to for every other refusal.
+pub fn close_current() -> bool {
+    let dialog = CURRENT_DIALOG.0.borrow().clone();
+    match dialog {
+        Some(dialog) => {
+            let accepted = dialog.close();
+            if !accepted {
+                eprintln!("[webview] close_current: the open dialog did not accept the close request");
+            }
+            accepted
+        }
+        None => {
+            eprintln!("[webview] close_current: no web window is currently open");
+            false
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BridgeHandler {
     ExecuteRoblox,
@@ -325,6 +376,17 @@ fn forward_script_message(
         eprintln!("[webview] rejected a bridge message (host {}): {reason}", verdict.host);
         return;
     }
+    // Named, not quoted: the module and function the page called, and the
+    // feature for a sign-in check, so a report says what the page asked of the
+    // app even without `CORDIAL_TRACE_BRIDGE`. A sign-in that stalls after the
+    // window opened was indistinguishable from one where the page never spoke
+    // (#83), and the difference is the whole diagnosis.
+    eprintln!(
+        "[webview] bridge command {} ({} bytes, via {})",
+        webview_policy::describe_command(&command).as_deref().unwrap_or("(not a hybrid command)"),
+        command.len(),
+        handler.name(),
+    );
     match BRIDGE_SINK.get() {
         Some(sink) => sink(&command),
         None => eprintln!(
@@ -334,6 +396,41 @@ fn forward_script_message(
             command.len()
         ),
     }
+    acknowledge_captcha_event(view, &command);
+}
+
+/// Answer a security-check page's `CaptchaShown`/`CaptchaSuccess` command, and
+/// close the window once the user has passed.
+///
+/// Forwarding to the engine is not enough on its own: the page waits for its
+/// `callbackID` to be answered in the page itself, and a window that never
+/// answers is left on "Verification complete" for ever (#83). See
+/// [`webview_captcha`] for the command shape and where it comes from. Any
+/// other command is left alone.
+///
+/// **The page answering `true` is what closes the window**, not merely a
+/// `CaptchaSuccess` having arrived, so a page with no bridge to answer is not
+/// closed on a guess.
+fn acknowledge_captcha_event(view: &webkit6::WebView, command: &str) {
+    let Some(event) = webview_captcha::parse_captcha_event(command) else {
+        return;
+    };
+    let name = event.kind.name();
+    let Some(script) = webview_captcha::callback_script(&event.callback_id) else {
+        eprintln!("[webview] {name} arrived with no callback id; there is nothing to answer");
+        return;
+    };
+    let kind = event.kind;
+    view.evaluate_javascript(&script, None, None, gtk4::gio::Cancellable::NONE, move |result| {
+        let answered = matches!(&result, Ok(value) if value.is_boolean() && value.to_boolean());
+        match &result {
+            Ok(_) => eprintln!("[webview] {name} answered: {answered}"),
+            Err(e) => eprintln!("[webview] {name} could not be answered: {e}"),
+        }
+        if answered && kind == webview_captcha::CaptchaEventKind::Success {
+            close_current();
+        }
+    });
 }
 
 /// Install the sink [`open`]'s bridge handler forwards an approved message
@@ -527,6 +624,32 @@ pub fn open(parent: &(impl IsA<gtk4::Widget> + Clone), request: &WindowRequest) 
     // from the argument type instead, giving the owned widget `upcast` needs.
     install_popup_handling(&view, Clone::clone(parent).upcast(), request.user_agent.clone());
 
+    // Whether the page decided it is running inside an app. roblox.com reads
+    // that from the User-Agent, and the answer decides whether anything the page
+    // does reaches the engine at all (#83): `Roblox.Hybrid.Bridge.isNative` is
+    // `false` under the default desktop identity and `true` under the Android
+    // hybrid one. Asked of every window, a couple of seconds after it finishes
+    // loading because the page builds `Roblox.Hybrid` after its own scripts run,
+    // and reported as a fact either way. A boolean read in the page's own world,
+    // which is where `Roblox` lives; it carries no address and no account.
+    view.connect_load_changed(|v, event| {
+        if event != webkit6::LoadEvent::Finished {
+            return;
+        }
+        let view = v.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+            const ASK: &str = "(window.Roblox && Roblox.Hybrid && Roblox.Hybrid.Bridge) \
+                ? String(Roblox.Hybrid.Bridge.isNative) : 'no Roblox.Hybrid.Bridge on this page'";
+            view.evaluate_javascript(ASK, None, None, gtk4::gio::Cancellable::NONE, |r| match r {
+                Ok(value) => eprintln!(
+                    "[webview] the page's hybrid bridge is native: {}",
+                    value.to_str()
+                ),
+                Err(e) => eprintln!("[webview] could not ask the page whether its bridge is native: {e}"),
+            });
+        });
+    });
+
     // Whether this WebKitGTK build has WebAuthn at all, asked of a live page,
     // once per process. A Roblox account with a passkey enrolled cannot finish
     // sign-in without `navigator.credentials.get`, and when the binding is
@@ -606,27 +729,50 @@ pub fn open(parent: &(impl IsA<gtk4::Widget> + Clone), request: &WindowRequest) 
             // bridge global is injected there and a named world would not see
             // it -- which would make this report "absent" on a perfectly
             // healthy build.
-            if std::env::var_os("CORDIAL_WEBVIEW_BRIDGE_TEST").is_some() {
+            //
+            // `CORDIAL_WEBVIEW_BRIDGE_TEST=hybrid` goes one step further and has
+            // the page call its *own* `Roblox.Hybrid.Navigation.navigateToFeature`
+            // (the call a sign-in check makes), three seconds after the load so
+            // the page has built `Roblox.Hybrid`. That is the test of whether the
+            // page believes it is in an app (#83): the plain self-test posts to
+            // the bridge directly and passes under any User-Agent, which is why
+            // it could not have found the stall.
+            if let Some(mode) = std::env::var_os("CORDIAL_WEBVIEW_BRIDGE_TEST") {
                 const SELF_TEST: &str = r#"(() => {
   const bridge = window.__globalRobloxAndroidBridge__;
   if (!bridge || typeof bridge.executeRoblox !== "function") { return "no bridge on this page"; }
   bridge.executeRoblox(JSON.stringify({ cordial: "bridge-self-test" }));
   return "called";
 })()"#;
-                v.evaluate_javascript(
-                    SELF_TEST,
-                    None,
-                    None,
-                    gtk4::gio::Cancellable::NONE,
-                    |r| match r {
-                        Ok(value) => eprintln!(
-                            "[webview] bridge self-test: {} (a `forwarded a bridge message` line \
-                             below is the round trip; its absence is the finding)",
-                            value.to_str()
-                        ),
-                        Err(e) => eprintln!("[webview] bridge self-test could not run: {e}"),
-                    },
-                );
+                const HYBRID_TEST: &str = r#"(() => {
+  const nav = window.Roblox && Roblox.Hybrid && Roblox.Hybrid.Navigation;
+  if (!nav || typeof nav.navigateToFeature !== "function") { return "no Roblox.Hybrid.Navigation on this page"; }
+  nav.navigateToFeature({ feature: "CaptchaShown" }, () => {});
+  return "called the page's own navigateToFeature";
+})()"#;
+                let hybrid = mode == "hybrid";
+                let view = v.clone();
+                let run = move || {
+                    view.evaluate_javascript(
+                        if hybrid { HYBRID_TEST } else { SELF_TEST },
+                        None,
+                        None,
+                        gtk4::gio::Cancellable::NONE,
+                        |r| match r {
+                            Ok(value) => eprintln!(
+                                "[webview] bridge self-test: {} (a `forwarded a bridge message` \
+                                 line below is the round trip; its absence is the finding)",
+                                value.to_str()
+                            ),
+                            Err(e) => eprintln!("[webview] bridge self-test could not run: {e}"),
+                        },
+                    );
+                };
+                if hybrid {
+                    glib::timeout_add_local_once(std::time::Duration::from_secs(3), run);
+                } else {
+                    run();
+                }
             }
 
             // **`CORDIAL_WEBVIEW_CLICK_PROBE=1`: fire a script-driven `.click()`
@@ -750,6 +896,23 @@ pub fn open(parent: &(impl IsA<gtk4::Widget> + Clone), request: &WindowRequest) 
 
     view.load_uri(&request.url);
     dialog.present(Some(parent));
+
+    // Tracked for [`close_current`], and untracked again the moment this
+    // dialog's own `closed` signal fires -- by any path, not only that
+    // function's -- so a stale handle here never outlives the window it
+    // names. Guarded by identity, not just by clearing unconditionally: a
+    // second `open()` call that presented a newer dialog before this one
+    // got around to closing must not have its entry erased by the older
+    // dialog's own belated signal.
+    *CURRENT_DIALOG.0.borrow_mut() = Some(dialog.clone());
+    let tracked = dialog.clone();
+    dialog.connect_closed(move |_| {
+        let mut slot = CURRENT_DIALOG.0.borrow_mut();
+        if slot.as_ref() == Some(&tracked) {
+            *slot = None;
+        }
+    });
+
     Some(dialog)
 }
 

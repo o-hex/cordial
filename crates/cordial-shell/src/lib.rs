@@ -37,12 +37,39 @@
 // see ADR-036's discussion of why that trade was rejected workspace-wide.
 #![allow(unsafe_code)]
 
+mod build_remote;
 pub mod branding;
+pub mod doctor;
+pub mod frame_rate_limit;
+pub mod freeze_recovery;
+// Which display backend a gamescope session gets; the launcher, `--doctor` and
+// the loader all ask it, so it is here and not in any one of them.
+pub mod gamescope;
+pub mod editor;
 pub mod host_window;
+pub mod x11_editor;
 pub mod json_highlight;
+pub mod log_export;
+pub mod runtime_session;
+pub mod session_log;
+pub mod startup_watch;
 pub mod network;
+// What Cordial does only when the GPU is NVIDIA's, and the parsing the shell and
+// the runtime both need for it. In the library half for the reason `network`
+// is: `cordial-runtime` already depends on this crate and needs the same
+// vendor gate and driver decode the launcher's diagnostics and crash page use.
+pub mod nvidia;
+pub mod plugin_listing;
 pub mod plugin_preferences;
 pub mod profile;
+pub mod stacking_gate;
+/// What "Play in VR" needs from the machine: the Quest build, an OpenXR
+/// runtime, WiVRn's server (ADR-053). In the library so `--doctor` and the
+/// launcher read the same answers.
+pub mod vr;
+/// The headset half of getting the Quest build: `adb`, behind a trait so each
+/// state the setup pages handle is tested without a headset.
+pub mod quest_adb;
 pub mod title_bar;
 // Not pulled in by `host_window` or `network` -- registered here on its own
 // so `cordial-runtime` can reach it as `cordial_shell::refresh_watch`, which
@@ -70,8 +97,11 @@ pub mod secrets;
 /// because the window Roblox runs in is built by `cordial-runtime`, which
 /// depends on this crate and has to read and write the same records.
 pub mod version;
+pub mod gtk_renderer;
+pub mod vulkan_probe;
 pub mod window_state;
 pub mod webview_policy;
+pub mod webview_captcha;
 #[cfg(feature = "webview")]
 pub mod webview;
 

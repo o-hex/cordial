@@ -17,6 +17,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub use cordial_shell::frame_rate_limit::FrameRateLimit;
 pub use cordial_shell::title_bar::TitleBar;
 
 /// What appearance Cordial itself should use.
@@ -274,16 +275,17 @@ impl ThrottleWhen {
 #[serde(rename_all = "lowercase")]
 pub enum PointerAcceleration {
     /// The desktop's setting moves the cursor, and camera movement is raw.
-    /// The default, and the only honest description of the status quo.
     UnlockedCursor,
-    /// The desktop's setting moves the camera too, for anyone who has tuned
-    /// their pointer profile and wants the client to obey it.
+    /// The desktop's setting moves the camera too. The default since
+    /// 2026-09-30: players found accelerated camera movement better in
+    /// shooters, and raw movement is still one choice away. A profile whose
+    /// saved config already names "unlocked" keeps it.
     Always,
 }
 
 impl Default for PointerAcceleration {
     fn default() -> Self {
-        PointerAcceleration::UnlockedCursor
+        PointerAcceleration::Always
     }
 }
 
@@ -502,6 +504,22 @@ impl AudioOutput {
     }
 }
 
+/// The microphone Roblox records from: a PipeWire source's `node.name`, empty
+/// for "follow the system default source".
+///
+/// The same type as [`AudioOutput`] on purpose. Everything that type decides is
+/// true of an input for the same reasons -- `node.name` rather than an index or
+/// a description, global rather than per profile, absent rather than empty, and
+/// a chosen device that has gone keeping its row -- and a second type would
+/// copy its methods and its tests while leaving the two free to drift. What
+/// differs is the consequence of a wrong value, which is a microphone that
+/// records from somewhere nobody chose; that is handled where the stream
+/// opens (`resolve_input_target` in `native/pipewire_backend.cpp`), not here.
+///
+/// Stored as `audio_input`, sent as `CORDIAL_AUDIO_SOURCE` at launch and as the
+/// `audio_input` live key afterwards. Choosing one opens nothing.
+pub type AudioInput = AudioOutput;
+
 /// One choice that settles both of the things Cordial can ask the engine to do
 /// differently about graphics: which device it says it is, and how many of the
 /// machine's cores the engine's own worker pools may use.
@@ -719,6 +737,16 @@ pub struct ShellConfig {
     /// upgrading gets a different feel than they had.
     #[serde(default)]
     pub present_mode: PresentMode,
+    /// How far `DFIntTaskSchedulerTargetFps` may be raised, and reasserted, on
+    /// top of the present mode above. See [`FrameRateLimit`] for the reasoning
+    /// and the reset it exists to survive.
+    ///
+    /// `#[serde(default)]` for the same reason `present_mode` carries it: a
+    /// `shell.json` written before this row existed has no such key, and it
+    /// must load as `Display` -- what every build before this one already
+    /// did -- rather than fail to parse.
+    #[serde(default)]
+    pub frame_rate_limit: FrameRateLimit,
     /// Whether Cordial reads `/dev/input/js*` and tells Roblox about pads.
     ///
     /// On by default. Off is a real setting rather than a debugging knob:
@@ -743,6 +771,17 @@ pub struct ShellConfig {
     /// and the test below caught it, which is why both the attribute's absence
     /// and the reason are written down.
     pub gamepad: bool,
+    /// Record every session to a video file (ADR-059).
+    ///
+    /// Off by default: a recording writes a few hundred megabytes an hour and
+    /// costs the engine's present thread about three milliseconds a captured
+    /// frame, neither of which somebody who did not ask for it should pay. The
+    /// client reads it at launch only; there is no live toggle yet.
+    pub record_session: bool,
+    /// Record the game's own sound with it, copied from the buffers Cordial
+    /// plays. Off by default, a switch of its own: a recording that included
+    /// sound nobody asked for is a surprise in a file about to be shared.
+    pub record_audio: bool,
     /// Quit the client when the user leaves a game and returns to the home
     /// screen.
     ///
@@ -792,11 +831,29 @@ pub struct ShellConfig {
     #[serde(default)]
     pub carry_launch_ticket: bool,
     pub mangohud: bool,
+    /// Sharpen and anti-alias the frame with vkBasalt's Vulkan layer.
+    ///
+    /// Same shape as `mangohud` above, deliberately: both are implicit Vulkan
+    /// layers Cordial does not implement, both draw or alter the frame whether
+    /// or not the layer is actually installed, and both need the same guard —
+    /// see `launch::vkbasalt_layer`. Default off for the same reason as
+    /// `mangohud`: it changes what is on screen, so it is asked for rather than
+    /// assumed.
+    ///
+    /// Turning it on writes a per-profile `vkBasalt.conf` the first time, at
+    /// `launch::vkbasalt_config_path`, and never overwrites one that is already
+    /// there — see that function's doc for why silently replacing a config
+    /// somebody has since edited would be the wrong failure to introduce.
+    #[serde(default)]
+    pub vkbasalt: bool,
     /// Which audio device Roblox plays through. See [`AudioOutput`], which
     /// carries the whole of the reasoning, including why the stored form is a
     /// `node.name` and why the default must stay "follow the system".
     #[serde(default)]
     pub audio_output: AudioOutput,
+    /// Which microphone Roblox records from. See [`AudioInput`].
+    #[serde(default)]
+    pub audio_input: AudioInput,
     /// The accelerator that toggles fullscreen, in GTK's own syntax.
     ///
     /// Configurable rather than hardcoded because F11 is not reachable on every
@@ -831,6 +888,14 @@ pub struct ShellConfig {
     /// both about the machine's software, not about an account (ADR-013).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marketplace_index_dir: Option<PathBuf>,
+    /// Which OpenXR runtime "Play in VR" hands the client: absent for the
+    /// system's active runtime, a detected runtime's id (`crate::vr::detect`),
+    /// or an absolute path to a manifest the user chose. Machine-wide like
+    /// `roblox`, because a runtime is software on the machine (ADR-013), and
+    /// passed per launch in `XR_RUNTIME_JSON` -- never written into the
+    /// system's own `active_runtime.json` (ADR-053).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vr_openxr_runtime: Option<String>,
     /// The base64 minisign public key the Marketplace section checks
     /// `marketplace_index_dir`'s signature against.
     ///
@@ -879,14 +944,20 @@ impl Default for ShellConfig {
             graphics: "automatic".to_string(),
             graphics_optimization_mode: GraphicsOptimization::default(),
             present_mode: PresentMode::default(),
+            frame_rate_limit: FrameRateLimit::default(),
             gamepad: true,
+            record_session: false,
+            record_audio: false,
             close_on_leave: false,
             unpacked_plugins: Vec::new(),
             carry_launch_ticket: false,
             audio_output: AudioOutput::default(),
+            audio_input: AudioInput::default(),
             mangohud: false,
+            vkbasalt: false,
             fullscreen_accel: default_fullscreen_accel(),
             marketplace_index_dir: None,
+            vr_openxr_runtime: None,
             marketplace_public_key: None,
             multi_instance_warning_seen: false,
         }
@@ -911,6 +982,10 @@ pub fn path() -> PathBuf {
 /// most people never open settings — and a malformed one is reported and
 /// treated the same as missing, per the module docs above.
 pub fn load(path: &Path) -> ShellConfig {
+    with_command_line(load_file(path))
+}
+
+fn load_file(path: &Path) -> ShellConfig {
     let Ok(text) = std::fs::read_to_string(path) else {
         return ShellConfig::default();
     };
@@ -923,7 +998,100 @@ pub fn load(path: &Path) -> ShellConfig {
     }
 }
 
+/// `--set KEY=VALUE` from the command line, once there is one, and the fact that
+/// nothing this process does is allowed to reach `shell.json`.
+///
+/// **Applied inside [`load`] and not only to the in-memory config `main` holds,
+/// because `launch::spawn` and `live` each read the file themselves** -- the
+/// comment in `launch.rs` says so and asks for a `&ShellConfig` to be handed in
+/// instead. Until it is, a setting applied only to the copy in `main` would show
+/// in the window and be absent from the client the window starts, which is a
+/// setting that works in every test and in no launch.
+static COMMAND_LINE: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+/// Make `settings` win over `shell.json` for the rest of this process, and make
+/// [`save`] a no-op.
+///
+/// Both halves are one decision. A process that was told `--profile P2` or
+/// `--set present_mode=fifo` was told it for one run, and the next ordinary
+/// launch must find the user's settings where they left them -- which is also
+/// why a second instance started by another program (ADR-058) cannot be allowed
+/// to write `shell.json` at all: two of them would race to leave their own
+/// profile in it.
+pub fn hold_unsaved(settings: Vec<(String, String)>) {
+    let _ = COMMAND_LINE.set(settings);
+}
+
+fn with_command_line(config: ShellConfig) -> ShellConfig {
+    let Some(settings) = COMMAND_LINE.get() else {
+        return config;
+    };
+    // Already validated by `main` before this process went any further; a
+    // failure here would be a setting that parsed once and does not now, and the
+    // file's value is the safe thing to fall back on.
+    with_overrides(&config, settings).unwrap_or(config)
+}
+
+/// Whether [`hold_unsaved`] has been called.
+fn unsaved() -> bool {
+    COMMAND_LINE.get().is_some()
+}
+
+/// The names `--set` accepts: every setting `shell.json` stores, as it spells it.
+pub fn setting_keys() -> Vec<String> {
+    match serde_json::to_value(ShellConfig::default()) {
+        Ok(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `config` with one setting changed, from the text a person typed.
+///
+/// The value is read as JSON first (`true`, `30`, `"x"`) and as a bare string
+/// when that is not JSON or is not what the setting holds, so `present_mode=fifo`
+/// and `audio_output=123` both do what they look like. The result is built by
+/// deserialising the whole document again, which is what makes the type check
+/// the one `shell.json` itself gets and not a second set of rules.
+pub fn with_override(config: &ShellConfig, key: &str, raw: &str) -> Result<ShellConfig, String> {
+    use serde_json::Value;
+    let Ok(Value::Object(doc)) = serde_json::to_value(config) else {
+        return Err("the settings could not be read back".into());
+    };
+    if key == "profile" {
+        return Err("the profile is chosen with --profile NAME, not --set".into());
+    }
+    if !doc.contains_key(key) {
+        return Err(format!(
+            "{key:?} is not a setting; the settings are {}",
+            setting_keys().join(", ")
+        ));
+    }
+    let candidates = [serde_json::from_str::<Value>(raw).ok(), Some(Value::String(raw.to_string()))];
+    let mut last = String::new();
+    for value in candidates.into_iter().flatten() {
+        let mut trial = doc.clone();
+        trial.insert(key.to_string(), value);
+        match serde_json::from_value::<ShellConfig>(Value::Object(trial)) {
+            Ok(changed) => return Ok(changed),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(format!("{key}={raw}: {last}"))
+}
+
+/// [`with_override`] for each in turn.
+pub fn with_overrides(config: &ShellConfig, settings: &[(String, String)]) -> Result<ShellConfig, String> {
+    let mut config = config.clone();
+    for (key, raw) in settings {
+        config = with_override(&config, key, raw)?;
+    }
+    Ok(config)
+}
+
 pub fn save(path: &Path, config: &ShellConfig) -> std::io::Result<()> {
+    if unsaved() {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -953,6 +1121,48 @@ mod tests {
         assert_eq!(ThrottleWhen::Visible.as_str(), "visible");
         assert_eq!(ThrottleWhen::Unfocused.as_str(), "unfocused");
         assert_eq!(ThrottleWhen::Off.as_str(), "off");
+    }
+
+    #[test]
+    fn a_setting_is_typed_the_way_shell_json_types_it() {
+        let base = ShellConfig::default();
+        // A bool, an enum spelled as its stored word, and a plain string.
+        assert!(with_override(&base, "mangohud", "true").unwrap().mangohud);
+        assert_eq!(with_override(&base, "present_mode", "fifo").unwrap().present_mode, PresentMode::Fifo);
+        assert_eq!(with_override(&base, "graphics", "vulkan").unwrap().graphics, "vulkan");
+        // A string setting that happens to look like a number is still a string.
+        assert_eq!(with_override(&base, "graphics", "123").unwrap().graphics, "123");
+        // Nothing else about the config moves.
+        let changed = with_override(&base, "mangohud", "true").unwrap();
+        assert_eq!(ShellConfig { mangohud: false, ..changed }.profile, base.profile);
+    }
+
+    #[test]
+    fn a_wrong_value_or_name_is_refused_with_what_would_have_been_right() {
+        let base = ShellConfig::default();
+        let e = with_override(&base, "mangohud", "yes").unwrap_err();
+        assert!(e.contains("mangohud=yes"), "{e}");
+        let e = with_override(&base, "present_mode", "warp").unwrap_err();
+        assert!(e.contains("fifo"), "serde names the variants it knows: {e}");
+        let e = with_override(&base, "mangohood", "true").unwrap_err();
+        assert!(e.contains("mangohud") && e.contains("present_mode"), "the valid names are listed: {e}");
+        // The profile has a flag of its own, with its own validation.
+        assert!(with_override(&base, "profile", "x").unwrap_err().contains("--profile"));
+    }
+
+    #[test]
+    fn every_listed_setting_can_be_set_to_its_own_default() {
+        // The listing and the setter must agree on what a setting is, or `--set`
+        // would advertise keys it then refuses.
+        let base = ShellConfig::default();
+        let doc = serde_json::to_value(&base).unwrap();
+        for key in setting_keys() {
+            if key == "profile" {
+                continue;
+            }
+            let raw = serde_json::to_string(&doc[&key]).unwrap();
+            with_override(&base, &key, &raw).unwrap_or_else(|e| panic!("{key}: {e}"));
+        }
     }
 
     #[test]
@@ -1003,6 +1213,7 @@ mod tests {
         // applies to them: everybody's shell.json predates them.
         assert!(config.gamemode, "an older config must still get GameMode's default");
         assert!(!config.mangohud);
+        assert!(!config.vkbasalt, "vkbasalt is newer still and every existing shell.json predates it");
     }
 
     #[test]
@@ -1045,23 +1256,26 @@ mod tests {
         // reverse and a setting that only saves the value it already had would
         // pass a one-way test.
         let p = scratch("performance.json");
-        save(&p, &ShellConfig { gamemode: false, mangohud: true, ..Default::default() }).unwrap();
+        save(
+            &p,
+            &ShellConfig { gamemode: false, mangohud: true, vkbasalt: true, ..Default::default() },
+        )
+        .unwrap();
         let back = load(&p);
         assert!(!back.gamemode);
         assert!(back.mangohud);
+        assert!(back.vkbasalt);
     }
 
     #[test]
-    fn the_roblox_paths_round_trip() {
+    fn the_roblox_apk_round_trips() {
         let p = scratch("roblox.json");
         let mut config = ShellConfig::default();
         config.roblox.apk = Some(PathBuf::from("/somewhere/base.apk"));
-        config.roblox.lib_dir = Some(PathBuf::from("/somewhere/lib/x86_64"));
         config.profile = "alt_account".into();
         save(&p, &config).unwrap();
         let back = load(&p);
         assert_eq!(back.roblox.apk, config.roblox.apk);
-        assert_eq!(back.roblox.lib_dir, config.roblox.lib_dir);
         assert_eq!(back.profile, "alt_account");
     }
 
@@ -1175,6 +1389,25 @@ mod tests {
     }
 
     #[test]
+    fn the_audio_input_round_trips_and_an_old_file_follows_the_system_default() {
+        let p = scratch("audio-input.json");
+        let name = "alsa_input.usb-Generic_USB_Audio-00.mono-fallback";
+        save(&p, &ShellConfig { audio_input: AudioOutput(name.into()), ..Default::default() })
+            .unwrap();
+        let back = load(&p);
+        assert_eq!(back.audio_input, AudioOutput(name.into()));
+        assert!(back.audio_output.is_system_default(), "the two choices are separate fields");
+
+        // Everybody's file predates the field; landing on anything but the
+        // default source would move somebody's microphone because they upgraded.
+        let old = scratch("pre-audio-input.json");
+        std::fs::write(&old, r#"{"appearance":"dark","audio_output":"some-sink"}"#).unwrap();
+        let loaded = load(&old);
+        assert!(loaded.audio_input.is_system_default());
+        assert_eq!(loaded.audio_input.env_value(), None);
+    }
+
+    #[test]
     fn a_config_written_before_the_audio_row_existed_follows_the_system_default() {
         // Everybody's shell.json predates this field, and landing on anything
         // but "follow the system" would move somebody's game audio to another
@@ -1206,6 +1439,19 @@ mod tests {
         assert!(parsed.gamepad, "a config predating the key must not read as controllers off");
         let off: ShellConfig = serde_json::from_str(r#"{"gamepad":false}"#).unwrap();
         assert!(!off.gamepad, "an explicit false must survive");
+    }
+
+    /// Recording writes files and costs the present thread time, so nothing is
+    /// recorded for somebody who never opened the row, and an older config
+    /// without the keys must not start recording on upgrade.
+    #[test]
+    fn recording_is_off_until_it_is_switched_on() {
+        let d = ShellConfig::default();
+        assert!(!d.record_session && !d.record_audio);
+        let older: ShellConfig = serde_json::from_str(r#"{"gamemode":true}"#).unwrap();
+        assert!(!older.record_session && !older.record_audio);
+        let on: ShellConfig = serde_json::from_str(r#"{"record_session":true,"record_audio":true}"#).unwrap();
+        assert!(on.record_session && on.record_audio);
     }
 
     /// **A fresh install is responsive, and pays power for it.**
@@ -1263,6 +1509,75 @@ mod tests {
         let older = r#"{"gamemode":true,"graphics":"automatic","mangohud":false}"#;
         let parsed: ShellConfig = serde_json::from_str(older).expect("an older shell.json must load");
         assert_eq!(parsed.present_mode, PresentMode::Mailbox);
+    }
+
+    /// A fresh install sends nothing extra: the frame rate stays at the
+    /// engine's own default, which is what every Cordial before this row did.
+    #[test]
+    fn a_fresh_install_does_not_raise_the_frame_rate_cap() {
+        assert_eq!(ShellConfig::default().frame_rate_limit, FrameRateLimit::Display);
+        assert_eq!(FrameRateLimit::default().as_env(), "display");
+    }
+
+    /// The words on the wire and in `CORDIAL_FRAME_RATE_LIMIT`. This cannot
+    /// also assert that `cordial_runtime::flags::FrameRateLimit::parse` accepts
+    /// them: `cordial-shell` cannot depend on `cordial-runtime`, and that
+    /// crate's `the_shells_words_are_the_runtimes_words` test is the other half.
+    #[test]
+    fn every_choice_names_itself_to_the_client() {
+        for (mode, spelling) in [
+            (FrameRateLimit::Display, "display"),
+            (FrameRateLimit::Cap90, "90"),
+            (FrameRateLimit::Cap120, "120"),
+            (FrameRateLimit::Cap144, "144"),
+            (FrameRateLimit::Cap165, "165"),
+            (FrameRateLimit::Cap240, "240"),
+            (FrameRateLimit::Cap360, "360"),
+            (FrameRateLimit::Cap480, "480"),
+        ] {
+            assert_eq!(mode.as_env(), spelling);
+            assert_eq!(FrameRateLimit::parse(spelling), Some(mode));
+        }
+        assert_eq!(FrameRateLimit::parse("unlimited"), None, "there is no unlimited choice");
+        assert_eq!(FrameRateLimit::parse("9999"), None);
+        assert_eq!(FrameRateLimit::parse("1000"), None, "rows stop at 480");
+        assert_eq!(FrameRateLimit::parse(""), None);
+    }
+
+    /// The combo model's positions and the enum must not drift apart.
+    #[test]
+    fn frame_rate_limit_survives_the_combo_row_round_trip() {
+        for mode in FrameRateLimit::ALL {
+            assert_eq!(FrameRateLimit::from_index(mode.index()), mode);
+        }
+        assert_eq!(FrameRateLimit::from_index(0), FrameRateLimit::Display, "Display is first and the default");
+        assert_eq!(FrameRateLimit::from_index(99), FrameRateLimit::Display, "out of range is the default");
+    }
+
+    /// A `shell.json` from before this row existed must still load, and must
+    /// read as `Display` rather than fail to parse or silently raise a cap.
+    #[test]
+    fn an_older_config_without_the_frame_rate_limit_key_keeps_the_cap_it_had() {
+        let older = r#"{"gamemode":true,"graphics":"automatic","mangohud":false}"#;
+        let parsed: ShellConfig = serde_json::from_str(older).expect("an older shell.json must load");
+        assert_eq!(parsed.frame_rate_limit, FrameRateLimit::Display);
+    }
+
+    #[test]
+    fn a_prerelease_config_that_says_unlimited_still_loads() {
+        let older = r#"{"frame_rate_limit":"unlimited"}"#;
+        let parsed: ShellConfig = serde_json::from_str(older).expect("must load");
+        assert_eq!(parsed.frame_rate_limit, FrameRateLimit::Cap240);
+    }
+
+    #[test]
+    fn the_choice_is_saved_under_its_lowercase_name() {
+        let mut config = ShellConfig::default();
+        config.frame_rate_limit = FrameRateLimit::Cap240;
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(text.contains(r#""frame_rate_limit":"cap240""#), "{text}");
+        let back: ShellConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.frame_rate_limit, FrameRateLimit::Cap240);
     }
 
     /// Everybody's `shell.json` predates the multi-instance warning, and a

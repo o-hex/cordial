@@ -208,7 +208,7 @@
 //! them on one seat is tolerated stays a question this can answer by running.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use libadwaita as adw;
@@ -533,11 +533,19 @@ const WL_SUBSURFACE_SET_DESYNC: u32 = 5;
 const WL_DISPLAY_GET_REGISTRY: u32 = 1;
 const WL_REGISTRY_BIND: u32 = 0;
 const WL_COMPOSITOR_CREATE_SURFACE: u32 = 0;
+/// `wl_compositor.create_region`, for the opaque region `set_engine_stacking`
+/// builds by hand -- see the comment there.
+const WL_COMPOSITOR_CREATE_REGION: u32 = 1;
 const WL_POINTER_SET_CURSOR: u32 = 0;
 const WL_SURFACE_COMMIT: u32 = 6;
 /// `wl_surface.set_opaque_region`. Sent by Cordial directly, not through GDK --
 /// see `set_engine_stacking`.
 const WL_SURFACE_SET_OPAQUE_REGION: u32 = 4;
+/// `wl_region.destroy`/`wl_region.add`. No `subtract` -- the rectangles
+/// `HostWindow::opaque_region_rects` hands back are already the finished,
+/// non-overlapping shape, so only `add` is ever needed to reproduce it.
+const WL_REGION_DESTROY: u32 = 0;
+const WL_REGION_ADD: u32 = 1;
 const WL_SEAT_GET_POINTER: u32 = 0;
 const WL_SEAT_GET_KEYBOARD: u32 = 1;
 const WL_SEAT_GET_TOUCH: u32 = 2;
@@ -657,6 +665,10 @@ struct WlClient {
     /// should be given when creating one — see the text-input section of the
     /// module doc for what a guess cost here.
     get_version: unsafe extern "C" fn(*mut c_void) -> u32,
+    /// For giving the canvas a `GdkSurface` to answer to; see
+    /// [`attach_touch_stand_in`] for why a surface GDK did not create has to
+    /// carry one.
+    set_user_data: unsafe extern "C" fn(*mut c_void, *mut c_void),
     /// Set once the connection is unusable. Non-zero means every later request
     /// is discarded and every dispatch fails, so a run that reaches this is
     /// over whatever it does next; `pump` reports it rather than letting the
@@ -675,6 +687,10 @@ struct WlClient {
     pointer_interface: *const WlInterface,
     keyboard_interface: *const WlInterface,
     touch_interface: *const WlInterface,
+    /// For `wl_compositor.create_region`, in `set_engine_stacking` -- see the
+    /// comment there on why the opaque region sent in that commit is built by
+    /// hand rather than left to GDK.
+    region_interface: *const WlInterface,
 }
 // SAFETY: every field is either a function pointer (inherently `Send + Sync`
 // — it is a code address, not aliased state) or a pointer into a host shared
@@ -758,6 +774,7 @@ impl WlClient {
             marshal_flags: sym!("wl_proxy_marshal_flags"),
             add_listener: sym!("wl_proxy_add_listener"),
             get_version: sym!("wl_proxy_get_version"),
+            set_user_data: sym!("wl_proxy_set_user_data"),
             get_error: sym!("wl_display_get_error"),
             get_protocol_error: sym!("wl_display_get_protocol_error"),
             registry_interface: sym!("wl_registry_interface"),
@@ -769,6 +786,7 @@ impl WlClient {
             pointer_interface: sym!("wl_pointer_interface"),
             keyboard_interface: sym!("wl_keyboard_interface"),
             touch_interface: sym!("wl_touch_interface"),
+            region_interface: sym!("wl_region_interface"),
         })
     }
 }
@@ -948,8 +966,8 @@ struct LockedPointerListener {
 /// accelerated delta the compositor's pointer profile produced, then the raw
 /// unaccelerated one.
 ///
-/// Cordial uses the **unaccelerated** pair by default, and which pair it uses
-/// is now a setting -- see [`relative_pointer_motion`]. This comment said the
+/// Cordial uses the **accelerated** pair by default since 2026-09-30 (it was
+/// the unaccelerated one before), and which pair it uses is a setting -- see [`relative_pointer_motion`]. This comment said the
 /// opposite until 2026-08-21, having outlived commit 6cb9ed7 which changed the
 /// behaviour and left the description behind. A comment that contradicts the
 /// code twenty lines below it costs more than no comment.
@@ -1066,18 +1084,34 @@ struct HostWindowCell(cordial_shell::host_window::HostWindow);
 unsafe impl Send for HostWindowCell {}
 unsafe impl Sync for HostWindowCell {}
 
+/// The unmapped `GdkSurface` [`attach_touch_stand_in`] makes. GTK refcounts
+/// non-atomically, so this is main-thread-only like `HostWindowCell`; nothing
+/// ever touches it again after `open` stores it, and it is never dropped,
+/// because `WINDOW` lives for the whole process.
+struct TouchStandIn(#[allow(dead_code)] gtk4::gdk::Surface);
+// SAFETY: see above -- created on the thread that called `open`, never used
+// again, and not dropped before the process exits.
+unsafe impl Send for TouchStandIn {}
+unsafe impl Sync for TouchStandIn {}
+
 pub struct WaylandWindow {
     wl: WlClient,
     egl: Option<WlEgl>,
     display: *mut c_void,
     host: HostWindowCell,
-    // Kept named and typed even though only `surface`/`subsurface` are read
-    // again after construction — the rest are still owned proxies for the
-    // life of this one-window-per-process runtime (the same scope
+    /// The `GdkSurface` the canvas answers to for GDK's touch handler. Held
+    /// only so it lives as long as the canvas does; see
+    /// [`attach_touch_stand_in`].
+    _touch_stand_in: TouchStandIn,
+    // Kept named and typed even though only `surface`/`subsurface`/`compositor`
+    // are read again after construction — the rest are still owned proxies for
+    // the life of this one-window-per-process runtime (the same scope
     // `window.rs`'s `HostWindow` has), and naming them documents the object
     // graph a future teardown or diagnostic would need, rather than letting
     // it go unrecorded because nothing currently reads it back.
-    #[allow(dead_code)]
+    //
+    // `compositor` itself is read again, in `set_engine_stacking`, to build
+    // the opaque region sent in the same commit as the restack.
     compositor: *mut c_void,
     #[allow(dead_code)]
     subcompositor: *mut c_void,
@@ -1169,6 +1203,11 @@ pub struct WaylandWindow {
     /// one goes.
     open_web_view_dialogs: AtomicI32,
     text_overlay_visible: AtomicBool,
+    /// Whether the canvas may be lowered yet. See [`WaylandWindow::reconcile_stacking`].
+    stacking_gate: Mutex<cordial_shell::stacking_gate::Gate>,
+    /// Whether the compositor has `wp_presentation`, so GDK's frame timings can
+    /// say a frame reached the screen.
+    presentation_reported: bool,
     text_overlay_cache:
         Mutex<Option<(u32, u64, String, i32, cordial_linker_sys::game_activity::RawTextBoxInfo)>>,
     /// What `nativeGetTextBoxInfo` last said, for the focus generation it said
@@ -1237,6 +1276,11 @@ impl Placed {
 struct LastPlacement {
     info: cordial_linker_sys::game_activity::RawTextBoxInfo,
     at: std::time::Instant,
+    /// The canvas size this rectangle was accepted under, so a later ask that
+    /// answers with the exact same numbers under a *different* canvas size can
+    /// be told apart from a genuinely unmoved box -- see
+    /// [`WaylandWindow::resolve_textbox_geometry`]'s stale-repeat check.
+    canvas: (i32, i32),
 }
 
 /// One focus generation's worth of polling state for
@@ -1258,6 +1302,27 @@ struct PolledTextBoxInfo {
     /// The last answer good enough to place an editor from, if there has been
     /// one. `None` while the engine is still saying null or still mid-layout.
     usable: Option<cordial_linker_sys::game_activity::RawTextBoxInfo>,
+    /// A nonzero rectangle seen on the most recent ask, not yet committed to
+    /// `usable` because it has not been confirmed by a second, matching ask.
+    ///
+    /// Exists because of the search modal's own opening animation, measured
+    /// 2026-09-24: focusing it drives `property_generation` forward on every
+    /// resized frame, which bypasses `POLL_INTERVAL` below by that field's own
+    /// design, so this function is asked dozens of times a second while the
+    /// modal grows and every ask returns a slightly different rectangle
+    /// (`x=427 w=455` down through many intermediate steps to the settled
+    /// `x=332 w=592`, over roughly 700ms in that measurement). Committing
+    /// each one to `usable` immediately paints the editor at every
+    /// intermediate frame of the animation, narrower and offset from where
+    /// the box actually ends up -- which is what a first click's editor
+    /// "sitting above the box" turned out to be, not a stale cache or the
+    /// wrong source. Requiring the same rectangle twice in a row before
+    /// committing it waits out the animation instead of drawing every frame
+    /// of it; `resolve_textbox_geometry`'s carry-over keeps the previous
+    /// box's placement on screen for that whole window, which is already this
+    /// file's "hold still rather than jump" behaviour for a zero spec, simply
+    /// extended to a nonzero one that has not settled yet.
+    pending: Option<cordial_linker_sys::game_activity::RawTextBoxInfo>,
 }
 // SAFETY: every raw pointer field is either a `libwayland-client` proxy (only
 // ever touched from the single input-pump thread, matching the file-level
@@ -1298,6 +1363,11 @@ struct Globals {
     text_input_manager: Option<(u32, u32)>,
     pointer_constraints: Option<(u32, u32)>,
     relative_pointer_manager: Option<(u32, u32)>,
+    /// Only whether it exists, never bound: GDK binds `wp_presentation` for the
+    /// window's own frames, and the question here is whether GDK's frame
+    /// timings can report a presentation at all. See
+    /// `HostWindow::present_probe_committed`.
+    presentation: bool,
 }
 
 unsafe extern "C" fn registry_global(
@@ -1321,6 +1391,7 @@ unsafe extern "C" fn registry_global(
         "zwp_text_input_manager_v3" => globals.text_input_manager = Some((name, version)),
         "zwp_pointer_constraints_v1" => globals.pointer_constraints = Some((name, version)),
         "zwp_relative_pointer_manager_v1" => globals.relative_pointer_manager = Some((name, version)),
+        "wp_presentation" => globals.presentation = true,
         _ => {}
     }
 }
@@ -1336,6 +1407,68 @@ unsafe extern "C" fn registry_global_remove(_data: *mut c_void, _registry: *mut 
 static REGISTRY_LISTENER: RegistryListener =
     RegistryListener { global: registry_global, global_remove: registry_global_remove };
 
+/// Give the canvas `wl_surface` something GDK's touch handler can hold.
+///
+/// **Issue #36: any touch on the engine's canvas killed the client with
+/// SIGSEGV in `gdk_surface_handle_event`, reproduced on GTK 4.22.4 with a touch
+/// injected by `tools/touch-compositor`.** GDK's `touch_handle_down` stores
+/// `wl_surface_get_user_data(surface)` as the contact's surface and builds a
+/// `GDK_TOUCH_BEGIN` on it without asking whether it is a `GdkSurface`.
+/// `pointer_handle_enter` and `keyboard_handle_enter` both do ask, which is why
+/// the canvas -- a plain `wl_surface` this file made, with no user data --
+/// has never troubled the pointer. A touch on it therefore queued an event
+/// whose surface was NULL (**INFERRED** from the 4.22 source; the fault site
+/// and the cure are measured), and the main loop dereferenced it on the next
+/// iteration, inside `HostWindow::pump`. `CORDIAL_NO_TOUCH=1` cannot prevent
+/// it: that stops this file binding its own `wl_touch`, and GDK binds one
+/// regardless -- the crash was reproduced with it set.
+///
+/// The stand-in is a toplevel `GdkSurface` that is never presented. GTK has
+/// no widget for it, so a touch on the canvas is queued against it and
+/// dropped, which is what ought to happen to a contact on a surface GTK does
+/// not draw; the engine still gets the touch from this file's own `wl_touch`,
+/// which filters by `wl_surface` pointer and never consults the user data.
+///
+/// **What this does to the pointer, measured.** The canvas used to fail GDK's
+/// `GDK_IS_SURFACE` check on pointer enter and be ignored. With a user data it
+/// passes, so GDK now takes pointer focus on the stand-in while the pointer is
+/// over the canvas, and drops the events that follow because GTK has no widget
+/// for it. The one visible difference is on the wire:
+/// `tools/touch-compositor/touch-e2e.py --pointer-only` records the
+/// `wl_pointer.set_cursor` requests, and where only this file's pointer sent one
+/// over the canvas before, GDK's pointer now sends one as well, after it. That
+/// is why the stand-in carries the `none` cursor: GDK attaches a NULL buffer for
+/// it, so both requests hide the cursor. **INFERRED for a real cursor theme:**
+/// the headless sway used for the measurement draws no arrow in any state, so
+/// the two outcomes could not be told apart there, and the claim rests on GDK's
+/// `_gdk_wayland_cursor_get_buffer` returning NULL for `none`.
+///
+/// The alternatives were worse. The toplevel's own `GdkSurface` would have GTK
+/// hit-test canvas coordinates against the header bar and click whatever sits
+/// under them. An empty input region on the canvas is the change
+/// `set_engine_stacking` records as reverted, because a click then falls
+/// through to the window behind.
+fn attach_touch_stand_in(
+    wl: &WlClient,
+    host: &cordial_shell::host_window::HostWindow,
+    canvas: *mut c_void,
+) -> TouchStandIn {
+    use gtk4::glib::prelude::ObjectType;
+    use gtk4::prelude::{SurfaceExt, WidgetExt};
+    let stand_in = gtk4::gdk::Surface::new_toplevel(&host.window().display());
+    // Hidden, because GDK sets the cursor for whichever surface holds its
+    // pointer focus and a surface with none gets the default arrow -- which
+    // lands after this file's own `hide_pointer` and puts the system cursor
+    // back over the engine's own.
+    stand_in.set_cursor(gtk4::gdk::Cursor::from_name("none", None).as_ref());
+    // SAFETY: `canvas` is the live `wl_surface` proxy created in `open`, and
+    // the pointer stored is the `GdkSurface` just made, which `TouchStandIn`
+    // keeps alive for the life of the process. GDK only ever compares and
+    // dereferences it as a `GdkSurface`.
+    unsafe { (wl.set_user_data)(canvas, stand_in.as_ptr() as *mut c_void) };
+    TouchStandIn(stand_in)
+}
+
 pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWindow, String> {
     if let Some(w) = WINDOW.get() {
         return Ok(w);
@@ -1346,6 +1479,10 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     // `xdg_toplevel`, draws the header bar and answers configure/ack; this
     // file's job starts at the content area and stops there. See the module
     // doc for why the engine's surface cannot live on a connection of its own.
+    // GTK reads GSK_RENDERER when the toplevel is realised, so the choice has
+    // to be made before `HostWindow` exists. It costs nothing to ask here: the
+    // probe has been running since startup.
+    cordial_shell::gtk_renderer::settle();
     cordial_shell::host_window::init_wayland()?;
     let host = cordial_shell::host_window::HostWindow::with_canvas(title, width as i32, height as i32);
 
@@ -1466,6 +1603,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     // all". Text entry simply will not compose through an IME on such a
     // compositor, which is reported once, not hidden.
     let text_input_manager_global = globals.text_input_manager;
+    let presentation_reported = globals.presentation;
     if text_input_manager_global.is_none() {
         eprintln!(
             "[android] wayland: compositor advertises no zwp_text_input_manager_v3; \
@@ -1566,6 +1704,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
     if surface.is_null() {
         return Err("wl_compositor.create_surface failed".into());
     }
+    let touch_stand_in = attach_touch_stand_in(&wl, &host, surface);
     let subsurface = unsafe {
         (wl.marshal_flags)(
             subcompositor,
@@ -1627,6 +1766,26 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         }
     } else {
         eprintln!("[android] wayland: the seat advertises no keyboard; running without one");
+        std::ptr::null_mut()
+    };
+    // The frame-watching pointer, Hyprland only and only when the drag lock is
+    // wanted there: a second seat object at version 5, because the first is
+    // version 1 and a version 1 pointer is sent no frames. See [`DragHold`].
+    let watch_pointer = if on_hyprland()
+        && drag_lock_allowed(true, std::env::var("CORDIAL_DRAG_LOCK").ok().as_deref())
+        && !no_drag_lock()
+        && caps & WL_SEAT_CAPABILITY_POINTER != 0
+        && seat_ver >= 5
+    {
+        let watch_seat = bind(seat_name, 5, seat_ver, unsafe { &*wl.seat_interface }, "wl_seat");
+        if watch_seat.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                (wl.marshal_flags)(watch_seat, WL_SEAT_GET_POINTER, wl.pointer_interface, 5, 0, std::ptr::null_mut::<c_void>())
+            }
+        }
+    } else {
         std::ptr::null_mut()
     };
     // The touchscreen, on the same terms and for the same protocol reason:
@@ -1753,6 +1912,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         egl,
         display,
         host: HostWindowCell(host),
+        _touch_stand_in: touch_stand_in,
         compositor,
         subcompositor,
         surface,
@@ -1788,6 +1948,10 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         active_handle: AtomicI64::new(0),
         open_web_view_dialogs: AtomicI32::new(0),
         text_overlay_visible: AtomicBool::new(false),
+        stacking_gate: Mutex::new(cordial_shell::stacking_gate::Gate::new(
+            cordial_shell::stacking_gate::Mode::from_env(),
+        )),
+        presentation_reported,
         text_overlay_cache: Mutex::new(None),
         polled_textbox_info: Mutex::new(None),
         last_placement: Mutex::new(None),
@@ -1836,6 +2000,22 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
         }
     });
 
+    // **Enter on a single-line box, which is an editor action rather than text.**
+    //
+    // GTK's `activate` is Android's IME action listener: the final text goes
+    // to the engine first, then the engine is told Enter was pressed on this
+    // box. What follows -- focus released through `hideKeyboard`, the text
+    // cleared or kept through `onLuaTextBoxChangedCallback` -- is the
+    // engine's answer, and nothing here second-guesses it. A multi-line box
+    // never reaches this: its Enter is a newline GTK inserts and
+    // `connect_editor_changed` above syncs like any other edit.
+    host.host.0.connect_editor_activate(|| {
+        let Some(w) = WINDOW.get() else { return };
+        let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else { return };
+        w.send_current_text(which);
+        super::input::return_pressed(which);
+    });
+
     // Listeners that dereference `current()` can only be installed now.
     unsafe {
         if !pointer.is_null() {
@@ -1844,6 +2024,19 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
             // `hide_pointer`. Sending it at setup was wrong twice over: there
             // is no valid serial to send yet, and the request has to be
             // repeated on every enter regardless.
+        }
+        if !watch_pointer.is_null() {
+            (host.wl.add_listener)(
+                watch_pointer,
+                &WATCH_POINTER_LISTENER as *const PointerListener as *const c_void,
+                std::ptr::null_mut(),
+            );
+            FRAME_WATCH_ACTIVE.store(true, Ordering::Release);
+            println!(
+                "[android] wayland: Hyprland takes the camera button away when the pointer lock \
+                 activates and never reports its release; a version-5 pointer is watching for \
+                 the frame that does, so right-drag can hold the lock"
+            );
         }
         if !keyboard.is_null() {
             (host.wl.add_listener)(keyboard, &KEYBOARD_LISTENER as *const KeyboardListener as *const c_void, std::ptr::null_mut());
@@ -1867,6 +2060,10 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static WaylandWind
             );
         }
         (host.wl.flush)(display);
+    }
+
+    if !host.pointer_constraints.is_null() && !no_pointer_lock() && WaylandWindow::constrain_toplevel() {
+        host.host.0.set_canvas_in_input_region(true);
     }
 
     Ok(host)
@@ -2150,11 +2347,8 @@ impl WaylandWindow {
     /// site that will eventually be trusted to mean "just lowered it", which
     /// would be false the second time.
     pub fn webview_dialog_opened(&self) {
-        if self.open_web_view_dialogs.fetch_add(1, Ordering::SeqCst) == 0
-            && !self.text_overlay_visible.load(Ordering::SeqCst)
-        {
-            self.set_engine_stacking(false);
-        }
+        self.open_web_view_dialogs.fetch_add(1, Ordering::SeqCst);
+        self.reconcile_stacking();
         // **Claim the whole window for GTK while the dialog is up.**
         //
         // The parent's input region normally has the canvas rectangle punched
@@ -2192,11 +2386,8 @@ impl WaylandWindow {
     /// with two dialogs open, closing one must leave the engine hidden behind
     /// whichever is still up.
     pub fn webview_dialog_closed(&self) {
-        if self.open_web_view_dialogs.fetch_sub(1, Ordering::SeqCst) == 1
-            && !self.text_overlay_visible.load(Ordering::SeqCst)
-        {
-            self.set_engine_stacking(true);
-        }
+        self.open_web_view_dialogs.fetch_sub(1, Ordering::SeqCst);
+        self.reconcile_stacking();
         // Only on the last close. With two dialogs up, closing one must leave
         // the window claimed for the other -- the same edge the restack above
         // uses, and for the same reason.
@@ -2334,8 +2525,9 @@ impl WaylandWindow {
             // values are the ones observed on boxes that masked their text.
             // Roblox's own enum, not Android's `InputType` -- see the field.
             password: matches!(info.text_input_type, 5 | 9 | 10),
-            // Passed through and, for now, only *reported*. See `TextOverlay`.
+            // Picks the widget -- see `TextOverlay::multiline`.
             multiline: info.multiline != 0,
+            text_wrapped: info.text_wrapped != 0,
             // Only the placed bar draws its own chrome. An editor held at the
             // previous box's place is still sitting on a real field and must
             // not suddenly grow a background.
@@ -2349,11 +2541,8 @@ impl WaylandWindow {
             x_alignment: info.x_alignment,
             y_alignment: info.y_alignment,
         }));
-        if !self.text_overlay_visible.swap(true, Ordering::SeqCst)
-            && self.open_web_view_dialogs.load(Ordering::SeqCst) == 0
-        {
-            self.set_engine_stacking(false);
-        }
+        self.text_overlay_visible.store(true, Ordering::SeqCst);
+        self.reconcile_stacking();
     }
 
     /// Where to draw the editor when the engine never told us where the box is.
@@ -2448,31 +2637,99 @@ impl WaylandWindow {
             // below rather than waiting out the rest of the interval, which
             // is the whole reason `property_generation` is tracked at all.
             _ => {
-                *state = Some(PolledTextBoxInfo { generation, property_generation, asked: now, usable: None });
+                *state = Some(PolledTextBoxInfo {
+                    generation,
+                    property_generation,
+                    asked: now,
+                    usable: None,
+                    pending: None,
+                });
             }
         }
         let carried = state.as_ref().and_then(|p| p.usable);
-        let answer = match cordial_linker_sys::game_activity::textbox_info_now(native) {
+        let pending = state.as_ref().and_then(|p| p.pending);
+        let canvas = super::canvas_size();
+        // SAFETY: `native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        let fresh = match unsafe { cordial_linker_sys::game_activity::textbox_info_now(native) } {
             // **A zero height is the trap this call brings with it.** Asked on
             // the same pump tick as `showKeyboard`, the search modal answered
             // `x=596 y=10 w=42 h=0` -- caught mid-animation, expanding out of
             // the header search bar it replaces. Non-zero x, y and width make
             // it look like an answer; the zero height makes it invisible. Same
-            // test as the remembered spec gets, for the same reason.
-            Ok(Some(i)) if i.width > 0.0 && i.height > 0.0 => Some(i),
-            // Null is ordinary, not a failure: it is what the whole sign-in
-            // page answers. Keep whatever the last poll found rather than
-            // dropping an editor that is currently placed correctly.
-            Ok(_) => carried,
+            // test as the remembered spec gets, for the same reason. A rectangle
+            // that does not fit the current canvas at all gets the same
+            // treatment, for the reason `info_fits_canvas` documents: this same
+            // native answered a since-resized window's old geometry, unchanged,
+            // on the real GNOME session.
+            Ok(Some(i)) if i.width > 0.0 && i.height > 0.0 && Self::info_fits_canvas(&i, canvas) => Some(i),
+            Ok(_) => None,
             Err(e) => {
                 if super::input::trace_text() {
                     eprintln!("[cordial] nativeGetTextBoxInfo failed: {e}");
                 }
-                carried
+                None
             }
         };
-        *state = Some(PolledTextBoxInfo { generation, property_generation, asked: now, usable: answer });
+        // **Confirm before committing.** `fresh` may be one frame of the
+        // modal's own opening animation rather than its resting place -- see
+        // `PolledTextBoxInfo::pending`'s doc comment. Only a rectangle that
+        // repeats on two consecutive asks is trusted enough to place an
+        // editor from; a still-moving one is held as `pending` and the
+        // previous commit (or the carry-over above it, if there has not been
+        // one yet) keeps the editor on screen meanwhile, same as a genuinely
+        // unusable spec always has.
+        let (answer, new_pending) = match fresh {
+            Some(i) if pending == Some(i) => (Some(i), Some(i)),
+            Some(i) => (carried, Some(i)),
+            // A null answer is ordinary -- it is what the whole sign-in page
+            // answers -- and unrelated to the animation this gate is for, so
+            // it neither confirms nor restarts a pending rectangle; it only
+            // keeps whatever was already committed rather than dropping an
+            // editor that is currently placed correctly.
+            None => (carried, pending),
+        };
+        *state = Some(PolledTextBoxInfo {
+            generation,
+            property_generation,
+            asked: now,
+            usable: answer,
+            pending: new_pending,
+        });
         answer
+    }
+
+    /// Whether a reported rectangle could plausibly belong to the window as it
+    /// is *now*, rather than as it was the last time the engine answered.
+    ///
+    /// **Why this exists.** `nativeGetTextBoxInfo` answers from the engine's
+    /// own idea of where the box is, and that idea does not update on a mere
+    /// resize -- confirmed on the real GNOME session, 2026-09-28: focus a box
+    /// fullscreen at 3440x1440 (placed at `x=1550`, dead centre of that
+    /// width), leave fullscreen without losing focus, and the engine keeps
+    /// answering `x=1550` in the new 1280-wide window -- 270px past the right
+    /// edge. Cordial has no way to *tell* the engine a box lost focus (no
+    /// native for it), so the only lever here is whether to *believe* the
+    /// number, and a rectangle that does not fit inside the current canvas at
+    /// all cannot be this window's honest answer.
+    ///
+    /// A generous margin rather than an exact bound: the sign this exists to
+    /// catch is a rectangle that is grossly outside the canvas (planted from a
+    /// since-resized window), not a few pixels of legitimate overhang from
+    /// rounding. `(0, 0)` -- no canvas yet -- passes everything, the same
+    /// "nothing to compare against, so do not guess" rule
+    /// [`super::canvas_size`] documents for itself.
+    fn info_fits_canvas(
+        info: &cordial_linker_sys::game_activity::RawTextBoxInfo,
+        (canvas_w, canvas_h): (i32, i32),
+    ) -> bool {
+        if canvas_w <= 0 || canvas_h <= 0 {
+            return true;
+        }
+        const MARGIN: f32 = 8.0;
+        info.x >= -MARGIN
+            && info.y >= -MARGIN
+            && info.x + info.width <= canvas_w as f32 + MARGIN
+            && info.y + info.height <= canvas_h as f32 + MARGIN
     }
 
     /// Where the focused box is, from the best source that will answer.
@@ -2498,13 +2755,33 @@ impl WaylandWindow {
         /// on screen.
         const CARRY_OVER: std::time::Duration = std::time::Duration::from_millis(1_500);
 
+        let canvas = super::canvas_size();
         let found = match cordial_linker_sys::game_activity::focused_textbox_info() {
-            Some(info) if info.width > 0.0 && info.height > 0.0 => Some(info),
+            Some(info) if info.width > 0.0 && info.height > 0.0 && Self::info_fits_canvas(&info, canvas) => {
+                Some(info)
+            }
             _ => self.polled_textbox_info(generation),
         };
         let mut last = self.last_placement.lock().unwrap_or_else(|e| e.into_inner());
+        // **A repeat under a different canvas is not confirmation, it is the
+        // same staleness `info_fits_canvas` cannot see.** That check only
+        // catches a rectangle that no longer fits *at all* -- the fullscreen
+        // case, going back to a smaller window. Going the other way, a
+        // windowed rectangle placed well inside a since-fullscreened canvas
+        // still fits it easily, and passes, while being just as wrong: on the
+        // real GNOME session, focusing at `x=470` in a 1280-wide window and
+        // then entering fullscreen (3440 wide) kept answering `x=470`
+        // indefinitely, and the editor sat near the top-left corner instead of
+        // the re-laid-out field. The engine has no native to tell it a box
+        // lost focus, so the only signal available here is exactly this: the
+        // *identical* rectangle, bit for bit, surviving a canvas size it was
+        // never placed under.
+        let found = match (found, last.as_ref()) {
+            (Some(info), Some(p)) if info == p.info && p.canvas != canvas => None,
+            (found, _) => found,
+        };
         if let Some(info) = found {
-            *last = Some(LastPlacement { info, at: std::time::Instant::now() });
+            *last = Some(LastPlacement { info, at: std::time::Instant::now(), canvas });
             return (info, Placed::Engine);
         }
         // **Hold still rather than jump.** Clicking the home search bar opens a
@@ -2531,12 +2808,14 @@ impl WaylandWindow {
                 *self.text_overlay_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 *LAST_EDITOR_RECT.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 self.host.0.set_text_overlay(None);
-                if self.open_web_view_dialogs.load(Ordering::SeqCst) == 0 {
-                    self.set_engine_stacking(true);
-                }
+                self.reconcile_stacking();
             }
             return;
         };
+        // Before the revision is read, because applying the engine's text is
+        // what moves it -- reading first would draw the old text for one more
+        // tick, and an engine-side clear would show a tick late.
+        super::input::apply_engine_text();
         let generation = cordial_linker_sys::game_activity::textbox_generation();
         let revision = super::input::text_buffer_revision();
         // **A missing spec is not a reason to draw nothing.**
@@ -2668,6 +2947,79 @@ impl WaylandWindow {
         );
     }
 
+    /// Bring the canvas's stacking in line with what wants it out of the way,
+    /// one step at a time.
+    ///
+    /// **The canvas is lowered only once the compositor holds a GTK frame that
+    /// can be seen through, and this is what waits for it -- issue #53.** The
+    /// restack used to be issued straight after a 40 ms wait that logged its
+    /// own failure and carried on. On a KWin session that produced a grey
+    /// screen for as long as the box was focused: GTK never attached a buffer
+    /// to the window surface in that time, so the compositor went on showing
+    /// the last one, which was opaque, with the canvas now beneath it.
+    ///
+    /// Called on every edge (an editor or dialog appearing or leaving) and on
+    /// every pump tick, because arming, waiting and retrying are spread over
+    /// ticks rather than blocking one. The decision itself is
+    /// [`cordial_shell::stacking_gate::Gate`], which has the tests; this is
+    /// the part that touches GTK and the wire.
+    ///
+    /// **Why not lower first and repair afterwards, or keep the window
+    /// permanently transparent:** either leaves the compositor showing a stale
+    /// opaque buffer if GTK stops presenting, and the second is the invisible
+    /// window 5a295e3 had to fix. Waiting is the only ordering that fails to
+    /// *the game staying visible*, with an editor that does not appear, which
+    /// is a smaller fault than a screen that is grey until the box blurs.
+    fn reconcile_stacking(&self) {
+        use cordial_shell::stacking_gate::Step;
+        let want_below = self.text_overlay_visible.load(Ordering::SeqCst)
+            || self.open_web_view_dialogs.load(Ordering::SeqCst) > 0;
+        let mut gate = self.stacking_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let committed = gate.is_arming()
+            && self.host.0.present_probe_committed(self.presentation_reported);
+        let step = gate.poll(want_below, std::time::Instant::now(), committed);
+        // Released before anything below runs. `set_engine_stacking` calls
+        // back into GTK, which can run a callback that reaches this function.
+        drop(gate);
+        match step {
+            Step::Idle => {}
+            Step::Arm => {
+                self.host.0.arm_present_probe();
+                if super::input::trace_text() {
+                    println!("[android] wayland: canvas lowering armed, waiting for a GTK frame");
+                }
+            }
+            Step::Lower => {
+                // Legacy mode arrives here without having armed anything, and
+                // keeps the old order: transparent, repaint, then restack.
+                let prepared = self.host.0.is_probe_armed();
+                if prepared {
+                    println!(
+                        "[android] wayland: GTK committed a frame ({}); lowering the canvas",
+                        self.host.0.present_probe_report()
+                    );
+                    self.host.0.disarm_present_probe(false);
+                }
+                self.set_engine_stacking(false, prepared);
+            }
+            Step::GiveUp { attempt } => {
+                let report = self.host.0.present_probe_report();
+                self.host.0.disarm_present_probe(true);
+                // The first, then every tenth: a GTK that is not presenting is
+                // retried once a second for as long as the box has focus, and a
+                // line each time would bury everything else in the log.
+                if attempt == 1 || attempt % 10 == 0 {
+                    println!(
+                        "[android] wayland: GTK committed no frame within {} ms of being asked (attempt {attempt}; {report}); the canvas stays above the window so the game stays visible, and the editor cannot be seen until GTK presents. GSK_RENDERER=cairo takes GTK off the GL path if that is the cause",
+                        cordial_shell::stacking_gate::CONFIRM_TIMEOUT.as_millis(),
+                    );
+                }
+            }
+            Step::Cancel => self.host.0.disarm_present_probe(true),
+            Step::Raise => self.set_engine_stacking(true, false),
+        }
+    }
+
     /// Reorder the engine's subsurface relative to `parent_surface` — the
     /// only other member of this window's subsurface stack, and so the only
     /// valid reference for `place_above`/`place_below` to name (see the
@@ -2678,6 +3030,10 @@ impl WaylandWindow {
     /// of no dialog open. `above = false` is the fix: GTK's content,
     /// including anything an `AdwDialog` drew into it, shows through instead.
     ///
+    /// **Not to be called directly to lower.** [`Self::reconcile_stacking`]
+    /// decides when that is safe; `prepared` says it has already made the
+    /// window transparent and seen GTK commit a frame that way.
+    ///
     /// Follows `sync_canvas_geometry`'s own fix for the same double-buffering
     /// hazard `set_position` has: the reorder is pending on the *subsurface*
     /// but does not take effect until the *parent's* next commit, and asking
@@ -2685,7 +3041,7 @@ impl WaylandWindow {
     /// (see that function's "issue #7" comment) — so this commits
     /// `parent_surface` directly as well, the same belt-and-braces the
     /// geometry sync already needed.
-    fn set_engine_stacking(&self, above: bool) {
+    fn set_engine_stacking(&self, above: bool, prepared: bool) {
         // The window has to stop painting its own background over the canvas
         // for a lowered engine to be visible at all -- punching the opaque
         // region is not enough, because GTK's pixels are still there. Measured:
@@ -2695,18 +3051,21 @@ impl WaylandWindow {
         // **Order matters, and getting it wrong costs a visible frame.**
         //
         // Going *down*, the background must already be transparent when the
-        // restack lands: a CSS class change is honoured on GTK's next frame
-        // while the restack and the parent commit below go out immediately, so
+        // restack lands: a CSS class change is honoured on GTK's next frame while
+        // the restack and the parent commit below go out immediately, so
         // doing them in the written order hands the compositor "the canvas is
         // underneath now" together with a parent buffer that is still opaque.
         // The engine vanishes for exactly one frame and comes back when GTK
         // next paints -- reported as "once you press it, roblox disappears for
-        // a frame then reappears".
+        // a frame then reappears". `reconcile_stacking` has established that
+        // by the time `prepared` is true, and by more than a bounded wait.
         //
         // Going *up* the same reasoning runs backwards: restack first, and the
         // canvas is opaque and covering before the background stops being
         // transparent, so there is no frame where the desktop shows through.
-        if !above {
+        if !above && !prepared {
+            // `CORDIAL_STACKING_GATE=off`: the ordering as it was before #53,
+            // kept as the control for a before-and-after on one binary.
             self.host.0.set_canvas_see_through(true);
             self.host.0.repaint_now();
         }
@@ -2729,28 +3088,90 @@ impl WaylandWindow {
         }
         self.host.0.queue_commit();
         if !above {
-            // **Say "nothing here is opaque" ourselves, in the same commit as
-            // the restack.**
+            // **Say what is actually opaque ourselves, in the same commit as
+            // the restack -- not "nothing", the whole surface minus the
+            // canvas.**
             //
-            // Cordial already asks GDK for this through
-            // `set_opaque_region(None)`, and the game still went black in an
-            // experience with every other explanation eliminated -- GTK
-            // painting (every descendant forced transparent), the CSS class
-            // (instrumented identical), a stale region (fixed), frame
+            // Cordial already asks GDK for the canvas-shaped punch-out through
+            // `HostWindow::refresh_opaque_region`, and the game still went
+            // black in an experience with every other explanation eliminated
+            // -- GTK painting (every descendant forced transparent), the CSS
+            // class (instrumented identical), a stale region (fixed), frame
             // starvation (200ms of pumping). What none of those could rule out
             // is GDK recomputing its own region and committing it after ours,
             // because that happens inside GTK where this code cannot see.
             //
-            // Sending it on the wire here removes the question. The request is
-            // double-buffered like everything else, so landing it immediately
-            // before the commit below means the compositor applies an empty
-            // opaque region and the `place_below` together, with no window in
-            // which the parent claims to be opaque over a lowered canvas.
+            // This used to send a blanket empty region here to remove the
+            // question, which does remove it -- at the cost of telling the
+            // compositor the header bar and every other pixel of the parent
+            // are *also* possibly transparent, for as long as nothing
+            // afterwards corrects it. GTK keeps painting the header bar
+            // solidly regardless (`headerbar` is deliberately left out of the
+            // `cordial-canvas-below` CSS class), so the visible result was a
+            // header bar the compositor was free to blend with whatever is
+            // behind the window -- reported as the title bar turning
+            // translucent the instant a text box took focus, and it stayed
+            // that way because nothing re-triggers a geometry sync while the
+            // box remains focused and the window sits still.
             //
+            // `HostWindow::opaque_region_rects` computes the exact same
+            // corner-safe, canvas-subtracted shape `refresh_opaque_region`
+            // asks GDK for, as plain rectangles, precisely so this raw send
+            // does not have to choose between "trust GDK's timing" and "claim
+            // nothing everywhere". An empty list (no canvas rectangle yet, no
+            // window size) still means "claim nothing", the same fallback
+            // `refresh_opaque_region` itself uses.
+            //
+            // SAFETY: `parent_surface` and `compositor` are GTK's own proxies,
+            // live for the process's lifetime. `create_region`'s signature is
+            // "n" -- one new-id, returned as the proxy. `add`'s is "iiii" --
+            // four `int32`s, the rectangle. `set_opaque_region`'s is "?o" --
+            // one nullable object. `destroy` takes no arguments and, combined
+            // with `WL_MARSHAL_FLAG_DESTROY`, also frees the local proxy.
+            let rects = self.host.0.opaque_region_rects();
+            let region = if rects.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                // SAFETY: `compositor` is GTK's own bound proxy, live for the
+                // process's lifetime. `create_region`'s signature is "n" -- one
+                // new-id and no other argument -- so the returned pointer is
+                // the new region proxy.
+                let region = unsafe {
+                    (self.wl.marshal_flags)(
+                        self.compositor,
+                        WL_COMPOSITOR_CREATE_REGION,
+                        self.wl.region_interface,
+                        1,
+                        0,
+                        std::ptr::null_mut::<c_void>(),
+                    )
+                };
+                if !region.is_null() {
+                    for (x, y, w, h) in rects {
+                        // SAFETY: `region` was just created above and is not
+                        // shared with anything else yet. `add`'s signature is
+                        // "iiii" -- four `int32`s, the rectangle.
+                        unsafe {
+                            (self.wl.marshal_flags)(
+                                region,
+                                WL_REGION_ADD,
+                                std::ptr::null(),
+                                1,
+                                0,
+                                x,
+                                y,
+                                w,
+                                h,
+                            );
+                        }
+                    }
+                }
+                region
+            };
             // SAFETY: `parent_surface` is GTK's toplevel `wl_surface`, live for
             // the process's lifetime. `set_opaque_region`'s signature is "?o" --
-            // one nullable object -- and a null region is the protocol's own
-            // spelling of "empty".
+            // one nullable object, and `region` is either that new proxy or
+            // null, both valid spellings of the argument.
             unsafe {
                 (self.wl.marshal_flags)(
                     self.parent_surface,
@@ -2758,8 +3179,24 @@ impl WaylandWindow {
                     std::ptr::null(),
                     1,
                     0,
-                    std::ptr::null_mut::<c_void>(),
+                    region,
                 );
+            }
+            if !region.is_null() {
+                // SAFETY: `region` is a live proxy this function alone created
+                // and is about to stop using. `destroy` takes no arguments,
+                // and `WL_MARSHAL_FLAG_DESTROY` frees the local proxy in the
+                // same call as sending the request, so it is not touched again.
+                unsafe {
+                    (self.wl.marshal_flags)(
+                        region,
+                        WL_REGION_DESTROY,
+                        std::ptr::null(),
+                        1,
+                        WL_MARSHAL_FLAG_DESTROY,
+                        std::ptr::null_mut::<c_void>(),
+                    );
+                }
             }
         }
         // SAFETY: `self.parent_surface` is GTK's toplevel `wl_surface`, live
@@ -2926,6 +3363,11 @@ impl WaylandWindow {
         unpack_pointer_position(self.pointer_pos.load(Ordering::Acquire))
     }
 
+    fn canvas_centre(&self) -> (f32, f32) {
+        let (w, h, _) = self.geometry();
+        (w as f32 / 2.0, h as f32 / 2.0)
+    }
+
     fn dispatch_pointer_motion(&self, x: f32, y: f32) {
         self.set_pointer_position(x, y);
         let handle = self.active_handle.load(Ordering::Relaxed);
@@ -2940,16 +3382,40 @@ impl WaylandWindow {
         super::input::pass_mouse_move(x, y);
     }
 
-    /// Deliver a release for every button this side still thinks is down.
-    ///
-    /// Called when the pointer leaves the canvas, where no real release will
-    /// arrive. Goes through `dispatch_pointer_button` rather than clearing the
-    /// mask directly so the engine sees exactly the events it would have seen
-    /// had the user released on the canvas -- a bitmask cleared behind the
-    /// engine's back leaves the two disagreeing, which is the same bug one
-    /// layer down.
+    /// Release stranded buttons after dispatching the pending Wayland events.
+    /// A canvas leave can be followed by a toplevel lock in the same batch;
+    /// releasing inside that callback cuts off a held fire or aim button.
+    fn reconcile_pointer_buttons(&self) {
+        // A release set aside with no `leave` behind it was the player's, and a
+        // hold whose lock never arrived has waited long enough.
+        let due = drag_hold().batch_end(
+            self.now_ms(),
+            POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+            LAST_COUNTED_EVENT_MS.load(Ordering::Relaxed),
+        );
+        if due != 0 {
+            self.release_buttons(due);
+        }
+        let owns_pointer = pointer_event_is_the_engines(
+            POINTER_ON_CANVAS.load(Ordering::Acquire),
+            POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+        ) || drag_hold().holding();
+        if !owns_pointer || dialog_in_front(self) || self.host.0.focused() == Some(false) {
+            self.release_held_buttons();
+        }
+    }
+
+    /// Tell the engine about each release before forgetting the held mask.
+    /// Clearing only our copy leaves the engine firing or dragging after focus
+    /// loss, with no real release left to correct it.
     fn release_held_buttons(&self) {
         let held = self.pointer_buttons.load(Ordering::Relaxed);
+        self.release_buttons(held);
+    }
+
+    /// Release each of the buttons in `mask` that is believed down.
+    fn release_buttons(&self, mask: i32) {
+        let held = self.pointer_buttons.load(Ordering::Relaxed) & mask;
         if held == 0 {
             return;
         }
@@ -2962,7 +3428,7 @@ impl WaylandWindow {
         ] {
             if held & button != 0 {
                 if super::input::trace_mouse() {
-                    eprintln!("[cordial] pointer left the canvas holding {button}; releasing it");
+                    eprintln!("[cordial] pointer ownership lost holding {button}; releasing it");
                 }
                 self.dispatch_pointer_button(button, false);
             }
@@ -2980,30 +3446,42 @@ impl WaylandWindow {
             if before == 0 {
                 self.down_time_ms.store(now, Ordering::Relaxed);
             }
-            let buttons = self.pointer_buttons.load(Ordering::Relaxed);
             let down_time = self.down_time_ms.load(Ordering::Relaxed);
             if handle != 0 {
-                super::input::deliver_mouse(handle, super::input::ACTION_DOWN, x, y, buttons, 0, now, down_time);
-                super::input::deliver_mouse(
-                    handle, super::input::ACTION_BUTTON_PRESS, x, y, buttons, android_button, now, down_time,
-                );
+                super::input::deliver_mouse_button(handle, true, before, android_button, x, y, now, down_time);
             }
         } else {
-            self.pointer_buttons.fetch_and(!android_button, Ordering::Relaxed);
-            let buttons = self.pointer_buttons.load(Ordering::Relaxed);
-            LAST_POINTER_BUTTONS.store(buttons, Ordering::Relaxed);
+            drag_hold().forget(android_button);
+            let before = self.pointer_buttons.fetch_and(!android_button, Ordering::Relaxed);
+            LAST_POINTER_BUTTONS.store(before & !android_button, Ordering::Relaxed);
             let down_time = self.down_time_ms.load(Ordering::Relaxed);
             if handle != 0 {
-                super::input::deliver_mouse(
-                    handle, super::input::ACTION_BUTTON_RELEASE, x, y, buttons, android_button, now, down_time,
-                );
-                super::input::deliver_mouse(handle, super::input::ACTION_UP, x, y, buttons, 0, now, down_time);
+                super::input::deliver_mouse_button(handle, false, before, android_button, x, y, now, down_time);
             }
         }
 
         // Every button, not only the primary one. The gate that used to stand
         // here dropped right and middle before they reached Roblox's own input
         // path, and a right-button drag is how a mouse turns the camera.
+        //
+        // **This is also why a right press outside a focused TextBox does not
+        // blur it, and that is left alone.** Measured live, signed in, on
+        // 2026-09-28: a left click outside a focused chat box blurs it
+        // (`cordial_textbox` reports `focus=none` immediately); a right
+        // press-drag-release at the same point leaves the box focused
+        // (`focus` unchanged, same generation). The line above shows there is
+        // no Cordial-side asymmetry to fix -- both buttons reach
+        // `nativePassMouseButton` the same way, at the same coordinate, and
+        // whether a click blurs a box is entirely the engine's own
+        // `hideKeyboard`/focus-loss decision (see the comment on the key path
+        // below this file's `pass_key_event` wrapper). `tools/sober-corpus`
+        // has nothing on point either way -- issues #723, #970, #1176 and
+        // #2106 are about unrelated focus and camera bugs -- so there is no
+        // evidence Roblox's own client blurs a TextBox on a secondary click,
+        // and forcing one here would be Cordial second-guessing the engine
+        // for a convention (primary button dismisses a text field, secondary
+        // does not) that holds on every desktop toolkit this side of the
+        // platform boundary. Not changed.
         super::input::pass_mouse_button(x, y, press, android_button);
 
         // Do not wait for the next pump to capture a camera drag. Pointer
@@ -3112,6 +3590,41 @@ const WHEEL_AXIS_STEP: f32 = 10.0;
 /// `hide_pointer` fired for it.
 static POINTER_ON_CANVAS: AtomicBool = AtomicBool::new(false);
 
+/// Whether a pointer event delivered on Cordial's own `wl_pointer` is the
+/// engine's to receive.
+///
+/// The canvas subsurface holds pointer focus while the pointer is over it, and
+/// [`POINTER_ON_CANVAS`] records that. But a confirmed lock that constrains the
+/// *toplevel* — KWin and Hyprland, see [`constrain_toplevel`] — moves pointer
+/// focus onto the parent window, so `POINTER_ON_CANVAS` reads false for as long
+/// as shift lock or first person holds the cursor. Gating a handler on the
+/// canvas alone therefore drops events that are plainly the engine's.
+///
+/// **That has now cost three separate features, one per commit.** It dropped
+/// every relative sample, leaving the camera frozen under a lock that had
+/// confirmed (issue #56, fixed in [`relative_pointer_motion`]). The same gate
+/// in [`pointer_button`] then dropped every click — the report was shift lock
+/// "and I can't click" — and in [`pointer_axis`] every scroll notch. A
+/// confirmed lock is the stronger proof of ownership: the cursor has nowhere
+/// else to be, so the event cannot belong to the header bar it cannot reach.
+///
+/// **The click half is measured; the scroll half is `INFERRED`.** Confirmed on
+/// Hyprland 0.56.2 on 2026-10-07: with shift lock engaged, a click that this
+/// gate had been swallowing now reaches the engine and the game acts on it.
+/// Scroll rides the identical gate and is reasoned from that alone, not
+/// separately observed. The readback for a repeat is the `nativePassMouseButton`
+/// line under `CORDIAL_TRACE_MOUSE=1`; the control is
+/// `CORDIAL_POINTER_LOCK_SURFACE=canvas`, where the lock never confirms on
+/// Hyprland and the pre-fix behaviour is what runs.
+fn pointer_event_is_the_engines(on_canvas: bool, lock_active: bool) -> bool {
+    on_canvas || lock_active
+}
+
+fn route_pointer_button(owns_pointer: bool, held: i32, button: i32, press: bool) -> bool {
+    let was_down = held & button != 0;
+    if press { owns_pointer && !was_down } else { was_down }
+}
+
 /// Whether a web-view dialog of Cordial's own is in front of the engine.
 ///
 /// **Stacking and input focus are decided separately, and only stacking was
@@ -3216,32 +3729,23 @@ unsafe extern "C" fn pointer_enter(
     w.dispatch_pointer_motion(fixed_to_f32(x), fixed_to_f32(y));
 }
 unsafe extern "C" fn pointer_leave(_data: *mut c_void, _pointer: *mut c_void, _serial: u32, _surface: *mut c_void) {
-    // **Let go of anything still held, before the canvas flag drops.**
-    //
-    // Wayland sends no button release on leave, and `pointer_button` below
-    // ignores events while the pointer is off the canvas -- so a button held
-    // as the pointer leaves is a bit in `pointer_buttons` that nothing ever
-    // clears. That bit is one of the two things `sync_pointer_lock` locks the
-    // pointer for, and it is gated on being back on the canvas, so the next
-    // time the pointer comes back the drag-lock engages with no button down
-    // and the camera is captured until something happens to clear it.
-    //
-    // Reported as shift lock that "sometimes won't undo ... so you're kinda
-    // stuck with it, then it works": the "then it works" is the next press and
-    // release on the canvas clearing the stale bit. The engine is told too,
-    // not just this side's bitmask, because it received the press and would
-    // otherwise go on believing the button is down -- which is the other half
-    // of a camera that will not let go.
-    //
-    // Synthesising the release is the correct platform behaviour rather than a
-    // workaround: the protocol guarantees no real one is coming, and Android's
-    // own answer to the same situation is ACTION_CANCEL.
-    if let Some(w) = current() {
-        w.release_held_buttons();
-    }
+    // A leave is not necessarily a lost gesture: the toplevel may be taking
+    // focus for a lock. Reconcile held buttons after the event batch, once its
+    // enter/locked/unlocked callbacks have supplied the new ownership state.
+    // INFERRED as the cause of intermittent shooting loss on Hyprland; the
+    // button routing is unit-tested, but this needs an in-experience repeat.
     POINTER_ON_CANVAS.store(false, Ordering::Release);
     super::input::reset_mouse_delta();
     super::input::forget_pending_unlocked_delta();
+    if let Some(w) = current() {
+        let promoted = drag_hold().left_canvas(w.now_ms());
+        if promoted != 0 && super::input::trace_mouse() {
+            eprintln!(
+                "[cordial] pointer lock: the canvas lost focus with the release ({promoted}); \
+                 that was the compositor's, so the drag is still held"
+            );
+        }
+    }
 }
 unsafe extern "C" fn pointer_motion(_data: *mut c_void, _pointer: *mut c_void, _time: u32, x: i32, y: i32) {
     if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
@@ -3262,27 +3766,68 @@ unsafe extern "C" fn pointer_button(
     button: u32,
     state: u32,
 ) {
-    if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
-        return;
-    }
     let Some(w) = current() else { return };
-    if dialog_in_front(&w) {
-        // Said once per press rather than per motion event, which would be a
-        // line per frame while the pointer moves over the dialog.
-        if super::input::trace_mouse() {
+    let Some(android_button) = linux_button_to_android(button) else { return };
+    let owns_pointer = pointer_event_is_the_engines(
+        POINTER_ON_CANVAS.load(Ordering::Acquire),
+        POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+    ) && !dialog_in_front(w);
+    // A press of a camera button already believed down means its release went
+    // by unseen -- the compositor took it, and the frame that would have said so
+    // did not arrive. Tell the engine now, or the press below is refused as a
+    // duplicate and the drag it starts never begins.
+    if state == 1 {
+        let stale = drag_hold().press(android_button);
+        if stale != 0 {
             eprintln!(
-                "[cordial] click withheld from the engine: a web-view dialog is in front"
+                "[android] wayland: a camera button was pressed that was still believed held \
+                 after the compositor released it for the lock; ending that drag first"
             );
+            w.dispatch_pointer_button(stale, false);
+        }
+    }
+    // A release belongs to whoever received its press, even if the lock or
+    // focus changed meanwhile. Conversely, a release for GTK's press is not
+    // an engine event, and a duplicate press must not restart a held gesture.
+    if !route_pointer_button(
+        owns_pointer,
+        w.pointer_buttons.load(Ordering::Relaxed),
+        android_button,
+        state == 1,
+    ) {
+        if state == 1 && dialog_in_front(w) && super::input::trace_mouse() {
+            eprintln!("[cordial] click withheld from the engine: a web-view dialog is in front");
         }
         return;
     }
-    let Some(android_button) = linux_button_to_android(button) else { return };
+    // Hyprland's release for a button held under a lock it is just activating:
+    // set aside until the `leave` that follows it says whose it was. See
+    // [`DragHold`].
+    if state == 0 {
+        let pending = !w.locked_pointer.lock().unwrap_or_else(|e| e.into_inner()).is_null()
+            && !POINTER_LOCK_ACTIVE.load(Ordering::Acquire);
+        if drag_hold().release(android_button, pending, FRAME_WATCH_ACTIVE.load(Ordering::Acquire)) {
+            if super::input::trace_mouse() {
+                eprintln!(
+                    "[cordial] pointer lock: camera button released while the lock is pending; \
+                     waiting to see whether the canvas loses focus with it"
+                );
+            }
+            return;
+        }
+    }
     w.dispatch_pointer_button(android_button, state == 1);
 }
 /// The scroll wheel. Filtered by surface like every other pointer event: the
 /// header bar is GTK's, and a scroll over it is not the engine's to see.
 unsafe extern "C" fn pointer_axis(_data: *mut c_void, _pointer: *mut c_void, _time: u32, axis: u32, value: i32) {
-    if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+    // Same toplevel-lock gap as `pointer_button`: scroll while shift lock or
+    // first person holds the cursor was dropped because the canvas no longer
+    // has pointer focus. See `pointer_event_is_the_engines`.
+    if !pointer_event_is_the_engines(
+        POINTER_ON_CANVAS.load(Ordering::Acquire),
+        POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+    ) {
         return;
     }
     if let Some(w) = current() {
@@ -3322,6 +3867,80 @@ static POINTER_LISTENER: PointerListener = PointerListener {
     axis_discrete: pointer_axis_discrete,
     axis_value120: pointer_axis_value120,
     axis_relative_direction: pointer_axis_relative_direction,
+};
+
+// -------------------------------------------------- the frame-watching pointer
+//
+// A second `wl_seat` bound at version 5, and a pointer taken from it, whose only
+// job is to receive `wl_pointer.frame`. Cordial's own pointer is version 1
+// because the seat it was taken from is, and a child object cannot be newer than
+// its parent; raising that seat would also change what the keyboard and touch
+// objects deliver, which is a separate change with its own testing. Binding a
+// global twice gives independent objects, so this one costs the others nothing.
+//
+// It exists for one fact: on Hyprland the physical release of a camera button
+// is never reported once the lock has activated, and a frame with nothing in
+// it is the only trace it leaves. See [`DragHold`].
+
+/// Every event other than `frame` counts as "something happened", because the
+/// question asked of a frame is only whether it closed an empty batch.
+unsafe extern "C" fn watch_enter(_: *mut c_void, _: *mut c_void, _: u32, _: *mut c_void, _: i32, _: i32) {
+    count_pointer_event();
+}
+unsafe extern "C" fn watch_leave(_: *mut c_void, _: *mut c_void, _: u32, _: *mut c_void) {
+    count_pointer_event();
+}
+unsafe extern "C" fn watch_motion(_: *mut c_void, _: *mut c_void, _: u32, _: i32, _: i32) {
+    count_pointer_event();
+}
+unsafe extern "C" fn watch_button(_: *mut c_void, _: *mut c_void, _: u32, _: u32, _: u32, _: u32) {
+    count_pointer_event();
+}
+unsafe extern "C" fn watch_axis(_: *mut c_void, _: *mut c_void, _: u32, _: u32, _: i32) {
+    count_pointer_event();
+}
+unsafe extern "C" fn watch_axis_source(_: *mut c_void, _: *mut c_void, _: u32) {
+    count_pointer_event();
+}
+unsafe extern "C" fn watch_axis_stop(_: *mut c_void, _: *mut c_void, _: u32, _: u32) {
+    count_pointer_event();
+}
+unsafe extern "C" fn watch_axis_discrete(_: *mut c_void, _: *mut c_void, _: u32, _: i32) {
+    count_pointer_event();
+}
+unsafe extern "C" fn watch_axis_value120(_: *mut c_void, _: *mut c_void, _: u32, _: i32) {
+    count_pointer_event();
+}
+unsafe extern "C" fn watch_axis_relative_direction(_: *mut c_void, _: *mut c_void, _: u32, _: u32) {
+    count_pointer_event();
+}
+unsafe extern "C" fn watch_frame(_: *mut c_void, _: *mut c_void) {
+    let events = EVENTS_SINCE_FRAME.swap(0, Ordering::AcqRel);
+    let Some(w) = current() else { return };
+    let released = drag_hold().frame(events, POINTER_LOCK_ACTIVE.load(Ordering::Acquire));
+    if released != 0 {
+        if super::input::trace_mouse() {
+            eprintln!(
+                "[cordial] pointer lock: a frame with no event in it while a camera button is \
+                 held for the lock ({released}); that is the physical release, ending the drag"
+            );
+        }
+        w.release_buttons(released);
+    }
+}
+
+static WATCH_POINTER_LISTENER: PointerListener = PointerListener {
+    enter: watch_enter,
+    leave: watch_leave,
+    motion: watch_motion,
+    button: watch_button,
+    axis: watch_axis,
+    frame: watch_frame,
+    axis_source: watch_axis_source,
+    axis_stop: watch_axis_stop,
+    axis_discrete: watch_axis_discrete,
+    axis_value120: watch_axis_value120,
+    axis_relative_direction: watch_axis_relative_direction,
 };
 
 // -------------------------------------------------------------------- touch
@@ -3601,6 +4220,226 @@ static SHIFT_DURING_RIGHT_DRAG: AtomicBool = AtomicBool::new(false);
 /// which is the same shape as the Escape latch this release just removed.
 static RIGHT_DRAG_LATCH_SINCE: AtomicI64 = AtomicI64::new(0);
 
+/// The camera buttons, as the bits `pointer_buttons` holds them in.
+const CAMERA_BUTTONS: i32 = super::input::BUTTON_SECONDARY | super::input::BUTTON_TERTIARY;
+
+/// How a camera drag survives the release Hyprland invents when its lock
+/// activates, and how the real release is found afterwards.
+///
+/// **The mechanism, read from Hyprland 0.56.2's source and then seen on the
+/// wire in a nested Hyprland.** Activating a lock on the toplevel moves pointer
+/// focus off the canvas subsurface, and `CWLPointerResource::sendLeave` answers
+/// a focus change by releasing every button that pointer had pressed, with the
+/// *current* time (not the press's: the reporter's trace showed the two equal
+/// only because they fell in the same millisecond). The pointer then holds no
+/// pressed buttons, so when the physical release comes
+/// `CWLPointerResource::sendButton` drops it as "a release on a non-pressed
+/// button" -- no `wl_pointer.button` ever arrives -- but
+/// `CInputManager::onMouseButton` still ends in `sendPointerFrame()`. A
+/// `wl_pointer.frame` with nothing in front of it is therefore the one thing
+/// that says the button came up.
+///
+/// So a camera-button release that arrives while the lock is still pending is
+/// *set aside* rather than delivered. If the canvas's `leave` follows in the
+/// same batch it was Hyprland's, and the drag carries on as held; if not it was
+/// the player's, and the batch's end delivers it. Once held, a frame carrying no
+/// event of any kind, seen after `locked`, is the physical release.
+///
+/// Pure bookkeeping, so every transition can be tested without a compositor.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct DragHold {
+    /// Camera buttons whose release arrived with the lock pending and is waiting
+    /// to learn whether a `leave` follows.
+    deferred: i32,
+    /// Camera buttons the compositor released for us, still down for real.
+    held: i32,
+    /// `now_ms` at which `held` last became non-zero.
+    since_ms: i64,
+}
+
+impl DragHold {
+    /// A release arrived. True when it was set aside.
+    fn release(&mut self, button: i32, lock_pending: bool, watching: bool) -> bool {
+        if !watching || !lock_pending || button & CAMERA_BUTTONS == 0 {
+            return false;
+        }
+        self.deferred |= button;
+        true
+    }
+
+    /// The canvas lost pointer focus. Anything set aside just before it was the
+    /// compositor's, not the player's. Returns the buttons now held.
+    fn left_canvas(&mut self, now_ms: i64) -> i32 {
+        let promoted = std::mem::take(&mut self.deferred);
+        if promoted != 0 {
+            self.held |= promoted;
+            self.since_ms = now_ms;
+        }
+        promoted
+    }
+
+    /// The batch of events has been dispatched. A release still set aside had no
+    /// `leave` behind it, so it was real; a hold whose lock never confirmed has
+    /// run out of time to. Returns the buttons to release now.
+    ///
+    /// **A hold also gives up after a long silence**, whatever the lock says. The
+    /// frame that ends it is read off Hyprland 0.56.2's source and one nested
+    /// run, and a compositor that stops sending it would leave the camera turning
+    /// with the mouse until the next click. `last_event_ms` is the last pointer
+    /// event of any kind; a button held that long without one is let go.
+    fn batch_end(&mut self, now_ms: i64, lock_active: bool, last_event_ms: i64) -> i32 {
+        let mut out = std::mem::take(&mut self.deferred);
+        if self.held != 0 {
+            let waited = now_ms.saturating_sub(self.since_ms) > DRAG_HOLD_CONFIRM_MS && !lock_active;
+            let silent = now_ms.saturating_sub(self.since_ms.max(last_event_ms)) > DRAG_HOLD_SILENCE_MS;
+            if waited || silent {
+                out |= std::mem::take(&mut self.held);
+            }
+        }
+        out
+    }
+
+    /// A `wl_pointer.frame` arrived having carried `events` events. Returns the
+    /// buttons to release: all of them, because every held button came up in
+    /// something the pointer could not report, and only one is needed to say so.
+    fn frame(&mut self, events: u32, lock_active: bool) -> i32 {
+        if events == 0 && lock_active {
+            return std::mem::take(&mut self.held);
+        }
+        0
+    }
+
+    /// A press of a button already believed held. The player cannot press what
+    /// is down, so its release went by unseen.
+    fn press(&mut self, button: i32) -> i32 {
+        let stale = self.held & button;
+        self.held &= !button;
+        stale
+    }
+
+    /// A real release was delivered, or the engine was told one.
+    fn forget(&mut self, button: i32) {
+        self.held &= !button;
+        self.deferred &= !button;
+    }
+
+    /// The lock went away under a held drag; no frame will say when it ended.
+    fn lock_lost(&mut self) -> i32 {
+        std::mem::take(&mut self.held) | std::mem::take(&mut self.deferred)
+    }
+
+    fn holding(&self) -> bool {
+        self.held != 0 || self.deferred != 0
+    }
+}
+
+/// How long a held drag may go without any pointer event before it is let go.
+/// Long enough that nobody holds a camera button this still, short enough that a
+/// compositor which never reports the release costs seconds and not a session.
+const DRAG_HOLD_SILENCE_MS: i64 = 20_000;
+
+/// How long a held drag waits for `locked` before it stops waiting. The refusal
+/// timeout beside it, for the same reason.
+const DRAG_HOLD_CONFIRM_MS: i64 = 1_000;
+
+static DRAG_HOLD: Mutex<DragHold> =
+    Mutex::new(DragHold { deferred: 0, held: 0, since_ms: 0 });
+
+/// Events the frame-watching pointer, and the relative-pointer object, have
+/// delivered since the last `wl_pointer.frame`. Zero at a frame means the frame
+/// closed something the pointer was not allowed to report.
+static EVENTS_SINCE_FRAME: AtomicU32 = AtomicU32::new(0);
+
+/// `now_ms` of the last event counted into [`EVENTS_SINCE_FRAME`].
+static LAST_COUNTED_EVENT_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Count one pointer event towards the frame it will be closed by.
+fn count_pointer_event() {
+    EVENTS_SINCE_FRAME.fetch_add(1, Ordering::AcqRel);
+    if let Some(w) = current() {
+        LAST_COUNTED_EVENT_MS.store(w.now_ms(), Ordering::Relaxed);
+    }
+}
+
+/// Whether a second, version-5 `wl_pointer` exists to receive frames. Cordial's
+/// own pointer is version 1, which the compositor sends no frames to.
+static FRAME_WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn drag_hold() -> std::sync::MutexGuard<'static, DragHold> {
+    DRAG_HOLD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The engine, not a right-button drag, is what holds the pointer lock -- shift
+/// lock or first person -- and so Cordial keeps the engine's pointer at the
+/// canvas centre while it is held. Set from `sync_pointer_lock`, read when the
+/// compositor confirms the lock and when it is released.
+///
+/// **Set only where the toplevel is the constrained surface.** The PR that
+/// added it showed, on Plasma, that leaving shift lock puts the cursor back at
+/// the canvas centre when the stored position is recentred while the lock is
+/// held and the hint is committed on release. That is now KWin and Hyprland
+/// (see [`constrain_toplevel`]). The recentre-on-release is `INFERRED` on
+/// Hyprland, because the run that settled the lock did not single that half
+/// out. On Mutter and sway the subsurface is constrained and the flag is never
+/// set, which is where [`engine_owns_lock`] is decided and tested.
+static ENGINE_OWNS_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Whether this tick's lock is the engine's to recentre. `toplevel_lock` is
+/// `constrain_toplevel()`: true on KWin and Hyprland only, unless
+/// `CORDIAL_POINTER_LOCK_SURFACE` says otherwise.
+///
+/// A right-button drag Cordial started itself is not the engine's, and
+/// recentring under it would snap the camera to the middle of the canvas every
+/// tick -- unless the engine had the lock before the drag or shift went down
+/// during it, in which case the engine does own it.
+fn engine_owns_lock(
+    toplevel_lock: bool,
+    engine_wants: bool,
+    dragging: bool,
+    wanted_before_drag: bool,
+    shift_during_drag: bool,
+) -> bool {
+    toplevel_lock && engine_wants && (!dragging || wanted_before_drag || shift_during_drag)
+}
+
+/// Where to tell the compositor the cursor should reappear when a lock is given
+/// back, in the coordinates of the surface the lock was on.
+///
+/// **A lock on the toplevel is in toplevel coordinates, and the engine's pointer
+/// is in canvas coordinates.** The canvas sits below the header bar, so a hint
+/// that forgot the difference put the cursor `offset` up and to the left of where
+/// the drag had left it, and a right-button drag ended with the cursor jumping by
+/// the height of the title bar. Seen in a nested Hyprland as the press point
+/// climbing 46 px with every drag (y = 185, 139, 93, 47, 1 over five drags
+/// without moving the pointer), and in a nested KWin as a hint of (640, 360.5)
+/// for a press at that canvas point whose toplevel position is (665, 431.5).
+/// Only the shift-lock path, which recentres and so already added the offset,
+/// was right.
+///
+/// `canvas_pointer` is the engine's pointer, already recentred by the caller
+/// when the engine owned the lock.
+fn release_hint(toplevel: bool, canvas_pointer: (f32, f32), offset: (i32, i32)) -> (f32, f32) {
+    if toplevel {
+        (canvas_pointer.0 + offset.0 as f32, canvas_pointer.1 + offset.1 as f32)
+    } else {
+        canvas_pointer
+    }
+}
+
+/// Whether releasing the lock sends an extra `wl_surface.commit` on the parent
+/// to deliver the cursor hint now.
+///
+/// Never while the stacking gate is waiting for GTK's frame
+/// ([ADR-047](../../../../docs/adr/ADR-047-the-canvas-is-lowered-only-under-a-presented-frame.md)):
+/// a commit of ours resolves GDK's pending presentation feedback, and the gate
+/// would take that as GTK having attached a buffer. Focusing the chat box
+/// while in shift lock releases the lock and arms the gate in the same tick,
+/// which is exactly the overlap. The hint then rides on GTK's own next commit,
+/// which the gate is already waiting for; `INFERRED`, not observed.
+fn release_commits_parent(owned: bool, gate_arming: bool) -> bool {
+    owned && !gate_arming
+}
+
 
 /// `CORDIAL_NO_POINTER_LOCK=1` — never capture the pointer, whatever the engine
 /// or the mouse buttons say.
@@ -3613,6 +4452,91 @@ static RIGHT_DRAG_LATCH_SINCE: AtomicI64 = AtomicI64::new(0);
 fn no_pointer_lock() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CORDIAL_NO_POINTER_LOCK").is_some())
+}
+
+/// Whether a held camera button asks for the pointer lock.
+///
+/// Pure so the Hyprland case can be tested without a compositor: the inputs are
+/// the switch, whether the drag lock is usable here ([`drag_lock_usable`]),
+/// whether a camera button is down, and whether the pointer is the engine's to
+/// capture.
+fn drag_takes_the_lock(
+    no_drag_lock: bool,
+    drag_lock_usable: bool,
+    camera_button_held: bool,
+    owns_pointer: bool,
+) -> bool {
+    !no_drag_lock && drag_lock_usable && camera_button_held && owns_pointer
+}
+
+/// Whether another button is held under a camera button, on a compositor that
+/// takes every held button away when a lock moves pointer focus.
+///
+/// **Hyprland releases every button the pointer had pressed, not only the
+/// camera's.** [`DragHold`] finds the camera button's real release afterwards,
+/// but a left button held under a right-button drag is not a camera button, so
+/// its invented release was delivered as a real one: the engine saw the left
+/// button come up the instant the right one went down, and heard nothing more
+/// about it until the physical release arrived (reproduced in a nested Hyprland
+/// 0.56.2, `tools/hyprland-drag-e2e.py`). A chord therefore takes no drag lock
+/// there, as before 0.26.0 -- the camera still turns, on a cursor that is free
+/// to leave the window, and the held button stays held. Elsewhere a lock leaves
+/// the buttons alone and nothing changes.
+///
+/// Only the *taking* of the lock is refused. A lock already held when the second
+/// button goes down is kept, because dropping it mid-drag would be the same
+/// focus change.
+fn chord_defeats_drag_lock(hyprland: bool, held: i32) -> bool {
+    hyprland && held & !CAMERA_BUTTONS != 0
+}
+
+/// Whether a held camera button may ask for the pointer lock on this compositor.
+///
+/// Everywhere but Hyprland, always. **On Hyprland it needs the means to find the
+/// button coming up**, because Hyprland takes the button away from the client
+/// when the lock activates and never reports the physical release (see
+/// [`DragHold`] for the whole mechanism). Without a version-5 pointer to
+/// receive frames there is no way to see it, and a drag that took the lock
+/// would last until the next click -- which is what the reporter of #56 tried
+/// with a grace window and rejected. So there the answer is no, and the camera
+/// pans on an unlocked cursor as it did before 0.26.0.
+///
+/// 0.28.0 answered no on Hyprland unconditionally, which kept the camera but let
+/// the cursor drift and jump on release (#56 again). `CORDIAL_DRAG_LOCK=0`
+/// restores that; anything else, or nothing, takes the lock.
+///
+/// `CORDIAL_DRAG_LOCK=1` used to mean "put the lock back at the press". It now
+/// means the same as unset, because the lock at the press without the hold is
+/// the bug.
+fn drag_lock_usable() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let allowed = *ON.get_or_init(|| {
+        drag_lock_allowed(on_hyprland(), std::env::var("CORDIAL_DRAG_LOCK").ok().as_deref())
+    });
+    allowed && (!on_hyprland() || FRAME_WATCH_ACTIVE.load(Ordering::Acquire))
+}
+
+/// The environment half of [`drag_lock_usable`], pure so it can be tested.
+fn drag_lock_allowed(hyprland: bool, var: Option<&str>) -> bool {
+    !(hyprland && var == Some("0"))
+}
+
+/// Whether the compositor is Hyprland, by the same two variables
+/// `constrain_toplevel` reads plus the instance signature Hyprland exports to
+/// every client it starts.
+fn on_hyprland() -> bool {
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    hyprland_from(
+        &var("XDG_CURRENT_DESKTOP"),
+        &var("XDG_SESSION_DESKTOP"),
+        std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some(),
+    )
+}
+
+fn hyprland_from(current_desktop: &str, session_desktop: &str, has_signature: bool) -> bool {
+    current_desktop.to_ascii_lowercase().contains("hyprland")
+        || session_desktop.to_ascii_lowercase().contains("hyprland")
+        || has_signature
 }
 
 /// `CORDIAL_NO_DRAG_LOCK=1` — leave the engine's own request as the only thing
@@ -3673,6 +4597,12 @@ unsafe extern "C" fn locked_pointer_locked(_data: *mut c_void, _lp: *mut c_void)
     // be drained by.
     super::input::reset_mouse_delta();
     super::input::forget_pending_unlocked_delta();
+    if ENGINE_OWNS_LOCK.load(Ordering::Acquire) && WaylandWindow::constrain_toplevel() {
+        if let Some(w) = current() {
+            let (cx, cy) = w.canvas_centre();
+            w.set_pointer_position(cx, cy);
+        }
+    }
     if super::input::trace_mouse() {
         eprintln!("[cordial] pointer lock: compositor sent locked");
     }
@@ -3688,6 +4618,12 @@ unsafe extern "C" fn locked_pointer_locked(_data: *mut c_void, _lp: *mut c_void)
 unsafe extern "C" fn locked_pointer_unlocked(_data: *mut c_void, _lp: *mut c_void) {
     POINTER_LOCK_ACTIVE.store(false, Ordering::Release);
     if let Some(w) = current() {
+        // A drag held for the lock cannot outlive it: nothing is left to say when
+        // the button comes up.
+        let lost = drag_hold().lock_lost();
+        if lost != 0 {
+            w.release_buttons(lost);
+        }
         let mut since = w.lock_inactive_since.lock().unwrap_or_else(|e| e.into_inner());
         if since.is_none() {
             *since = Some(std::time::Instant::now());
@@ -3713,13 +4649,30 @@ unsafe extern "C" fn relative_pointer_motion(
     dx_unaccel: i32,
     dy_unaccel: i32,
 ) {
+    // Counted before any early return: the frame that follows is not empty for
+    // having been ignored here. See [`DragHold`].
+    count_pointer_event();
     // Relative motion arrives whenever the seat's pointer has focus, lock or no
     // lock — this object is bound to the seat's one `wl_pointer`, not to a
     // surface, so `POINTER_ON_CANVAS` is the same focus test `wl_pointer.motion`
     // uses and is checked for the identical reason: nothing else here says
     // whether the movement belongs to Cordial's canvas or another window
     // entirely.
-    if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+    //
+    // **A confirmed lock skips that test, and it must.** `POINTER_ON_CANVAS` is
+    // set from Cordial's *own* secondary `wl_pointer`, while the constraint is
+    // requested against GDK's. When the constraint is on the toplevel — what
+    // Hyprland needs, see `constrain_toplevel` — the compositor can hold the
+    // lock without the canvas subsurface keeping the pointer focus this side
+    // records, and gating on it dropped every relative sample: the lock was
+    // confirmed and the camera never moved, which is issue #56's `toplevel`
+    // result. Relative motion is only emitted while a constraint is active, so
+    // `POINTER_LOCK_ACTIVE` is the stronger and correct gate. The dialog check
+    // below still applies.
+    if !pointer_event_is_the_engines(
+        POINTER_ON_CANVAS.load(Ordering::Acquire),
+        POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+    ) {
         return;
     }
     let Some(w) = current() else { return };
@@ -3777,10 +4730,10 @@ unsafe extern "C" fn relative_pointer_motion(
         // argument above is strong for a first-person camera and not
         // universal: a player who has tuned their desktop pointer profile and
         // wants the client to obey it is not wrong, and neither is one who
-        // wants raw input. The default is unaccelerated because that is what a
-        // camera wants and what the original reported bug was about;
-        // `CORDIAL_POINTER_ACCEL=always` restores the accelerated pair, and
-        // the settings window offers it as a switch. This env var governs the
+        // wants raw input. The default was unaccelerated until 2026-09-30 and is
+        // now accelerated, because players preferred it in shooters;
+        // `CORDIAL_POINTER_ACCEL=unlocked` selects the raw pair, and the
+        // settings window offers both. This env var governs the
         // camera only. The unlocked cursor below has no equivalent switch --
         // not because an honest "off" is impossible for it, the unaccelerated
         // pair is sitting right there in the same event exactly as it is
@@ -3852,7 +4805,11 @@ unsafe extern "C" fn relative_pointer_motion(
 
 /// Whether to pass the compositor's accelerated deltas through to the camera.
 ///
-/// Read once. Consulted only from the locked branch of
+/// Initialised from the environment and changeable afterwards through
+/// [`set_pointer_acceleration`] (the shell's live-settings socket, ADR-044).
+/// It stays a single relaxed atomic load on the hot path: the lookup that used
+/// to be cached in a `OnceLock<bool>` is now a `OnceLock<AtomicBool>`, so the
+/// environment is still read once. Consulted only from the locked branch of
 /// `relative_pointer_motion` — the unlocked cursor takes the accelerated pair
 /// unconditionally and never calls this, see that function's own comment for
 /// why there is no equivalent switch for it. A locked pointer still reports
@@ -3863,15 +4820,65 @@ unsafe extern "C" fn relative_pointer_motion(
 /// before reaching here; it no longer is, which is why "consulted on every
 /// relative-motion event" would now be the wrong claim to make here.
 fn pointer_acceleration() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        // "always" is the only value that turns this on. Anything else,
-        // including the variable being absent, leaves the camera on raw
-        // movement -- the shell sends "unlocked" for that, which names what
-        // happens rather than pretending Cordial can disable acceleration for
-        // the unlocked cursor, because it cannot.
-        matches!(std::env::var("CORDIAL_POINTER_ACCEL").as_deref(), Ok("always"))
+    pointer_acceleration_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn pointer_acceleration_cell() -> &'static std::sync::atomic::AtomicBool {
+    static ON: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        // "unlocked" is the only value that turns this off, leaving the camera
+        // on raw movement; anything else, including the variable being absent,
+        // uses the accelerated pair, matching the shell's default. "unlocked"
+        // names what happens rather than pretending Cordial can disable
+        // acceleration for the unlocked cursor, because it cannot.
+        std::sync::atomic::AtomicBool::new(!matches!(
+            std::env::var("CORDIAL_POINTER_ACCEL").as_deref(),
+            Ok("unlocked")
+        ))
     })
+}
+
+/// Change the camera-acceleration choice in a running client. `true` passes the
+/// compositor's accelerated deltas through, `false` uses the raw pair.
+pub fn set_pointer_acceleration(accelerated: bool) {
+    pointer_acceleration_cell().store(accelerated, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The value in force, for the live-settings `get` reply.
+pub fn current_pointer_acceleration() -> bool {
+    pointer_acceleration()
+}
+
+/// The title-bar choice a live change has asked for, or [`TITLE_BAR_UNSET`] when
+/// none has and the launch environment still stands.
+static TITLE_BAR: AtomicU8 = AtomicU8::new(TITLE_BAR_UNSET);
+const TITLE_BAR_UNSET: u8 = u8::MAX;
+
+/// Set by [`set_title_bar`] and cleared by the pump, which is the only thread
+/// GTK objects may be touched from. The live socket's thread cannot call
+/// `HostWindow::set_title_bar` itself, so it leaves the request here.
+static TITLE_BAR_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Ask for a different title bar on the game window (ADR-044). Takes effect on
+/// the pump's next turn, which is at most a few tens of milliseconds away; a
+/// request made before the window exists is applied when it first pumps.
+pub fn set_title_bar(choice: cordial_shell::title_bar::TitleBar) {
+    TITLE_BAR.store(choice.index() as u8, Ordering::Relaxed);
+    TITLE_BAR_PENDING.store(true, Ordering::Relaxed);
+}
+
+/// The title bar in force, for the live `get` reply: the last one asked for, or
+/// the launch environment's if none has been.
+pub fn current_title_bar() -> cordial_shell::title_bar::TitleBar {
+    match TITLE_BAR.load(Ordering::Relaxed) {
+        TITLE_BAR_UNSET => cordial_shell::title_bar::TitleBar::from_env(),
+        v => cordial_shell::title_bar::TitleBar::from_index(u32::from(v)),
+    }
+}
+
+/// The change the pump has yet to apply, taken so it is applied once.
+pub(crate) fn take_pending_title_bar() -> Option<cordial_shell::title_bar::TitleBar> {
+    TITLE_BAR_PENDING.swap(false, Ordering::Relaxed).then(current_title_bar)
 }
 
 static RELATIVE_POINTER_LISTENER: RelativePointerListener =
@@ -4024,10 +5031,18 @@ impl WaylandWindow {
         // drag this was reported for and middle is the pan; both are gestures
         // where the cursor is meant to stay put, which is exactly the
         // distinction Roblox's own desktop client draws.
-        const CAMERA_BUTTONS: i32 = super::input::BUTTON_SECONDARY | super::input::BUTTON_TERTIARY;
-        let dragging = !no_drag_lock()
-            && self.pointer_buttons.load(Ordering::Relaxed) & CAMERA_BUTTONS != 0
-            && POINTER_ON_CANVAS.load(Ordering::Acquire);
+        let dragging = drag_takes_the_lock(
+            no_drag_lock(),
+            drag_lock_usable(),
+            self.pointer_buttons.load(Ordering::Relaxed) & CAMERA_BUTTONS != 0,
+            // A drag the compositor released for us is still the engine's
+            // between the canvas's `leave` and the lock's `locked`, when
+            // neither of the other two says so.
+            pointer_event_is_the_engines(
+                POINTER_ON_CANVAS.load(Ordering::Acquire),
+                POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+            ) || drag_hold().holding(),
+        );
         let asked = engine_wants || dragging || force_pointer_lock();
 
         // **A dialog on top of the canvas takes the cursor back, whatever the
@@ -4085,10 +5100,42 @@ impl WaylandWindow {
         // `false` with the menu open, `true` again on closing it. The latch was
         // duplicating a decision the engine had already made correctly.
         let want = asked;
+        if want {
+            let owned = engine_owns_lock(
+                Self::constrain_toplevel(),
+                engine_wants,
+                dragging,
+                LOCK_WANTED_BEFORE_RIGHT_DRAG.load(Ordering::Acquire),
+                SHIFT_DURING_RIGHT_DRAG.load(Ordering::Acquire),
+            );
+            ENGINE_OWNS_LOCK.store(owned, Ordering::Release);
+            if owned && POINTER_LOCK_ACTIVE.load(Ordering::Acquire) {
+                let (cx, cy) = self.canvas_centre();
+                self.set_pointer_position(cx, cy);
+            }
+        }
 
         let held = !self.locked_pointer.lock().unwrap_or_else(|e| e.into_inner()).is_null();
+        let lockable_here = !Self::constrain_toplevel() || POINTER_ON_CANVAS.load(Ordering::Acquire);
+        // A drag with another button already down is not given the lock where
+        // taking it would release that button. See `chord_defeats_drag_lock`.
+        // The engine's own request and the forced one still are: they are not
+        // a camera drag, and refusing them would strand first person.
+        let chord = !engine_wants
+            && !force_pointer_lock()
+            && chord_defeats_drag_lock(on_hyprland(), self.pointer_buttons.load(Ordering::Relaxed));
+        if chord && want && !held && super::input::trace_mouse() {
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[cordial] pointer lock: not taken for a camera button held beside another                      button; Hyprland would release the other one"
+                );
+            }
+        }
         if want && !held {
-            self.lock_pointer();
+            if lockable_here && !chord {
+                self.lock_pointer();
+            }
         } else if !want && held {
             self.release_pointer();
         } else if want && held && self.lock_went_dead() {
@@ -4141,10 +5188,27 @@ impl WaylandWindow {
 
 /// Whether to constrain the GTK toplevel rather than the engine's subsurface.
 ///
-/// KWin only, and only because of KDE bug 463088 -- see `lock_pointer`. On
-/// every other compositor the subsurface is the surface that actually holds
-/// pointer focus over the canvas, and constraining anything else is a lock that
-/// is granted and never activates.
+/// **Two compositors need this, for opposite reasons.** KWin activates a lock
+/// on a constrained subsurface and then still lets the physical cursor leave it
+/// (KDE bug 463088), which is why the toplevel is constrained there at all --
+/// and the canvas being cut out of the toplevel's input region is why the
+/// constraint alone was not enough; see `lock_pointer`. Hyprland is here
+/// because it never answers `locked` for a constraint on a subsurface: the
+/// engine's canvas is a `wl_subsurface` (ADR-011) and Hyprland's
+/// pointer-constraints path is toplevel-first, the same gap Godot hit and the
+/// one `hyprwm/Hyprland#16311` exists to close. On the compositors that are
+/// neither, the subsurface is the surface that actually holds pointer focus
+/// over the canvas, and constraining anything else is a lock that is granted
+/// and never activates.
+///
+/// This is also the gate for everything the toplevel lock needed beyond the
+/// constraint itself: the canvas in the input region, recentring the engine's
+/// pointer while it holds the lock, and the hint commit on release.
+///
+/// Observed on Hyprland 0.56.2 by the reporter of #56: with the constraint on
+/// the toplevel the lock confirms and shift lock holds the cursor in the
+/// window, where before it walked out. The reasoning above came first and is
+/// left as it was written; the run is what settled it.
 fn constrain_toplevel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -4155,8 +5219,9 @@ fn constrain_toplevel() -> bool {
         }
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_ascii_lowercase();
         let session = std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_ascii_lowercase();
-        desktop.contains("kde") || desktop.contains("plasma")
-            || session.contains("kde") || session.contains("plasma")
+        let kde = desktop.contains("kde") || desktop.contains("plasma")
+            || session.contains("kde") || session.contains("plasma");
+        kde || on_hyprland()
     })
 }
 
@@ -4182,13 +5247,24 @@ fn constrain_toplevel() -> bool {
         // windows such as Sober's SDL3 window constrain their xdg_toplevel and
         // do not hit that path.
         //
+        // **Constraining the toplevel is only half of what KWin needs.** KWin
+        // activates a lock on the toplevel only where the pointer is inside the
+        // toplevel's *input region*, and Cordial cuts the canvas out of that
+        // region so clicks reach the engine's subsurface. A lock requested over
+        // the canvas was therefore granted and never activated, which is the
+        // cursor leaving the window during a right drag. `open` now keeps the
+        // canvas in the region on this path (`set_canvas_in_input_region`).
+        // Measured by the PR author on Plasma; not reproducible on sway, which
+        // takes the other branch.
+        //
         // So the two halves of 3d67e59 are separated, because only one of them
         // was ever about the surface. Using **GDK's** pointer rather than
         // Cordial's own is the half that fixed the escape -- Cordial's separate
         // event pointer can be acknowledged as locked while the real cursor,
         // which GDK owns, stays free -- and it applies everywhere. Constraining
         // the **toplevel** is the half that is a KWin bug workaround, and it is
-        // now gated to KWin instead of imposed on every compositor.
+        // now gated to the compositors that need it -- KWin and Hyprland --
+        // instead of imposed on every compositor.
         //
         // `CORDIAL_POINTER_LOCK_SURFACE=toplevel|canvas` overrules the guess,
         // because a compositor list in a binary goes stale and the person
@@ -4250,7 +5326,14 @@ fn constrain_toplevel() -> bool {
         if slot.is_null() {
             return;
         }
-        let (x, y) = self.pointer_position();
+        let toplevel = Self::constrain_toplevel();
+        let centre = ENGINE_OWNS_LOCK.swap(false, Ordering::AcqRel) && toplevel;
+        if centre {
+            let (cx, cy) = self.canvas_centre();
+            self.set_pointer_position(cx, cy);
+        }
+        let offset = *self.placed_at.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, y) = release_hint(toplevel, self.pointer_position(), offset);
         // SAFETY: `*slot` is the live locked-pointer proxy; the two calls match
         // `set_cursor_position_hint`'s "ff" and `destroy`'s empty signature,
         // the latter sent with the destroy flag its `type="destructor"`
@@ -4265,6 +5348,10 @@ fn constrain_toplevel() -> bool {
                 f32_to_fixed(x),
                 f32_to_fixed(y),
             );
+            let gate_arming = self.stacking_gate.lock().unwrap_or_else(|e| e.into_inner()).is_arming();
+            if release_commits_parent(centre, gate_arming) {
+                (self.wl.marshal_flags)(self.parent_surface, WL_SURFACE_COMMIT, std::ptr::null(), 1, 0);
+            }
             (self.wl.marshal_flags)(
                 *slot,
                 LOCKED_POINTER_DESTROY,
@@ -4286,7 +5373,8 @@ fn constrain_toplevel() -> bool {
         super::input::reset_mouse_delta();
         super::input::forget_pending_unlocked_delta();
         if super::input::trace_mouse() {
-            eprintln!("[cordial] pointer lock: released, cursor hinted to ({x}, {y})");
+            let how = if centre { " (canvas centre, committed)" } else { "" };
+            eprintln!("[cordial] pointer lock: released, cursor hinted to ({x}, {y}){how}");
         }
     }
 
@@ -4317,7 +5405,8 @@ pub(crate) fn pointer_lock_report() -> String {
     };
     format!(
         "ok requested={} confirmed={} focused={} engine={engine} \
-         awaiting_drag_unlock={} shift_in_drag={} on_canvas={} buttons={}",
+         awaiting_drag_unlock={} shift_in_drag={} on_canvas={} buttons={} held_for_lock={} \
+         frame_watch={}",
         POINTER_LOCK_REQUESTED.load(Ordering::Acquire),
         POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
         match current().and_then(|w| w.host.0.focused()) {
@@ -4329,6 +5418,11 @@ pub(crate) fn pointer_lock_report() -> String {
         SHIFT_DURING_RIGHT_DRAG.load(Ordering::Acquire),
         POINTER_ON_CANVAS.load(Ordering::Acquire),
         LAST_POINTER_BUTTONS.load(Ordering::Relaxed),
+        {
+            let h = drag_hold();
+            h.held | h.deferred
+        },
+        FRAME_WATCH_ACTIVE.load(Ordering::Acquire),
     )
 }
 
@@ -4719,6 +5813,7 @@ unsafe extern "C" fn keyboard_key(_data: *mut c_void, _kb: *mut c_void, _serial:
     // held" are different states and only the second should drop a key.
     reconcile_keyboard_focus();
     if !KEYBOARD_FOCUSED.load(Ordering::Acquire) {
+        super::input::trace_gated_key(state == 1, key as i32);
         return;
     }
     if let Some(w) = current() {
@@ -4900,6 +5995,16 @@ impl WaylandWindow {
             return;
         }
 
+        // The recording hotkey (ADR-059) is taken the same way, before the
+        // engine hears it. Control or Alt held leaves the chord to the game.
+        if crate::recording::hotkey_event(
+            evdev_key as i32,
+            down,
+            meta & (super::input::META_CTRL_ON | super::input::META_ALT_ON) != 0,
+        ) {
+            return;
+        }
+
         let handle = self.active_handle.load(Ordering::Relaxed);
         let now = self.now_ms();
 
@@ -4929,9 +6034,18 @@ impl WaylandWindow {
         // no F5 and no F11 at all. The `else` branch did say so on every press
         // -- `wayland: unmapped keysym` -- but it is a trace line, and the
         // greps that were run looked for `passKeyEvent`.
+        //
+        // **Enter is decided once, before either path.** While the editor
+        // widget is on a box it is Android's `EditText` here, and an
+        // `EditText` consumes the key: a multi-line box gets its newline from
+        // GTK and a single-line one gets `nativeReturnPressedFromOnScreenKeyboard`
+        // (see `connect_editor_activate`), and neither also hears a raw key.
+        let enter_to_editor = super::input::editor_consumes_enter(down, evdev_key as i32);
         if let Some(keycode) = super::input::keysym_to_android(keysym) {
             if handle != 0 {
-                super::input::deliver_key(handle, down, keycode, evdev_key as i32, meta, 0, unicode, now, now);
+                if !enter_to_editor {
+                    super::input::deliver_key(handle, down, keycode, evdev_key as i32, meta, 0, unicode, now, now);
+                }
             } else {
                 // **A mapped key with no handle went nowhere and said nothing.**
                 //
@@ -4956,12 +6070,20 @@ impl WaylandWindow {
                         true
                     }
                 };
+                //
+                // **"Dropped before reaching the engine" was only half true.**
+                // It is AGDK's `onKeyDownNative` that has nowhere to go;
+                // `pass_key_event` below runs either way, and under
+                // `--app-bridge`, which never has a handle, it is the only key
+                // path there is. A user on that path read the old line as the
+                // reason typing failed, when the key had in fact reached the
+                // engine and been withheld from a focused box by design.
                 if first {
                     eprintln!(
-                        "[android] wayland: key {evdev_key} (Android {keycode}) mapped but the \
-                         activity handle is 0, so it was dropped before reaching the engine. \
-                         Every later press of this key is dropped the same way and will not be \
-                         reported again."
+                        "[android] wayland: key {evdev_key} (Android {keycode}) has no activity \
+                         handle, so AGDK's onKey{}Native did not see it; it still goes to \
+                         nativePassKeyEvent. Not reported again for this key.",
+                        if down { "Down" } else { "Up" }
                     );
                 }
             }
@@ -4970,7 +6092,9 @@ impl WaylandWindow {
         }
         // The evdev code, not the Android keycode: this native speaks the
         // platform's own vocabulary. See `pass_key_event`.
-        super::input::pass_key_event(down, evdev_key as i32, meta);
+        if !enter_to_editor {
+            super::input::pass_key_event(down, evdev_key as i32, meta);
+        }
 
         if !down {
             return;
@@ -5010,6 +6134,53 @@ impl WaylandWindow {
         // unchanged. What stops is only this side's editing of a buffer that
         // is no longer the authority -- which is what the comment above wanted
         // and could not have until something else was willing to own it.
+        //
+        // **Enter is the editor's, as it is on Android -- and the engine's
+        // answer to it comes back through its own callbacks.**
+        //
+        // The focused Roblox box is an `EditText` on a phone, and an
+        // `EditText` consumes Enter: nothing downstream hears a key. On a
+        // multi-line box it inserts "\n" into the text, the text is synced,
+        // and whatever happens next (a chat script that sends on seeing the
+        // newline and empties the box, or a box that simply keeps it) is the
+        // engine's, delivered through `onLuaTextBoxChangedCallback` and
+        // `input::apply_engine_text`. On a single-line box it is an editor
+        // action: the final text is synced and
+        // `nativeReturnPressedFromOnScreenKeyboard` tells the engine, which
+        // decides whether the box loses focus (`hideKeyboard`) and whether its
+        // text clears or stays -- see `connect_editor_activate`.
+        //
+        // So `editor_consumes_enter` above keeps the raw key from the engine
+        // on both paths while a box is focused, and this file neither blurs a
+        // box nor clears the editor on Enter itself.
+        //
+        // **An earlier version swallowed Return in the multi-line widget and
+        // sent the engine the raw key instead, and that was the wrong
+        // owner.** It fixed one symptom -- GTK's newline overwriting a chat
+        // box the engine had just cleared -- by deciding in the host that a
+        // multi-line box never keeps its newline, which is the engine's
+        // decision per box, and it left single-line boxes with a key the
+        // platform never sends them. The control for both is
+        // `tools/text-input-e2e.py`'s section 15.
+        //
+        // What is INFERRED, because no signed-in run has held it: that the
+        // engine acts on `nativeReturnPressedFromOnScreenKeyboard` the way it
+        // acted on the raw key. A synthetic `fakefocus` box has no engine
+        // behind it, so it can show that the call is made once and the key is
+        // withheld; it cannot show what a chat box or a search box does next.
+        //
+        // **Escape and a click outside need no special case here either**, for
+        // the same reason the comment above this function gives Escape: both
+        // reach the engine as ordinary input (Escape through this same path,
+        // an outside click through `dispatch_button`) and it is the engine's
+        // `hideKeyboard`/focus-loss handling that decides whether the box
+        // blurs.
+        //
+        // **`returnKeyType`/`manualFocusRelease` (`RawTextBoxInfo`'s slots 11
+        // and 12) are read only to be traced, in `input::return_pressed`.** On
+        // Android they pick the IME action button and say whether the game,
+        // not the `EditText`, releases focus on it -- meaningless without a
+        // soft keyboard to draw a button on, and Cordial supplies neither.
         if self.editor_owns_text() {
             return;
         }
@@ -5041,7 +6212,7 @@ impl WaylandWindow {
         // key events only and never text" and a paste is text. What is left
         // here is a Wayland session where the editor widget is not up, plus
         // the X11 path, which has its own copy of this branch in `window.rs`
-        // and no editor widget at all (ADR-024).
+        // for when its editor window is off (ADR-062).
         if super::input::is_paste_shortcut(keysym, meta) {
             if let Err(e) = super::clipboard::paste_into_engine(handle) {
                 super::trace(format_args!("wayland: clipboard paste failed: {e}"));
@@ -5156,6 +6327,43 @@ impl WaylandWindow {
     /// the input region got out of step before.
     fn editor_owns_text(&self) -> bool {
         cordial_linker_sys::game_activity::focused_textbox().is_some()
+    }
+
+    /// The development control surface's `paste`/`settext`, dispatched to
+    /// whichever GTK primitive a real edit of that shape uses --
+    /// [`host_window::HostWindow::editor_paste_at_caret`] calls the same
+    /// `delete_selection`/`insert_text` pair GTK's own Ctrl+V handler does,
+    /// and `editor_set_text` is `set_text`, the primitive `set_text_overlay`
+    /// already reaches for when the engine reseeds the field. Either one fires
+    /// the widget's ordinary `changed`/`cursor-position` signals, so
+    /// `connect_editor_changed` -- installed once, above -- mirrors the write
+    /// into `TEXT_BUFFER`, pushes it to the engine and redraws, exactly as it
+    /// would for a keystroke. See `clipboard::paste_text`/`clipboard::set_text`
+    /// for why this is what runs instead of touching `TEXT_BUFFER` directly.
+    ///
+    /// Callers have already checked a box has focus and already flattened
+    /// `text` -- this only decides which GTK primitive to use.
+    ///
+    /// **Now three-way, not two.** Added alongside the multi-line editor:
+    /// [`cordial_shell::host_window::HostWindow::editor_multiline_active`]
+    /// reports which of `editor`/`editor_multiline`
+    /// [`cordial_shell::host_window::HostWindow::set_text_overlay`] most
+    /// recently placed, which is the same widget GDK is currently handing
+    /// keystrokes to -- so a `paste`/`settext` into a multi-line box lands in
+    /// the widget that owns it and keeps its newlines, rather than in the
+    /// single-line widget, which would silently flatten them.
+    pub fn devctl_replace_editor_text(&self, text: &str, replace_all: bool) -> usize {
+        if self.host.0.editor_multiline_active() {
+            if replace_all {
+                self.host.0.editor_multiline_set_text(text)
+            } else {
+                self.host.0.editor_multiline_paste_at_caret(text)
+            }
+        } else if replace_all {
+            self.host.0.editor_set_text(text)
+        } else {
+            self.host.0.editor_paste_at_caret(text)
+        }
     }
 
     /// Drive `enable()`/`disable()` off the same focus signal `input.rs`
@@ -5576,6 +6784,37 @@ impl WaylandWindow {
             let (gw, gh, _) = self.geometry();
             super::input::report_keyboard_state((gw, gh));
         }
+        self.pump_window(true);
+    }
+
+    /// Run GTK and the display connection with no GameActivity to deliver to.
+    ///
+    /// `--app-bridge` starts the engine without one, and GTK's main loop was
+    /// only ever iterated from [`Self::pump`], which needs a handle, so under
+    /// it the window never ran at all: no header-bar clicks, no move or resize,
+    /// and the canvas left at its first guessed rectangle, overlapping the
+    /// title bar.
+    ///
+    /// **The text editor runs here too, because nothing it needs is
+    /// GameActivity's.** This used to skip the IME and text-overlay syncs on
+    /// the belief that they asked GameActivity natives. They do not: focus is
+    /// `NativeGLJavaInterface.showKeyboard`, geometry is `nativeGetTextBoxInfo`
+    /// and the typed text goes back through `syncTextboxTextAndCursorPosition2`,
+    /// all plain JNI. Skipping them is what made a focused box untypeable under
+    /// `--app-bridge`: `pass_key_event` withholds character keys from a focused
+    /// box because the editor is meant to own them, and the editor was never
+    /// placed, so every letter went nowhere. Only pointer lock stays off, as a
+    /// decision about the headset rather than a dependency -- see
+    /// [`Self::pump_window`].
+    fn pump_without_engine(&self) {
+        self.pump_window(false);
+    }
+
+    /// `engine` is whether a GameActivity is driving this pump. It gates only
+    /// pointer lock: under `--app-bridge` the window shows a mirror of the
+    /// left eye, and capturing the desktop pointer into it on the engine's say
+    /// is untested against a headset session, so it is left as it was.
+    fn pump_window(&self, engine: bool) {
 
         // GTK's main loop does not get a thread of its own. It is iterated
         // here, on the thread that ran `gtk_init`, from inside the engine's
@@ -5588,7 +6827,22 @@ impl WaylandWindow {
         // any traffic on the display connection — and the display connection
         // is exactly where a click on the header bar arrives, so the idle case
         // is the only one that waits.
+        // A live title-bar change, applied here because this is the GTK thread.
+        if let Some(choice) = take_pending_title_bar() {
+            self.host.0.set_title_bar(choice);
+            println!("[cordial] title bar: now {choice:?}");
+        }
+        // The recording marker in the title (ADR-059), set here for the same
+        // reason: this is the GTK thread, and recording starts and stops on others.
+        if let Some(on) = crate::recording::take_indicator_change() {
+            const MARK: &str = " \u{25cf} REC";
+            let window = self.host.0.window();
+            let base = window.title().map(|t| t.trim_end_matches(MARK).to_string()).unwrap_or_default();
+            window.set_title(Some(&if on { format!("{base}{MARK}") } else { base }));
+        }
+        let pump_started = std::time::Instant::now();
         self.host.0.pump();
+        let gtk_ms = pump_started.elapsed().as_millis() as u64;
         // The close button destroys the toplevel inside the `pump` just above,
         // and the surface proxies below go with it. `looper::pump` only learns
         // of the close from `window_closed` on its next turn, so without this
@@ -5596,12 +6850,23 @@ impl WaylandWindow {
         // `wl_argument_from_va_list` under `sync_canvas_geometry`, caught with
         // gdb on a window closed in a nested sway. The launcher reported that
         // as a crash every time somebody closed the game.
+        // Recorded on every exit below, or a pump that returned early would
+        // leave the previous one's numbers standing.
+        let _phases = PumpPhases { started: pump_started, gtk_ms };
         if self.host.0.wl_surface().is_none() {
             return;
         }
         self.sync_canvas_geometry();
         self.sync_ime_focus();
         self.sync_text_overlay();
+        // Every tick, not only on the edges: a lowering waits for GTK to commit
+        // a frame and is decided here, and one that timed out is retried here.
+        self.reconcile_stacking();
+        if !engine {
+            self.read_display();
+            self.reconcile_pointer_buttons();
+            return;
+        }
         // Polled rather than driven by an event, because the engine's own
         // request for a locked centre is a *getter* — `nativeGetMainWindow
         // IsMouseLockedCenter` — with nothing that calls out when it changes.
@@ -5609,7 +6874,11 @@ impl WaylandWindow {
         // an atomic load against a decision a person makes a few times a
         // minute.
         self.sync_pointer_lock();
+        self.read_display();
+        self.reconcile_pointer_buttons();
+    }
 
+    fn read_display(&self) {
         // The documented thread-safe idiom for a `wl_display` connection that
         // more than one thread touches — and more than one does: Mesa's own
         // Wayland EGL winsys reads and writes this exact connection from
@@ -5711,13 +6980,34 @@ impl WaylandWindow {
     }
 }
 
+/// Hands the pump's timings to `input::note_pump_phases` when the pump ends, by
+/// whatever return it takes.
+struct PumpPhases {
+    started: std::time::Instant,
+    gtk_ms: u64,
+}
+
+impl Drop for PumpPhases {
+    fn drop(&mut self) {
+        super::input::note_pump_phases(self.gtk_ms, self.started.elapsed().as_millis() as u64);
+    }
+}
+
 /// So that a dead connection is described once rather than on every pump tick
 /// for however many ticks happen before the process goes.
 static DISPLAY_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 
 pub fn pump_input_events(handle: i64) {
+    super::input::note_pump_tick();
     if let Some(w) = current() {
         w.pump(handle);
+    }
+}
+
+/// [`WaylandWindow::pump_without_engine`], for a run with no GameActivity.
+pub fn pump_window_only() {
+    if let Some(w) = current() {
+        w.pump_without_engine();
     }
 }
 
@@ -6030,6 +7320,228 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A left button held under a right-button drag stays held on Hyprland
+    /// because the drag does not take the lock that would release it.
+    #[test]
+    fn a_chord_takes_no_drag_lock_on_hyprland_and_nowhere_else() {
+        use crate::android::input::{BUTTON_BACK, BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_TERTIARY};
+        assert!(chord_defeats_drag_lock(true, BUTTON_PRIMARY | BUTTON_SECONDARY));
+        assert!(chord_defeats_drag_lock(true, BUTTON_BACK | BUTTON_TERTIARY));
+        assert!(!chord_defeats_drag_lock(false, BUTTON_PRIMARY | BUTTON_SECONDARY), "other compositors keep their lock");
+        assert!(!chord_defeats_drag_lock(true, BUTTON_SECONDARY), "a lone right drag still locks");
+        assert!(
+            !chord_defeats_drag_lock(true, BUTTON_SECONDARY | BUTTON_TERTIARY),
+            "two camera buttons are DragHold's to find"
+        );
+        assert!(!chord_defeats_drag_lock(true, 0));
+    }
+
+    /// The three ways a held camera button never asks for the lock, on any
+    /// compositor, and the one way it may not on Hyprland.
+    #[test]
+    fn a_camera_drag_asks_for_the_lock_when_the_drag_lock_is_usable() {
+        assert!(drag_takes_the_lock(false, true, true, true));
+        assert!(!drag_takes_the_lock(false, false, true, true), "Hyprland with nothing watching for frames");
+        assert!(!drag_takes_the_lock(true, true, true, true), "CORDIAL_NO_DRAG_LOCK");
+        assert!(!drag_takes_the_lock(false, true, false, true), "no camera button down");
+        assert!(!drag_takes_the_lock(false, true, true, false), "the pointer is not the engine's");
+    }
+
+    /// `CORDIAL_DRAG_LOCK=0` is the way back to 0.28.0 on Hyprland and nothing
+    /// else; `1` no longer means anything because the lock at the press without
+    /// the hold is the bug.
+    #[test]
+    fn the_drag_lock_variable_only_turns_it_off_and_only_on_hyprland() {
+        assert!(drag_lock_allowed(true, None));
+        assert!(drag_lock_allowed(true, Some("1")));
+        assert!(!drag_lock_allowed(true, Some("0")));
+        assert!(drag_lock_allowed(false, Some("0")), "other compositors never lost the drag lock");
+    }
+
+    const RIGHT: i32 = super::super::input::BUTTON_SECONDARY;
+
+    /// #56 and #105, in the order the nested Hyprland put them on the wire: the
+    /// lock is requested at the press, the compositor releases the button and
+    /// takes the canvas's focus before it answers, and the physical release is
+    /// only ever a frame with nothing in it. The drag must survive the first
+    /// and end on the last.
+    #[test]
+    fn a_drag_survives_hyprlands_release_and_ends_on_the_empty_frame() {
+        let mut hold = DragHold::default();
+        // The compositor's release, with the lock requested and not yet answered.
+        assert!(hold.release(RIGHT, true, true), "set aside rather than delivered");
+        assert!(hold.holding());
+        // The canvas's `leave` follows it: that was the compositor's doing.
+        assert_eq!(hold.left_canvas(100), RIGHT);
+        // The batch ends before `locked`: the drag is still the player's.
+        assert_eq!(hold.batch_end(101, false, 100), 0);
+        // Frames closing the activation (leave, enter) are not the release.
+        assert_eq!(hold.frame(3, false), 0);
+        assert_eq!(hold.frame(0, false), 0, "an empty frame before `locked` is the activation's");
+        // Camera motion under the lock arrives as relative motion plus a frame.
+        assert_eq!(hold.frame(1, true), 0);
+        assert!(hold.holding(), "still dragging");
+        // The player lets go: Hyprland drops the button and sends only a frame.
+        assert_eq!(hold.frame(0, true), RIGHT);
+        assert!(!hold.holding());
+    }
+
+    /// A release that no `leave` follows was the player's, and is delivered
+    /// when the batch ends. Without this a click shorter than the compositor's
+    /// reply would never reach the engine.
+    #[test]
+    fn a_release_with_no_leave_behind_it_is_delivered_at_the_batch_end() {
+        let mut hold = DragHold::default();
+        assert!(hold.release(RIGHT, true, true));
+        assert_eq!(hold.batch_end(5, false, 0), RIGHT);
+        assert!(!hold.holding());
+    }
+
+    #[test]
+    fn nothing_is_set_aside_unless_it_could_be_hyprlands() {
+        let mut hold = DragHold::default();
+        assert!(!hold.release(RIGHT, false, true), "no lock pending: a normal release");
+        assert!(!hold.release(RIGHT, true, false), "nothing is watching for frames, so it could never end");
+        assert!(!hold.release(super::super::input::BUTTON_PRIMARY, true, true), "the primary button never takes the lock");
+        assert!(!hold.holding());
+    }
+
+    /// The ways a hold ends that are not the frame: the player presses again,
+    /// the compositor takes the lock away, or the lock never arrived.
+    #[test]
+    fn a_held_drag_cannot_outlive_the_things_that_make_it_possible() {
+        let mut hold = DragHold::default();
+        hold.release(RIGHT, true, true);
+        hold.left_canvas(0);
+        assert_eq!(hold.press(RIGHT), RIGHT, "a press means its release went by unseen");
+        assert!(!hold.holding());
+
+        hold.release(RIGHT, true, true);
+        hold.left_canvas(0);
+        assert_eq!(hold.lock_lost(), RIGHT, "`unlocked` leaves nothing to report the release");
+
+        hold.release(RIGHT, true, true);
+        hold.left_canvas(0);
+        assert_eq!(hold.batch_end(DRAG_HOLD_CONFIRM_MS, false, 0), 0, "within the wait");
+        assert_eq!(hold.batch_end(DRAG_HOLD_CONFIRM_MS + 1, false, 0), RIGHT, "the lock never confirmed");
+        assert!(!hold.holding());
+    }
+
+    /// The hint is in the coordinates of the surface that was locked. On the
+    /// toplevel that is the canvas point plus the header bar, whoever owned the
+    /// lock; the canvas lock has no offset to add.
+    #[test]
+    fn the_release_hint_is_in_the_locked_surfaces_coordinates() {
+        assert_eq!(release_hint(true, (640.0, 360.5), (25, 71)), (665.0, 431.5));
+        assert_eq!(release_hint(true, (500.0, 300.0), (0, 46)), (500.0, 346.0));
+        assert_eq!(release_hint(false, (640.0, 360.5), (25, 71)), (640.0, 360.5));
+    }
+
+    /// A confirmed lock does not time out while the pointer is doing anything,
+    /// however long the drag; with nothing at all for twenty seconds the compositor
+    /// has stopped reporting and the button is let go rather than stuck.
+    #[test]
+    fn a_confirmed_hold_lasts_while_events_come_and_gives_up_in_silence() {
+        let mut hold = DragHold::default();
+        hold.release(RIGHT, true, true);
+        hold.left_canvas(0);
+        assert_eq!(hold.batch_end(60_000, true, 59_000), 0, "events a second ago");
+        assert!(hold.holding());
+        assert_eq!(hold.batch_end(60_000, true, 30_000), RIGHT, "thirty seconds of nothing");
+        assert!(!hold.holding());
+    }
+
+    /// The Hyprland switch decides the case above, so its detection is pinned
+    /// by name without touching the process environment other tests read.
+    #[test]
+    fn hyprland_is_recognised_from_the_session_variables() {
+        assert!(!hyprland_from("", "", false));
+        assert!(!hyprland_from("KDE", "plasma", false));
+        assert!(hyprland_from("Hyprland", "", false));
+        assert!(hyprland_from("", "hyprland", false));
+        assert!(hyprland_from("sway", "", true), "the instance signature alone is enough");
+    }
+
+    /// The recentring and the release hint are KWin's. Everything that is not
+    /// the toplevel-lock path must come out false whatever else is true, which
+    /// is the whole of "other compositors keep today's behaviour".
+    #[test]
+    fn the_engine_owns_the_lock_only_on_the_toplevel_path() {
+        for engine_wants in [false, true] {
+            for dragging in [false, true] {
+                for before in [false, true] {
+                    for shift in [false, true] {
+                        assert!(
+                            !engine_owns_lock(false, engine_wants, dragging, before, shift),
+                            "off KWin: engine_wants={engine_wants} dragging={dragging} \
+                             before={before} shift={shift}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(engine_owns_lock(true, true, false, false, false));
+        assert!(!engine_owns_lock(true, false, false, false, false));
+    }
+
+    #[test]
+    fn a_cordial_started_drag_is_not_the_engines_lock() {
+        assert!(!engine_owns_lock(true, true, true, false, false));
+        assert!(engine_owns_lock(true, true, true, true, false));
+        assert!(engine_owns_lock(true, true, true, false, true));
+    }
+
+    #[test]
+    fn the_release_commit_waits_for_the_stacking_gate() {
+        assert!(release_commits_parent(true, false));
+        assert!(!release_commits_parent(true, true));
+        assert!(!release_commits_parent(false, false));
+        assert!(!release_commits_parent(false, true));
+    }
+
+    #[test]
+    fn a_confirmed_lock_makes_a_pointer_event_the_engines() {
+        // On the canvas is the engine's whether or not a lock is held.
+        assert!(pointer_event_is_the_engines(true, false));
+        assert!(pointer_event_is_the_engines(true, true));
+        // Off the canvas with a lock confirmed is the toplevel-lock case: the
+        // focus moved to the parent window but the cursor is captured, so the
+        // event is still the engine's. This is the one that used to return
+        // false and drop the click.
+        assert!(pointer_event_is_the_engines(false, true));
+        // Off the canvas with no lock is the header bar's click, which is what
+        // the flag was added to keep the engine from seeing.
+        assert!(!pointer_event_is_the_engines(false, false));
+    }
+
+    #[test]
+    fn a_release_follows_its_press_across_pointer_ownership_changes() {
+        use super::super::input::{BUTTON_PRIMARY, BUTTON_SECONDARY};
+        let mut held = 0;
+        let mut event = |owns, button, press| {
+            let routed = route_pointer_button(owns, held, button, press);
+            if routed {
+                if press { held |= button; } else { held &= !button; }
+            }
+            routed
+        };
+        assert!(event(true, BUTTON_PRIMARY, true));
+        assert!(event(true, BUTTON_SECONDARY, true));
+        // Losing focus between aim/fire and release must finish both presses.
+        assert!(event(false, BUTTON_SECONDARY, false));
+        assert!(event(false, BUTTON_PRIMARY, false));
+        assert!(!event(false, BUTTON_PRIMARY, false));
+        // A titlebar press and its release must both stay with GTK, even if
+        // the pointer reaches the canvas between the two.
+        assert!(!event(false, BUTTON_PRIMARY, true));
+        assert!(!event(true, BUTTON_PRIMARY, false));
+        // A later gesture must still start, once, and end normally.
+        assert!(event(true, BUTTON_PRIMARY, true));
+        assert!(!event(true, BUTTON_PRIMARY, true));
+        assert!(event(true, BUTTON_PRIMARY, false));
+        assert_eq!(held, 0);
+    }
 
     #[test]
     fn pointer_positions_and_side_buttons_keep_their_meaning() {

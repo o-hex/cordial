@@ -50,9 +50,11 @@ fn automatic_browser_launch_starts_and_last_clean_client_closes_hidden_launcher(
     .unwrap();
     std::fs::set_permissions(&loader, std::fs::Permissions::from_mode(0o755)).unwrap();
     let apk = root.path().join("base.apk");
-    let lib_dir = root.path().join("lib");
+    // Beside the APK, which is where `install::locate` looks for an unpacked
+    // engine now that Settings has no engine-directory row to point elsewhere.
+    let lib_dir = root.path().join("lib").join(cordial_update::apk::HOST_ABI);
     std::fs::write(&apk, []).unwrap();
-    std::fs::create_dir(&lib_dir).unwrap();
+    std::fs::create_dir_all(&lib_dir).unwrap();
     std::fs::write(lib_dir.join(install::LIBRARY), []).unwrap();
 
     let old_path = std::env::var_os("PATH");
@@ -66,7 +68,6 @@ fn automatic_browser_launch_starts_and_last_clean_client_closes_hidden_launcher(
     let mut shell_config = ShellConfig::default();
     shell_config.profile = "clean-exit".into();
     shell_config.roblox.apk = Some(apk);
-    shell_config.roblox.lib_dir = Some(lib_dir);
     let config = Rc::new(RefCell::new(shell_config));
     let config_path = Rc::new(root.path().join("shell.json"));
     let requested = "roblox-player:1+launchmode:play+placelauncherurl:x";
@@ -77,7 +78,7 @@ fn automatic_browser_launch_starts_and_last_clean_client_closes_hidden_launcher(
         let config_path = config_path.clone();
         let started = started.clone();
         app.connect_activate(move |app| {
-            let shell = build(app, config.clone(), config_path.clone());
+            let shell = build(app, config.clone(), config_path.clone(), false);
             shell.join.queue(requested.into());
             started.set(WidgetExt::activate_action(&shell.window, "win.launch", None).is_ok());
         });
@@ -134,7 +135,7 @@ fn manual_launch_entry_invalidates_lookup_without_consuming_join() {
     let config = Rc::new(RefCell::new(ShellConfig::default()));
     config.borrow_mut().profile = "last-used".into();
     config.borrow_mut().roblox.apk = Some(root.path().join("missing.apk"));
-    let shell = build(&app, config, Rc::new(root.path().join("shell.json")));
+    let shell = build(&app, config, Rc::new(root.path().join("shell.json")), false);
     let requested = "roblox-player:1+launchmode:play+gameinfo:FAKE+placelauncherurl:x";
     let task = shell
         .queue_with_lookup(requested.into(), |_| Some("browser-account".into()))
@@ -183,9 +184,11 @@ fn changed_profile_after_account_resolution_falls_back_before_spawn() {
     std::fs::write(&loader, "#!/bin/sh\n/usr/bin/sleep 2\n").unwrap();
     std::fs::set_permissions(&loader, std::fs::Permissions::from_mode(0o755)).unwrap();
     let apk = root.path().join("base.apk");
-    let lib_dir = root.path().join("lib");
+    // Beside the APK, which is where `install::locate` looks for an unpacked
+    // engine now that Settings has no engine-directory row to point elsewhere.
+    let lib_dir = root.path().join("lib").join(cordial_update::apk::HOST_ABI);
     std::fs::write(&apk, []).unwrap();
-    std::fs::create_dir(&lib_dir).unwrap();
+    std::fs::create_dir_all(&lib_dir).unwrap();
     std::fs::write(lib_dir.join(install::LIBRARY), []).unwrap();
     let old_path = std::env::var_os("PATH");
     std::env::set_var("PATH", root.path());
@@ -204,7 +207,6 @@ fn changed_profile_after_account_resolution_falls_back_before_spawn() {
     let mut shell_config = ShellConfig::default();
     shell_config.profile = "last-used".into();
     shell_config.roblox.apk = Some(apk);
-    shell_config.roblox.lib_dir = Some(lib_dir);
     let config = Rc::new(RefCell::new(shell_config));
     let lifecycle = LaunchLifecycle::default();
     let actions = gtk::gio::SimpleActionGroup::new();
@@ -222,6 +224,7 @@ fn changed_profile_after_account_resolution_falls_back_before_spawn() {
                 &config,
                 &join,
                 &lifecycle,
+                Mode::Phone,
             );
         });
     }

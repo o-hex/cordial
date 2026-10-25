@@ -56,9 +56,13 @@ jobs:
         # optional features compile rather than silently taking their
         # "unavailable" arms — the shape that made web views do nothing for
         # months and audio do nothing before that.
+        #
+        # `boost-devel` is for dynarmic (crates/cordial-guest, behind
+        # `cordial-runtime/vr`), which find_package()s Boost's headers on
+        # x86-64; `llvm` and `lld` also build that crate's arm64 test image.
         run: |
           dnf install -y --setopt=install_weak_deps=False \
-            git rust cargo clang cmake gcc-c++ binutils llvm lld \
+            git rust cargo clang cmake gcc-c++ binutils llvm lld boost-devel \
             pkgconf-pkg-config openssl-devel \
             gtk4-devel libadwaita-devel webkitgtk6.0-devel \
             pipewire-devel pulseaudio-libs-devel alsa-lib-devel \
@@ -67,13 +71,16 @@ jobs:
         with:
           submodules: recursive
       - name: cargo test --workspace
+        # The default features, as a checkout builds: no web view and no VR,
+        # so neither dynarmic nor its arm64 test image is built here.
+        #
         # Not `--all-features`: the `webview` feature is exercised separately
         # below, because enabling only one crate's half leaves the caller
         # cfg'd out and the linker collects the whole web view — the dead-code
         # shape that hid this feature being absent for months.
         run: cargo test --workspace
-      - name: cargo test with the web view
-        run: cargo test --workspace --features cordial-shell/webview,cordial-runtime/webview
+      - name: cargo test with the web view and VR
+        run: cargo test --workspace --features cordial-shell/webview,cordial-runtime/webview,cordial-runtime/vr
 
   # The Discord issue bridge generates its modals from `.github/ISSUE_TEMPLATE/`
   # and fetches them at *runtime*, so an edit to a template needs no redeploy.
@@ -109,3 +116,15 @@ jobs:
       - name: deno lint and fmt
         working-directory: tools/discord-bridge
         run: deno lint && deno fmt --check
+
+  # The scripts the workflows run are Python with no build step, so they get
+  # their own cheap job rather than waiting behind the Rust build. The Discord
+  # release announcer lives here: a release nobody is told about is the
+  # failure CLAUDE.md names, and this is what stands between a bad edit to it
+  # and the next release.
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests for .github/scripts
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v

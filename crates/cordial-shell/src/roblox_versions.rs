@@ -35,7 +35,6 @@ use cordial_update::store::{self, Entry};
 use cordial_update::Unreachable;
 
 use crate::download_progress::Meter;
-use crate::install;
 use crate::shell_config::ShellConfig;
 
 /// Said above the choice, not after a failure, because the failure it pre-empts
@@ -54,7 +53,7 @@ const SERVER_MINIMUM: &str =
 pub fn describe(entry: &Entry, current: Option<&str>, this_cordial: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     if current == Some(entry.version.as_str()) {
-        parts.push("Current build".into());
+        parts.push("Latest".into());
     }
     match entry.loaded_by.as_deref() {
         Some(v) if v == this_cordial => parts.push("Loaded by this Cordial".into()),
@@ -71,7 +70,7 @@ pub fn describe(entry: &Entry, current: Option<&str>, this_cordial: &str) -> Str
 /// Why a remove button is greyed out, or `None` when it is not.
 pub fn removal_blocked(version: &str, current: Option<&str>, pinned_anywhere: &[String]) -> Option<&'static str> {
     if current == Some(version) {
-        Some("The current build cannot be removed")
+        Some("Latest cannot be removed")
     } else if pinned_anywhere.iter().any(|p| p == version) {
         Some("A profile is pinned to this build")
     } else {
@@ -248,9 +247,10 @@ fn populate(view: &Rc<View>) {
     let profile_dir = profile::dir(&profile_name);
     let pinned = profile_dir.as_ref().ok().and_then(|d| profile::pinned_version(d));
     let root = store::root();
-    let live = install::engine_cache();
-    let current = store::current_in(&root, &live);
     let entries = store::list();
+    // What Latest runs: the newest build a launch may run, not whatever the old
+    // slot happens to point at (ADR-054).
+    let current = store::latest(&entries).map(|e| e.version.clone());
     let pinned_anywhere = profile::all_pinned_versions();
     let this_cordial = env!("CARGO_PKG_VERSION");
 
@@ -274,21 +274,31 @@ fn populate(view: &Rc<View>) {
     let status = adw::ActionRow::builder().title("").build();
     status.set_visible(false);
     status.set_subtitle_lines(4);
+    // Derived from the state rather than raised by the click, because every
+    // choice repopulates this page and an event-driven message would vanish
+    // with the rows. It stands for as long as the profile would run a build
+    // older than the one it last ran.
+    let target = pinned.clone().or_else(|| current.clone());
+    if let Some(warning) = target.as_deref().and_then(|t| {
+        profile::downgrade_warning(profile::last_roblox_version(&profile_dir).as_deref(), t)
+    }) {
+        show_status(&status, "Older than this profile last ran", &warning);
+    }
 
     let follow = adw::ActionRow::builder()
-        .title("Follow the current build")
+        .title("Latest")
         .subtitle(subtitle(
             pinned.is_none(),
             &match &current {
-                Some(v) => format!("Roblox {v} now, and newer builds as they are installed"),
-                None => "Whichever build Cordial has, and newer builds as they are installed".into(),
+                Some(v) => format!("Roblox {v} now, and newer builds as they are downloaded"),
+                None => "The newest build Cordial has, and newer builds as they are downloaded".into(),
             },
         ))
         .activatable(true)
         .build();
     follow.set_subtitle_lines(2);
     follow.add_prefix(&tick(pinned.is_none()));
-    let play = icon_button("media-playback-start-symbolic", "Follow the current build and launch");
+    let play = icon_button("media-playback-start-symbolic", "Use Latest and launch");
     follow.add_suffix(&play);
     list.add(&follow);
     connect_use(&follow, &play, &profile_dir, None, &status, &weak);
@@ -325,9 +335,9 @@ fn populate(view: &Rc<View>) {
             remove.set_tooltip_text(Some(why));
         }
         let version = entry.version.clone();
-        let (root, live, pinned_anywhere) = (root.clone(), live.clone(), pinned_anywhere.clone());
+        let (root, pinned_anywhere) = (root.clone(), pinned_anywhere.clone());
         let (status_for_remove, weak_for_remove) = (status.clone(), weak.clone());
-        remove.connect_clicked(move |_| match store::remove_in(&root, &live, &version, &pinned_anywhere) {
+        remove.connect_clicked(move |_| match store::remove_in(&root, &version, &pinned_anywhere) {
             Ok(()) => repopulate_soon(&weak_for_remove),
             Err(e) => show_status(&status_for_remove, "The build was not removed", &e),
         });
@@ -352,10 +362,9 @@ fn populate(view: &Rc<View>) {
 
     if !entries.is_empty() {
         let note = adw::PreferencesGroup::builder()
-            .description(format!(
-                "Cordial keeps the newest {} and any build a profile is pinned to. Removing one does not touch APKs that came from Sober.",
-                store::KEEP
-            ))
+            .description(
+                "Cordial keeps the newest build, the one before it, any build a profile is pinned to and any a client is running. Removing one does not touch Sober's files.",
+            )
             .build();
         add_group(view, note);
     }
@@ -554,6 +563,12 @@ mod tests {
             loaded_by: loaded_by.map(Into::into),
             bytes: 118_732_400,
             complete,
+            // No fixture here has a real engine on disk to hash; `None` is
+            // exactly what `ensure_content_hash` reports for the same reason.
+            content_hash: None,
+            signer: None,
+            provenance: None,
+            version_code: None,
         }
     }
 
@@ -566,7 +581,7 @@ mod tests {
     #[test]
     fn the_current_build_loaded_by_this_cordial_says_both() {
         let line = describe(&entry("2.738.0.1397", Some("0.14.0"), true), Some("2.738.0.1397"), "0.14.0");
-        assert_eq!(line, "Current build · Loaded by this Cordial · 118.7 MB");
+        assert_eq!(line, "Latest · Loaded by this Cordial · 118.7 MB");
     }
 
     #[test]

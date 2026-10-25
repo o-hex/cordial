@@ -623,6 +623,25 @@ pub fn verify(path: &Path) -> Result<Signer, Refusal> {
 /// correct direction to fail: trusting nothing stops a download, and trusting
 /// everything installs whatever a mirror felt like serving.
 pub fn pinned() -> Vec<String> {
+    pinned_under("certificates")
+}
+
+/// The certificates Cordial accepts a **Quest** build from, which are not the
+/// phone build's.
+///
+/// Measured 2026-10-01 on 2.740.0.927 pulled from a Quest 3: the archive's v2
+/// signature verifies, to a certificate whose digest is not in
+/// [`pinned`]. So the Quest build is signed with a key of its own, and it is
+/// kept in a list of its own rather than added to the phone build's: a digest
+/// in `certificates` is one every mirror download is accepted against, and the
+/// Quest key has no business widening what an update will install. Only
+/// [`crate::quest::import`] reads this list, for a file the user supplied from
+/// their own headset; nothing downloads a Quest build.
+pub fn pinned_quest() -> Vec<String> {
+    pinned_under("quest_certificates")
+}
+
+fn pinned_under(key: &str) -> Vec<String> {
     const BUILT_IN: &str =
         include_str!("../../../packaging/trust/roblox-signing-certificates.json");
 
@@ -650,7 +669,7 @@ pub fn pinned() -> Vec<String> {
     };
 
     parsed
-        .get("certificates")
+        .get(key)
         .and_then(|c| c.as_array())
         .map(|list| {
             list.iter()

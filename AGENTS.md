@@ -307,6 +307,32 @@ Where the user-facing writing lives, and who it is for:
 | `docs/analysis/`, `docs/NEXT.md` | Somebody continuing an investigation |
 | Release notes in `docs/releases/` | Somebody who just installed it and hit something |
 
+**`docs/` is also the docs site.** The pages `docs/docs.json` lists are
+published by Mintlify, from a `mintlify` branch the `Docs site` workflow
+generates; never edit that branch. Internal notes stay off the site through
+`docs/.mintignore`. Write plain Markdown that reads well on GitHub, and get
+Mintlify's components from syntax GitHub already renders, which
+`tools/docs-site/build.py` translates: `> [!NOTE]`/`[!TIP]`/`[!WARNING]`/
+`[!CAUTION]`/`[!IMPORTANT]` callouts, `<details><summary>` for an accordion,
+`<!-- steps -->`/`<!-- tabs -->` regions with one heading per step or tab,
+`<!-- cards -->` around a `- [Title](page.md): text` list, and the page's `#`
+heading plus `<!-- description: ... -->` and `<!-- icon: ... -->` for its
+frontmatter. Keep links relative with `.md`. A published page must still parse
+as MDX: a `<placeholder>` goes in backticks, and code blocks are fenced, not
+indented. CI runs `mint validate` and `mint broken-links` on every change to
+`docs/`.
+
+**A user page says what to do; the ADR says why.** Every published guide page
+leads with what the feature does and how to use it, then what is broken. Use
+the components where they help the reader: steps for a procedure, tabs for
+per-install or per-distribution variants, a callout for the one thing that
+will bite, `<details>` for a full variable list or troubleshooting. Reasoning,
+history, how something was measured and retractions do not go on that page:
+add them to the ADR they belong to and link it in one line ("Why:
+[ADR-0NN](adr/...)"). Anything the reader acts on stays on the page: commands,
+paths, Settings labels, and `INFERRED` where a claim is not measured.
+[`docs/plugins-overview.md`](docs/plugins-overview.md) is the model.
+
 **The README has a length ceiling, and it is the one document here that
 does.** It is read by somebody deciding whether to install Cordial and then
 installing it, and nobody in that state reads twelve hundred lines. It reached
@@ -344,7 +370,9 @@ cargo build --release      # Clang required; AOSP bionic does not build with GCC
 cargo test --workspace
 ```
 
-Both must pass. Run them; do not assume.
+Both must pass. Run them; do not assume. A change to the VR mode needs both
+again with `--features cordial-runtime/vr`, which is off by default and needs
+Boost's headers, and `lld` and `llvm` for its tests.
 
 **Two builds must never share one `target/`, and this is not a tidiness rule.**
 On 2026-08-24 an agent working in a `git worktree` pointed `CARGO_TARGET_DIR` at
@@ -569,11 +597,22 @@ collide on that lock and read the refusal as a bug in whatever they were
 working on:
 
 ```bash
-XDG_DATA_HOME=~/.cache/cordial-agent-<yours> just client --run 30
+XDG_DATA_HOME=~/.cache/cordial-agent-<yours>/data \
+XDG_CACHE_HOME=~/.cache/cordial-agent-<yours>/cache \
+XDG_CONFIG_HOME=~/.cache/cordial-agent-<yours>/config just client --run 30
 ```
 
 Both the shell's profile root and the client's data directory derive from
-`XDG_DATA_HOME`, so that redirects the lot. Use a path on disk — `/tmp` is tmpfs
+`XDG_DATA_HOME`, but since 0.25.0 that no longer redirects the lot: the shell's
+first launch moves an old build store from `$XDG_CACHE_HOME/cordial/builds`
+into `$XDG_DATA_HOME/cordial/builds` (ADR-054). On 2026-10-08 an agent that
+redirected only `XDG_DATA_HOME` had the host's real store moved into its scratch
+directory, then deleted it with the rest of its scratch. Redirect all three. And start the shell under its own `dbus-run-session`: it is a
+`GApplication` named `io.github.luohoa97.Cordial`, so a test shell left on the
+real session bus owns that name, and the user's own Cordial then hands its
+activation to it and exits in a tenth of a second -- on 2026-10-08 an agent's
+leftover shell, displaying into a nested sway nobody could see, made the
+maintainer's Flatpak look like it would not start. Use a path on disk — `/tmp` is tmpfs
 and comes out of RAM — and delete it when you are done. `CORDIAL_PROFILE_ROOT`
 redirects `profile.rs` only, which is what the unit tests use; it does **not**
 move the client, which still hardcodes its own path.

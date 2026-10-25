@@ -1,6 +1,7 @@
 # ADR-025: Cordial may fetch the build from a third-party mirror, if it can prove Roblox signed it
 
 **Status:** accepted
+**Amended by:** [ADR-054](ADR-054-cordial-owns-its-roblox-builds.md) (launches resolve from the store; Sober is an import; 2026-10-04)
 **Extends:** [ADR-015](ADR-015-cordial-may-fetch-the-roblox-build.md)
 **Related:** [ADR-012](ADR-012-profiles-and-instances.md), [ADR-016](ADR-016-per-profile-network-egress.md)
 

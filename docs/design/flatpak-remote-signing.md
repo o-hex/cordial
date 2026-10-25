@@ -1,7 +1,11 @@
 # Signing the Flatpak remote — the procedure, for whoever holds the key
 
-**Status: the CI side is built and waiting; nobody has generated a key.** This
-document is the other half of that sentence in
+**Status: done.** A key exists and the published remote has been signed with it
+since at least 2026-09-29 (`summary.sig` is served and the
+`.flatpakrepo` carries a `GPGKey`); the fingerprint is in
+[`docs/install.md`](../install.md). What follows was written before that, and is
+kept as the procedure for rotating or regenerating the key. This
+document is the other half of the sentence in
 [`.github/workflows/flatpak.yml`](../../.github/workflows/flatpak.yml) — "switches
 on the day a maintainer adds a key" — written down precisely enough that adding
 one is fifteen minutes of following steps rather than an afternoon of reading
@@ -178,3 +182,17 @@ GitHub account — can serve a different package under the same name with no
 warning to an installed client. A signed remote turns that into "serve a
 different package signed by a key they would also have had to steal", which is
 a materially smaller set of attackers.
+
+## Notes moved from docs/install.md (2026-10-02)
+
+Moved out of the install page when it was cut down to what a reader acts on.
+
+**Measured end to end on 2026-08-05, flatpak 1.18.0**, against the published URL rather than a stand-in: `remote-add` accepted, `remote-ls` returning `app/io.github.luohoa97.Cordial/x86_64/master`, `install` placing both `cordial-shell` and `cordial-run` in `/app/bin`, and `flatpak run` bringing up the launcher window and holding it. The appstream branch resolves and the metainfo validates, so a software centre lists it too.
+
+**Observed on 2026-09-30:** `summary.sig` is published, and with the key imported into a throwaway OSTree repository `ostree remote refs` reads the summary with `gpg-verify-summary` on; the same command against a remote with no key fails with `Can't check signature: public key not found`. `flatpak install` itself was not run against it. The fingerprint was read from the published file, the same place a compromised site would have changed it, so it is not confirmed out of band.
+
+**What a signature does not do** is make the GitHub Pages site trustworthy to host it: whoever holds the private key, which lives as a repository secret, can sign anything. That is a weaker arrangement than Flathub's. Signing is set up in `.github/workflows/flatpak.yml`. Building from source is the whole of the alternative for someone who would rather not extend that trust.
+
+**Why release-page files use cosign and the repositories use OpenPGP.** Every `.deb`, `.rpm`, `.AppImage` and Arch package on a release page is signed keyless with cosign, so there is no Cordial signing key to lose, and the signature proves the file came out of this repository's own release workflow at that tag and not from someone who obtained a key. The trade is that every signature is recorded permanently in Sigstore's public transparency log, which for public release artefacts is the point: it lets a reader check, a year later, that a file was signed by this workflow at that tag. The Flatpak remote and the apt, dnf and pacman repositories use OpenPGP keys because Sigstore cannot supply them.
+
+**Cordial is not on Flathub, and the generative-AI policy is the whole of what stands in the way.** The argument, including Sober's own manifest as precedent for a client that downloads Roblox's build at runtime, is in [`docs/HANDOVER.md`](../HANDOVER.md#flathub-and-why-it-is-not-the-plan).

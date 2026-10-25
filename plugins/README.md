@@ -34,6 +34,18 @@ allowed to do is decided per account. An existing
 first profile that looks for one, and every other profile starts at default deny
 — see [ADR-013](../docs/adr/ADR-013-per-profile-configuration.md).
 
+**None of this needs a restart to reach a running client**
+([ADR-038](../docs/adr/ADR-038-plugin-hot-swap.md)). Installing, updating,
+removing, enabling, disabling or granting a plugin in this profile is
+noticed within a second or two and starts, stops or restarts exactly that
+plugin. An update that changes what your manifest requests never lets a
+restarted process keep a capability the new manifest stopped asking for,
+whatever the grants file still says — see `intersect_for_restart` in
+`crates/cordial-plugins/src/reconcile.rs`. The one thing that still waits for
+the next launch is a `flags.write` layer, because `FFlag`/`FInt`/`FString`
+are read once at startup regardless (ADR-005) — see "Flags have two
+lifetimes" below.
+
 ## Versions and dependencies
 
 `version` is a semantic version, `major.minor.patch`. It is optional — a plugin

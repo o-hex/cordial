@@ -32,6 +32,47 @@ use std::time::{Duration, Instant};
 /// `tests::app_id_matches_the_desktop_entry`.
 pub const APP_ID: &str = "Cordial";
 
+/// The id WebKit and the desktop portals know this program by, which is not
+/// [`APP_ID`] and must not be.
+///
+/// `WTF::applicationID()` takes `g_application_get_default()`'s id, else
+/// `g_get_prgname()` *if* that is a valid application id, else
+/// `org.webkit.app-<sha256 of the executable path>`. `Cordial` has no dot, so
+/// `cordial-run` -- which has no `GApplication` -- got the hashed name. Inside
+/// the Flatpak, WebKit spawns the web process through the portal's
+/// sub-sandbox and names an AT-SPI bus name after that id; the portal insists
+/// the name be prefixed by the real app id and refuses, and WebKit turns the
+/// refusal into a `g_error`. Measured on 0.24.1: opening any in-app web window
+/// ended the whole client with `Invalid sandbox a11y own name ... doesn't
+/// match app id`.
+///
+/// A bare default `GApplication` supplies the right answer without touching
+/// the window. GTK4's Wayland backend reads the `xdg_toplevel` app_id from the
+/// toplevel's own D-Bus properties, which only a `GtkApplication` association
+/// sets, and otherwise from the program name -- so `Cordial` stays what the
+/// compositor sees and ADR-009 is undisturbed. It is never registered, because
+/// the shell already owns this bus name and only the id is wanted.
+const WEBKIT_APP_ID: &str = "io.github.luohoa97.Cordial";
+
+/// Give WebKit an application id before anything asks it for one.
+///
+/// `applicationID()` is computed once per process, so this has to run before
+/// the first `WebKitWebView` -- `init_wayland` is the latest that can be. The
+/// application is leaked rather than stored: `g_application_set_default` holds
+/// no reference, and the default silently reverts to none when it is finalised.
+fn claim_webkit_application_id() {
+    use libadwaita::gio;
+    if gio::Application::default().is_some() {
+        return;
+    }
+    let app = gio::Application::builder()
+        .application_id(WEBKIT_APP_ID)
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.set_default();
+    std::mem::forget(app);
+}
+
 /// What the header bar says.
 ///
 /// It used to name the graphics backend and the name it gave was "OpenGL ES",
@@ -154,7 +195,8 @@ fn smallest_monitor() -> Option<(i32, i32)> {
 ///
 /// `glib::set_prgname` because a window with no `GApplication` takes its
 /// `xdg_toplevel.app_id` from the program name, which would otherwise be
-/// `cordial-run`. See [`APP_ID`].
+/// `cordial-run`. See [`APP_ID`]. `claim_webkit_application_id` is the other
+/// half of that, for WebKit rather than for the compositor.
 pub fn init_wayland() -> Result<(), String> {
     if std::env::var("GDK_BACKEND").is_ok_and(|v| v != "wayland") {
         // SAFETY: `g_setenv` is not thread-safe against a concurrent
@@ -167,6 +209,7 @@ pub fn init_wayland() -> Result<(), String> {
     }
     gtk::gdk::set_allowed_backends("wayland");
     glib::set_prgname(Some(APP_ID));
+    claim_webkit_application_id();
     adw::init().map_err(|e| format!("libadwaita would not initialise: {e}"))?;
     unmute_waylands_own_errors();
     Ok(())
@@ -253,6 +296,13 @@ pub struct HostWindow {
     /// Font size and colours for the current box. Reloaded when a box takes
     /// focus rather than styled per keystroke -- see [`HostWindow::set_text_overlay`].
     editor_css: gtk::CssProvider,
+    /// The title-bar preference in force. A cell because it changes while the
+    /// window is up (ADR-044), and shared because the fullscreen handler reads
+    /// it each time the window enters or leaves fullscreen and must see the
+    /// current choice, not the one the window was built with.
+    title_bar: std::rc::Rc<std::cell::Cell<crate::title_bar::TitleBar>>,
+    /// Holds [`COMPACT_SHEET`] when the bar is compact and nothing otherwise.
+    compact_css: gtk::CssProvider,
     /// Where the editor is in surface coordinates, so the input-region punch
     /// can hand that one rectangle back to GTK. `None` when nothing is focused.
     editor_rect: std::cell::Cell<Option<(i32, i32, i32, i32)>>,
@@ -262,10 +312,52 @@ pub struct HostWindow {
     /// What to tell when the user edits. Installed by the runtime, which owns
     /// the push to `syncTextboxTextAndCursorPosition2`.
     editor_changed: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(&str, i32)>>>>,
+    /// Called when Enter is pressed in the single-line editor, GTK's
+    /// `activate`. Absent on the multi-line one on purpose: Enter there is a
+    /// newline in the text, not an action. See [`Self::connect_editor_activate`].
+    editor_activated: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn()>>>>,
     /// The font family the engine draws with, once the runtime has found it in
     /// the APK. `None` until then, and `None` for ever if it is not there --
     /// see [`HostWindow::set_editor_font_family`].
     editor_font_family: std::cell::RefCell<Option<String>>,
+    /// The multi-line editor for a Roblox `TextBox` with `MultiLine` true.
+    ///
+    /// `gtk::Text` cannot hold more than one line -- see [`Self::editor`]'s own
+    /// doc -- so a genuinely multi-line box (Circuit Maker 2's assembler and
+    /// ROM boxes, a code editor, a chat entry more than one line tall) needs a
+    /// widget that can wrap and scroll. `gtk::TextView` is GTK's editable
+    /// multi-line widget; [`Self::editor_multiline_scroll`] is the
+    /// `gtk::ScrolledWindow` that actually sits in [`Self::text_layer`], so
+    /// text past the box's height scrolls inside the box instead of spilling
+    /// onto the canvas. Exactly one of `editor`/`editor_multiline` is visible
+    /// at a time -- chosen in [`Self::set_text_overlay`] by
+    /// `TextOverlay::multiline` -- and [`Self::editor_active_multiline`]
+    /// records which, for devctl's `paste`/`settext` to route to.
+    editor_multiline: gtk::TextView,
+    /// The scrollable container [`Self::editor_multiline`] sits in, and the
+    /// widget [`Self::text_layer`] actually places and sizes. See
+    /// [`Self::editor_multiline`].
+    editor_multiline_scroll: gtk::ScrolledWindow,
+    /// Same purpose as [`Self::editor_seeding`], and kept separate rather than
+    /// shared: the two widgets' change signals fire independently of each
+    /// other and only one editor is ever live, but a single flag toggled by
+    /// both would race if a stray signal from the widget being hidden arrived
+    /// after the other had already started seeding.
+    editor_multiline_seeding: std::rc::Rc<std::cell::Cell<bool>>,
+    /// The one `GtkTextTag` carrying the current box's font family, weight,
+    /// style and size, reapplied across the whole buffer on every change.
+    ///
+    /// `gtk::TextView` has no per-widget equivalent of `gtk::Text::set_attributes`
+    /// -- a `GtkTextBuffer`'s formatting lives in tags attached to ranges of
+    /// text, not in one Pango attribute list for the whole widget. One mutable
+    /// tag, restyled here and kept applied to the entire buffer (see the
+    /// `connect_changed` handler installed in [`Self::new`]), gets the same
+    /// effect as `gtk::Text`'s attribute list without hand-tracking which
+    /// ranges are tagged.
+    editor_multiline_tag: gtk::TextTag,
+    /// Which of `editor`/`editor_multiline` [`Self::set_text_overlay`] last
+    /// showed. `false` (and no editor visible) once a box has blurred.
+    editor_active_multiline: std::cell::Cell<bool>,
     /// Whether the canvas is currently lowered. Remembered for the CSS class;
     /// the input region no longer depends on it, see [`HostWindow::set_canvas_cutout`].
     canvas_see_through: std::cell::Cell<bool>,
@@ -283,6 +375,24 @@ pub struct HostWindow {
     /// Separate from `canvas_see_through`, which both the editor and a dialog
     /// set: those two want opposite answers here. See `input_region`.
     dialog_up: std::cell::Cell<bool>,
+    canvas_in_input_region: std::cell::Cell<bool>,
+    /// The frame clock's counter when a lowering was last prepared, and whether
+    /// `after-paint` has fired since. `None` when no lowering is being
+    /// prepared. See [`HostWindow::arm_present_probe`].
+    present_probe: std::cell::RefCell<Option<PresentProbe>>,
+}
+
+/// What [`HostWindow::arm_present_probe`] remembers between ticks.
+struct PresentProbe {
+    /// The last frame that had begun when the probe was armed. Any frame with a
+    /// higher counter was laid out after the window was made transparent, so it
+    /// carries the new background.
+    counter: i64,
+    /// Set by the frame clock's `after-paint`. Weaker than a presentation
+    /// report -- see [`HostWindow::present_probe_committed`] -- and only the
+    /// answer when the compositor cannot report presentation at all.
+    painted: std::rc::Rc<std::cell::Cell<bool>>,
+    handler: glib::SignalHandlerId,
 }
 
 /// The Android editor rectangle Roblox asks the platform to paint over its
@@ -321,11 +431,13 @@ pub struct TextOverlay<'a> {
     /// itself. Such an editor is not sitting on the box, so it has to carry its
     /// own chrome to be legible -- see the CSS class below.
     pub fallback: bool,
-    /// Roblox's `Enum.TextXAlignment`: `Left` = 0, `Center` = 1, `Right` = 2.
+    /// Roblox's `Enum.TextXAlignment`: `Left` = 0, `Right` = 1, `Center` = 2.
     /// These are Roblox's own published scripting-API ordinals -- not
     /// something read out of a binary -- and they line up with what
     /// `native/android_classes.cpp`'s `CordialTextBoxInfo::x_alignment`
-    /// carries. See [`gtk_xalign`] for where they turn into a GTK property.
+    /// carries. See [`gtk_xalign`] for where they turn into a GTK property,
+    /// and that function's own doc for why this is `Right`/`Center` and not
+    /// the `Center`/`Right` this project assumed before 2026-09-26.
     pub x_alignment: i32,
     /// Roblox's `Enum.TextYAlignment`: `Top` = 0, `Center` = 1, `Bottom` = 2.
     /// See [`vertical_placement`] -- `gtk::Text` has no equivalent property of
@@ -334,42 +446,79 @@ pub struct TextOverlay<'a> {
     pub y_alignment: i32,
     /// Roblox's `TextBox.MultiLine`, from constructor slot 5.
     ///
-    /// **The editor is still a single-line `gtk::Text` when this is true, and
-    /// that is a known gap rather than a decision.** What it changes today is
-    /// only [`vertical_placement`]: a `Top`- or `Bottom`-aligned single-line
-    /// box is shrunk to one line's natural height and anchored, which is right
-    /// for a one-line field and wrong for a chat entry that is four lines tall
-    /// -- it would draw the editor as a one-line strip at the top or bottom of
-    /// a box the engine drew full height. Leaving the rectangle alone is the
-    /// smaller error of the two until there is a real multi-line editor.
+    /// **As of the `gtk::TextView` overlay, this picks the widget.** `true`
+    /// places [`HostWindow::editor_multiline`] -- a real multi-line, scrolling
+    /// editor -- instead of the single-line [`HostWindow::editor`]. Before
+    /// that widget existed this field was only ever *reported*: every box got
+    /// the single-line `gtk::Text` and [`vertical_placement`] special-cased a
+    /// `true` here to leave the box's full rectangle alone rather than
+    /// shrinking it to one line -- see that function's history for why the
+    /// shrink was the wrong failure mode for a box nothing could yet fill
+    /// properly. `vertical_placement` no longer takes this at all, because a
+    /// box this is true for never reaches it any more.
     pub multiline: bool,
+    /// Roblox's `TextBox.TextWrapped`, constructor slot 13.
+    ///
+    /// Only consulted by the multi-line editor -- `gtk::Text` never wraps,
+    /// being one line by definition, so a single-line box's own wrapping
+    /// preference has nothing to apply to here.
+    pub text_wrapped: bool,
 }
 
 /// GTK's `Editable::set_alignment` fraction for Roblox's `xAlignment`: `0.0`
 /// is flush left, `1.0` flush right, `0.5` centred -- the same three points a
 /// `TextXAlignment` names, just spelled as a fraction instead of an enum.
 ///
-/// **Confirmed, not inferred.** Every box this project has focused before
-/// today read `xAlignment=Left` here, and nothing anywhere applied it -- a
-/// TextBox actually styled `Center` or `Right` would draw the engine's own
-/// text centred or flush right and Cordial's editor flush left underneath it,
-/// which is one plausible reading of "the text box isn't centred". Which slot
-/// carries the value, and that it is `xAlignment` and not `font` (the two
-/// were genuinely ambiguous from Cordial's own two-box capture -- both read
-/// `0` on both boxes), is settled by mocktail's `NativeTextBoxInfo`
-/// constructor, `src/jnivm/jnivm.cc:4016-4024` (Apache-2.0): its varargs
-/// reader lists the six int arguments in declared order as `xAlignment,
-/// yAlignment, textColor, font, textInputType, returnKeyType`, which is a
-/// fact about Roblox's platform API rather than about mocktail's own
-/// implementation. The ordinals themselves are Roblox's published
-/// `Enum.TextXAlignment`, not read out of mocktail at all.
+/// **The ordinal order was wrong here until 2026-09-26, and this is the
+/// function it actually reached a pixel through.** Which slot carries the
+/// value, and that it is `xAlignment` and not `font` (the two were genuinely
+/// ambiguous from Cordial's own two-box capture -- both read `0` on both
+/// boxes), is settled by mocktail's `NativeTextBoxInfo` constructor,
+/// `src/jnivm/jnivm.cc:4016-4024` (Apache-2.0): its varargs reader lists the
+/// six int arguments in declared order as `xAlignment, yAlignment, textColor,
+/// font, textInputType, returnKeyType`, which is a fact about Roblox's
+/// platform API rather than about mocktail's own implementation. But *which
+/// ordinal means which alignment* is a different question mocktail's field
+/// order says nothing about, and this file answered it by assuming
+/// alphabetical order -- `Left, Center, Right` -- rather than checking.
+/// Roblox's own published enum reference
+/// (`create.roblox.com/docs/reference/engine/enums/TextXAlignment` and
+/// `robloxapi.github.io/ref/enum/TextXAlignment.html`, cross-checked against
+/// each other) gives `Left=0, Right=1, Center=2`: the enum was reindexed at
+/// some point in Roblox's history, swapping `Right` and `Center`, and the
+/// alphabetical guess landed on the pre-reindex order. Every box this project
+/// has ever focused reads `xAlignment=Left` (`0`), which is unaffected by the
+/// swap either way -- so nothing here had ever drawn a `Right` or `Center`
+/// box to notice, and the maintainer's report of a game-defined box aligned
+/// "from the right when it's supposed to be from the left" is consistent with
+/// this: a `Right`-styled box (`1`) drew centred under the old mapping, and
+/// (on a narrower box, or read at a glance) a wrongly-centred short line can
+/// read as sitting off to the right of where a left-aligned line would start.
 fn gtk_xalign(x_alignment: i32) -> f32 {
     match x_alignment {
-        2 => 1.0,
-        1 => 0.5,
+        1 => 1.0,
+        2 => 0.5,
         // `0` (Left) and anything this build has never seen: Roblox's own
         // default, and the one value this project has actually observed.
         _ => 0.0,
+    }
+}
+
+/// [`gtk_xalign`]'s counterpart for [`HostWindow::editor_multiline`]:
+/// `gtk::TextView` has no `Editable::set_alignment`, only
+/// `set_justification`, so the three points need a second mapping onto a
+/// different enum rather than a fraction. Same ordinals, same 2026-09-26
+/// correction, same reasoning -- see that function's doc comment -- kept as
+/// its own named function rather than inlined at the one call site so a
+/// future edit to one mapping cannot silently leave the other on the old
+/// ordinals, which is exactly how the multi-line branch would otherwise have
+/// kept drawing `Right` centred and `Center` flush right after the
+/// single-line fix.
+fn gtk_justification(x_alignment: i32) -> gtk::Justification {
+    match x_alignment {
+        1 => gtk::Justification::Right,
+        2 => gtk::Justification::Center,
+        _ => gtk::Justification::Left,
     }
 }
 
@@ -459,20 +608,21 @@ fn corner_safe_rects(x: i32, y: i32, w: i32, h: i32, radius: i32) -> Vec<(i32, i
     ]
 }
 
-/// [`vertical_placement_tests`] covers the arithmetic, not a live box.
-fn vertical_placement(
-    y_alignment: i32,
-    box_y: i32,
-    box_h: i32,
-    natural_h: i32,
-    multiline: bool,
-) -> (i32, i32) {
-    // A multi-line box has no single "the line" to anchor, and `natural_h` is
-    // one line of the editor -- so every branch below would shrink a tall box
-    // to a strip. See `TextOverlay::multiline`.
-    if multiline {
-        return (box_y, box_h);
-    }
+/// Where to place the single-line `gtk::Text` overlay vertically.
+///
+/// **No longer takes a `multiline` flag.** It used to special-case
+/// `multiline` by returning `(box_y, box_h)` unshrunk -- the box's full
+/// height handed to a widget that can only ever draw one line -- because
+/// every box got this widget regardless of `TextBox.MultiLine`. That was the
+/// smaller of two wrong answers while there was nothing better, and it is the
+/// leading suspect for a report of the editor "filling the whole window"
+/// after a resize with a tall multi-line box focused: a box whose reported
+/// height happened to be the whole content area, handed straight through with
+/// no clamp at all. A genuinely multi-line box now gets
+/// [`HostWindow::editor_multiline`] instead -- see `TextOverlay::multiline` --
+/// and never calls this function, so the branch is deleted rather than kept
+/// dead. [`vertical_placement_tests`] covers the arithmetic, not a live box.
+fn vertical_placement(y_alignment: i32, box_y: i32, box_h: i32, natural_h: i32) -> (i32, i32) {
     let h = natural_h.clamp(1, box_h.max(1));
     match y_alignment {
         0 => (box_y, h),
@@ -481,6 +631,41 @@ fn vertical_placement(
         // from before this function existed.
         _ => (box_y, box_h),
     }
+}
+
+/// Where to place the multi-line `gtk::TextView` overlay vertically: the
+/// box's own rectangle, always.
+///
+/// A separate function from [`vertical_placement`] rather than a shared one
+/// with a flag, because there is nothing left to share -- a multi-line box
+/// has no single line to anchor a `Top`/`Bottom` alignment against, so
+/// `yAlignment` is not consulted at all. Kept as a named, tested function
+/// anyway rather than inlined at the one call site, so the choice is visible
+/// next to [`vertical_placement`]'s and a future edit cannot silently drop the
+/// "always the whole box" guarantee the way the old shared function nearly
+/// did for the single-line widget.
+fn multiline_placement(box_y: i32, box_h: i32) -> (i32, i32) {
+    (box_y, box_h)
+}
+
+/// The stylesheet that gives the focused box's colour to both editors.
+///
+/// **A `GtkTextView` takes its text colour from its own node, not from the
+/// `text` child inside it**, and the rule used to name only the child. The
+/// single-line editor drew in the engine's colour and the multi-line one in the
+/// theme's: white under a dark theme, near-black under a light one. A light
+/// theme over a dark game is black text on black, in a box that holds every
+/// character typed into it -- the shape of #86 ("the text I type doesn't show
+/// up, but it's still there"). Measured on a nested sway with a photograph of
+/// the output (`tools/text-input-e2e.py --visibility`): typing 12 characters
+/// added 56 pixels of the engine's #d5d5dd to the single-line editor and none
+/// to the multi-line one, in both themes, and the multi-line text came out
+/// near-black under the light one.
+fn editor_colour_sheet(rgb: &str) -> String {
+    format!(
+        ".cordial-editor, .cordial-editor-multiline, .cordial-editor-multiline text \
+         {{ color: {rgb}; caret-color: {rgb}; }}"
+    )
 }
 
 /// Pango's `Weight` from an OpenType weight number.
@@ -527,6 +712,37 @@ fn canvas_cursor() -> Option<&'static str> {
     }
 }
 
+/// The sheet that makes the header bar compact, loaded into its own provider so
+/// the preference can change while the window is up (ADR-044): clearing a
+/// provider is one call, where removing rules from the middle of the main sheet
+/// would mean parsing all of it again.
+///
+/// The close button's right margin is one pixel short of its
+/// other three, and that asymmetry is deliberate. Reported as
+/// the x sitting too far left, with the gap to the right edge
+/// visibly larger than the gap above and below it -- which it
+/// was, by exactly one pixel. The two gaps are computed
+/// differently: the horizontal one is a sum of paddings
+/// (`windowhandle` insets its `GtkCenterBox` child equally on
+/// both sides, and the button's own margin adds to that), while
+/// the vertical one is whatever centring leaves over once the
+/// bar's height is settled by something else entirely -- the
+/// title label, not this sheet, which is also why the
+/// `min-height` below does not bind. Measured with
+/// `examples/compact_bar_offsets.rs`: 8/8/9 before, 8/8/8
+/// after, against the unmodified sheet in the same session.
+///
+/// A pixel off one margin is the smallest change that squares
+/// them. Equalising them properly would mean driving the bar's
+/// height from this sheet rather than the label's, which is the
+/// aggressive compaction 3d67e59 already tried and got reverted
+/// for.
+const COMPACT_SHEET: &str = " .cordial-engine-host headerbar { min-height: 30px; padding: 0 6px; } \
+                 .cordial-engine-host headerbar windowcontrols button { \
+                     min-width: 24px; min-height: 24px; padding: 0; \
+                     margin: 2px 1px 2px 2px; \
+                 }";
+
 impl HostWindow {
     /// Build the window with an empty canvas in the content slot.
     ///
@@ -535,7 +751,13 @@ impl HostWindow {
     /// rather than that minus a titlebar.
     pub fn with_canvas(title: &str, width: i32, height: i32) -> Self {
         let title_bar = crate::title_bar::TitleBar::from_env();
-        let chrome_height = if title_bar.revealed(false) { header_height_hint() } else { 0 };
+        // With no header bar the window carries the visibility anchor instead,
+        // so the content still comes out the size the caller asked for.
+        let chrome_height = if title_bar.revealed(false) {
+            header_height_hint()
+        } else {
+            anchor_height(false)
+        };
         // A `GtkDrawingArea` with no draw function paints nothing at all, so
         // what shows through is the themed window background — which is
         // exactly what ADR-011 asks for behind the canvas ("the desktop's own
@@ -561,6 +783,7 @@ impl HostWindow {
         canvas.set_cursor_from_name(canvas_cursor());
         let host = Self::new(title, width, height + chrome_height, &canvas);
         host.toolbar.set_reveal_top_bars(title_bar.revealed(false));
+        host.title_bar.set(title_bar);
 
         // Hide the header bar while fullscreen. Restore it afterwards only
         // when the saved preference has not hidden windowed chrome too.
@@ -578,8 +801,17 @@ impl HostWindow {
         // gap it was sitting in.
         {
             let toolbar_for_fs = host.toolbar.clone();
+            let choice = host.title_bar.clone();
             host.window.connect_fullscreened_notify(move |w| {
-                toolbar_for_fs.set_reveal_top_bars(title_bar.revealed(w.is_fullscreen()));
+                toolbar_for_fs.set_reveal_top_bars(choice.get().revealed(w.is_fullscreen()));
+                // Leaving fullscreen left the bar missing until the app menu
+                // was opened and closed. The reveal alone need not reach the
+                // compositor: GSK can judge a fullscreen-transition frame
+                // undamaged and skip the commit, the same failure f56e466 hit
+                // for the canvas. Queue a redraw from idle, once the notify has
+                // returned, so the revealed bar is actually presented.
+                let w = w.clone();
+                glib::idle_add_local_once(move || w.queue_draw());
             });
         }
         host.window.add_css_class("cordial-engine-host");
@@ -605,15 +837,18 @@ impl HostWindow {
         // libadwaita default nearer 47px, which read as "the x in the title bar
         // looks off and the titlebar looks short". That is now opt-in through
         // the Appearance page rather than the only option.
-        let compact = title_bar == crate::title_bar::TitleBar::Compact;
         // The see-through state is a class rather than the default, and that
         // distinction is the whole lesson of 5a295e3. A permanently transparent
         // toplevel shows the desktop whenever the engine is not painting, which
         // is a window nobody can find. Transparent *only while the engine is
         // deliberately lowered* is safe, because in that state the engine is by
         // definition the thing painting the canvas.
-        let mut sheet = String::from(
+        let sheet = String::from(
             ".cordial-engine-host drawingarea { background-color: transparent; } \
+             .cordial-engine-host .cordial-visibility-anchor { \
+                 background-color: #000000; \
+                 min-height: 1px; \
+             } \
              .cordial-engine-host headerbar { \
                  background-color: @headerbar_bg_color; \
                  color: @headerbar_fg_color; \
@@ -636,6 +871,23 @@ impl HostWindow {
                  min-height: 0; \
                  min-width: 0; \
              } \
+             .cordial-editor-multiline, .cordial-editor-multiline text { \
+                 background: none; \
+                 background-image: none; \
+                 border: none; \
+                 box-shadow: none; \
+                 outline: none; \
+                 padding: 0; \
+                 margin: 0; \
+                 min-height: 0; \
+                 min-width: 0; \
+             } \
+             .cordial-editor-multiline-scroll { \
+                 background: none; \
+                 background-image: none; \
+                 border: none; \
+                 box-shadow: none; \
+             } \
              .cordial-text-fallback { \
                  background-color: rgba(28, 28, 30, 0.94); \
                  color: #ffffff; \
@@ -644,40 +896,20 @@ impl HostWindow {
                  padding: 6px 10px; \
              }",
         );
-        if compact {
-            sheet.push_str(
-                // The close button's right margin is one pixel short of its
-                // other three, and that asymmetry is deliberate. Reported as
-                // the x sitting too far left, with the gap to the right edge
-                // visibly larger than the gap above and below it -- which it
-                // was, by exactly one pixel. The two gaps are computed
-                // differently: the horizontal one is a sum of paddings
-                // (`windowhandle` insets its `GtkCenterBox` child equally on
-                // both sides, and the button's own margin adds to that), while
-                // the vertical one is whatever centring leaves over once the
-                // bar's height is settled by something else entirely -- the
-                // title label, not this sheet, which is also why the
-                // `min-height` below does not bind. Measured with
-                // `examples/compact_bar_offsets.rs`: 8/8/9 before, 8/8/8
-                // after, against the unmodified sheet in the same session.
-                //
-                // A pixel off one margin is the smallest change that squares
-                // them. Equalising them properly would mean driving the bar's
-                // height from this sheet rather than the label's, which is the
-                // aggressive compaction 3d67e59 already tried and got reverted
-                // for.
-                " .cordial-engine-host headerbar { min-height: 30px; padding: 0 6px; } \
-                 .cordial-engine-host headerbar windowcontrols button { \
-                     min-width: 24px; min-height: 24px; padding: 0; \
-                     margin: 2px 1px 2px 2px; \
-                 }",
-            );
-        }
         let css = gtk::CssProvider::new();
         css.load_from_string(&sheet);
         gtk::style_context_add_provider_for_display(
             &WidgetExt::display(&host.window),
             &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        // After the main sheet at the same priority, so where both name the same
+        // property this one wins, as it did when it was appended to it.
+        host.compact_css
+            .load_from_string(if title_bar == crate::title_bar::TitleBar::Compact { COMPACT_SHEET } else { "" });
+        gtk::style_context_add_provider_for_display(
+            &WidgetExt::display(&host.window),
+            &host.compact_css,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
         // The editor's own sheet, empty until a box takes focus and reloaded
@@ -697,6 +929,7 @@ impl HostWindow {
         let header = adw::HeaderBar::new();
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
+        install_visibility_anchor(&toolbar);
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(content));
         let text_layer = gtk::Fixed::new();
@@ -750,6 +983,16 @@ impl HostWindow {
         let editor_changed: std::rc::Rc<
             std::cell::RefCell<Option<Box<dyn Fn(&str, i32)>>>,
         > = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let editor_activated: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn()>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        {
+            let sink = editor_activated.clone();
+            editor.connect_activate(move |_| {
+                if let Some(cb) = sink.borrow().as_ref() {
+                    cb();
+                }
+            });
+        }
         {
             // One closure behind an `Rc`, shared by both signals: the text and
             // the caret are one fact as far as the engine is concerned --
@@ -773,6 +1016,70 @@ impl HostWindow {
         }
         text_layer.put(&editor, 0.0, 0.0);
 
+        // The multi-line editor. Same cursor and CSS reasoning as `editor`
+        // above -- see its comments, not repeated here -- applied to a
+        // `gtk::TextView` inside a `gtk::ScrolledWindow` instead of a bare
+        // `gtk::Text`, because a `TextBox` with `MultiLine` true needs a
+        // widget that can hold more than one line and scroll. See
+        // [`HostWindow::editor_multiline`]'s own doc.
+        let editor_multiline = gtk::TextView::new();
+        editor_multiline.add_css_class("cordial-editor-multiline");
+        editor_multiline.set_overflow(gtk::Overflow::Hidden);
+        editor_multiline.set_cursor_from_name(canvas_cursor());
+        let editor_multiline_scroll = gtk::ScrolledWindow::new();
+        editor_multiline_scroll.set_child(Some(&editor_multiline));
+        editor_multiline_scroll.set_has_frame(false);
+        editor_multiline_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        editor_multiline_scroll.add_css_class("cordial-editor-multiline-scroll");
+        editor_multiline_scroll.set_visible(false);
+
+        // One tag, mutated in place rather than replaced, carries the current
+        // box's font -- see [`HostWindow::editor_multiline_tag`]'s doc for why
+        // `gtk::TextView` needs this where `gtk::Text` needed only an
+        // attribute list.
+        let editor_multiline_tag = gtk::TextTag::new(Some("cordial-editor-style"));
+        let multiline_buffer = editor_multiline.buffer();
+        multiline_buffer.tag_table().add(&editor_multiline_tag);
+
+        let editor_multiline_seeding = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            // Same shape as `editor`'s notify closure above: text and caret
+            // are one fact to the engine, so both signals feed one sink.
+            let seeding = editor_multiline_seeding.clone();
+            let sink = editor_changed.clone();
+            let buf = multiline_buffer.clone();
+            let notify: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+                if seeding.get() {
+                    return;
+                }
+                if let Some(cb) = sink.borrow().as_ref() {
+                    let (start, end) = buf.bounds();
+                    let caret = buf.iter_at_mark(&buf.get_insert()).offset();
+                    cb(buf.text(&start, &end, true).as_str(), caret);
+                }
+            });
+            let on_text = notify.clone();
+            multiline_buffer.connect_changed(move |_| on_text());
+            multiline_buffer.connect_notify_local(Some("cursor-position"), move |_, _| notify());
+        }
+        {
+            // Reapply the style tag across the whole buffer on every content
+            // change, because a `GtkTextBuffer` does not extend a tag to text
+            // typed at its edges the way a single Pango attribute list applies
+            // to everything a `gtk::Text` draws -- see `editor_multiline_tag`'s
+            // doc. Fires on `changed`, not on `insert-text`/`delete-range`,
+            // because those run *before* the edit and a range spanning
+            // start/end taken then would miss the very text just inserted.
+            // Separate handler from the outward-sync one above so a keystroke
+            // is both retagged and pushed to the engine, not one or the other.
+            let tag = editor_multiline_tag.clone();
+            multiline_buffer.connect_changed(move |buf| {
+                let (start, end) = buf.bounds();
+                buf.apply_tag(&tag, &start, &end);
+            });
+        }
+        text_layer.put(&editor_multiline_scroll, 0.0, 0.0);
+
         overlay.add_overlay(&text_layer);
         toolbar.set_content(Some(&overlay));
 
@@ -793,6 +1100,9 @@ impl HostWindow {
             .default_height(h)
             .content(&toolbar)
             .build();
+        // Tells the launcher's startup watchdog that there is nothing to
+        // report. Harmless in `cordial-run`, which never arms it.
+        window.connect_map(|_| crate::startup_watch::mapped());
 
         HostWindow {
             window,
@@ -802,13 +1112,23 @@ impl HostWindow {
             text_layer,
             editor,
             editor_css,
+            title_bar: std::rc::Rc::new(std::cell::Cell::new(crate::title_bar::TitleBar::Default)),
+            compact_css: gtk::CssProvider::new(),
             editor_rect: std::cell::Cell::new(None),
+            editor_multiline,
+            editor_multiline_scroll,
+            editor_multiline_seeding,
+            editor_multiline_tag,
+            editor_active_multiline: std::cell::Cell::new(false),
             canvas_see_through: std::cell::Cell::new(false),
             opaque_unsized: std::cell::Cell::new(false),
             canvas_rect: std::cell::Cell::new(None),
             dialog_up: std::cell::Cell::new(false),
+            canvas_in_input_region: std::cell::Cell::new(false),
+            present_probe: std::cell::RefCell::new(None),
             editor_seeding,
             editor_changed,
+            editor_activated,
             editor_font_family: std::cell::RefCell::new(None),
         }
     }
@@ -854,6 +1174,101 @@ impl HostWindow {
         *self.editor_changed.borrow_mut() = Some(Box::new(f));
     }
 
+    /// Install a callback for Enter in the single-line editor.
+    ///
+    /// This is the editor action Android's IME sends a single-line `EditText`;
+    /// the runtime owns what it means (sync the final text, tell the engine),
+    /// because the engine, not this window, decides whether the box then loses
+    /// focus or clears. The multi-line editor has no equivalent: GTK inserts
+    /// the newline into its buffer, `connect_editor_changed` reports it like
+    /// any other edit, and what the engine does with a newline is its own.
+    pub fn connect_editor_activate<F: Fn() + 'static>(&self, f: F) {
+        *self.editor_activated.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// The development control surface's `paste`: insert `text` at the
+    /// caret, replacing a selection first exactly as a real Ctrl+V would.
+    ///
+    /// `delete_selection` then `insert_text` is not an approximation of what
+    /// GTK's own paste handling does -- it is the same pair of `GtkEditable`
+    /// calls that handling makes internally, so this and a real paste share
+    /// an implementation rather than merely agreeing on the outcome. Both
+    /// calls emit the widget's ordinary signals (`changed`, then
+    /// `notify::cursor-position` from the explicit `set_position` below,
+    /// needed because `insert_text`'s own cursor placement is not
+    /// documented to land where its `position` out-parameter says) --
+    /// synchronously, so `connect_editor_changed`'s callback has already run
+    /// by the time this returns. No `editor_seeding` guard: seeding is for
+    /// the engine telling the widget what it already contains, and this is
+    /// the opposite direction, the same as a keystroke.
+    ///
+    /// Caller has checked a box has focus; this does not.
+    ///
+    /// **Flattens embedded newlines to spaces.** `text` comes through
+    /// `input::flatten_for_field`, which deliberately keeps `\n` because the
+    /// multi-line widget below wants it -- so this, the single-line widget's
+    /// own insertion point, is where a newline that reaches a `gtk::Text`
+    /// anyway gets turned into a space rather than trusted to whatever GTK's
+    /// own filtering does. UNVERIFIED whether `gtk::Text::insert_text` would
+    /// have dropped it unaided; flattening explicitly is correct either way
+    /// and does not depend on finding out.
+    pub fn editor_paste_at_caret(&self, text: &str) -> usize {
+        let text = text.replace('\n', " ");
+        self.editor.delete_selection();
+        let mut pos = self.editor.position();
+        self.editor.insert_text(&text, &mut pos);
+        self.editor.set_position(pos);
+        self.editor.text().chars().count()
+    }
+
+    /// The development control surface's `settext`: replace the field's
+    /// whole contents and place the caret at the end.
+    ///
+    /// Deliberately not select-all followed by [`Self::editor_paste_at_caret`]
+    /// -- see `clipboard::set_text`'s doc for why a test seam with no
+    /// user-reachable equivalent is the more honest shape here. Same
+    /// synchronous signal path as the paste above, and the same newline
+    /// flattening.
+    pub fn editor_set_text(&self, text: &str) -> usize {
+        let text = text.replace('\n', " ");
+        self.editor.set_text(&text);
+        self.editor.set_position(text.chars().count() as i32);
+        self.editor.text().chars().count()
+    }
+
+    /// [`Self::editor_paste_at_caret`]'s multi-line counterpart: insert at the
+    /// buffer's own caret (`GtkTextBuffer::insert_at_cursor`), after removing
+    /// a selection first exactly as `gtk::Text`'s does. Newlines in `text` are
+    /// kept -- this is the path a multi-line box's `paste`/`settext` actually
+    /// takes, and flattening them the way the single-line method above does
+    /// would defeat the entire point of routing here instead.
+    ///
+    /// Caller has checked a box has focus and that it is multi-line.
+    pub fn editor_multiline_paste_at_caret(&self, text: &str) -> usize {
+        let buffer = self.editor_multiline.buffer();
+        buffer.delete_selection(false, true);
+        buffer.insert_at_cursor(text);
+        buffer.char_count() as usize
+    }
+
+    /// [`Self::editor_set_text`]'s multi-line counterpart: replace the whole
+    /// buffer and place the caret at the end.
+    pub fn editor_multiline_set_text(&self, text: &str) -> usize {
+        let buffer = self.editor_multiline.buffer();
+        buffer.set_text(text);
+        let end = buffer.end_iter();
+        buffer.place_cursor(&end);
+        buffer.char_count() as usize
+    }
+
+    /// Which editor [`Self::set_text_overlay`] last showed -- `true` for
+    /// [`Self::editor_multiline`], `false` for [`Self::editor`] or for no box
+    /// focused at all. What the runtime's devctl `paste`/`settext` reads to
+    /// decide which of the two pairs of methods above to call.
+    pub fn editor_multiline_active(&self) -> bool {
+        self.editor_active_multiline.get()
+    }
+
     /// Place (or hide) the desktop equivalent of Android's transparent
     /// `EditText` over the engine canvas. The caller controls subsurface
     /// stacking; this method only updates GTK's parent surface.
@@ -867,13 +1282,18 @@ impl HostWindow {
     pub fn set_text_overlay(&self, overlay: Option<TextOverlay<'_>>) {
         let Some(overlay) = overlay else {
             self.editor.set_visible(false);
+            self.editor_multiline_scroll.set_visible(false);
             self.text_layer.set_can_target(false);
             self.editor_rect.set(None);
+            self.editor_active_multiline.set(false);
             // Seeded, not typed: clearing on blur must not reach the engine as
             // an edit that empties the box the user just finished filling in.
             self.editor_seeding.set(true);
             self.editor.set_text("");
             self.editor_seeding.set(false);
+            self.editor_multiline_seeding.set(true);
+            self.editor_multiline.buffer().set_text("");
+            self.editor_multiline_seeding.set(false);
             self.refresh_input_region();
             self.window.queue_draw();
             return;
@@ -890,26 +1310,53 @@ impl HostWindow {
         // defaults to the themed text colour and takes no notice of a Pango
         // foreground override -- so an attribute-styled editor on Roblox's
         // light search field drew dark text with the theme's white caret,
-        // invisible on exactly the field it was in.
+        // invisible on exactly the field it was in. Both editors share one
+        // sheet: only one of them is ever visible, so there is nothing to
+        // disambiguate by restricting the selector to whichever is active.
         let rgb = format!(
             "#{:02x}{:02x}{:02x}",
             (overlay.text_color >> 16) & 0xff,
             (overlay.text_color >> 8) & 0xff,
             overlay.text_color & 0xff
         );
-        // **Colour here, size deliberately not.** A CSS `font-size` is scaled
-        // by the desktop's text-scaling factor before it reaches Pango, so on
-        // any setup with font scaling turned up -- which is most laptops -- the
-        // editor drew visibly larger than the text Roblox draws in the same box
-        // when it is not focused. Reported as "text gets too big when
-        // selected", and "selected" is "focused", because the editor only
-        // exists while the box has focus.
-        //
-        // The size is set below as an absolute Pango attribute instead, which
-        // is in the same units as the rest of this spec.
-        self.editor_css
-            .load_from_string(&format!(".cordial-editor {{ color: {rgb}; caret-color: {rgb}; }}"));
+        self.editor_css.load_from_string(&editor_colour_sheet(&rgb));
 
+        self.editor_active_multiline.set(overlay.multiline);
+        // Each branch may adjust `y`/`h` for its own vertical placement rule
+        // (`vertical_placement` for the single-line widget, `multiline_placement`
+        // -- a no-op -- for the multi-line one) and hands back the rectangle it
+        // actually drew at, which is what the input-region punch below must
+        // match. Using the pre-adjustment `(x, y, w, h)` here instead would
+        // reopen the coordinate-space bug `the_editor_is_clickable_where_it_is_drawn`
+        // regression-tests: a `Top`- or `Bottom`-aligned single-line box would
+        // punch a hole for its full height while the widget itself only drew
+        // (and could only be clicked) inside the shrunk strip.
+        let placed = if overlay.multiline {
+            self.editor.set_visible(false);
+            self.set_multiline_overlay(&overlay, x, y, w, h)
+        } else {
+            self.editor_multiline_scroll.set_visible(false);
+            self.set_singleline_overlay(&overlay, x, y, w, h)
+        };
+
+        self.text_layer.set_can_target(true);
+        self.editor_rect.set(Some(placed));
+        self.refresh_input_region();
+        self.window.queue_draw();
+    }
+
+    /// [`Self::set_text_overlay`]'s single-line branch: place and style
+    /// [`Self::editor`]. Split out so the multi-line branch below is not
+    /// buried inside it -- the two widgets share nothing past the colour CSS
+    /// and the rectangle already handled by the caller.
+    fn set_singleline_overlay(
+        &self,
+        overlay: &TextOverlay<'_>,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) -> (i32, i32, i32, i32) {
         // `new_size_absolute`, not `new`. `AttrSize::new` takes points and Pango
         // converts them through the context's resolution; the absolute form takes
         // device units and skips that conversion entirely. The engine's
@@ -922,6 +1369,14 @@ impl HostWindow {
         // field's own doc comment -- and that is a different adjustment for a
         // different reason: it is reconciling Roblox's own two text stacks
         // with each other, not converting between Pango's and the engine's.
+        //
+        // **Colour is set by the caller, size deliberately not the same way.**
+        // A CSS `font-size` is scaled by the desktop's text-scaling factor
+        // before it reaches Pango, so on any setup with font scaling turned up
+        // -- which is most laptops -- the editor drew visibly larger than the
+        // text Roblox draws in the same box when it is not focused. Reported
+        // as "text gets too big when selected", and "selected" is "focused",
+        // because the editor only exists while the box has focus.
         let attrs = gtk::pango::AttrList::new();
         attrs.insert(gtk::pango::AttrSize::new_size_absolute(
             (overlay.font_size.max(1.0) * gtk::pango::SCALE as f32).round() as i32,
@@ -1022,7 +1477,7 @@ impl HostWindow {
         // project has ever measured) leaves `y`/`h` exactly as they arrived,
         // so this changes nothing for every box checked in docs/NEXT.md.
         let (_, natural_h, _, _) = self.editor.measure(gtk::Orientation::Vertical, -1);
-        let (y, h) = vertical_placement(overlay.y_alignment, y, h, natural_h, overlay.multiline);
+        let (y, h) = vertical_placement(overlay.y_alignment, y, h, natural_h);
 
         self.editor.set_size_request(w, h);
         self.text_layer.move_(&self.editor, x as f64, y as f64);
@@ -1040,9 +1495,6 @@ impl HostWindow {
         }
 
         self.editor.set_visible(true);
-        self.text_layer.set_can_target(true);
-        self.editor_rect.set(Some((x, y, w, h)));
-        self.refresh_input_region();
         if !self.editor.has_focus() {
             // **`grab_focus_without_selecting`, and the difference is not
             // cosmetic.** GTK's `gtk-entry-select-on-focus` is on by default,
@@ -1069,7 +1521,114 @@ impl HostWindow {
         // nothing and dragging across text would not highlight it.
         // `grab_focus_without_selecting` already handles the only case that
         // needed handling. The widget owns its selection.
-        self.window.queue_draw();
+        (x, y, w, h)
+    }
+
+    /// [`Self::set_text_overlay`]'s multi-line branch: place and style
+    /// [`Self::editor_multiline`].
+    ///
+    /// Mirrors [`Self::set_singleline_overlay`] wherever the two widgets can
+    /// agree -- horizontal alignment, text seeding, fallback chrome -- and
+    /// departs where `gtk::TextView` genuinely differs: font styling goes
+    /// through [`Self::editor_multiline_tag`] rather than `set_attributes`
+    /// (`gtk::TextView` has no such method -- see the field's own doc), the
+    /// vertical rectangle is never shrunk (see [`multiline_placement`]), and
+    /// there is no password masking: Roblox's own masked `textInputType`
+    /// values have never been observed on a box that also reports
+    /// `multiline=1`, and `gtk::TextView` has nothing built in to mask with in
+    /// any case. Should a masked multi-line box ever turn up, drawing it
+    /// unmasked is the same "smaller of two wrong answers" this project has
+    /// taken before rather than the worse failure of drawing nothing.
+    fn set_multiline_overlay(
+        &self,
+        overlay: &TextOverlay<'_>,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) -> (i32, i32, i32, i32) {
+        let tag = &self.editor_multiline_tag;
+        tag.set_size((overlay.font_size.max(1.0) * gtk::pango::SCALE as f32).round() as i32);
+        let per_box = overlay.font_family;
+        let process_wide = self.editor_font_family.borrow();
+        tag.set_family(per_box.or(process_wide.as_deref()));
+        drop(process_wide);
+        if per_box.is_some() {
+            tag.set_weight(overlay.font_weight);
+            tag.set_style(if overlay.font_italic {
+                gtk::pango::Style::Italic
+            } else {
+                gtk::pango::Style::Normal
+            });
+        } else {
+            // Put the weight/style back to the tag's own unset state, the
+            // same reasoning as `gtk::Text`'s attribute list starting empty
+            // each call: a restyled box followed by an unstyled one must not
+            // carry the first box's weight over.
+            tag.set_weight(400);
+            tag.set_style(gtk::pango::Style::Normal);
+        }
+
+        self.editor_multiline.set_justification(gtk_justification(overlay.x_alignment));
+        self.editor_multiline.set_wrap_mode(if overlay.text_wrapped {
+            gtk::WrapMode::WordChar
+        } else {
+            gtk::WrapMode::None
+        });
+
+        let buffer = self.editor_multiline.buffer();
+        let (start, end) = buffer.bounds();
+        if buffer.text(&start, &end, true).as_str() != overlay.text {
+            self.editor_multiline_seeding.set(true);
+            buffer.set_text(overlay.text);
+            // Inside the guard, as `gtk::Text`'s `set_position` is. Placed
+            // after it, the move from where `set_text` left the cursor to
+            // `overlay.caret_chars` fired the cursor signal unguarded and sent
+            // the text the engine had just pushed straight back to it.
+            let at = buffer.iter_at_offset(overlay.caret_chars.max(0));
+            buffer.place_cursor(&at);
+            self.editor_multiline_seeding.set(false);
+        }
+        // The tag is reapplied on every text change too (see the
+        // `connect_changed` handler installed in `Self::new`), which is what
+        // keeps newly typed characters styled; this covers the seed above and
+        // the case where only the styling changed and the text did not, which
+        // would fire no `changed` signal to trigger that handler.
+        let (start, end) = buffer.bounds();
+        buffer.apply_tag(tag, &start, &end);
+        // Caret placement, mirroring `gtk::Text::set_position` above: only
+        // meaningful right after a reseed, since `edit_text_buffer`'s own
+        // caret tracking is what moves it the rest of the time and this would
+        // otherwise fight the user's own cursor on every pump tick.
+        let target = buffer.iter_at_offset(overlay.caret_chars.max(0));
+        if buffer.iter_at_mark(&buffer.get_insert()).offset() != target.offset() {
+            buffer.place_cursor(&target);
+        }
+
+        // `multiline_placement` rather than the box's `(y, h)` inline: see its
+        // own doc for why a multi-line box is never shrunk to a line height,
+        // and why that decision has its own named, tested function rather
+        // than being folded back into this one.
+        let (y, h) = multiline_placement(y, h);
+        self.editor_multiline_scroll.set_size_request(w, h);
+        self.text_layer.move_(&self.editor_multiline_scroll, x as f64, y as f64);
+
+        if overlay.fallback {
+            self.editor_multiline_scroll.add_css_class("cordial-text-fallback");
+        } else {
+            self.editor_multiline_scroll.remove_css_class("cordial-text-fallback");
+        }
+
+        self.editor_multiline_scroll.set_visible(true);
+        if !self.editor_multiline.has_focus() {
+            // `gtk::TextView` has no `gtk-entry-select-on-focus` equivalent --
+            // that setting is `GtkEntry`'s -- so a plain `grab_focus` here
+            // does not select the field's contents the way it would on
+            // `gtk::Text`. UNVERIFIED against a real multi-line box; see
+            // docs/NEXT.md.
+            self.editor_multiline.grab_focus();
+        }
+        (x, y, w, h)
     }
 
     /// The `wl_display` GTK opened, as a raw pointer.
@@ -1137,6 +1696,13 @@ impl HostWindow {
         self.refresh_input_region();
     }
 
+    pub fn set_canvas_in_input_region(&self, on: bool) {
+        if self.canvas_in_input_region.replace(on) == on {
+            return;
+        }
+        self.refresh_input_region();
+    }
+
     pub fn set_canvas_see_through(&self, on: bool) {
         if on {
             // **Every layer, not just the window.** Making the toplevel
@@ -1177,7 +1743,11 @@ impl HostWindow {
             (surface.width(), surface.height()),
             canvas,
             self.editor_rect.get(),
-            self.dialog_up.get(),
+            claims_whole_window(
+                self.dialog_up.get(),
+                self.canvas_in_input_region.get(),
+                self.canvas_see_through.get(),
+            ),
         );
         surface.set_input_region(Some(&region));
     }
@@ -1252,21 +1822,63 @@ impl HostWindow {
     /// lower. That is luck, and it is why this looked state-dependent.
     fn refresh_opaque_region(&self) {
         let Some(surface) = self.window.surface() else { return };
+        match self.compute_opaque_region() {
+            // Nothing computable yet (no surface size, no canvas rectangle) --
+            // leave whatever was set before rather than guessing.
+            None => {}
+            // Explicitly nothing opaque -- an unsized window, or one too small
+            // to inset by the corner radius. See `compute_opaque_region`.
+            Some(None) => {
+                #[allow(deprecated)]
+                surface.set_opaque_region(None);
+            }
+            Some(Some(region)) => {
+                // Deprecated since GDK 4.16, which computes its own from the
+                // render tree -- and its own answer is "the whole surface",
+                // because the drawing area being transparent is not something
+                // it can see through to a subsurface with.
+                #[allow(deprecated)]
+                surface.set_opaque_region(Some(&region));
+            }
+        }
+    }
+
+    /// The region [`Self::refresh_opaque_region`] would ask the compositor to
+    /// treat as opaque, computed but not yet sent.
+    ///
+    /// Split out so [`Self::opaque_region_rects`] can hand the exact same
+    /// shape to `android::wayland::WaylandWindow::set_engine_stacking`, which
+    /// sends it over the raw wire in the same commit that lowers the canvas
+    /// -- see that method's own comment for why waiting on this call's GDK
+    /// commit is not good enough there.
+    ///
+    /// `None` means "nothing to say, leave the existing region alone" (no
+    /// surface yet, no canvas rectangle, or a `cairo::Region` operation
+    /// failed). `Some(None)` means "say so explicitly: nothing is opaque" (an
+    /// unsized window, or one too small to inset by the corner radius).
+    /// `Some(Some(region))` is the ordinary answer: the window, corner-safe,
+    /// with the canvas rectangle subtracted out.
+    fn compute_opaque_region(&self) -> Option<Option<gtk::cairo::Region>> {
+        let surface = self.window.surface()?;
         let (sw, sh) = (surface.width(), surface.height());
         if sw <= 0 || sh <= 0 {
-            return;
+            return None;
         }
 
-        // Nothing is opaque while the canvas is lowered: the toplevel is
-        // transparent over it so the subsurface can show through, and claiming
-        // otherwise is what hid it.
-        if self.canvas_see_through.get() {
-            #[allow(deprecated)]
-            surface.set_opaque_region(None);
-            return;
-        }
-
-        let Some((x, y, w, h)) = self.canvas_rect.get() else { return };
+        // The canvas rectangle is not opaque while it is lowered, so the
+        // subsurface can show through it. This used to be answered with
+        // `None` for the *entire surface* whenever the canvas was see-through,
+        // not just the canvas rectangle -- which told the compositor the
+        // header bar and every other pixel were also possibly transparent.
+        // GTK still paints the header bar solidly (see the `headerbar` rule
+        // above, deliberately left out of `cordial-canvas-below`), so nothing
+        // there actually changed -- only what the compositor was told about
+        // it, and reported as the title bar turning translucent the moment a
+        // text box took focus. The fix is the same punch-out below regardless
+        // of that state: the whole window opaque, the canvas rectangle
+        // subtracted out of it. The subsurface only ever needed *its own
+        // rectangle* excluded to show through, not the rest of the frame.
+        let (x, y, w, h) = self.canvas_rect.get()?;
 
         // The window, not the surface. A GTK surface carries the client-side
         // decoration shadow -- a translucent margin around a floating window --
@@ -1301,9 +1913,7 @@ impl HostWindow {
                     "[shell] no window size to build an opaque region from (window {ww}x{wh}, surface {sw}x{sh}); claiming nothing until it has one"
                 );
             }
-            #[allow(deprecated)]
-            surface.set_opaque_region(None);
-            return;
+            return Some(None);
         };
         if self.opaque_unsized.replace(false) {
             eprintln!("[shell] window size is back ({ww}x{wh}); opaque region rebuilt");
@@ -1312,9 +1922,7 @@ impl HostWindow {
         // The corners are left out; see `corner_safe_rects`.
         let rects = corner_safe_rects(ox, oy, ow, oh, WINDOW_CORNER_RADIUS);
         let Some((fx, fy, fw, fh)) = rects.first().copied() else {
-            #[allow(deprecated)]
-            surface.set_opaque_region(None);
-            return;
+            return Some(None);
         };
         let opaque =
             gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(fx, fy, fw, fh));
@@ -1323,18 +1931,31 @@ impl HostWindow {
                 .union_rectangle(&gtk::cairo::RectangleInt::new(*rx, *ry, *rw, *rh))
                 .is_err()
             {
-                return;
+                return None;
             }
         }
         if opaque.subtract_rectangle(&gtk::cairo::RectangleInt::new(x, y, w, h)).is_err() {
-            return;
+            return None;
         }
-        // Deprecated since GDK 4.16, which computes its own from the render
-        // tree -- and its own answer is "the whole surface", because the
-        // drawing area being transparent is not something it can see through
-        // to a subsurface with.
-        #[allow(deprecated)]
-        surface.set_opaque_region(Some(&opaque));
+        Some(Some(opaque))
+    }
+
+    /// [`Self::compute_opaque_region`]'s answer as plain surface-coordinate
+    /// rectangles, for `android::wayland::WaylandWindow::set_engine_stacking`
+    /// to send over the raw wire.
+    ///
+    /// Collapses the "leave it alone" and "explicitly nothing" cases together
+    /// -- both mean "claim nothing opaque" to a caller that, unlike
+    /// [`Self::refresh_opaque_region`], must send *something* in this commit
+    /// and cannot defer to a later one.
+    pub fn opaque_region_rects(&self) -> Vec<(i32, i32, i32, i32)> {
+        let Some(region) = self.compute_opaque_region().flatten() else { return Vec::new() };
+        (0..region.num_rectangles())
+            .map(|i| {
+                let r = region.rectangle(i);
+                (r.x(), r.y(), r.width(), r.height())
+            })
+            .collect()
     }
 
     /// Whether the compositor currently considers this window focused.
@@ -1374,7 +1995,8 @@ impl HostWindow {
     }
 
     /// The toplevel's whole state, for the instrumented run that established
-    /// what [`Self::visible`] can actually see. Not used by anything else.
+    /// what [`Self::visible`] can actually see, and for the line
+    /// [`Self::present_probe_report`] prints when a frame does not arrive.
     pub fn toplevel_state(&self) -> Option<gtk::gdk::ToplevelState> {
         let surface = self.window.surface()?;
         Some(surface.downcast::<gtk::gdk::Toplevel>().ok()?.state())
@@ -1477,6 +2099,12 @@ impl HostWindow {
     /// repaint the window, which reads as a stuck or torn canvas.
     /// Repaint the toplevel now, rather than on GTK's next frame.
     ///
+    /// **Since issue #53 this is only the `CORDIAL_STACKING_GATE=off` path**,
+    /// kept as the control for showing what the gate changes; the restack now
+    /// waits for a committed frame through [`Self::arm_present_probe`]
+    /// instead of for 40 ms. What follows describes the wait as it was, and
+    /// its failure -- the timeout branch's log line is the one #53 quoted.
+    ///
     /// Exists for one caller: restacking the engine's subsurface. Lowering it
     /// and turning the background transparent have to reach the compositor in
     /// the same breath, and they do not by default -- a CSS class change is
@@ -1576,6 +2204,137 @@ impl HostWindow {
         }
     }
 
+    /// Start preparing the window for the canvas to be lowered beneath it, and
+    /// begin waiting for the proof that the compositor holds the result.
+    ///
+    /// **This replaces waiting 40 ms in [`Self::repaint_now`] and lowering
+    /// whatever happened** -- issue #53. On a KWin session GTK started a frame
+    /// after every one of those timeouts and then attached nothing to the
+    /// window surface for the two seconds the box stayed focused, while the
+    /// restack had already gone out: the compositor kept showing the last GTK
+    /// buffer, painted with the canvas above and opaque across the whole
+    /// window, with the canvas now underneath it. Grey, until the box blurred.
+    /// `repaint_now`'s own log line said so three times in that report and
+    /// nothing acted on it.
+    ///
+    /// So this only *prepares* -- transparent background, both regions, a
+    /// redraw request, the frame clock kept ticking -- and leaves the canvas
+    /// where it is. The caller polls [`Self::present_probe_committed`] and
+    /// restacks only when that says a frame painted after this call has
+    /// reached the compositor, or calls [`Self::disarm_present_probe`] if it
+    /// never does. While waiting the canvas is still on top and covering, so
+    /// the transparency cannot show.
+    pub fn arm_present_probe(&self) {
+        // A second arming without a disarm would leak the first handler and the
+        // `begin_updating` it holds.
+        self.disarm_present_probe(false);
+        self.set_canvas_see_through(true);
+        self.window.queue_draw();
+        let Some(clock) = self.window.frame_clock() else { return };
+        let painted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let handler = {
+            let painted = painted.clone();
+            clock.connect_after_paint(move |_| painted.set(true))
+        };
+        // The clock does not tick when nothing else is animating, and the
+        // whole point of this call is that a tick be produced.
+        clock.begin_updating();
+        *self.present_probe.borrow_mut() =
+            Some(PresentProbe { counter: clock.frame_counter(), painted, handler });
+    }
+
+    /// Whether GTK has committed a frame, laid out after
+    /// [`Self::arm_present_probe`], that the compositor has presented.
+    ///
+    /// **`after-paint` is not that, and this used to be exactly that.** The
+    /// frame clock emits it once GTK has finished with a frame, including a
+    /// frame whose render was skipped: GDK sends the frame's window-geometry,
+    /// opaque-region, frame-callback and presentation-feedback requests before
+    /// GSK decides whether there is anything to draw, and in #53's log a frame
+    /// of exactly that shape went out and no `attach` followed. GTK had
+    /// "painted" and the compositor had been given nothing.
+    ///
+    /// What cannot happen without a commit is the compositor *presenting* the
+    /// frame, and GDK records that: a frame's timings gain a presentation time
+    /// only when `wp_presentation_feedback.presented` arrives. Nothing else
+    /// resolves it while the caller sends no parent commit of its own, which
+    /// is why the lowering, whose commit would do so, waits for this.
+    ///
+    /// With `presentation_reported` false -- the compositor has no
+    /// `wp_presentation`, so GDK never asks -- the timings can say nothing and
+    /// `after-paint` is all there is; that is the weaker old answer, used only
+    /// there.
+    ///
+    /// INFERRED: that a frame with a presentation time necessarily attached a
+    /// buffer. It follows from the protocol (feedback is delivered for a
+    /// commit, and GDK's GL path commits by attaching), and it matches
+    /// #53's log, where the feedback for the stalled frame was delivered only
+    /// after Cordial's own commit.
+    pub fn present_probe_committed(&self, presentation_reported: bool) -> bool {
+        let probe = self.present_probe.borrow();
+        let Some(probe) = probe.as_ref() else { return false };
+        let Some(clock) = self.window.frame_clock() else { return false };
+        if !presentation_reported {
+            return probe.painted.get();
+        }
+        ((probe.counter + 1)..=clock.frame_counter()).any(|n| {
+            clock
+                .timings(n)
+                .is_some_and(|t| t.is_complete() && t.presentation_time() > 0)
+        })
+    }
+
+    /// Whether [`Self::arm_present_probe`] has run and not been disarmed.
+    pub fn is_probe_armed(&self) -> bool {
+        self.present_probe.borrow().is_some()
+    }
+
+    /// Stop preparing. With `revert`, also give the window its background
+    /// back, which is right when the lowering was abandoned and wrong when it
+    /// went ahead.
+    pub fn disarm_present_probe(&self, revert: bool) {
+        if let Some(probe) = self.present_probe.borrow_mut().take() {
+            if let Some(clock) = self.window.frame_clock() {
+                clock.disconnect(probe.handler);
+                clock.end_updating();
+            }
+        }
+        if revert {
+            self.set_canvas_see_through(false);
+        }
+    }
+
+    /// One line of what GTK's frame clock has been doing, for the log line that
+    /// says a frame did not arrive. Reading `toplevel_state` here is the check
+    /// on the compositor having told the window it is suspended.
+    pub fn present_probe_report(&self) -> String {
+        let probe = self.present_probe.borrow();
+        let Some(clock) = self.window.frame_clock() else { return "no frame clock".into() };
+        let armed = probe.as_ref().map_or(-1, |p| p.counter);
+        let now = clock.frame_counter();
+        let painted = probe.as_ref().is_some_and(|p| p.painted.get());
+        let (mut complete, mut presented) = (0, 0);
+        for n in (armed + 1).max(clock.history_start())..=now {
+            if let Some(t) = clock.timings(n) {
+                complete += usize::from(t.is_complete());
+                presented += usize::from(t.presentation_time() > 0);
+            }
+        }
+        // The renderer is the first thing to know when this line is read: GTK on
+        // its GL renderer inside a process whose engine is running GLES is what
+        // never presented in #53, and cairo presented from the same binary.
+        let renderer = self
+            .window
+            .native()
+            .and_then(|n| n.renderer())
+            .map_or_else(|| "none".to_string(), |r| r.type_().name().to_string());
+        format!(
+            "renderer {renderer}, frames since arming {}, after-paint seen {painted}, complete {complete}, presented {presented}, toplevel state {:?}",
+            now - armed,
+            self.toplevel_state()
+        )
+    }
+
     pub fn queue_commit(&self) {
         self.window.queue_draw();
     }
@@ -1610,6 +2369,47 @@ impl HostWindow {
             self.window.unfullscreen();
         }
     }
+
+    /// Change the title-bar preference while the window is up (ADR-044).
+    ///
+    /// The window keeps the size it has: the bar's height comes out of the
+    /// canvas or goes back into it, which reaches the engine as the ordinary
+    /// resize it already handles, and the window is not resized to keep the
+    /// canvas constant because that would move a window the user placed.
+    ///
+    /// Honours fullscreen the way the handler in `with_canvas` does: a bar the
+    /// user asked to see is not revealed under a fullscreen game.
+    pub fn set_title_bar(&self, choice: crate::title_bar::TitleBar) {
+        self.title_bar.set(choice);
+        self.toolbar.set_reveal_top_bars(choice.revealed(self.window.is_fullscreen()));
+        self.compact_css.load_from_string(
+            if choice == crate::title_bar::TitleBar::Compact { COMPACT_SHEET } else { "" },
+        );
+        // See the fullscreen handler: a reveal alone need not reach the
+        // compositor, so ask for a frame once this call has returned.
+        let w = self.window.clone();
+        glib::idle_add_local_once(move || w.queue_draw());
+    }
+
+    /// The preference in force.
+    pub fn title_bar(&self) -> crate::title_bar::TitleBar {
+        self.title_bar.get()
+    }
+}
+
+/// Whether the toplevel's input region should cover the canvas too, which
+/// [`input_region`] receives as `modal`.
+///
+/// Two unrelated reasons, and one exception. A web-view dialog is modal. On
+/// KWin the pointer lock is constrained on the toplevel and activates only
+/// where the pointer is inside the toplevel's input region, so while the canvas
+/// is on top and the lock path wants it (`canvas_in_input_region`) the cut-out
+/// must go -- the engine's subsurface keeps its own input region above the
+/// parent, so clicks still reach it. Not while the canvas is see-through, which
+/// is the editor or a dialog being drawn through it and wants the usual
+/// cut-out for the editor's own rectangle.
+fn claims_whole_window(dialog_up: bool, canvas_in_input_region: bool, see_through: bool) -> bool {
+    dialog_up || (canvas_in_input_region && !see_through)
 }
 
 /// The parent surface's input region: everything except the canvas, plus the
@@ -1676,6 +2476,61 @@ fn input_region(
     region
 }
 
+/// How tall the strip of window that keeps the host surface visible is, given
+/// whether the header bar is showing.
+///
+/// **Zero while the header bar is up, one pixel when it is not.** The engine's
+/// subsurface is opaque and, with no header bar, exactly as large as the window,
+/// so the compositor sees the GTK surface behind it as fully covered. A
+/// compositor sends no frame callbacks and no presentation feedback to a surface
+/// nobody can see (wlroots: `wl_surface.leave`, then silence), GDK's frame clock
+/// waits on a callback before it paints again, and the gate in
+/// [`crate::stacking_gate`] -- which lowers the canvas only once GTK has
+/// presented a frame -- waits for ever. Measured in a nested sway: the same
+/// binary lowers the canvas in 20 ms with a header bar and never does in
+/// fullscreen, or tiled with the title bar set to Hidden. One pixel of the
+/// window left uncovered is all the compositor needs to count it visible.
+/// ADR-056.
+pub const fn visibility_anchor_height(top_bars_revealed: bool) -> i32 {
+    if top_bars_revealed { 0 } else { 1 }
+}
+
+/// [`visibility_anchor_height`], unless `CORDIAL_VISIBILITY_ANCHOR=off`.
+///
+/// The switch is the control a before-and-after needs from one binary, the same
+/// role `CORDIAL_STACKING_GATE=off` plays for the gate. It is read each time so
+/// a test can flip it, and nothing but a measurement should set it.
+fn anchor_height(top_bars_revealed: bool) -> i32 {
+    match std::env::var("CORDIAL_VISIBILITY_ANCHOR").as_deref() {
+        Ok("off") | Ok("0") => 0,
+        _ => visibility_anchor_height(top_bars_revealed),
+    }
+}
+
+/// Put the one-pixel strip at the foot of the window, shown exactly while the
+/// header bar is not. See [`visibility_anchor_height`].
+///
+/// A bottom bar rather than a margin on the canvas because the toolbar view
+/// already owns the layout the engine's rectangle is read from
+/// (`content_rect`), so the content shrinks by the strip without a second
+/// source of truth. It paints black rather than the window's background: the
+/// background is near white under a light theme, and a white line under a game
+/// reads as a defect where a black one reads as the edge of the screen.
+fn install_visibility_anchor(toolbar: &adw::ToolbarView) {
+    let anchor = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    anchor.add_css_class("cordial-visibility-anchor");
+    anchor.set_height_request(visibility_anchor_height(false));
+    anchor.set_can_target(false);
+    anchor.set_visible(anchor_height(toolbar.reveals_top_bars()) > 0);
+    toolbar.add_bottom_bar(&anchor);
+    // Every writer of the reveal -- the fullscreen handler, the live
+    // title-bar setting, `with_canvas` -- goes through the property, so one
+    // notify keeps the strip right for all of them.
+    toolbar.connect_reveal_top_bars_notify(move |t| {
+        anchor.set_visible(anchor_height(t.reveals_top_bars()) > 0);
+    });
+}
+
 /// A first guess at the header bar's height, used only to pick the window's
 /// initial size so the *content* comes out at the requested resolution. The
 /// real height is read back from the widget tree once there is a layout — see
@@ -1729,17 +2584,40 @@ mod tests {
 
     /// Roblox's three `TextXAlignment` ordinals, both ways: the value this
     /// project has actually measured (`Left`, on every box so far) must not
-    /// move, and `Center`/`Right` must land on the fractions `Editable`
-    /// documents -- `0.5` and `1.0` -- rather than on whatever the match arm
+    /// move, and `Right`/`Center` must land on the fractions `Editable`
+    /// documents -- `1.0` and `0.5` -- rather than on whatever the match arm
     /// order happens to produce.
+    ///
+    /// **`1`/`2` swapped here on 2026-09-26.** This test asserted
+    /// `gtk_xalign(1) == 0.5` (Center) and `gtk_xalign(2) == 1.0` (Right)
+    /// until then, which is Roblox's enum in alphabetical rather than actual
+    /// order -- see `gtk_xalign`'s own doc comment for the two published
+    /// references this is corrected against. Nothing caught the old values
+    /// being wrong because they were exactly as internally consistent as the
+    /// right ones: a test asserting a match arm against itself proves the
+    /// arm was copied correctly, not that the ordinal it names is the right
+    /// one, and only Roblox's own documentation says which is which.
     #[test]
     fn xalign_maps_every_ordinal_and_defaults_left() {
         assert_eq!(gtk_xalign(0), 0.0, "Left, the only value ever measured");
-        assert_eq!(gtk_xalign(1), 0.5, "Center");
-        assert_eq!(gtk_xalign(2), 1.0, "Right");
+        assert_eq!(gtk_xalign(1), 1.0, "Right");
+        assert_eq!(gtk_xalign(2), 0.5, "Center");
         // A build that renumbers the enum, or a slot this project has the
         // wrong one for, must draw left rather than somewhere arbitrary.
         assert_eq!(gtk_xalign(99), 0.0);
+    }
+
+    /// [`gtk_justification`] must agree with [`gtk_xalign`] ordinal-for-ordinal
+    /// -- a box that draws its single-line editor flush right must draw its
+    /// multi-line one the same way, and the two mappings living in separate
+    /// functions (`gtk::Text` and `gtk::TextView` share no alignment API) is
+    /// exactly how they could drift apart silently if only one were fixed.
+    #[test]
+    fn justification_maps_every_ordinal_and_defaults_left() {
+        assert_eq!(gtk_justification(0), gtk::Justification::Left);
+        assert_eq!(gtk_justification(1), gtk::Justification::Right);
+        assert_eq!(gtk_justification(2), gtk::Justification::Center);
+        assert_eq!(gtk_justification(99), gtk::Justification::Left);
     }
 
     /// `vertical_placement`'s `Center` arm is the load-bearing one: it is the
@@ -1813,44 +2691,46 @@ mod tests {
     #[test]
     fn vertical_placement_centre_is_untouched_top_and_bottom_anchor() {
         assert_eq!(
-            vertical_placement(1, 10, 22, 13, false),
+            vertical_placement(1, 10, 22, 13),
             (10, 22),
             "Centre must pass y/h through unchanged -- this is the measured case"
         );
         assert_eq!(
-            vertical_placement(0, 10, 22, 13, false),
+            vertical_placement(0, 10, 22, 13),
             (10, 13),
             "Top anchors the natural height at the box's own top"
         );
         assert_eq!(
-            vertical_placement(2, 10, 22, 13, false),
+            vertical_placement(2, 10, 22, 13),
             (19, 13),
             "Bottom anchors it at the box's own bottom: 10 + (22 - 13)"
         );
         // An unrecognised ordinal must be as inert as Centre, not stretch or
         // shrink the widget to something nobody asked for.
-        assert_eq!(vertical_placement(99, 10, 22, 13, false), (10, 22));
+        assert_eq!(vertical_placement(99, 10, 22, 13), (10, 22));
     }
 
-    /// **A multi-line box keeps its whole rectangle, whatever it aligns to.**
-    ///
-    /// `natural_h` is one line of a single-line `gtk::Text`, so without this
-    /// a `Top`-aligned four-line chat entry would draw the editor as a
-    /// one-line strip along the top of a box the engine drew full height --
-    /// which is the shape "the text box is misaligned" describes. Asserted
-    /// against the arithmetic; UNVERIFIED against a real multi-line box,
-    /// because no capture in this project holds one yet.
+    /// **A multi-line box gets the whole rectangle, whatever it aligns to --**
+    /// but through [`HostWindow::editor_multiline`] and its scrolled window
+    /// now, not through `vertical_placement`, which no longer has a multiline
+    /// branch at all. This is the replacement for the test that used to be
+    /// here (`vertical_placement_leaves_a_multiline_box_its_full_height`): the
+    /// case it asserted -- a `Top`-aligned box keeping its full height rather
+    /// than being shrunk to one line -- is no longer `vertical_placement`'s
+    /// problem, because a box `TextOverlay::multiline` is true for never calls
+    /// it. `editor_multiline_fills_its_whole_box` below is the equivalent
+    /// assertion for the function that replaced it.
     #[test]
-    fn vertical_placement_leaves_a_multiline_box_its_full_height() {
+    fn editor_multiline_fills_its_whole_box() {
         for align in [0, 1, 2, 99] {
             assert_eq!(
-                vertical_placement(align, 10, 88, 13, true),
+                multiline_placement(10, 88),
                 (10, 88),
-                "yAlignment {align} must not shrink a multi-line box to one line"
+                "yAlignment {align} is not consulted -- a multi-line box always fills its rectangle"
             );
         }
-        // And the single-line behaviour it is contrasted with is unchanged.
-        assert_eq!(vertical_placement(0, 10, 88, 13, false), (10, 13));
+        // And the single-line function it replaced for this box is unchanged.
+        assert_eq!(vertical_placement(0, 10, 88, 13), (10, 13));
     }
 
     /// A natural height taller than the box (a font too big for its own line
@@ -1859,8 +2739,8 @@ mod tests {
     /// outside it or invert the `Bottom` offset into a negative height.
     #[test]
     fn vertical_placement_clamps_a_natural_height_taller_than_the_box() {
-        assert_eq!(vertical_placement(0, 10, 22, 40, false), (10, 22));
-        assert_eq!(vertical_placement(2, 10, 22, 40, false), (10, 22));
+        assert_eq!(vertical_placement(0, 10, 22, 40), (10, 22));
+        assert_eq!(vertical_placement(2, 10, 22, 40), (10, 22));
     }
 
     /// **While a dialog is up the whole window is ours to click.**
@@ -1893,6 +2773,29 @@ mod tests {
         let region = input_region(surface, content, Some(editor), false);
         let (cx, cy, cw, ch) = content;
         assert!(!region.contains_point(cx + cw / 2, cy + ch / 2));
+    }
+
+    #[test]
+    fn a_toplevel_pointer_lock_keeps_the_raised_canvas_in_the_input_region() {
+        assert!(!claims_whole_window(false, false, false));
+        assert!(claims_whole_window(false, true, false));
+        assert!(!claims_whole_window(false, true, true));
+        assert!(claims_whole_window(true, false, true));
+        assert!(claims_whole_window(true, true, true));
+    }
+
+    #[test]
+    fn the_box_colour_reaches_the_multiline_widget_itself() {
+        // A `GtkTextView` draws its text in its own node's colour, so a rule
+        // that names only the `text` child leaves the theme's colour on it --
+        // near-black under a light theme, on a dark game.
+        let sheet = editor_colour_sheet("#d5d5dd");
+        let selectors = sheet.split('{').next().unwrap();
+        let named: Vec<&str> = selectors.split(',').map(str::trim).collect();
+        for want in [".cordial-editor", ".cordial-editor-multiline", ".cordial-editor-multiline text"] {
+            assert!(named.contains(&want), "{want} must be coloured, selectors were {named:?}");
+        }
+        assert!(sheet.contains("color: #d5d5dd;") && sheet.contains("caret-color: #d5d5dd;"));
     }
 
     #[test]
@@ -1963,6 +2866,17 @@ mod tests {
     }
 
     #[test]
+    fn the_webkit_id_is_a_valid_application_id_and_is_the_flatpaks() {
+        // WebKit only trusts an id GLib calls valid, and inside the Flatpak the
+        // portal only accepts a11y names prefixed by the app id in
+        // `/.flatpak-info`. `Cordial` fails the first, which is the bug.
+        assert!(!libadwaita::gio::Application::id_is_valid(APP_ID));
+        assert!(libadwaita::gio::Application::id_is_valid(WEBKIT_APP_ID));
+        let manifest = include_str!("../../../packaging/io.github.luohoa97.Cordial.yml");
+        assert!(manifest.contains(&format!("app-id: {WEBKIT_APP_ID}")));
+    }
+
+    #[test]
     fn the_title_does_not_name_a_graphics_backend() {
         // It used to say "(OpenGL ES)" and the engine renders through Vulkan,
         // measured over three runs. A title bar that reports the wrong backend
@@ -2005,5 +2919,29 @@ mod tests {
         // default size" rather than as an error — a silently ignored clamp.
         let (w, h) = fit_within((1280, 767), (64, 48));
         assert!(w > 0 && h > 0, "{w}x{h}");
+    }
+
+    /// The rule that keeps the host surface visible to the compositor. With the
+    /// header bar up the window is already partly uncovered by the engine's
+    /// subsurface, so it needs nothing; the moment there is no bar -- fullscreen,
+    /// or Title bar set to Hidden -- one pixel must stay uncovered, or sway sends
+    /// the surface no frame callback at all and the editor never appears.
+    #[test]
+    fn the_host_surface_keeps_one_pixel_exactly_when_there_is_no_header_bar() {
+        assert_eq!(visibility_anchor_height(true), 0);
+        assert_eq!(visibility_anchor_height(false), 1);
+    }
+
+    /// Control for the switch the measurement uses: with it off the window goes
+    /// back to being fully covered, which is the behaviour under test.
+    #[test]
+    fn the_control_switch_removes_the_pixel_in_every_state() {
+        // `set_var` is process-wide; every other test here leaves this one alone.
+        std::env::set_var("CORDIAL_VISIBILITY_ANCHOR", "off");
+        let off = (anchor_height(true), anchor_height(false));
+        std::env::remove_var("CORDIAL_VISIBILITY_ANCHOR");
+        let on = (anchor_height(true), anchor_height(false));
+        assert_eq!(off, (0, 0));
+        assert_eq!(on, (0, 1));
     }
 }

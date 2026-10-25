@@ -16,7 +16,6 @@
 //! and a surface role — more moving parts for the same first frame.
 
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CString};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -41,6 +40,9 @@ pub const WINDOW_FORMAT_RGBA_8888: i32 = 1;
 /// flash on every resize.
 const INPUT_EVENT_MASK: c_long =
     0x1 | 0x2 | 0x4 | 0x8 | 0x40 | 0x8000 | 0x20000 | 0x200000;
+
+/// `PointerMotionMask`, from X.h.
+const POINTER_MOTION_MASK: c_long = 0x40;
 
 type Display = *mut c_void;
 type Window = c_ulong;
@@ -71,8 +73,18 @@ struct Xlib {
     connection_number: unsafe extern "C" fn(Display) -> c_int,
     pending: unsafe extern "C" fn(Display) -> c_int,
     next_event: unsafe extern "C" fn(Display, *mut c_void) -> c_int,
-    peek_event: Option<unsafe extern "C" fn(Display, *mut c_void) -> c_int>,
-    xkb_set_detectable_auto_repeat: Option<unsafe extern "C" fn(Display, c_int, *mut c_int) -> c_int>,
+    /// `XPeekEvent`, only ever called after `pending` has said an event is
+    /// queued, so it cannot block. It is how a server-generated auto-repeat is
+    /// told apart from a person tapping a key twice; see [`is_autorepeat_pair`].
+    peek_event: unsafe extern "C" fn(Display, *mut c_void) -> c_int,
+    /// `XCheckMaskEvent`: removes one queued event matching a mask without
+    /// blocking. Used once, to throw away the motion that was already queued
+    /// when the pointer lock engaged; see [`HostWindow::lock_pointer`].
+    check_mask_event: unsafe extern "C" fn(Display, c_long, *mut c_void) -> c_int,
+    /// `XkbSetDetectableAutoRepeat`, which libX11 exports from the XKB part of
+    /// itself. Optional because a missing symbol must fall back to pairing
+    /// rather than stop the window opening.
+    detectable_autorepeat: Option<unsafe extern "C" fn(Display, c_int, *mut c_int) -> c_int>,
 
     grab_pointer: unsafe extern "C" fn(
         Display, Window, c_int, c_uint, c_int, c_int, Window, c_ulong, c_ulong,
@@ -163,6 +175,14 @@ impl Xlib {
             connection_number: sym!("XConnectionNumber"),
             pending: sym!("XPending"),
             next_event: sym!("XNextEvent"),
+            peek_event: sym!("XPeekEvent"),
+            check_mask_event: sym!("XCheckMaskEvent"),
+            detectable_autorepeat: {
+                // SAFETY: the handle is open and the name is XKB's documented
+                // export; null is mapped to `None`, never called.
+                let p = unsafe { dlsym(lib, c"XkbSetDetectableAutoRepeat".as_ptr()) };
+                if p.is_null() { None } else { Some(unsafe { std::mem::transmute(p) }) }
+            },
             grab_pointer: sym!("XGrabPointer"),
             ungrab_pointer: sym!("XUngrabPointer"),
             warp_pointer: sym!("XWarpPointer"),
@@ -172,16 +192,6 @@ impl Xlib {
             create_pixmap_cursor: sym!("XCreatePixmapCursor"),
             define_cursor: sym!("XDefineCursor"),
             free_pixmap: sym!("XFreePixmap"),
-            peek_event: {
-                let name = CString::new("XPeekEvent").unwrap();
-                let p = unsafe { dlsym(lib, name.as_ptr()) };
-                if p.is_null() { None } else { Some(unsafe { std::mem::transmute(p) }) }
-            },
-            xkb_set_detectable_auto_repeat: {
-                let name = CString::new("XkbSetDetectableAutoRepeat").unwrap();
-                let p = unsafe { dlsym(lib, name.as_ptr()) };
-                if p.is_null() { None } else { Some(unsafe { std::mem::transmute(p) }) }
-            },
         })
     }
 }
@@ -208,6 +218,11 @@ pub struct HostWindow {
     input: Mutex<InputState>,
     pointer_lock: Mutex<PointerLockState>,
     fullscreen: AtomicBool,
+    /// Whether the server agreed to report auto-repeat as presses alone. When
+    /// it did not, a repeat arrives as a release and a press with one
+    /// timestamp and the release has to be recognised by its neighbour; see
+    /// [`is_autorepeat_pair`].
+    detectable_autorepeat: bool,
 }
 
 /// Buttons and timing carried across calls to `pump_input_events`, the way a
@@ -221,7 +236,50 @@ struct InputState {
     /// exact meaning: constant across a MOVE/UP sequence, not per-event.
     down_time_ms: i64,
     clock: std::time::Instant,
-    key_down_times: HashMap<i32, i64>,
+    /// Keys the engine has been told are down and not yet told are up, as
+    /// (Android keycode, X keycode). See the `FOCUS_OUT` arm.
+    held_keys: Vec<(i32, i32)>,
+}
+
+/// Record that `key` went down or up, so a focus loss can release whatever is
+/// still down. A repeat of a key already held is not held twice: auto-repeat
+/// sends KeyPress over and over, and one release per press would send the
+/// engine releases for a key it was only ever pressed once.
+fn track_held_key(held: &mut Vec<(i32, i32)>, down: bool, key: (i32, i32)) {
+    if down {
+        if !held.contains(&key) {
+            held.push(key);
+        }
+    } else {
+        held.retain(|k| *k != key);
+    }
+}
+
+/// Whether a KeyRelease is half of a server-generated auto-repeat rather than
+/// a person letting go.
+///
+/// Without detectable auto-repeat the X server reports each repeat as a release
+/// and a press that carry the same timestamp, and nothing else is queued
+/// between them. A real release and a real press of one key cannot share a
+/// millisecond, so the timestamp is what tells a repeat from a tap; the keycode
+/// is checked as well because two different keys can.
+///
+/// `next` is the event after the release, `(type, time, keycode)`, or `None`
+/// when the queue is empty -- in which case the release is real, because a
+/// repeat's press is written to the connection with it.
+fn is_autorepeat_pair(release: (c_ulong, c_uint), next: Option<(c_int, c_ulong, c_uint)>) -> bool {
+    matches!(next, Some((KEY_PRESS, time, key)) if time == release.0 && key == release.1)
+}
+
+/// Whether this press is a repeat of a key the engine already holds down.
+///
+/// A repeat is not forwarded to the engine as a second press. On Wayland the
+/// engine has only ever been given one press per physical hold and walks, jumps
+/// and holds prompts correctly on it; X11 now matches that. The text path still
+/// sees every repeat, which is how holding a letter in a text box types it
+/// again.
+fn is_key_repeat(held: &[(i32, i32)], down: bool, key: (i32, i32)) -> bool {
+    down && held.contains(&key)
 }
 
 /// X11 pointer capture state.
@@ -233,22 +291,58 @@ struct PointerLockState {
     locked: bool,
     suppressed: bool,
     ignore_next_warp: bool,
-    /// Consecutive locked `MotionNotify` events discarded while waiting for
-    /// the confirmed echo of the last recentring warp. See
-    /// [`locked_pointer_delta`] for why a single check on the very next event
-    /// was not enough, and [`MAX_WARP_ECHO_WAIT`] for the bound.
-    warp_echo_wait: u8,
+    /// Where the last locked `MotionNotify` put the pointer. Deltas are taken
+    /// from this and not from the centre: see
+    /// [`PointerLockState::locked_motion`].
+    last: (i32, i32),
     centre: (i32, i32),
     saved_root: Option<(i32, i32)>,
 }
 
+/// What one locked `MotionNotify` turned out to be. See
+/// [`PointerLockState::locked_motion`].
+#[derive(Debug, PartialEq, Eq)]
+enum LockStep {
+    /// The recentring warp landing back on the centre: not motion.
+    Echo,
+    /// The camera is owed this much.
+    Real(i32, i32),
+}
+
 impl PointerLockState {
+    /// Decide what one locked `MotionNotify` means, and what the camera is owed.
+    ///
+    /// **Deltas are taken from the previous event's position, not from the
+    /// centre.** The recentring warp is a request, not an event: everything the
+    /// server had already queued for this client when it was issued carries the
+    /// pre-warp path, and the pump drains such a backlog in one go after any
+    /// hitch. Measuring each of those against the centre counted the first
+    /// event again inside every later one, so a 60-event, 180 px flick came
+    /// out as 1026 px (reproduced on Xvfb by stopping the client, queueing 60
+    /// XTest motions and resuming it) -- the camera snap in #41. Against the
+    /// previous position the backlog sums to exactly what the mouse moved, and
+    /// the warp's own echo, which lands on the centre, is the one event that is
+    /// not motion.
+    ///
+    /// The motion that predates the lock is not handled here; `lock_pointer`
+    /// removes it from the queue, which is the only way to tell it from the
+    /// camera moving.
+    fn locked_motion(&mut self, pos: (i32, i32)) -> LockStep {
+        if pos == self.centre && self.ignore_next_warp {
+            self.ignore_next_warp = false;
+            self.last = self.centre;
+            return LockStep::Echo;
+        }
+        let last = std::mem::replace(&mut self.last, pos);
+        LockStep::Real(pos.0 - last.0, pos.1 - last.1)
+    }
+
     fn new() -> Self {
         Self {
             locked: false,
             suppressed: false,
             ignore_next_warp: false,
-            warp_echo_wait: 0,
+            last: (0, 0),
             centre: (0, 0),
             saved_root: None,
         }
@@ -463,15 +557,39 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         return Err("no X display (is DISPLAY set?)".into());
     }
 
+    // **Ask the server to report auto-repeat as presses alone.** Without this
+    // a held key is delivered as a KeyRelease and a KeyPress back to back, once
+    // per repeat, and the engine was told about every one of them as a real
+    // release. A hold-to-interact prompt (Doors' key on a lock, Grace) restarts
+    // its progress bar on each release, which is the report that holding E
+    // "randomly refreshes" near the end of the bar: the repeat delay is
+    // roughly the time it takes to get that far, and after it every repeat
+    // restarts the hold. Wayland never had this because the compositor does
+    // not repeat for the client at all. Per connection, so it changes nothing
+    // for any other X client.
+    //
+    // `CORDIAL_X11_NO_DETECTABLE_AUTOREPEAT=1` declines it, which is the only
+    // way to exercise the pairing fallback on a server that would have agreed.
+    let declined = std::env::var_os("CORDIAL_X11_NO_DETECTABLE_AUTOREPEAT").is_some();
+    let detectable_autorepeat = match xlib.detectable_autorepeat {
+        Some(set) if !declined => {
+            let mut supported: c_int = 0;
+            // SAFETY: `display` is open and `supported` is a live out-pointer.
+            unsafe { set(display, 1, &mut supported) };
+            supported != 0
+        }
+        _ => false,
+    };
+    if !detectable_autorepeat {
+        println!(
+            "[android] X11: detectable auto-repeat is not in use; pairing a release with the \
+             press that follows it instead, so a held key is not read as many taps"
+        );
+    }
+
     // SAFETY: `display` is open; the geometry and border/background pixels are
     // plain values.
     CURRENT_DISPLAY.store(display as usize, std::sync::atomic::Ordering::Relaxed);
-
-    if let Some(set_detectable) = xlib.xkb_set_detectable_auto_repeat {
-        let mut supported: c_int = 0;
-        let r = unsafe { (set_detectable)(display, 1, &mut supported) };
-        println!("[android] XkbSetDetectableAutoRepeat enabled (result={r}, supported={supported})");
-    }
     let place = placement(width as c_int, height as c_int);
     // Reported always, not behind a trace flag: "the window opened on the wrong
     // screen" is a user-visible complaint, and this line is what separates
@@ -681,10 +799,11 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             buttons: 0,
             down_time_ms: 0,
             clock: std::time::Instant::now(),
-            key_down_times: HashMap::new(),
+            held_keys: Vec::new(),
         }),
         pointer_lock: Mutex::new(PointerLockState::new()),
         fullscreen: AtomicBool::new(place.fullscreen),
+        detectable_autorepeat,
     };
     // No touchscreen, and that is a statement about this backend rather than
     // about the machine: X11 core input has no touch at all, XInput2's is a
@@ -694,7 +813,12 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
     // what `isTouchDevice` is for. A user on a touchscreen who wants the mobile
     // interface on X11 has `CORDIAL_INPUT_TOUCH=1`, which overrides this.
     super::input::report_touchscreen(false);
-    Ok(WINDOW.get_or_init(|| host))
+    let host = WINDOW.get_or_init(|| host);
+    // The editor is a GTK window over the focused box, so GTK has to be up on
+    // this display. A failure leaves the backend on the buffer path, which is
+    // what it was before there was an editor at all.
+    super::x11_text::init(host.window);
+    Ok(host)
 }
 
 /// Whether the pointer lock should be held, and what the Escape-suppression
@@ -725,78 +849,6 @@ fn pointer_lock_decision(
     let asked = engine_wants || dragging || force;
     let suppressed = asked && previously_suppressed;
     (asked && !suppressed, suppressed)
-}
-
-/// Bound on how many consecutive locked `MotionNotify` events
-/// [`locked_pointer_delta`] discards while waiting for the confirmed echo of
-/// a recentring warp, before giving up and trusting the next one regardless.
-///
-/// It exists because `XWarpPointer` onto a pixel the pointer already
-/// occupies generates no `MotionNotify` at all -- X does not report a
-/// position that did not change -- so there is no unbounded wait that is
-/// safe: without this, that one coincidence would discard camera input for
-/// the rest of the lock. Four is arbitrary but generous: the steady-state
-/// case (nothing else moved the mouse in between) confirms on the very next
-/// event, so this bound is only ever exercised by the pathological case it
-/// guards against, not by ordinary play.
-const MAX_WARP_ECHO_WAIT: u8 = 4;
-
-/// What [`locked_pointer_delta`] decided about one locked `MotionNotify`.
-#[derive(Debug, PartialEq, Eq)]
-enum LockedMotion {
-    /// The confirmed echo of the recentring warp, or an event that
-    /// coincidentally lands exactly on `centre` -- either way its delta is
-    /// zero, so the two cases need not be told apart. Clears the wait latch.
-    Echo,
-    /// Not the echo, and still within [`MAX_WARP_ECHO_WAIT`] of the warp that
-    /// is being waited for, so discarded rather than trusted.
-    Waiting,
-    /// A real relative motion to report.
-    Real(i32, i32),
-}
-
-/// What one `MotionNotify` means while the pointer is locked, or whether it
-/// must be discarded instead of reported as camera movement.
-///
-/// Two different things get discarded here, and conflating them was the
-/// X11-180 bug in #41. One is the literal echo of this backend's own
-/// `XWarpPointer` call landing back on `centre`. The other is anything still
-/// arriving from *before* the lock was taken: the pointer is free-roaming
-/// right up to the instant a camera-drag button or the engine's own
-/// `SetMouseBehavior(LockCenter)` engages the lock, and X11 guarantees event
-/// ordering on one connection -- a `MotionNotify` generated before this
-/// backend's `XGrabPointer`+`XWarpPointer` request is necessarily delivered
-/// no later than that request's own echo, never after it. The version of
-/// this function that shipped only ever checked the *immediate* next event:
-/// if a stray in-flight motion sample arrived first, it was read as real
-/// motion relative to `centre` rather than discarded, and a pointer that
-/// happened to be sitting near a window edge -- exactly where a free cursor
-/// tends to be right when the user has just clicked something there -- at
-/// the instant the lock engaged reported that stale absolute position as a
-/// multi-hundred-pixel relative delta in one frame: a one-shot spin, worst
-/// at the edges, which is the shape #41 reports and the discriminator its
-/// reporter offered.
-///
-/// `waiting` is how many consecutive events this lock has already discarded
-/// looking for the echo; see [`MAX_WARP_ECHO_WAIT`] for why that is bounded.
-///
-/// Separate from [`HostWindow::dispatch_motion`] for the same reason as
-/// [`pointer_lock_decision`] above: the centre-relative arithmetic and the
-/// echo check are the two things in the locked motion path actually worth
-/// getting wrong, and neither needs a window to test.
-fn locked_pointer_delta(
-    event_pos: (i32, i32),
-    centre: (i32, i32),
-    ignore_next_warp: bool,
-    waiting: u8,
-) -> LockedMotion {
-    if event_pos == centre {
-        return LockedMotion::Echo;
-    }
-    if ignore_next_warp && waiting < MAX_WARP_ECHO_WAIT {
-        return LockedMotion::Waiting;
-    }
-    LockedMotion::Real(event_pos.0 - centre.0, event_pos.1 - centre.1)
 }
 
 impl HostWindow {
@@ -909,7 +961,7 @@ impl HostWindow {
     /// cannot be the default but stays as the only thing that works when XI2
     /// is not there to ask. Landing XI2 is sequenced after this change, not
     /// inside it — see ADR-028's "Sequencing" — so `pointer_lock_decision`
-    /// and `locked_pointer_delta` above are not where that work belongs.
+    /// and `PointerLockState::locked_motion` are not where that work belongs.
     fn sync_pointer_lock(&self) {
         let engine_wants = super::input::engine_wants_pointer_lock() == Some(true);
 
@@ -1018,6 +1070,7 @@ impl HostWindow {
 
             state.locked = true;
             state.ignore_next_warp = true;
+            state.last = centre;
             state.centre = centre;
             state.saved_root = saved_root;
         }
@@ -1035,6 +1088,38 @@ impl HostWindow {
                 centre.1,
             );
             (self.xlib.flush)(self.display);
+            // **Throw away every motion event that was queued before the warp
+            // took effect.** `XSync` returns once the server has processed the
+            // grab and the warp, and everything it generated before that --
+            // the free cursor's last positions, then the warp's own echo -- is
+            // by then in this client's queue, ahead of anything the camera
+            // produces. None of it is camera movement, and it cannot be told
+            // apart from movement by position: it is a handful of absolute
+            // coordinates wherever the cursor happened to be, which read as a
+            // delta from the centre is the 180 degree snap in #41. This used to
+            // discard the first few events and trust the fifth, so a backlog of
+            // five or more (a high-rate mouse after a hitch) leaked one
+            // window-sized delta. Nothing is left to guess at here: after this
+            // the next motion event is genuinely post-warp, and a warp that
+            // landed on the pixel the cursor already occupied, which echoes
+            // nothing, needs no special case.
+            (self.xlib.sync)(self.display, 0);
+            let mut scratch = [0u8; 256];
+            let mut purged = 0u32;
+            while (self.xlib.check_mask_event)(
+                self.display,
+                POINTER_MOTION_MASK,
+                scratch.as_mut_ptr() as *mut c_void,
+            ) != 0
+            {
+                purged += 1;
+            }
+            // The echo, if there was one, went with them.
+            let mut state = self.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            state.ignore_next_warp = false;
+            if super::input::trace_mouse() {
+                eprintln!("[cordial] X11 pointer lock: discarded {purged} motion event(s) queued before the grab");
+            }
         }
 
         super::input::reset_mouse_delta();
@@ -1112,30 +1197,28 @@ impl HostWindow {
         }
     }
 
-    fn toggle_pointer_lock_suppression(&self) -> Option<bool> {
-        let mut state = self
+    fn escape_pointer_lock(&self) -> bool {
+        let held = self
             .pointer_lock
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|e| e.into_inner())
+            .locked;
 
-        if state.suppressed {
-            state.suppressed = false;
-            drop(state);
-            self.sync_pointer_lock();
-            return Some(false);
+        if !held {
+            return false;
         }
 
-        if !state.locked {
-            return None;
-        }
+        self.pointer_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .suppressed = true;
 
-        state.suppressed = true;
-        drop(state);
         self.release_pointer_lock();
-        Some(true)
+        true
     }
 
     pub fn close(&self) {
+        super::x11_text::close();
         // SAFETY: both handles came from this struct's own creation calls.
         unsafe {
             (self.xlib.destroy_window)(self.display, self.window);
@@ -1314,10 +1397,11 @@ fn android_meta_state(x11_state: c_uint) -> i32 {
 // why the keysym table in particular carries over unchanged: X11 keysyms and
 // XKB keysyms are the same numbering.
 use super::input::{
-    deliver_key, deliver_surface_redraw, deliver_mouse, edit_text_buffer, keysym_to_android,
+    deliver_key, deliver_surface_redraw, deliver_mouse, deliver_mouse_button, edit_text_buffer,
+    keysym_to_android,
     pass_key_event, pass_mouse_button, pass_mouse_move, pass_text, report_keyboard_state, Caret,
-    Edit, ACTION_BUTTON_PRESS, ACTION_BUTTON_RELEASE, ACTION_DOWN, ACTION_HOVER_MOVE, ACTION_MOVE,
-    ACTION_UP, BUTTON_BACK, BUTTON_FORWARD, BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_TERTIARY,
+    Edit, ACTION_HOVER_MOVE, ACTION_MOVE,
+    BUTTON_BACK, BUTTON_FORWARD, BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_TERTIARY,
 };
 
 /// X11 numbers buttons 1/2/3 as left/middle/right; Android's bit assignment
@@ -1381,23 +1465,6 @@ fn is_final_expose(count: c_int) -> bool {
 }
 
 impl HostWindow {
-    fn is_synthetic_key_repeat(&self, release_ev: &XInputEvent) -> bool {
-        let Some(peek) = self.xlib.peek_event else { return false };
-        if unsafe { (self.xlib.pending)(self.display) } <= 0 {
-            return false;
-        }
-        let mut next_buf = [0u8; 256];
-        unsafe { (peek)(self.display, next_buf.as_mut_ptr() as *mut c_void) };
-        let next_type = unsafe { *(next_buf.as_ptr() as *const c_int) };
-        if next_type == KEY_PRESS {
-            let next_ev = unsafe { &*(next_buf.as_ptr() as *const XInputEvent) };
-            if next_ev.detail == release_ev.detail && next_ev.time == release_ev.time {
-                return true;
-            }
-        }
-        false
-    }
-
     fn now_ms(&self) -> i64 {
         let state = self.input.lock().unwrap_or_else(|e| e.into_inner());
         state.clock.elapsed().as_millis() as i64
@@ -1423,25 +1490,21 @@ impl HostWindow {
         let mut state = self.input.lock().unwrap_or_else(|e| e.into_inner());
         let now = state.clock.elapsed().as_millis() as i64;
 
+        let before = state.buttons;
         if press {
-            if state.buttons == 0 {
+            if before == 0 {
                 state.down_time_ms = now;
             }
             state.buttons |= android_button;
-            let (buttons, down_time) = (state.buttons, state.down_time_ms);
-            drop(state);
-            // Real Android mouse input delivers exactly this pair for a
-            // click: ACTION_DOWN establishes the gesture, then
-            // ACTION_BUTTON_PRESS names which button did it.
-            deliver_mouse(handle, ACTION_DOWN, x, y, buttons, 0, now, down_time);
-            deliver_mouse(handle, ACTION_BUTTON_PRESS, x, y, buttons, android_button, now, down_time);
         } else {
             state.buttons &= !android_button;
-            let (buttons, down_time) = (state.buttons, state.down_time_ms);
-            drop(state);
-            deliver_mouse(handle, ACTION_BUTTON_RELEASE, x, y, buttons, android_button, now, down_time);
-            deliver_mouse(handle, ACTION_UP, x, y, buttons, 0, now, down_time);
         }
+        let down_time = state.down_time_ms;
+        drop(state);
+        // Real Android mouse input delivers `ACTION_DOWN` for the first button
+        // only, `ACTION_BUTTON_PRESS` for each, and `ACTION_UP` when the last
+        // comes up. See `mouse_button_events`.
+        deliver_mouse_button(handle, press, before, android_button, x, y, now, down_time);
 
         // The interface's own input path, alongside AGDK's — and every button,
         // not only the primary one. The gate that used to stand here dropped
@@ -1460,41 +1523,9 @@ impl HostWindow {
             if state.locked {
                 let centre = state.centre;
 
-                let (dx, dy) = match locked_pointer_delta(
-                    (ev.x, ev.y),
-                    centre,
-                    state.ignore_next_warp,
-                    state.warp_echo_wait,
-                ) {
-                    LockedMotion::Echo => {
-                        if super::input::trace_mouse() && state.warp_echo_wait > 0 {
-                            eprintln!(
-                                "[cordial] X11 pointer lock: warp echo confirmed at ({}, {}) after discarding {} stale event(s)",
-                                ev.x, ev.y, state.warp_echo_wait
-                            );
-                        }
-                        state.ignore_next_warp = false;
-                        state.warp_echo_wait = 0;
-                        return;
-                    }
-                    LockedMotion::Waiting => {
-                        state.warp_echo_wait += 1;
-                        if super::input::trace_mouse() {
-                            eprintln!(
-                                "[cordial] X11 pointer lock: discarding stale motion at ({}, {}), waiting for warp echo at ({}, {}) (wait={})",
-                                ev.x, ev.y, centre.0, centre.1, state.warp_echo_wait
-                            );
-                        }
-                        return;
-                    }
-                    LockedMotion::Real(dx, dy) => {
-                        // Either the ordinary case (no warp outstanding) or
-                        // `MAX_WARP_ECHO_WAIT` was reached, in which case the
-                        // wait is abandoned here rather than left stuck at
-                        // the bound forever.
-                        state.warp_echo_wait = 0;
-                        (dx, dy)
-                    }
+                let (dx, dy) = match state.locked_motion((ev.x, ev.y)) {
+                    LockStep::Echo => return,
+                    LockStep::Real(dx, dy) => (dx, dy),
                 };
                 let (cx, cy) = centre;
 
@@ -1597,6 +1628,70 @@ impl HostWindow {
         pass_mouse_move(x, y);
     }
 
+    /// Whether the KeyRelease in `buf` is the first half of an auto-repeat the
+    /// server did not mark as one. Only ever true when detectable auto-repeat
+    /// was refused, and only after `pending` has said there is a following
+    /// event to look at, so `XPeekEvent` cannot block the pump.
+    fn release_is_autorepeat(&self, buf: &[u8; 256]) -> bool {
+        if self.detectable_autorepeat {
+            return false;
+        }
+        // SAFETY: `XPending` only reads the connection's own queue.
+        if unsafe { (self.xlib.pending)(self.display) } <= 0 {
+            return false;
+        }
+        let mut peek = [0u8; 256];
+        // SAFETY: an event is queued, so this returns at once; `peek` is
+        // larger than every concrete event struct in the `XEvent` union.
+        unsafe { (self.xlib.peek_event)(self.display, peek.as_mut_ptr() as *mut c_void) };
+        let kind = unsafe { *(peek.as_ptr() as *const c_int) };
+        let release = unsafe { &*(buf.as_ptr() as *const XInputEvent) };
+        let next = unsafe { &*(peek.as_ptr() as *const XInputEvent) };
+        is_autorepeat_pair((release.time, release.detail), Some((kind, next.time, next.detail)))
+    }
+
+    /// A key the editor window received that the engine must also hear. Returns
+    /// whether it was consumed, so the editor does not act on it too.
+    ///
+    /// The editor holds X focus while a box is focused, which means the engine's
+    /// own connection hears nothing. Three keys cannot wait for the box to blur:
+    /// Escape, which is how the engine's `hideKeyboard` is reached from the
+    /// keyboard; F11, because fullscreen is this backend's own and the editor
+    /// would otherwise swallow it; and the recording hotkey (ADR-059), taken
+    /// before the engine hears it as everywhere else. Everything else stays with
+    /// the widget -- the engine is not told a key was pressed in a text field,
+    /// as Android's `EditText` consumes them.
+    ///
+    /// `keyval` is a keysym and `keycode` an X keycode, which is what GDK's X11
+    /// backend reports; `state` carries the same modifier bits as an X event.
+    pub fn forward_editor_key(&self, keyval: u32, keycode: u32, state: u32, down: bool) -> bool {
+        let meta = android_meta_state(state);
+        if keyval == 0xffc8 {
+            if down {
+                self.set_fullscreen(!self.fullscreen.load(Ordering::Relaxed));
+            }
+            return true;
+        }
+        if crate::recording::hotkey_event(
+            keycode as i32 - 8,
+            down,
+            meta & (super::input::META_CTRL_ON | super::input::META_ALT_ON) != 0,
+        ) {
+            return true;
+        }
+        if keyval == 0xff1b {
+            let now = self.now_ms();
+            let handle = super::x11_text::active_handle();
+            if let Some(android) = keysym_to_android(keyval as c_ulong) {
+                if handle != 0 {
+                    deliver_key(handle, down, android, keycode as i32, meta, 0, 0, now, now);
+                }
+            }
+            pass_key_event(down, keycode as i32 - 8, meta);
+        }
+        false
+    }
+
     fn dispatch_key(&self, handle: i64, buf: &mut [u8; 256], down: bool) {
         let mut keysym: c_ulong = 0;
         let mut text = [0u8; 8];
@@ -1629,32 +1724,26 @@ impl HostWindow {
         let meta = android_meta_state(ev.state);
         let now = self.now_ms();
 
-        let evdev = ev.detail as i32 - 8;
-        let (down_time, is_repeat) = {
-            let mut state = self.input.lock().unwrap_or_else(|e| e.into_inner());
-            if down {
-                if let Some(&orig_down) = state.key_down_times.get(&evdev) {
-                    (orig_down, true)
-                } else {
-                    state.key_down_times.insert(evdev, now);
-                    (now, false)
-                }
-            } else {
-                let orig_down = state.key_down_times.remove(&evdev).unwrap_or(now);
-                (orig_down, false)
-            }
-        };
-
-        if down && !is_repeat && keysym == 0xff1b {
-            self.toggle_pointer_lock_suppression();
+        if down && keysym == 0xff1b && self.escape_pointer_lock() {
+            return;
         }
 
         // XK_F11. Like the Wayland game window, this backend is not the GTK
         // launcher and therefore cannot inherit its `win.fullscreen` action.
         if keysym == 0xffc8 {
-            if down && !is_repeat {
+            if down {
                 self.set_fullscreen(!self.fullscreen.load(Ordering::Relaxed));
             }
+            return;
+        }
+
+        // The recording hotkey (ADR-059), taken before the engine hears it.
+        // `detail` is an X keycode; evdev's is eight lower.
+        if crate::recording::hotkey_event(
+            ev.detail as i32 - 8,
+            down,
+            meta & (super::input::META_CTRL_ON | super::input::META_ALT_ON) != 0,
+        ) {
             return;
         }
 
@@ -1662,7 +1751,7 @@ impl HostWindow {
             // `text=` is a length unless `CORDIAL_TRACE_TEXT_SHOW_PASSWORDS=1`:
             // one character at a time is still a password, printed slowly.
             eprintln!(
-                "[cordial] key {} (repeat={is_repeat}) keysym={keysym:#x} text={} keycode={:?} focus={:?}",
+                "[cordial] key {} keysym={keysym:#x} text={} keycode={:?} focus={:?}",
                 if down { "down" } else { "up" },
                 super::input::redacted(typed_text),
                 keysym_to_android(keysym),
@@ -1670,21 +1759,33 @@ impl HostWindow {
             );
         }
 
-        // Real per-key downTime tracking (one slot per held key) is handled
-        // via state.key_down_times above.
-        //
-        // Only non-repeat presses are delivered to Roblox's game input.
-        // Auto-repeats from the X server reset hold actions (e.g. ProximityPrompt)
-        // because Roblox interprets duplicate press events as new InputBegan triggers.
-        // Note that text entry below still receives repeat events so holding keys in
-        // textboxes (like Backspace) works as expected.
+        // Real per-key downTime tracking (one slot per held key) is not
+        // implemented; both fields use the current time on every call. That
+        // is a simplification, not a faithful `downTime`, and is called out in
+        // the report — it does not block a key reaching the engine, only the
+        // precision of one timing field most UI code does not consult.
+        // Keys the Android keycode table covers. A keysym with no mapping — the
+        // shifted symbols, `@` among them — used to `return` here, which also
+        // skipped the text path below and silently dropped the character. Text
+        // does not need an Android keycode: `@` is a character whether or not
+        // AKEYCODE has a name for it, and an email address is unusable without
+        // it. So this is now a branch rather than an exit.
         if let Some(keycode) = keysym_to_android(keysym) {
-            if !is_repeat {
-                deliver_key(handle, down, keycode, ev.detail as i32, meta, 0, unicode, now, down_time);
+            let repeat = {
+                let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
+                let key = (keycode, ev.detail as i32);
+                let repeat = is_key_repeat(&input.held_keys, down, key);
+                track_held_key(&mut input.held_keys, down, key);
+                repeat
+            };
+            // A repeat of a key the engine already holds is not a second press.
+            // See `is_key_repeat`; the text path below still runs for it.
+            if !repeat {
+                deliver_key(handle, down, keycode, ev.detail as i32, meta, 0, unicode, now, now);
                 // The evdev code, not the Android keycode. X11 keycodes are evdev
                 // offset by 8 -- XKB reserves the low 8 for historical reasons every
                 // consumer has to undo. See `pass_key_event`.
-                pass_key_event(down, evdev, meta);
+                pass_key_event(down, ev.detail as i32 - 8, meta);
             }
         } else {
             super::trace(format_args!("unmapped X11 keysym {keysym:#x}"));
@@ -1702,6 +1803,17 @@ impl HostWindow {
             let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else {
                 return;
             };
+            // **The editor window owns the text while it holds the keyboard.**
+            // X delivers keys to one focus window, so this is rarely reached
+            // then -- a key typed in the few ticks between a box taking focus
+            // and the editor taking X focus still goes down the buffer path
+            // below, and the editor is seeded from that buffer when it shows.
+            // The guard is for the case where one arrives anyway, because
+            // inserting it here as well as in the widget is every character
+            // twice.
+            if super::x11_text::owns_keyboard() {
+                return;
+            }
             // Ctrl+V, before anything reads the character.
             //
             // There is no engine call to look for here and that is correct
@@ -1747,6 +1859,12 @@ impl HostWindow {
     fn pump_input_events(&self, handle: i64) {
         self.sync_pointer_lock();
 
+        // GTK first, then the editor's placement: a keystroke typed into the
+        // editor arrives through GTK's own connection and is turned into an
+        // edit here, before the engine's connection is drained below. Ahead of
+        // the early return so an idle pump still runs it.
+        super::x11_text::pump(handle);
+
         // Before draining input: if the engine has opened or closed an editor
         // since last time, acknowledge it. Cheap — an atomic load and a
         // comparison unless something actually changed.
@@ -1790,46 +1908,47 @@ impl HostWindow {
                     let ev = unsafe { &*(buf.as_ptr() as *const XInputEvent) };
                     self.dispatch_motion(handle, ev);
                 }
-                KEY_RELEASE => {
-                    let ev = unsafe { &*(buf.as_ptr() as *const XInputEvent) };
-                    if self.is_synthetic_key_repeat(ev) {
+                KEY_PRESS | KEY_RELEASE => {
+                    if event_type == KEY_RELEASE && self.release_is_autorepeat(&buf) {
                         continue;
                     }
-                    self.dispatch_key(handle, &mut buf, false);
-                }
-                KEY_PRESS => {
-                    self.dispatch_key(handle, &mut buf, true);
+                    self.dispatch_key(handle, &mut buf, event_type == KEY_PRESS);
                 }
                 FOCUS_OUT => {
                     self.release_pointer_lock();
 
-                    let mut state = self
-                        .input
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let stranded = {
+                        let mut state = self.input.lock().unwrap_or_else(|e| e.into_inner());
+                        state.buttons = 0;
+                        std::mem::take(&mut state.held_keys)
+                    };
 
-                    state.buttons = 0;
-                    state.key_down_times.clear();
-
-                    // Mouse buttons get corrected here, but nothing does the
-                    // same for the keyboard: this backend keeps no held-key
-                    // set at all (only `InputState.buttons`), and there is no
-                    // `FOCUS_IN` arm to reconcile one even if it did. A
-                    // KeyRelease for a key that is let go while this window
-                    // does not have focus is never delivered to it -- X only
-                    // sends key events to the focused client -- so the
-                    // engine's own idea of "is W still held" has no external
-                    // correction the way the button bitmask just got one.
-                    // `INFERRED`, not confirmed: this is a candidate mechanism
-                    // for #41's second fault (movement continuing for several
-                    // seconds after the pointer lock's warp/grab cycle), not
-                    // an established cause -- reproducing it needs a real
-                    // keyboard and a focus change mid-drag, which this
-                    // sandbox cannot generate (see AGENTS.md on synthesised
-                    // input) and the MCP's `cordial_key` cannot exercise
-                    // either, since it calls `input::pass_key_event` directly
-                    // (`devctl.rs`'s `Cmd::Key`) and never goes through this
-                    // X11 event path at all.
+                    // **Let go of every key the engine still thinks is down.**
+                    // X only sends key events to the focused client, so a key
+                    // released while another window has focus never produces a
+                    // KeyRelease here, and the engine goes on walking in the
+                    // direction it was last told. Issue #41 describes exactly
+                    // that on X11: movement continuing in the previous
+                    // direction for about five seconds after the camera's
+                    // warp/grab cycle, which releases the grab through this
+                    // arm. The Wayland backend has done this on
+                    // `wl_keyboard.leave` for some time; this backend kept no
+                    // held-key set to do it with. Measured on a private Xvfb: a key held
+                    // by XTest, then `XSetInputFocus` onto another window, produces
+                    // the release here. `INFERRED` that this is the whole of #41's
+                    // second symptom, which was reported on XFCE with a window
+                    // manager this was not run under; a release for a key that is
+                    // up is harmless, and a missing one is the reported bug's shape.
+                    if !stranded.is_empty() {
+                        let now = self.now_ms();
+                        for (keycode, x_keycode) in stranded {
+                            deliver_key(handle, false, keycode, x_keycode, 0, 0, 0, now, now);
+                            pass_key_event(false, x_keycode - 8, 0);
+                        }
+                        if super::input::trace_mouse() || super::input::trace_text() {
+                            eprintln!("[cordial] X11 focus out: released keys still held");
+                        }
+                    }
                 }
                 EXPOSE => {
                     // SAFETY: `event_type == EXPOSE` means `XNextEvent` just
@@ -1943,8 +2062,12 @@ impl HostWindow {
 /// one is open — the loader/asset-only paths that never call `open()` make
 /// this a no-op).
 pub fn pump_input_events(handle: i64) {
+    super::input::note_pump_tick();
     if let Some(w) = current() {
+        let started = std::time::Instant::now();
         w.pump_input_events(handle);
+        // No GTK main loop is iterated on this path, so none of it is GTK's.
+        super::input::note_pump_phases(0, started.elapsed().as_millis() as u64);
     }
 }
 
@@ -2186,6 +2309,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn held_keys_are_tracked_once_and_dropped_on_release() {
+        let mut held = Vec::new();
+        track_held_key(&mut held, true, (51, 25));
+        track_held_key(&mut held, true, (51, 25)); // auto-repeat
+        track_held_key(&mut held, true, (47, 39));
+        assert_eq!(held, vec![(51, 25), (47, 39)]);
+        track_held_key(&mut held, false, (51, 25));
+        assert_eq!(held, vec![(47, 39)], "only the key that came up is forgotten");
+        track_held_key(&mut held, false, (99, 99)); // release for a key never seen
+        assert_eq!(held, vec![(47, 39)]);
+    }
+
+    #[test]
+    fn a_release_followed_by_its_own_press_is_an_autorepeat_not_a_release() {
+        // #106: without detectable auto-repeat the server writes a held key as
+        // a release and a press with one timestamp. Forwarding the release
+        // restarts a hold-to-interact bar every repeat.
+        assert!(is_autorepeat_pair((5_000, 26), Some((KEY_PRESS, 5_000, 26))));
+        // A person tapping E twice cannot share a millisecond with themselves.
+        assert!(!is_autorepeat_pair((5_000, 26), Some((KEY_PRESS, 5_090, 26))));
+        // Another key pressed in the same millisecond is not this key repeating.
+        assert!(!is_autorepeat_pair((5_000, 26), Some((KEY_PRESS, 5_000, 25))));
+        // Something other than a press next, or nothing queued at all: real.
+        assert!(!is_autorepeat_pair((5_000, 26), Some((KEY_RELEASE, 5_000, 26))));
+        assert!(!is_autorepeat_pair((5_000, 26), Some((MOTION_NOTIFY, 5_000, 26))));
+        assert!(!is_autorepeat_pair((5_000, 26), None));
+    }
+
+    #[test]
+    fn only_a_press_of_a_key_already_held_is_a_repeat() {
+        let held = vec![(51, 25)];
+        assert!(is_key_repeat(&held, true, (51, 25)), "the second press of a held key");
+        assert!(!is_key_repeat(&held, true, (47, 39)), "a different key is a fresh press");
+        assert!(!is_key_repeat(&held, false, (51, 25)), "a release is never a repeat");
+        assert!(!is_key_repeat(&[], true, (51, 25)), "the first press is never a repeat");
+    }
+
+    #[test]
     fn a_keysym_only_supplies_text_that_xlib_could_not() {
         // Cyrillic_a on a Russian layout: no Latin-1 bytes, no modifiers.
         assert_eq!(keysym_text_fallback(0, 0, 0x06c1), Some('а'));
@@ -2233,50 +2394,75 @@ mod tests {
         // The synthetic MotionNotify this backend's own XWarpPointer produces
         // lands exactly on the capture centre and must be dropped, or every
         // recentring warp would report itself as a fresh delta.
-        assert_eq!(locked_pointer_delta((640, 360), (640, 360), true, 0), LockedMotion::Echo);
-        // The same coincidence with the latch already spent (a previous
-        // frame consumed the echo) is still just a zero delta -- an `Echo`
-        // either way, since the two cases are indistinguishable and neither
-        // has anything to report.
-        assert_eq!(locked_pointer_delta((640, 360), (640, 360), false, 0), LockedMotion::Echo);
+        let mut state = engaged_lock();
+        state.ignore_next_warp = true;
+        assert_eq!(state.locked_motion((640, 360)), LockStep::Echo);
         // Ordinary motion away from centre, with no warp outstanding, is
         // never swallowed.
-        assert_eq!(locked_pointer_delta((645, 358), (640, 360), false, 0), LockedMotion::Real(5, -2));
+        assert_eq!(state.locked_motion((645, 358)), LockStep::Real(5, -2));
+        // The same coincidence with no warp outstanding is just a move that
+        // happened to end on the centre, and is reported as one.
+        assert_eq!(state.locked_motion((640, 360)), LockStep::Real(-5, 2));
     }
 
-    #[test]
-    fn stale_pre_lock_motion_is_discarded_rather_than_read_as_a_spin() {
-        // #41: a motion event still in flight from before the lock engaged --
-        // the free cursor sitting near a window edge at the instant a camera
-        // drag or SetMouseBehavior(LockCenter) grabbed it -- must not be
-        // reported as a several-hundred-pixel delta just because it is not
-        // itself the echo. It is discarded, and the wait latch stays armed.
-        assert_eq!(locked_pointer_delta((1900, 40), (640, 360), true, 0), LockedMotion::Waiting);
-        // A second stale event before the echo arrives: still discarded.
-        assert_eq!(locked_pointer_delta((1850, 55), (640, 360), true, 1), LockedMotion::Waiting);
-        // The echo itself, whenever it turns up, is still recognised and
-        // clears the latch.
-        assert_eq!(locked_pointer_delta((640, 360), (640, 360), true, 2), LockedMotion::Echo);
-    }
-
-    #[test]
-    fn a_warp_with_no_echo_eventually_gives_up_waiting() {
-        // XWarpPointer onto a pixel the pointer already occupies produces no
-        // MotionNotify -- there is nothing to confirm the warp with -- so an
-        // unbounded wait would discard camera input for the rest of the
-        // lock. Once MAX_WARP_ECHO_WAIT is reached the next event is trusted
-        // even though the latch was never explicitly cleared.
-        for waiting in 0..MAX_WARP_ECHO_WAIT {
-            assert_eq!(
-                locked_pointer_delta((900, 200), (640, 360), true, waiting),
-                LockedMotion::Waiting,
-                "wait {waiting} should still be discarded"
-            );
+    /// Feed a sequence of `MotionNotify` positions through the locked path the
+    /// way `dispatch_motion` does, and return the total delta the camera was
+    /// handed. A real event is followed by a recentring warp, so the next
+    /// echo is expected.
+    fn camera_total(state: &mut PointerLockState, events: &[(i32, i32)]) -> (i32, i32) {
+        let mut total = (0, 0);
+        for &pos in events {
+            if let LockStep::Real(dx, dy) = state.locked_motion(pos) {
+                total.0 += dx;
+                total.1 += dy;
+                if dx != 0 || dy != 0 {
+                    state.ignore_next_warp = true;
+                }
+            }
         }
-        assert_eq!(
-            locked_pointer_delta((900, 200), (640, 360), true, MAX_WARP_ECHO_WAIT),
-            LockedMotion::Real(260, -160)
-        );
+        total
+    }
+
+    fn engaged_lock() -> PointerLockState {
+        let mut state = PointerLockState::new();
+        state.locked = true;
+        state.centre = (640, 360);
+        // The acquire-time warp has already echoed.
+        state.ignore_next_warp = false;
+        state.last = (640, 360);
+        state
+    }
+
+    #[test]
+    fn a_backlog_of_motion_is_counted_once_not_once_per_event() {
+        // #41 and the camera snap it reports: the pump drains X events in
+        // batches, so after a hitch dozens of `MotionNotify` are already queued
+        // when the first one is read. Every one of them was generated before the
+        // recentring warp that the first one triggers, so all carry positions
+        // along the original path -- 3 px apart here -- and none sits near the
+        // centre. Reading each as an offset from the centre counted the first
+        // event again inside every later one: a 60-event, 180 px flick was
+        // reported as 1026 px (measured on Xvfb with the client stopped while 60
+        // XTest motions were queued), and a gaming mouse after a 100 ms hitch
+        // would turn the camera several times over.
+        let mut state = engaged_lock();
+        let mut events: Vec<(i32, i32)> = (1..=60).map(|i| (640 + 3 * i, 360)).collect();
+        // The warp's own echo comes last, in server order.
+        events.push((640, 360));
+        let (dx, dy) = camera_total(&mut state, &events);
+        assert_eq!((dx, dy), (180, 0), "the camera must turn by what the mouse moved");
+        // And motion after the echo is relative to the centre again.
+        assert_eq!(camera_total(&mut state, &[(644, 358)]), (4, -2));
+    }
+
+    #[test]
+    fn a_backlog_in_both_directions_cancels_out() {
+        let mut state = engaged_lock();
+        let mut events: Vec<(i32, i32)> = (1..=30).map(|i| (640 + 3 * i, 360)).collect();
+        events.extend((0..30).rev().map(|i| (640 + 3 * i, 360 - 1)));
+        events.push((640, 360));
+        let (dx, dy) = camera_total(&mut state, &events);
+        assert_eq!((dx, dy), (0, -1), "out 90 px and back 90 px, one pixel higher");
     }
 
     #[test]

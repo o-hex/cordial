@@ -39,11 +39,12 @@
 //! apart — a version, then `+`-separated `key:value` pairs — percent-decodes its
 //! `placelauncherurl`, and carries the `placeId` out of that launcher query into
 //! `roblox://experiences/start?placeId=<id>`, which is the exact string measured
-//! to work. `CORDIAL_DEEPLINK_NO_TRANSLATE=1` is the control. Nothing else is
-//! carried: the desktop link's `gameinfo` is a one-time authentication ticket,
-//! and a launcher query that names a *particular server* rather than an
-//! experience is refused outright rather than flattened into a join somewhere
-//! else.
+//! to work. `CORDIAL_DEEPLINK_NO_TRANSLATE=1` is the control. A launcher query
+//! that names a *particular server* (a private server's codes, a job id) has
+//! that server carried too, under the engine's own parameter names; one that
+//! cannot be carried safely is refused rather than flattened into a join
+//! somewhere else. The desktop link's `gameinfo`, a one-time authentication
+//! ticket, is not carried by default.
 //!
 //! **This used to say the Android client "has no use for" that ticket, and
 //! that was asserted without a citation.** It is what makes browser launches
@@ -361,22 +362,29 @@ pub fn validate(raw: &str) -> Result<JoinUrl, String> {
 /// worth refusing carries one of these or no `placeId` at all, so the parameters
 /// answer the question the request kind would have.
 ///
-/// **This still guards exactly the case it always did, and is still right to.**
-/// [`translate`] only ever had a bare `placeId` to work with -- a browser
-/// click hands over a `roblox-player:` link, and the *only* thing this file
-/// could pull out of it was the place, never a specific server, so carrying
-/// one of these alone would have joined the wrong game silently. Issue #40's
-/// round 6 found a second, later path in ([`publish_hybrid_game_launch`])
-/// where the whole query the page actually sent — including a real
-/// `instanceId` naming one server — arrives intact, because it comes from
-/// intercepting a JS call rather than reparsing a launcher URL. That path
-/// carries the instance forward instead of refusing on it, precisely because
-/// nothing is lost there the way it would be here. The refusal below stays
-/// exactly as strict as it was for the path it was written for; it does not
-/// need to loosen for a different path to stop losing what this one always
-/// lost.
+/// **Carried, not refused, since 2026-09-25.** These used to stop the
+/// translation outright, when only the place id could be carried and doing so
+/// would have joined a different server from the one clicked. The engine's
+/// own link grammar names `accessCode`, `linkCode`, `reservedServerAccessCode`
+/// and `gameInstanceId`, so [`translate`] now carries each under that name
+/// (see [`server_key`]); a value it cannot pass on safely still refuses the
+/// whole link rather than flattening it to the place.
 const SERVER_SELECTING: [&str; 5] =
     ["accesscode", "linkcode", "reservedserveraccesscode", "gameid", "jobid"];
+
+/// The engine's own name for a server-picking launcher parameter, as its
+/// `FStringGameLaunchLinkURL` grammar and `publish_hybrid_game_launch` spell
+/// it. `gameid` and `jobid` both name a running server, which the mobile link
+/// calls `gameInstanceId`.
+fn server_key(launcher_key: &str) -> Option<&'static str> {
+    match launcher_key {
+        "accesscode" => Some("accessCode"),
+        "linkcode" => Some("linkCode"),
+        "reservedserveraccesscode" => Some("reservedServerAccessCode"),
+        "gameid" | "jobid" => Some("gameInstanceId"),
+        _ => None,
+    }
+}
 
 /// What [`translate`] made of the link.
 #[derive(Debug)]
@@ -405,11 +413,28 @@ pub enum Translated {
 /// exchange for not typing a password. That is a reasonable trade to offer and
 /// not one to make for them, which is why there is a switch in Settings rather
 /// than a better default.
+///
+/// The environment gives the starting value; the shell's `settings.set`
+/// can change it afterwards ([`set_carry_ticket`], ADR-044). It is consulted
+/// each time a link is translated, so a change applies to the next link and
+/// not to one already handed to the engine.
 pub fn carry_ticket() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(std::env::var("CORDIAL_DEEPLINK_CARRY_TICKET").ok().as_deref(), Some("1"))
+    carry_ticket_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn carry_ticket_cell() -> &'static std::sync::atomic::AtomicBool {
+    static ON: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(matches!(
+            std::env::var("CORDIAL_DEEPLINK_CARRY_TICKET").ok().as_deref(),
+            Some("1")
+        ))
     })
+}
+
+/// Change whether a browser sign-in ticket is passed on, in a running client.
+pub fn set_carry_ticket(on: bool) {
+    carry_ticket_cell().store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether a ticket is shaped like one, and so may be formatted into a URL.
@@ -448,11 +473,11 @@ fn ticket_shaped(ticket: &str) -> bool {
 /// or stop being claimed.
 ///
 /// **What is carried, and what is not.** The `placelauncherurl` decodes to a
-/// `PlaceLauncher.ashx` request whose query names a `placeId`. That id, and only
-/// that id, is carried into `roblox://experiences/start?placeId=<id>` — the
-/// exact shape measured to produce a `Game.launch`. Everything else in the
-/// launcher query is named in the log and dropped; nothing is guessed at, and
-/// [`SERVER_SELECTING`] is the set whose presence stops the translation instead.
+/// `PlaceLauncher.ashx` request whose query names a `placeId`. That id, and
+/// any server it picks ([`SERVER_SELECTING`]), are carried into
+/// `roblox://experiences/start?placeId=<id>` — the exact shape measured to
+/// produce a `Game.launch`. Everything else in the launcher query is named in
+/// the log and dropped; nothing is guessed at.
 ///
 /// **`gameinfo` is dropped unless [`carry_ticket`] says otherwise, and that is
 /// still the open question.** It is a one-time authentication ticket the
@@ -520,6 +545,7 @@ pub fn translate(url: &JoinUrl) -> Translated {
 
     let query = launcher.split_once('?').map(|(_, q)| q).unwrap_or_default();
     let mut place = None;
+    let mut server: Vec<(&'static str, &str)> = Vec::new();
     let mut blocking: Vec<&str> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
     for pair in query.split('&') {
@@ -530,9 +556,14 @@ pub fn translate(url: &JoinUrl) -> Translated {
         if lower == "placeid" {
             place = Some(value);
         } else if let Some(known) = SERVER_SELECTING.iter().find(|s| **s == lower) {
-            // The canonical spelling rather than the one that arrived, so that
-            // the sentence a user reads is Cordial's and not a web page's.
-            blocking.push(known);
+            // A server-picking parameter is carried under the name the
+            // engine's own link grammar uses, or the whole translation is
+            // refused: never flattened to the place alone, which would join
+            // a different server from the one clicked.
+            match (server_key(known), url_value_safe(value)) {
+                (Some(engine_key), true) => server.push((engine_key, value)),
+                _ => blocking.push(known),
+            }
         } else if is_identifier(key) {
             dropped.push(key.to_string());
         }
@@ -540,9 +571,8 @@ pub fn translate(url: &JoinUrl) -> Translated {
 
     if !blocking.is_empty() {
         return Translated::Refused(format!(
-            "its placelauncherurl carries {}, which picks a particular server rather than an \
-             experience; carrying only the place id would join a different game from the one \
-             clicked",
+            "its placelauncherurl carries {} in a form Cordial cannot pass on safely; carrying \
+             only the place id would join a different server from the one clicked",
             blocking.join(", ")
         ));
     }
@@ -580,7 +610,14 @@ pub fn translate(url: &JoinUrl) -> Translated {
         None => String::new(),
     };
 
-    match validate(&format!("roblox://experiences/start?placeId={place}{suffix}")) {
+    let mut selecting = String::new();
+    for (key, value) in &server {
+        selecting.push('&');
+        selecting.push_str(key);
+        selecting.push('=');
+        selecting.push_str(value);
+    }
+    match validate(&format!("roblox://experiences/start?placeId={place}{selecting}{suffix}")) {
         Ok(url) => Translated::To { url, dropped },
         // Unreachable as long as the digit check above holds, and reported
         // rather than unwrapped because a panic here would be a browser click
@@ -728,7 +765,8 @@ pub fn deliver(lib: linker::Library, url: &JoinUrl) -> Outcome {
     for (class, tag) in [(BASE_URL, "JNIBaseUrlProtocol"), (WEB_LOGIN, "JNIWebLoginProtocol")] {
         let sym = format!("Java_{}_init", class.replace('/', "_"));
         if let Some(f) = lib.symbol(&sym) {
-            match linker::game_activity::protocol_init(f, class) {
+            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            match unsafe { linker::game_activity::protocol_init(f, class) } {
                 Ok(()) => println!("[deeplink] {tag}.init ok"),
                 Err(e) => println!("[deeplink] {tag}.init failed: {e}"),
             }
@@ -743,7 +781,8 @@ pub fn deliver(lib: linker::Library, url: &JoinUrl) -> Outcome {
             continue;
         };
         any_surface = true;
-        match linker::game_activity::cold_start_protocol_launch(f, class, url.expose()) {
+        // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        match unsafe { linker::game_activity::cold_start_protocol_launch(f, class, url.expose()) } {
             Ok(true) => {
                 println!("[deeplink] {tag} took the link");
                 return Outcome::Claimed(tag);
@@ -823,6 +862,13 @@ pub fn tick() {
     if std::env::var_os("CORDIAL_DEEPLINK_PROBE").is_some() {
         println!("[deeplink] (app ready) {GAME_LAUNCH} is: {launched:?}");
     }
+    if launched.is_none() && crate::game_launch::arrived() {
+        println!(
+            "[deeplink] the app shell asked to launch an experience; the link reached the engine \
+             (Game.launch went to the app-bridge subscriber, so the bus holds no copy to read back)"
+        );
+        return;
+    }
     match (launched, cold_start_flag(lib)) {
         (Some(_), _) => println!(
             "[deeplink] the app shell asked to launch an experience; the link reached the engine"
@@ -875,6 +921,20 @@ fn url_value_safe(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
 }
 
+/// The fields of a live `Roblox.Hybrid.Game.launchGame` payload that
+/// [`publish_hybrid_game_launch`] carries into the join link.
+pub struct HybridLaunch<'a> {
+    pub place_id: &'a str,
+    pub instance_id: Option<&'a str>,
+    pub join_attempt_id: Option<&'a str>,
+    pub join_attempt_origin: Option<&'a str>,
+    pub browser_tracker_id: Option<&'a str>,
+    pub access_code: Option<&'a str>,
+    pub link_code: Option<&'a str>,
+    pub reserved_server_access_code: Option<&'a str>,
+}
+
+
 /// Deliver a live `Roblox.Hybrid.Game.launchGame` interception, carrying the
 /// whole payload the page supplied rather than the bare `placeId` [`translate`]
 /// is limited to.
@@ -910,13 +970,15 @@ fn url_value_safe(s: &str) -> bool {
 /// it -- reported by name either way, so a link that behaves differently
 /// from the payload that produced it always says which field explains it,
 /// the same discipline [`translate`]'s own `dropped` list already keeps.
-pub fn publish_hybrid_game_launch(
-    place_id: &str,
-    instance_id: Option<&str>,
-    join_attempt_id: Option<&str>,
-    join_attempt_origin: Option<&str>,
-    browser_tracker_id: Option<&str>,
-) -> Result<(), String> {
+///
+/// **A private or reserved server's codes are carried too** (`accessCode`,
+/// `linkCode`, `reservedServerAccessCode`): all three are in the engine's own
+/// `FStringGameLaunchLinkURL` grammar (`docs/analysis/deep-links.md`), and a
+/// private-server Join from the Servers list sends `RequestPrivateGame` with
+/// them rather than `RequestGameJob`. Without them that Join did nothing. Only
+/// their names are ever logged, never their values.
+pub fn publish_hybrid_game_launch(launch: &HybridLaunch<'_>) -> Result<(), String> {
+    let place_id = launch.place_id;
     let Some(lib) = *LIVE_LIB.lock().expect("no other thread panics holding this") else {
         return Err("no engine library armed yet for a live publish (arm_live was never called)"
             .to_string());
@@ -925,28 +987,7 @@ pub fn publish_hybrid_game_launch(
         return Err("placeId is not a number, and Cordial will not invent one".to_string());
     }
 
-    let mut url = format!("roblox://experiences/start?placeId={place_id}");
-    let mut carried = vec!["placeId"];
-    let mut dropped = Vec::new();
-    for (name, value) in [
-        ("gameInstanceId", instance_id),
-        ("joinAttemptId", join_attempt_id),
-        ("joinAttemptOrigin", join_attempt_origin),
-        ("browserTrackerId", browser_tracker_id),
-    ] {
-        match value {
-            Some(v) if url_value_safe(v) => {
-                url.push('&');
-                url.push_str(name);
-                url.push('=');
-                url.push_str(v);
-                carried.push(name);
-            }
-            Some(_) => dropped.push(name),
-            None => {}
-        }
-    }
-
+    let (url, carried, dropped) = hybrid_launch_url(launch);
     let joined = validate(&url)
         .map_err(|e| format!("the built link is not one Cordial takes: {e}"))?;
     println!("[deeplink] live hybrid launch: carrying {}", carried.join(", "));
@@ -962,6 +1003,36 @@ pub fn publish_hybrid_game_launch(
     } else {
         Err("MessageBus.publishRaw is not exported by this build".to_string())
     }
+}
+
+/// The link [`publish_hybrid_game_launch`] builds, with the names it carried
+/// and dropped. Split out so it can be tested without an engine.
+fn hybrid_launch_url(launch: &HybridLaunch<'_>) -> (String, Vec<&'static str>, Vec<&'static str>) {
+    let mut url = format!("roblox://experiences/start?placeId={}", launch.place_id);
+    let mut carried = vec!["placeId"];
+    let mut dropped = Vec::new();
+    for (name, value) in [
+        ("gameInstanceId", launch.instance_id),
+        ("joinAttemptId", launch.join_attempt_id),
+        ("joinAttemptOrigin", launch.join_attempt_origin),
+        ("browserTrackerId", launch.browser_tracker_id),
+        ("accessCode", launch.access_code),
+        ("linkCode", launch.link_code),
+        ("reservedServerAccessCode", launch.reserved_server_access_code),
+    ] {
+        match value {
+            Some(v) if url_value_safe(v) => {
+                url.push('&');
+                url.push_str(name);
+                url.push('=');
+                url.push_str(v);
+                carried.push(name);
+            }
+            Some(_) => dropped.push(name),
+            None => {}
+        }
+    }
+    (url, carried, dropped)
 }
 
 /// Put the URL on the engine's message bus.
@@ -1004,7 +1075,8 @@ fn publish_url(lib: linker::Library, url: &JoinUrl, phase: &str) -> bool {
         println!("[deeplink] ({phase}) not publishing (CORDIAL_DEEPLINK_NO_PUBLISH)");
         return true;
     }
-    match linker::game_activity::call_static_strings(publish, BUS, &[DETECT_URL, &payload]) {
+    // SAFETY: `publish` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    match unsafe { linker::game_activity::call_static_strings(publish, BUS, &[DETECT_URL, &payload]) } {
         Ok(()) => println!("[deeplink] ({phase}) published {DETECT_URL}"),
         Err(e) => {
             println!("[deeplink] ({phase}) publishing {DETECT_URL} failed: {e}");
@@ -1025,7 +1097,8 @@ fn publish_url(lib: linker::Library, url: &JoinUrl, phase: &str) -> bool {
 /// `MessageBus.getLastRaw(id)` — the last payload published on a message id,
 /// or `None` when there has never been one.
 fn read_last(f: *mut std::ffi::c_void, id: &str) -> Option<String> {
-    match linker::game_activity::call_static_string_ret_string(f, BUS, id) {
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    match unsafe { linker::game_activity::call_static_string_ret_string(f, BUS, id) } {
         Ok(v) if v.is_empty() => None,
         Ok(v) => Some(v),
         Err(e) => {
@@ -1061,7 +1134,8 @@ fn escape_json(s: &str) -> String {
 /// exactly where Cordial hands the URL over.
 fn cold_start_flag(lib: linker::Library) -> Option<bool> {
     let f = lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_isColdStartDeeplinkToGame")?;
-    linker::game_activity::call_static_bare_bool(f, "com/roblox/engine/jni/NativeGLInterface").ok()
+    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+    unsafe { linker::game_activity::call_static_bare_bool(f, "com/roblox/engine/jni/NativeGLInterface") }.ok()
 }
 
 /// Read the linking protocol's own vocabulary out of the running engine.
@@ -1098,7 +1172,8 @@ fn probe(lib: linker::Library) {
     for name in GETTERS {
         match lib.symbol(&format!("{prefix}{name}")) {
             None => println!("[deeplink probe] {name}: not exported"),
-            Some(f) => match linker::game_activity::call_static_ret_string(f, LINKING) {
+            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            Some(f) => match unsafe { linker::game_activity::call_static_ret_string(f, LINKING) } {
                 Ok(v) => println!("[deeplink probe] {name} -> {v:?}"),
                 Err(e) => println!("[deeplink probe] {name} failed: {e}"),
             },
@@ -1106,10 +1181,11 @@ fn probe(lib: linker::Library) {
     }
     match lib.symbol("Java_com_roblox_universalapp_experience_JNIExperienceProtocol_getLaunchId") {
         None => println!("[deeplink probe] JNIExperienceProtocol.getLaunchId: not exported"),
-        Some(f) => match linker::game_activity::call_static_ret_string(
+        // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        Some(f) => match unsafe { linker::game_activity::call_static_ret_string(
             f,
             "com/roblox/universalapp/experience/JNIExperienceProtocol",
-        ) {
+        ) } {
             Ok(v) => println!("[deeplink probe] JNIExperienceProtocol.getLaunchId -> {v:?}"),
             Err(e) => println!("[deeplink probe] JNIExperienceProtocol.getLaunchId failed: {e}"),
         },
@@ -1118,6 +1194,48 @@ fn probe(lib: linker::Library) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A private server's Join carries its access code into the link the
+    /// engine gets, and that link passes the same validation every launch
+    /// does. Fake, obviously-shaped values; no real code in a test.
+    #[test]
+    fn a_private_server_join_carries_its_codes_and_validates() {
+        let launch = HybridLaunch {
+            place_id: "4924922222",
+            instance_id: None,
+            join_attempt_id: Some("0f0e0d0c-aaaa-bbbb-cccc-000000000001"),
+            join_attempt_origin: Some("privateServerListJoin"),
+            browser_tracker_id: None,
+            access_code: Some("00000000-1111-2222-3333-444444444444"),
+            link_code: Some("12345678901234567890"),
+            reserved_server_access_code: None,
+        };
+        let (url, carried, dropped) = hybrid_launch_url(&launch);
+        assert!(carried.contains(&"accessCode"), "carried: {carried:?}");
+        assert!(carried.contains(&"linkCode"), "carried: {carried:?}");
+        assert!(dropped.is_empty(), "dropped: {dropped:?}");
+        assert!(url.contains("&accessCode=00000000-1111-2222-3333-444444444444"));
+        assert!(validate(&url).is_ok(), "the engine-bound link must validate: {url}");
+    }
+
+    /// A value that is not safe to put in a query unescaped is dropped by
+    /// name, never passed through or silently lost.
+    #[test]
+    fn an_unsafe_access_code_is_dropped_and_named() {
+        let launch = HybridLaunch {
+            place_id: "1818",
+            instance_id: None,
+            join_attempt_id: None,
+            join_attempt_origin: None,
+            browser_tracker_id: None,
+            access_code: Some("a&b=c"),
+            link_code: None,
+            reserved_server_access_code: None,
+        };
+        let (url, _, dropped) = hybrid_launch_url(&launch);
+        assert_eq!(dropped, vec!["accessCode"]);
+        assert!(!url.contains("accessCode"));
+    }
     /// **The ticket is dropped unless the setting says otherwise.**
     ///
     /// The default matters more than the feature: `gameinfo` is a live
@@ -1320,30 +1438,46 @@ mod tests {
         }
     }
 
-    /// The honest refusal. A private-server link names a place *and* an access
-    /// code, so carrying only the place id would produce a link that joins —
-    /// into the public server, not the one that was clicked. That is worse than
-    /// not joining, which is the whole argument in AGENTS.md against a stub that
-    /// returns success.
+    /// A link that picks a server — a private server's access or link code, a
+    /// reserved server, a running server's job id — joins *that* server: the
+    /// code is carried under the engine's own name for it. Opening a private
+    /// server in the browser used to be refused here, because only the place
+    /// id could be carried and that would have joined a public server instead.
     #[test]
-    fn a_link_that_picks_a_particular_server_is_refused_by_name() {
-        for (query, named) in [
-            ("https://x/PlaceLauncher.ashx?placeId=1818&accessCode=abc", "accesscode"),
-            ("https://x/PlaceLauncher.ashx?placeId=1818&linkCode=abc", "linkcode"),
-            ("https://x/PlaceLauncher.ashx?placeId=1818&gameId=abc", "gameid"),
-            ("https://x/PlaceLauncher.ashx?placeId=1818&jobId=abc", "jobid"),
+    fn a_link_that_picks_a_particular_server_carries_it() {
+        for (query, engine_key) in [
+            ("https://x/PlaceLauncher.ashx?placeId=1818&accessCode=abc", "accessCode"),
+            ("https://x/PlaceLauncher.ashx?placeId=1818&linkCode=abc", "linkCode"),
+            ("https://x/PlaceLauncher.ashx?placeId=1818&gameId=abc", "gameInstanceId"),
+            ("https://x/PlaceLauncher.ashx?placeId=1818&jobId=abc", "gameInstanceId"),
             (
                 "https://x/PlaceLauncher.ashx?placeId=1818&reservedServerAccessCode=abc",
-                "reservedserveraccesscode",
+                "reservedServerAccessCode",
             ),
         ] {
             match translate(&validate(&desktop(query)).unwrap()) {
-                Translated::Refused(why) => {
-                    assert!(why.contains(named), "{why}");
-                    assert!(!why.contains("abc"), "the reason must not carry a value: {why}");
+                Translated::To { url, .. } => {
+                    let want = format!("placeId=1818&{engine_key}=abc");
+                    assert!(url.expose().contains(&want), "{query} gave {}", url.expose());
                 }
-                other => panic!("{query} should be refused: {other:?}"),
+                other => panic!("{query} should translate: {other:?}"),
             }
+        }
+    }
+
+    /// The honest refusal survives for a code that cannot be carried safely:
+    /// flattening to the place alone would join a different server from the
+    /// one clicked, which is worse than not joining (AGENTS.md on a stub that
+    /// returns success).
+    #[test]
+    fn a_server_code_that_cannot_be_carried_is_refused_by_name() {
+        let query = "https://x/PlaceLauncher.ashx?placeId=1818&accessCode=ab/cd";
+        match translate(&validate(&desktop(query)).unwrap()) {
+            Translated::Refused(why) => {
+                assert!(why.contains("accesscode"), "{why}");
+                assert!(!why.contains("ab/cd"), "the reason must not carry a value: {why}");
+            }
+            other => panic!("{query} should be refused: {other:?}"),
         }
     }
 

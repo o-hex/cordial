@@ -2,6 +2,19 @@
 
 2026-09-15, Roblox 2.738.0.1397, Cordial 0.15.1 (worktree build).
 
+*Corrected 2026-10-01:* everything below was measured on the x86-64 **phone** build,
+and for that build it may still hold; nothing since has re-run it. What does not hold
+is the conclusion drawn from it that VR needs a device built some other way. Roblox's
+**Meta Quest** build (2.740.0.927, arm64-v8a only) constructs its VR device through
+ordinary OpenXR calls as soon as a runtime is present: under Cordial's in-process
+translator it created an instance, a Vulkan device through `xrCreateVulkanDeviceKHR`
+and a session, logged `SurfaceController::enableVR`, and reached `FOCUSED` on Monado's
+simulated HMD with no engine memory written
+([ADR-053](../adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md),
+[`vr/dynarmic-design.md`](../vr/dynarmic-design.md) §9.5). That first happened with
+`InitParams.isVrDevice` still false; setting it true is what makes the engine load
+its VR app-shell place, `Maquettes.rbxl`.
+
 **No, not through anything this experiment could exercise, and the flags
 produce no observable effect at all rather than hitting a nameable wall.**
 `TASKS.md`'s "Closed, not deferred" verdict (dex class-count of `Oculus`,
@@ -188,6 +201,11 @@ platform layer and not the exported natives. It is that nothing constructs a VR
 device, and the only demonstrated way to make one is a byte written at a
 per-build address -- which [ADR-001](../adr/ADR-001-in-process-hooking.md) and
 [ADR-003](../adr/ADR-003-plugin-isolation.md) make absent rather than disabled.
+
+*Corrected 2026-10-01:* "nothing constructs a VR device" is a finding about the phone
+build. "The only demonstrated way" stopped being true when the Quest build constructed
+its own through OpenXR, unmodified, under the translator (see the note at the top).
+The byte-write route is still out of bounds and is no longer needed.
 
 **Two corrections to claims made while chasing this, both mine.** A previous
 summary asserted `SurfaceController::disableVR` fires unconditionally at

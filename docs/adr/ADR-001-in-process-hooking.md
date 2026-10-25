@@ -3,7 +3,13 @@
 **Status:** Rejected
 **Date:** 2026-07-31
 **Supersedes:** nothing
-**Related:** architecture spec §1.2, §4, §7.3, §9b
+**Related:** architecture spec §1.2, §4, §7.3, §9b, [ADR-053](ADR-053-vr-is-a-mode-of-the-android-runtime.md)
+
+> ADR-053's VR mode runs the Quest build's arm64 engine in an in-process
+> translator. It stays inside this record because the engine's code runs
+> unmodified and the translator dispatches only on Cordial's own stub
+> addresses, never on an engine address; `cordial-guest` refuses any other
+> key, and its tests fail if that refusal is removed.
 
 ---
 
@@ -176,12 +182,14 @@ and a decision here that costs Cordial capability. Both impressions are wrong.
 `allow_legacy_binary_patches` is set, and their `config/roblox_compatibility.json`
 sets that for exactly one build:
 
-    2.721.1108  status "legacy-researched"  allow_legacy_binary_patches: true
-                default_allowed: false
-                reason: "Reverse-engineered startup baseline; no verified real frame."
+```text
+2.721.1108  status "legacy-researched"  allow_legacy_binary_patches: true
+            default_allowed: false
+            reason: "Reverse-engineered startup baseline; no verified real frame."
 
-    2.725.1142  status "supported"          allow_legacy_binary_patches: false
-                default_allowed: true
+2.725.1142  status "supported"          allow_legacy_binary_patches: false
+            default_allowed: true
+```
 
 On 2.721.1108 they had never got a verified frame. Forcing the byte let them
 push past a gate they did not yet understand and watch what happened downstream.

@@ -2,14 +2,16 @@
 resolver = "2"
 members = [
     "crates/cordial-linker-sys",
+    "crates/cordial-guest",
     "crates/cordial-runtime",
     "crates/cordial-plugins",
     "crates/cordial-shell",
     "crates/cordial-update",
+    "crates/cordial-protocol",
 ]
 
 [workspace.package]
-version = "0.18.0"
+version = "0.34.0"
 edition = "2021"
 license = "GPL-3.0-or-later"  # see LICENSE; third-party notices in THIRD-PARTY-NOTICES.md
 rust-version = "1.75"
@@ -42,13 +44,5 @@ unsafe_op_in_unsafe_fn = "deny"
 # cordial-linker-sys, unrelated to unsafe documentation -- see ADR-036.
 undocumented_unsafe_blocks = "warn"
 
-[profile.dev]
-debug = false
-strip = "symbols"
-incremental = false
-
 [profile.release]
-debug = false     # Disabled on Android/Termux to prevent excessive UFS 4.1 flash wear and write amplification (reduces build artifacts from ~11.5 GB to ~350 MB)
-strip = "symbols"
-
-
+debug = true      # the runtime is useless to debug without symbols

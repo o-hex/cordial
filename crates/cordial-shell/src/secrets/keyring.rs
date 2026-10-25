@@ -20,6 +20,13 @@ use super::{
 /// nothing.
 static WEDGED: AtomicBool = AtomicBool::new(false);
 
+/// Whether a call has timed out this session, for the live tests to tell a
+/// slow machine from a wrong answer.
+#[cfg(test)]
+pub(super) fn wedged() -> bool {
+    WEDGED.load(Ordering::Acquire)
+}
+
 pub(super) fn read_keyring(attrs: &HashMap<String, String>) -> Answer {
     match ask(Ask::Read(attrs.clone()), CALL_TIMEOUT)? {
         Some(stored) if stored.starts_with(ENCODED_PREFIX) => decode_keyring(&stored)

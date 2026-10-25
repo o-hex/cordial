@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+include!("../../patches/apply.rs");
+
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -14,16 +16,28 @@ fn main() {
         );
     }
 
+    // The loader patches that change behaviour rather than add a trace:
+    // 0005 so a RELR-packed library is relocated at all, 0006 so the x86-64
+    // client can link the Quest build's arm64 objects for the translator
+    // (inert until `--guest-arm64` sets a guest machine). In that order, since
+    // 0006 is made against 0005. patches/README.md has both, and
+    // patches/apply.rs why the loader is compiled from a patched overlay
+    // under OUT_DIR rather than from the submodule.
+    let linker = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("mcpelauncher-linker");
+    patched_overlay(
+        &root.join("third_party/mcpelauncher-linker"),
+        "bionic",
+        &linker,
+        &root.join("patches"),
+        &["0005-parse-relr-dynamic-tags", "0006-link-guest-arch-objects"],
+    );
+
     // AOSP bionic does not build with GCC; see docs/base-evaluation.md §2.1.
-    let mut config = cmake::Config::new(&native);
-    config
+    let dst = cmake::Config::new(&native)
         .define("CMAKE_C_COMPILER", "clang")
         .define("CMAKE_CXX_COMPILER", "clang++")
         .define("CMAKE_BUILD_TYPE", "Release")
-        .cflag("-pipe")
-        .cxxflag("-pipe")
-        .cflag("-g0")
-        .cxxflag("-g0")
+        .define("CORDIAL_LINKER_DIR", &linker)
         // `CORDIAL_JNI_TRACE=1 cargo build` turns on libjnivm's trace.
         //
         // Not a convenience. libjnivm only emits `Constructed Unresolved
@@ -39,12 +53,8 @@ fn main() {
         .define(
             "CORDIAL_JNI_TRACE",
             if std::env::var_os("CORDIAL_JNI_TRACE").is_some() { "ON" } else { "OFF" },
-        );
-    if std::env::var("TARGET").map_or(false, |t| t.contains("android")) {
-        config.cflag("--target=aarch64-linux-android30");
-        config.cxxflag("--target=aarch64-linux-android30");
-    }
-    let dst = config.build();
+        )
+        .build();
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=cordial_linker_shim");
@@ -55,11 +65,7 @@ fn main() {
     // archive only satisfies symbols from archives listed after it.
     println!("cargo:rustc-link-lib=static=logger");
     println!("cargo:rustc-link-lib=static=linker");
-    if std::env::var("TARGET").map_or(false, |t| t.contains("android")) {
-        println!("cargo:rustc-link-lib=dylib=c++_shared");
-    } else {
-        println!("cargo:rustc-link-lib=dylib=stdc++");
-    }
+    println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-lib=dylib=z");
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=pthread");

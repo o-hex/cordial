@@ -212,12 +212,17 @@ the APK's *content*, and no platform string can move them:
 [FLog::Graphics] Loaded 3022 shaders from pack vulkan_mobile variant default
 ```
 
-`rbxasset://places/Mobile.rbxl` is the only app-shell place the APK ships
-(`Maquettes.rbxl` is the other and is not an app shell), and
+`rbxasset://places/Mobile.rbxl` is the only app-shell place the phone APK
+ships, and
 `shaders_vulkan_mobile.pack` and `shaders_glsles3.pack` are the only shader packs
 in it. The Android build has no desktop app shell to load and no desktop shader
 pack to pick. **Cordial's app shell will look like the mobile app shell whatever
 it reports as its platform**, because it is the mobile app shell.
+
+The Quest APK also ships `places/Maquettes.rbxl`, and that one *is* an app
+shell place: with `InitParams.isVrDevice` true the Quest engine loads it in
+place of `Mobile.rbxl` and the menu sits in its environment (cordial-vr,
+measured on Monado 2026-09-30). No platform string moves it; that field does.
 
 `NativeSettingsInterface.nativeOverrideChannelPlatformName(String)` is a real
 export and Roblox's own settings document carries

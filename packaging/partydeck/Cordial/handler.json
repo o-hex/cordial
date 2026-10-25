@@ -1,0 +1,23 @@
+{
+  "name": "Cordial",
+  "author": "Cordial",
+  "version": "1",
+  "info": "Roblox through Cordial, one profile per player. Sign each profile in once from a normal Cordial window first; see docs/partydeck.md.",
+  "spec_ver": 3,
+  "path_gameroot": "/usr/bin",
+  "runtime": "",
+  "exec": "cordial",
+  "args": "--profile $PROFILE --play --fullscreen",
+  "env": "",
+  "sdl2_override": "No",
+  "pause_between_starts": 3.0,
+  "use_mangohud": false,
+  "use_goldberg": false,
+  "ps_xinput": true,
+  "steam_appid": null,
+  "game_null_paths": [],
+  "overrides": {
+    "profile_unique_dirs": false,
+    "disable_mount_gamedirs": true
+  }
+}

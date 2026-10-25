@@ -18,16 +18,25 @@ pub mod capture;
 pub mod clipboard;
 pub mod config;
 pub mod editor_font;
+pub mod etc_decode;
 pub mod frame_pacing;
 pub mod gamepad;
 pub mod gl;
 pub mod glcount;
 pub mod input;
 pub mod looper;
+pub mod surface_params;
 pub mod system;
+pub mod text_geometry;
 pub mod vulkan;
+pub mod vulkan_etc;
+pub mod wl_dmabuf;
 pub mod wayland;
 pub mod window;
+pub mod x11_text;
+// VR only: it mirrors the guest engine's OpenXR left eye into the window.
+#[cfg(feature = "vr")]
+pub mod xr_mirror;
 
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +49,10 @@ static TRACE: AtomicBool = AtomicBool::new(false);
 /// watch which of these it reached.
 pub fn set_trace(on: bool) {
     TRACE.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn tracing() -> bool {
+    TRACE.load(Ordering::Relaxed)
 }
 
 pub(crate) fn trace(args: std::fmt::Arguments<'_>) {
@@ -103,9 +116,19 @@ pub fn backend() -> Backend {
         // escape hatch is how a regression becomes unreportable: anyone whose
         // session breaks on Wayland needs a way to say so from a working
         // client rather than from a bisect.
-        let b = if std::env::var_os("CORDIAL_X11").is_some() {
+        //
+        // **"Is there a compositor" is `gamescope::wayland_usable_here`, not
+        // "is the variable set".** gamescope exports `WAYLAND_DISPLAY=""`
+        // unless it was started with `--expose-wayland`, and a variable set to
+        // nothing used to read as a Wayland session: GTK was then forced onto a
+        // display that did not exist and the client exited 0 with no window.
+        // With `--expose-wayland` the socket is real and lacks the
+        // `wl_subcompositor` the engine's surface is embedded with, so that is
+        // X11 too. ADR-058.
+        let forced = std::env::var_os("CORDIAL_X11").is_some();
+        let b = if forced {
             Backend::X11
-        } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        } else if cordial_shell::gamescope::wayland_usable_here() {
             Backend::Wayland
         } else {
             Backend::X11
@@ -114,9 +137,12 @@ pub fn backend() -> Backend {
             Backend::Wayland => {
                 println!("[android] display backend: Wayland (set CORDIAL_X11=1 to force X11)")
             }
-            Backend::X11 if std::env::var_os("CORDIAL_X11").is_some() => {
+            Backend::X11 if forced => {
                 println!("[android] display backend: X11 (forced by CORDIAL_X11; web views cannot be attached on this backend)")
             }
+            Backend::X11 if cordial_shell::gamescope::inside_here() => println!(
+                "[android] display backend: X11 (inside gamescope, whose Wayland server cannot host the engine's surface; web views cannot be attached on this backend)"
+            ),
             Backend::X11 => println!(
                 "[android] display backend: X11 (no WAYLAND_DISPLAY; web views cannot be attached on this backend)"
             ),
@@ -389,6 +415,15 @@ pub fn pump_input_events(handle: i64) {
     match backend() {
         Backend::Wayland => wayland::pump_input_events(handle),
         Backend::X11 => window::pump_input_events(handle),
+    }
+}
+
+/// Keep the window itself alive when there is no GameActivity to feed, as
+/// under `--app-bridge`. Wayland only: the X11 window has no toolkit loop of
+/// its own to starve.
+pub fn pump_window_only() {
+    if let Backend::Wayland = backend() {
+        wayland::pump_window_only();
     }
 }
 

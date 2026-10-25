@@ -24,32 +24,42 @@
 // [ADR-036](../../../docs/adr/ADR-036-unsafe-is-a-boundary-not-a-convention.md),
 // for why cordial-shell carries the allow at all.
 #![allow(unsafe_code)]
-#![allow(dead_code)]
 
 mod audio_devices;
 mod chooser;
+mod cli;
 mod crash;
 mod deep_link;
 mod browser_account;
 mod diagnostics;
+mod doctor_run;
+mod flag_import;
 mod download_progress;
 mod install;
 mod instructions;
 mod launch;
+mod live;
+mod migration;
 mod multi_instance_warning;
 mod profile_switcher;
 mod refresh_watch;
+mod report;
+mod roblox_store;
 mod roblox_versions;
 mod root_warning;
 mod settings;
 mod shell_config;
 mod updater;
+mod vr_settings;
+mod quest_wizard;
+mod x11_notice;
 // The window itself needs webkitgtk6.0-devel, which an immutable host does not
 // have; the policy beside it needs nothing and is always compiled, because it is
 // the part that has to be right and it should be under test everywhere.
 #[cfg(feature = "webview")]
 mod webview;
 mod webview_policy;
+mod webview_captcha;
 mod window;
 use cordial_shell::window_state;
 
@@ -75,6 +85,10 @@ use cordial_shell::window_state;
 #[cfg(test)]
 pub(crate) static PROFILE_ROOT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+use libadwaita::gtk::gio;
+use libadwaita::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Must match `packaging/io.github.luohoa97.Cordial.desktop`'s file name and
 /// `StartupWMClass`. GNOME Shell uses the application id to find the desktop
@@ -88,260 +102,401 @@ pub(crate) static PROFILE_ROOT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new
 /// a link on a website wakes the launcher instead of starting a second one.
 const APP_ID: &str = "io.github.luohoa97.Cordial";
 
-use std::io::Write;
-
-fn installed_roblox_version() -> Option<String> {
-    let engine_dir = cordial_update::install::engine_dir();
-    cordial_update::cache::recorded_version(&engine_dir)
-        .or_else(|| cordial_update::engine::version_of(&engine_dir.join(cordial_update::engine::LIBRARY)))
-}
-
-fn run_cli_install(is_update: bool, force: bool) -> bool {
-    let installed = installed_roblox_version();
-
-    if is_update && !force {
-        if let Some(ref current) = installed {
-            print!("Checking for updates... ");
-            let _ = std::io::stdout().flush();
-            match cordial_update::provider::newest_obtainable() {
-                Some(newest) => {
-                    if !cordial_update::version::is_newer(&newest, current) {
-                        println!("up to date.");
-                        println!("Roblox is already at the latest available version ({current}).");
-                        println!("Use 'cordial update --force' to force re-download.");
-                        return true;
-                    }
-                    println!("update available ({current} -> {newest}).");
-                }
-                None => {
-                    println!("provider unreachable.");
-                    eprintln!("Warning: could not query update provider. Proceeding with update attempt...");
-                }
-            }
-        }
-    } else if !is_update && !force {
-        if let Some(ref current) = installed {
-            println!("Roblox is already installed (version {current}).");
-            println!("Use 'cordial update' to check for updates or 'cordial install --force' to reinstall.");
-            return true;
-        }
-    }
-
-    println!("Connecting to update provider (apkpure)...");
-    let cancel = cordial_update::provider::Cancel::new();
-    let want = if is_update {
-        cordial_update::provider::Want::Newest
-    } else {
-        cordial_update::provider::Want::Any
-    };
-    let store = cordial_update::install::Store::live(cordial_shell::profile::all_pinned_versions());
-
-    let result = cordial_update::provider::obtain_and_install(
-        None,
-        want,
-        Some(&store),
-        &cancel,
-        &mut |p| match p {
-            cordial_update::provider::Progress::Asking { provider } => {
-                println!("  Querying {provider}...");
-            }
-            cordial_update::provider::Progress::Fetching { file, done, total } => {
-                let msg = if let Some(total) = total {
-                    let percent = (done as f64 / total as f64) * 100.0;
-                    format!(
-                        "  Fetching {file}: {:.1} MB / {:.1} MB ({:.1}%)",
-                        done as f64 / 1_000_000.0,
-                        total as f64 / 1_000_000.0,
-                        percent
-                    )
-                } else {
-                    format!("  Fetching {file}: {:.1} MB", done as f64 / 1_000_000.0)
-                };
-                print!("\r{msg}\x1b[K");
-                let _ = std::io::stdout().flush();
-            }
-            cordial_update::provider::Progress::Verifying { file } => {
-                println!("\n  Verifying signature of {file}...");
-            }
-        },
-    );
-
-    match result {
-        Ok((obtained, installed)) => {
-            println!("\nInstalled Roblox version {}.", obtained.version.name);
-            println!("  APK: {}", installed.base.display());
-            println!("  Engine: {}", installed.engine.display());
-            true
-        }
-        Err(e) => {
-            eprintln!("\nFailed to install Roblox: {e}");
-            false
-        }
-    }
-}
-
-fn main() -> std::process::ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    if args.iter().any(|a| a == "--diagnostics" || a == "diagnostics") {
+fn main() -> libadwaita::glib::ExitCode {
+    // **Answered before the `GApplication` exists, and that is the whole
+    // point.** This binary is a single-instance application: with a Cordial
+    // already running, anything handed to a second invocation is forwarded to
+    // the first over D-Bus and this process exits. A diagnostics flag that went
+    // through that would print nothing, or print into the other process's
+    // terminal, which is worse than printing nothing.
+    //
+    // It also has to work when the shell cannot start at all -- a missing
+    // WebKitGTK, a GTK too old, no display -- because that is exactly the
+    // report that most needs the distribution and the package format in it.
+    // Reading `argv` directly costs nothing and depends on none of that.
+    let flags: Vec<String> = std::env::args().skip(1).collect();
+    if flags.iter().any(|a| a == "--diagnostics") {
         print!("{}", diagnostics::report());
-        return std::process::ExitCode::SUCCESS;
+        return libadwaita::glib::ExitCode::SUCCESS;
     }
-
-    if args.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
+    // `--doctor` for the same reasons, and it must not go through the
+    // single-instance forwarding either: it is a question about this machine,
+    // asked of this process.
+    if flags.iter().any(|a| a == "--doctor") {
+        return libadwaita::glib::ExitCode::from(doctor_run::run(&flags));
+    }
+    // Also before the `GApplication`, and for a scripting reason: importing a
+    // flag list should work over ssh and from a dotfiles script, with no window.
+    if flags.iter().any(|a| a == "--import-flags") {
+        return libadwaita::glib::ExitCode::from(flag_import::run(&flags));
+    }
+    // The Quest build for "Play in VR", from a file, with no window: the same
+    // `quest::import` Settings → VR runs, for a machine where a file picker is
+    // the hard part (ADR-053).
+    if flags.iter().any(|a| a == "--import-quest-apk") {
+        return libadwaita::glib::ExitCode::from(import_quest_apk(&flags));
+    }
+    // What `--doctor` runs, in a child of this binary, to ask Vulkan for its
+    // devices without loading a driver into the launcher. Not in `--help`: it
+    // prints a private line format for the doctor to read.
+    if flags.iter().any(|a| a == "--vulkan-probe") {
+        return libadwaita::glib::ExitCode::from(cordial_shell::vulkan_probe::run_probe_mode());
+    }
+    // **`--help` printed nothing at all and exited 0**, which is how a flag
+    // gets shipped and never found. `GApplication` only prints its own usage
+    // for options it was told about, and this binary registers none -- it takes
+    // a deep link positionally and now one flag. Four lines beat a user
+    // discovering `--diagnostics` from a bug report template they cannot open
+    // because the shell will not start.
+    if flags.iter().any(|a| a == "--help" || a == "-h") {
         println!(
             "cordial {version}\n\
              \n\
-             Usage: cordial [COMMAND | ROBLOX-LINK] [OPTIONS]\n\
+             Usage: cordial [OPTIONS] [ROBLOX-LINK]\n\
              \n\
-             Commands:\n\
-               run [LINK]          Launch Roblox Player directly (default)\n\
-               install [--force]   Download, verify and install Roblox APK and engine\n\
-               update [--force]    Check for updates and install the newest Roblox build\n\
-               diagnostics         Print diagnostic information\n\
-               help, -h            Show this help message\n\
+             With no arguments it opens the launcher. A `roblox-player:` or\n\
+             `roblox:` link joins that experience, which is what your browser\n\
+             hands over when you press Play on the website.\n\
+             \n\
+             To start a game from another program, as PartyDeck does, give it a\n\
+             profile and --play: `cordial --profile P2 --play --fullscreen`.\n\
+             Each such invocation is a Cordial of its own, so several can run at\n\
+             once, one profile each. Inside gamescope see docs/partydeck.md.\n\
+             \n\
+             Starting a game:\n\
+             {game_options}\
              \n\
              Options:\n\
-               --force, -f         Force re-download even if already up to date\n\
-               --apk <PATH>        Override Roblox APK path\n\
-               --profile <NAME>    Roblox profile to use (default: \"default\")\n\
+             \x20 --diagnostics  Print which Cordial and Roblox build this is, the\n\
+             \x20                distribution, and how Cordial was installed. Paste\n\
+             \x20                it into a bug report. The main menu's Report a\n\
+             \x20                Problem shows the same block behind a Copy button.\n\
+             \x20 --doctor       Check this machine for what stops Roblox running: the\n\
+             \x20                display, GPU and Vulkan, sound, keyring and more, each\n\
+             \x20                with what to do about it. Exits 1 only if something\n\
+             \x20                will stop it starting. --offline skips the update check.\n\
+             \x20 --import-flags FILE|-|--sober\n\
+             \x20                Merge a Bloxstrap, Fishstrap or Sober FastFlag list into\n\
+             \x20                a profile (--profile NAME, --replace). Skips a bad entry\n\
+             \x20                and names it; the rest are kept.\n\
+             \x20 --import-quest-apk FILE\n\
+             \x20                File the Quest build of Roblox, pulled from your own\n\
+             \x20                headset, for Play in VR. Checks Roblox's signature.\n\
+             \x20 -h, --help     This.\n\
              \n\
-             `cordial-run` is the engine loader. Issues: https://github.com/luohoa97/cordial/issues\n\
+             `cordial-run` is the loader this launches and is not meant to be run\n\
+             by hand. Issues: https://github.com/luohoa97/cordial/issues\n\
              \n\
              {notice}",
             version = cordial_shell::version::full(),
+            game_options = cli::HELP,
             notice = cordial_shell::version::NOTICE,
         );
-        return std::process::ExitCode::SUCCESS;
+        return libadwaita::glib::ExitCode::SUCCESS;
     }
 
-    let force = args.iter().any(|a| a == "--force" || a == "-f");
-
-    if args.iter().any(|a| a == "install" || a == "--install") {
-        return if run_cli_install(false, force) {
-            std::process::ExitCode::SUCCESS
-        } else {
-            std::process::ExitCode::FAILURE
-        };
-    }
-
-    if args.iter().any(|a| a == "update" || a == "--update") {
-        return if run_cli_install(true, force) {
-            std::process::ExitCode::SUCCESS
-        } else {
-            std::process::ExitCode::FAILURE
-        };
-    }
-
-    let mut link = None;
-    let mut profile = "default".to_string();
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        if arg == "run" {
-            continue;
-        } else if arg == "--profile" {
-            if let Some(p) = iter.next() {
-                profile = p;
-            }
-        } else if arg == "--apk" {
-            if let Some(apk_path) = iter.next() {
-                std::env::set_var(install::APK_OVERRIDE, apk_path);
-            }
-        } else if arg.starts_with("roblox-player:")
-            || arg.starts_with("roblox:")
-            || arg.starts_with("http:")
-            || arg.starts_with("https:")
-        {
-            match deep_link::accept(&arg) {
-                Ok(u) => link = Some(u),
-                Err(why) => {
-                    eprintln!("Warning: ignoring malformed link ({why})");
-                }
-            }
-        } else if !arg.starts_with('-') && link.is_none() {
-            match deep_link::accept(&arg) {
-                Ok(u) => link = Some(u),
-                Err(_) => link = Some(arg),
-            }
-        }
-    }
-
-    cordial_shell::profile::migrate_legacy_layout();
-    let config_path = shell_config::path();
-    let config = shell_config::load(&config_path);
-
-    let build = match install::locate(&config.roblox) {
-        Ok(b) => b,
-        Err(install::NotFound::NoBuild) => {
-            println!("No Roblox build found.");
-            print!("Would you like to download and install Roblox now? [Y/n]: ");
-            let _ = std::io::stdout().flush();
-            let mut answer = String::new();
-            let _ = std::io::stdin().read_line(&mut answer);
-            let trimmed = answer.trim();
-            if trimmed.is_empty()
-                || trimmed.eq_ignore_ascii_case("y")
-                || trimmed.eq_ignore_ascii_case("yes")
-            {
-                if !run_cli_install(false, false) {
-                    return std::process::ExitCode::FAILURE;
-                }
-                match install::locate(&config.roblox) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("Failed to locate newly installed build: {e:?}");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                }
-            } else {
-                eprintln!("Aborted. Run 'cordial install' when you are ready to install Roblox.");
-                return std::process::ExitCode::FAILURE;
-            }
-        }
-        Err(install::NotFound::Unusable(why)) => {
-            eprintln!("Cannot use Roblox build: {why}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
-    let claim = match cordial_shell::profile::claim_for_instance(&profile) {
+    // Parsed before the `GApplication` exists, and for a reason of the same
+    // family as the flags above: whether this process is allowed to be a
+    // `GApplication` of the usual kind is decided by it. An instance that was
+    // told to play is *not* forwarded to a launcher that is already open --
+    // that is the single-instance behaviour doing the opposite of what a
+    // launcher of several games needs (ADR-058).
+    let command_line = match cli::parse(&flags) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("Profile '{profile}' could not be claimed: {e}");
-            return std::process::ExitCode::FAILURE;
+        Err(message) => {
+            eprintln!("cordial: {message}");
+            return libadwaita::glib::ExitCode::from(2);
         }
     };
+    // Checked here, against the defaults, rather than when the first launch
+    // reads them: a typo in `--set` should be the first thing a caller hears,
+    // not the last thing a game that already started never mentions.
+    if let Err(message) = shell_config::with_overrides(&shell_config::ShellConfig::default(), &command_line.settings) {
+        eprintln!("cordial: --set: {message}");
+        return libadwaita::glib::ExitCode::from(2);
+    }
+    // For the client, which reads it. Set on this process's own environment
+    // because the launcher hands its environment on unchanged (`launch.rs` adds
+    // to it and never clears it), and before any thread exists to race it.
+    if command_line.fullscreen {
+        std::env::set_var("CORDIAL_FULLSCREEN", "1");
+    }
+    let instance = command_line.is_instance();
+    cli::install(command_line);
 
-    println!("Starting Roblox Player (profile: {profile})...");
-    let req = launch::LaunchRequest {
-        run_seconds: None,
-        join_url: link.as_deref(),
-        secret_store: None,
-    };
+    // From here on this process shows a window, and the log export (Report a
+    // Problem -> Save logs) wants what it has printed. After every flag that
+    // answers and exits, so those keep their plain stdout.
+    cordial_shell::session_log::install();
 
-    let mut instance = match launch::spawn(&build, claim, req) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("Launch failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
+    // Both flags, and the second one is the load-bearing one.
+    //
+    // `HANDLES_OPEN` says this application takes URLs at all; a `GApplication`
+    // without it refuses arguments outright. On its own it delivers them as
+    // `GFile`s to the `open` signal, and **`GFile` reshapes a Roblox link**:
+    // `roblox-player:1+launchmode:play+gameinfo:AAA` comes back out as
+    // `roblox-player:///1+launchmode:play+gameinfo:AAA`, because GIO parses it
+    // as a URL with an empty authority. `deep_link`'s tests pin that
+    // measurement. So `HANDLES_COMMAND_LINE` is added, which hands over the
+    // invoking process's `argv` — remote invocations included, which is where
+    // the string would otherwise have already been rewritten before this
+    // process saw it — and the link is taken from there, byte for byte.
+    //
+    // `open` stays connected for the other route in: a caller that speaks
+    // `org.freedesktop.Application.Open` over D-Bus hands over URIs and never
+    // an `argv`, and a link arriving that way is better carried in GIO's
+    // spelling than dropped.
+    //
+    // **`NON_UNIQUE` for an invocation that was told to run a game** (ADR-058).
+    // A `GApplication` registered on the bus under a fixed name sends every
+    // later invocation to the first and exits, which is exactly right for a link
+    // clicked on a website and exactly wrong for a program starting four games
+    // side by side: the second `--profile P2 --play` would have been swallowed
+    // by the first window and the user left with one game and no error. A
+    // non-unique application does not claim the name at all, so the
+    // launcher the user has open keeps it.
+    let mut app_flags = gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::HANDLES_COMMAND_LINE;
+    if instance {
+        app_flags |= gio::ApplicationFlags::NON_UNIQUE;
+    }
+    let app = libadwaita::Application::builder().application_id(APP_ID).flags(app_flags).build();
 
-    match instance.wait() {
-        Ok(status) => {
-            if let Some(code) = status.code() {
-                if code == 0 {
-                    std::process::ExitCode::SUCCESS
-                } else {
-                    std::process::ExitCode::from(code as u8)
+    // The shell, once there is one. A link that arrives while Cordial is
+    // already up is the ordinary case — somebody clicks Play on the website
+    // with the launcher open — and it must reach that window rather than build
+    // a second one.
+    let shell: Rc<RefCell<Option<window::Shell>>> = Rc::new(RefCell::new(None));
+
+    {
+        let shell = shell.clone();
+        app.connect_activate(move |app| {
+            start(app, &shell);
+            // A game started from the command line has no launcher to show.
+            if cli::playing() {
+                return;
+            }
+            if let Some(shell) = shell.borrow().as_ref() {
+                shell.present();
+            }
+        });
+    }
+    {
+        // The path every desktop launch takes, local or remote: `Exec=` in the
+        // desktop entry passes `%u` as an argument, and this is where it lands
+        // unaltered.
+        let shell = shell.clone();
+        app.connect_command_line(move |app, command_line| {
+            start(app, &shell);
+            // Lossy is safe here rather than convenient: anything that was not
+            // valid UTF-8 comes out with replacement characters, which `accept`
+            // refuses along with everything else that is not printable ASCII.
+            let arguments: Vec<String> =
+                command_line.arguments().into_iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+            // The same grammar `main` read, so a remote invocation's options are
+            // not mistaken for links. Its own options are not acted on: they
+            // belong to a process that is not this one, and a launcher asked to
+            // adopt another invocation's profile would be the single-instance
+            // behaviour this flag family exists to avoid.
+            let links = match cli::parse(&arguments) {
+                Ok(parsed) => parsed.links,
+                Err(message) => {
+                    println!("  shell: ignoring the command line: {message}");
+                    Vec::new()
                 }
-            } else {
-                std::process::ExitCode::FAILURE
+            };
+            for link in &links {
+                queue(&shell, link);
+            }
+            let links = links.len();
+            // A second invocation with nothing on it is somebody starting
+            // Cordial again — from the desktop icon, most likely — and what
+            // they want is the window they already have, in front.
+            if links == 0 && !cli::playing() {
+                if let Some(shell) = shell.borrow().as_ref() {
+                    shell.present();
+                }
+            }
+            // The status the *invoking* process exits with, which for a remote
+            // invocation is the one the browser waits on. Nothing here can
+            // fail in a way that process should hear about: a refused link is
+            // reported on the primary's stdout and the launcher is up either
+            // way.
+            libadwaita::glib::ExitCode::SUCCESS
+        });
+    }
+    {
+        let shell = shell.clone();
+        app.connect_open(move |app, files, _hint| {
+            start(app, &shell);
+            for file in files {
+                queue(&shell, &file.uri());
+            }
+        });
+    }
+
+    let code = app.run();
+    // What a game started from the command line failed at, if it did: a launcher
+    // that could not start the client says so on stderr and exits with it, where
+    // the interactive one raises a dialog (`window.rs`, `cli::set_status`).
+    match cli::status() {
+        0 => code,
+        status => libadwaita::glib::ExitCode::from(status),
+    }
+}
+
+/// Check a link and hand it to the window, or say why not.
+///
+/// Nothing about the string is trusted: it was produced by a browser acting on
+/// somebody's click. [`deep_link::accept`] validates the envelope before the
+/// window attempts account routing or holds it for a manual launch.
+fn queue(shell: &Rc<RefCell<Option<window::Shell>>>, raw: &str) {
+    match deep_link::accept(raw) {
+        Ok(url) => match shell.borrow().as_ref() {
+            Some(shell) => {
+                println!("  shell: received Roblox link");
+                // A game started from the command line has no picker to fall
+                // back to, so the browser account routing that might need one
+                // is skipped: the profile was named.
+                if cli::playing() {
+                    shell.queue_quietly(url);
+                } else {
+                    shell.queue_join(url);
+                }
+            }
+            // `start` built the window immediately above, so this is
+            // unreachable rather than merely unlikely — and said out loud,
+            // because a link silently going nowhere is the failure this whole
+            // path exists to avoid.
+            None => println!("  shell: no window to receive Roblox link"),
+        },
+        // Reported rather than swallowed: somebody whose browser opens Cordial
+        // and appears to do nothing has no other way to find out that the link
+        // was refused, or why.
+        Err(why) => {
+            println!("  shell: ignoring {why}");
+            if let Some(shell) = shell.borrow().as_ref() {
+                shell.present();
             }
         }
+    }
+}
+
+/// Build the window, once.
+///
+/// Called from all three entry points because any of them can be the first
+/// thing that happens, and called again on every subsequent one because that is
+/// what a remote invocation looks like from in here. The second call does
+/// nothing.
+fn start(app: &libadwaita::Application, shell: &Rc<RefCell<Option<window::Shell>>>) {
+    if shell.borrow().is_some() {
+        return;
+    }
+
+    // Before anything can be launched, because the launcher points the
+    // engine at a profile directory and the storage that has a login in it
+    // is still at the pre-ADR-012 path. Skipped when there is nothing to
+    // move, which is every run after the first.
+    cordial_shell::startup_watch::stage("moving a pre-profile layout");
+    cordial_shell::profile::migrate_legacy_layout();
+
+    cordial_shell::startup_watch::stage("reading settings");
+    let config_path = Rc::new(shell_config::path());
+    let config = Rc::new(RefCell::new(shell_config::load(&config_path)));
+
+    // ADR-054: before the window, because everything it draws and launches
+    // reads the store, and the first launch after the upgrade has things to
+    // move into it. Once, by construction -- see `migration`.
+    cordial_shell::startup_watch::stage("moving the build store");
+    let migrated = migration::run(&mut config.borrow_mut());
+    migrated.print();
+    if migrated.config_changed() {
+        if let Err(e) = shell_config::save(&config_path, &config.borrow()) {
+            eprintln!("shell: could not save {}: {e}", config_path.display());
+        }
+    }
+
+    // The command line, over what was just read from disk. After the migration's
+    // own save above, which is the one write this process may make: from here on
+    // `shell_config::save` does nothing, so what was asked for one run is not
+    // left behind as what the next ordinary launch does.
+    let playing = cli::playing();
+    if let Some(command_line) = cli::active() {
+        if command_line.profile.is_some() || command_line.play || !command_line.settings.is_empty() {
+            shell_config::hold_unsaved(command_line.settings.clone());
+            let changed = shell_config::with_overrides(&config.borrow(), &command_line.settings);
+            if let Ok(changed) = changed {
+                *config.borrow_mut() = changed;
+            }
+            if let Some(profile) = &command_line.profile {
+                config.borrow_mut().profile = profile.clone();
+                // Said once and not refused: a profile that does not exist yet is
+                // a new account, which is a fair thing to start. But a typo makes
+                // one too, and under gamescope there is no sign-in to recover
+                // with (docs/partydeck.md), so the console is told.
+                if !cordial_shell::profile::list().iter().any(|p| p == profile) {
+                    eprintln!(
+                        "cordial: profile {profile:?} does not exist yet, so it starts signed out"
+                    );
+                }
+            }
+        }
+    }
+
+    // Applied before the window exists so the very first paint already
+    // matches whatever the user last chose in Appearance, rather than
+    // flashing the libadwaita default and then correcting itself.
+    config.borrow().appearance.apply();
+
+    // Running games follow Settings (ADR-044). Leaked on purpose: the watch has
+    // to outlive every window and dropping the guard would stop it.
+    cordial_shell::startup_watch::stage("starting the live settings watch");
+    let live_watch = live::start(&config_path, &config.borrow());
+    std::mem::forget(live_watch);
+
+    // The offer to fetch a newer build is a dialog, and a game that was told to
+    // play has nobody to answer it.
+    cordial_shell::startup_watch::stage("building the window");
+    if !playing {
+        // Armed here and not earlier: a game started from the command line
+        // shows no launcher, and a watchdog waiting for one would be wrong.
+        cordial_shell::startup_watch::arm();
+    }
+    *shell.borrow_mut() =
+        Some(window::build(app, config, config_path, migrated.offer_newest() && !playing));
+    cordial_shell::startup_watch::stage("built the window; waiting for GTK to map it");
+    // `--place-id`: waiting as the link the next launch carries, with no banner
+    // shown to anybody and no window raised.
+    if let Some(link) = cli::active().and_then(|c| c.place_link()) {
+        queue(shell, &link);
+    }
+}
+
+/// `cordial --import-quest-apk FILE`. Exit 0 when filed (or already held), 1
+/// when refused, 2 on a bad command line.
+fn import_quest_apk(flags: &[String]) -> u8 {
+    // Filing a Quest build in a build that cannot run it would only leave a
+    // copy nothing reads.
+    if !cordial_shell::vr::HOST_SUPPORTED {
+        eprintln!("cordial: this build has no VR support, so there is nowhere to use a Quest build");
+        return 1;
+    }
+    let Some(path) = flags.iter().skip_while(|a| *a != "--import-quest-apk").nth(1) else {
+        eprintln!("cordial: --import-quest-apk needs a FILE");
+        return 2;
+    };
+    let root = cordial_update::quest::root();
+    match cordial_update::quest::import(
+        std::path::Path::new(path),
+        &root,
+        &cordial_update::apk_signature::pinned_quest(),
+    ) {
+        Ok(version) => {
+            println!("Quest build {version} is ready for Play in VR.");
+            0
+        }
         Err(e) => {
-            eprintln!("Error waiting for client: {e}");
-            std::process::ExitCode::FAILURE
+            eprintln!("cordial: {e}");
+            1
         }
     }
 }

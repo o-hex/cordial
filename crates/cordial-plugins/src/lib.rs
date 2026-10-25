@@ -38,6 +38,7 @@ pub mod plugin_data;
 pub mod preferences;
 pub mod presence;
 pub mod protocol;
+pub mod reconcile;
 pub mod sandbox;
 pub mod registry;
 pub mod resolve;

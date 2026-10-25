@@ -124,6 +124,22 @@ engine's own glue inside `libroblox.so`, not to anything this project wrote.
 And Cordial's main thread is starved too: its Wayland display socket has
 produced no event for twenty-five seconds.
 
+**Correction, 2026-09-29: this census does not separate a frozen client from a
+healthy one, and the reading above ("waiting for something that never arrives")
+should not be used as evidence of the freeze.** Eight healthy signed-in clients
+sampled at 60-400 s, `devctl loopers`: the engine's looper is `fds=1 [31:1:-]`
+with `events=9` in seven of them and `events=6` in the eighth, `since_event`
+equal to the age of the process, and 315-484 million polls. A healthy client
+delivers those nine events during start-up and then never another on that
+descriptor; it is simply not a channel that carries traffic afterwards. What
+probably differs is that the poll count stops growing once presents pass 120
+and the idle back-off engages, which a frozen client never reaches. `INFERRED`:
+the counts at 66-107 s (315-484 million) and at 406 s (445 million, one run) are
+in the same range, but no healthy client was sampled twice. The spin is a
+consequence of the stall, as the 2026-09-28 entry in `docs/NEXT.md` already said
+of the back-off gate, and the thread is not evidence of what the stall is
+waiting for.
+
 ## Input does not recover a frozen client. Measured, and it refutes the obvious theory
 
 The shape above suggests a starvation cycle -- the engine waits for a command,
@@ -204,3 +220,170 @@ is to count freezes rather than explain one.
 gdb rather than lldb, deliberately. On a genuinely deadlocked client here lldb
 produced one frame per thread, twice; gdb walked the same process and named
 both halves. A one-frame backtrace is not an answer.
+
+## Recovery and prevention, both attempted and neither proven, 2026-09-18
+
+See `docs/NEXT.md`'s "Recovery and a settings-race prevention attempt" entry
+for the full account. In short: `CORDIAL_STARTUP_RETRY` is re-confirmed to
+make a frozen client worse (the retried call never returns, 5/5 this
+session); a settings/flags-ordering fix aimed at matching Sober's clean
+single-pass finalize (`CORDIAL_SYNC_BOOTSTRAP`) made no measured difference
+to whether the finalize-retry line appears at all; and a whole-process
+self-relaunch (`CORDIAL_STARTUP_SELFRELAUNCH`) is mechanically sound but was
+observed to recover 0 of 3 fired attempts in this session's n=20 batch — not
+enough evidence to trust a rate, and possibly evidence that a freeze this
+soon after teardown is not an independent event. None of the three is
+shipped as default.
+
+## The settings document, 2026-09-24
+
+Cordial fetched the `AndroidApp` client-settings document; the engine's own
+reloader fetches `GoogleAndroidApp`. A Roblox rollout that day left
+`AndroidApp` unable to start the client (grey window, 10/10), while
+`GoogleAndroidApp` reached Landing 10/10. That is fixed in 89d494a (0.18.0).
+
+**It does not fix the freeze, and the mismatch is not what causes it.** For a
+few hours that day every run started in one cycle with no
+`Forcing finalize`, which looked like the fix. It was the rollout of the
+moment. Later the same day, signed in, n=10 each, interleaved:
+
+| | two cycles | FROZEN | GOOD |
+|---|---|---|---|
+| pre-rollout `AndroidApp` document via `--client-settings` (mismatched) | 10/10 | 0/10 | 10/10 |
+| default, `GoogleAndroidApp` (matched) | 10/10 | 3/10 | 7/10 |
+
+The frozen runs have the classic signature: `sync cookies from engine`, then
+no `~UgcExperienceController()`, presents stopped. Untested lead: the
+control also differs in *how* the document arrives (`--client-settings`
+reads a file; the default goes through the fetch and cache path). The arm
+that separates the two is the `GoogleAndroidApp` document delivered with
+`--client-settings`.
+
+The startup experiments tried before this (`CORDIAL_SYNC_BOOTSTRAP`,
+`CORDIAL_STARTUP_RETRY`, `CORDIAL_STARTUP_SELFRELAUNCH`,
+`CORDIAL_SKIP_AGDK_SETTINGS` with a V1 `nativeAppBridgeAppStart`,
+`CORDIAL_SOBER_ORDER`) were each refuted and are removed; they are recorded
+in 179ac13.
+
+## Later on 2026-09-24: delivery path and latency, both refuted
+
+Signed in, interleaved, flag cache reset per run:
+
+| condition | FROZEN |
+|---|---|
+| default, with `CORDIAL_SETTINGS_HISTORY`'s extra fetch in the callback | 3/10 |
+| `--client-settings` file, same extra fetch | 0/10 |
+| default, no extra fetch | 0/10 |
+| `--client-settings` file of the same document, no extra fetch | 0/10 |
+| default, stale cache (synchronous network fetch, 38-261 ms) | 1/8 |
+| default, warm cache (0-4 ms) | 0/8 |
+| warm cache plus a 300 ms sleep in the callback | 0/3 |
+
+Neither how the document arrives nor how long delivery takes separates
+frozen from good: the one stale-cache freeze had a 42 ms fetch, the 261 ms
+one did not freeze, and an injected 300 ms did nothing.
+
+**The rate itself has dropped**: 4 frozen in 49 signed-in runs across these
+batches, against 40-70% before this day. Two things changed on the default
+path that day: the settings document (`GoogleAndroidApp`, 89d494a) and
+`DeviceStaticParams.osVersion` "15" to "33" (d803c47). The second can be
+compared directly, `"15"` against `"33"` on one build; the first cannot while
+the `AndroidApp` document blanks.
+
+## The descriptor and the census, reconfirmed unchanged on `8c85be7`, 2026-09-28
+
+Everything in "What a frozen client is doing" and "Three captures agree, and
+they name the descriptor" above still holds, byte for byte in shape, on
+current `main`: `polls` past a billion, `events=9`, `presents` fixed. See
+`docs/NEXT.md`'s "the missing-AGDK-command theory is refuted live" entry for
+what changed this time: a live `devctl redraw` verb was added and used to
+feed the spinning thread's command pipe up to 95 more events on an
+already-wedged client (one `onSurfaceRedrawNeededNative`, ten more, then a
+full `fullscreen`/`windowed` resize cycle) with zero effect on `presents` or
+the engine log. **The pipe accepting and counting an event is not the same as
+the stall being about that pipe** — this was the mistake the "one missing
+command" reading of the 09d315b redraw action invited, and it is now
+measured rather than argued. The actual wait is confirmed to be inside
+`UgcExperienceController`/`SingleSurfaceApp`'s own finalize retry, which
+prints no further `FLog::` line of any kind once it fails to recover, on a
+process whose every other thread (including `cordial-secrets`, checked and
+found idly parked on its own job queue, not blocked mid-request) stays
+observably healthy.
+
+## 2026-10-04: the freeze is decided before the wait, at the first Lua app's teardown
+
+Eight signed-in launches of `CordialTest` (162 s or more apart, all signed in,
+no `DID_LOG_OUT`) on 192fdfc gave one freeze, under core pinning plus a busy
+loop (1 of 3 amplified, 0 of 5 plain). Harness, logs and captures:
+`~/.cache/cordial-handoff/freeze-92/`.
+
+**The HttpClient-completion model does not survive.** With
+`DFLogHttpTraceLight=7`, the frozen run had the same set of open requests at
+`startLuaApp_` as healthy runs (16 against 17, same endpoints), every socket
+established with bytes both ways, and the HttpClient completion thread still
+waking (its condvar wait count grew between two captures 82 s apart). The
+2026-09-29 watchpoint saw an HttpClient thread wake the finalize thread in
+healthy runs; it never identified a request.
+
+**The discriminator is earlier.** Across every signed-in engine log on this
+machine with a `Forcing finalize` line (41, recounted independently):
+`[Graphics] RenderView destroyed[1]`, logged on the finalize thread inside
+`~SurfaceController[_:1]` 10-76 ms before the wait, appears in 22 of 22
+healthy runs and 0 of 19 frozen ones. In a frozen run the first app's
+RenderView and DataModel are never released.
+
+**A timing correlate, post hoc.** The old DataModel's first render step ("No
+data model. Bind workspace now") lands 2-9 ms after `getFlags: success` in 16
+of 19 frozen logs and 1 of 19 healthy ones. The eight new runs, taken after the
+rule was formed, fit it (the frozen one at +5 ms; all seven healthy outside).
+
+**INFERRED:** a race in the engine between the first Lua app's first render
+step and the teardown that `startLuaApp_` begins once settings and flags load;
+when it loses, the finalize thread waits for a task nothing posts. Cordial does
+not cause it, but it fixes when `initialize` is called relative to the first
+render, so it likely sets how often the race is lost.
+
+**Next:** (1) the lever: delay Cordial's `initialize` until the first render
+step has run, measured against interleaved controls, at least 20 signed-in
+launches per arm (several days at the launch cap); (2) meanwhile, recovery:
+detect the frozen shape from the engine log (`Forcing finalize` with no
+`RenderView destroyed[1]` before it and no `~UgcExperienceController` within
+5 s) and relaunch the client.
+
+### Recovery in the shell (2026-10-04)
+
+`crates/cordial-shell/src/freeze_recovery.rs` implements the second item: the
+shell reads the new client's engine log once a second, and calls it stuck when
+the first `Forcing finalize` has no `[Graphics] RenderView destroyed[1]` before
+it and no `~UgcExperienceController` within 5 s. It then stops the client
+(`SIGTERM`, `SIGKILL` after 5 s) and relaunches the same profile, at most twice
+per press of Play, and on the third freeze shows a message pointing at #92.
+
+The rule over every engine log on this machine (the capture directories, `/tmp`
+and the app's own profiles; 173 logs after de-duplicating): **38 signed-in logs
+healthy and 24 frozen**, 3 signed-out logs that never finish a finalize, 34 with
+no finalize at all. Restricted to `~/.cache` and `/tmp`, which is where the
+22/19 above was counted, it gives 21 healthy and 19 frozen; the missing healthy
+log was not found. It agrees, on all 139 logs that have a finalize, with the
+check that does not use the rule (a finished finalize logs the destructor sooner
+or later). In 112 healthy
+logs the finalize-to-destructor gap is at most 0.71 s, so 5 s is a wide margin.
+`cargo test -p cordial-shell --lib freeze_corpus -- --ignored --nocapture` with
+`CORDIAL_FREEZE_CORPUS` set to colon-separated directories reprints this.
+
+**Not measured:** that a real freeze is recovered. Whether `SIGTERM` stops a
+client that is wedged in the finalize is not known (the `SIGKILL` fallback is
+for that), and the restart's effect on how often the race is lost is not
+known. `CORDIAL_NO_FREEZE_RESTART=1` turns it off for the measurement in item
+(1).
+
+## 2026-10-16: this describes the first of two regimes
+
+Everything above is a launch with no usable flag cache: the engine says
+`onFlagsFailed`, waits for Cordial's post-settings call, and the freeze is the
+first render step landing between that call and the end of the teardown it
+starts. With a valid cache the engine starts its Lua app on its own and ignores
+the call; that regime did not freeze in this session, but holding Cordial's
+thread in it left the client at four presents, the render thread in
+`vkAcquireNextImageKHR`. Evidence, counts and what was not measured:
+`docs/NEXT.md`, "#92: two startup regimes".

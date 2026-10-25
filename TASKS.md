@@ -90,6 +90,14 @@ and the NVIDIA workaround are in effect.
 - **Caveat:** unverifiable on this machine — the development box is an Intel
   13th-gen part, so the NVIDIA path cannot be exercised here. Ships as
   `INFERRED` unless someone with NVIDIA hardware confirms it.
+- **Decided 2026-09-30: not applied.** mocktail's own comment on the flag
+  (`scripts/real_bringup_smoke.sh`) gives its reason as a non-atomic
+  `fseek`/`fread` pair in its libc bridge, which is not an NVIDIA fault; no Sober
+  issue mentions shader threading; and `flags.rs` (`BUILTIN`) records what an
+  inferred default cost last time. Still available in `flags.json`, and step 10
+  of the tester plan in
+  [docs/analysis/nvidia-support.md](docs/analysis/nvidia-support.md) measures it.
+  See [ADR-046](docs/adr/ADR-046-nvidia-is-gated-on-the-vendor-id.md).
 
 ---
 
@@ -113,7 +121,20 @@ This is the single most substantial thing in mocktail that Cordial lacks.
   Do not read their file while writing ours.
 - **Prerequisite:** first establish that Cordial actually hits this. Look for
   ETC1/`VK_FORMAT_ETC2` requests or missing-format failures in a join run before
-  building anything. **Not yet established for Cordial.**
+  building anything.
+  **Partly established, 2026-09-29, on Intel (no NVIDIA hardware to hand):**
+  the engine does query `vkGetPhysicalDeviceFormatProperties` for ASTC and BC
+  directly at the signed-out landing screen (6 ASTC, 4 BC, 0 ETC2 queries in
+  one run) — so this is a real code path, not merely a compiled-in assumption
+  — and, with ASTC's answer masked to fully unsupported, TM2 selection and
+  shader-module count were unaffected. That is evidence *against* this task's
+  original framing ("shader translation for NVIDIA so TM2 works"), not for it.
+  See [docs/analysis/nvidia-texture-manager2.md](docs/analysis/nvidia-texture-manager2.md)
+  and [ADR-042](docs/adr/ADR-042-texture-format-query-observability.md). What
+  remains open: in-game (as opposed to landing-screen) behaviour, and whether
+  a real NVIDIA driver's `VK_FORMAT_ETC2_*` answers differ from what the mask
+  assumes. No transcoder has been built; T3 stays unstarted pending either of
+  those.
 
 ### T4. ANGLE fallback path
 
@@ -177,6 +198,9 @@ would mean either a mixed style or a sweep. **Skip.**
 *generate* AArch64 instructions, which is a JIT/binary-translation concern.
 Cordial loads the **x86-64** Android build natively on x86-64 hardware; there is
 nothing to translate. **This is Sober-architecture-specific. Do not adopt.**
+*2026-10-01:* there is now something to translate, the Quest build, and dynarmic
+(`crates/cordial-guest`) links `mcl` as its own dependency. The verdict stands for
+the phone path, which still translates nothing.
 
 **dyncall** (ISC) — dynamic FFI calls with runtime-constructed signatures. Same
 category: it exists for a translation layer that must call across an ABI it
@@ -260,6 +284,13 @@ x86-64 Android build, `2.730.0.790`:
 
 ### VR is not available and this is not a Cordial limitation
 
+*Corrected 2026-10-01:* this section is about the x86-64 phone build, and for it the
+findings below may still hold. VR now works through a different build: Roblox's Meta
+Quest build, run under an in-process translator, constructs its VR device through
+ordinary OpenXR and reaches `FOCUSED` on Monado's simulated HMD
+([ADR-053](docs/adr/ADR-053-vr-is-a-mode-of-the-android-runtime.md),
+[docs/vr.md](docs/vr.md)). The heading's "not available" is no longer true of Cordial.
+
 **The reasoning above is incomplete, though the verdict holds.** A dex
 class-count of zero only shows Roblox's own Java code has no VR surface — it
 says nothing about what the engine asks the *platform* for, and Cordial
@@ -280,7 +311,8 @@ engine's own log stream with `FLogVRService`/`DFLogVRService` turned on — the
 two runs are indistinguishable. No new class or method is requested, no
 unresolved symbol appears, no VRService line is ever printed, and a
 `CORDIAL_TRACE_PATHS=1` capture shows no attempt to `dlopen` a VR runtime
-library. The flags do nothing observable, which is a different and stronger
+library (*retracted:* that trace does not wrap `dlopen` and could not show this
+either way; vr-reachability.md withdrew it on 2026-09-16). The flags do nothing observable, which is a different and stronger
 finding than "no VR classes in the dex" — reached at the account-router/menu
 shell, not inside a joined place, which that document names as the one gap
 still open.
@@ -304,6 +336,13 @@ path is reachable, and "zero OpenXR symbols imported by `libroblox.so`" never
 ruled it out. On this architecture Cordial supplies the platform, so a runtime
 integration lives in the host by construction and no imported symbol would ever
 appear in the engine. The symbol scan answered a question nobody needed asked.
+
+*Corrected 2026-10-01:* no such implementation was ever shown. `git log --all -S`
+for `xrCreateVulkanDeviceKHR`, `xrEndFrame`, `XrInstance` and `openxr/openxr.h`
+finds no OpenXR code in any branch before the cordial-vr fork's own, which runs the
+arm64 Quest build rather than this x86-64 APK, and the commit that added this
+paragraph changed only this file and vr-reachability.md. Treat the 15,500-line
+figure as unverified. The Quest build does import OpenXR (`xr*`) symbols itself.
 
 **That arm has since been run, and it went against the hypothesis.** Three
 runs to the Landing page, each with its own data root, repeated: flags off;
@@ -337,6 +376,12 @@ hardcoded per-build address, which [ADR-001](docs/adr/ADR-001-in-process-hooking
 and [ADR-003](docs/adr/ADR-003-plugin-isolation.md) make absent rather than
 disabled, and which would break on every Roblox update besides. **Not closed,
 and not pursued: blocked on a route this project does not take.**
+
+*Superseded 2026-10-01:* the Quest build constructs its VR device through OpenXR
+with no byte written, and with a runtime present it reached a joined place: 44 to 65
+frames/s in game on Monado's simulated HMD (`docs/vr/dynarmic-design.md` §9.8, §9.9).
+VR is pursued through that build, not this one. Whether the phone build would ever
+construct a device remains untested and is no longer needed.
 
 ### Voice chat — implemented, broader testing remains
 
@@ -477,7 +522,8 @@ the `broken_feature` shape from AGENTS.md.
 - **Scope:** major. Lower priority than voice unless something specific needs it.
 
 **Order for these four:** gamepad (moderate, isolated, immediately useful) →
-voice (major, best understood) → camera (major, no current demand) → VR (closed).
+voice (major, best understood) → camera (major, no current demand) → VR (closed;
+*reopened 2026-10-01* through the Quest build, ADR-053).
 
 ---
 
@@ -590,6 +636,14 @@ Vendoring detex before knowing that is the same mistake mimalloc nearly was.
 which `VK_FORMAT_*` the engine requests and whether any are refused. If ETC
 formats reach the driver, detex earns its place; if the engine transcodes to DXT
 itself, it does not.
+
+**A first pass at this measurement landed 2026-09-29** (Intel only, no NVIDIA
+to hand): the engine does reach the driver for ASTC and BC format properties at
+the landing screen, on every request seen the driver answered "supported" —
+Intel's Xe-LP hardware natively decodes both. ETC2 was never queried in that
+window. See [docs/analysis/nvidia-texture-manager2.md](docs/analysis/nvidia-texture-manager2.md).
+detex's place in this decision is unchanged: nothing has yet shown a format the
+driver refuses, on any hardware this project has access to.
 
 ## JNI surface diff — 24 classes mocktail names that Cordial does not
 

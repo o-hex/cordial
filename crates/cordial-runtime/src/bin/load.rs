@@ -39,12 +39,14 @@ struct Options {
     gl_probe: bool,
     window_seconds: Option<u64>,
     game_activity: bool,
+    app_bridge: bool,
     join_url: Option<cordial_runtime::deeplink::JoinUrl>,
     run_seconds: u64,
     host_libc: bool,
     jni_onload: bool,
     dump_classes: Option<String>,
     verbose: bool,
+    guest_arm64: bool,
 }
 
 const USAGE: &str = "\
@@ -78,6 +80,11 @@ usage: cordial-load --lib-dir <dir> [options]
   --host-libc       also resolve libc from the host (ABI-unsafe; diagnostic only)
   --jni-onload      stand up a JavaVM and call JNI_OnLoad
   --game-activity   implies --jni-onload; bring Roblox up and hand it a surface
+  --app-bridge      implies --game-activity, for a build with no GameActivity
+                    (the Quest build exports no initializeNativeCode). Runs the
+                    same bring-up with Cordial delivering the settings itself,
+                    as ActivityNativeMain's Java does, and the surface through
+                    the app bridge alone
   --join-url <url>  a roblox-player:// or roblox:// link from a browser click,
                     handed to the engine during bring-up. Rejected unless it is
                     one of those two schemes, printable ASCII, and under 2 kB.
@@ -91,6 +98,13 @@ usage: cordial-load --lib-dir <dir> [options]
                     and scripted runs, not the way a session is meant to end
   --dump-classes <f>  implies --jni-onload; write the Java classes Roblox asked
                     for to <f> — the observed Phase 2 backlog
+  --guest-arm64     link an arm64 libroblox.so (the Quest build) for the
+                    dynarmic translator instead of loading an x86-64 one.
+                    Runs its constructors under the translator, and with
+                    --jni-onload its JNI_OnLoad (docs/vr/dynarmic-design.md,
+                    M3), or with --app-bridge the whole bring-up (M4).
+                    CORDIAL_GUEST_OMIT=<a,b> leaves those imports
+                    unanswered
   -v, --verbose     list every symbol and how it resolved
 
 env:
@@ -101,6 +115,24 @@ env:
                                      functions with fixed-arity ones, which is
                                      not ABI-safe — it changes behaviour)
   CORDIAL_ANDROID_TRACE=1            log Android API calls (safe; no variadics)
+  CORDIAL_TIME_CTORS=1               time the constructors apart from linking
+                                     (needs patches/0003)
+  CORDIAL_GUEST_MONITOR=global       --guest-arm64: dynarmic's exact exclusive
+                                     monitor instead of inline CAS (the default)
+  CORDIAL_GUEST_PROFILE=1            --guest-arm64: report host-side time of
+                                     guest-to-host calls
+  CORDIAL_GUEST_CODE_CACHE_MIB=<n>   --guest-arm64: each Jit's code cache
+  CORDIAL_GUEST_TLS_KEYS=host        --guest-arm64: pthread keys as host glibc
+                                     keys behind stubs (a control; the default
+                                     is bionic's key map read by guest code)
+  CORDIAL_GUEST_UNSAFE_FP=nan,recip,fma
+                                     --guest-arm64: dynarmic's inexact FP
+                                     optimisations (off; measured no gain)
+  CORDIAL_GUEST_THREADS=0            --guest-arm64: pthread_create fails with
+                                     EAGAIN (a control)
+  CORDIAL_GUEST_TRACE_THREADS=1      --guest-arm64: a line per guest thread
+  CORDIAL_GUEST_TRACE_SVC=1          --guest-arm64 --jni-onload: every stub
+                                     call from JNI_OnLoad on
   CORDIAL_MONITOR=<n>                open the window on the nth monitor (0 is
                                      the first), instead of the primary one
   CORDIAL_WINDOW_POS=<x>,<y>         explicit window position; wins over
@@ -153,7 +185,9 @@ env:
                                      responsive, and it costs power; 'fifo'
                                      saves the power and feels floatier),
                                      off (forward the engine's own choice, which
-                                     is FIFO — this is the control for a frame
+                                     is IMMEDIATE on 2.738 and was FIFO on the
+                                     builds measured in August — the log line
+                                     names it; this is the control for a frame
                                      rate measurement), or one of mailbox,
                                      immediate, uncapped, fifo, fifo-relaxed.
                                      'uncapped' means MAILBOX if the driver has
@@ -172,6 +206,38 @@ env:
                                      calls and report them after --run
   CORDIAL_SWAP_TIMES=1               with CORDIAL_COUNT_GL=1, also print how
                                      long each real eglSwapBuffers call blocked
+  CORDIAL_MASK_MOBILE_TEXTURE_FORMATS=1
+                                     report ETC2 and ASTC as unsupported to
+                                     vkGetPhysicalDeviceFormatProperties
+                                     regardless of what the real driver says.
+                                     A test-only substitute for hardware this
+                                     project lacks — see docs/adr/ADR-042-
+                                     texture-format-query-observability.md. Off
+                                     by default; never changes what a shipped
+                                     client tells the engine
+  CORDIAL_NO_ETC_EMULATION=1         on a GPU without native ETC2 (NVIDIA), stop
+                                     reporting ETC2/EAC and decoding it on the
+                                     CPU; the engine then sees ETC1 0 ETC2 0.
+                                     The control for docs/adr/ADR-049-etc2-is-
+                                     emulated-where-the-driver-lacks-it.md
+  CORDIAL_FORCE_ETC_EMULATION=1      decode ETC2/EAC on the CPU even where the
+                                     driver has it natively, to compare native
+                                     against decoded output on a machine without
+                                     NVIDIA hardware. CORDIAL_NO_ETC_EMULATION
+                                     wins if both are set. Same ADR
+  CORDIAL_FORCE_GPU_VENDOR=0x10de[@550.163.01]
+                                     behave as though the GPU were NVIDIA's (or
+                                     as another vendor id) for the code that is
+                                     gated on it, optionally with that driver
+                                     version. Changes what Cordial decides and
+                                     nothing the engine sees. A test-only
+                                     substitute for hardware this project lacks;
+                                     see docs/adr/ADR-046-nvidia-is-gated-on-
+                                     the-vendor-id.md. Off by default
+  CORDIAL_TEST_FAIL_PRESENT_MODES=N  on an NVIDIA-gated device, make the first N
+                                     present-mode queries fail with
+                                     VK_ERROR_UNKNOWN so the retry can be watched
+                                     recovering. Test-only
 ";
 
 fn parse() -> Result<Options, String> {
@@ -187,12 +253,14 @@ fn parse() -> Result<Options, String> {
         gl_probe: false,
         window_seconds: None,
         game_activity: false,
+        app_bridge: false,
         join_url: None,
         run_seconds: 15,
         host_libc: false,
         jni_onload: false,
         dump_classes: None,
         verbose: false,
+        guest_arm64: false,
     };
     // Before anything can latch a profile. ADR-012's move used to be driven only
     // from the shell's `main`, so a client started any other way — `just client`,
@@ -264,6 +332,11 @@ fn parse() -> Result<Options, String> {
                 opt.jni_onload = true;
                 opt.game_activity = true;
             }
+            "--app-bridge" => {
+                opt.jni_onload = true;
+                opt.game_activity = true;
+                opt.app_bridge = true;
+            }
             // The URL a browser click produced, forwarded by the shell. It is
             // validated here, at the edge, rather than anywhere further in:
             // this is the process boundary the value crosses, and a bad one
@@ -282,6 +355,7 @@ fn parse() -> Result<Options, String> {
                 opt.jni_onload = true;
                 opt.dump_classes = Some(args.next().ok_or("--dump-classes needs a path")?);
             }
+            "--guest-arm64" => opt.guest_arm64 = true,
             "-v" | "--verbose" => opt.verbose = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unrecognised argument: {other}")),
@@ -290,7 +364,91 @@ fn parse() -> Result<Options, String> {
     if opt.lib_dir.is_empty() {
         return Err("--lib-dir is required".into());
     }
+    if opt.guest_arm64 {
+        // Refused before anything below changes the environment: the
+        // translator and the guest's bridges are behind the `vr` feature,
+        // which every package turns on and a checkout's `cargo build` does not.
+        if !cfg!(feature = "vr") {
+            return Err("--guest-arm64: this build has no VR support; built without the `vr` feature".into());
+        }
+        // The Quest build keeps its engine storage apart from the phone
+        // build's within the same profile, and shares the sign-in (ADR-053).
+        cordial_runtime::profile::set_build(cordial_runtime::profile::Build::Quest);
+        // The Quest build is a VR device's engine and runs here only behind
+        // an OpenXR session; `InitParams.isVrDevice` says so (init_params.cpp).
+        if std::env::var_os("CORDIAL_VR_DEVICE").is_none() {
+            std::env::set_var("CORDIAL_VR_DEVICE", "1");
+        }
+        // And presented as one: the PC identity's "Windows" platform name
+        // beside `isVrDevice` left games' `UserInputService.VREnabled` false.
+        // `CORDIAL_DEVICE_PROFILE=pc-windows-11` is the control.
+        if std::env::var_os(cordial_runtime::flags::DEVICE_PROFILE_ENV).is_none() {
+            std::env::set_var(cordial_runtime::flags::DEVICE_PROFILE_ENV, "meta-quest");
+        }
+        if !cfg!(target_arch = "x86_64") {
+            return Err("--guest-arm64 needs the x86-64 build: dynarmic has no arm64 host backend".into());
+        }
+        // Refused rather than ignored: the translator runs the constructors
+        // and JNI_OnLoad (M3), and nothing after them yet. A window or the
+        // GL probe would call engine natives the guest path cannot reach.
+        if opt.gl_probe || opt.window_seconds.is_some() || (opt.game_activity && !opt.app_bridge) {
+            return Err("--guest-arm64 runs the constructors and JNI_OnLoad, or with --app-bridge the \
+                        bring-up after them; GameActivity and the GL probes are not translated"
+                .into());
+        }
+    }
     Ok(opt)
+}
+
+/// The `--lib-dir` this process was given, once parsed, for [`assets_root`].
+static LIB_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Where the APK's assets are unpacked.
+///
+/// **Inside the store entry the engine came from, when it came from one.** One
+/// tree per build flavour, stamped with the APK it was made from, meant a
+/// second profile on another version re-extracted over the first one's tree
+/// while that client was running -- the rewrite-under-a-reader failure ADR-053
+/// records for phone against Quest, only between two phone builds. An entry's
+/// own `assets/` is stamped against the entry's own `base.apk`, so a profile
+/// following Latest and one pinned to the same version share one tree, and two
+/// versions never touch each other's. Anything outside the store (a
+/// hand-typed `--lib-dir`) keeps the shared tree, under the cache root.
+/// ADR-054; the Quest build is not a version directory and keeps its own.
+fn assets_root() -> std::path::PathBuf {
+    if cordial_runtime::profile::build() == cordial_runtime::profile::Build::Phone {
+        if let Some(entry) = LIB_DIR.get().and_then(|d| cordial_update::store::entry_at(std::path::Path::new(d))) {
+            return cordial_update::store::assets_dir(&entry);
+        }
+    }
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        // The Quest build's assets apart from the phone build's. One directory
+        // re-extracted whenever the APK changed would ping-pong between the two
+        // on every switch, leave each build's extra files in the other's tree
+        // (the Quest APK carries `shaders_vulkan_mobile_vr.pack`), and rewrite
+        // files under a client of the other build still reading them.
+        .join(match cordial_runtime::profile::build() {
+            cordial_runtime::profile::Build::Phone => "cordial/assets",
+            cordial_runtime::profile::Build::Quest => "cordial/assets-arm64-v8a",
+        })
+}
+
+/// Say that this process is running the store entry `--lib-dir` names, for as
+/// long as the returned file is kept: garbage collection and removal ask for
+/// the same lock exclusively, so a build in use is never taken from under it.
+/// Nothing to hold for a `--lib-dir` outside the store.
+fn hold_build(lib_dir: &str) -> Result<Option<std::fs::File>, String> {
+    let _ = LIB_DIR.set(lib_dir.to_string());
+    if cordial_runtime::profile::build() != cordial_runtime::profile::Build::Phone {
+        return Ok(None);
+    }
+    let Some(entry) = cordial_update::store::entry_at(std::path::Path::new(lib_dir)) else {
+        return Ok(None);
+    };
+    cordial_update::store::hold_in_use(&entry).map(Some).map_err(|e| e.to_string())
 }
 
 /// The directory the engine should treat as its asset folder.
@@ -328,11 +486,7 @@ fn parse() -> Result<Options, String> {
 /// and asset paths still work without it.
 fn asset_folder(apk: &Option<String>) -> String {
     let Some(apk) = apk else { return String::new() };
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("cordial/assets");
+    let base = assets_root();
     match cordial_runtime::android::asset::extract_to(&base) {
         Ok(dir) => {
             // The overlay resolver needs the *extraction root*, not the
@@ -392,8 +546,16 @@ fn enter_run_dir(opt: &mut Options) {
     // because `profile::active()` has latched by now, and the socket belongs
     // inside the profile so ADR-012's one-instance lock already covers it.
     cordial_runtime::devctl::start();
+    // `CORDIAL_RECORD` (ADR-059): record from the first presented frame.
+    cordial_runtime::recording::arm_from_env();
+    // `cordial.runtime/1` (ADR-055): the launcher's channel to this process, and
+    // unlike the socket above it is always on. It can only apply the closed set
+    // of settings in `cordial_protocol::settings` and lives in a private
+    // directory inside the profile (ADR-044). It replaced the version-0 settings
+    // socket that was started here; nothing is asked of the engine.
+    cordial_runtime::control::start();
 
-    let root = cordial_runtime::profile::active().join("run");
+    let root = cordial_runtime::profile::engine_root().join("run");
     if let Err(e) = std::fs::create_dir_all(root.join("exe")) {
         println!("  could not create {}: {e}", root.display());
         return;
@@ -401,11 +563,7 @@ fn enter_run_dir(opt: &mut Options) {
 
     // The trust store, from the APK's own copy. Linked rather than copied so a
     // re-extracted bundle is picked up without a stale duplicate.
-    let ca = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("cordial/assets/ssl/cacert.pem");
+    let ca = assets_root().join("ssl/cacert.pem");
     let link_ca = |dest: std::path::PathBuf| {
         if !ca.exists() {
             return;
@@ -430,9 +588,7 @@ fn enter_run_dir(opt: &mut Options) {
     // `CORDIAL_EARLY_DIRS=files` produces exactly that, and the control in the
     // same session does not. One symlink removes the dependency on which root
     // wins the race.
-    let files_root = std::env::var("CORDIAL_FILES_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| cordial_runtime::profile::active().join("data"));
+    let files_root = cordial_runtime::profile::engine_data();
     link_ca(files_root.join("files/exe/cacert.pem"));
 
     if let Err(e) = std::env::set_current_dir(&root) {
@@ -601,7 +757,8 @@ fn call_globals(lib: &linker::Library, when: &str) {
         let short = name.rsplit('_').next().unwrap_or(name);
         match lib.symbol(name) {
             None => println!("  {name} not exported"),
-            Some(f) => match linker::game_activity::appbridge_call_bare(f) {
+            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            Some(f) => match unsafe { linker::game_activity::appbridge_call_bare(f) } {
                 Ok(()) => println!("  {short} ok ({when})"),
                 Err(e) => println!("  {short} failed ({when}): {e}"),
             },
@@ -652,10 +809,11 @@ extern "C" fn run_bootstrap() {
                     .unwrap_or_else(|| plan.settings.clone()),
                 _ => plan.settings.clone(),
             };
-            match linker::game_activity::preload_flag_overrides(
+            // SAFETY: `plan.preload_native as *mut std::ffi:...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            match unsafe { linker::game_activity::preload_flag_overrides(
                 plan.preload_native as *mut std::ffi::c_void,
                 &body,
-            ) {
+            ) } {
                 Ok(()) => println!(
                     "    nativePreloadFlagOverrides ok ({shape}, {} bytes)",
                     body.len()
@@ -705,7 +863,8 @@ extern "C" fn run_bootstrap() {
                     .ok()
                     .and_then(|v| v.parse::<i64>().ok())
                     .unwrap_or(when);
-                match linker::game_activity::init_client_settings_cached_compressed(
+                // SAFETY: `plan.cached_native as *mut std::ffi::...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                match unsafe { linker::game_activity::init_client_settings_cached_compressed(
                     plan.cached_native as *mut std::ffi::c_void,
                     &bytes,
                     a1,
@@ -713,7 +872,7 @@ extern "C" fn run_bootstrap() {
                     a3,
                     when,
                     flag,
-                ) {
+                ) } {
                     Ok(code) => println!(
                         "    nativeInitClientSettingsCachedCompressed ({} bytes, [{a1}|{a2}|{a3}], when {when}, flag {flag}) -> {code}",
                         bytes.len()
@@ -786,12 +945,13 @@ extern "C" fn run_bootstrap() {
         SETTINGS_DELIVERED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     if plan.settings_native != 0 {
-        match linker::game_activity::init_client_settings(
+        // SAFETY: `plan.settings_native as *mut std::ffi...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        match unsafe { linker::game_activity::init_client_settings(
             plan.settings_native as *mut std::ffi::c_void,
             &plan.settings,
             "",
             "",
-        ) {
+        ) } {
             Ok(code) => println!("    nativeInitClientSettings -> {code}"),
             Err(e) => println!("    nativeInitClientSettings failed: {e}"),
         }
@@ -816,9 +976,11 @@ extern "C" fn run_bootstrap() {
         // Roblox's own reloader lands at 1.6-2.3 s and reapplies Roblox's
         // document over the top, so a `DF*` key Roblox ships is reverted
         // within seconds however it was set, while `FFlag`/`FInt`/`FString`
-        // are read once at startup and are *not* reverted. Whichever way this
-        // experiment comes out, "dynamic flags apply live" is the wrong shape:
-        // the dynamic family is the one that does not stick.
+        // are read once at startup and are *not* reverted. The experiment
+        // answered the first question (a second document is taken). The shape
+        // worry has since been answered too: `flag_reapply` below hands the
+        // document over again after each of the engine's own refreshes, so the
+        // dynamic family sticks (ADR-051). This hook stays as the one-shot probe.
         //
         // Off by default and deliberately not wired to anything a user can
         // press. Shipping an inference as a default is a mistake this file has
@@ -844,15 +1006,47 @@ extern "C" fn run_bootstrap() {
                      ({} bytes)",
                     settings.len()
                 );
-                match linker::game_activity::init_client_settings(
+                // SAFETY: `native as *mut std::ffi::c_void` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                match unsafe { linker::game_activity::init_client_settings(
                     native as *mut std::ffi::c_void,
                     &settings,
                     "",
                     "",
-                ) {
+                ) } {
                     Ok(code) => println!("  [experiment] second nativeInitClientSettings -> {code}"),
                     Err(e) => println!("  [experiment] second nativeInitClientSettings failed: {e}"),
                 }
+            });
+        }
+
+        // Keep the profile's flag overrides in force after the engine's own
+        // settings refresh (ADR-051). The engine refetches Roblox's document
+        // about every two minutes and applies it over the top, which puts every
+        // `DF*` override back to Roblox's value; `flag_reapply` hands the
+        // engine the document again, with the overrides merged, once the
+        // engine's log says the refresh has finished. Started here, after the
+        // launch call above has been answered, because that call is the first
+        // apply and the worker's timing runs from it.
+        //
+        // The call is made from the worker's own thread, as the resettle
+        // experiment above makes it from its thread; neither is the pump.
+        // `CORDIAL_NO_FLAG_REDELIVERY=1` withdraws it, which is the control a
+        // measurement needs.
+        {
+            let native = plan.settings_native;
+            cordial_runtime::flag_reapply::start(cordial_runtime::flag_reapply::Hooks {
+                call: Box::new(move |settings| {
+                    // SAFETY: `native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                    unsafe {
+                        linker::game_activity::init_client_settings(
+                            native as *mut std::ffi::c_void,
+                            settings,
+                            "",
+                            "",
+                        )
+                    }
+                }),
+                document: Box::new(cordial_runtime::client_settings::reapply_document),
             });
         }
     }
@@ -888,9 +1082,10 @@ extern "C" fn run_bootstrap() {
     // call site, which predates the early one and is what actually produces the
     // block, is untouched.
     if plan.post_native != 0 && std::env::var_os("CORDIAL_EARLY_POST").is_some() {
-        match linker::game_activity::post_client_settings_loaded(
+        // SAFETY: `plan.post_native as *mut std::ffi::c_...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        match unsafe { linker::game_activity::post_client_settings_loaded(
             plan.post_native as *mut std::ffi::c_void,
-        ) {
+        ) } {
             Ok(()) => println!("    postClientSettingsLoadedInitialization3 ok"),
             Err(e) => println!("    postClientSettingsLoadedInitialization3 failed: {e}"),
         }
@@ -903,10 +1098,11 @@ extern "C" fn run_bootstrap() {
         println!("  nativeInitializeNativeFlags is not exported by this build; no flag names sent");
     }
     if plan.flags_native != 0 {
-        match linker::game_activity::init_flags(
+        // SAFETY: `plan.flags_native as *mut std::ffi::c...` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+        match unsafe { linker::game_activity::init_flags(
             plan.flags_native as *mut std::ffi::c_void,
             &plan.flag_names,
-        ) {
+        ) } {
             Ok(()) => println!("    flags initialised"),
             Err(e) => println!("    flag init failed: {e}"),
         }
@@ -1046,7 +1242,8 @@ fn wire_refresh_rate(lib: linker::Library) {
             if supported.is_empty() {
                 println!("  refresh: no plausible output to report yet");
             } else {
-                match linker::game_activity::pass_supported_refresh_rates(supported_native, &supported) {
+                // SAFETY: `supported_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                match unsafe { linker::game_activity::pass_supported_refresh_rates(supported_native, &supported) } {
                     Ok(()) => println!("  refresh: nativePassSupportedRefreshRates {supported:?}"),
                     Err(e) => println!("  refresh: nativePassSupportedRefreshRates failed: {e}"),
                 }
@@ -1062,7 +1259,16 @@ fn wire_refresh_rate(lib: linker::Library) {
             let current = cordial_runtime::refresh::current_for(&outputs);
             if cordial_runtime::refresh::worth_announcing(previous_current.get(), current) {
                 if let Some(hz) = current {
-                    match linker::game_activity::pass_current_refresh_rate(current_native, hz) {
+                    // The engine takes the rate as information and still runs
+                    // at 60; "Display refresh" is the scheduler target set to
+                    // it (`flags::frame_rate_limit_flags_for`). Recorded
+                    // before the re-apply below so the document it builds
+                    // already carries it, and requested here because the
+                    // launch-time document was built before any rate was known.
+                    cordial_runtime::refresh::note_announced(hz);
+                    cordial_runtime::flag_reapply::request_apply();
+                    // SAFETY: `current_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                    match unsafe { linker::game_activity::pass_current_refresh_rate(current_native, hz) } {
                         Ok(()) => println!("  refresh: nativePassCurrentDisplayRefreshRate {hz}"),
                         Err(e) => println!("  refresh: nativePassCurrentDisplayRefreshRate failed: {e}"),
                     }
@@ -1129,11 +1335,12 @@ fn wire_battery_reporting(lib: linker::Library) {
         if changed {
             match cordial_runtime::battery::state_changed_args(&reading) {
                 Some((status, plugged)) => {
-                    match linker::game_activity::report_battery_state_changed(
+                    // SAFETY: `state_changed_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                    match unsafe { linker::game_activity::report_battery_state_changed(
                         state_changed_native,
                         status,
                         plugged,
-                    ) {
+                    ) } {
                         Ok(()) => {
                             println!("  battery: reportBatteryStateChanged({status}, {plugged})")
                         }
@@ -1166,7 +1373,8 @@ fn wire_battery_reporting(lib: linker::Library) {
                 temperature_c: b.and_then(|b| b.temperature_tenths_c).map(|t| t as f32 / 10.0),
                 plugged: reading.plugged,
             };
-            match linker::game_activity::report_battery_status(status_native, &fields) {
+            // SAFETY: `status_native` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            match unsafe { linker::game_activity::report_battery_status(status_native, &fields) } {
                 Ok(()) => println!("  battery: reportBatteryStatus {fields:?}"),
                 Err(e) => println!("  battery: reportBatteryStatus failed: {e}"),
             }
@@ -1284,6 +1492,18 @@ fn install_webview_presenter() {
     // and says so on every one -- which is the state the maintainer was
     // looking at when Join navigated instead of joining.
     cordial_shell::webview::set_bridge_sink(cordial_runtime::webview::forward_bridge_message);
+
+    // The close counterpart: `cordial_runtime::webview::on_close_window`
+    // cannot touch `cordial_shell`'s `AdwDialog` directly (see that crate's
+    // dependency direction, noted beside `set_bridge_sink` above), so this
+    // hands it a closure that can. Re-enters the GTK thread for the same
+    // reason the presenter itself does -- `close-window` can arrive on
+    // whichever thread the engine published from, same as `openWindow`.
+    cordial_runtime::webview::set_close_handler(|| {
+        gtk4::glib::MainContext::default().invoke(|| {
+            cordial_shell::webview::close_current();
+        });
+    });
     println!("  webview: presenter installed; an openWindow request will now be attached to the host window");
 
     // Said here, at startup, rather than left for the first `openWindow` to
@@ -1314,7 +1534,8 @@ fn install_webview_presenter() {
         println!(
             "  webview: WARNING -- there is no Wayland host window, so nothing can be attached \
              to and every openWindow (Join, sign-in, Robux) will be dropped. This run is on the \
-             X11 backend -- either CORDIAL_X11 is set, or there is no WAYLAND_DISPLAY to use. \
+             X11 backend -- either CORDIAL_X11 is set, there is no WAYLAND_DISPLAY to use, or this is \
+             inside gamescope, whose Wayland server cannot host the engine's surface. \
              Web views need the Wayland backend."
         );
     }
@@ -1357,6 +1578,16 @@ fn install_webview_presenter() {
             std::thread::sleep(std::time::Duration::from_millis(1500));
             cordial_runtime::webview::report_window_closed();
         });
+    });
+    // There is no dialog for a `closeWindow` message to close -- `openWindow`
+    // went to the user's own browser, a tab this process has no handle to and
+    // no business closing. Said plainly rather than left silent, the same
+    // reason the presenter above prints instead of just opening.
+    cordial_runtime::webview::set_close_handler(|| {
+        println!(
+            "  webview: closeWindow arrived, but this build has no in-app window to close -- \
+             openWindow already went to your browser"
+        );
     });
 }
 
@@ -1559,6 +1790,18 @@ enum DiskMoment {
     AfterExit,
 }
 fn main() -> ExitCode {
+    // Before anything can create the engine's log: the post gate reads only a
+    // log that was not modified before this (ADR-065).
+    cordial_runtime::post_gate::note_start();
+    // What `cordial_shell::gtk_renderer` runs in a child of this binary to ask
+    // Vulkan for its devices without loading a driver into the client. First,
+    // before the profile is claimed or anything else is read: the child must
+    // not be refused the profile its parent holds, and it has no business
+    // anywhere near one.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--vulkan-probe") {
+        return ExitCode::from(cordial_shell::vulkan_probe::run_probe_mode());
+    }
+
     // **Before `parse()`, and that is not stylistic.** `--profile` latches the
     // active profile directory as a side effect of being parsed, and the whole
     // point of `--headless` is that the compositor must already be this
@@ -1612,6 +1855,16 @@ fn main() -> ExitCode {
         }
     };
 
+    // The build this client runs is in use from here to the process's end. Bound
+    // to a name for the same reason `_claim` is: the lock is the open file.
+    let _in_use = match hold_build(&opt.lib_dir) {
+        Ok(held) => held,
+        Err(why) => {
+            eprintln!("error: {why}");
+            return ExitCode::from(4);
+        }
+    };
+
     // Before anything this profile might do reaches a network, including the
     // client-settings fetch further down -- which is a real HTTP request over
     // `ureq`, made by Cordial itself, and would otherwise go out whatever
@@ -1641,6 +1894,11 @@ fn main() -> ExitCode {
     // those get asked from a support thread rather than from a terminal somebody
     // is willing to re-run with a trace variable set.
     cordial_runtime::graphics::report();
+
+    // Start asking Vulkan what it can drive, so that GTK's renderer can be
+    // chosen before the window exists. Concurrent with the load below, and
+    // collected in `wayland::open`; see `cordial_shell::gtk_renderer`.
+    cordial_shell::gtk_renderer::begin();
 
     // Before anything can resolve a path: Android's `/system`, served from a
     // directory Cordial builds out of the host's fonts. Roblox asks for
@@ -1675,6 +1933,15 @@ fn main() -> ExitCode {
         }
         if cordial_runtime::android::asset::start_watcher() {
             println!("  overlay: watching for changes (CORDIAL_OVERLAY_WATCH)");
+        }
+    }
+    // Held the profile's lock since `claim_profile` above, and nothing has
+    // opened engine storage yet: the one moment a move of it is safe.
+    if cordial_runtime::profile::build() == cordial_runtime::profile::Build::Quest {
+        match cordial_shell::profile::migrate_quest_storage(&cordial_runtime::profile::active()) {
+            Ok(true) => println!("profiles: moved this profile's earlier Quest storage into quest/ (ADR-053)"),
+            Ok(false) => {}
+            Err(e) => println!("profiles: could not move earlier Quest storage into quest/ ({e}); starting fresh beside it"),
         }
     }
     enter_run_dir(&mut opt);
@@ -1763,13 +2030,33 @@ fn main() -> ExitCode {
     // Before the engine loads, so the governor is already up when the shader
     // compiles and the asset cache warms — the part of a launch most obviously
     // bound by a CPU that has not been asked to hurry yet.
-    gamemode::register();
+    cordial_runtime::gamemode::register();
 
     // Before the table is built, because `symtab::build` consults the same
     // selection to decide whether `libaaudio.so` exists at all, and a reader
     // of this log should see the choice before its consequence.
     cordial_runtime::bionic::announce_audio_backend();
 
+    // `--guest-arm64` links the Quest build for the translator and runs its
+    // constructors (M2, M3). With `--app-bridge` the bring-up below then
+    // carries on with that library exactly as it would with a native one,
+    // its `Java_*` exports reaching the guest through host entries (M4).
+    #[cfg(all(feature = "vr", target_arch = "x86_64"))]
+    let guest_lib = if opt.guest_arm64 {
+        match guest_arm64_link(&opt) {
+            Ok(lib) => Some(lib),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "vr", target_arch = "x86_64")))]
+    let guest_lib: Option<linker::Library> = None;
+
+    let (lib, defer_ctors, android_libpath, time_ctors, elapsed) = 'link: {
+    if let Some(lib) = guest_lib {
+        break 'link (lib, false, false, false, std::time::Duration::ZERO);
+    }
     // Ask the engine what it imports rather than trusting the checked-in list.
     // `docs/analysis/undefined-symbols.tsv` still generates the stubs, but it is
     // no longer the gate: a Roblox update that adds an ordinary libc import used
@@ -1786,7 +2073,23 @@ fn main() -> ExitCode {
         opt.lib_dir
     );
 
-    let table = symtab::build(opt.host_libc, &imports);
+    let mut table = symtab::build(opt.host_libc, &imports);
+
+    // An import another library in the same directory exports is the linker's
+    // to resolve against that library, and is not a gap. The Quest build's 73
+    // `xr*` and `ovr_*` imports are all of that kind, and counting them buried
+    // the three that were real. See `elf::defined_symbols_in_dir`.
+    let siblings = cordial_runtime::elf::defined_symbols_in_dir(std::path::Path::new(&opt.lib_dir));
+    let before = table.unprovidable.len();
+    table.unprovidable.retain(|u| !siblings.contains(&u.symbol));
+    let answered_by_siblings = before - table.unprovidable.len();
+    if answered_by_siblings > 0 {
+        println!(
+            "  {answered_by_siblings} more imports are exported by other libraries in {}, \
+             which the linker searches",
+            opt.lib_dir
+        );
+    }
     let totals = table.totals();
 
     println!(
@@ -1810,9 +2113,17 @@ fn main() -> ExitCode {
     // Both of these are empty on a build whose imports the checked-in list
     // already covers, so anything printed here is news.
     for (symbol, library) in &table.beyond_stub_table {
+        // Cordial's own implementations reach this list too when the TSV
+        // predates them, and "from the host" would then misname the answer.
+        let by_cordial = table.libraries.get(library).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.symbol == symbol.as_str() && e.source == symtab::Source::Cordial)
+        });
+        let whence = if by_cordial { "implemented by Cordial" } else { "resolved from the host" };
         println!(
             "  note: {symbol} is not in docs/analysis/undefined-symbols.tsv; \
-             resolved from the host under {library}"
+             {whence} under {library}"
         );
     }
     if !table.unprovidable.is_empty() {
@@ -1934,7 +2245,17 @@ fn main() -> ExitCode {
     // it. Also needs constructors deferred, for the same reason as above: the
     // override has to be in place before whatever reads it runs.
     let android_libpath = std::env::var_os("CORDIAL_ANDROID_LIBPATH").is_some();
-    if defer_ctors || android_libpath {
+    // `CORDIAL_TIME_CTORS=1`: the same deferral, used only to put a clock
+    // around the constructors on their own, since `dlopen` otherwise times
+    // linking and construction as one. It is the native half of the M3
+    // comparison in docs/vr/dynarmic-design.md §9.2 (the translator's half
+    // is `--guest-arm64`'s own timing line), and needs patches/0003.
+    let time_ctors = std::env::var_os("CORDIAL_TIME_CTORS").is_some() && !defer_ctors && !android_libpath;
+    if time_ctors && !linker::defer_available() {
+        eprintln!("CORDIAL_TIME_CTORS needs patches/0003, which this loader was built without");
+        return ExitCode::FAILURE;
+    }
+    if defer_ctors || android_libpath || time_ctors {
         linker::defer_next_ctors(true);
     }
 
@@ -1950,9 +2271,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    (lib, defer_ctors, android_libpath, time_ctors, elapsed)
+    };
 
     let (code_base, code_size) = lib.code_region();
     println!("\nLOADED in {:.0?}", elapsed);
+    let ctors_started = Instant::now();
+    if time_ctors {
+        linker::run_deferred_ctors(lib);
+        println!("TIMING constructors: {:.3?}", ctors_started.elapsed());
+    }
 
     // **Here, and only here.** A build in the keyed store records which Cordial
     // last got it as far as a successful `dlopen`, because Cordial's own shim
@@ -2011,8 +2339,7 @@ fn main() -> ExitCode {
         };
         println!("cordial-agent-defer: JavaVM at {vm:p} (Cordial's own jnivm; libroblox.so's constructors have not run)");
 
-        let root = std::env::var("CORDIAL_FILES_DIR")
-            .unwrap_or_else(|_| format!("{}/data", cordial_runtime::profile::active().display()));
+        let root = cordial_runtime::profile::engine_data().display().to_string();
         let files = format!("{root}/files");
         let cache = format!("{root}/cache");
         let external = format!("{root}/external");
@@ -2065,7 +2392,8 @@ fn main() -> ExitCode {
         for (name, args) in dirs {
             match lib.symbol(name) {
                 None => println!("  {name} not exported (pre-ctors)"),
-                Some(f) => match linker::game_activity::call_static_strings(f, SETTINGS, args) {
+                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                Some(f) => match unsafe { linker::game_activity::call_static_strings(f, SETTINGS, args) } {
                     Ok(()) => println!(
                         "  {} ok (pre-ctors)",
                         name.rsplit('_').next().unwrap_or(name)
@@ -2097,7 +2425,8 @@ fn main() -> ExitCode {
             if let Some(f) = lib.symbol(
                 "Java_com_roblox_engine_jni_NativeGLInterface_nativeInitClientSettings",
             ) {
-                match linker::game_activity::init_client_settings(f, &settings_json, "", "") {
+                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                match unsafe { linker::game_activity::init_client_settings(f, &settings_json, "", "") } {
                     Ok(code) => println!("  nativeInitClientSettings -> {code} (pre-ctors)"),
                     Err(e) => println!("  nativeInitClientSettings failed (pre-ctors): {e}"),
                 }
@@ -2107,7 +2436,8 @@ fn main() -> ExitCode {
             if let Some(f) = lib.symbol(
                 "Java_com_roblox_client_flags_FlagJniInterface_nativeInitializeNativeFlags",
             ) {
-                match linker::game_activity::init_flags(f, FLAG_NAMES) {
+                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                match unsafe { linker::game_activity::init_flags(f, FLAG_NAMES) } {
                     Ok(()) => println!("  flags initialised (pre-ctors)"),
                     Err(e) => println!("  flag init failed (pre-ctors): {e}"),
                 }
@@ -2144,10 +2474,19 @@ fn main() -> ExitCode {
             };
             println!("\nJavaVM at {vm:p}; calling JNI_OnLoad");
 
-            match linker::jni::call_on_load(p) {
+            let onload_started = Instant::now();
+            // SAFETY: `p` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+            match unsafe { linker::jni::call_on_load(p) } {
                 // JNI versions are 0x000M_000m; 0x00010006 is JNI_VERSION_1_6.
                 Ok(rc) => {
                     println!("JNI_OnLoad returned {rc:#x} = JNI {}.{}", rc >> 16, rc & 0xffff);
+                    if time_ctors {
+                        println!(
+                            "TIMING first constructor to JNI_OnLoad returning: {:.3?} (JNI_OnLoad {:.3?})",
+                            ctors_started.elapsed(),
+                            onload_started.elapsed()
+                        );
+                    }
                 }
                 Err(e) => {
                     println!("JNI_OnLoad failed: {e}");
@@ -2180,7 +2519,10 @@ fn main() -> ExitCode {
                     match cordial_runtime::android::open_window(
                         rw, rh, &cordial_shell::host_window::title(),
                     ) {
-                        Err(e) => println!("  no window: {e}"),
+                        Err(e) => {
+                                        println!("  no window: {e}");
+                                        WINDOW_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
                         Ok(w) => {
                             let (width, height, _) = w.geometry();
                             cordial_runtime::android::config::set_screen(width, height);
@@ -2228,13 +2570,16 @@ fn main() -> ExitCode {
                                     continue;
                                 };
                                 let r = match run {
-                                    1 => linker::game_activity::appbridge_init(
+                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                    1 => unsafe { linker::game_activity::appbridge_init(
                                         f, &apk_path, width, height,
-                                    ),
-                                    2 => linker::game_activity::appbridge_start_app(
+                                    ) },
+                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                    2 => unsafe { linker::game_activity::appbridge_start_app(
                                         f, &apk_path, width, height,
-                                    ),
-                                    _ => linker::game_activity::appbridge_call_bare(f),
+                                    ) },
+                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                    _ => unsafe { linker::game_activity::appbridge_call_bare(f) },
                                 };
                                 match r {
                                     Ok(()) => println!("  {name} ok"),
@@ -2254,10 +2599,16 @@ fn main() -> ExitCode {
                     }
                 }
 
-                match native {
-                    None if !skip_agdk => eprintln!("  initializeNativeCode is not exported"),
-                    None => {}
-                    Some(f) => {
+                // `--app-bridge` enters the same bring-up with no
+                // `initializeNativeCode` at all, because the Quest build exports
+                // none: its launcher is ActivitySplash -> ActivityNativeMain, the
+                // same chain Roblox's own phone build takes on Android (see
+                // `cordial_game_activity_start`'s comment), and no GameActivity
+                // native exists in that libroblox.so to register.
+                match (native, opt.app_bridge) {
+                    (None, false) if !skip_agdk => eprintln!("  initializeNativeCode is not exported"),
+                    (None, false) => {}
+                    (f, _) => {
                         // `initStorageManagerNativeV3` takes *two different*
                         // directories. The Waydroid capture shows the real
                         // client using `<app>/files` and `<app>/cache`, with the
@@ -2273,9 +2624,7 @@ fn main() -> ExitCode {
                         // while everything else in the process had moved to
                         // `profiles/<name>`, so the engine's own storage ended up
                         // in a directory nothing else looked at.
-                        let root = std::env::var("CORDIAL_FILES_DIR").unwrap_or_else(|_| {
-                            format!("{}/data", cordial_runtime::profile::active().display())
-                        });
+                        let root = cordial_runtime::profile::engine_data().display().to_string();
                         let files = format!("{root}/files");
                         // Kept separately because `files` is moved into a
                         // closure further down, and the disk report needs the
@@ -2350,9 +2699,10 @@ fn main() -> ExitCode {
                                 opt.client_settings.as_deref(),
                             )
                             .unwrap_or_default();
-                            match linker::game_activity::init_client_settings(
+                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                            match unsafe { linker::game_activity::init_client_settings(
                                 f, &settings, "", "",
-                            ) {
+                            ) } {
                                 Ok(code) => {
                                     println!("  early client settings ({} bytes) -> {code}", settings.len())
                                 }
@@ -2506,9 +2856,10 @@ fn main() -> ExitCode {
                                 );
                                 match lib.symbol(&sym) {
                                     None => println!("  {name} not exported (early)"),
-                                    Some(f) => match linker::game_activity::call_static_strings(
+                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                    Some(f) => match unsafe { linker::game_activity::call_static_strings(
                                         f, SETTINGS, args,
-                                    ) {
+                                    ) } {
                                         Ok(()) => println!("  {name} ok (early)"),
                                         Err(e) => println!("  {name} failed (early): {e}"),
                                     },
@@ -2618,8 +2969,29 @@ fn main() -> ExitCode {
                         println!("  uiMode: night={}", if dark { "yes" } else { "no" });
                         linker::game_activity::set_ui_mode_night(if dark { 1 } else { 0 });
 
-                        println!("\ncalling GameActivity.initializeNativeCode");
-                        match linker::game_activity::initialize(f, &files, &files, &files) {
+                        // Without GameActivity nothing calls `bootstrapTheApp`
+                        // back, so the settings are delivered here, on this
+                        // thread, where `initializeNativeCode` would have
+                        // triggered them. That is ActivityNativeMain's order in
+                        // the Waydroid capture too: `nativeInitClientSettings`
+                        // and the flags arrive from Java before
+                        // `nativeAppBridgeAppStart`. The handle is 0, which every
+                        // AGDK call below either refuses or is skipped for.
+                        let initialized = match f {
+                            Some(f) if !opt.app_bridge => {
+                                println!("\ncalling GameActivity.initializeNativeCode");
+                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                unsafe { linker::game_activity::initialize(f, &files, &files, &files) }
+                            }
+                            _ => {
+                                println!("\napp bridge: no GameActivity; delivering settings from this thread");
+                                if bootstrap_installed {
+                                    run_bootstrap();
+                                }
+                                Ok(0)
+                            }
+                        };
+                        match initialized {
                             Ok(handle) => {
                                 println!("  native handle {handle:#x}");
 
@@ -2630,7 +3002,10 @@ fn main() -> ExitCode {
                                 match cordial_runtime::android::open_window(
                                     rw, rh, &cordial_shell::host_window::title(),
                                 ) {
-                                    Err(e) => println!("  no window: {e}"),
+                                    Err(e) => {
+                                        println!("  no window: {e}");
+                                        WINDOW_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                     Ok(w) => {
                                         let (width, height, format) = w.geometry();
                                         cordial_runtime::android::config::set_screen(width, height);
@@ -2998,9 +3373,10 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeSetDeviceInfo",
                                         ) {
-                                            match linker::game_activity::set_device_info(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::set_device_info(
                                                 f, width, height,
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  device info set"),
                                                 Err(e) => println!("  nativeSetDeviceInfo failed: {e}"),
                                             }
@@ -3027,9 +3403,10 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_client_LocalStorageManager_initStorageManagerNativeV3",
                                         ) {
-                                            match linker::game_activity::init_storage_manager(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::init_storage_manager(
                                                 f, &files, &cache,
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  storage manager initialised"),
                                                 Err(e) => println!("  initStorageManagerNativeV3 failed: {e}"),
                                             }
@@ -3053,9 +3430,10 @@ fn main() -> ExitCode {
                                         for (name, cls, args) in dirs2 {
                                             match lib.symbol(name) {
                                                 None => println!("  {name} not exported"),
-                                                Some(f) => match linker::game_activity::call_static_strings(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::call_static_strings(
                                                     f, cls, args,
-                                                ) {
+                                                ) } {
                                                     Ok(()) => println!(
                                                         "  {} ok",
                                                         name.rsplit('_').next().unwrap_or(name)
@@ -3068,9 +3446,10 @@ fn main() -> ExitCode {
                                         for (name, args) in dirs {
                                             match lib.symbol(name) {
                                                 None => println!("  {name} not exported"),
-                                                Some(f) => match linker::game_activity::call_static_strings(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::call_static_strings(
                                                     f, SETTINGS, args,
-                                                ) {
+                                                ) } {
                                                     Ok(()) => println!(
                                                         "  {} ok",
                                                         name.rsplit('_').next().unwrap_or(name)
@@ -3117,11 +3496,12 @@ fn main() -> ExitCode {
                                                 None => println!(
                                                     "  webview: setWebviewUserAgent not exported by this build"
                                                 ),
-                                                Some(f) => match linker::game_activity::call_static_strings(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::call_static_strings(
                                                     f,
                                                     "com/roblox/engine/jni/NativeGLInterface",
                                                     &[ua.as_str()],
-                                                ) {
+                                                ) } {
                                                     Ok(()) => println!("  webview: setWebviewUserAgent ok"),
                                                     Err(e) => println!(
                                                         "  webview: setWebviewUserAgent failed: {e}"
@@ -3193,10 +3573,11 @@ fn main() -> ExitCode {
                                                 None => println!(
                                                     "  [cookies] updateOnSetCookieHandler not exported; cookie changes will not be noticed"
                                                 ),
-                                                Some(f) => match linker::game_activity::cookies_register_handler(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::cookies_register_handler(
                                                     f,
                                                     cordial_runtime::cookies::observe_host,
-                                                ) {
+                                                ) } {
                                                     Ok(()) => println!("  [cookies] OnSetCookieHandler registered"),
                                                     Err(e) => println!("  [cookies] updateOnSetCookieHandler failed: {e}"),
                                                 },
@@ -3210,12 +3591,16 @@ fn main() -> ExitCode {
                                         let steps: Vec<(&str, Box<dyn Fn(*mut std::ffi::c_void) -> Result<(), String>>)> = vec![
                                             (
                                                 "Java_com_roblox_client_JNIAAssetManagerSetup_initNative",
-                                                Box::new(linker::game_activity::asset_manager_init),
+                                                Box::new(|f| {
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    unsafe { linker::game_activity::asset_manager_init(f) }
+                                                }),
                                             ),
                                             (
                                                 "Java_com_roblox_client_LocalStorageManager_initStorageManagerNativeV3",
                                                 Box::new(move |f| {
-                                                    linker::game_activity::storage_init(f, &files, &cache)
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    unsafe { linker::game_activity::storage_init(f, &files, &cache) }
                                                 }),
                                             ),
                                         ];
@@ -3315,12 +3700,13 @@ fn main() -> ExitCode {
                                             // the `.apk`. Naming the archive here
                                             // made every path the engine built
                                             // from it a file inside a file.
-                                            match linker::game_activity::set_init_params(
+                                            // SAFETY: `p` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::set_init_params(
                                                 p,
                                                 &asset_folder(&opt.apk),
                                                 width,
                                                 height,
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  init params set"),
                                                 Err(e) => println!("  init params failed: {e}"),
                                             }
@@ -3441,9 +3827,10 @@ fn main() -> ExitCode {
                                                 // client_settings.rs.
                                                 _ => (settings.as_str(), "", ""),
                                             };
-                                            match linker::game_activity::init_client_settings(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::init_client_settings(
                                                 f, a, b, c,
-                                            ) {
+                                            ) } {
                                                 Ok(code) => println!(
                                                     "  nativeInitClientSettings -> {code}"
                                                 ),
@@ -3475,7 +3862,8 @@ fn main() -> ExitCode {
                                                 )
                                                 .filter(|_| !already)
                                             {
-                                                match linker::game_activity::post_client_settings_loaded(f) {
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                match unsafe { linker::game_activity::post_client_settings_loaded(f) } {
                                                     Ok(()) => println!(
                                                         "  postClientSettingsLoadedInitialization3 ok"
                                                     ),
@@ -3543,9 +3931,10 @@ fn main() -> ExitCode {
                                                 } else {
                                                     format!("FLog{name}")
                                                 };
-                                                match linker::game_activity::get_fint(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                match unsafe { linker::game_activity::get_fint(
                                                     f, &full, ABSENT,
-                                                ) {
+                                                ) } {
                                                     Ok(v) if v == ABSENT => {
                                                         println!("  flog probe: {full} = <not a registered flag>")
                                                     }
@@ -3594,7 +3983,8 @@ fn main() -> ExitCode {
                                                 "  flag names: {}",
                                                 settings.lines().filter(|l| !l.trim().is_empty()).count()
                                             );
-                                            match linker::game_activity::init_flags(f, &settings) {
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::init_flags(f, &settings) } {
                                                 Ok(()) => println!("  flags initialised"),
                                                 Err(e) => println!("  flag init failed: {e}"),
                                             }
@@ -3626,9 +4016,10 @@ fn main() -> ExitCode {
                                             if let Some(f) = lib.symbol(
                                                 "Java_com_roblox_client_startup_MainGameActivity_nativePreloadFlagOverrides",
                                             ) {
-                                                match linker::game_activity::preload_flag_overrides(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                match unsafe { linker::game_activity::preload_flag_overrides(
                                                     f, json,
-                                                ) {
+                                                ) } {
                                                     Ok(()) => println!(
                                                         "  flag overrides preloaded ({} bytes)",
                                                         json.len()
@@ -3658,7 +4049,8 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_readLocalFlags",
                                         ) {
-                                            match linker::game_activity::read_local_flags(f) {
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::read_local_flags(f) } {
                                                 Ok(()) => println!("  local flags read"),
                                                 Err(e) => println!("  readLocalFlags failed: {e}"),
                                             }
@@ -3710,7 +4102,8 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_client_startup_MainGameActivity_nativeRetryInit",
                                         ) {
-                                            match linker::game_activity::call_bare(f) {
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::call_bare(f) } {
                                                 Ok(()) => println!("  retryInit ok"),
                                                 Err(e) => println!("  retryInit failed: {e}"),
                                             }
@@ -3855,6 +4248,22 @@ fn main() -> ExitCode {
                                                     "resolved"
                                                 }
                                             );
+                                            // Enter on a single-line box: what
+                                            // Android's IME action listener
+                                            // calls once the final text is
+                                            // synced. See `input::return_pressed`.
+                                            let rp = lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeGLInterface_nativeReturnPressedFromOnScreenKeyboard",
+                                            ).unwrap_or(std::ptr::null_mut());
+                                            cordial_runtime::android::input::set_return_pressed_native(rp);
+                                            println!(
+                                                "  input: nativeReturnPressedFromOnScreenKeyboard {}",
+                                                if rp.is_null() {
+                                                    "NOT exported; Enter on a single-line box reaches the engine as a raw key"
+                                                } else {
+                                                    "resolved"
+                                                }
+                                            );
                                             println!(
                                                 "  input: nativeGetMainWindowIsMouseLockedCenter {}",
                                                 if ml.is_null() {
@@ -3885,9 +4294,10 @@ fn main() -> ExitCode {
                                                 None => println!(
                                                     "  [sign-in] nativeIsLuaLoginEnabled not exported"
                                                 ),
-                                                Some(f) => match linker::game_activity::call_static_bare_bool(
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::call_static_bare_bool(
                                                     f, SETTINGS,
-                                                ) {
+                                                ) } {
                                                     Ok(v) => println!(
                                                         "  [sign-in] nativeIsLuaLoginEnabled() -> {v}"
                                                     ),
@@ -3918,9 +4328,10 @@ fn main() -> ExitCode {
                                                 if let Some(f) =
                                                     lib.symbol(&format!("{PREFIX}{stage}"))
                                                 {
-                                                    match linker::game_activity::activity_lifecycle(
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    match unsafe { linker::game_activity::activity_lifecycle(
                                                         f, activity,
-                                                    ) {
+                                                    ) } {
                                                         Ok(()) => fired += 1,
                                                         Err(e) => {
                                                             println!("  {stage} failed: {e}")
@@ -3998,7 +4409,8 @@ fn main() -> ExitCode {
                                         {
                                             match lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3") {
                                                 None => println!("  pre-bridge post: not exported"),
-                                                Some(f) => match linker::game_activity::post_client_settings_loaded(f) {
+                                                // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                Some(f) => match unsafe { linker::game_activity::post_client_settings_loaded(f) } {
                                                     Ok(()) => println!("  pre-bridge post: postClientSettingsLoadedInitialization3 ok"),
                                                     Err(e) => println!("  pre-bridge post failed: {e}"),
                                                 },
@@ -4018,9 +4430,10 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeV2InitWithParams",
                                         ) {
-                                            match linker::game_activity::appbridge_init(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::appbridge_init(
                                                 f, &apk_path, width, height,
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  app bridge initialised"),
                                                 Err(e) => println!("  app bridge init failed: {e}"),
                                             }
@@ -4086,7 +4499,8 @@ fn main() -> ExitCode {
                                             ) {
                                                 None => {}
                                                 Some(f) => {
-                                                    let n = cordial_runtime::cookies::restore(f);
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    let n = unsafe { cordial_runtime::cookies::restore(f) };
                                                     println!(
                                                         "  [cookies] restored {n} domain(s) from {}",
                                                         cordial_runtime::cookies::where_kept()
@@ -4104,7 +4518,10 @@ fn main() -> ExitCode {
                                                         if let Some(g) = lib.symbol(
                                                             "Java_com_roblox_engine_jni_NativeSettingsInterface_nativeGetCookiesForDomain",
                                                         ) {
-                                                            cordial_runtime::cookies::probe(f, g, "restore");
+                                                            // SAFETY: `f`/`g` are natives resolved via symbol lookups against the loaded libroblox.so, which is never unloaded.
+                                                            unsafe {
+                                                                cordial_runtime::cookies::probe(f, g, "restore");
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -4143,7 +4560,8 @@ fn main() -> ExitCode {
                                                     "  [identity] nativeSetUserId not exported; the engine will not know who is signed in"
                                                 ),
                                                 Some(f) => {
-                                                    if cordial_runtime::identity::push_user_id(f) {
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    if unsafe { cordial_runtime::identity::push_user_id(f) } {
                                                         println!("  [identity] the engine has been told which user is signed in");
                                                     }
                                                 }
@@ -4174,34 +4592,37 @@ fn main() -> ExitCode {
                                         // bridge back before starting the Lua
                                         // app.**
                                         //
-                                        // Measured, and it is the reason this
-                                        // exists rather than a guess. Across
-                                        // thirty launches with the engine's own
-                                        // log timestamped, **a run that freezes
-                                        // reaches every startup milestone
-                                        // earlier than one that does not** --
-                                        // `StartLuaAppDM` at a median of 0.490s
-                                        // against 0.665s, `Lua app running
-                                        // status ... true` at 0.625 against
-                                        // 0.896, `sync cookies from engine` at
-                                        // 1.237 against 1.558. Consistently
-                                        // faster, at every mark, in the same
-                                        // direction.
+                                        // This used to say a thirty-launch
+                                        // comparison showed a run that freezes
+                                        // reaching every startup milestone
+                                        // earlier than one that does not, and
+                                        // that busying the machine during
+                                        // startup made the freeze less likely.
+                                        // **Both are retracted in
+                                        // docs/NEXT.md ("RETRACTED: frozen runs
+                                        // are not the fast ones" / "Load is not
+                                        // it"), on larger, interleaved samples:
+                                        // the apparent timing gap was Simpson's
+                                        // paradox from pooling two `LOAD` arms
+                                        // that themselves shift startup speed,
+                                        // and the freeze rate drifts in minutes-
+                                        // long bursts independent of load or
+                                        // code.** A stale copy of the retracted
+                                        // claim sat here for over a month and
+                                        // was still being cited as established
+                                        // in 2026-09; don't re-derive it.
                                         //
-                                        // Two other results point the same way.
-                                        // Running the machine deliberately busy
-                                        // during startup made the freeze *less*
-                                        // likely, not more -- one in fifteen
-                                        // against five in fifteen -- and the
-                                        // person who reported the bug works
-                                        // around it by giving the client input
-                                        // while it loads, which is another way
-                                        // of slowing that window down.
-                                        //
-                                        // So the shape is a race that is lost by
-                                        // arriving too early, and the crudest
-                                        // possible test of that is to arrive
-                                        // later on purpose.
+                                        // The knob itself is harmless and is
+                                        // kept as the cheapest way to hold the
+                                        // bridge back if a future timing idea
+                                        // needs testing -- see
+                                        // docs/NEXT.md's "Where the two
+                                        // actually part company, in one clock",
+                                        // which places the real divergence
+                                        // inside the engine, between the
+                                        // resize being reported and the second
+                                        // swapchain being rebuilt, not in
+                                        // anything Cordial's own log shows.
                                         if let Ok(ms) = std::env::var("CORDIAL_BRIDGE_DELAY_MS") {
                                             if let Ok(ms) = ms.parse::<u64>() {
                                                 println!("  holding the bridge back {ms}ms before StartLuaAppDM");
@@ -4212,7 +4633,8 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeStartLuaAppDM",
                                         ) {
-                                            match linker::game_activity::appbridge_call_bare(f) {
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::appbridge_call_bare(f) } {
                                                 Ok(()) => println!("  Lua app DataModel started"),
                                                 Err(e) => println!("  StartLuaAppDM failed: {e}"),
                                             }
@@ -4236,9 +4658,10 @@ fn main() -> ExitCode {
                                             println!("  startup recovery armed");
                                             let _ = cordial_runtime::android::looper::STARTUP_RECOVERY
                                                 .set(Box::new(move || {
-                                                    linker::game_activity::appbridge_call_bare(
+                                                    // SAFETY: `addr as *mut std::ffi::c_void` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    unsafe { linker::game_activity::appbridge_call_bare(
                                                         addr as *mut std::ffi::c_void,
-                                                    )
+                                                    ) }
                                                 }));
                                         }
                                         }
@@ -4253,12 +4676,13 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_setTaskSchedulerBackgroundMode",
                                         ) {
-                                            match linker::game_activity::call_static_bool_string(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::call_static_bool_string(
                                                 f,
                                                 "com/roblox/engine/jni/NativeGLInterface",
                                                 false,
                                                 "ASMA.start",
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  task scheduler foregrounded"),
                                                 Err(e) => {
                                                     println!("  setTaskSchedulerBackgroundMode failed: {e}")
@@ -4270,11 +4694,49 @@ fn main() -> ExitCode {
                                         if let Some(f) = lib.symbol(
                                             "Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeV2StartAppWithParams",
                                         ) {
-                                            match linker::game_activity::appbridge_start_app(
+                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                            match unsafe { linker::game_activity::appbridge_start_app(
                                                 f, &apk_path, width, height,
-                                            ) {
+                                            ) } {
                                                 Ok(()) => println!("  app started with surface"),
                                                 Err(e) => println!("  StartApp failed: {e}"),
+                                            }
+                                        }
+
+                                        // The Quest app's app-half manager starts
+                                        // the app and then hands a Runnable to a
+                                        // fresh single-thread executor whose only
+                                        // call is `initMaquettesSDK(Activity)`
+                                        // (dex call graph: `ih/e.F` invokes
+                                        // `StartAppWithParams`, then
+                                        // `Executors.newSingleThreadExecutor` and
+                                        // `execute(new ih/e$c)`; `ih/e$c.run` is
+                                        // the native's only caller). Nothing called
+                                        // it here, so the engine never started the
+                                        // Meta platform SDK and logged
+                                        // `MaquettesDataNotification: SDK not
+                                        // initialized` on every menu change. The
+                                        // SDK fails honestly behind it (guest_ovr).
+                                        // `CORDIAL_NO_MAQUETTES_INIT` is the control.
+                                        if opt.app_bridge && std::env::var_os("CORDIAL_NO_MAQUETTES_INIT").is_none() {
+                                            if let Some(f) = lib.symbol(
+                                                "Java_com_roblox_engine_jni_NativeGLInterface_initMaquettesSDK",
+                                            ) {
+                                                let addr = f as usize;
+                                                let spawned = std::thread::Builder::new()
+                                                    .name("maquettes-sdk".into())
+                                                    .spawn(move || {
+                                                        match unsafe { linker::game_activity::call_static_activity(
+                                                            addr as *mut std::ffi::c_void,
+                                                            "com/roblox/engine/jni/NativeGLInterface",
+                                                        ) } {
+                                                            Ok(()) => println!("  initMaquettesSDK returned"),
+                                                            Err(e) => println!("  initMaquettesSDK failed: {e}"),
+                                                        }
+                                                    });
+                                                if let Err(e) = spawned {
+                                                    println!("  initMaquettesSDK: no thread: {e}");
+                                                }
                                             }
                                         }
 
@@ -4302,9 +4764,10 @@ fn main() -> ExitCode {
                                             ] {
                                                 let which = if game { "game" } else { "app" };
                                                 match lib.symbol(native) {
-                                                    Some(f) => match linker::game_activity::appbridge_update_surface(
+                                                    // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                    Some(f) => match unsafe { linker::game_activity::appbridge_update_surface(
                                                         f, &apk_path, width, height, game,
-                                                    ) {
+                                                    ) } {
                                                         Ok(()) => println!("  surface+platform params delivered ({which})"),
                                                         Err(e) => println!("  UpdateSurface {which} failed: {e}"),
                                                     },
@@ -4322,10 +4785,33 @@ fn main() -> ExitCode {
                                             }
                                         }
 
+                                        // Kept so the development control socket's
+                                        // `updatesurface` can deliver them again
+                                        // into a client already in the state under
+                                        // investigation (`android::surface_params`).
+                                        cordial_runtime::android::surface_params::register(
+                                            lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeV2UpdateSurfaceAppWithPlatformParams")
+                                                .unwrap_or(std::ptr::null_mut()),
+                                            lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeV2UpdateSurfaceGameWithPlatformParams")
+                                                .unwrap_or(std::ptr::null_mut()),
+                                            &apk_path,
+                                            width,
+                                            height,
+                                        );
+
                                         report_disk(&data_root, DiskMoment::BeforeLaunch);
-                                        match linker::game_activity::start(
-                                            handle, width, height, format,
-                                        ) {
+                                        // No AGDK lifecycle to drive without
+                                        // GameActivity: the surface has already
+                                        // gone through StartAppWithParams and
+                                        // UpdateSurfaceApp above, which is all
+                                        // ActivityNativeMain delivers on Android.
+                                        let started = if opt.app_bridge {
+                                            println!("  app bridge: no AGDK lifecycle; surface delivered through the bridge only");
+                                            Ok(())
+                                        } else {
+                                            linker::game_activity::start(handle, width, height, format)
+                                        };
+                                        match started {
                                             Ok(()) => {
                                                 println!("  surface handed to the engine");
 
@@ -4374,15 +4860,152 @@ fn main() -> ExitCode {
                                                 // the smallest number tried that did
                                                 // not crash, and the race underneath
                                                 // is unfinished work.
+                                                //
+                                                // **2026-10-16: the sleep is the part that
+                                                // hurts, not the lateness.** A post made 20 ms
+                                                // after the handoff from a thread of its own
+                                                // (`CORDIAL_POST_ASYNC=1`) did not crash, and
+                                                // the same 1200 ms made from a thread of its
+                                                // own was healthy where it stalled the client
+                                                // when this thread slept (docs/NEXT.md).
                                                 let late_post = std::env::var("CORDIAL_LATE_POST_MS")
                                                     .ok()
                                                     .map_or(Some(250), |v| {
                                                         if v == "off" { None } else { v.parse::<u64>().ok() }
                                                     });
-                                                if let Some(ms) = late_post {
+                                                // `CORDIAL_POST_GATE` (ADR-065, #92) holds the post, on a
+                                                // launch the engine is waiting for it on, until the engine's log
+                                                // shows its first render step. It needs the thread below, so it
+                                                // implies it.
+                                                let post_gate = match std::env::var("CORDIAL_POST_GATE") {
+                                                    Ok(v) => switch_on(Some(&v)),
+                                                    Err(_) => cordial_runtime::post_gate::DEFAULT_ON,
+                                                };
+                                                // `CORDIAL_POST_ASYNC=1`: make the late post, and the retry that
+                                                // follows it, from a thread of their own so this one goes on to
+                                                // pump the looper at once (#92).
+                                                //
+                                                // Sleeping here keeps the pump -- and
+                                                // so the window's GTK main loop -- from running, and in launches
+                                                // where the engine had already started its Lua app on its own (a
+                                                // valid flag cache) every sleep of 330 ms or more was followed by
+                                                // a client stuck for good in `vkAcquireNextImageKHR` after four
+                                                // presents, waiting for the compositor to release a swapchain
+                                                // image (docs/NEXT.md). The post is made from this thread on
+                                                // Android's behalf anyway; that it may be made from another is
+                                                // `INFERRED` until a launch shows it.
+                                                let own_thread = post_async() || post_gate;
+                                                if let (true, Some(ms)) = (own_thread, late_post) {
+                                                    let post_f = lib
+                                                        .symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3")
+                                                        .map(|p| p as usize);
+                                                    let retry_f = lib
+                                                        .symbol("Java_com_roblox_client_startup_MainGameActivity_nativeRetryInit")
+                                                        .map(|p| p as usize);
+                                                    let extra = std::env::var("CORDIAL_POST_AFTER_HOME_MS")
+                                                        .ok()
+                                                        .and_then(|v| v.parse::<u64>().ok());
+                                                    let retry_on = std::env::var("CORDIAL_LATE_RETRY").map_or(true, |v| v != "off");
+                                                    println!(
+                                                        "  late post: on its own thread, after {ms} ms{}{}",
+                                                        extra.map_or(String::new(), |e| format!(" and Home + {e} ms")),
+                                                        if post_gate { ", then the engine's first render step" } else { "" }
+                                                    );
+                                                    let logs_dir = cordial_runtime::profile::engine_data().join("files/appData/logs");
+                                                    let _ = std::thread::Builder::new().name("cordial-late-post".into()).spawn(move || {
+                                                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                                                        if let Some(extra) = extra {
+                                                            if linker::game_activity::flags_failed() == 0 {
+                                                                println!("  post not held: the engine loaded its flags itself");
+                                                            } else {
+                                                                let t0 = std::time::Instant::now();
+                                                                while linker::game_activity::home_ready() == 0
+                                                                    && t0.elapsed() < std::time::Duration::from_secs(3)
+                                                                {
+                                                                    std::thread::sleep(std::time::Duration::from_micros(500));
+                                                                }
+                                                                let seen = linker::game_activity::home_ready() != 0;
+                                                                println!(
+                                                                    "  post held for Home: {} after {} ms, then {extra} ms",
+                                                                    if seen { "announced" } else { "NOT announced" },
+                                                                    t0.elapsed().as_millis()
+                                                                );
+                                                                std::thread::sleep(std::time::Duration::from_millis(extra));
+                                                            }
+                                                        }
+                                                        // The engine waits for this call only when its flag load
+                                                        // failed; with a valid cache it ignores the call, so there is
+                                                        // nothing to order it against.
+                                                        if post_gate {
+                                                            if linker::game_activity::flags_failed() == 0 {
+                                                                println!("  post gate: not needed, the engine loaded its flags itself");
+                                                            } else {
+                                                                cordial_runtime::post_gate::hold(&logs_dir);
+                                                            }
+                                                        }
+                                                        match post_f {
+                                                            None => println!("  late post: not exported"),
+                                                            // SAFETY: a native resolved by symbol lookup against the loaded libroblox.so, never unloaded.
+                                                            Some(f) => match unsafe { linker::game_activity::post_client_settings_loaded(f as *mut std::ffi::c_void) } {
+                                                                Ok(()) => println!("  late post: postClientSettingsLoadedInitialization3 ok (after {ms} ms, own thread)"),
+                                                                Err(e) => println!("  late post failed: {e}"),
+                                                            },
+                                                        }
+                                                        if retry_on {
+                                                            match retry_f {
+                                                                None => println!("  late retry: not exported"),
+                                                                // SAFETY: as above.
+                                                                Some(f) => match unsafe { linker::game_activity::appbridge_call_bare(f as *mut std::ffi::c_void) } {
+                                                                    Ok(()) => println!("  late retry: nativeRetryInit ok"),
+                                                                    Err(e) => println!("  late retry failed: {e}"),
+                                                                },
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                                if let Some(ms) = late_post.filter(|_| !own_thread) {
                                                     std::thread::sleep(
                                                         std::time::Duration::from_millis(ms),
                                                     );
+                                                    // `CORDIAL_POST_AFTER_HOME_MS=<n>`: hold the post until the
+                                                    // engine has announced Home and <n> ms more (#92).
+                                                    //
+                                                    // EXPERIMENT, off by default. In the engine logs the
+                                                    // startup freeze goes with the post landing before the
+                                                    // render job's first step (which follows Home by about
+                                                    // 30 ms) and the healthy runs with it landing after;
+                                                    // `CORDIAL_LATE_POST_MS` cannot guarantee that because
+                                                    // Home arrives at a different time every launch. A plain
+                                                    // 1200 ms delay was tried once and changed the failure
+                                                    // rather than removing it (docs/NEXT.md), which is why this
+                                                    // waits on the engine instead of on the clock. Capped at
+                                                    // three seconds so a client that never reaches Home is not
+                                                    // held for ever.
+                                                    if let Some(extra) = std::env::var("CORDIAL_POST_AFTER_HOME_MS")
+                                                        .ok()
+                                                        .and_then(|v| v.parse::<u64>().ok())
+                                                    {
+                                                        // Only when the engine is going to wait for this call: with a valid flag cache
+                                                        // (`onFlagsLoaded`) it started its Lua app at `onStart` and ignores the post, and
+                                                        // holding Cordial's thread then stalls it instead (measured, docs/NEXT.md).
+                                                        if linker::game_activity::flags_failed() == 0 {
+                                                            println!("  post not held: the engine loaded its flags itself");
+                                                        } else {
+                                                        let t0 = std::time::Instant::now();
+                                                        while linker::game_activity::home_ready() == 0
+                                                            && t0.elapsed() < std::time::Duration::from_secs(3)
+                                                        {
+                                                            std::thread::sleep(std::time::Duration::from_millis(2));
+                                                        }
+                                                        let seen = linker::game_activity::home_ready() != 0;
+                                                        println!(
+                                                            "  post held for Home: {} after {} ms, then {extra} ms",
+                                                            if seen { "announced" } else { "NOT announced" },
+                                                            t0.elapsed().as_millis()
+                                                        );
+                                                        std::thread::sleep(std::time::Duration::from_millis(extra));
+                                                        }
+                                                    }
                                                     // Deliver the settings again
                                                     // here, immediately before the
                                                     // post call, so the app-provided
@@ -4420,7 +5043,8 @@ fn main() -> ExitCode {
                                                                 opt.client_settings.as_deref(),
                                                             )
                                                             .unwrap_or_default();
-                                                            match linker::game_activity::init_client_settings(sf, &doc, "", "") {
+                                                            // SAFETY: `sf` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                            match unsafe { linker::game_activity::init_client_settings(sf, &doc, "", "") } {
                                                                 Ok(code) => println!("  late settings ({} bytes) -> {code}", doc.len()),
                                                                 Err(e) => println!("  late settings failed: {e}"),
                                                             }
@@ -4428,7 +5052,8 @@ fn main() -> ExitCode {
                                                     }
                                                     match lib.symbol("Java_com_roblox_engine_jni_NativeGLInterface_nativePostClientSettingsLoadedInitialization3") {
                                                         None => println!("  late post: not exported"),
-                                                        Some(f) => match linker::game_activity::post_client_settings_loaded(f) {
+                                                        // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                        Some(f) => match unsafe { linker::game_activity::post_client_settings_loaded(f) } {
                                                             Ok(()) => println!("  late post: postClientSettingsLoadedInitialization3 ok (after {ms} ms)"),
                                                             Err(e) => println!("  late post failed: {e}"),
                                                         },
@@ -4457,7 +5082,8 @@ fn main() -> ExitCode {
                                                     if std::env::var("CORDIAL_LATE_RETRY").map_or(true, |v| v != "off") {
                                                         match lib.symbol("Java_com_roblox_client_startup_MainGameActivity_nativeRetryInit") {
                                                             None => println!("  late retry: not exported"),
-                                                            Some(f) => match linker::game_activity::appbridge_call_bare(f) {
+                                                            // SAFETY: `f` is a native resolved via a symbol lookup against the loaded libroblox.so, which is never unloaded.
+                                                            Some(f) => match unsafe { linker::game_activity::appbridge_call_bare(f) } {
                                                                 Ok(()) => println!("  late retry: nativeRetryInit ok"),
                                                                 Err(e) => println!("  late retry failed: {e}"),
                                                             },
@@ -4478,11 +5104,11 @@ fn main() -> ExitCode {
                                                 // registered yet, the same
                                                 // not-yet-vs-failed distinction the
                                                 // other AGDK natives use.
-                                                match linker::game_activity::set_input_connection(handle) {
+                                                if !opt.app_bridge { match linker::game_activity::set_input_connection(handle) {
                                                     Ok(Some(())) => println!("  InputConnection registered with the engine"),
                                                     Ok(None) => println!("  setInputConnectionNative not registered yet; IME state will not reach Cordial"),
                                                     Err(e) => println!("  setInputConnectionNative failed: {e}"),
-                                                }
+                                                } }
                                                 let secs = opt.run_seconds;
                                                 if secs == 0 {
                                                     println!(
@@ -4511,6 +5137,27 @@ fn main() -> ExitCode {
                                                 if n > 0 {
                                                     println!("  {n} plugin(s) running");
                                                 }
+
+                                                // ADR-038's hot-swap
+                                                // reconciler: notices a
+                                                // plugin installed, removed,
+                                                // updated, enabled, disabled
+                                                // or granted something new in
+                                                // this profile while this
+                                                // client keeps running, and
+                                                // starts, stops or restarts
+                                                // exactly that plugin through
+                                                // the same `spawn_one`
+                                                // `start_all` just used.
+                                                // Started unconditionally,
+                                                // after `start_all` rather
+                                                // than before it, so its
+                                                // first tick's "what is
+                                                // running" snapshot already
+                                                // matches what `start_all`
+                                                // just spawned instead of
+                                                // racing it.
+                                                cordial_runtime::plugin_host::start_reconciler();
 
                                                 // ADR-026's core bus, from the
                                                 // client rather than from a
@@ -4641,7 +5288,21 @@ fn main() -> ExitCode {
                                                 // Roblox can never request the
                                                 // microphone.
                                                 cordial_runtime::permissions::arm(|name| lib.symbol(name));
+                                                // Play. On Android the Java app
+                                                // answers the app shell's
+                                                // `Game.launch`; under AGDK the
+                                                // engine answers it itself, so
+                                                // only the app-bridge bring-up
+                                                // subscribes.
+                                                if opt.app_bridge {
+                                                    cordial_runtime::game_launch::arm(|name| lib.symbol(name), &apk_path, width, height);
+                                                }
                                                 install_webview_presenter();
+                                                // The sign-in security check arrives as
+                                                // an app-bridge notification, not an
+                                                // `openWindow`, and uses the presenter
+                                                // just installed.
+                                                cordial_runtime::webview::install_app_bridge_sink();
 
                                                 // A dev-only trigger, in the same family as
                                                 // `CORDIAL_TRACE_PATHS`: off by default, out of the
@@ -4667,10 +5328,17 @@ fn main() -> ExitCode {
                                                     );
                                                     cordial_runtime::webview::dev_trigger_open_window(url);
                                                 }
+                                                // Same family: the sign-up security check
+                                                // through the real app-bridge hook, because
+                                                // a sign-in check needs credentials.
+                                                if let Ok(kind) = std::env::var("CORDIAL_WEBVIEW_TEST_CAPTCHA") {
+                                                    println!("  webview: CORDIAL_WEBVIEW_TEST_CAPTCHA set; sending OPEN_CAPTCHA_VIEW");
+                                                    cordial_runtime::webview::dev_trigger_captcha(&kind);
+                                                }
 
                                                 cordial_runtime::android::looper::pump(
                                                     std::time::Duration::from_secs(secs),
-                                                    Some(handle),
+                                                    (!opt.app_bridge).then_some(handle),
                                                 );
                                                 // Ungated, unlike the block below: this
                                                 // is the one line somebody debugging a
@@ -4770,11 +5438,7 @@ fn main() -> ExitCode {
     // Whether Roblox's own storage came up, which the engine's `RbxStorage::init
     // [INIT]` line would say if it were not logged before the log file exists.
     // The same `files` directory the tree above was created under.
-    cordial_runtime::storage::report(std::path::Path::new(&format!(
-        "{}/files",
-        std::env::var("CORDIAL_FILES_DIR")
-            .unwrap_or_else(|_| format!("{}/data", cordial_runtime::profile::active().display()))
-    )));
+    cordial_runtime::storage::report(&cordial_runtime::profile::engine_data().join("files"));
 
     stubs::report();
 
@@ -4829,7 +5493,12 @@ fn main() -> ExitCode {
     // was gone on its own — it reaps clients whose pid has vanished — but that
     // is a poll, so leaving it implicit means the governor stays raised for
     // however long the sweep takes after a session ends.
-    gamemode::unregister();
+    cordial_runtime::gamemode::unregister();
+
+    // The encoder is a child process and `_exit` below runs nothing: without
+    // this a recording ends with its index unwritten and its last seconds in a
+    // pipe nobody drains.
+    cordial_runtime::recording::finish_at_exit();
 
     // Leave via _exit rather than returning.
     //
@@ -4842,108 +5511,22 @@ fn main() -> ExitCode {
     //
     // SAFETY: _exit is async-signal-safe and terminates without running any
     // handler. Nothing here owns a resource the kernel will not reclaim.
-    unsafe { libc_exit(0) }
+    //
+    // **5 when no window could be opened, because 0 was a lie.** Under gamescope
+    // the client printed "no window: ..." and left with status 0, so the
+    // launcher reported "the client exited cleanly" for a run that never showed
+    // anything -- and a program that starts games from the command line
+    // (ADR-058) had no way to tell a game from a failure to start one.
+    let status = if WINDOW_FAILED.load(std::sync::atomic::Ordering::Relaxed) { 5 } else { 0 };
+    unsafe { libc_exit(status) }
 }
+
+/// Set when `open_window` failed. Read once, at exit, for the status above.
+static WINDOW_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" {
     #[link_name = "_exit"]
     fn libc_exit(status: std::ffi::c_int) -> !;
-}
-
-/// Feral Interactive's GameMode, asked for over D-Bus.
-///
-/// GameMode is a request rather than a wrapper. There is nothing to link and
-/// nothing to `LD_PRELOAD`: `gamemoded` owns `com.feralinteractive.GameMode` on
-/// the session bus and takes `RegisterGame(i pid)` / `UnregisterGame(i pid)`.
-/// While a client is registered it puts the CPU governor in performance, raises
-/// the process's I/O and scheduling priority, puts the GPU in its performance
-/// profile and inhibits the screensaver. That last one is not a footnote for a
-/// game the user plays with a controller and does not touch the keyboard for.
-///
-/// **Absence is the ordinary case and must not fail a launch.** Most machines
-/// do not have gamemoded, and this is an optimisation rather than a dependency
-/// — a client that refused to start because a performance daemon was missing
-/// would be a far worse bug than the frame it was trying to save. Every failure
-/// here is reported in one line and stepped over.
-///
-/// On by default, which is what Sober does. `CORDIAL_GAMEMODE=0` turns it off,
-/// and that is the control: it is the only way to show, in the same session,
-/// that a timing difference came from this and not from something else.
-mod gamemode {
-    use std::sync::OnceLock;
-
-    const SERVICE: &str = "com.feralinteractive.GameMode";
-    const OBJECT: &str = "/com/feralinteractive/GameMode";
-
-    /// Held for the life of the process rather than opened per call. Not because
-    /// `RegisterGame` needs it — it registers a pid, and gamemoded watches that
-    /// pid rather than this connection — but because [`unregister`] runs during
-    /// teardown, and opening a bus connection is the wrong thing to be doing at
-    /// the point where the engine's own destructors are already known to be
-    /// unsafe to run.
-    static CONNECTION: OnceLock<Option<zbus::blocking::Connection>> = OnceLock::new();
-
-    /// Whether [`register`] actually got a yes, so [`unregister`] does not send
-    /// an `UnregisterGame` for a registration that never happened.
-    static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-    fn enabled() -> bool {
-        !matches!(
-            std::env::var("CORDIAL_GAMEMODE").unwrap_or_default().trim(),
-            "0" | "off" | "false" | "no"
-        )
-    }
-
-    fn connection() -> Option<&'static zbus::blocking::Connection> {
-        CONNECTION.get_or_init(|| zbus::blocking::Connection::session().ok()).as_ref()
-    }
-
-    /// `RegisterGame`/`UnregisterGame` both answer `0` for success and a
-    /// negative number for a refusal, so the reply has to be read rather than
-    /// just checked for not being a D-Bus error — gamemoded returns `-1` for a
-    /// pid it will not accept and `-2` for one already registered, over a
-    /// perfectly successful method call.
-    fn call(method: &str) -> Result<i32, String> {
-        let conn = connection().ok_or_else(|| "no session bus".to_string())?;
-        let pid = std::process::id() as i32;
-        let reply = conn
-            .call_method(Some(SERVICE), OBJECT, Some(SERVICE), method, &(pid,))
-            .map_err(|e| e.to_string())?;
-        reply.body().deserialize::<i32>().map_err(|e| e.to_string())
-    }
-
-    pub fn register() {
-        if !enabled() {
-            println!("[gamemode] off (CORDIAL_GAMEMODE=0)");
-            return;
-        }
-        match call("RegisterGame") {
-            Ok(0) => {
-                REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
-                println!(
-                    "[gamemode] registered pid {}: performance governor, raised priority, \
-                     GPU performance profile, screensaver inhibited",
-                    std::process::id()
-                );
-            }
-            // Said plainly rather than folded into the error path below. A
-            // daemon that answered and declined is a different situation from
-            // one that is not there, and only the second is the ordinary case.
-            Ok(rc) => println!("[gamemode] gamemoded declined to register this process (rc {rc})"),
-            Err(e) => println!("[gamemode] not available, continuing without it: {e}"),
-        }
-    }
-
-    pub fn unregister() {
-        if !REGISTERED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-        match call("UnregisterGame") {
-            Ok(0) => println!("[gamemode] unregistered"),
-            Ok(rc) => println!("[gamemode] UnregisterGame returned {rc}"),
-            Err(e) => println!("[gamemode] UnregisterGame failed: {e}"),
-        }
-    }
 }
 
 /// The store behind `native/local_storage.cpp`'s `PlatformLocalStorageHandler`
@@ -5375,6 +5958,8 @@ mod local_storage_secrets {
         if value.is_null() {
             return -1;
         }
+        // SAFETY: `value` points to `value_len` bytes the caller owns for the
+        // duration of this call, per this function's own contract above.
         let bytes = unsafe { std::slice::from_raw_parts(value as *const u8, value_len) };
         let Ok(value) = std::str::from_utf8(bytes) else {
             println!("  [local-storage] {key}: value is not UTF-8; refused rather than stored");
@@ -5385,6 +5970,8 @@ mod local_storage_secrets {
 
     #[no_mangle]
     pub extern "C" fn cordial_local_storage_delete(user_id: c_longlong, key: *const c_char) -> c_int {
+        // SAFETY: `key` is a NUL-terminated C string owned by the caller for
+        // the duration of this call, per `borrow_str`'s own contract.
         let Some(key) = (unsafe { borrow_str(key) }) else {
             return -1;
         };
@@ -5440,5 +6027,468 @@ mod disk_tests {
         // And it names where, because a machine has more than one filesystem
         // and the profile is not always on the one the user is watching.
         assert!(after.contains("profiles/x/files"), "{after}");
+    }
+}
+
+/// `--guest-arm64`: link the Quest build's arm64 `libroblox.so` into this
+/// x86-64 process for the translator (docs/vr/dynarmic-design.md §2, M2),
+/// then run its constructors and, with `--jni-onload`, its `JNI_OnLoad`
+/// (M3; `guest_arm64_run`).
+///
+/// The linker leaves the engine's constructors for the translator
+/// (`patches/0006`), since they are guest code. The link itself establishes
+/// that every import has an answer the guest can safely jump to, and that
+/// every relocation was applied -- the linker logs the count per type, to be
+/// checked against `llvm-readelf -r`.
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+fn guest_arm64_link(opt: &Options) -> Result<linker::Library, ExitCode> {
+    use cordial_runtime::guest_link::{self, Answer};
+    use std::collections::BTreeSet;
+
+    let path = std::path::Path::new(&opt.lib_dir).join(&opt.library);
+    let read = (|| -> std::io::Result<_> {
+        Ok((
+            cordial_runtime::elf::undefined_symbols(&path)?,
+            cordial_runtime::elf::undefined_data_symbols(&path)?,
+            cordial_runtime::elf::needed_libraries(&path)?,
+        ))
+    })();
+    let (imports, data, needed) = match read {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("guest: cannot read {}: {e}", path.display());
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    println!(
+        "guest arm64: {} imports by {} ({} data), DT_NEEDED {}",
+        imports.len(),
+        opt.library,
+        data.len(),
+        needed.join(" ")
+    );
+
+    // Which implementation a dispatching stub calls is the native path's
+    // choice, so the guest and the x86-64 engine get the same answer.
+    let native = symtab::build(opt.host_libc, &imports);
+    // TLS slot 5 and the `__stack_chk_guard` import must hold the same
+    // canary, or the engine's first function that reads one and checks
+    // against the other aborts.
+    // LL/SC is inline compare-and-swap against the value LDXR loaded
+    // (`IgnoreGlobalMonitor`) unless `CORDIAL_GUEST_MONITOR=global` asks for
+    // dynarmic's exact exclusive monitor. Measured on the engine at M4
+    // (design §9.3): the monitor cost about a quarter of the process's CPU at
+    // Landing and a second of start-up. What is given up is exactness under
+    // ABA, which the outline-atomics helpers the engine's atomics go through
+    // do not rely on -- a value compare is C++'s own compare_exchange.
+    let monitor = match std::env::var("CORDIAL_GUEST_MONITOR").as_deref() {
+        Ok("global") => cordial_guest::MonitorMode::Global,
+        _ => cordial_guest::MonitorMode::Ignore,
+    };
+    // `CORDIAL_GUEST_CODE_CACHE_MIB`: each Jit's code cache, reserved and
+    // committed as it fills. The engine's start-up outgrew design §4's 64 MiB
+    // on the main thread's Jit (§9.3).
+    let code_cache = std::env::var("CORDIAL_GUEST_CODE_CACHE_MIB").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(cordial_guest::Options::default().code_cache, |m| m << 20);
+    // `CORDIAL_GUEST_UNSAFE_FP=nan,recip,fma`: dynarmic's inexact FP
+    // optimisations, for measuring (M7). Off unless named.
+    let unsafe_fp = std::env::var("CORDIAL_GUEST_UNSAFE_FP").unwrap_or_default().split(',')
+        .map(|f| match f {
+            "nan" => cordial_guest::UNSAFE_FP_INACCURATE_NAN,
+            "recip" => cordial_guest::UNSAFE_FP_REDUCED_ERROR,
+            "fma" => cordial_guest::UNSAFE_FP_UNFUSE_FMA,
+            _ => 0,
+        })
+        .fold(0, |a, b| a | b);
+    if unsafe_fp != 0 {
+        println!("guest unsafe FP optimisations: {unsafe_fp:#x}");
+    }
+    let rt = cordial_guest::Runtime::new(cordial_guest::Options {
+        stack_guard: cordial_runtime::bionic::stack_chk_guard(),
+        code_cache,
+        unsafe_fp,
+        monitor,
+        profile: std::env::var_os("CORDIAL_GUEST_PROFILE").is_some(),
+        ..cordial_guest::Options::default()
+    });
+    // The engine executes `svc #0` itself as well as calling `syscall()`;
+    // both get the same translation (guest_sys.rs).
+    rt.set_syscall_handler(cordial_runtime::guest_sys::raw_syscall());
+    println!("guest monitor: {monitor:?}");
+    let omit: BTreeSet<String> = std::env::var("CORDIAL_GUEST_OMIT")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let table = guest_link::build(&rt, &native, &imports, &data, &needed, &omit);
+
+    let (page, page_end) = rt.stub_page();
+    println!("guest stub page: {page:#x}..{page_end:#x}");
+    println!("guest symbol table, by answer:");
+    for a in [Answer::Cordial, Answer::Host, Answer::Thunk, Answer::OpenXr, Answer::Stop,
+              Answer::Data, Answer::WeakNull, Answer::Unanswered] {
+        println!("  {:<12} {}", a.label(), table.count(a));
+    }
+    println!("guest virtual libraries:");
+    for (lib, syms) in &table.libraries {
+        let rows: Vec<_> = table.rows.iter().filter(|r| &r.library == lib).collect();
+        let stops = rows.iter().filter(|r| r.answer == Answer::Stop).count();
+        println!("  {lib:<26} {:>4} symbols, {stops} stop when called", syms.len());
+    }
+    for r in &table.rows {
+        let loud = matches!(r.answer, Answer::Unanswered | Answer::WeakNull | Answer::Data);
+        if opt.verbose || loud {
+            let addr = table.libraries.get(&r.library)
+                .and_then(|syms| syms.iter().find(|(n, _)| n == &r.symbol))
+                .map_or(String::from("-"), |(_, a)| format!("{:p}", *a));
+            println!("  {:<44} {:<12} {:<24} {:<16} {}", r.symbol, r.answer.label(), r.library, addr, r.note);
+        }
+    }
+
+    println!("\ninitialising bionic linker for arm64 guests...");
+    linker::init();
+    if let Err(e) = linker::set_guest_machine(linker::EM_AARCH64) {
+        eprintln!("guest: {e}");
+        return Err(ExitCode::FAILURE);
+    }
+    for (name, syms) in &table.libraries {
+        if let Err(e) = linker::register_guest(name, linker::EM_AARCH64, syms) {
+            eprintln!("failed to register guest {name}: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    }
+    println!("registered {} guest virtual libraries", table.libraries.len());
+    if let Err(e) = linker::set_library_path(&opt.lib_dir) {
+        eprintln!("bad --lib-dir: {e}");
+        return Err(ExitCode::FAILURE);
+    }
+
+    println!("\nlinking {} ...", opt.library);
+    let start = Instant::now();
+    let lib = match linker::dlopen(&opt.library, linker::RTLD_NOW) {
+        Ok(lib) => lib,
+        Err(e) => {
+            eprintln!("\nGUEST LINK FAILED after {:.0?}: {e}", start.elapsed());
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    println!("\nLINKED in {:.0?}", start.elapsed());
+    let (code_base, code_size) = lib.code_region();
+    println!("  base       {:#x}", lib.base());
+    println!("  code       {code_base:#x} + {code_size} bytes, mapped without PROT_EXEC");
+    let Some(ctors) = linker::guest_ctors(lib) else {
+        eprintln!("guest: the loader cannot say what the constructors are (patches/0006 absent)");
+        return Err(ExitCode::FAILURE);
+    };
+    println!(
+        "  machine    {} ; DT_INIT {}, DT_INIT_ARRAY {} entries at {:p}",
+        ctors.machine,
+        if ctors.init_func.is_null() { "absent" } else { "present" },
+        ctors.init_array_count,
+        ctors.init_array
+    );
+    let code = guest_arm64_run(opt, &rt, lib, &ctors);
+    if code.is_none() && opt.app_bridge {
+        let apk = std::path::PathBuf::from(opt.apk.clone().unwrap_or_default());
+        match cordial_runtime::guest_jni::install_symbol_filter(&rt, lib, &apk) {
+            Ok(n) => println!("guest: {n} native method names declared in the APK's dex; host entries made on lookup"),
+            Err(e) => {
+                eprintln!("guest: cannot read the natives' descriptors: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+        guest_stats_reporter(rt.clone());
+    }
+    // The stub page belongs to `rt`, and the linked library now points into
+    // it for the rest of the process.
+    std::mem::forget(rt);
+    match code {
+        None if opt.app_bridge => Ok(lib),
+        None => Err(ExitCode::SUCCESS),
+        Some(c) => Err(c),
+    }
+}
+
+/// `--guest-arm64 --app-bridge`: every ten seconds, the translator's state --
+/// Jits, resident code cache, guest-to-host calls and their rate, and the CPU
+/// time of each thread that has run guest code -- so a long run records its
+/// own steady state (M4).
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+fn guest_stats_reporter(rt: std::sync::Arc<cordial_guest::Runtime>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // utime + stime of one task of this process, in clock ticks, and its name.
+    fn task_cpu(tid: i32) -> Option<(u64, String)> {
+        let s = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+        let (l, r) = (s.find('(')?, s.rfind(')')?);
+        let f: Vec<&str> = s[r + 2..].split(' ').collect();
+        Some((f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?, s[l + 1..r].to_string()))
+    }
+    let _ = std::thread::Builder::new().name("guest-stats".into()).spawn(move || {
+        let t0 = Instant::now();
+        let mut last = (Instant::now(), 0u64);
+        let mut ticks: std::collections::HashMap<i32, u64> = std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut last_ns = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let s = rt.stats();
+            let calls = rt.svc_calls();
+            let window = last.0.elapsed().as_secs_f64();
+            let rate = (calls - last.1) as f64 / window;
+            last = (Instant::now(), calls);
+            // Per guest thread, CPU over the window as a percentage of one
+            // core (CLK_TCK is 100 on Linux).
+            let mut cpu: Vec<(f64, i32, String)> = Vec::new();
+            let mut total = 0.0;
+            for t in cordial_guest::guest_threads() {
+                if let Some((now, name)) = task_cpu(t.tid) {
+                    let was = ticks.insert(t.tid, now).unwrap_or(now);
+                    let pct = (now - was) as f64 / window;
+                    total += pct;
+                    cpu.push((pct, t.tid, name));
+                }
+            }
+            cpu.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let top: Vec<String> = cpu.iter().take(8).map(|(p, t, n)| format!("{n}/{t}={p:.1}%")).collect();
+            println!(
+                "[guest] t={:.0}s jits={} guest-threads={} code-cache-resident={} KiB translated-insns={} \
+                 svc-calls={} ({:.0}/s) host-entries={} emulated={} icache-ops={}",
+                t0.elapsed().as_secs_f64(),
+                s.jits_created.load(Relaxed),
+                cordial_guest::guest_threads().len(),
+                code_cache_resident_kib(),
+                cordial_guest::translated_instructions(),
+                calls,
+                rate,
+                cordial_guest::host_entry_count(),
+                s.emulated.load(Relaxed),
+                s.icache_ops.load(Relaxed),
+            );
+            println!("[guest] cpu over {window:.1}s: guest threads {total:.1}% of a core; busiest {}", top.join(" "));
+            // Stub calls per second in the window, busiest first. The counts
+            // are kept whether or not CORDIAL_GUEST_PROFILE is set; profiling
+            // adds the host-side time.
+            let mut first: Vec<String> = Vec::new();
+            let mut per: Vec<(String, f64)> = rt.call_counts().into_iter().map(|(n, k)| {
+                let was = counts.insert(n.clone(), k);
+                if was.is_none() {
+                    first.push(n.clone());
+                }
+                (n, (k - was.unwrap_or(0)) as f64 / window)
+            }).collect();
+            // Every import the guest reaches is named once, when first seen,
+            // so a run records which of its answers were ever exercised --
+            // an OpenXR honest failure or a Meta platform stop included.
+            first.sort();
+            println!("[guest] first called in this window ({}): {}", first.len(), first.join(" "));
+            if (t0.elapsed().as_secs() / 10) % 6 == 0 {
+                cordial_runtime::guest_libc::report();
+            }
+            per.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let top: Vec<String> = per.iter().take(8).map(|(n, r)| format!("{n}={r:.0}/s")).collect();
+            println!("[guest] most called: {}", top.join(" "));
+            if rt.options().profile {
+                let ns = s.svc_nanos.load(Relaxed);
+                println!("[guest] host side of stub calls: {:.1}% of a core in the window",
+                         (ns - last_ns) as f64 / 1e9 / window * 100.0);
+                last_ns = ns;
+            }
+        }
+    });
+}
+
+/// `--guest-arm64`, after the link: the engine's constructors in linker
+/// order, then `JNI_OnLoad` with `--jni-onload` (docs/vr/dynarmic-design.md
+/// M3), all on this thread's guest Jit.
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+fn guest_arm64_run(
+    opt: &Options,
+    rt: &std::sync::Arc<cordial_guest::Runtime>,
+    lib: linker::Library,
+    ctors: &linker::GuestCtors,
+) -> Option<ExitCode> {
+    use cordial_runtime::guest_jni;
+
+    let base = lib.base() as u64;
+    let report = |what: &str, f: &cordial_guest::Fault| {
+        eprintln!("\nGUEST STOPPED in {what}: {f:?}");
+        for c in cordial_guest::last_fault_context() {
+            let off = |a: u64| {
+                if a >= base && a < base + lib.code_region().1 as u64 + (lib.code_region().0 as u64 - base) {
+                    format!("{a:#x} (libroblox+{:#x})", a - base)
+                } else if let Some(n) = rt.stub_name(a & !15) {
+                    format!("{a:#x} (stub {n})")
+                } else {
+                    format!("{a:#x}")
+                }
+            };
+            eprintln!("  pc {}  lr {}  sp {:#x}", off(c.pc), off(c.lr), c.sp);
+            for (i, r) in c.frames.iter().enumerate() {
+                eprintln!("    #{i} {}", off(*r));
+            }
+        }
+        cordial_runtime::guest_libc::report();
+    };
+
+    // bionic's call_array: DT_INIT first, then each DT_INIT_ARRAY entry in
+    // order, skipping 0 and -1, each called as f(argc, argv, envp). This
+    // linker's g_argc/g_argv/g_envp are never set, so those are 0 and null
+    // for the native path too.
+    let mut list: Vec<u64> = Vec::new();
+    if !ctors.init_func.is_null() {
+        list.push(ctors.init_func as u64);
+    }
+    for i in 0..ctors.init_array_count {
+        // SAFETY: the linker's own init_array pointer and count for `lib`.
+        list.push(unsafe { *ctors.init_array.add(i) } as u64);
+    }
+    let skipped = list.iter().filter(|&&f| f == 0 || f == u64::MAX).count();
+    println!("\nrunning {} guest constructors ({skipped} null or -1, skipped as bionic does)...",
+             list.len() - skipped);
+    let t0 = Instant::now();
+    for (i, &f) in list.iter().enumerate() {
+        if f == 0 || f == u64::MAX {
+            continue;
+        }
+        if let Err(e) = cordial_guest::guest_call(rt, f, &[0, 0, 0], &[]) {
+            report(&format!("constructor {i} of {} at libroblox+{:#x}", list.len(), f - base), &e);
+            return Some(ExitCode::FAILURE);
+        }
+    }
+    let t_ctors = t0.elapsed();
+    println!("CONSTRUCTORS DONE: {} run in {:.3?}", list.len() - skipped, t_ctors);
+
+    // With `--app-bridge` the bring-up calls `JNI_OnLoad` itself, through the
+    // same host entry as every other native.
+    if opt.app_bridge {
+        return None;
+    }
+    if opt.jni_onload {
+        let Some(onload) = lib.symbol("JNI_OnLoad") else {
+            eprintln!("JNI_OnLoad not found");
+            return Some(ExitCode::FAILURE);
+        };
+        let Some(host_vm) = linker::jni::create_vm() else {
+            eprintln!("could not create a JavaVM");
+            return Some(ExitCode::FAILURE);
+        };
+        let vm = match guest_jni::guest_vm(rt, host_vm as u64) {
+            Ok(vm) => vm,
+            Err(e) => {
+                eprintln!("guest JNI: {e}");
+                return Some(ExitCode::FAILURE);
+            }
+        };
+        println!("\nguest JavaVM at {vm:#x}; calling JNI_OnLoad at libroblox+{:#x}", onload as u64 - base);
+        let t1 = Instant::now();
+        // `CORDIAL_GUEST_TRACE_SVC=1`: every stub call from JNI_OnLoad on.
+        if std::env::var_os("CORDIAL_GUEST_TRACE_SVC").is_some() {
+            cordial_guest::set_trace(true);
+        }
+        let r = cordial_guest::guest_call(rt, onload as u64, &[vm, 0], &[]);
+        let t_onload = t1.elapsed();
+        match r {
+            Ok(r) => {
+                let rc = r.x0 as u32;
+                println!("JNI_OnLoad returned {rc:#x} = JNI {}.{}", rc >> 16, rc & 0xffff);
+            }
+            Err(e) => {
+                report("JNI_OnLoad", &e);
+                return Some(ExitCode::FAILURE);
+            }
+        }
+        println!("guest natives registered: {}", guest_jni::registered_natives());
+        println!(
+            "TIMING first constructor to JNI_OnLoad returning: {:.3?} (constructors {:.3?}, JNI_OnLoad {:.3?})",
+            t0.elapsed(), t_ctors, t_onload
+        );
+        if let Some(path) = &opt.dump_classes {
+            match linker::jni::dump_classes(path) {
+                Ok(()) => println!("  Java classes Roblox reached for -> {path}"),
+                Err(e) => eprintln!("  class dump failed: {e}"),
+            }
+        }
+    }
+
+    let s = rt.stats();
+    println!(
+        "guest: {} Jits created ({} on this thread), {} guest instructions translated, {} guest-to-host \
+         calls, {} host entries, anonymous executable memory resident {} KiB (code caches of {} MiB \
+         reserved per Jit)",
+        s.jits_created.load(std::sync::atomic::Ordering::Relaxed),
+        cordial_guest::thread_jit_count(),
+        cordial_guest::translated_instructions(),
+        rt.svc_calls(),
+        cordial_guest::host_entry_count(),
+        code_cache_resident_kib(),
+        rt.options().code_cache >> 20
+    );
+    if rt.options().profile {
+        println!(
+            "guest profile: {:.3?} on the host side of stub calls, exclusive of guest code they ran",
+            std::time::Duration::from_nanos(s.svc_nanos.load(std::sync::atomic::Ordering::Relaxed))
+        );
+    }
+    let counts = rt.call_counts();
+    let jni: Vec<String> = counts.iter().filter(|(n, _)| n.starts_with("JNIEnv::") || n.starts_with("JavaVM::"))
+        .map(|(n, k)| format!("{n}={k}")).collect();
+    let top: Vec<String> = counts.iter().take(12).map(|(n, k)| format!("{n}={k}")).collect();
+    println!("guest stubs called: {} distinct; most called: {}", counts.len(), top.join(" "));
+    if opt.verbose {
+        let all: Vec<String> = counts.iter().map(|(n, k)| format!("{n}={k}")).collect();
+        println!("guest stubs called, all: {}", all.join(" "));
+    }
+    println!("guest JNI calls: {}", if jni.is_empty() { "none".into() } else { jni.join(" ") });
+    cordial_runtime::guest_libc::report();
+    None
+}
+
+/// Resident KiB in the process's anonymous executable mappings: dynarmic's
+/// code caches, which it commits lazily so that what is resident is what was
+/// emitted (to the page), plus the one host-entry page. Read from /proc
+/// rather than from dynarmic, which has no public accessor for it.
+#[cfg(all(feature = "vr", target_arch = "x86_64"))]
+fn code_cache_resident_kib() -> u64 {
+    let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") else { return 0 };
+    let mut total = 0;
+    let mut in_cache = false;
+    for line in smaps.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let Some(first) = f.first() else { continue };
+        if let Some((a, b)) = first.split_once('-') {
+            if u64::from_str_radix(a, 16).is_ok() && u64::from_str_radix(b, 16).is_ok() {
+                in_cache = f.get(1).is_some_and(|p| p.contains('x')) && f.len() == 5;
+                continue;
+            }
+        }
+        if in_cache && *first == "Rss:" {
+            total += f.get(1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        }
+    }
+    total
+}
+
+/// `CORDIAL_POST_ASYNC`: make the late post from a thread of its own (#92).
+/// Read as a switch, not as "set at all", so `CORDIAL_POST_ASYNC=0` means off.
+fn post_async() -> bool {
+    switch_on(std::env::var("CORDIAL_POST_ASYNC").ok().as_deref())
+}
+
+fn switch_on(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), None | Some("") | Some("0") | Some("off") | Some("false") | Some("no"))
+}
+
+#[cfg(test)]
+mod post_async_tests {
+    #[test]
+    fn zero_and_off_mean_off() {
+        for v in [None, Some(""), Some("0"), Some("off"), Some("false"), Some("no")] {
+            assert!(!super::switch_on(v), "{v:?} must be off");
+        }
+        for v in [Some("1"), Some("on"), Some("yes")] {
+            assert!(super::switch_on(v), "{v:?} must be on");
+        }
     }
 }

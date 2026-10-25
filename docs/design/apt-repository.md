@@ -59,11 +59,9 @@ acceptable, and it is not wired into any CI path that could publish it.
 
 ### Generating the key
 
-**Status: nobody has generated one, and this repository's CI has no
-`APT_GPG_PRIVATE_KEY` secret as of this writing.** The commands below build
-nothing until that changes, and both the README and
-[`.github/workflows/apt.yml`](../../.github/workflows/apt.yml) say so
-plainly rather than implying a working install path that is not there yet.
+**Status: done.** The key exists and the repository is published and signed
+(`dists/stable/InRelease` verified on 2026-09-30, listing 0.20.1-1 for amd64
+and arm64). The commands below are the procedure for regenerating it.
 
 **Do not reuse the Flatpak signing key.** Both are plain OpenPGP signatures
 and gpg has no objection to signing two unrelated things with one key, but
@@ -198,17 +196,14 @@ shares.
 
 ### The key
 
-**No key exists yet.** Once `APT_GPG_KEY_ID` is set, this section is where
-its fingerprint goes, published out of band from the install commands above
-so a user has a second source to check against:
+**The key exists.** Its fingerprint is in [`docs/install.md`](../install.md); it was read from the published file on 2026-09-30 and has not been confirmed by whoever holds the key. To read it from the keyring you downloaded:
 
 ```bash
 gpg --show-keys --with-fingerprint /etc/apt/keyrings/cordial-archive-keyring.gpg
 ```
 
-Until this section names a fingerprint, there is nothing at the published
-URL to check it against in the first place -- see "Nothing is signed yet" in
-the README.
+A second source, out of band from the site, still wants to be added here by
+whoever holds the key.
 
 ### Key rotation
 
@@ -319,3 +314,7 @@ therefore the plan, not a stopgap for §2** -- the same framing
 [flatpak-remote-signing.md](flatpak-remote-signing.md) gives for Flathub, and
 for the same underlying reason: the channel Cordial controls is the one that
 can actually ship this week.
+
+## Notes moved from docs/install.md (2026-10-02)
+
+What was observed on 2026-09-30 when the key's fingerprint was recorded: `InRelease` verified as a good signature against the published keyring, and the `amd64` and `arm64` `Packages` files both listed 0.20.1-1. `apt install` itself was not run. The keyring form (one file named on the `deb` line, not the system-wide trusted keyring) is the `apt-key`-free one. A `curl` in a document is exactly what a supply-chain attack looks like, which is why the install page asks the reader to check the fingerprint.

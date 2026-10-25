@@ -166,6 +166,15 @@ matching the desktop entry for the reasons in
 [ADR-009](ADR-009-capture-yes-overlay-injection-no.md). The test that pins them
 together needs to follow.
 
+That string is not the id WebKit uses. `Cordial` is not a valid application id,
+so `cordial-run` had WebKit name itself `org.webkit.app-<hash of the executable
+path>`, and inside the Flatpak the portal refuses a web process whose a11y bus
+name is not prefixed by the real app id: opening any in-app web window aborted
+the client. `host_window::claim_webkit_application_id` gives WebKit the
+Flatpak's id through an unregistered default `GApplication`, and leaves the
+`xdg_toplevel` app_id as `Cordial` -- GTK4 reads that from the program name
+unless a `GtkApplication` is associated with the window.
+
 **Rejected: Wayland with an X11 fallback maintained in parallel.** Two backends
 means every input and surface bug is asked "on which one?", and the fallback
 rots because nobody runs it. Xwayland exists for hosts without a Wayland

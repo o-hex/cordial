@@ -78,6 +78,243 @@
       and is not this change. AppStream shows the newest entry as "what's new",
       so the important one is the top.
     -->
+    <release version="0.34.0" date="2026-10-16">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.34.0</url>
+      <description>
+        <p>
+          A fix for Roblox freezing on the loading screen after sign-in.
+        </p>
+      </description>
+    </release>
+    <release version="0.33.0" date="2026-10-16">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.33.0</url>
+      <description>
+        <p>
+          Controller sticks work up and down, holding two mouse buttons no
+          longer breaks the first, and two-step sign-in can finish.
+        </p>
+      </description>
+    </release>
+    <release version="0.32.0" date="2026-10-16">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.32.0</url>
+      <description>
+        <p>
+          Text boxes show what you type on X11, as they already did on Wayland.
+        </p>
+      </description>
+    </release>
+    <release version="0.31.0" date="2026-10-16">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.31.0</url>
+      <description>
+        <p>
+          Movement keys work as soon as you join a game, and a launcher that
+          never shows its window says where it is stuck.
+        </p>
+      </description>
+    </release>
+    <release version="0.30.0" date="2026-10-15">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.30.0</url>
+      <description>
+        <p>
+          Camera drags hold on Hyprland, recordings carry the game's own sound
+          with an F9 hotkey, and a start-up crash on compositors without GPU
+          buffer sharing is gone.
+        </p>
+      </description>
+    </release>
+    <release version="0.29.0" date="2026-10-15">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.29.0</url>
+      <description>
+        <p>
+          Gameplay can be recorded to a video file, the camera no longer spins
+          on X11, and Enter sends chat again.
+        </p>
+      </description>
+    </release>
+    <release version="0.28.0" date="2026-10-15">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.28.0</url>
+      <description>
+        <p>
+          Cordial can be started straight into a game by another program, runs
+          inside gamescope and under PartyDeck, and controllers reach the
+          Flatpak.
+        </p>
+      </description>
+    </release>
+    <release version="0.27.0" date="2026-10-08">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.27.0</url>
+      <description>
+        <p>
+          A touchscreen no longer crashes Cordial, text boxes work in
+          fullscreen, and Settings shows which changes apply to a running game.
+        </p>
+      </description>
+    </release>
+    <release version="0.26.0" date="2026-10-08">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.26.0</url>
+      <description>
+        <p>
+          The profile switcher moves into the header bar, built-in plugins ask
+          for permission once instead of stacking dialogs, and shift lock holds
+          the cursor on Hyprland.
+        </p>
+      </description>
+    </release>
+    <release version="0.25.0" date="2026-10-05">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.25.0</url>
+      <description>
+        <p>
+          Cordial keeps its own Roblox builds, and each profile runs the newest
+          or one you pin. Opening a web page in the Flatpak no longer crashes,
+          and Settings can choose the microphone.
+        </p>
+      </description>
+    </release>
+    <release version="0.24.1" date="2026-10-04">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.24.1</url>
+      <description>
+        <p>
+          A start that gets stuck on the loading screen is now restarted
+          automatically, and Enter in a text box does what Roblox asks.
+        </p>
+      </description>
+    </release>
+    <release version="0.24.0" date="2026-10-04">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.24.0</url>
+      <description>
+        <p>
+          Experimental VR: Roblox's Meta Quest build on your PC, in a headset,
+          started from Settings. Chat boxes now clear after Enter.
+        </p>
+        <p>
+          Settings can download Cordial's own copy of Roblox when Sober is
+          installed, and FPS Flex gets a frame rate cap.
+        </p>
+      </description>
+    </release>
+    <release version="0.23.2" date="2026-10-01">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.23.2</url>
+      <description>
+        <p>
+          The game now follows the window while you drag to resize it, instead
+          of waiting until you stop.
+        </p>
+      </description>
+    </release>
+    <release version="0.23.1" date="2026-10-01">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.23.1</url>
+      <description>
+        <p>
+          FastFlags such as the frame rate target no longer reset while you
+          play, and Settings has a frame rate limit that applies in game.
+        </p>
+        <p>
+          The text editor appears without working Vulkan, pointer lock works on
+          KDE Plasma, missing textures on GPUs without ETC2 are decoded, and
+          fullscreen no longer crashes on AMD's RADV driver.
+        </p>
+      </description>
+    </release>
+    <release version="0.23.0" date="2026-10-01">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.23.0</url>
+      <description>
+        <p>
+          A doctor that checks your display, GPU, sound and Roblox install, on
+          one Report a Problem screen. The game no longer goes grey when a text
+          box takes focus without working Vulkan.
+        </p>
+        <p>
+          NVIDIA GPUs and drivers are named in diagnostics, with warnings for
+          known-bad drivers. Audio output, GameMode, controllers and the title
+          bar change while you play. FastFlags can be imported from Bloxstrap,
+          Fishstrap or Sober, and profiles can be deleted.
+        </p>
+      </description>
+    </release>
+    <release version="0.22.0" date="2026-09-30">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.22.0</url>
+      <description>
+        <p>
+          Mouse acceleration, background throttling and two other settings now
+          apply to a running game without a restart, and settings that need a
+          restart say so.
+        </p>
+        <p>
+          Settings shows which Roblox build this Cordial installs.
+        </p>
+      </description>
+    </release>
+    <release version="0.21.1" date="2026-09-30">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.21.1</url>
+      <description>
+        <p>
+          The 0.21.0 changes, with the AppImage, deb, rpm and Arch packages
+          that 0.21.0's release was missing.
+        </p>
+      </description>
+    </release>
+    <release version="0.21.0" date="2026-09-30">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.21.0</url>
+      <description>
+        <p>
+          Plugins that cannot start are reported once instead of retried every
+          second, and a plugin update asking for permissions you never granted
+          waits for approval.
+        </p>
+        <p>
+          Mouse acceleration now applies to the camera by default.
+        </p>
+      </description>
+    </release>
+    <release version="0.20.1" date="2026-09-29">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.20.1</url>
+      <description>
+        <p>
+          Flatpak updates work again: the repository had stopped publishing
+          new versions after 0.18.0.
+        </p>
+      </description>
+    </release>
+    <release version="0.20.0" date="2026-09-29">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.20.0</url>
+      <description>
+        <p>
+          An optional Shaders switch adds sharpening and anti-aliasing through
+          vkBasalt, once it is installed.
+        </p>
+        <p>
+          Multi-line text boxes get a proper multi-line editor, and typing
+          stays in place when the window is resized or goes fullscreen.
+        </p>
+      </description>
+    </release>
+    <release version="0.19.0" date="2026-09-25">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.19.0</url>
+      <description>
+        <p>
+          Private servers can be joined from the Roblox website and from a
+          game's Servers list, and joining a game from a Roblox web page
+          closes the page.
+        </p>
+        <p>
+          Plugins now apply to a running Cordial without restarting it.
+        </p>
+      </description>
+    </release>
+    <release version="0.18.0" date="2026-09-24">
+      <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.18.0</url>
+      <description>
+        <p>
+          Cordial starts again: a change on Roblox's side had it opening to a
+          grey window. It now fetches the same startup settings the Roblox
+          client itself uses.
+        </p>
+        <p>
+          ARM64 builds are published alongside x86_64. They have not been
+          tested on real ARM hardware yet.
+        </p>
+      </description>
+    </release>
     <release version="0.17.0" date="2026-09-16">
       <url type="details">https://github.com/luohoa97/cordial/releases/tag/v0.17.0</url>
       <description>

@@ -141,6 +141,13 @@ pub struct Instance {
     /// immediately — an exit code on its own says nothing about what was run.
     pub command_line: String,
     tail: Tail,
+    /// The directory this client's `ctl.sock` is in (`cordial.runtime/1`,
+    /// ADR-055), made by the launcher before the spawn. `None` when it could not
+    /// be made, and the client then has no channel to this launcher.
+    pub session: Option<cordial_shell::runtime_session::SessionDir>,
+    /// What the client was started with, so `live` can tell what a newly
+    /// connected one still needs (ADR-044).
+    pub launched_with: Vec<cordial_protocol::Update>,
 }
 
 /// Per-launch values that may be absent for an ordinary button launch.
@@ -148,6 +155,20 @@ pub struct LaunchRequest<'a> {
     pub run_seconds: Option<u64>,
     pub join_url: Option<&'a str>,
     pub secret_store: Option<Store>,
+    /// Present for "Play in VR": the Quest build, under the translator, in an
+    /// OpenXR session (ADR-053). `None` is the phone build, as it always was.
+    pub vr: Option<VrLaunch>,
+}
+
+/// What a VR launch adds to an ordinary one.
+#[derive(Clone)]
+pub struct VrLaunch {
+    /// The OpenXR runtime manifest to hand the client in `XR_RUNTIME_JSON`, for
+    /// this launch only. `None` leaves the loader to the system's active
+    /// runtime. Cordial never writes `active_runtime.json`: switching the
+    /// machine's runtime to play one game is a change to every other OpenXR
+    /// application the user has, made by something they did not ask to do it.
+    pub openxr_runtime: Option<PathBuf>,
 }
 
 impl Instance {
@@ -269,6 +290,9 @@ fn pump(reader: impl std::io::Read + Send + 'static, tail: Tail, to_stderr: bool
                 println!("{line}");
             }
             let kept = redact(&line).map(str::to_string).unwrap_or(line);
+            // The log export keeps the last few of these; they scroll out of
+            // the 200-line tail in any game longer than a few minutes.
+            cordial_shell::session_log::health_line(&kept);
             let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
             if tail.len() == KEPT_LINES {
                 tail.pop_front();
@@ -315,10 +339,24 @@ pub fn spawn(
         // this project has recorded as working passed. `--host-libc` is marked
         // diagnostic in cordial-run's usage text and dropping it is a separate
         // experiment, not something to fold into wiring up a button.
-        .arg("--host-libc")
-        .arg("--game-activity")
-        .arg("--run")
-        .arg(&run);
+        .arg("--host-libc");
+    match &request.vr {
+        // The Quest build has no GameActivity: it starts through the app
+        // bridge, the way `ActivityNativeMain` starts it on the headset, and
+        // its arm64 engine runs under the translator. `--guest-arm64` also
+        // selects the profile's `quest/` engine storage and the meta-quest
+        // device identity (ADR-053).
+        Some(vr) => {
+            command.arg("--guest-arm64").arg("--app-bridge");
+            if let Some(manifest) = &vr.openxr_runtime {
+                command.env("XR_RUNTIME_JSON", manifest);
+            }
+        }
+        None => {
+            command.arg("--game-activity");
+        }
+    }
+    command.arg("--run").arg(&run);
 
     // The profile stops being a directory name and starts meaning something
     // here. `--profile` is the whole of it: the client resolves the directory
@@ -338,6 +376,7 @@ pub fn spawn(
     // One value decides where everything else lives, and an argument cannot
     // change while the client runs, which is exactly what the dynamic DFFlag
     // families exist for (ADR-013).
+    let profile_dir = claim.profile_dir().to_path_buf();
     let profile_name = claim
         .profile_dir()
         .file_name()
@@ -439,6 +478,16 @@ pub fn spawn(
         command.env("CORDIAL_PRESENT_MODE", mode);
     }
 
+    // The Frame rate limit row. Sent unconditionally, unlike the present-mode
+    // row just above -- there is no flag-layer entry a plugin contributes this
+    // key through that an absent variable would leave room for, so there is no
+    // "leave a plugin the floor" state to preserve the way `CORDIAL_GRAPHICS`
+    // and `CORDIAL_PRESENT_MODE` have to. This is the launch value: the row is
+    // live (ADR-044), and the settings socket changes it afterwards. Keeping
+    // the flag in force against the engine's own settings refresh is the
+    // client's job, not something to ask for here (ADR-051).
+    command.env("CORDIAL_FRAME_RATE_LIMIT", config.frame_rate_limit.as_env());
+
     // The Controllers switch, and **only when it is off**. `CORDIAL_GAMEPAD`
     // is an off switch on the client side -- absent means on, and only the
     // exact string "0" disables it -- so sending nothing is how "leave it on"
@@ -447,6 +496,17 @@ pub fn spawn(
     // another value.
     if !config.gamepad {
         command.env("CORDIAL_GAMEPAD", "0");
+    }
+
+    // Recording, and **only when it is on**: the client records nothing unless
+    // `CORDIAL_RECORD` says so, and `1` means the default folder (ADR-059).
+    if config.record_session {
+        command.env("CORDIAL_RECORD", "1");
+    }
+    // Sound is the game's own, and it applies to a hotkey recording as much as to
+    // a whole-session one, so it is set whether or not the session switch is on.
+    if config.record_audio {
+        command.env("CORDIAL_RECORD_AUDIO", "game");
     }
 
     // Close on leave, and **only when it is on**. The client's own gate wants
@@ -485,11 +545,18 @@ pub fn spawn(
     // one choice, and `GraphicsOptimization` owns the mapping from that choice
     // to the two values, so this block cannot drift from what the row says it
     // does without the enum changing first.
-    if let Some(profile) = config.graphics_optimization_mode.device_profile_env() {
-        command.env("CORDIAL_DEVICE_PROFILE", profile);
-    }
-    if let Some(mode) = config.graphics_optimization_mode.performance_env() {
-        command.env("CORDIAL_PERFORMANCE", mode);
+    //
+    // Not for a VR launch: the Quest build has to present as the headset it
+    // was built for, and `cordial-run --guest-arm64` chooses `meta-quest`
+    // itself when nothing overrides it. A phone-build performance preset sent
+    // to it would make games read `VREnabled` false (flags.rs).
+    if request.vr.is_none() {
+        if let Some(profile) = config.graphics_optimization_mode.device_profile_env() {
+            command.env("CORDIAL_DEVICE_PROFILE", profile);
+        }
+        if let Some(mode) = config.graphics_optimization_mode.performance_env() {
+            command.env("CORDIAL_PERFORMANCE", mode);
+        }
     }
 
     // The Audio row's chosen output sink, and **only when one was actually
@@ -510,6 +577,13 @@ pub fn spawn(
     // ends agree even if one of them is given something odd.
     if let Some(sink) = config.audio_output.env_value() {
         command.env("CORDIAL_AUDIO_SINK", sink);
+    }
+    // The microphone, on the same terms: only when one was chosen, so that an
+    // unset variable keeps following the session's default source. It names a
+    // device and opens nothing -- the capture stream is created when Roblox
+    // starts recording, and not before.
+    if let Some(source) = config.audio_input.env_value() {
+        command.env("CORDIAL_AUDIO_SOURCE", source);
     }
 
     // MangoHUD is a Vulkan implicit layer, so `MANGOHUD=1` on the client's
@@ -541,6 +615,44 @@ pub fn spawn(
         }
     }
 
+    // vkBasalt, the same shape as MangoHUD immediately above: an implicit
+    // Vulkan layer, switched on by an environment variable the loader acts on
+    // by itself, offered only when the layer is actually there. See ADR-041
+    // for why a layer that never touches engine memory is in scope under
+    // ADR-001, and `vkbasalt_layer`'s doc for why the check is not optional.
+    if config.vkbasalt {
+        match vkbasalt_layer() {
+            Some(layer) => match vkbasalt_config_path(profile_name) {
+                Ok(config_path) => match ensure_vkbasalt_config(&config_path) {
+                    Ok(()) => {
+                        command.env("ENABLE_VKBASALT", "1");
+                        command.env("VKBASALT_CONFIG_FILE", config_path.as_os_str());
+                        println!(
+                            "  shell: vkBasalt on, via {} ({})",
+                            layer.display(),
+                            config_path.display()
+                        );
+                    }
+                    // A config Cordial cannot write is a config vkBasalt cannot
+                    // read either, so turning the layer on regardless would
+                    // hand it a `VKBASALT_CONFIG_FILE` that does not exist —
+                    // reported here rather than found by whoever reads
+                    // vkBasalt's own log next.
+                    Err(e) => println!(
+                        "  shell: vkBasalt is switched on but its config at {} could not be \
+                         written ({e}); leaving it off for this launch",
+                        config_path.display()
+                    ),
+                },
+                Err(e) => println!("  shell: vkBasalt is switched on but {e}; leaving it off for this launch"),
+            },
+            None => println!(
+                "  shell: vkBasalt is switched on but its Vulkan layer is not installed; \
+                 no shaders will run. {}", vkbasalt_install_hint()
+            ),
+        }
+    }
+
     // Piped rather than inherited, and echoed straight back out by `pump`, so
     // a shell started from a terminal still narrates the load the way it always
     // has. Both streams, not stderr alone: `cordial-run` says almost everything
@@ -549,14 +661,38 @@ pub fn spawn(
     // panic with none of what led to it.
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
+    // The channel to the runtime: `<profile>/runtime/<session>/`, mode 0700,
+    // made here because the launcher is the side that can be restarted and has
+    // to be able to find it again by scanning for it. The profile lock is held,
+    // which is what lets this clear the directories a killed client left.
+    //
+    // Passed in the environment because the built-in runtime keeps env and argv
+    // for its launch configuration (spec section 6); a third-party runtime gets
+    // the same path as `{session_dir}`. A failure is narrated and not fatal: a
+    // client with no channel still plays, and live settings then wait for the
+    // next launch, as they did before the channel existed.
+    let session = match cordial_shell::runtime_session::SessionDir::create(&profile_dir) {
+        Ok(s) => {
+            command.env("CORDIAL_SESSION_DIR", &s.dir);
+            Some(s)
+        }
+        Err(e) => {
+            println!("  shell: could not make a session directory under {} ({e}); this client will not take live settings", profile_dir.display());
+            None
+        }
+    };
+
     claim.hand_to(&mut command);
 
-    let command_line = describe(&loader, &build.lib_dir, &build.apk, &run, request.join_url);
+    let command_line = describe(&loader, &build.lib_dir, &build.apk, &run, request.join_url, request.vr.is_some());
     let mut child = command
         .spawn()
         .map_err(|e| format!("Could not start {}: {e}\n\n{command_line}", loader.display()))?;
 
     let tail: Tail = Arc::new(Mutex::new(VecDeque::with_capacity(KEPT_LINES)));
+    // The same buffer the crash page reads, so the log export's "last client
+    // run" is exactly what that page would have shown.
+    cordial_shell::session_log::set_last_client(tail.clone(), &command_line);
     // Taken out of the `Child` so the pipes close when the reader threads see
     // EOF rather than being held open by a struct nobody is reading -- a child
     // whose stdout nothing drains blocks on a full pipe, which for a process
@@ -574,7 +710,13 @@ pub fn spawn(
     // quitting the shell would be the thing that released it.
     drop(claim);
 
-    Ok(Instance { child, command_line, tail })
+    Ok(Instance {
+        child,
+        command_line,
+        tail,
+        session,
+        launched_with: crate::live::live_updates(&config),
+    })
 }
 
 fn pin_secret_store(command: &mut Command, store: Option<Store>) {
@@ -608,21 +750,149 @@ pub fn in_flatpak() -> bool {
 /// two ways to accomplish one thing.
 ///
 /// So the hint names one, and it is chosen rather than guessed.
-pub fn mangohud_install_hint() -> &'static str {
-    // **Kept to one line each, because this is shown in a settings row that
-    // cannot be clicked.** It used to spell out why the *other* route fails --
-    // a host package is invisible to a sandboxed build, and the Flatpak
-    // extension's library path exists only inside one -- which is true, useful,
-    // and was reported rendering as five lines ending in an ellipsis. A
-    // paragraph nobody can read is worth less than the one sentence that names
-    // the right command. The reasoning lives in this function's doc instead.
-    if in_flatpak() {
-        "Install the Flatpak extension: flatpak install \
-         org.freedesktop.Platform.VulkanLayer.MangoHud"
-    } else {
-        "Install it from your distribution (Fedora: dnf install mangohud, Arch: pacman -S \
-         mangohud)."
+/// The branch of `org.freedesktop.Platform.VulkanLayer.*` that Cordial's
+/// Flatpak runtime loads: org.gnome.Platform 50 declares the extension point at
+/// version 25.08 (`flatpak info --show-metadata org.gnome.Platform//50`). The
+/// hints name it because a bare `flatpak install` asks which branch to use, and
+/// picking the end-of-life `stable` one installs an extension the runtime never
+/// loads, so the switch stays "Not available" after a successful install. A
+/// test ties this to the manifest's runtime-version.
+pub const VULKAN_LAYER_BRANCH: &str = "25.08";
+
+/// Which Vulkan layer a host install hint is for.
+#[derive(Clone, Copy)]
+enum Layer {
+    MangoHud,
+    VkBasalt,
+}
+
+/// The host distribution, as far as an install hint needs it: `/etc/os-release`'s
+/// `ID`, `ID_LIKE` and `VARIANT_ID`. Only read for a host (non-Flatpak) build,
+/// where the layer has to come from the host's own packages.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Distro {
+    id: String,
+    like: Vec<String>,
+    variant: String,
+}
+
+impl Distro {
+    fn here() -> Distro {
+        std::fs::read_to_string("/etc/os-release")
+            .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))
+            .map(|t| Distro::parse(&t))
+            .unwrap_or_default()
     }
+
+    fn parse(text: &str) -> Distro {
+        let mut d = Distro::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else { continue };
+            let value = value.trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase();
+            match key.trim() {
+                "ID" => d.id = value,
+                "ID_LIKE" => d.like = value.split_whitespace().map(str::to_owned).collect(),
+                "VARIANT_ID" => d.variant = value,
+                _ => {}
+            }
+        }
+        d
+    }
+
+    fn is(&self, family: &str) -> bool {
+        self.id == family || self.like.iter().any(|l| l == family)
+    }
+
+    /// An image-based Fedora (Silverblue, Kinoite, Bluefin, Bazzite, Aurora
+    /// and friends), where `dnf install` does not work on the host and packages
+    /// are layered with rpm-ostree instead.
+    fn is_atomic_fedora(&self) -> bool {
+        const ATOMIC: [&str; 8] =
+            ["silverblue", "kinoite", "sericea", "onyx", "bluefin", "bazzite", "aurora", "ublue"];
+        ATOMIC.iter().any(|a| self.id.contains(a) || self.variant.contains(a))
+            || std::path::Path::new("/run/ostree-booted").exists() && self.is("fedora")
+    }
+}
+
+/// One line naming the command for this distribution, falling back to a plain
+/// sentence where the package name is not known for certain. Only package
+/// names confirmed in each distribution's main repositories are named.
+fn host_install_hint(d: &Distro, layer: Layer) -> String {
+    let (fedora, arch, debian, suse, nix) = match layer {
+        Layer::MangoHud => ("mangohud", "mangohud", "mangohud", "mangohud", "mangohud"),
+        Layer::VkBasalt => ("vkBasalt", "vkbasalt", "vkbasalt", "vkbasalt", "vkbasalt"),
+    };
+    let generic = match layer {
+        Layer::MangoHud => "Install MangoHud from your distribution's packages.",
+        Layer::VkBasalt => "Install vkBasalt from your distribution's packages.",
+    };
+    if d.is("fedora") && d.is_atomic_fedora() {
+        format!("Install it with: rpm-ostree install {fedora} (then reboot)")
+    } else if d.is("fedora") {
+        format!("Install it with: sudo dnf install {fedora}")
+    } else if d.is("arch") {
+        format!("Install it with: sudo pacman -S {arch}")
+    } else if d.is("debian") || d.is("ubuntu") {
+        format!("Install it with: sudo apt install {debian}")
+    } else if d.is("suse") || d.is("opensuse") || d.id.starts_with("opensuse") {
+        format!("Install it with: sudo zypper install {suse}")
+    } else if d.is("nixos") {
+        format!("Add pkgs.{nix} to your configuration")
+    } else {
+        generic.to_owned()
+    }
+}
+
+/// How to get `adb` on this distribution, for the Quest set-up pages
+/// (ADR-053). The same `Distro` reading as the layer hints, with the package
+/// each distribution names it: `android-tools` on Fedora, Arch, openSUSE and
+/// Nix, `adb` on Debian and Ubuntu.
+pub fn adb_install_hint() -> String {
+    // The Flatpak carries no adb and cannot run the host's: bundling one
+    // would also need raw USB access (`--device=usb`), which the manifest
+    // does not grant for a path nobody has run in the sandbox against a
+    // headset, and `flatpak-spawn --host` is a sandbox escape it refuses
+    // outright (packaging/io.github.luohoa97.Cordial.yml). So the pull is two
+    // commands on the host, and the import is the file picker's.
+    if in_flatpak() {
+        return "Cordial's Flatpak has no adb and cannot run the one on your computer. In a terminal, with \
+                the headset connected and allowed, run `adb shell pm path com.roblox.client`, then \
+                `adb pull` the path it prints, and choose I Have the APK File in Settings → VR."
+            .into();
+    }
+    adb_install_hint_for(&Distro::here())
+}
+
+fn adb_install_hint_for(d: &Distro) -> String {
+    if d.is("fedora") && d.is_atomic_fedora() {
+        "Install it with: rpm-ostree install android-tools (then reboot)".into()
+    } else if d.is("fedora") {
+        "Install it with: sudo dnf install android-tools".into()
+    } else if d.is("arch") {
+        "Install it with: sudo pacman -S android-tools".into()
+    } else if d.is("debian") || d.is("ubuntu") {
+        "Install it with: sudo apt install adb".into()
+    } else if d.is("suse") || d.is("opensuse") || d.id.starts_with("opensuse") {
+        "Install it with: sudo zypper install android-tools".into()
+    } else if d.is("nixos") {
+        "Add pkgs.android-tools to your configuration".into()
+    } else {
+        "Install Android's platform tools (adb) from your distribution's packages.".into()
+    }
+}
+
+pub fn mangohud_install_hint() -> String {
+    mangohud_install_hint_for(in_flatpak())
+}
+
+fn mangohud_install_hint_for(flatpak: bool) -> String {
+    if flatpak {
+        return format!(
+            "Install the Flatpak extension: flatpak install flathub \
+             org.freedesktop.Platform.VulkanLayer.MangoHud//{VULKAN_LAYER_BRANCH}"
+        );
+    }
+    host_install_hint(&Distro::here(), Layer::MangoHud)
 }
 
 /// Where MangoHUD's implicit layer manifest is, or `None` if it is not
@@ -646,25 +916,7 @@ pub fn mangohud_install_hint() -> &'static str {
 /// `MangoHud.x86.json` and plain `MangoHud.json` depending on version and
 /// architecture, and a fixed list would go stale silently.
 pub fn mangohud_layer() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut dirs: Vec<PathBuf> = Vec::new();
-
-    if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
-        dirs.push(PathBuf::from(x).join("vulkan/implicit_layer.d"));
-    } else if let Some(h) = &home {
-        dirs.push(h.join(".local/share/vulkan/implicit_layer.d"));
-    }
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-        dirs.push(PathBuf::from(x).join("vulkan/implicit_layer.d"));
-    } else if let Some(h) = &home {
-        dirs.push(h.join(".config/vulkan/implicit_layer.d"));
-    }
-    let data_dirs = std::env::var("XDG_DATA_DIRS")
-        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
-    for d in data_dirs.split(':').filter(|d| !d.is_empty()) {
-        dirs.push(PathBuf::from(d).join("vulkan/implicit_layer.d"));
-    }
-    dirs.push(PathBuf::from("/etc/vulkan/implicit_layer.d"));
+    let mut dirs = vulkan_implicit_layer_dirs();
     // The Flatpak runtime extension, which mounts here rather than anywhere
     // XDG_DATA_DIRS points at.
     dirs.push(PathBuf::from(
@@ -695,15 +947,198 @@ fn find_mangohud_layer_in(dirs: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
+/// What to tell somebody who wants vkBasalt and has not got it.
+///
+/// Same reasoning as [`mangohud_install_hint`], and the same trap: the Flatpak
+/// extension and the host package are not interchangeable, and which one is
+/// right is decided by how Cordial was installed, not by preference.
+pub fn vkbasalt_install_hint() -> String {
+    vkbasalt_install_hint_for(in_flatpak())
+}
+
+fn vkbasalt_install_hint_for(flatpak: bool) -> String {
+    if flatpak {
+        return format!(
+            "Install the Flatpak extension: flatpak install flathub \
+             org.freedesktop.Platform.VulkanLayer.vkBasalt//{VULKAN_LAYER_BRANCH}"
+        );
+    }
+    host_install_hint(&Distro::here(), Layer::VkBasalt)
+}
+
+/// Where vkBasalt's implicit layer manifest is, or `None` if it is not
+/// installed.
+///
+/// The same check as [`mangohud_layer`], for the same reason: `ENABLE_VKBASALT=1`
+/// is not an error when there is no vkBasalt, so a switch that does not check
+/// first is a switch that appears to work and does nothing.
+///
+/// The search path is identical to `mangohud_layer`'s, because both are
+/// implicit layers the Vulkan loader discovers the same way, and both ship a
+/// Flatpak runtime extension mounted under `/usr/lib/extensions/vulkan`.
+/// Fedora's `vkBasalt` package installs `vkBasalt.json` at
+/// `/usr/share/vulkan/implicit_layer.d` — confirmed by installing the package
+/// and reading `rpm -ql` rather than assumed — which the prefix match below
+/// finds regardless of the exact casing or architecture suffix a distribution
+/// chooses.
+pub fn vkbasalt_layer() -> Option<PathBuf> {
+    let mut dirs = vulkan_implicit_layer_dirs();
+    // The Flatpak runtime extension, which mounts here rather than anywhere
+    // XDG_DATA_DIRS points at — see `mangohud_layer`'s identical entry.
+    dirs.push(PathBuf::from("/usr/lib/extensions/vulkan/vkBasalt/share/vulkan/implicit_layer.d"));
+    find_vkbasalt_layer_in(&dirs)
+}
+
+/// The Vulkan loader's implicit-layer search path, plus the Flatpak extension
+/// mount point — shared by [`mangohud_layer`] and [`vkbasalt_layer`] so the two
+/// detectors cannot drift apart on where they look, only on what they look for.
+fn vulkan_implicit_layer_dirs() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
+        dirs.push(PathBuf::from(x).join("vulkan/implicit_layer.d"));
+    } else if let Some(h) = &home {
+        dirs.push(h.join(".local/share/vulkan/implicit_layer.d"));
+    }
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
+        dirs.push(PathBuf::from(x).join("vulkan/implicit_layer.d"));
+    } else if let Some(h) = &home {
+        dirs.push(h.join(".config/vulkan/implicit_layer.d"));
+    }
+    let data_dirs = std::env::var("XDG_DATA_DIRS")
+        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
+    for d in data_dirs.split(':').filter(|d| !d.is_empty()) {
+        dirs.push(PathBuf::from(d).join("vulkan/implicit_layer.d"));
+    }
+    dirs.push(PathBuf::from("/etc/vulkan/implicit_layer.d"));
+    dirs
+}
+
+/// The scan, split out for the same testing reason as
+/// [`find_mangohud_layer_in`]: built against a directory made for the test
+/// rather than whatever happens to be installed on the machine running it.
+fn find_vkbasalt_layer_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_ascii_lowercase();
+            if name.starts_with("vkbasalt") && name.ends_with(".json") {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
+}
+
+/// vkBasalt's toggle key, chosen rather than left at upstream's default.
+///
+/// Upstream's own example ships `toggleKey = Home`, and Home is a real Roblox
+/// chat key — it moves the cursor to the start of a line while a chat box is
+/// focused. vkBasalt does not consume the key or care which window has focus:
+/// `keyboard_input_x11.cpp` polls the X11 keyboard globally with
+/// `XQueryKeymap`, so upstream's default would toggle the shader effect on
+/// every message somebody types that starts with a jump to the beginning of the
+/// line. `Scroll_Lock` is not bound by Roblox, by GTK, or by Cordial's own
+/// `fullscreen_accel` (F11 by default), and is one of the few keys nobody
+/// reaches for while typing.
+///
+/// **This only matters when the toggle can fire at all.** Read from the same
+/// source: `isKeyPressedX11` looks at `$DISPLAY` once and returns `false`
+/// forever when it is unset, which is Cordial's own Wayland backend — the
+/// primary one, per ADR-011 — with no XWayland running. On that backend the
+/// key does nothing at all and `enableOnLaunch` is the only lever there is;
+/// the choice below still matters on the X11 backend (ADR-024) and for anybody
+/// running XWayland alongside. Documented in `docs/shaders.md` rather than left
+/// for somebody to find by testing a key that appears to do nothing.
+const VKBASALT_TOGGLE_KEY: &str = "Scroll_Lock";
+
+/// The vkBasalt config Cordial writes the first time a profile turns the
+/// switch on.
+///
+/// CAS plus SMAA, which is the pairing the settings row promises: a sharpen
+/// pass and an anti-alias pass, in that order, at upstream's own documented
+/// defaults for both (`config/vkBasalt.json.in` in the vkBasalt repository,
+/// zlib licence) rather than any third party's tuned numbers — see
+/// `docs/adr` for why VineShade's own config specifically was not read for
+/// this. `enableOnLaunch = True` matters more here than it would upstream,
+/// for the reason [`VKBASALT_TOGGLE_KEY`]'s doc explains: on Cordial's default
+/// Wayland backend the toggle key cannot fire, so an effect that started
+/// disabled would need the X11 backend just to be turned on once.
+fn vkbasalt_config_template() -> String {
+    format!(
+        "# Written once by Cordial when vkBasalt was first switched on for this\n\
+         # profile. Cordial never rewrites this file after this — edit the effects\n\
+         # list, the sharpening strength, or the toggle key below and it stays\n\
+         # exactly as you left it.\n\
+         #\n\
+         # Full key reference: https://github.com/DadSchoorse/vkBasalt/blob/master/config/vkBasalt.json.in\n\
+         #\n\
+         # The toggle key below only does anything when vkBasalt can see a real X11\n\
+         # keyboard (`$DISPLAY` set) -- it polls the keyboard directly rather than\n\
+         # through the window, so it does nothing on Cordial's default Wayland\n\
+         # backend with no XWayland running. See docs/shaders.md.\n\
+         \n\
+         effects = cas:smaa\n\
+         \n\
+         toggleKey = {VKBASALT_TOGGLE_KEY}\n\
+         enableOnLaunch = True\n\
+         \n\
+         # Contrast Adaptive Sharpening. 0.0 is barely sharpened, 1.0 is maximum.\n\
+         casSharpness = 0.4\n\
+         \n\
+         # Enhanced Subpixel Morphological Antialiasing, upstream's own defaults.\n\
+         smaaEdgeDetection = luma\n\
+         smaaThreshold = 0.05\n\
+         smaaMaxSearchSteps = 32\n\
+         smaaMaxSearchStepsDiag = 16\n\
+         smaaCornerRounding = 25\n"
+    )
+}
+
+/// Where the per-profile vkBasalt config for `profile_name` lives.
+///
+/// Inside the profile's own directory (`cordial_shell::profile::dir`), on the
+/// same footing as the engine's `appData` and the cookie store: which shaders
+/// somebody has picked is a per-account preference in the same way their
+/// pointer acceleration is not, and two profiles on one machine should not
+/// fight over one shared file.
+pub fn vkbasalt_config_path(profile_name: &str) -> Result<PathBuf, String> {
+    Ok(cordial_shell::profile::dir(profile_name)?.join("vkBasalt.conf"))
+}
+
+/// Write the generated config to `path`, but only if nothing is there yet.
+///
+/// **Never overwrites.** A config that replaced a file the user had already
+/// edited would be the settings-page equivalent of a stub that returns
+/// success: the switch would appear to respect a choice it just discarded.
+/// `create_new` is what enforces this — not a `path.exists()` check beforehand,
+/// which would leave a window between the check and the write for another
+/// launch of the same profile to land in.
+fn ensure_vkbasalt_config(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => file.write_all(vkbasalt_config_template().as_bytes()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// The command line quoted back when the client dies at once.
 ///
 /// It carries `--join-url` when there was one, because a launch that fails only
 /// with a link on it is exactly the launch somebody needs to be able to repeat
 /// in a terminal.
-fn describe(loader: &Path, lib_dir: &Path, apk: &Path, run: &str, join_url: Option<&str>) -> String {
+fn describe(loader: &Path, lib_dir: &Path, apk: &Path, run: &str, join_url: Option<&str>, vr: bool) -> String {
     let join = join_url.map(|u| format!(" --join-url {u}")).unwrap_or_default();
+    let mode = if vr { "--guest-arm64 --app-bridge" } else { "--game-activity" };
     format!(
-        "{} --lib-dir {} --apk {} --host-libc --game-activity --run {run}{join}",
+        "{} --lib-dir {} --apk {} --host-libc {mode} --run {run}{join}",
         loader.display(),
         lib_dir.display(),
         apk.display()
@@ -712,6 +1147,21 @@ fn describe(loader: &Path, lib_dir: &Path, apk: &Path, run: &str, join_url: Opti
 
 #[cfg(test)]
 mod tests {
+
+    /// The layer branch in the install hints has to follow the Flatpak runtime.
+    /// GNOME 50 loads VulkanLayer 25.08; a runtime bump must revisit both.
+    #[test]
+    fn the_vulkan_layer_branch_follows_the_flatpak_runtime() {
+        let manifest = include_str!("../../../packaging/io.github.luohoa97.Cordial.yml");
+        assert!(
+            manifest.lines().any(|l| l.trim() == "runtime-version: '50'"),
+            "the Flatpak runtime changed; update VULKAN_LAYER_BRANCH to the VulkanLayer \
+             version it declares (flatpak info --show-metadata org.gnome.Platform//N)"
+        );
+        assert_eq!(VULKAN_LAYER_BRANCH, "25.08");
+        assert!(vkbasalt_install_hint_for(true).ends_with(&format!("//{VULKAN_LAYER_BRANCH}")));
+        assert!(mangohud_install_hint_for(true).ends_with(&format!("//{VULKAN_LAYER_BRANCH}")));
+    }
 
     #[test]
     fn a_session_line_is_replaced_rather_than_kept_or_dropped() {
@@ -774,7 +1224,7 @@ mod tests {
         let result = spawn(
             &build,
             claim,
-            LaunchRequest { run_seconds: Some(1), join_url: None, secret_store: None },
+            LaunchRequest { run_seconds: Some(1), join_url: None, secret_store: None, vr: None },
         );
 
         std::env::remove_var("CORDIAL_PROFILE_ROOT");
@@ -792,6 +1242,102 @@ mod tests {
         };
         assert!(err.contains("vpn-required"), "{err}");
         assert!(err.contains("check"), "{err}");
+    }
+
+    #[test]
+    fn the_shell_actually_hands_vkbasalt_env_to_the_client() {
+        // Every other test above proves the pieces -- detection, the hint, the
+        // toggle key, the config that is never overwritten. None of them prove
+        // the thing the settings row promises: that switching it on in
+        // `shell.json` actually reaches the client's environment when a launch
+        // goes through `spawn`, which is the one path a user's toggle takes.
+        //
+        // A stub `cordial-run` on `PATH` stands in for the 115 MB engine --
+        // real for `loader_path`'s lookup, and cheap enough to run inside
+        // `cargo test --workspace` rather than behind `--ignored`, unlike
+        // `a_launch_really_starts_the_client` below.
+        let _env_guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _root_guard = crate::PROFILE_ROOT_ENV.lock().unwrap_or_else(|e| e.into_inner());
+
+        let root = std::env::temp_dir().join("cordial-vkbasalt-env-test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // The fake layer, so `vkbasalt_layer()` finds one and the switch is not
+        // reported as unavailable -- exactly the guard `mangohud_layer` has,
+        // exercised rather than bypassed. `vulkan_implicit_layer_dirs` joins
+        // each `XDG_DATA_DIRS` entry with `vulkan/implicit_layer.d` directly
+        // (the same shape as the real `/usr/share`), so the manifest goes
+        // straight under `root` rather than under a `share/` of its own.
+        let layer_dir = root.join("vulkan/implicit_layer.d");
+        std::fs::create_dir_all(&layer_dir).unwrap();
+        std::fs::write(layer_dir.join("vkBasalt.json"), "{}").unwrap();
+
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let capture = root.join("captured-env");
+        std::fs::write(
+            bin_dir.join(LOADER),
+            format!("#!/bin/sh\nenv > {}\n", capture.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            bin_dir.join(LOADER),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let profile_root = root.join("profiles");
+        std::fs::create_dir_all(&profile_root).unwrap();
+        std::env::set_var("CORDIAL_PROFILE_ROOT", &profile_root);
+        std::env::set_var("XDG_DATA_DIRS", &root);
+        let shell_config_path = root.join("shell.json");
+        std::env::set_var("CORDIAL_SHELL_CONFIG", &shell_config_path);
+        shell_config::save(
+            &shell_config_path,
+            &crate::shell_config::ShellConfig { vkbasalt: true, ..Default::default() },
+        )
+        .unwrap();
+
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs = vec![bin_dir.clone()];
+        dirs.extend(std::env::split_paths(&old_path));
+        std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+
+        let claim = cordial_shell::profile::acquire("vkbasalt-env-test").expect("a fresh profile is free");
+        let build = Build { apk: PathBuf::from("/nonexistent.apk"), lib_dir: PathBuf::from("/nonexistent") };
+        let result = spawn(
+            &build,
+            claim,
+            LaunchRequest { run_seconds: Some(1), join_url: None, secret_store: None, vr: None },
+        );
+
+        let mut instance = result.expect("the stub loader must be found and spawned");
+        let _ = instance.child.wait();
+
+        std::env::set_var("PATH", &old_path);
+        std::env::remove_var("CORDIAL_PROFILE_ROOT");
+        std::env::remove_var("CORDIAL_SHELL_CONFIG");
+        std::env::remove_var("XDG_DATA_DIRS");
+
+        let captured = std::fs::read_to_string(&capture)
+            .unwrap_or_else(|e| panic!("the stub never ran or never wrote {}: {e}", capture.display()));
+
+        assert!(captured.contains("ENABLE_VKBASALT=1"), "{captured}");
+        let config_line = captured
+            .lines()
+            .find(|l| l.starts_with("VKBASALT_CONFIG_FILE="))
+            .unwrap_or_else(|| panic!("no VKBASALT_CONFIG_FILE in:\n{captured}"))
+            .to_string();
+        assert!(config_line.ends_with("vkBasalt.conf"), "{config_line}");
+        // And the config the client was pointed at genuinely exists -- checked
+        // before `root` is removed below, since it lives under it -- a path
+        // handed to the engine that nothing wrote would be the same failure as
+        // no variable at all, just one step further along.
+        let path_str = config_line.trim_start_matches("VKBASALT_CONFIG_FILE=");
+        assert!(Path::new(path_str).is_file(), "{path_str} was never written");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -817,6 +1363,7 @@ mod tests {
             Path::new("/home/a/base.apk"),
             "600",
             None,
+            false,
         );
         assert!(line.contains("--lib-dir /home/a/.cache/cordial/lib/x86_64"), "{line}");
         assert!(line.contains("--apk /home/a/base.apk"), "{line}");
@@ -836,8 +1383,23 @@ mod tests {
             Path::new("/base.apk"),
             "0",
             Some("roblox-player://placeId=1818"),
+            false,
         );
         assert!(line.contains("--join-url roblox-player://placeId=1818"), "{line}");
+    }
+
+    #[test]
+    fn a_vr_launch_quotes_the_translator_and_the_app_bridge_instead_of_game_activity() {
+        let line = describe(
+            Path::new("/app/bin/cordial-run"),
+            Path::new("/c/builds/arm64-v8a/2.740.0.927"),
+            Path::new("/c/builds/arm64-v8a/2.740.0.927/base.apk"),
+            "0",
+            None,
+            true,
+        );
+        assert!(line.contains("--guest-arm64 --app-bridge"), "{line}");
+        assert!(!line.contains("--game-activity"), "{line}");
     }
 
     #[test]
@@ -879,11 +1441,12 @@ mod tests {
         // while running a host build -- twice -- and got silence, because that
         // layer's manifest names a library under /usr/lib/extensions which only
         // exists inside a sandbox.
-        let hint = mangohud_install_hint();
-        if in_flatpak() {
-            assert!(hint.contains("flatpak install"), "{hint}");
-            assert!(!hint.contains("dnf install"), "{hint}");
-        } else {
+        let hint = mangohud_install_hint_for(true);
+        assert!(hint.contains("flatpak install"), "{hint}");
+        assert!(!hint.contains("dnf install"), "{hint}");
+        let fedora = Distro::parse("ID=fedora\nVARIANT_ID=workstation\n");
+        let hint = host_install_hint(&fedora, Layer::MangoHud);
+        {
             assert!(hint.contains("dnf install"), "{hint}");
             // It used to name the Flatpak extension in order to rule it out,
             // and that clause was most of what made this string too long to
@@ -922,6 +1485,98 @@ mod tests {
         assert!(find_mangohud_layer_in(&[missing, root.clone()]).is_some());
 
         let _ = std::fs::remove_dir_all(root.parent().expect("has a parent"));
+    }
+
+    #[test]
+    fn the_vkbasalt_hint_names_one_package_and_it_matches_how_cordial_was_installed() {
+        // Same failure mode `the_mangohud_hint_names_one_package...` guards
+        // against, for the same two packages that cannot see each other.
+        let hint = vkbasalt_install_hint_for(true);
+        assert!(hint.contains("flatpak install"), "{hint}");
+        assert!(!hint.contains("dnf install"), "{hint}");
+        let fedora = Distro::parse("ID=fedora\nVARIANT_ID=workstation\n");
+        let hint = host_install_hint(&fedora, Layer::VkBasalt);
+        assert!(hint.contains("dnf install vkBasalt"), "{hint}");
+        assert!(!hint.contains("flatpak install"), "{hint}");
+    }
+
+    #[test]
+    fn the_host_hint_follows_the_distribution() {
+        let cases = [
+            ("ID=arch\n", "pacman -S vkbasalt"),
+            ("ID=cachyos\nID_LIKE=arch\n", "pacman -S vkbasalt"),
+            ("ID=ubuntu\nID_LIKE=debian\n", "apt install vkbasalt"),
+            ("ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n", "apt install vkbasalt"),
+            ("ID=\"opensuse-tumbleweed\"\nID_LIKE=\"opensuse suse\"\n", "zypper install vkbasalt"),
+            ("ID=nixos\n", "pkgs.vkbasalt"),
+            ("ID=bluefin\nID_LIKE=\"fedora\"\nVARIANT_ID=bluefin-dx\n", "rpm-ostree install vkBasalt"),
+            ("ID=fedora\nVARIANT_ID=silverblue\n", "rpm-ostree install vkBasalt"),
+            ("ID=gentoo\n", "from your distribution"),
+            ("", "from your distribution"),
+        ];
+        for (os_release, want) in cases {
+            let hint = host_install_hint(&Distro::parse(os_release), Layer::VkBasalt);
+            assert!(hint.contains(want), "{os_release:?} gave {hint:?}, wanted {want:?}");
+        }
+    }
+
+    #[test]
+    fn the_vkbasalt_layer_is_found_by_prefix_and_not_by_an_exact_filename() {
+        // Confirmed against the real Fedora package, which installs
+        // `vkBasalt.json` at `/usr/share/vulkan/implicit_layer.d` --
+        // `rpm -ql vkBasalt` inside the build container, not assumed -- but the
+        // prefix match is what has to hold across distributions and versions.
+        let root = std::env::temp_dir().join("cordial-vkbasalt-detect/implicit_layer.d");
+        let _ = std::fs::remove_dir_all(root.parent().expect("has a parent"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("VkLayer_MESA_device_select.json"), "{}").unwrap();
+
+        assert!(
+            find_vkbasalt_layer_in(&[root.clone()]).is_none(),
+            "an unrelated implicit layer must not read as vkBasalt"
+        );
+
+        std::fs::write(root.join("vkBasalt.json"), "{}").unwrap();
+        let found = find_vkbasalt_layer_in(&[root.clone()]).expect("the layer is there now");
+        assert!(found.ends_with("vkBasalt.json"), "{}", found.display());
+
+        let missing = root.join("nowhere");
+        assert!(find_vkbasalt_layer_in(&[missing, root.clone()]).is_some());
+
+        let _ = std::fs::remove_dir_all(root.parent().expect("has a parent"));
+    }
+
+    #[test]
+    fn vkbasalt_toggle_key_is_not_a_key_roblox_chat_uses() {
+        // The whole reason upstream's own `Home` default was not kept: it is a
+        // real Roblox chat key (cursor to start of line), and vkBasalt polls
+        // the keyboard globally rather than through the focused window, so
+        // typing in chat would have toggled the effect. Pinned so nobody
+        // reintroduces Home while simplifying the config template.
+        assert_ne!(VKBASALT_TOGGLE_KEY, "Home");
+        assert_eq!(VKBASALT_TOGGLE_KEY, "Scroll_Lock");
+    }
+
+    #[test]
+    fn the_generated_vkbasalt_config_is_never_overwritten() {
+        // The whole point of `ensure_vkbasalt_config`: a user who has edited
+        // their config must not have it silently replaced the next time the
+        // switch happens to be read at launch.
+        let dir = std::env::temp_dir().join("cordial-vkbasalt-config-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("vkBasalt.conf");
+
+        ensure_vkbasalt_config(&path).expect("first write succeeds");
+        let generated = std::fs::read_to_string(&path).unwrap();
+        assert!(generated.contains("effects = cas:smaa"));
+        assert!(generated.contains(VKBASALT_TOGGLE_KEY));
+
+        std::fs::write(&path, "# a user's own config\neffects = fxaa\n").unwrap();
+        ensure_vkbasalt_config(&path).expect("second call must not fail");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "# a user's own config\neffects = fxaa\n", "the user's edit must survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Everything the chooser row does, minus the click.
@@ -968,7 +1623,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::env::set_var("CORDIAL_PROFILE_ROOT", &root);
 
-        let build = match install::locate(&install::RobloxInstall::default()) {
+        let build = match profile::dir("e2e").map_err(|e| install::NotFound::Unusable(e)).and_then(|d| install::resolve(&d)) {
             Ok(build) => build,
             Err(e) => {
                 println!("no Roblox build on this machine, nothing to prove: {e:?}");
@@ -982,7 +1637,7 @@ mod tests {
         let mut instance = spawn(
             &build,
             claim,
-            LaunchRequest { run_seconds: Some(40), join_url: None, secret_store: None },
+            LaunchRequest { run_seconds: Some(40), join_url: None, secret_store: None, vr: None },
         )
         .expect("the client starts");
 
@@ -1017,4 +1672,19 @@ mod tests {
         instance.child.wait().ok();
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn the_adb_hint_names_each_distributions_package() {
+        for (release, want) in [
+            ("ID=fedora\n", "dnf install android-tools"),
+            ("ID=kinoite\nID_LIKE=fedora\n", "rpm-ostree install android-tools"),
+            ("ID=arch\n", "pacman -S android-tools"),
+            ("ID=ubuntu\nID_LIKE=debian\n", "apt install adb"),
+            ("ID=\"opensuse-tumbleweed\"\nID_LIKE=\"opensuse suse\"\n", "zypper install android-tools"),
+        ] {
+            let hint = adb_install_hint_for(&Distro::parse(release));
+            assert!(hint.contains(want), "{release:?}: {hint}");
+        }
+    }
+
 }

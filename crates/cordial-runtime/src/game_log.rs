@@ -87,6 +87,19 @@ pub enum Event {
     /// Passed through rather than parsed here so that this module stays "what
     /// the log said" and the protocol stays in the module that documents it.
     Rpc(String),
+    /// The engine's settings reloader ran and applied Roblox's settings document.
+    ///
+    /// Not about a game at all, and here because this is the one place that
+    /// already tails the engine's log. It is what `flag_reapply` waits for: the
+    /// refresh reverts every `DF*` override, so the overrides go back in
+    /// straight after it. The line is the last of the refresh, written after
+    /// the flag cache is, and has been in every log that ran past two minutes
+    /// at about 120, 241 and 362 seconds.
+    ///
+    /// `Could not fetch settings` means the fetch failed, which reverts nothing
+    /// and is deliberately not this event. The `Skipping flag cache write`
+    /// wording was found in a contributor's log (pull request 73).
+    SettingsRefreshed,
 }
 
 /// One log line, or `None` if it is not one of the four.
@@ -101,6 +114,16 @@ pub fn parse_line(line: &str) -> Option<Event> {
     }
     if line.contains("[FLog::SingleSurfaceApp] leaveUGCGameInternal") {
         return Some(Event::Left);
+    }
+    // Two wordings of the end of a refresh: `finished flag fetch`, seen in every
+    // log that ran past two minutes, and `Skipping flag cache write: ...`, which
+    // a contributor's log shows in its place in a session on another channel.
+    // The failed fetch (`Could not fetch settings`) and the rollout-time line
+    // after it apply no document and revert nothing, so they are not events.
+    if line.contains("[FLog::DynamicFastVariableReloader]")
+        && (line.contains("finished flag fetch") || line.contains("Skipping flag cache write"))
+    {
+        return Some(Event::SettingsRefreshed);
     }
     if line.contains("[FLog::GameJoinLoadTime]") && line.contains("game_join_loadtime") {
         // All three or none. A join with one id and not the others is a line
@@ -302,15 +325,13 @@ fn newest_log(dir: &Path) -> Option<PathBuf> {
 
 /// Where the engine writes its logs, for this profile.
 ///
-/// The same expression `load.rs` uses to build the tree in the first place:
-/// `CORDIAL_FILES_DIR` when set, otherwise `<profile>/data`. Repeated rather
-/// than shared because the two are the same fact from opposite ends -- one
-/// creates the directory and one reads it -- and a helper spanning a binary
-/// and its library would be the wrong shape for one `format!`.
+/// The same root `load.rs` builds the tree under, from the same function:
+/// `CORDIAL_FILES_DIR` when set, otherwise `data/` under the profile's engine
+/// root. This used to repeat the `format!`, which was fine while there was one
+/// layout and would have read a Quest run's logs from the phone build's tree
+/// once there were two (ADR-053).
 fn logs_dir() -> PathBuf {
-    let root = std::env::var("CORDIAL_FILES_DIR")
-        .unwrap_or_else(|_| format!("{}/data", crate::profile::active().display()));
-    PathBuf::from(root).join("files/appData/logs")
+    crate::profile::engine_data().join("files/appData/logs")
 }
 
 /// `CORDIAL_CLOSE_ON_LEAVE=1` — exit when the user leaves a game.
@@ -320,9 +341,31 @@ fn logs_dir() -> PathBuf {
 /// wants it deliberately: they launched from a deep link to play one game and
 /// have no use for the home screen afterwards. Somebody who did not ask and
 /// meets it once has lost their session to a setting they did not know existed.
+///
+/// The environment gives the starting value; the shell's `settings.set`
+/// can change it afterwards ([`set_close_on_leave`], ADR-044), which is safe to
+/// read on the log poll's schedule because it is one relaxed atomic load.
 fn close_on_leave() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| close_on_leave_for(std::env::var("CORDIAL_CLOSE_ON_LEAVE").ok().as_deref()))
+    close_on_leave_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn close_on_leave_cell() -> &'static std::sync::atomic::AtomicBool {
+    static ON: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
+    ON.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(close_on_leave_for(
+            std::env::var("CORDIAL_CLOSE_ON_LEAVE").ok().as_deref(),
+        ))
+    })
+}
+
+/// Change the quit-on-leave choice in a running client.
+pub fn set_close_on_leave(on: bool) {
+    close_on_leave_cell().store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The value in force, for the live-settings `get` reply.
+pub fn current_close_on_leave() -> bool {
+    close_on_leave()
 }
 
 /// The gate's decision, split out so it can be tested -- `close_on_leave`
@@ -477,6 +520,9 @@ pub fn poll() {
 
     for event in watcher.poll() {
         match event {
+            // Not a game event. Handed to the worker that owns the re-apply,
+            // which does the work off this thread; see `flag_reapply`.
+            Event::SettingsRefreshed => crate::flag_reapply::note_engine_refresh(),
             Event::Joined { place_id, universe_id, user_id } => {
                 println!(
                     "[cordial] game: joined place {place_id} (universe {universe_id}) as {user_id}"
@@ -499,6 +545,10 @@ pub fn poll() {
                     // agree.
                     state.joined_at = Some(now_secs());
                 }
+                // Told to the launcher from the same update that wrote the state,
+                // so the snapshot it can ask for and the event it hears are one
+                // thing seen twice (ADR-055).
+                crate::control::game_joined(&session_state());
                 crate::plugin_host::publish_core(
                     cordial_plugins::core_events::GAME_PRESENCE,
                     presence_payload(),
@@ -532,6 +582,7 @@ pub fn poll() {
                 // The experience's name and creator go with the experience too.
                 *DEFAULTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 STATE.lock().unwrap_or_else(|e| e.into_inner()).left();
+                crate::control::game_left();
                 crate::plugin_host::publish_core(
                     cordial_plugins::core_events::GAME_PRESENCE,
                     serde_json::json!({}),
@@ -610,6 +661,7 @@ pub fn poll() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// Every line below is verbatim from the capture named in the module
     /// comment. Hand-written approximations of a log format are how a parser
@@ -810,6 +862,7 @@ mod tests {
                     println!("leave");
                 }
                 Some(Event::Rpc(_)) => rpc += 1,
+                Some(Event::SettingsRefreshed) => println!("settings refresh finished"),
                 None => {}
             }
         }
@@ -874,6 +927,54 @@ mod tests {
     fn a_fresh_presence_carries_nothing() {
         let payload = crate::bloxstrap_rpc::Presence::new().to_payload();
         assert_eq!(payload, serde_json::json!({}));
+    }
+
+    /// Lines the reloader logs around its 120 s refresh: the finished line
+    /// verbatim from `2.734.0.917_20260824T023830Z_Player_ee712_last.log`, the
+    /// failed fetch from `2.730.0.790_20260802T042333Z_Player_e5e7f_last.log`.
+    /// The `rollout` line that follows a failed fetch is not one either.
+    #[test]
+    fn a_refresh_is_an_event_and_a_failed_fetch_is_not() {
+        let finished = "2026-08-24T02:40:30.525Z,120.525764,c616d6c0,6,Info \
+             [FLog::DynamicFastVariableReloader] DynamicFastVariableReloader finished flag fetch. \
+             Tombstone status: invalid";
+        let failed = "2026-08-02T04:25:33.438Z,120.438156,348886c0,6,Warning \
+             [FLog::DynamicFastVariableReloader] Could not fetch settings";
+        let rollout = "2026-08-02T04:25:33.438Z,120.438156,348886c0,6,Info \
+             [FLog::DynamicFastVariableReloader] Setting rollout time to local time";
+        assert_eq!(parse_line(finished), Some(Event::SettingsRefreshed));
+        let skipped = "2026-09-30T22:33:02.260Z,120,260689,61bfb6c0,6,Info \
+             [FLog::DynamicFastVariableReloader] Skipping flag cache write: server channel differs \
+             from current session channel, preserving prefetched cache";
+        assert_eq!(parse_line(skipped), Some(Event::SettingsRefreshed), "another wording of the same refresh");
+        assert_eq!(parse_line(failed), None);
+        assert_eq!(parse_line(rollout), None);
+    }
+
+    /// The same, through the tail: a watcher following a growing log reports
+    /// the refresh once, when its line is complete.
+    #[test]
+    fn the_watcher_reports_a_refresh_when_the_line_lands() {
+        let dir = std::env::temp_dir().join(format!("cordial-game-log-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("player.log");
+        let line = "2026-08-24T02:40:30.525Z,120.525764,c616d6c0,6,Info \
+             [FLog::DynamicFastVariableReloader] DynamicFastVariableReloader finished flag fetch. \
+             Tombstone status: invalid";
+        std::fs::write(&log, "2026-08-24T02:40:30.489Z,120.4,c6,6 [FLog::Output] Settings Date header\n").unwrap();
+        let mut w = Watcher::new(&dir);
+        assert_eq!(w.poll(), Vec::new());
+        // Half a line first: the writer is mid-line, and the event must wait.
+        let (head, tail) = line.split_at(40);
+        std::fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(head.as_bytes()).unwrap();
+        assert_eq!(w.poll(), Vec::new());
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(tail.as_bytes()).unwrap();
+        f.write_all(b"\n").unwrap();
+        assert_eq!(w.poll(), vec![Event::SettingsRefreshed]);
+        assert_eq!(w.poll(), Vec::new(), "reported once");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An absent directory is silence, not an error.

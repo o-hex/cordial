@@ -37,11 +37,10 @@
 //! and the trait exists so that it is only those two things.
 //!
 //! That is also why this is a trait rather than a function with a `match` in
-//! it. [`local`] reads a file already on the disk and touches no network;
-//! [`mirror`] speaks an undocumented binary protocol to a third party and
-//! validates every URL it is handed. They share an output type and nothing
-//! else, and one function covering both would be a long `if` whose branches
-//! never meet.
+//! it. [`mirror`] speaks an undocumented binary protocol to a third party and
+//! validates every URL it is handed; a different protocol would share an
+//! output type with it and little else, and one function covering both would
+//! be a long `if` whose branches never meet.
 //!
 //! ## What a new provider is not allowed to do, and what enforces it
 //!
@@ -62,14 +61,16 @@
 //! So it is tested against a deliberately hostile provider rather than
 //! documented and hoped for: see `a_hostile_provider_cannot_get_anything_past_the_check`.
 //!
-//! ## The order matters and is not alphabetical
+//! ## There is one source, and Sober is not it
 //!
-//! [`all`] returns the zero-network source first. On a machine that already has
-//! the build -- which is most machines that have ever run Sober, and Sober is
-//! what the README tells people to install -- the whole of [`mirror`] is
-//! skipped: no request, no third party, no 150 MB, and nothing for a metered
-//! connection to object to. Reaching the network to fetch a file that is
-//! already present would be the worst version of this feature.
+//! [`all`] is the mirror alone. A machine that has Sober used to have its
+//! build found first, read in place, and reported as a download; that made
+//! Cordial's builds change when Sober's app did and left a first-time user
+//! with Sober never seeing the first-run screen. A build already on the
+//! disk is now an *import* ([`import`]): the user asks for it, it is verified
+//! like any download, copied into the store and forgotten.
+//! [ADR-054](../../../docs/adr/ADR-054-cordial-owns-its-roblox-builds.md)
+//! amends ADR-025's "free source first" ordering accordingly.
 
 use crate::Unreachable;
 use std::path::{Path, PathBuf};
@@ -109,7 +110,7 @@ impl Cancel {
     }
 }
 
-pub mod local;
+pub mod import;
 pub mod mirror;
 
 /// A version a provider says it can supply.
@@ -199,17 +200,12 @@ pub trait Provider {
 
 /// Why a build is being obtained, which decides how the sources are ordered.
 ///
-/// **These are not the same question and treating them as one was a bug.**
-/// `all()` returns the free source first, and for a first run that is exactly
-/// right: most machines that will run Cordial already have this file, and
-/// fetching a second copy from a mirror would be slower, more exposed and no
-/// more trustworthy. But the same ordering applied to an update means the local
-/// copy always wins, so **anybody with Sober installed could never receive a
-/// newer build** -- "Download Roblox" would reinstall the build they already
-/// had, for ever, and report success.
-///
-/// So an update asks every source what it has and takes the newest, and only
-/// falls back to order when the versions cannot be compared.
+/// With the mirror the only source ([`all`]) the two coincide; the distinction
+/// is kept because a second source is a line in [`all`] and the question of
+/// "cheapest" against "newest" is then real again. It used to matter: with a
+/// free local source first, **anybody with Sober installed could never receive
+/// a newer build**, because "Download Roblox" reinstalled the one they had and
+/// reported success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Want {
     /// Any usable build. Cheapest first.
@@ -218,11 +214,11 @@ pub enum Want {
     Newest,
 }
 
-/// Every source, in the order they should be tried.
+/// Every source, in the order they should be tried: the mirror.
 ///
-/// Zero-network first. See [`Want`] for when that ordering is wrong.
+/// Sober's copy is not a source. See the module documentation and [`import`].
 pub fn all() -> Vec<Box<dyn Provider>> {
-    vec![Box::new(local::OnThisMachine::default()), Box::new(mirror::ApkPure::default())]
+    vec![Box::new(mirror::ApkPure::default())]
 }
 
 /// The source named `name`, for a user who has chosen one.
@@ -606,110 +602,333 @@ pub(crate) fn obtain_into_store_from(
 
     let outcome = (|| {
         let archives = source.fetch(version, cancel, &staging, progress)?;
-        verify_archives(&archives, cancel, trusted, progress)?;
-        crate::install::file_into_store(&archive_names(&archives), root, cancel).map_err(from_install)
+        let certificate = verify_archives(&archives, cancel, trusted, progress)?;
+        // Filed with who signed it and where it came from, so the entry proves
+        // itself and a launch need not check it again (ADR-054). The mirror's
+        // `versionCode` rides along for display only.
+        let filing = crate::store::Filing {
+            source: crate::store::Source::Mirror,
+            signer: certificate,
+            version_code: Some(version.code).filter(|c| *c != 0),
+        };
+        crate::install::file_into_store(&archive_names(&archives), root, &filing, cancel)
+            .map_err(from_install)
     })();
 
     let _ = std::fs::remove_dir_all(&staging);
     outcome
 }
 
-/// Obtain a build and make it the one Cordial launches.
-///
-/// The whole thing, and the one call the shell needs: choose a source, fetch,
-/// verify against the pinned certificates, apply ADR-014's extraction refusals,
-/// extract the engine, and swap it in in an order that keeps a working build
-/// working if any step fails.
-///
-/// `staging` is where a downloading source writes. It is emptied first, because
-/// anything an interrupted attempt left there was never verified and is exactly
-/// the file the ordering exists to keep away from the live build.
-pub fn obtain_and_install(
-    preferred: Option<&str>,
-    want: Want,
-    store: Option<&crate::install::Store>,
+/// [`import_into_store`] into `store`, then what follows any filing: the old
+/// slot follows the newest entry and what nothing needs is collected. What the
+/// first-run screen's Copy button and Settings' imports call; the migration,
+/// which runs before there is a window to tidy for, calls the bare filing.
+pub fn import_and_tidy(
+    found: &import::Found,
+    source: crate::store::Source,
+    store: &crate::install::Store,
     cancel: &Cancel,
     progress: &mut dyn FnMut(Progress),
-) -> Result<(Obtained, crate::install::Installed), Unreachable> {
-    // **Before any network activity.**
-    ensure_room(&crate::install::build_dir())?;
+) -> Result<String, Unreachable> {
+    let version = import_into_store(found, source, &store.root, cancel, progress)?;
+    after_filing(store, &version, &crate::install::engine_dir());
+    Ok(version)
+}
 
-    // **One install at a time.** ADR-012's lock covers a profile; nothing
-    // covered the build directory, which every profile shares. Two clients --
-    // or one client and a second window -- could reach here together, and the
-    // loser would find its staging directory emptied, its archives renamed
-    // underneath it, or the engine cache stamped for a build it did not
-    // install. Held for the whole call; released when this returns, however it
-    // returns.
+/// Download the newest build from the mirror into the store, and leave the
+/// rest of the store as it was.
+///
+/// The Updates button, the Roblox page's Download Roblox, the background update
+/// and the first-run screen all call this. **It files; it does not install.**
+/// Nothing is swapped into a live slot, so a profile pinned to an older build
+/// and a client running one are untouched, and a profile on Latest moves at its
+/// next launch because the new entry is the newest one. Afterwards the old
+/// slot link follows the newest entry (best effort: it is for `just client`) and
+/// a garbage collection removes what nothing needs ([`store::gc_in`], spare
+/// one), saying what it removed.
+///
+/// A build the store already keeps is not downloaded again: the mirror's
+/// three-component name and the engine's four are compared as one build
+/// ([`crate::version::same_build`]), because fetching 230 MB to discover an
+/// entry already holds it would be the whole cost of an Update press that
+/// changes nothing. Returns the store's key for the build.
+pub fn update_store(
+    store: &crate::install::Store,
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String, Unreachable> {
+    update_store_from(
+        &mirror::ApkPure,
+        store,
+        &crate::apk_signature::pinned(),
+        &crate::install::engine_dir(),
+        cancel,
+        progress,
+    )
+}
+
+/// `slot` is a parameter so a test can hand it a scratch one: the filing
+/// re-points it, and a test that was given the real `engine_dir()` re-pointed
+/// the developer's own `$XDG_CACHE_HOME/cordial/lib/<abi>` into a temp dir that
+/// vanished at reboot.
+pub(crate) fn update_store_from(
+    source: &dyn Provider,
+    store: &crate::install::Store,
+    trusted: &[String],
+    slot: &Path,
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String, Unreachable> {
+    cancel.check()?;
+    let newest = source.newest(progress)?;
+    let kept = crate::store::list_in(&store.root);
+    let version = match kept
+        .iter()
+        .find(|e| e.launchable() && crate::version::same_build(&newest.name, &e.version))
+    {
+        Some(have) => have.version.clone(),
+        None => obtain_into_store_from(source, &newest, &store.root, trusted, cancel, progress)?,
+    };
+    after_filing(store, &version, slot);
+    Ok(version)
+}
+
+/// What follows a build landing in the store: the old slot follows the newest
+/// entry, and what nothing needs is collected. Both best effort and both said.
+fn after_filing(store: &crate::install::Store, version: &str, slot: &Path) {
+    // Only a slot that is absent or already a link is free to be pointed: a real
+    // directory is somebody's engine (the override's, `just client`'s).
+    let free = match std::fs::symlink_metadata(slot) {
+        Ok(m) => m.file_type().is_symlink(),
+        Err(_) => true,
+    };
+    if free {
+        let newest = crate::store::list_in(&store.root)
+            .into_iter()
+            .filter(|e| e.complete)
+            .max_by(|a, b| crate::store::compare(&a.version, &b.version));
+        if let Some(entry) = newest {
+            if let Err(e) = crate::store::point_current_at(slot, &entry.dir) {
+                println!("[update] could not point {} at Roblox {}: {e}", slot.display(), entry.version);
+            }
+        }
+    }
+    let dropped = crate::store::gc_in(&store.root, &store.protect, crate::store::SPARE);
+    if !dropped.is_empty() {
+        println!("[update] filed Roblox {version}; removed builds nothing uses: {}", dropped.join(", "));
+    }
+}
+
+/// The check an import takes: [`verify_archives`], the one every download takes.
+fn check_import(
+    found: &import::Found,
+    trusted: &[String],
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String, Unreachable> {
+    verify_archives(&found.archives, cancel, trusted, progress)
+}
+
+/// File a build that is already on this machine in the store, after the same
+/// signature check a download gets, and leave everything else alone.
+///
+/// The migration's route and the Settings imports': it touches nothing outside
+/// `root`, makes no build current and takes the store's `.downloading` lock, so
+/// it cannot interleave with a download. The archives are copied (they lie
+/// outside Cordial's directories), the entry says where it came from, and the
+/// original is never written. Returns the version the engine reads as.
+pub fn import_into_store(
+    found: &import::Found,
+    source: crate::store::Source,
+    root: &Path,
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String, Unreachable> {
+    import_into_store_trusting(found, source, root, &crate::apk_signature::pinned(), cancel, progress)
+}
+
+pub fn import_into_store_trusting(
+    found: &import::Found,
+    source: crate::store::Source,
+    root: &Path,
+    trusted: &[String],
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String, Unreachable> {
+    cancel.check()?;
+    std::fs::create_dir_all(root)
+        .map_err(|e| Unreachable::NoSource { why: format!("{}: {e}", root.display()) })?;
+    ensure_room(root)?;
     let _lock = exclusive(
-        &crate::install::build_dir().join(".installing"),
-        "another Cordial is already installing a Roblox build. Only one install can \
-         run at a time, because they share one build directory.",
+        &root.join(".downloading"),
+        "another Cordial window is already filing a Roblox build. Wait for it to finish.",
     )?;
-
-    let staging = crate::install::build_dir().join(".fetching");
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging)
-        .map_err(|e| Unreachable::NoSource { why: e.to_string() })?;
-
-    let outcome = (|| {
-        let obtained = obtain(preferred, want, cancel, &staging, progress)?;
-        let named = archive_names(&obtained.archives);
-
-        let installed = crate::install::adopt(
-            &named,
-            &crate::install::build_dir(),
-            &crate::install::engine_dir(),
-            &crate::install::build_dir().join(crate::install::INCOMING_ENGINE),
-            store,
-            cancel,
-            &mut |_, _, _| {},
-        )
-        .map_err(from_install)?;
-        Ok((obtained, installed))
-    })();
-
-    let _ = std::fs::remove_dir_all(&staging);
-    outcome
+    let certificate = check_import(found, trusted, cancel, progress)?;
+    let filing = crate::store::Filing { source, signer: certificate, version_code: None };
+    crate::install::file_into_store(&archive_names(&found.archives), root, &filing, cancel).map_err(from_install)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// ADR-054: Sober's copy is not a source. It used to be tried first, so a
+    /// machine with Sober never reached the mirror and a "download" copied
+    /// Sober's archives; the mirror is first, and alone.
     #[test]
-    fn the_zero_network_source_is_tried_first() {
+    fn the_mirror_is_the_only_source_and_nothing_local_is_offered() {
         let providers = all();
-        assert!(
-            !providers[0].needs_network(),
-            "a source that needs no network must come before one that does, or Cordial \
-             downloads a file it already has"
-        );
-    }
-
-    #[test]
-    fn every_source_has_a_distinct_name_and_can_be_asked_for_by_it() {
-        let names: Vec<_> = all().iter().map(|p| p.name()).collect();
-        for n in &names {
-            assert!(named(n).is_some(), "{n} is listed and cannot be looked up");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name(), "apkpure");
+        assert!(providers[0].needs_network());
+        assert!(named("local").is_none(), "Sober's directory is an import, not a source");
+        // An import is a function that takes a build somebody already chose,
+        // and it goes through the signature check like a download: an
+        // unsigned archive on disk is refused, not trusted for being local.
+        let dir = std::env::temp_dir().join(format!("cordial-import-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let apk = dir.join("base.apk");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&apk).unwrap());
+        {
+            use std::io::Write;
+            w.start_file("lib/x86_64/libroblox.so", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(b"\x7fELF unsigned").unwrap();
         }
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), names.len(), "two sources share a name: {names:?}");
+        w.finish().unwrap();
+        let found = import::Found {
+            dir: dir.clone(),
+            archives: Archives { base: apk.clone(), split: apk },
+            version: "2.738.0.1397".into(),
+            bytes: 1,
+        };
+        let trusted =
+            vec!["44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477".to_string()];
+        let refused = check_import(&found, &trusted, &Cancel::new(), &mut |_| {}).unwrap_err();
+        assert!(matches!(refused, Unreachable::Refused { .. }), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn kept_entry(root: &Path, version: &str) -> PathBuf {
+        let dir = root.join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libroblox.so"), version).unwrap();
+        std::fs::write(dir.join("base.apk"), format!("apk {version}")).unwrap();
+        crate::store::record_signer(&dir, &"ab".repeat(32)).unwrap();
+        dir
+    }
+
+    /// **An update leaves a pinned build and a running build alone.** What
+    /// follows a filing moves the old slot to the newest entry and collects what
+    /// nothing needs: the pinned build and the one a client holds both survive,
+    /// the build before the newest stays as the spare, and the rest goes.
+    #[test]
+    fn after_a_filing_a_pinned_build_and_a_running_one_survive_and_the_rest_is_collected() {
+        let dir = std::env::temp_dir().join(format!("cordial-after-filing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("builds");
+        for v in ["2.742.0.9", "2.740.0.5", "2.738.0.1397", "2.736.0.1408", "2.700.0.1", "2.690.0.1"] {
+            kept_entry(&root, v);
+        }
+        let running = crate::store::hold_in_use(&root.join("2.736.0.1408")).unwrap();
+        let slot = dir.join("lib/x86_64");
+        let store = crate::install::Store { root: root.clone(), protect: vec!["2.700.0.1".into()] };
+
+        after_filing(&store, "2.742.0.9", &slot);
+
+        let left: Vec<String> = crate::store::list_in(&root).into_iter().map(|e| e.version).collect();
+        // Newest, the spare (2.740), the pin (2.700) and the running one (2.736).
+        assert_eq!(left, ["2.742.0.9", "2.740.0.5", "2.736.0.1408", "2.700.0.1"]);
+        assert_eq!(crate::store::current_in(&root, &slot).as_deref(), Some("2.742.0.9"));
+        drop(running);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A slot that is a real directory is somebody's engine and is not replaced.
+    #[test]
+    fn after_a_filing_a_real_slot_directory_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("cordial-after-filing-slot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("builds");
+        kept_entry(&root, "2.742.0.9");
+        let slot = dir.join("lib/x86_64");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join("libroblox.so"), b"the override's engine").unwrap();
+        after_filing(&crate::install::Store { root, protect: vec![] }, "2.742.0.9", &slot);
+        assert_eq!(std::fs::read(slot.join("libroblox.so")).unwrap(), b"the override's engine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake mirror that answers a version and must never be asked to fetch.
+    struct Never(&'static str);
+    impl Provider for Never {
+        fn name(&self) -> &'static str {
+            "never"
+        }
+        fn needs_network(&self) -> bool {
+            false
+        }
+        fn newest(&self, _: &mut dyn FnMut(Progress)) -> Result<Available, Unreachable> {
+            Ok(Available { name: self.0.to_string(), code: 1 })
+        }
+        fn fetch(
+            &self,
+            _: &Available,
+            _: &Cancel,
+            _: &Path,
+            _: &mut dyn FnMut(Progress),
+        ) -> Result<Archives, Unreachable> {
+            panic!("a build the store already keeps must not be downloaded again")
+        }
     }
 
     #[test]
-    fn an_unknown_source_is_none_rather_than_a_default() {
-        assert!(named("whatever-the-user-typed").is_none());
+    fn an_update_for_a_build_the_store_already_keeps_downloads_nothing() {
+        let dir = std::env::temp_dir().join(format!("cordial-update-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("builds");
+        kept_entry(&root, "2.738.0.1397");
+        let store = crate::install::Store { root: root.clone(), protect: vec![] };
+        // The mirror says three components, the store keeps four: one build.
+        let slot = dir.join("lib/x86_64");
+        let version =
+            update_store_from(&Never("2.738.1397"), &store, &[], &slot, &Cancel::new(), &mut |_| {}).unwrap();
+        assert_eq!(version, "2.738.0.1397");
+        assert!(std::fs::symlink_metadata(&slot).is_ok(), "the scratch slot was the one pointed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An import files an unsigned archive nowhere: refused over its signature,
+    /// and the store holds nothing afterwards, not even a staging directory.
     #[test]
-    fn a_monolithic_archive_is_verified_once_and_not_twice() {
-        let one = Archives { base: "/x/a.apk".into(), split: "/x/a.apk".into() };
-        assert_eq!(one.distinct().len(), 1);
-        let two = Archives { base: "/x/a.apk".into(), split: "/x/b.apk".into() };
-        assert_eq!(two.distinct().len(), 2);
+    fn an_unsigned_import_leaves_the_store_empty() {
+        let dir = std::env::temp_dir().join(format!("cordial-import-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let apk = dir.join("base.apk");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&apk).unwrap());
+        {
+            use std::io::Write;
+            w.start_file("lib/x86_64/libroblox.so", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(b"\x7fELF unsigned").unwrap();
+        }
+        w.finish().unwrap();
+        let found = import::Found {
+            dir: dir.clone(),
+            archives: Archives { base: apk.clone(), split: apk },
+            version: "2.738.0.1397".into(),
+            bytes: 1,
+        };
+        let root = dir.join("builds");
+        let trusted =
+            vec!["44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477".to_string()];
+        let refused = import_into_store_trusting(
+            &found, crate::store::Source::Sober, &root, &trusted, &Cancel::new(), &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(refused, Unreachable::Refused { .. }), "{refused}");
+        assert!(crate::store::list_in(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Naming a source that does not exist must not silently fall back to one
@@ -766,13 +985,13 @@ mod tests {
     #[test]
     fn order_by_version_does_not_let_a_padding_zero_decide() {
         let sources: Vec<Box<dyn Provider>> =
-            vec![Box::new(Fixed("local", "2.734.0.917")), Box::new(Fixed("mirror", "2.734.917"))];
+            vec![Box::new(Fixed("four-part", "2.734.0.917")), Box::new(Fixed("three-part", "2.734.917"))];
         let mut absent = Vec::new();
         let ordered = order_by_version(sources, &mut |_| {}, &mut absent);
         let names: Vec<&str> = ordered.iter().map(|p| p.name()).collect();
         assert_eq!(
             names,
-            vec!["local", "mirror"],
+            vec!["four-part", "three-part"],
             "the same build named in two shapes must not reorder the sources: {names:?}"
         );
     }
@@ -979,6 +1198,6 @@ mod tests {
         let e = obtain(Some("no-such-source"), Want::Any, &Cancel::new(), &dir, &mut noise)
             .unwrap_err();
         assert!(e.to_string().contains("no-such-source"), "{e}");
-        assert!(e.to_string().contains("local"), "the error should list what does exist: {e}");
+        assert!(e.to_string().contains("apkpure"), "the error should list what does exist: {e}");
     }
 }

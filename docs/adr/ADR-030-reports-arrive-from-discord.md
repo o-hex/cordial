@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-09-03
-**Related:** [ADR-017](ADR-017-sober-issue-corpus.md)
+**Related:** [ADR-017](ADR-017-sober-issue-corpus.md), [ADR-048](ADR-048-labels-and-edits-from-discord.md)
 
 ## Context
 
@@ -156,3 +156,30 @@ separator, which an embed's single description could not do.
 sees message content in a message-command payload. Discord's documentation does
 not say, so an empty body is refused with an explanation rather than posted as
 a blank comment.
+
+## Later: labels and editing
+
+Labels in the report form, and an Edit button that updates the issue, are
+recorded in [ADR-048](ADR-048-labels-and-edits-from-discord.md), including the
+permission model. The rule above -- who may act is read from the issue and from
+Discord, never from the button -- is the one both of them follow.
+
+## Later: the log archive, and files
+
+The bug-shaped web forms now require a log archive (Report a Problem → Save
+logs…, [ADR-045](ADR-045-one-report-screen-outside-settings.md)). The bridge
+**cannot carry a file**, for two separate reasons:
+
+- A modal holds text inputs and menus. The `log-archive` field is therefore
+  listed in `WEB_ONLY_FIELDS` (`issue_forms.ts`): kept out of the modal and the
+  body, and the issue says no archive is attached and how one gets added.
+- GitHub's REST API has no way to upload a file to an issue; the drag-and-drop
+  on the web form uses an endpoint that needs a browser session. So "Add to the
+  issue" now accepts an attachment-only message and posts its `https` links,
+  saying Discord's signed links expire.
+
+What carrying the file itself would take: a Discord modal file-upload
+component (INFERRED to exist in current Discord; not checked), plus somewhere
+to put the bytes that a maintainer can open and the public cannot, such as an
+asset on a private repository's draft release, with a token for it.
+That is a new place user data lives and wants its own decision. Not built.

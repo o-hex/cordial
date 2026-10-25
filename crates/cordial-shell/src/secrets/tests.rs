@@ -198,6 +198,30 @@ impl Drop for KeyringCleanup<'_> {
     }
 }
 
+/// The live tests take turns with the real service.
+///
+/// Every call goes through one worker thread, and the first one also pays for
+/// connecting to D-Bus. Run side by side on a loaded machine, one test's
+/// probe could queue behind the other's calls past its two-second timeout.
+/// That marks the service wedged for the rest of the process, so the other
+/// test's migration was refused and its assertion failed: a flake that looked
+/// like a lost session. Seen twice in full workspace runs, each taking about
+/// 3 s against the usual 0.4 s.
+fn live_service() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A timeout part-way through is the machine being slow, not a wrong
+/// answer, and is reported as a skip rather than passed off as either.
+fn service_timed_out() -> bool {
+    let wedged = keyring::wedged();
+    if wedged {
+        println!("skipped: the secret service stopped answering part-way through");
+    }
+    wedged
+}
+
 /// The real thing, against the real service, skipped rather than failed
 /// where there is none.
 ///
@@ -206,6 +230,7 @@ impl Drop for KeyringCleanup<'_> {
 /// ends up believing something it never measured.
 #[test]
 fn a_session_survives_the_round_trip_through_the_service() {
+    let _turn = live_service();
     let scratch = tempfile::tempdir().unwrap();
     let dir = scratch.path();
     if let Err(why) = usable() {
@@ -219,26 +244,33 @@ fn a_session_survives_the_round_trip_through_the_service() {
     // Obviously fake, and short. No test in this repository holds a real
     // token, at any verbosity.
     let body = "# cordial test\nroblox.com\tCORDIALTEST=not-a-session\n";
-    save(Store::Keyring, &dir, Kind::Cookies, body).unwrap();
+    let saved = save(Store::Keyring, &dir, Kind::Cookies, body);
+    let back = load(Store::Keyring, &dir, Kind::Cookies);
+    let seen = snapshot(SnapshotRequest {
+        store: Store::Keyring,
+        profile_dir: dir,
+        kind: Kind::Cookies,
+        max_bytes: 1024 * 1024,
+    });
+    let erased = erase(Store::Keyring, &dir, Kind::Cookies);
+    let gone = load(Store::Keyring, &dir, Kind::Cookies);
+    if service_timed_out() {
+        return;
+    }
+    saved.unwrap();
     assert_eq!(
-        load(Store::Keyring, &dir, Kind::Cookies).as_deref(),
+        back.as_deref(),
         Some(body),
         "what was stored must come back byte for byte"
     );
     assert_eq!(
-        snapshot(SnapshotRequest {
-            store: Store::Keyring,
-            profile_dir: dir,
-            kind: Kind::Cookies,
-            max_bytes: 1024 * 1024,
-        })
-        .as_deref(),
+        seen.as_deref(),
         Some(body.as_bytes()),
         "the launcher's read-only path must decode the same service value"
     );
-    erase(Store::Keyring, &dir, Kind::Cookies).unwrap();
+    erased.unwrap();
     assert!(
-        load(Store::Keyring, &dir, Kind::Cookies).is_none(),
+        gone.is_none(),
         "and a removed item must not linger in somebody's keyring"
     );
 }
@@ -249,6 +281,7 @@ fn a_plaintext_store_is_adopted_and_destroyed() {
     // right now, and the launch after this change has to take it in
     // *without* signing them out. The body is returned as well as stored,
     // which is the half that is easy to leave out and expensive to notice.
+    let _turn = live_service();
     let scratch = tempfile::tempdir().unwrap();
     let dir = scratch.path();
     if let Err(why) = usable() {
@@ -261,17 +294,20 @@ fn a_plaintext_store_is_adopted_and_destroyed() {
     };
     let body = "# cordial test\nroblox.com\tCORDIALTEST=adopt-me\n";
     save(Store::File, &dir, Kind::Cookies, body).unwrap();
+    let migrated = load(Store::Keyring, &dir, Kind::Cookies);
+    let file_left = dir.join("cookies").exists();
+    let next = load(Store::Keyring, &dir, Kind::Cookies);
+    if service_timed_out() {
+        return;
+    }
     assert_eq!(
-        load(Store::Keyring, &dir, Kind::Cookies).as_deref(),
+        migrated.as_deref(),
         Some(body),
         "the migrating launch must still be signed in"
     );
-    assert!(
-        !dir.join("cookies").exists(),
-        "and the plaintext file must be gone"
-    );
+    assert!(!file_left, "and the plaintext file must be gone");
     assert_eq!(
-        load(Store::Keyring, &dir, Kind::Cookies).as_deref(),
+        next.as_deref(),
         Some(body),
         "the next launch must read it from the service"
     );

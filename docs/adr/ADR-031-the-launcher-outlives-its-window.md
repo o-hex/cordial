@@ -36,8 +36,10 @@ read ends of those pipes belong to the launcher process.** Close the launcher
 window, and with no window left the `GtkApplication` quits, the process exits,
 both read ends close — and the next `println!` inside `cordial-run` panics:
 
-    thread 'main' panicked at library/std/src/io/stdio.rs:1165:9:
-    failed printing to stdout: Broken pipe (os error 32)
+```text
+thread 'main' panicked at library/std/src/io/stdio.rs:1165:9:
+failed printing to stdout: Broken pipe (os error 32)
+```
 
 That message is quoted from a captured stderr, not inferred. It was reproduced
 with a two-binary stand-in of exactly this shape — a Rust parent that pipes and

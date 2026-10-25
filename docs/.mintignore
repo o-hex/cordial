@@ -1,0 +1,20 @@
+# Internal working notes: published in the repository, not on the docs site.
+# The site is for people installing Cordial, writing plugins, or about to
+# contradict a decision (the ADRs). AGENTS.md has the table of who reads what.
+NEXT.md
+HANDOVER.md
+README.md
+findings.md
+framework-api-inventory.md
+base-evaluation.md
+browser-account-routing.md
+queue-*.md
+analysis/
+traces/
+outreach/
+posts/
+design/
+vr/dynarmic-design.md
+vr/play-button.md
+releases/README.md
+vr/env.md

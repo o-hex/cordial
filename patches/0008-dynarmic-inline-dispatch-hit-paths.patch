@@ -1,0 +1,139 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index cec78138..3ba92b24 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -166,19 +166,21 @@ void A64EmitX64::ClearFastDispatchTable() {
+     }
+ }
+ 
++// PC ends up in rbp, location_descriptor ends up in rbx
++void A64EmitX64::EmitCalculateLocationDescriptor() {
++    // This calculation has to match up with A64::LocationDescriptor::UniqueHash
++    // TODO: Optimization is available here based on known state of fpcr.
++    code.mov(rbp, qword[r15 + offsetof(A64JitState, pc)]);
++    code.mov(rcx, A64::LocationDescriptor::pc_mask);
++    code.and_(rcx, rbp);
++    code.mov(ebx, dword[r15 + offsetof(A64JitState, fpcr)]);
++    code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
++    code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
++    code.or_(rbx, rcx);
++}
++
+ void A64EmitX64::GenTerminalHandlers() {
+-    // PC ends up in rbp, location_descriptor ends up in rbx
+-    const auto calculate_location_descriptor = [this] {
+-        // This calculation has to match up with A64::LocationDescriptor::UniqueHash
+-        // TODO: Optimization is available here based on known state of fpcr.
+-        code.mov(rbp, qword[r15 + offsetof(A64JitState, pc)]);
+-        code.mov(rcx, A64::LocationDescriptor::pc_mask);
+-        code.and_(rcx, rbp);
+-        code.mov(ebx, dword[r15 + offsetof(A64JitState, fpcr)]);
+-        code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
+-        code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
+-        code.or_(rbx, rcx);
+-    };
++    const auto calculate_location_descriptor = [this] { EmitCalculateLocationDescriptor(); };
+ 
+     Xbyak::Label fast_dispatch_cache_miss, rsb_cache_miss;
+ 
+@@ -203,6 +205,7 @@ void A64EmitX64::GenTerminalHandlers() {
+         code.align();
+         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
+         calculate_location_descriptor();
++        terminal_handler_rsb_miss = code.getCurr<const void*>();
+         code.L(rsb_cache_miss);
+         code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table.data()));
+         code.mov(rbp, rbx);
+@@ -214,6 +217,7 @@ void A64EmitX64::GenTerminalHandlers() {
+         code.cmp(rbx, qword[rbp + offsetof(FastDispatchEntry, location_descriptor)]);
+         code.jne(fast_dispatch_cache_miss);
+         code.jmp(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
++        terminal_handler_fast_dispatch_miss = code.getCurr<const void*>();
+         code.L(fast_dispatch_cache_miss);
+         code.mov(qword[rbp + offsetof(FastDispatchEntry, location_descriptor)], rbx);
+         code.LookupBlock();
+@@ -658,13 +662,32 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::Location
+     }
+ }
+ 
++// Cordial (patches/0008): the hit paths of the two handlers are emitted at
++// each site rather than jumped to. Every guest return and indirect branch
++// otherwise ends in the same host indirect jump, one for all returns and one
++// for all indirect branches, and the host's predictor has only its global
++// history to tell their targets apart. With a jump per site the jump's own
++// address is part of the prediction, as it is for the guest's branch on
++// hardware. The miss paths stay shared; they are entered with rbx holding
++// the location descriptor (and rbp the table entry), as inside the handlers.
+ void A64EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
+     if (!conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) || is_single_step) {
+         code.ReturnFromRunCode();
+         return;
+     }
+ 
+-    code.jmp(terminal_handler_pop_rsb_hint);
++    EmitCalculateLocationDescriptor();
++    code.mov(eax, dword[r15 + offsetof(A64JitState, rsb_ptr)]);
++    code.sub(eax, 1);
++    code.and_(eax, u32(A64JitState::RSBPtrMask));
++    code.mov(dword[r15 + offsetof(A64JitState, rsb_ptr)], eax);
++    code.cmp(rbx, qword[r15 + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
++    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
++        code.jne(terminal_handler_rsb_miss);
++    } else {
++        code.jne(code.GetReturnFromRunCodeAddress());
++    }
++    code.jmp(qword[r15 + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
+ }
+ 
+ void A64EmitX64::EmitTerminalImpl(IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
+@@ -673,7 +696,17 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::FastDispatchHint, IR::LocationDescri
+         return;
+     }
+ 
+-    code.jmp(terminal_handler_fast_dispatch_hint);
++    EmitCalculateLocationDescriptor();
++    code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table.data()));
++    code.mov(rbp, rbx);
++    if (code.HasHostFeature(HostFeature::SSE42)) {
++        code.crc32(rbp, r12);
++    }
++    code.and_(ebp, fast_dispatch_table_mask);
++    code.lea(rbp, ptr[r12 + rbp]);
++    code.cmp(rbx, qword[rbp + offsetof(FastDispatchEntry, location_descriptor)]);
++    code.jne(terminal_handler_fast_dispatch_miss);
++    code.jmp(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
+ }
+ 
+ void A64EmitX64::EmitTerminalImpl(IR::Term::If terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index ed493155..f553c86d 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -78,6 +78,11 @@ protected:
+ 
+     const void* terminal_handler_pop_rsb_hint;
+     const void* terminal_handler_fast_dispatch_hint = nullptr;
++    // Cordial (patches/0008): entry points into the shared handlers' miss
++    // paths, for the hit paths EmitTerminalImpl now emits inline.
++    const void* terminal_handler_rsb_miss = nullptr;
++    const void* terminal_handler_fast_dispatch_miss = nullptr;
++    void EmitCalculateLocationDescriptor();
+     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
+     void GenTerminalHandlers();
+ 
+diff --git a/src/dynarmic/backend/x64/a64_jitstate.h b/src/dynarmic/backend/x64/a64_jitstate.h
+index 0929e81e..f8ed734c 100644
+--- a/src/dynarmic/backend/x64/a64_jitstate.h
++++ b/src/dynarmic/backend/x64/a64_jitstate.h
+@@ -50,7 +50,10 @@ struct A64JitState {
+     static constexpr u64 RESERVATION_GRANULE_MASK = 0xFFFF'FFFF'FFFF'FFF0ull;
+     u8 exclusive_state = 0;
+ 
+-    static constexpr size_t RSBSize = 8;  // MUST be a power of 2.
++    // Cordial (patches/0008): 32 rather than 8. A C++ engine's call depth
++    // between returns routinely exceeds eight, and every return past the
++    // ring's depth missed into the fast-dispatch hash.
++    static constexpr size_t RSBSize = 32;  // MUST be a power of 2.
+     static constexpr size_t RSBPtrMask = RSBSize - 1;
+     u32 rsb_ptr = 0;
+     std::array<u64, RSBSize> rsb_location_descriptors;

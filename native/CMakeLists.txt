@@ -15,7 +15,13 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 # The AOSP bionic linker, via minecraft-linux's host wrapper. Target: `linker`.
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mcpelauncher-linker
+# crates/cordial-linker-sys/build.rs passes a patched overlay of the
+# submodule here (patches/apply.rs); the submodule itself is the default for
+# a configure run by hand.
+if(NOT CORDIAL_LINKER_DIR)
+  set(CORDIAL_LINKER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mcpelauncher-linker)
+endif()
+add_subdirectory(${CORDIAL_LINKER_DIR}
                  ${CMAKE_CURRENT_BINARY_DIR}/mcpelauncher-linker)
 
 # Undo the upstream `-DPATH_MAX=256`, which is a stack overflow waiting for a
@@ -177,7 +183,7 @@ endif()
 # pipewire-devel, and honestly refuses every stream there, exactly as
 # `slCreateEngine` does.
 add_library(cordial_liblog STATIC
-  liblog.cpp system_paths.cpp netdb_compat.cpp opensles.cpp pipewire_backend.cpp
+  liblog.cpp system_paths.cpp netdb_compat.cpp foreign_alloc.cpp opensles.cpp pipewire_backend.cpp
   pulse_backend.cpp alsa_backend.cpp oss_backend.cpp aaudio.cpp
   aaudio_input_callback.cpp thread_trace.cpp)
 # Compiled unconditionally, like every other file here: without the headers it
@@ -249,11 +255,25 @@ if(PIPEWIRE_FOUND)
     pipewire_backend_test.cpp)
   target_include_directories(cordial_pipewire_backend_test PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
   target_compile_definitions(cordial_pipewire_backend_test PRIVATE CORDIAL_HAVE_PIPEWIRE=1)
+  # Without this the asserts are compiled out of a release build, which is what
+  # this binary was for a long time: it printed "ok" for checks that never ran,
+  # and one of them was already wrong.
+  target_compile_options(cordial_pipewire_backend_test PRIVATE -UNDEBUG)
   add_custom_command(TARGET cordial_pipewire_backend_test POST_BUILD
     COMMAND cordial_pipewire_backend_test
     COMMENT "Running pipewire_backend fill_pcm checks (no PipeWire session needed)")
   add_dependencies(cordial_liblog cordial_pipewire_backend_test)
 endif()
+
+# The recorder's copy of the engine's sound (record_tap.h, ADR-059). Pure ring
+# and mixing logic, so it runs at build time with no sound server, like the
+# checks around it.
+add_executable(cordial_record_tap_test EXCLUDE_FROM_ALL record_tap_test.cpp)
+target_compile_options(cordial_record_tap_test PRIVATE -UNDEBUG)
+add_custom_command(TARGET cordial_record_tap_test POST_BUILD
+  COMMAND cordial_record_tap_test
+  COMMENT "Running recorder audio tap checks")
+add_dependencies(cordial_liblog cordial_record_tap_test)
 
 add_executable(cordial_aaudio_input_callback_test EXCLUDE_FROM_ALL
   aaudio_input_callback.cpp aaudio_input_callback_test.cpp)
@@ -270,6 +290,16 @@ add_custom_command(TARGET cordial_aaudio_input_test POST_BUILD
   COMMAND cordial_aaudio_input_test
   COMMENT "Running AAudio callback and blocking input ABI checks")
 add_dependencies(cordial_liblog cordial_aaudio_input_test)
+
+# The two libc allocators refused in foreign_alloc.cpp. Run at build time, like
+# the tests around it, so a shim that stops refusing cannot ship unnoticed.
+add_executable(cordial_foreign_alloc_test EXCLUDE_FROM_ALL
+  foreign_alloc.cpp foreign_alloc_test.cpp)
+target_compile_options(cordial_foreign_alloc_test PRIVATE -UNDEBUG)
+add_custom_command(TARGET cordial_foreign_alloc_test POST_BUILD
+  COMMAND cordial_foreign_alloc_test
+  COMMENT "Running foreign-allocation shim checks")
+add_dependencies(cordial_liblog cordial_foreign_alloc_test)
 
 add_library(cordial_linker_shim STATIC shim.cpp)
 target_link_libraries(cordial_linker_shim PUBLIC linker)

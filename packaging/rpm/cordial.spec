@@ -49,12 +49,13 @@ Summary:        Run Roblox natively on Linux -- you supply the Roblox build, non
 
 # The workspace is GPL-3.0-or-later; the vendored subtrees that end up in the
 # binary carry their own notices, installed alongside it.
-License:        GPL-3.0-or-later AND MIT AND Apache-2.0
+License:        GPL-3.0-or-later AND MIT AND Apache-2.0 AND 0BSD AND BSD-3-Clause
 URL:            https://github.com/luohoa97/cordial
 
 # Both produced by packaging/rpm/make-srpm.sh. Source0 carries the working tree
 # *including* third_party/mcpelauncher-linker (and its own bionic and core
-# submodules) and third_party/libjnivm, because the native subtree does not
+# submodules), third_party/libjnivm and third_party/dynarmic with its
+# externals, because the native subtree does not
 # build without them and %%prep has no network. Source1 is `cargo vendor`, for
 # the same reason -- Copr builds may run with networking off, and a build that
 # only works when it happens to be on is not reproducible.
@@ -101,6 +102,14 @@ BuildRequires:  pulseaudio-libs-devel
 BuildRequires:  alsa-lib-devel
 # `-lz` on the native link line.
 BuildRequires:  zlib-ng-compat-devel
+# Headers only, for dynarmic (crates/cordial-guest, the VR mode's translator),
+# which find_package()s Boost. Only an x86-64 build compiles dynarmic.
+# lld and llvm build cordial-guest's arm64 test image for %%check.
+%ifarch x86_64
+BuildRequires:  boost-devel
+BuildRequires:  lld
+BuildRequires:  llvm
+%endif
 BuildRequires:  desktop-file-utils
 BuildRequires:  libappstream-glib
 
@@ -208,7 +217,8 @@ export CORDIAL_GIT_SHA=$(printf %s %{describe} | sed "s/.*-g//")
 # linker collects webview::open, and the binary links no WebKit at all. That
 # shipped once in the Flatpak and was reported as "webview doesnt work in
 # cordial flatpak". %%check proves it linked rather than trusting this line.
-%cargo_build -f cordial-shell/webview,cordial-runtime/webview
+# cordial-runtime/vr is Play in VR (ADR-053), and why boost-devel is required.
+%cargo_build -f cordial-shell/webview,cordial-runtime/webview,cordial-runtime/vr
 
 %install
 # Not %%cargo_install: this is a virtual workspace with no [package] section,
@@ -283,6 +293,14 @@ install -Dpm 0644 third_party/libjnivm/LICENSE                      libjnivm-MIT
 # and said "fg: no job control". Every other comment in this file already
 # doubles them; this one did not, and it cost a CI round.
 install -Dpm 0644 third_party/mocktail-webview/LICENSE              mocktail-webview-Apache-2.0.txt
+# dynarmic and the externals of it compiled in, for the VR translator.
+install -Dpm 0644 third_party/dynarmic/LICENSE.txt                   dynarmic-0BSD.txt
+install -Dpm 0644 third_party/dynarmic/externals/fmt/LICENSE         fmt-MIT.txt
+install -Dpm 0644 third_party/dynarmic/externals/mcl/LICENSE         mcl-MIT.txt
+install -Dpm 0644 third_party/dynarmic/externals/robin-map/LICENSE   robin-map-MIT.txt
+install -Dpm 0644 third_party/dynarmic/externals/xbyak/COPYRIGHT     xbyak-BSD-3-Clause.txt
+install -Dpm 0644 third_party/dynarmic/externals/zydis/LICENSE       zydis-MIT.txt
+install -Dpm 0644 third_party/dynarmic/externals/zycore/LICENSE      zycore-MIT.txt
 
 %check
 export CC=clang CXX=clang++
@@ -332,7 +350,7 @@ appstream-util validate-relax --nonet \
 # binary reported `0 passed; N filtered out`. The build went green having run
 # no tests at all -- the exact shape of failure this project keeps retracting
 # commits for. Do not reflow this line.
-%cargo_test -f cordial-shell/webview,cordial-runtime/webview -- -- --skip secrets::tests::a_session_survives_the_round_trip_through_the_service --skip secrets::tests::a_plaintext_store_is_adopted_and_destroyed --skip deep_link::tests::gio_reshapes_a_roblox_link_and_is_therefore_not_where_the_string_comes_from
+%cargo_test -f cordial-shell/webview,cordial-runtime/webview,cordial-runtime/vr -- -- --skip secrets::tests::a_session_survives_the_round_trip_through_the_service --skip secrets::tests::a_plaintext_store_is_adopted_and_destroyed --skip deep_link::tests::gio_reshapes_a_roblox_link_and_is_therefore_not_where_the_string_comes_from
 
 %files
 %license LICENSE
@@ -342,6 +360,13 @@ appstream-util validate-relax --nonet \
 %license libjnivm-MIT.txt
 %license NOTICE
 %license mocktail-webview-Apache-2.0.txt
+%license dynarmic-0BSD.txt
+%license fmt-MIT.txt
+%license mcl-MIT.txt
+%license robin-map-MIT.txt
+%license xbyak-BSD-3-Clause.txt
+%license zydis-MIT.txt
+%license zycore-MIT.txt
 %{_datadir}/cordial/plugins/
 %doc README.md THIRD-PARTY-NOTICES.md
 %{_bindir}/cordial-shell

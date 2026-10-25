@@ -64,7 +64,7 @@ fn shell_construction_stays_hidden_until_explicitly_opened() {
     let root = tempfile::tempdir().unwrap();
     let config = Rc::new(RefCell::new(ShellConfig::default()));
     // When preparing a shell for a browser invocation.
-    let shell = super::super::build(&app, config, Rc::new(root.path().join("shell.json")));
+    let shell = super::super::build(&app, config, Rc::new(root.path().join("shell.json")), false);
     // Then construction does not show it, but a desktop-icon open still does.
     assert!(!shell.window.is_visible());
     shell.present();
@@ -126,7 +126,7 @@ fn hidden_application_stays_alive_until_browser_launch_dispatch() {
         let config_path = root.path().join("shell.json");
         app.connect_activate(move |app| {
             let config = Rc::new(RefCell::new(ShellConfig::default()));
-            let shell = super::super::build(app, config, Rc::new(config_path.clone()));
+            let shell = super::super::build(app, config, Rc::new(config_path.clone()), false);
             revealed.set(shell.window.is_visible());
             let maps = maps.clone();
             shell.window.connect_map(move |_| maps.set(maps.get() + 1));
@@ -185,7 +185,7 @@ fn closing_visible_picker_cancels_pending_browser_launch() {
     let config = Rc::new(RefCell::new(ShellConfig::default()));
     config.borrow_mut().profile = "last-used".into();
     config.borrow_mut().roblox.apk = Some(root.path().join("missing.apk"));
-    let shell = super::super::build(&app, config, Rc::new(root.path().join("shell.json")));
+    let shell = super::super::build(&app, config, Rc::new(root.path().join("shell.json")), false);
     shell.present();
     let task = shell
         .queue_with_lookup(

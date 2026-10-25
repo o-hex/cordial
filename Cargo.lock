@@ -300,15 +300,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cordial-guest"
+version = "0.34.0"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "cordial-linker-sys"
-version = "0.18.0"
+version = "0.34.0"
 dependencies = [
  "cmake",
 ]
 
 [[package]]
 name = "cordial-plugins"
-version = "0.18.0"
+version = "0.34.0"
 dependencies = [
  "base64 0.23.1",
  "blake2",
@@ -325,15 +332,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "cordial-runtime"
-version = "0.18.0"
+name = "cordial-protocol"
+version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cordial-runtime"
+version = "0.34.0"
+dependencies = [
+ "cordial-guest",
  "cordial-linker-sys",
  "cordial-plugins",
+ "cordial-protocol",
  "cordial-shell",
  "cordial-update",
  "gtk4",
  "libadwaita",
+ "libc",
  "libmimalloc-sys",
  "serde_json",
  "ureq",
@@ -344,10 +362,11 @@ dependencies = [
 
 [[package]]
 name = "cordial-shell"
-version = "0.18.0"
+version = "0.34.0"
 dependencies = [
  "cordial-linker-sys",
  "cordial-plugins",
+ "cordial-protocol",
  "cordial-update",
  "gdk4-wayland",
  "gtk4",
@@ -366,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "cordial-update"
-version = "0.18.0"
+version = "0.34.0"
 dependencies = [
  "cordial-plugins",
  "http",

@@ -8,10 +8,12 @@
 // `pipewire_backend.cpp` for how that split is enforced.
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -84,8 +86,10 @@ std::vector<DeviceInfo> enumerate_devices();
 /// `node.name` — `alsa_output.pci-0000_00_1f.3-...`, not an index and not a
 /// description.
 ///
-/// Read once from `CORDIAL_AUDIO_SINK`, which the shell sets from the Audio
-/// row in its settings. Empty is the ordinary state and means "follow
+/// Seeded from `CORDIAL_AUDIO_SINK` (which the shell sets from the Audio row in
+/// its settings) the first time it is asked, and replaced by
+/// [`set_output_device`] thereafter. Returned by value: it can change under the
+/// caller. Empty is the ordinary state and means "follow
 /// whatever the session calls the default sink", *and keeps following it* —
 /// PipeWire moves a stream with no `PW_KEY_TARGET_OBJECT` when the default
 /// changes, so the absence of a target is not a snapshot of today's default
@@ -103,7 +107,75 @@ std::vector<DeviceInfo> enumerate_devices();
 /// One reader, here, on the same argument `aaudio.h` makes for `CORDIAL_AUDIO`:
 /// each file calling `getenv` for itself is how a switch comes to mean two
 /// different things in one process.
-const std::string& configured_output_device();
+std::string configured_output_device();
+
+/// What [`set_output_device`] did.
+struct OutputSwitch {
+    /// Playback streams re-aimed while they were playing.
+    size_t moved = 0;
+    /// Set when the answer is not simply "moved them all" -- nothing was
+    /// playing, the session could not be asked, the host's backend has no
+    /// notion of a sink. Empty means nothing needs saying. It travels back to
+    /// the shell, because a setting that claims to have applied and did not is
+    /// the failure ADR-044 is written against.
+    std::string note;
+};
+
+/// Change the sink mid-game. `name` is a `node.name` as above, empty for the
+/// system default.
+///
+/// **The engine's streams are not recreated.** Its OpenSL ES players and AAudio
+/// streams keep their `pw_stream`, their buffers and their callbacks, so the
+/// objects FMOD holds stay valid and the mixer does not see an underrun. What
+/// changes is where the session manager links each stream, which is done the
+/// way `pw-metadata <node> target.object <sink>` and `pactl move-sink-input`
+/// do it: by writing the `target.object` key for the stream's node into the
+/// `default` metadata. **Updating the stream's own properties does not do this**
+/// -- measured on WirePlumber 0.5.14, `pw_stream_update_properties` with a new
+/// `target.object` returned success and the link stayed where it was, so the
+/// first design for this (and the obvious one) moved nothing.
+///
+/// Streams opened after this call use the new value. `configured_output_device`
+/// is seeded from `CORDIAL_AUDIO_SINK` at first use, so a client launched with
+/// the variable behaves as before.
+OutputSwitch set_output_device(const std::string& name);
+
+/// The PipeWire source Cordial has been asked to record from, as a
+/// `node.name`; empty is the ordinary state and means "follow the session's
+/// default source", the behaviour before there was a microphone picker.
+///
+/// The input twin of [`configured_output_device`], with the same reasons: seeded
+/// once from `CORDIAL_AUDIO_SOURCE`, replaced by [`set_input_device`], one
+/// reader so a switch cannot come to mean two things in one process, and a
+/// `node.name` rather than an index or a description because it is the only one
+/// of the three that survives a replug and a rename.
+///
+/// **Reading it opens nothing.** The choice is a string. The microphone rule at
+/// the top of `audio_classes.cpp` is about streams, and a stored preference is
+/// not one.
+std::string configured_input_device();
+
+/// Change the microphone. `name` is a `node.name` as above, empty for the
+/// system default.
+///
+/// A capture stream that is open when this is called is re-linked in place by
+/// the same `target.object` metadata write [`set_output_device`] uses; one that
+/// is not open picks the choice up when it opens, which is when the microphone
+/// indicator lights and not before. **Nothing here opens a capture stream** --
+/// with none open, the answer says there was nothing to move.
+OutputSwitch set_input_device(const std::string& name);
+
+/// The node name a capture stream should actually connect to, given what the
+/// user asked for. Empty in, empty out, and no registry walk for the common
+/// case.
+///
+/// The twin of [`resolve_output_target`] and for the same reason: a source that
+/// has been unplugged must not turn into a recording that captures nothing, so
+/// an absent one falls back to the default and says so on stderr, naming it.
+/// The callers in `audio_classes.cpp` then resolve an empty answer to the
+/// default source's name as they always have; the OpenSL and AAudio callers
+/// pass it on empty, which PipeWire reads as "the default".
+std::string resolve_input_target(const std::string& requested);
 
 /// The node name a playback stream should actually connect to, given what the
 /// user asked for.
@@ -489,6 +561,55 @@ private:
 /// checking on its own, not only by ear.
 namespace testing {
 
+/// One connection to something that may not be up yet, held for the process and
+/// retried after a failure.
+///
+/// **A failure used to be permanent.** `get_session` was a function-local
+/// static, so a PipeWire that was still starting when the first sound was
+/// wanted (a login where the audio daemon comes up a few seconds after the
+/// client) left the whole run without audio even though the daemon answered a
+/// moment later. A success is kept for the life of the process, as before; a
+/// failure is only remembered for `retry_after`, and the next caller after that
+/// tries again. The wait keeps a wedged daemon, which costs three seconds per
+/// attempt, from being asked on every call.
+///
+/// The connector and the clock are passed in so the retry rule can be checked
+/// without a PipeWire session.
+template <class T>
+class RetryingSlot {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    explicit RetryingSlot(Clock::duration retry_after) : retry_after_(retry_after) {}
+
+    /// `connect(first_attempt)` returns the connection or null. `now()` is read
+    /// after it returns, so the wait is counted from when a failure ended and
+    /// not from when it began.
+    template <class Connect, class Now>
+    T* get(Connect&& connect, Now&& now) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (value_) return value_;
+        if (attempts_ > 0 && now() - last_attempt_ < retry_after_) return nullptr;
+        const bool first = attempts_ == 0;
+        ++attempts_;
+        value_ = connect(first);
+        last_attempt_ = now();
+        return value_;
+    }
+
+    int attempts() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return attempts_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    Clock::duration retry_after_;
+    Clock::time_point last_attempt_{};
+    T* value_ = nullptr;
+    int attempts_ = 0;
+};
+
 struct PendingBuffer {
     const uint8_t* data;
     uint32_t size;
@@ -510,6 +631,13 @@ struct PendingBuffer {
 std::string choose_output_target(const std::string& requested,
                                  const std::vector<std::string>& available_sinks,
                                  bool* fell_back);
+
+/// The input twin of [`choose_output_target`]: the same rule over the list of
+/// sources instead of sinks, kept as its own name so a call site reads as what
+/// it is and a later difference between the two has somewhere to go.
+std::string choose_input_target(const std::string& requested,
+                                const std::vector<std::string>& available_sources,
+                                bool* fell_back);
 
 /// Copies from the front of `pending` into `dst[0, want)`, popping buffers
 /// as they empty (and recording their `context` in `drained_contexts`, in
@@ -567,5 +695,51 @@ struct CordialAudioSink {
 size_t cordial_audio_sinks(CordialAudioSink** out);
 
 void cordial_audio_sinks_free(CordialAudioSink* sinks, size_t count);
+
+/// Re-aims the running process's playback at `name` (a `node.name`; null or
+/// empty for the system default). Returns how many streams moved. `note`
+/// receives a NUL-terminated explanation when the answer is not a plain "all of
+/// them moved" and an empty string otherwise; it is always written when
+/// `note_len` is non-zero. See `cordial::audio::set_output_device`.
+///
+/// Called from `cordial-runtime`'s live-settings socket (ADR-044), on a thread
+/// that is neither the engine's nor PipeWire's.
+size_t cordial_audio_set_output(const char* name, char* note, size_t note_len);
+
+/// Fills `*out` with a freshly allocated array of every audio source the
+/// session has that a person would call a microphone or line input, and
+/// returns how many; the shape and ownership rules are `cordial_audio_sinks`'s,
+/// and the array goes back to `cordial_audio_sinks_free`. `is_default` marks the
+/// session's current `default.audio.source`.
+///
+/// **This opens no stream.** It is a projection of `enumerate_devices`, which
+/// walks the registry and reads properties, and the microphone rule at the top
+/// of `audio_classes.cpp` forbids anything on this path from constructing a
+/// `CaptureStream`. Sink monitors are not offered: the registry reports a
+/// monitor as a port on its sink and not as an `Audio/Source` node, so
+/// "listening to what the speakers play" is not reachable from here, which is
+/// the intended answer for a microphone row.
+size_t cordial_audio_sources(CordialAudioSink** out);
+
+/// How many capture streams this process holds open right now. Exposed so the
+/// shell's own tests can pin that listing sources opened none; see
+/// `cordial::audio::active_capture_streams`.
+unsigned cordial_audio_capture_streams(void);
+
+/// The microphone twin of `cordial_audio_set_output`: re-aims an open capture
+/// stream at `name` (null or empty for the system default), returns how many
+/// moved, and writes any explanation to `note`. With none open it moves nothing
+/// and opens nothing; the choice applies when Roblox next starts recording.
+size_t cordial_audio_set_input(const char* name, char* note, size_t note_len);
+
+/// The microphone twin of `cordial_audio_output`.
+size_t cordial_audio_input(char* out, size_t out_len);
+
+
+/// Copies the sink currently asked for (empty for the system default) into
+/// `out` as a NUL-terminated string, truncated to `out_len - 1` bytes, and
+/// returns its full length. What the live-settings socket reports back, so the
+/// shell sees what is in force and not what it asked for.
+size_t cordial_audio_output(char* out, size_t out_len);
 
 } // extern "C"

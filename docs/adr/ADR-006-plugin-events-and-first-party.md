@@ -107,3 +107,46 @@ If the event registry turns out to be a way for plugins to fingerprint each
 other — learning what is installed by watching what is declared — subscription
 would need to be scoped to declared dependencies rather than open. That is worth
 checking before the first plugin that handles anything account-shaped ships.
+
+## Notes moved from docs/plugin-api.md (2026-10-02)
+
+### Evidence that `start_all` ignores `dependencies`
+
+**And nothing orders the start-up so that the declaration happens first. Read
+this before you rely on `dependencies`.** ADR-006 describes dependency-resolved
+loading, and `events.rs`'s own module comment leans on it to explain why
+subscribe-time filtering is acceptable. **That start ordering is not
+implemented.** `plugin_host::start_all` — the only path that starts a plugin in
+the running client, called once from `crates/cordial-runtime/src/bin/load.rs` —
+iterates `manifest::discover(&manifest::plugin_root())`, which returns plugins
+sorted by **directory name** (`dirs.sort()` in `manifest.rs`) and nothing else.
+`plugin_host.rs` contains no reference to `dependencies` or `Dependency`
+anywhere in the file, and nothing in it reaches `cordial_plugins::resolve`. (The
+word `resolve` does appear there, in `crate::flags::resolve` and a local
+`resolve_within`; grep for the module rather than the word.) The dependency
+planner in
+`crates/cordial-plugins/src/resolve.rs` has non-test callers only in
+`marketplace.rs` and the settings window's install-confirmation UI: it decides
+what gets *installed*, never what starts first. Nothing refuses to start a
+plugin whose declared dependency is absent, either, so ADR-006's "must surface
+as a named error to the dependent" is unimplemented as well.
+
+So naming a plugin in `dependencies` has no effect on start order, and a
+start-up `events.subscribe` on another plugin's type is a race the manifest
+cannot influence. Two things actually work:
+
+- **Retry.** Treat `has not been declared by any plugin` as "not yet" rather
+  than as a permanent failure, and try again later — on a timer, or when you
+  next have reason to.
+- **Subscribe late.** Do it at the point you first need the events, by which
+  time a plugin that starts earlier in directory-name order has usually
+  declared.
+
+Still list a real dependency in `dependencies`: it is what the installer reads,
+so it is how the plugin gets onto the machine at all. Just do not read it as a
+scheduling promise. (**INFERRED:** `start_all` reads only
+`manifest::plugin_root()`, the user root, and never `system_plugin_root()`,
+whereas `flags::collect` reads both. On the face of the two call sites a
+first-party plugin shipped under the system prefix is never spawned by the
+runtime, which would make a first-party publisher unavailable at any time.
+Nobody has run the client to confirm the consequence.)

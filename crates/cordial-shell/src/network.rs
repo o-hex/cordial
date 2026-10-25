@@ -18,15 +18,17 @@
 //! environment variable, and it was considered and rejected, on two
 //! independent grounds — either one would be enough on its own.
 //!
-//! **Cordial's own client-settings fetch would not see it.**
-//! `cordial_runtime::client_settings::fetch` goes through
-//! `cordial_update::http::get_text` (it used to call `ureq::get(URL).call()`
-//! directly; GitHub issue #21 is why it now has the timeouts that call lacked,
-//! not why the proxy question below changed), and neither that nor the bare
-//! call it replaced configures a proxy; `ureq` does not consult
-//! `http_proxy`/`HTTPS_PROXY` on its own, so setting them would do nothing for
-//! the one HTTP request Cordial itself is definitely responsible for, before
-//! the engine exists to blame.
+//! **Cordial's own requests would follow it, but not for a per-profile
+//! reason.** *Correction, 2026-10-02:* this paragraph said `ureq` does not
+//! consult `http_proxy`/`HTTPS_PROXY` on its own. It does: ureq 3's default
+//! `Config` takes `Proxy::try_from_env()`, which reads `ALL_PROXY`,
+//! `HTTPS_PROXY`, `HTTP_PROXY`, their lowercase forms and `NO_PROXY`, and
+//! nothing in Cordial overrides that (read from ureq 3.3.0's source, not run).
+//! So the client-settings fetch through `cordial_update::http::get_text`, the
+//! update check and the downloads all go through a proxy set in the
+//! environment, and check its certificate against ureq's bundled roots rather
+//! than the host's. That makes a process-wide variable, not a per-profile
+//! setting, which is why the first ground still holds in substance.
 //!
 //! **Even where the engine's own traffic would see it, it is not the traffic
 //! that matters most.** `client_settings.rs` and `android/asset.rs` both

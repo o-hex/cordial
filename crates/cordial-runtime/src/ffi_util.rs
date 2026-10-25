@@ -12,11 +12,18 @@
 //! `answer`, `parse_open_window` — is ordinary safe Rust that never has to
 //! reason about a pointer at all.
 //!
-//! This is a demonstration of the pattern on three call sites, not a rewrite
-//! of the crate's ~350 `extern "C"` functions — see the tracking issue linked
-//! from ADR-036 for the rest.
+//! Started on those three call sites and extended to `android/asset.rs`, whose
+//! ten entry points now validate, convert through these helpers and call safe
+//! inner functions; `bionic/signal.rs`'s `sigaction` translation went the same
+//! way and has no pointer in its layout code at all. `bionic/pthread.rs`,
+//! `bionic/mod.rs` and `bionic/trace.rs` followed: the pthread wrappers borrow
+//! the engine's own `pthread_cond_t`/`sem_t` through [`overlay_ref`] and hand a
+//! `&BionicCond` to inner functions, and the seven hand-copied native symbol
+//! tables became one. That is a handful of files of the crate's ~350
+//! `extern "C"` functions, not a rewrite of it -- the tracking issue linked
+//! from ADR-036 says which remain.
 
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, c_void, CStr};
 
 /// Borrow a request string handed in across the ABI edge.
 ///
@@ -55,6 +62,96 @@ pub(crate) fn write_response(bytes: &[u8], out: *mut c_char, out_len: usize) -> 
     // checked immediately above; `bytes` is a Rust-owned slice the caller
     // holds no pointer into, so the two regions cannot overlap.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, out, bytes.len()) };
+    true
+}
+
+// ------------------------------------------------------------ opaque handles
+//
+// The other shape that repeats across this crate's `extern "C"` surface: a
+// native API that hands the engine an opaque pointer (`AAsset*`, `AAssetDir*`)
+// which is really a `Box<T>` of ours, and takes it back to read, advance or
+// free. Each function used to open-code the `*mut c_void as *const T` cast, its
+// own null check and a different spelling of the SAFETY comment. The four
+// operations below are the whole of it, so what remains in an entry point is
+// "is this a handle of ours" and a call into ordinary Rust.
+
+/// Move `value` to the heap and give the engine its address.
+pub(crate) fn into_handle<T>(value: T) -> *mut c_void {
+    Box::into_raw(Box::new(value)) as *mut c_void
+}
+
+/// Borrow the value behind a handle, or `None` for null.
+///
+/// # Safety
+/// `handle`, if not null, must have come from [`into_handle::<T>`] with this
+/// same `T` and not yet gone through [`drop_handle`], and nothing else may be
+/// using it mutably for the length of the borrow.
+pub(crate) unsafe fn handle_ref<'a, T>(handle: *mut c_void) -> Option<&'a T> {
+    // SAFETY: the contract above is the caller's; `as_ref` supplies the null check.
+    unsafe { (handle as *const T).as_ref() }
+}
+
+/// As [`handle_ref`], mutably.
+///
+/// # Safety
+/// As [`handle_ref`], and no other borrow of the handle may be live.
+pub(crate) unsafe fn handle_mut<'a, T>(handle: *mut c_void) -> Option<&'a mut T> {
+    // SAFETY: as above.
+    unsafe { (handle as *mut T).as_mut() }
+}
+
+/// Take a handle back and drop what it holds. Null is nothing to free.
+///
+/// # Safety
+/// As [`handle_ref`], and the handle must not be used again afterwards: the
+/// engine calls each `close` once, per the API's own contract.
+pub(crate) unsafe fn drop_handle<T>(handle: *mut c_void) {
+    if !handle.is_null() {
+        // SAFETY: non-null, and from `into_handle::<T>` per the contract.
+        drop(unsafe { Box::from_raw(handle as *mut T) });
+    }
+}
+
+/// Borrow storage the *caller* allocated as an overlay type of ours, or `None`
+/// for null.
+///
+/// The libc shim in `bionic/pthread.rs` lays `BionicCond`, `BionicSem` and the
+/// like over the engine's own `pthread_cond_t` and `sem_t`. That is the same
+/// shape as a handle (a `c_void` pointer that is really a `T`) with a different
+/// owner: the engine allocated it, so there is nothing for [`drop_handle`] to
+/// free and no [`into_handle`] to come from. Shared, not mutable, because the
+/// overlays are made of atomics and a `&mut` over storage that other threads
+/// are locking is a promise nobody can keep.
+///
+/// # Safety
+/// `ptr`, if not null, must point at storage at least `size_of::<T>()` bytes
+/// long, aligned for `T`, that stays valid for the borrow, and every field of
+/// `T` must tolerate concurrent access through a shared reference.
+pub(crate) unsafe fn overlay_ref<'a, T>(ptr: *const c_void) -> Option<&'a T> {
+    // SAFETY: the contract above is the caller's; `as_ref` supplies the null check.
+    unsafe { (ptr as *const T).as_ref() }
+}
+
+/// A C string for a diagnostic, or `"(null)"`.
+///
+/// `bionic::cstr` and `bionic::trace::s` were two copies of the same
+/// null-then-`CStr::from_ptr` dance for printing an assertion's arguments;
+/// this is the pointer-free half of it, taking what [`borrow_request`] returns.
+pub(crate) fn lossy_or_null(c: Option<&CStr>) -> String {
+    c.map_or_else(|| "(null)".into(), |c| c.to_string_lossy().into_owned())
+}
+
+/// Write `value` through an out-parameter the caller may have passed as null.
+/// Returns whether anything was written.
+///
+/// # Safety
+/// `out`, if not null, must be valid for a write of one `T`.
+pub(crate) unsafe fn store_out<T>(out: *mut T, value: T) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: non-null per the check above; validity is the caller's contract.
+    unsafe { out.write(value) };
     true
 }
 
@@ -104,5 +201,71 @@ mod tests {
         assert!(!write_response(bytes, std::ptr::null_mut(), 8));
         let mut out = vec![0u8; 8];
         assert!(!write_response(bytes, out.as_mut_ptr() as *mut c_char, 0));
+    }
+
+    #[test]
+    fn a_handle_round_trips_and_null_is_nothing() {
+        let h = into_handle(String::from("asset"));
+        // SAFETY: `h` is a live handle to a `String` and nothing else borrows it.
+        unsafe {
+            assert_eq!(handle_ref::<String>(h).map(String::as_str), Some("asset"));
+            handle_mut::<String>(h).unwrap().push('!');
+            assert_eq!(handle_ref::<String>(h).map(String::as_str), Some("asset!"));
+            drop_handle::<String>(h);
+            assert!(handle_ref::<String>(std::ptr::null_mut()).is_none());
+            assert!(handle_mut::<String>(std::ptr::null_mut()).is_none());
+            drop_handle::<String>(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn dropping_a_handle_runs_the_destructor_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct Counted;
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let h = into_handle(Counted);
+        // SAFETY: a live handle to a `Counted`, freed exactly once.
+        unsafe { drop_handle::<Counted>(h) };
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_overlay_borrows_caller_storage_and_null_is_nothing() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Two words of caller-owned storage, viewed as the atomic they hold.
+        let storage = [AtomicU32::new(7), AtomicU32::new(0)];
+        let p = storage.as_ptr() as *const c_void;
+        // SAFETY: `p` is live, aligned for `AtomicU32`, and atomics tolerate sharing.
+        let first = unsafe { overlay_ref::<AtomicU32>(p) }.expect("non-null borrows");
+        assert_eq!(first.load(Ordering::SeqCst), 7);
+        first.store(9, Ordering::SeqCst);
+        assert_eq!(storage[0].load(Ordering::SeqCst), 9, "the borrow is the storage, not a copy");
+        // SAFETY: null is the case under test; the helper checks before it looks.
+        assert!(unsafe { overlay_ref::<AtomicU32>(std::ptr::null()) }.is_none());
+    }
+
+    #[test]
+    fn a_null_diagnostic_string_prints_as_null_and_a_bad_one_does_not_panic() {
+        assert_eq!(lossy_or_null(None), "(null)");
+        assert_eq!(lossy_or_null(Some(c"plain")), "plain");
+        // Not UTF-8: the lossy conversion is the reason this is a `String`.
+        let bytes = CString::new(vec![b'a', 0xff, b'b']).unwrap();
+        assert_eq!(lossy_or_null(Some(bytes.as_c_str())), "a\u{fffd}b");
+    }
+
+    #[test]
+    fn an_out_parameter_may_be_null() {
+        let mut v = 0i64;
+        // SAFETY: `&mut v` is valid for a write; null is the case under test.
+        unsafe {
+            assert!(store_out(&mut v, 7));
+            assert!(!store_out(std::ptr::null_mut::<i64>(), 9));
+        }
+        assert_eq!(v, 7);
     }
 }

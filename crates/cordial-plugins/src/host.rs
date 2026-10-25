@@ -343,39 +343,83 @@ impl Plugin {
         self.writer.clone()
     }
 
-    /// **A single `SIGKILL` to this pid is not enough**, and the first version
-    /// of this method sent exactly that. `sandbox.rs` passes bwrap
-    /// `--new-session`, which calls `setsid()` before bwrap forks again to set
-    /// up the sandboxed pid namespace -- so this pid is the leader of its own
-    /// session and process group, and bwrap's own inner fork lives in that
-    /// group too, ahead of the point where it execs Deno. `Child::kill` signals
-    /// only the one pid; `SIGKILL` cannot be caught, so it never gives bwrap
-    /// the chance to tear its own children down on the way out, and the inner
-    /// fork survives it, reparented to init with nothing left watching it.
+    /// This process's pid, for a caller that wants to signal it from outside
+    /// without taking `&mut Plugin` -- the hot-swap reconciler in
+    /// `cordial-runtime::plugin_host` is the one that exists for. `Plugin`
+    /// itself is moved into the thread that serves it at spawn time (see
+    /// `plugin_host::start_all`), so nothing outside that thread can reach
+    /// `kill()` on it directly; a bare pid is `Copy` and costs nothing to keep
+    /// alongside it in a shared map instead.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// **A single `SIGKILL` to this pid, alone, was once believed not enough**
+    /// -- see [`kill_process_group`]'s doc for the correction. That belief is
+    /// why this method still sends both a group signal and a direct one
+    /// rather than either alone: whichever one actually reaps the tree on a
+    /// given bwrap build, this covers it, and the second call costs one
+    /// syscall against an already-dead target when it was not needed.
     ///
-    /// Measured directly: an otherwise clean, panic-free run of this crate's
-    /// own tests, with every `kill()` call reached, still left one such
-    /// process behind -- 21 seconds old and already reparented -- the same
-    /// shape as the sandboxed stragglers this whole guard exists to stop.
-    /// Signalling the *group* reaches every process `--new-session` put in it,
-    /// however many times bwrap forked.
-    ///
-    /// `rustix::process::kill_process_group` takes the plain (positive) pid
-    /// and negates it internally before calling `kill(2)` -- the previous
-    /// version of this method did that negation itself in an unsafe block.
-    /// The only failures are ESRCH (the group is already gone) and EPERM, and
-    /// both are fine to ignore: either way there is nothing left running that
-    /// this call could still reach, so the result is dropped rather than
-    /// reported. If `child.id()` somehow will not fit a `Pid` the group is
-    /// left unsignalled and `child.kill()` below still reaps the one pid we
-    /// definitely have.
+    /// Measured directly, twice now, with different results each time --
+    /// once (2026-08-26-ish) that the group signal alone left an orphaned
+    /// inner fork behind, and once (ADR-038's live verification) that the
+    /// group signal alone reached nothing at all because this pid was not
+    /// its own group leader on this host's bwrap. Both measurements are
+    /// real; neither generalises past "one bwrap build, once", which is the
+    /// whole reason this sends both rather than picking the one that was
+    /// right last time.
     pub fn kill(&mut self) {
-        if let Some(pid) = rustix::process::Pid::from_raw(self.child.id() as i32) {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-        }
+        kill_process_group(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Send `SIGKILL` to `pid` itself and to the process group its comment used
+/// to claim `pid` leads, ignoring both results.
+///
+/// **Correction, found live rather than reasoned out in advance (ADR-038).**
+/// This function used to send only the group signal, on the strength of the
+/// paragraph `Plugin::kill` still carries above: that `--new-session` makes
+/// `pid` a session and process-group leader, so signalling the group led by
+/// `pid` reaches everything bwrap forked. Measured directly, on this host,
+/// with `ps -o pid,ppid,pgid` while a plugin sat mid-teardown: the **outer**
+/// bwrap process -- the one `std::process::Command::spawn` returns and the
+/// one `pid` here always is -- kept the process group it inherited from
+/// *its own parent*; it was the **inner** bwrap fork, one level further down
+/// and holding a different pid entirely, that actually became the session
+/// and group leader. `killpg(pid, SIGKILL)` with the outer pid therefore
+/// signalled a group with nothing in it -- a syscall that succeeds and
+/// changes nothing, which is a worse failure than one that errors, because
+/// it looks identical to working. The hot-swap reconciler's own first
+/// integration test caught this: a plugin told to stop stayed alive for the
+/// whole test, `ps` showing it untouched down to the millisecond.
+///
+/// A plain `SIGKILL` to `pid` itself is what actually reaps the tree, and
+/// `--die-with-parent` is why: bwrap arranges to die when its own parent
+/// does, so the inner fork's parent (the outer bwrap) dying takes the inner
+/// fork and the Deno process under it down with it. That is also, in
+/// hindsight, the likelier explanation for `Plugin::kill`'s own "measured
+/// directly" paragraph -- a run that exercised both this call and its
+/// `child.kill()` cannot tell which one actually did the work, only that
+/// the pair together did. Both signals are sent here rather than removing
+/// the group one entirely, because a bwrap built differently, or an older
+/// one, may yet make the outer process the leader the original comment
+/// described -- and a `killpg` against an empty group costs one syscall
+/// that changes nothing, which is a cheap hedge against reasoning about a
+/// sandbox internal that has already been wrong once.
+///
+/// The only failures from either call are ESRCH (already gone) and EPERM,
+/// both ignored: either way there is nothing left running that this call
+/// could still reach. If `pid` will not fit a `Pid`, both signals are
+/// skipped; the caller's own retry (`plugin_host::reconcile_tick`, via
+/// `Shared::stopping`) tries again next tick rather than this function
+/// pretending to have done something it could not.
+pub fn kill_process_group(pid: u32) {
+    let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else { return };
+    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
 }
 
 /// **The reason this exists rather than trusting every caller to remember

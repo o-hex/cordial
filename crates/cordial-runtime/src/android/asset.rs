@@ -18,10 +18,12 @@
 //! without Cordial ever writing into the APK or into anything extracted from
 //! it.
 
+use crate::ffi_util::{borrow_request, drop_handle, handle_mut, handle_ref, into_handle, store_out, write_response};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -833,28 +835,29 @@ pub unsafe extern "C" fn cordial_overlay_resolve(
     out: *mut c_char,
     out_len: usize,
 ) -> c_int {
-    if path.is_null() || out.is_null() || out_len == 0 {
+    // Before the lookup, not after: resolving records the request, and a call
+    // with nowhere to put an answer should not leave one behind.
+    if out.is_null() || out_len == 0 {
         return 0;
     }
-    // SAFETY: `path` is non-null per the check above, and the function's own
-    // contract requires it be NUL-terminated.
-    let Some(name) = (unsafe { cstr(path) }) else { return 0 };
-    let Some(resolved) = resolve_asset_path(&name, for_write != 0) else {
+    // SAFETY: the function's own contract requires `path` be NUL-terminated
+    // when it is not null, and a null one is refused by the helper.
+    let Some(name) = (unsafe { borrow_request(path) }) else { return 0 };
+    let Some(answer) = redirect_bytes(&name.to_string_lossy(), for_write != 0) else {
         return 0;
     };
-    let bytes = resolved.as_os_str().as_encoded_bytes();
-    if bytes.len() + 1 > out_len {
-        return 0;
-    }
-    // SAFETY: `out` is non-null with at least `out_len` writable bytes per
-    // the function's own contract, and `bytes.len() + 1 <= out_len` is
-    // checked immediately above, so both the copy and the NUL write land
-    // inside that buffer.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
-        *out.add(bytes.len()) = 0;
-    }
-    1
+    // A buffer too small is refused whole rather than truncated, which the
+    // helper guarantees: a truncated path names a different file.
+    c_int::from(write_response(&answer, out, out_len))
+}
+
+/// The redirect for `name` as NUL-terminated bytes, or `None` to use the path
+/// as given. Everything `cordial_overlay_resolve` does that is not a pointer.
+fn redirect_bytes(name: &str, for_write: bool) -> Option<Vec<u8>> {
+    let resolved = resolve_asset_path(name, for_write)?;
+    let mut bytes = resolved.as_os_str().as_encoded_bytes().to_vec();
+    bytes.push(0);
+    Some(bytes)
 }
 
 // -------------------------------------------------------------- the recorder
@@ -1225,13 +1228,6 @@ fn write_atomically(out: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-/// SAFETY: `p` is null or a NUL-terminated C string, per the API contract.
-unsafe fn cstr(p: *const c_char) -> Option<String> {
-    // SAFETY: non-null per the check below; NUL-termination is this
-    // function's own contract, stated above.
-    (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
-}
-
 // ------------------------------------------------------------------- the API
 
 extern "C" fn asset_manager_from_java(_env: *mut c_void, _obj: *mut c_void) -> *mut c_void {
@@ -1252,90 +1248,181 @@ extern "C" fn asset_manager_open(
         return std::ptr::null_mut();
     };
     // SAFETY: the API contract is a NUL-terminated path.
-    let Some(name) = (unsafe { cstr(filename) }) else {
+    let Some(name) = (unsafe { borrow_request(filename) }) else {
         return std::ptr::null_mut();
     };
+    open_asset(manager, &name.to_string_lossy()).map_or(std::ptr::null_mut(), into_handle)
+}
 
-    match manager.read(&name) {
-        Some(bytes) => Box::into_raw(Box::new(Asset { bytes })) as *mut c_void,
-        // Not an error worth failing on: Android's asset manager returns null
-        // for a missing asset and callers probe for optional files. `read`
-        // already traced the miss (under `CORDIAL_TRACE_ASSETS=1`) with the
-        // name; nothing more to add here.
-        None => std::ptr::null_mut(),
-    }
+/// Not an error worth failing on: Android's asset manager returns null for a
+/// missing asset and callers probe for optional files. `read` already traced
+/// the miss (under `CORDIAL_TRACE_ASSETS=1`) with the name.
+fn open_asset(manager: &Manager, name: &str) -> Option<Asset> {
+    manager.read(name).map(|bytes| Asset { bytes })
 }
 
 extern "C" fn asset_get_buffer(asset: *mut c_void) -> *const c_void {
-    if asset.is_null() {
-        return std::ptr::null();
-    }
-    // SAFETY: `asset` came from asset_manager_open and has not been closed.
-    let a = unsafe { &*(asset as *const Asset) };
-    a.bytes.as_ptr() as *const c_void
+    // SAFETY: `asset` is null or came from asset_manager_open and has not been
+    // closed.
+    unsafe { handle_ref::<Asset>(asset) }.map_or(std::ptr::null(), |a| a.bytes.as_ptr() as *const c_void)
 }
 
 extern "C" fn asset_get_length(asset: *mut c_void) -> i64 {
-    if asset.is_null() {
-        return 0;
-    }
     // SAFETY: as above.
-    let a = unsafe { &*(asset as *const Asset) };
-    a.bytes.len() as i64
+    unsafe { handle_ref::<Asset>(asset) }.map_or(0, |a| a.bytes.len() as i64)
 }
 
 extern "C" fn asset_close(asset: *mut c_void) {
-    if asset.is_null() {
-        return;
-    }
-    // SAFETY: `asset` came from Box::into_raw in asset_manager_open and is closed
+    // SAFETY: `asset` is null or came from asset_manager_open and is closed
     // exactly once, per the API contract.
-    drop(unsafe { Box::from_raw(asset as *mut Asset) });
+    unsafe { drop_handle::<Asset>(asset) };
 }
 
 /// Some callers want a file descriptor rather than a buffer — Android can give
 /// one because assets are stored uncompressed at a known offset in the APK.
-/// Cordial's are decompressed in memory, so this hands back a sealed `memfd`
-/// holding the same bytes, which behaves the same for reading.
+/// Cordial's are decompressed in memory, so this hands back a `memfd` holding
+/// the same bytes, which behaves the same for reading.
 extern "C" fn asset_open_file_descriptor(
     asset: *mut c_void,
     out_start: *mut i64,
     out_length: *mut i64,
 ) -> c_int {
-    if asset.is_null() {
+    // SAFETY: `asset` is null or came from asset_manager_open.
+    let Some(a) = (unsafe { handle_ref::<Asset>(asset) }) else {
         return -1;
-    }
-    // SAFETY: `asset` came from asset_manager_open.
-    let a = unsafe { &*(asset as *const Asset) };
-
-    extern "C" {
-        fn memfd_create(name: *const c_char, flags: u32) -> c_int;
-        fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
-        fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
-    }
-
-    // SAFETY: a literal name and no flags; the fd is returned to the caller.
-    let fd = unsafe { memfd_create(c"cordial-asset".as_ptr(), 0) };
-    if fd < 0 {
+    };
+    let Some(fd) = memfd_with(a.bytes) else {
         return -1;
+    };
+    // SAFETY: the caller's out-parameters, each valid or null.
+    unsafe {
+        store_out(out_start, 0);
+        store_out(out_length, a.bytes.len() as i64);
     }
-    // SAFETY: writing exactly the bytes we own to a fresh fd.
-    let written = unsafe { write(fd, a.bytes.as_ptr() as *const c_void, a.bytes.len()) };
-    if written < 0 || written as usize != a.bytes.len() {
-        return -1;
-    }
-    // SAFETY: rewinding the fd we just wrote.
-    unsafe { lseek(fd, 0, 0) };
+    fd.into_raw_fd()
+}
 
-    if !out_start.is_null() {
-        // SAFETY: caller-provided out-parameter.
-        unsafe { *out_start = 0 };
+/// A fresh `memfd` holding exactly `bytes`, positioned at the start.
+///
+/// A short `write` is retried by `write_all`; the first version made one call
+/// and returned -1 on a short count without closing the descriptor, which is a
+/// leak for every large asset that hit it. Dropping the `File` on any failure
+/// closes it.
+fn memfd_with(bytes: &[u8]) -> Option<OwnedFd> {
+    // SAFETY: a literal name and no flags.
+    let raw = unsafe { libc::memfd_create(c"cordial-asset".as_ptr(), 0) };
+    if raw < 0 {
+        return None;
     }
-    if !out_length.is_null() {
-        // SAFETY: caller-provided out-parameter.
-        unsafe { *out_length = a.bytes.len() as i64 };
+    // SAFETY: `raw` is a descriptor this function just created and nothing else
+    // owns.
+    let mut file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    file.write_all(bytes).ok()?;
+    file.seek(SeekFrom::Start(0)).ok()?;
+    Some(file.into())
+}
+
+// ------------------------------------------------------------- directories
+//
+// The Quest build's OpenXR loader imports `AAssetManager_openDir` and its two
+// companions. The bionic linker binds every import when a library loads,
+// functions as much as data, and the loader is in `libroblox.so`'s
+// `DT_NEEDED`, so without these the engine did not load at all. The phone
+// build never imported them.
+
+/// An open `AAssetDir`: the file names directly inside one asset directory, and
+/// how far through them the caller has read.
+///
+/// `CString`s held here so that the pointer `AAssetDir_getNextFileName` returns
+/// stays valid until the next call or `close`, which is the NDK's promise.
+struct AssetDir {
+    names: Vec<std::ffi::CString>,
+    next: usize,
+}
+
+impl AssetDir {
+    /// The next name, or null at the end. The pointer is into `self`, so it
+    /// stays valid until the next call or `close`, as the NDK promises.
+    fn next_name(&mut self) -> *const c_char {
+        match self.names.get(self.next) {
+            Some(name) => {
+                self.next += 1;
+                name.as_ptr()
+            }
+            None => std::ptr::null(),
+        }
     }
-    fd
+}
+
+/// The file names directly inside `assets/<dir>/`, sorted.
+///
+/// Files only, and only one level: Android's `AAssetDir_getNextFileName` is
+/// documented to skip subdirectories, and a zip has no directory entries it
+/// can be relied on to carry anyway, so a subdirectory shows up here only as a
+/// name with a further `/` in it and is dropped. Sorted because Android's
+/// `AssetDir` is a sorted vector; nothing is known to depend on the order, but
+/// a listing that changed order between two APKs with the same contents would
+/// be one more thing to rule out.
+///
+/// `dir` is taken with or without surrounding slashes, and the empty string is
+/// the root of `assets/`. Overlays are not consulted: they replace files the APK
+/// already has and are not known to add any, so the APK's index is the listing.
+fn list_dir<'a>(entries: impl Iterator<Item = &'a str>, dir: &str) -> Vec<String> {
+    let dir = dir.trim_matches('/');
+    let prefix = if dir.is_empty() {
+        "assets/".to_string()
+    } else {
+        format!("assets/{dir}/")
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.strip_prefix(&prefix))
+        .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+extern "C" fn asset_manager_open_dir(_mgr: *mut c_void, dir_name: *const c_char) -> *mut c_void {
+    let Some(manager) = MANAGER.get() else {
+        eprintln!("[asset] openDir before an APK was set — pass --apk");
+        return std::ptr::null_mut();
+    };
+    // SAFETY: the API contract is a NUL-terminated path.
+    let Some(dir) = (unsafe { borrow_request(dir_name) }) else {
+        return std::ptr::null_mut();
+    };
+    open_dir(manager, &dir.to_string_lossy()).map_or(std::ptr::null_mut(), into_handle)
+}
+
+/// NULL is the documented failure value, and an unreadable APK is a failure;
+/// an empty listing would claim the directory is merely empty. A directory the
+/// APK does not have is an empty listing rather than NULL, which is what
+/// Android's AssetManager gives for one too (INFERRED from its `openDir`
+/// merging whatever it finds across asset paths, not measured on a device).
+fn open_dir(manager: &Manager, dir: &str) -> Option<AssetDir> {
+    let zip = manager.archive()?;
+    let names: Vec<std::ffi::CString> = list_dir(zip.file_names(), dir)
+        .into_iter()
+        .filter_map(|n| std::ffi::CString::new(n).ok())
+        .collect();
+    if trace_assets_enabled() {
+        eprintln!("[asset] openDir: {dir:?} -> {} files", names.len());
+    }
+    Some(AssetDir { names, next: 0 })
+}
+
+extern "C" fn asset_dir_get_next_file_name(dir: *mut c_void) -> *const c_char {
+    // SAFETY: `dir` is null or came from asset_manager_open_dir and has not been
+    // closed; the engine reads one directory from one thread.
+    unsafe { handle_mut::<AssetDir>(dir) }.map_or(std::ptr::null(), AssetDir::next_name)
+}
+
+extern "C" fn asset_dir_close(dir: *mut c_void) {
+    // SAFETY: `dir` is null or came from asset_manager_open_dir and is closed
+    // exactly once, per the API contract.
+    unsafe { drop_handle::<AssetDir>(dir) };
 }
 
 /// Everything this module provides, for the symbol table.
@@ -1352,6 +1439,9 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
         f!("AAsset_getLength", asset_get_length),
         f!("AAsset_close", asset_close),
         f!("AAsset_openFileDescriptor", asset_open_file_descriptor),
+        f!("AAssetManager_openDir", asset_manager_open_dir),
+        f!("AAssetDir_getNextFileName", asset_dir_get_next_file_name),
+        f!("AAssetDir_close", asset_dir_close),
     ]
 }
 
@@ -1390,6 +1480,7 @@ pub fn probe(name: &str) -> Result<usize, String> {
 #[cfg(test)]
 mod overlay_tests {
     use super::*;
+    use std::ffi::CStr;
 
     /// The global overlay stack, the built index and the request recorder are
     /// all process-wide, and cargo runs this file's tests on several threads.
@@ -1443,6 +1534,145 @@ mod overlay_tests {
         let path = dir.join(name);
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    #[test]
+    fn a_directory_listing_is_its_files_only_one_level_deep() {
+        let apk = apk_with(&[
+            ("assets/openxr/1/manifest.json", b"{}"),
+            ("assets/openxr/1/deeper/skip.json", b"{}"),
+            ("assets/openxr/other.json", b"{}"),
+            ("assets/root.txt", b"x"),
+            ("lib/arm64-v8a/libroblox.so", b"not an asset"),
+        ]);
+        let zip = archive_of(&apk);
+        assert_eq!(list_dir(zip.file_names(), "openxr/1"), ["manifest.json"]);
+        // Surrounding slashes are the caller's business, not a different dir.
+        assert_eq!(list_dir(zip.file_names(), "/openxr/1/"), ["manifest.json"]);
+        // `deeper/` is a subdirectory and `1/` is one too; neither is a file.
+        assert_eq!(list_dir(zip.file_names(), "openxr"), ["other.json"]);
+        assert_eq!(list_dir(zip.file_names(), ""), ["root.txt"]);
+        assert!(list_dir(zip.file_names(), "absent").is_empty());
+    }
+
+    // ------------------------------------------------- the C entry points
+
+    /// An `AAsset*` holding `bytes`, as `asset_manager_open` would hand out.
+    fn handle_to(bytes: &'static [u8]) -> *mut c_void {
+        into_handle(Asset { bytes })
+    }
+
+    #[test]
+    fn the_asset_entry_points_answer_a_null_handle_with_their_failure_value() {
+        // The engine probes; a null `AAsset*` is the miss it already handles.
+        assert!(asset_get_buffer(std::ptr::null_mut()).is_null());
+        assert_eq!(asset_get_length(std::ptr::null_mut()), 0);
+        assert_eq!(asset_open_file_descriptor(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()), -1);
+        asset_close(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn an_open_asset_reports_its_bytes_and_closes() {
+        let a = handle_to(b"hello");
+        assert_eq!(asset_get_length(a), 5);
+        let p = asset_get_buffer(a);
+        // SAFETY: five bytes owned by the asset, which is still open.
+        assert_eq!(unsafe { std::slice::from_raw_parts(p as *const u8, 5) }, b"hello");
+        asset_close(a);
+    }
+
+    #[test]
+    fn a_file_descriptor_holds_the_asset_from_its_first_byte() {
+        let a = handle_to(b"0123456789");
+        let (mut start, mut length) = (-1i64, -1i64);
+        let fd = asset_open_file_descriptor(a, &mut start, &mut length);
+        assert!(fd >= 0);
+        assert_eq!((start, length), (0, 10));
+        // SAFETY: a descriptor this call just handed over, owned from here on.
+        let mut file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        let mut got = Vec::new();
+        file.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"0123456789", "the descriptor must be positioned at the start");
+        // Both out-parameters are optional.
+        let again = asset_open_file_descriptor(a, std::ptr::null_mut(), std::ptr::null_mut());
+        assert!(again >= 0);
+        // SAFETY: as above.
+        drop(unsafe { OwnedFd::from_raw_fd(again) });
+        asset_close(a);
+    }
+
+    #[test]
+    fn a_large_asset_survives_the_trip_through_a_memfd() {
+        // Large enough that a single `write` is allowed to be short, which the
+        // first version of this treated as failure and leaked the descriptor.
+        let big: Vec<u8> = (0..16 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let fd = memfd_with(&big).expect("a memfd");
+        let mut file = File::from(fd);
+        let mut got = Vec::new();
+        file.read_to_end(&mut got).unwrap();
+        assert!(got == big, "the bytes read back are not the bytes written");
+    }
+
+    #[test]
+    fn an_overlay_redirect_is_nul_terminated_and_refused_when_it_does_not_fit() {
+        let _guard = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        isolate("resolve-c");
+        let root = scratch("resolve-c-assets");
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        let overlay = scratch("resolve-c-overlay");
+        write(&overlay, "content/a.bin", b"overlay");
+        register_plugin_root("resolver", overlay);
+        set_asset_root(&root);
+        let target = std::ffi::CString::new(root.join("content/a.bin").to_string_lossy().as_bytes()).unwrap();
+
+        let mut buf = vec![0x7fu8; 4096];
+        // SAFETY: `target` is NUL-terminated and `buf` is 4096 writable bytes.
+        let hit = unsafe { cordial_overlay_resolve(target.as_ptr(), 0, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        assert_eq!(hit, 1);
+        let end = buf.iter().position(|b| *b == 0).expect("a NUL terminator");
+        assert!(String::from_utf8_lossy(&buf[..end]).ends_with("content/a.bin"));
+
+        // Too small: refused, and not a byte of it written.
+        let mut small = vec![0x7fu8; 8];
+        // SAFETY: as above with an 8-byte buffer.
+        let miss = unsafe { cordial_overlay_resolve(target.as_ptr(), 0, small.as_mut_ptr() as *mut c_char, small.len()) };
+        assert_eq!(miss, 0);
+        assert_eq!(small, vec![0x7fu8; 8], "a refused answer must not be partly written");
+
+        // A write is not redirected, and the degenerate arguments are no-ops.
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(cordial_overlay_resolve(target.as_ptr(), 1, buf.as_mut_ptr() as *mut c_char, buf.len()), 0);
+            assert_eq!(cordial_overlay_resolve(std::ptr::null(), 0, buf.as_mut_ptr() as *mut c_char, buf.len()), 0);
+            assert_eq!(cordial_overlay_resolve(target.as_ptr(), 0, std::ptr::null_mut(), 16), 0);
+            assert_eq!(cordial_overlay_resolve(target.as_ptr(), 0, buf.as_mut_ptr() as *mut c_char, 0), 0);
+        }
+        unregister_plugin_root("resolver");
+    }
+
+    #[test]
+    fn get_next_file_name_walks_the_listing_once_then_answers_null() {
+        let names = ["a.json", "b.json"]
+            .iter()
+            .map(|n| std::ffi::CString::new(*n).unwrap())
+            .collect();
+        let dir = Box::into_raw(Box::new(AssetDir { names, next: 0 })) as *mut c_void;
+        let mut seen = Vec::new();
+        loop {
+            let p = asset_dir_get_next_file_name(dir);
+            if p.is_null() {
+                break;
+            }
+            // SAFETY: a pointer into the listing, which is still open.
+            seen.push(unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_string());
+        }
+        assert_eq!(seen, ["a.json", "b.json"]);
+        // Exhausted stays exhausted rather than wrapping round.
+        assert!(asset_dir_get_next_file_name(dir).is_null());
+        asset_dir_close(dir);
+        // A null handle is refused rather than dereferenced.
+        assert!(asset_dir_get_next_file_name(std::ptr::null_mut()).is_null());
+        asset_dir_close(std::ptr::null_mut());
     }
 
     #[test]

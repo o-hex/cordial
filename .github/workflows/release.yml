@@ -18,7 +18,7 @@
 # None of the four jobs below fetch, embed or reference any Roblox material.
 # Every one of them builds Cordial's own source (plus the same third-party OSS
 # Cordial always depends on -- libbadcpu, mcpelauncher-linker, libjnivm,
-# mocktail-webview) and nothing else; the resulting packages start, find no
+# mocktail-webview, and on x86-64 dynarmic with its externals) and nothing else; the resulting packages start, find no
 # Roblox build, and say so, exactly like every other packaging format already
 # does. See AGENTS.md, "Permanently out of scope".
 #
@@ -135,6 +135,15 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
+# Stamps every binary built here with the repository that ran the workflow, so
+# a bug report can say "Official build". A fork's own run stamps the fork's
+# name and is reported as that fork's. Triage only, and trivially spoofed:
+# crates/cordial-shell/build.rs and version::Origin say why nothing may ever
+# read it back. The AppImage, deb and rpm scripts and makepkg inherit it; the
+# rpm and makepkg legs are INFERRED to pass it through to cargo.
+env:
+  CORDIAL_OFFICIAL_BUILD: ${{ github.repository }}
+
 jobs:
   appimage:
     # **Not Fedora, since ADR-032.** Fedora 44's glibc is 2.43, four minor
@@ -184,7 +193,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             git ca-certificates curl build-essential clang cmake pkg-config \
-            binutils llvm lld \
+            binutils llvm lld libboost-dev \
             libssl-dev \
             libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev \
             libpipewire-0.3-dev libpulse-dev libasound2-dev \
@@ -307,7 +316,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             git ca-certificates curl build-essential clang cmake pkg-config \
-            binutils libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev \
+            binutils libboost-dev libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev \
             libpipewire-0.3-dev libpulse-dev libasound2-dev zlib1g-dev \
             desktop-file-utils
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -430,9 +439,17 @@ jobs:
     container: archlinux:base-devel
     timeout-minutes: 75
     steps:
+      # Before the checkout, not with the other packages below: `archlinux:
+      # base-devel` carries no git, and without one `actions/checkout` falls
+      # back to an archive with no `.git`, so the `git branch` in the build
+      # step has no repository to name and fails with "not a git repository".
+      - name: Install git for the checkout
+        run: pacman -Syu --noconfirm --needed git
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          # Whole history and tags: off a tag the package is built from this
+          # checkout, and pkgver() runs `git describe --tags` on it.
+          fetch-depth: 0
           submodules: false
       - name: Install the PKGBUILD's own depends() and makedepends()
         # Read out of packaging/aur/cordial/PKGBUILD by sourcing it rather
@@ -466,12 +483,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Off a tag, build the commit under test rather than `main`'s.
+          # A named branch, because makepkg mirror-clones the source and a
+          # detached HEAD is not a ref the mirror carries.
+          source=""
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            git -C "$GITHUB_WORKSPACE" branch -f ci-under-test HEAD
+            source="git+file://$GITHUB_WORKSPACE#branch=ci-under-test"
+          fi
           useradd --create-home builder
           # $GITHUB_WORKSPACE rather than a guessed container path: that is
           # the one name Actions guarantees points at the checkout, whatever
           # the container job happens to mount it at.
           chown -R builder:builder "$GITHUB_WORKSPACE"
           runuser -u builder -- env CORDIAL_PKGBUILD_TAG="$CORDIAL_PKGBUILD_TAG" \
+            CORDIAL_PKGBUILD_SOURCE="$source" \
             makepkg --dir "$GITHUB_WORKSPACE/packaging/aur/cordial" \
               --noconfirm --cleanbuild --force
           install -d dist/arch

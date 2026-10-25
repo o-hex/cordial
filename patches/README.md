@@ -20,7 +20,7 @@ and not the mapping change or the constructor split it also carried. It has been
 removed: its content is exactly these four patches, checked line for line before
 it went.
 
-**These are not applied automatically.** Applying them is a build-system change
+**0001 to 0004 are not applied automatically.** Applying them is a build-system change
 nobody has made yet, and a patch that silently applies is worse than one that
 does not: `crates/cordial-linker-sys/build.rs` did not watch the loader sources
 until recently, so a loader change that failed to take produced a binary that
@@ -140,3 +140,112 @@ it (no crash, two clean repeats), the failing `stat("")` triple is
 byte-for-byte identical to the unmodified baseline. None of the three ways
 native code can ask the linker "where am I" are used before, during, or in
 place of the failure.
+
+## 0005 — parse `DT_RELR` and `DT_ANDROID_RELR` again
+
+**Unlike the four above, this one changes behaviour, and a checkout without it
+cannot load a RELR-packed library.** The port wraps the three RELR cases in
+`soinfo::prelink_image` in `#if 0` while keeping `relocate_relr` and its call in
+`linker_relocate.cpp`, so a library whose relative relocations are packed that
+way loads with every one of them left as a bare file offset. Nothing reports
+it; the linker prints `unused DT entry: unknown OS-specific (type 0x6fffe000)`
+as a warning and carries on.
+
+No phone build has needed it. The Quest build's `libovrplatformloader.so` does:
+its single `.init_array` entry is stored as `0xcec64` and covered by its
+`.relr.dyn`, and under qemu-aarch64 the load died with `SIGSEGV` at `si_addr`
+`0xcec64` exactly, deterministically across two runs with ASLR off. With the
+cases compiled back in, the same load reached `LOADED` and `JNI_OnLoad returned
+0x10006` on three runs out of three.
+
+So it is applied by every build: `crates/cordial-linker-sys/build.rs`
+compiles the loader from an overlay of the submodule under `OUT_DIR`, built
+by `patches/apply.rs`, in which the files 0005 and 0006 touch are patched
+copies and everything else is a symlink to the submodule. The submodule
+itself is never written, so a build leaves `git status` clean and the window
+title free of a `-dirty` the build caused. A patch already in the submodule
+(applied by hand) is built as it is; one that neither applies nor is present
+stops the build by name. That used to be `tools/vr/build-aarch64.sh`'s job
+alone, applying in place, so a plain `cargo build` produced a client that
+could not link the Quest build.
+
+## 0006 — link objects built for another instruction set
+
+Behaviour, like 0005, and applied by the same build script after it (it is made
+against a tree with 0005 in). It lets the x86-64 client link the Quest build's
+arm64 `libroblox.so` for the dynarmic translator (docs/vr/dynarmic-design.md
+§2, milestone M2), and is inert until `mcpelauncher_set_guest_machine` is
+called with a non-zero machine, which only `cordial-run --guest-arm64` does.
+
+One linker instance serves both kinds of object rather than a second compiled
+copy. The loader's state is process-global -- the solist, the namespaces, the
+handle table, `dl_iterate_phdr`'s list, the lock -- and a second copy would need
+every one of its external symbols renamed and would not know about the first
+one's objects. What actually differs by instruction set is small and belongs
+to the object, not the loader, so it is a field on `soinfo`:
+
+- `ElfReader` accepts `EM_AARCH64` besides the host's machine, and records it.
+- A guest object's four relocation types that write a 64-bit address (ABS64,
+  GLOB_DAT, JUMP_SLOT, RELATIVE, plus NONE) are translated to the host's
+  generic numbers and applied by the unchanged code. Anything else is refused
+  by name: IRELATIVE would have the host call a guest resolver.
+- Once a guest machine is set, each object binds only to libraries of its own
+  kind. A virtual library is marked guest when its addresses are guest stubs.
+  Without this, `dlopen` in the engine's imports resolved against the linker's
+  own host `libdl.so`, which is in its `DT_NEEDED`.
+- A guest object's constructors are never called by the host; they are left
+  for the translator, and `mcpelauncher_guest_ctors` says what they are.
+- Guest segments are mapped without `PROT_EXEC`: the translator only reads
+  them, and a stray host jump then faults instead of running arm64 bytes.
+- Each guest object logs its relocations by type, which is how the load is
+  checked against `llvm-readelf -r`.
+
+Verified on the Quest build 2.740.927: the counts logged equal `llvm-readelf -r`
+type for type (RELATIVE 572,841, ABS64 22, GLOB_DAT 56, JUMP_SLOT 598), three
+runs out of three, and the native x86-64 load of the phone build produced the
+same relocation trace, type and symbol, line for line, with and without it.
+
+## 0007 — dynarmic: keep flag-setting logical ops out of constant folding
+
+Not the loader: this one is against `third_party/dynarmic`, which points at a
+repository this project cannot push to either, and `crates/cordial-guest/build.rs`
+applies it the same way as 0005 and 0006, on x86-64 only, since nothing else
+compiles dynarmic. Behaviour, and a translator bug fix
+rather than anything about the engine.
+
+The first run of the Quest build's constructors under the translator
+(docs/vr/dynarmic-design.md M3) aborted inside dynarmic with
+`assertion failed: value.GetInst()->MayGetNZCVFromOp()`, while translating a
+block at libroblox+0x1e6214c that ends `ands x12, x12, x13; b.eq`, where x13 is
+all ones. `ANDS` emits an `And64` with a `GetNZCVFromOp` pseudo-op attached;
+the constant-propagation pass folds `x & ~0` to `x`, which re-points the
+pseudo-op at the shift that produced `x`, and the pseudo-op's argument check
+fires. `FoldAdd` and `FoldSub` already leave an op with a pseudo-op alone;
+`FoldAND`, `FoldEOR`, `FoldOR` and `FoldNOT` did not. The patch gives them the
+same guard. With it the block translates and all 3,622 constructors run.
+
+## 0008 — dynarmic: return-stack and fast-dispatch hits at each site
+
+Against `third_party/dynarmic` like 0007, applied by the same call in
+`crates/cordial-guest/build.rs`. Performance only; it changes no guest-visible
+result.
+
+dynarmic ends every block that finishes in a guest `RET` by jumping to one
+shared handler that pops its return-stack buffer, and every `BR`/`BLR` by
+jumping to one shared fast-dispatch handler. Each handler then ends in a host
+indirect jump, so all guest returns share one host branch and all indirect
+calls another, and the host predictor has only global history to tell their
+targets apart. In game those two handlers were 6--10 % of the frame threads'
+samples (docs/vr/dynarmic-design.md §9.8). The patch emits each handler's hit
+path inline at the site and keeps the shared code for the misses, entered with
+the same registers, and deepens the ring from 8 entries to 32, since a C++
+engine's call chains between returns routinely run deeper than eight. Measured
+in §9.9: fewer host branch misses on `RBX Worker C`, and a frame-rate effect
+inside the noise of the runs taken.
+
+## 0003, for timing
+
+`CORDIAL_TIME_CTORS=1` on the native path splits `dlopen`'s time into linking and
+constructors, which is the qemu half of M3's comparison, and needs 0003's
+deferral. It refuses to run without it rather than report a constructor time of
+zero. 0003 was applied by hand for that measurement and taken out again.

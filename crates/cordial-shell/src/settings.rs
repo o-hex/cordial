@@ -8,7 +8,7 @@
 //! graphics preference to be usable, without a terminal.
 //!
 //! `AdwPreferencesDialog` with several `AdwPreferencesPage`s — Roblox, Updates,
-//! Version, General, Plugins, FastFlags, Report — each becomes its own tab/sidebar entry for free;
+//! Version, General, Plugins, FastFlags — each becomes its own tab/sidebar entry for free;
 //! that is libadwaita's own page-switcher, not something built here. Appearance
 //! used to be its own page; its two groups live inside General now, and
 //! `build_preferences_window`'s own comment explains why.
@@ -19,9 +19,10 @@
 //! command line. That is configuration rather than a fallback, and it belongs
 //! in the shell because the shell is what has to work when nothing else does.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use libadwaita as adw;
 use libadwaita::glib;
@@ -46,7 +47,7 @@ use cordial_plugins::unpack;
 
 use crate::audio_devices;
 use crate::install;
-use crate::shell_config::{self, AppearanceScheme, AudioOutput, ShellConfig, ThrottleWhen};
+use crate::shell_config::{self, AppearanceScheme, AudioInput, AudioOutput, ShellConfig, ThrottleWhen};
 
 /// What a plugin asks for, and what this profile has actually given it.
 ///
@@ -156,10 +157,16 @@ fn discover_tiers(system_root: &Path, user_root: &Path) -> (Vec<Plugin>, Vec<Plu
 /// and not the user's to delete, and it cannot be replaced by a same-id user
 /// directory. It can be switched off exactly like any other, which is the whole
 /// reason enablement is a separate file from grants.
+///
+/// A third kind is a folder somebody is writing a plugin in, loaded from where
+/// it lives (`unpacked_plugins`). It is listed with the installed ones and
+/// marked, but it is not *in* either directory: nothing can be uninstalled from
+/// an archive, there is no update, and "remove" means forgetting the folder.
 #[derive(Clone, Copy, PartialEq)]
 enum Tier {
     BuiltIn,
     User,
+    Development,
 }
 
 /// "Appearance" — Cordial's own theme preference, independent of anything
@@ -236,10 +243,7 @@ fn add_appearance_groups(page: &adw::PreferencesPage, config: Rc<RefCell<ShellCo
             }
         });
     }
-    // Says when it applies, because it does not apply to a window already open
-    // and a setting that appears to do nothing is worse than one that explains
-    // itself.
-    bar_row.set_subtitle("Hidden removes the title bar without fullscreen. Applies to the next launch.");
+    bar_row.set_subtitle("Hidden removes the title bar without fullscreen.");
     bar_row.add_suffix(&detail(
         "Hidden also removes the window controls. Use your desktop's window shortcuts to move or close the game.",
     ));
@@ -247,6 +251,35 @@ fn add_appearance_groups(page: &adw::PreferencesPage, config: Rc<RefCell<ShellCo
     page.add(&window_group);
 
 }
+
+/// Mark a row whose setting a running game does not pick up.
+///
+/// Live settings say nothing (ADR-044); a row that changes nothing until the
+/// client restarts has to say so, or it is a control that appears to do nothing.
+/// The key is checked against `live::CLASSIFICATION` so a row cannot claim to be
+/// next-launch while the table says it is live, or the reverse.
+fn next_launch(row: &impl IsA<adw::ActionRow>, key: &str) {
+    debug_assert_eq!(
+        crate::live::classify(key),
+        Some(crate::live::Applies::NextLaunch),
+        "{key} is not a next-launch setting"
+    );
+    let row = row.upcast_ref::<adw::ActionRow>();
+    let base = row.subtitle().map(|s| s.to_string()).unwrap_or_default();
+    row.set_subtitle(&if base.is_empty() {
+        NEXT_LAUNCH.to_string()
+    } else {
+        format!("{base} {NEXT_LAUNCH}")
+    });
+    // A row limited to N lines is limited to N+1 now; without this the note is
+    // the first thing ellipsised.
+    let lines = row.subtitle_lines();
+    if lines > 0 {
+        row.set_subtitle_lines(lines + 1);
+    }
+}
+
+const NEXT_LAUNCH: &str = "Applies at next launch.";
 
 /// The small `i` button that carries what a row cannot afford to say in its
 /// subtitle.
@@ -309,42 +342,251 @@ pub fn persist(config: &Rc<RefCell<ShellConfig>>, path: &Rc<PathBuf>) {
     }
 }
 
-/// One row showing a path Cordial is using, where it came from, and how to
-/// change it.
+/// The two lines under "Roblox build": which build a profile on Latest runs, and
+/// how it came to be in the store -- a fact read off the entry, not a guess.
 ///
-/// The provenance line is not decoration. The build usually comes from another
-/// application's private directory (Sober's), and a user who does not know that
-/// has no way to understand why deleting Sober broke Cordial. ADR-002's rule
-/// about not silently depending on something applies to a path exactly as much
-/// as to a capability.
-fn path_row(
-    title: &str,
-    effective: Option<(PathBuf, String)>,
-    chosen: bool,
-    on_choose: impl Fn() + 'static,
-    on_clear: impl Fn() + 'static,
-) -> adw::ActionRow {
-    let subtitle = match &effective {
-        Some((path, origin)) => format!("{}\n{origin}", path.display()),
-        None => "Not found. Press Roblox in the launcher for how to get one.".to_string(),
-    };
-    let row = adw::ActionRow::builder().title(title).subtitle(subtitle).build();
-    row.set_subtitle_lines(3);
+/// `overridden` is `CORDIAL_APK`, which replaces the store for a run and is said
+/// first because it changes what the rest of the line means.
+fn build_subtitle(latest: Option<&cordial_update::store::Entry>, overridden: bool) -> String {
+    let mut lines = Vec::new();
+    if overridden {
+        lines.push("CORDIAL_APK names the build for this run. The store is not used while it is set.".to_string());
+    }
+    match latest {
+        Some(entry) => {
+            lines.push(format!("Roblox {} runs on profiles set to Latest", entry.version));
+            if let Some(p) = &entry.provenance {
+                lines.push(p.label());
+            }
+        }
+        None => lines.push("No build yet. Press Download Roblox.".to_string()),
+    }
+    lines.join("\n")
+}
 
-    if chosen {
-        let clear = gtk::Button::from_icon_name("edit-clear-symbolic");
-        clear.set_tooltip_text(Some("Forget this and look again on the next launch"));
-        clear.set_valign(gtk::Align::Center);
-        clear.add_css_class("flat");
-        clear.connect_clicked(move |_| on_clear());
-        row.add_suffix(&clear);
+/// The build row: what Latest runs, how to get a newer one, and the two imports.
+///
+/// Returns the progress meter as well, for the caller to put in the group under
+/// the row: it is a separate widget because a bar inside an `AdwActionRow`
+/// fights the suffix buttons for the width.
+///
+/// **Recomputed by one closure, `refresh`**, which every action calls when it
+/// ends. The row used to be built once and left, which was harmless while
+/// nothing on this page could change what the build was. A download does, and a
+/// row that went on saying "No build yet" beside a finished install is the
+/// stale-label failure this crate keeps rediscovering.
+///
+/// A file or Sober's build is *imported* into the store, never followed
+/// (ADR-054): verified like a download, copied, filed with where it came from,
+/// and forgotten. **Import from Sober is offered only when Sober's directory
+/// holds a build the store does not**, and nothing on the page says Cordial
+/// depends on Sober.
+fn build_build_row(
+    window: &gtk::Window,
+    on_changed: Rc<dyn Fn()>,
+) -> (Vec<adw::ActionRow>, Rc<crate::download_progress::Meter>) {
+    let row = adw::ActionRow::builder().title("Roblox build").build();
+    row.set_subtitle_lines(4);
+
+    // Three rows, not three buttons on one: a row's suffixes are not given the
+    // width they ask for before its title and subtitle are, and with three
+    // buttons beside them the build's own line wrapped to one word a row.
+    let download = gtk::Button::with_label("Download Roblox");
+    download.set_valign(gtk::Align::Center);
+    row.add_suffix(&download);
+
+    let file_row = adw::ActionRow::builder()
+        .title("Import from a file")
+        .subtitle("Copy an APK you already have into Cordial. It is checked like a download.")
+        .build();
+    file_row.set_subtitle_lines(3);
+    let import_file = gtk::Button::with_label("Import…");
+    import_file.set_valign(gtk::Align::Center);
+    file_row.add_suffix(&import_file);
+
+    let sober_row = adw::ActionRow::builder()
+        .title("Import from Sober")
+        .subtitle(
+            "Sober has a Roblox build Cordial does not. Copying it does not change Sober's files, \
+             and Cordial does not follow Sober's updates.",
+        )
+        .build();
+    sober_row.set_subtitle_lines(3);
+    let import_sober = gtk::Button::with_label("Import…");
+    import_sober.set_valign(gtk::Align::Center);
+    sober_row.add_suffix(&import_sober);
+
+    let meter = crate::download_progress::Meter::new();
+    meter.widget().set_margin_top(8);
+    meter.widget().set_margin_bottom(8);
+    meter.widget().set_margin_start(12);
+    meter.widget().set_margin_end(12);
+
+    let refresh: Rc<dyn Fn()> = {
+        let (row, download, import_sober, import_file, sober_row) =
+            (row.clone(), download.clone(), import_sober.clone(), import_file.clone(), sober_row.clone());
+        Rc::new(move || {
+            let entries = cordial_update::store::list();
+            let latest = cordial_update::store::latest(&entries);
+            // Escaped: the subtitle is Pango markup.
+            row.set_subtitle(&glib::markup_escape_text(&build_subtitle(
+                latest,
+                install::override_apk().is_some(),
+            )));
+            let blocked = install::updates_blocked().is_some();
+            download.set_sensitive(!blocked);
+            import_file.set_sensitive(!blocked);
+            sober_row.set_visible(cordial_update::provider::import::sober_offer(&entries).is_some());
+            import_sober.set_sensitive(!blocked);
+            // The list of what is kept changes when this row's answer does.
+            on_changed();
+        })
+    };
+    refresh();
+
+    // One flag for every action on the row: they all write the store's one
+    // install directory, and the second would be refused by its lock with a
+    // sentence about "another Cordial".
+    let busy: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+
+    // One handler, two meanings, decided by whether a download is running --
+    // `Some` while it is, holding the token that stops it. Two handlers (one to
+    // start, one connected later to cancel) both fire on the second press, and
+    // the first of them starts another download.
+    let running: Rc<RefCell<Option<Arc<cordial_update::provider::Cancel>>>> = Rc::new(RefCell::new(None));
+    {
+        let (meter, refresh, busy) = (meter.clone(), refresh.clone(), busy.clone());
+        let (import_sober, import_file) = (import_sober.clone(), import_file.clone());
+        download.connect_clicked(move |button| {
+            if let Some(cancel) = running.borrow().as_ref() {
+                cancel.stop();
+                button.set_sensitive(false);
+                button.set_label("Stopping...");
+                return;
+            }
+            if busy.get() {
+                return;
+            }
+            busy.set(true);
+            let cancel = Arc::new(cordial_update::provider::Cancel::new());
+            *running.borrow_mut() = Some(cancel.clone());
+            meter.start();
+            button.set_label("Cancel");
+            import_sober.set_sensitive(false);
+            import_file.set_sensitive(false);
+
+            let (button, meter_done, refresh, running, busy) =
+                (button.clone(), meter.clone(), refresh.clone(), running.clone(), busy.clone());
+            let meter_step = meter.clone();
+            crate::updater::on_worker_reporting(
+                move |report: &dyn Fn(cordial_update::provider::Progress)| {
+                    // `Newest`, the same as the Updates page. The mirror is the
+                    // only source (ADR-054): pressing this downloads the newest
+                    // build and never copies Sober's.
+                    cordial_update::provider::update_store(
+                    &cordial_update::install::Store::live(cordial_shell::profile::all_pinned_versions()),
+                    &cancel,
+                    &mut |p| report(p),
+                )
+                    .map_err(|e| e.to_string())
+                },
+                move |step| meter_step.step(&step),
+                move |outcome| {
+                    *running.borrow_mut() = None;
+                    busy.set(false);
+                    button.set_sensitive(true);
+                    button.set_label("Download Roblox");
+                    match outcome {
+                        Ok(version) => meter_done.finish(&version),
+                        // A stop is not a failure and must not be drawn as one;
+                        // `updater.rs` makes the same distinction.
+                        Err(why) if why == cordial_update::Unreachable::Cancelled.to_string() => {
+                            meter_done.stopped()
+                        }
+                        Err(why) => meter_done.failed(&why),
+                    }
+                    // After the outcome either way: a failed install can still
+                    // have left the row's answer different from what it was.
+                    refresh();
+                },
+            );
+        });
     }
 
-    let choose = gtk::Button::with_label("Choose…");
-    choose.set_valign(gtk::Align::Center);
-    choose.connect_clicked(move |_| on_choose());
-    row.add_suffix(&choose);
-    row
+    // Both imports end the same way and differ only in what they file.
+    let import: Rc<dyn Fn(Box<dyn FnOnce() -> Result<String, String> + Send>)> = {
+        let (meter, refresh, busy) = (meter.clone(), refresh.clone(), busy.clone());
+        let buttons = [download.clone(), import_sober.clone(), import_file.clone()];
+        Rc::new(move |work| {
+            if busy.get() {
+                return;
+            }
+            busy.set(true);
+            meter.start();
+            for b in &buttons {
+                b.set_sensitive(false);
+            }
+            let (meter_done, refresh, busy, buttons) =
+                (meter.clone(), refresh.clone(), busy.clone(), buttons.clone());
+            let meter_step = meter.clone();
+            crate::updater::on_worker_reporting(
+                move |report: &dyn Fn(cordial_update::provider::Progress)| {
+                    let _ = report;
+                    work()
+                },
+                move |step| meter_step.step(&step),
+                move |outcome| {
+                    busy.set(false);
+                    for b in &buttons {
+                        b.set_sensitive(true);
+                    }
+                    match outcome {
+                        Ok(version) => meter_done.finish(&version),
+                        Err(why) => meter_done.failed(&why),
+                    }
+                    refresh();
+                },
+            );
+        })
+    };
+    {
+        let import = import.clone();
+        import_sober.connect_clicked(move |_| {
+            import(Box::new(|| {
+                let found = cordial_update::provider::import::detect_sober()
+                    .ok_or_else(|| "Sober's package directory holds no Roblox build any more.".to_string())?;
+                cordial_update::provider::import_and_tidy(
+                    &found,
+                    cordial_update::store::Source::Sober,
+                    &cordial_update::install::Store::live(cordial_shell::profile::all_pinned_versions()),
+                    &cordial_update::provider::Cancel::new(),
+                    &mut |_| {},
+                )
+                .map_err(|e| e.to_string())
+            }));
+        });
+    }
+    {
+        let (import, window) = (import.clone(), window.clone());
+        import_file.connect_clicked(move |_| {
+            let import = import.clone();
+            choose_file(&window, "Choose the Roblox APK", false, move |path| {
+                import(Box::new(move || {
+                    let found = cordial_update::provider::import::from_file(&path)?;
+                    cordial_update::provider::import_and_tidy(
+                        &found,
+                        cordial_update::store::Source::for_path(&path),
+                        &cordial_update::install::Store::live(cordial_shell::profile::all_pinned_versions()),
+                        &cordial_update::provider::Cancel::new(),
+                        &mut |_| {},
+                    )
+                    .map_err(|e| e.to_string())
+                }));
+            });
+        });
+    }
+
+    (vec![row, file_row, sober_row], meter)
 }
 
 /// "Roblox" — where the build is.
@@ -358,7 +600,6 @@ fn path_row(
 fn build_roblox_page(
     parent: &impl IsA<gtk::Window>,
     config: Rc<RefCell<ShellConfig>>,
-    config_path: Rc<PathBuf>,
 ) -> adw::PreferencesPage {
     let page =
         adw::PreferencesPage::builder()
@@ -373,93 +614,25 @@ fn build_roblox_page(
         // cannot work out from the controls: that leaving both empty is a
         // working state rather than an unfinished one. The "and never will"
         // half was the project talking about itself.
-        .description("Leave these empty and Cordial finds a build. Choose a file to pin one.")
+        .description("Cordial downloads Roblox and keeps its own copy.")
         .build();
 
-    let apk = install::effective_apk(&config.borrow().roblox)
-        .map(|(path, origin)| (path, origin.describe().to_string()));
-    let apk_chosen = config.borrow().roblox.apk.is_some();
+    let (store_group, redraw_store) = crate::roblox_store::build_group(parent.as_ref());
+    let (build_rows, meter) = build_build_row(parent.as_ref(), redraw_store);
+    for row in &build_rows {
+        group.add(row);
+    }
+    group.add(meter.widget());
 
-    let window = parent.as_ref().clone();
-    let apk_row = {
-        let config = config.clone();
-        let config_path = config_path.clone();
-        let window = window.clone();
-        let cleared = config.clone();
-        let cleared_path = config_path.clone();
-        path_row(
-            "APK",
-            apk,
-            apk_chosen,
-            move || {
-                let config = config.clone();
-                let config_path = config_path.clone();
-                choose_file(&window, "Choose the Roblox APK", false, move |path| {
-                    config.borrow_mut().roblox.apk = Some(path);
-                    persist(&config, &config_path);
-                });
-            },
-            move || {
-                cleared.borrow_mut().roblox.apk = None;
-                persist(&cleared, &cleared_path);
-            },
-        )
-    };
-    group.add(&apk_row);
-
-    // Shown separately from the APK because it usually is separate: on a split
-    // build `libroblox.so` is inside `split_config.x86_64.apk`, not `base.apk`,
-    // and Cordial extracts it into its own cache rather than writing into
-    // whichever application's directory the APK came from.
-    //
-    // The extracted case carries `updater::cache_line`, which says whether the
-    // engine still matches the APK above. That used to be a row in the
-    // header-bar button's window; it belongs here, beside the directory it is
-    // about, and it is the only place a Cordial that re-extracts 115 MB on every
-    // launch says what it is comparing.
-    let lib = config.borrow().roblox.lib_dir.clone().map(|p| (p, "Chosen in Settings".to_string())).or_else(
-        || {
-            let cache = install::engine_cache();
-            if !cache.join(install::LIBRARY).is_file() {
-                return None;
-            }
-            let apk = install::effective_apk(&config.borrow().roblox).map(|(path, _)| path);
-            let line = crate::updater::cache_line(
-                true,
-                cordial_update::cache::stamp_of(&cache),
-                apk.as_deref().is_some_and(|apk| cordial_update::cache::is_current(&cache, apk)),
-            );
-            Some((cache, line))
-        },
-    );
-    let lib_chosen = config.borrow().roblox.lib_dir.is_some();
-
-    let lib_row = {
-        let config = config.clone();
-        let config_path = config_path.clone();
-        let window = window.clone();
-        let cleared = config.clone();
-        let cleared_path = config_path.clone();
-        path_row(
-            "Engine directory",
-            lib,
-            lib_chosen,
-            move || {
-                let config = config.clone();
-                let config_path = config_path.clone();
-                choose_file(&window, "Choose the directory holding libroblox.so", true, move |path| {
-                    config.borrow_mut().roblox.lib_dir = Some(path);
-                    persist(&config, &config_path);
-                });
-            },
-            move || {
-                cleared.borrow_mut().roblox.lib_dir = None;
-                persist(&cleared, &cleared_path);
-            },
-        )
-    };
-    group.add(&lib_row);
+    // **There is no "Engine directory" row, and that is a removal rather than
+    // an omission.** It was a second path to choose, beside the APK, for a file
+    // Cordial extracts from that APK itself into its own cache and keeps in
+    // step with it. Nobody needed to choose it, and a chosen one was used
+    // as it stood and never compared with the APK.
     page.add(&group);
+    // What is kept, where each came from, who uses it. Redrawn by the row above
+    // whenever a download or an import lands.
+    page.add(&store_group);
 
     // The update settings were a group on this page, on the argument that they
     // govern the build the two rows above point at. They are a page of their own
@@ -794,7 +967,7 @@ fn build_performance_group(
         // acceleration off system-wide will find it changes only speed. Said
         // here because the obvious reading of the title is that turning it on
         // introduces acceleration from nowhere.
-        .subtitle("Camera movement is raw by default, which is what a camera wants.")
+        .subtitle("Cursor and camera by default. Choose Only the cursor for raw camera movement.")
         .model(&accel_model)
         .selected(config.borrow().pointer_acceleration.index())
         .build();
@@ -841,6 +1014,12 @@ fn build_performance_group(
         .sensitive(layer.is_some())
         .build();
     mangohud.set_subtitle_lines(3);
+    // Only when the row is offering the switch; the other subtitle is an
+    // explanation of why it is dead, and "applies at next launch" to a switch
+    // that cannot be pressed is noise.
+    if layer.is_some() {
+        next_launch(&mangohud, "mangohud");
+    }
     // Only when it is there to describe: see `detail`, and the comment above.
     if let Some(path) = &layer {
         mangohud.add_suffix(&detail(&format!(
@@ -859,6 +1038,63 @@ fn build_performance_group(
         });
     }
     group.add(&mangohud);
+
+    // Same shape as the MangoHUD row immediately above, for the same reason:
+    // an implicit Vulkan layer Cordial does not implement, so the switch is
+    // only offered when the layer is actually there. See
+    // `launch::vkbasalt_layer` and ADR-041.
+    let vkbasalt_layer = crate::launch::vkbasalt_layer();
+    let vkbasalt = adw::SwitchRow::builder()
+        .title("Shaders (vkBasalt)")
+        .subtitle(match &vkbasalt_layer {
+            Some(_) => {
+                "Sharpening and anti-aliasing, drawn over the game by vkBasalt's Vulkan layer."
+                    .to_string()
+            }
+            // Same reason the MangoHUD row below states its own dead-switch
+            // wording inline rather than in a `detail` popover: a button
+            // inside an insensitive row cannot be pressed.
+            None => format!(
+                "Not available: vkBasalt's Vulkan layer is not installed.\n{}",
+                crate::launch::vkbasalt_install_hint()
+            ),
+        })
+        // A stale `true` in shell.json must not read as on once the layer has
+        // been uninstalled, because at launch it would not be.
+        .active(config.borrow().vkbasalt && vkbasalt_layer.is_some())
+        .sensitive(vkbasalt_layer.is_some())
+        .build();
+    vkbasalt.set_subtitle_lines(3);
+    if vkbasalt_layer.is_some() {
+        next_launch(&vkbasalt, "vkbasalt");
+    }
+    if let Some(path) = &vkbasalt_layer {
+        let profile = config.borrow().profile.clone();
+        let config_note = match crate::launch::vkbasalt_config_path(&profile) {
+            Ok(p) => format!(
+                "Its own settings live at\n{}\nwritten the first time this switch is turned on, \
+                 and never overwritten once it exists.",
+                p.display()
+            ),
+            Err(e) => format!("Its config could not be located: {e}"),
+        };
+        vkbasalt.add_suffix(&detail(&format!(
+            "Drawn by vkBasalt's Vulkan layer, which this machine has at\n{}\n\n{}\n\nThe \
+             effects, sharpening strength and toggle key are vkBasalt's own configuration, \
+             not Cordial's.",
+            path.display(),
+            config_note
+        )));
+    }
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        vkbasalt.connect_active_notify(move |row| {
+            config.borrow_mut().vkbasalt = row.is_active();
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&vkbasalt);
 
     group
 }
@@ -972,7 +1208,58 @@ fn build_audio_group(
         });
     }
     group.add(&row);
+    group.add(&build_microphone_row(config, config_path));
     group
+}
+
+/// The Microphone row beside the output one: which input Roblox's voice chat
+/// records from. The rows, the stored form and the "not connected" rule are the
+/// output picker's, through [`output_picker_rows`] and `AudioInput`, so the two
+/// cannot disagree about what a missing device looks like.
+///
+/// **Listing the microphones opens none.** `audio_devices::sources` walks the
+/// registry and nothing else, which `audio_devices.rs` pins with a test, so
+/// opening Settings does not light the desktop's recording indicator.
+fn build_microphone_row(
+    config: Rc<RefCell<ShellConfig>>,
+    config_path: Rc<PathBuf>,
+) -> gtk::Widget {
+    let sources = audio_devices::sources();
+    let chosen = config.borrow().audio_input.clone();
+    let (labels, names) = output_picker_rows(&sources, &chosen);
+
+    if sources.is_empty() {
+        let row = adw::ActionRow::builder()
+            .title("Microphone")
+            .subtitle("No microphones found.")
+            .sensitive(false)
+            .build();
+        return row.upcast();
+    }
+
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let model = gtk::StringList::new(&label_refs);
+    let row = adw::ComboRow::builder()
+        .title("Microphone")
+        .subtitle("Where Roblox's voice chat records from. Choosing one does not turn it on.")
+        .model(&model)
+        .selected(chosen.index_in(&names))
+        .build();
+    row.set_subtitle_lines(2);
+    row.add_suffix(&detail(
+        "The microphone is opened only while Roblox is recording, and closed again when it \
+         stops. Choosing a device here does not open it.\n\nSystem default follows your \
+         desktop's default microphone. This is Cordial's routing, not Roblox's own device \
+         list. A change takes effect straight away if you are already in voice chat.",
+    ));
+    {
+        let names = names.clone();
+        row.connect_selected_notify(move |row| {
+            config.borrow_mut().audio_input = AudioInput::from_index(row.selected(), &names);
+            persist(&config, &config_path);
+        });
+    }
+    row.upcast()
 }
 
 /// "General" — ordinary client settings.
@@ -982,138 +1269,38 @@ fn build_audio_group(
 /// only by the X11 backend and do nothing on the Wayland one the launcher asks
 /// for, so a row for either would be a control that changes nothing — which is
 /// exactly what the Renderer row turned out to be until this change.
-/// Where a report goes. One constant, because the Settings row and the page
-/// description both name it and two copies drift.
-const ISSUES_URL: &str = "https://github.com/luohoa97/cordial/issues/new/choose";
-
-/// The page that turns "it doesn't work" into a report somebody can act on.
+/// "Running now": what the game that is open says about how it takes these
+/// settings.
 ///
-/// **A terminal is not a reasonable thing to require here.** `cordial-shell
-/// --diagnostics` prints the same block and is the right answer for anyone
-/// already in a shell, but the people whose reports are hardest to act on are
-/// the ones who installed a Flatpak from a link and have never opened one. The
-/// button and the flag share `diagnostics::report`, so the two can never drift
-/// into telling different stories about the same machine.
-///
-/// The text is shown as well as copied. Somebody is about to paste it into a
-/// public issue and is entitled to read it first -- and to edit out the
-/// hostname in `uname -a` if they would rather, which is the argument for a
-/// visible block over a button that silently uploads.
-fn build_report_page(parent: &impl IsA<gtk::Window>) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::builder()
-        .title("Report")
-        .name("report")
-        .icon_name("dialog-warning-symbolic")
-        .build();
-
-    let group = adw::PreferencesGroup::builder()
-        .title("Diagnostics")
-        // **One line.** This said four, explaining what the block contains and
-        // what it does not -- true, and none of it what somebody opening this
-        // page wants. They came to copy the thing. The block is right there and
-        // says what it contains by containing it, and the reasoning about what
-        // is deliberately absent lives in `diagnostics.rs` next to the code
-        // that decides it.
-        .description("Paste this into a GitHub issue.")
-        .build();
-
-    let text = crate::diagnostics::report();
-
-    // Monospace and selectable: the columns only line up in a fixed-width font,
-    // and somebody who wants one line rather than the block should be able to
-    // take it without the button's all-or-nothing.
-    let view = gtk::TextView::builder()
-        .editable(false)
-        .monospace(true)
-        .cursor_visible(false)
-        // **Wrapped, because `uname -a` is longer than any settings window.**
-        // Without this the System line ran off the right edge with no scrollbar
-        // and no way to see the rest -- the Copy button had the whole string,
-        // but somebody checking what they were about to paste into a public
-        // issue could not read the one line most likely to make them think
-        // twice. `WordChar` rather than `Word`: a kernel version has no spaces
-        // to break at.
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .top_margin(12)
-        .bottom_margin(12)
-        .left_margin(12)
-        .right_margin(12)
-        .build();
-    view.buffer().set_text(&text);
-    let frame = gtk::Frame::new(None);
-    frame.set_child(Some(&view));
-    frame.set_margin_top(6);
-
-    let copy = gtk::Button::with_label("Copy");
-    copy.set_valign(gtk::Align::Center);
-    let copied = text.clone();
-    copy.connect_clicked(move |b| {
-        if let Some(display) = gtk::gdk::Display::default() {
-            display.clipboard().set_text(&copied);
-            // The label is the confirmation. A toast needs an overlay this page
-            // does not own, and a button that looks identical after a press is
-            // one people press three times.
-            b.set_label("Copied");
-            let b = b.clone();
-            glib::timeout_add_seconds_local_once(2, move || b.set_label("Copy"));
-        }
-    });
-
-    let row = adw::ActionRow::builder().title("Copy diagnostics").build();
-    row.add_suffix(&copy);
+/// **The runtime's word, not this window's.** The rows below say "Applies at
+/// next launch" from a table the shell keeps; this group reads the declaration
+/// the running runtime sent in `settings.get` (ADR-044, ADR-055), so a runtime
+/// that takes a setting differently is described as it is. Hidden when nothing
+/// is running, which is every time the window is opened before a game is
+/// started, and refreshed while it is open because a game can start or exit
+/// under it.
+fn add_running_group(page: &adw::PreferencesPage) {
+    let row = adw::ActionRow::builder().build();
+    let group = adw::PreferencesGroup::builder().title("Running now").visible(false).build();
     group.add(&row);
-    group.add(&frame);
     page.add(&group);
-
-    let where_group = adw::PreferencesGroup::builder()
-        .title("Bugs and feature requests")
-        // The row below says where it goes and the form asks for the block. A
-        // paragraph here repeated both.
-        .build();
-
-    // A link row rather than prose with a URL in it: this window is the last
-    // place somebody is before they give up, and it should take one press to
-    // get from here to the form.
-    let issues = adw::ActionRow::builder()
-        .title("Open an issue")
-        .subtitle(ISSUES_URL.trim_start_matches("https://"))
-        .activatable(true)
-        .build();
-    // `go-next-symbolic`, and checked on disk rather than guessed: the first
-    // attempt used `external-link-symbolic`, which is in no icon theme here and
-    // rendered as the missing-image glyph. `go-next-symbolic` ships in Adwaita
-    // (`symbolic/actions/`) and is the affordance libadwaita already uses for a
-    // row that takes you somewhere.
-    issues.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-    // **`GtkUriLauncher`, not `cordial_plugins::urlopen`, and the difference is
-    // focus.** Both reach `org.freedesktop.portal.OpenURI`, so both work inside
-    // the Flatpak sandbox where a spawned `xdg-open` would not. But `urlopen`
-    // is the *plugin* path: a plugin has no window, so it passes an empty
-    // parent handle and no activation token, and GNOME's focus-stealing
-    // prevention answers that by declining to raise the browser -- you get a
-    // "Firefox is ready" notification instead of the page you asked for.
-    //
-    // This row has a window to offer. `UriLauncher::launch` takes the parent
-    // and hands the portal what it needs to raise the browser properly, which
-    // is the whole reason to use the GTK wrapper rather than call the portal by
-    // hand a second time. `urlopen` is left exactly as it is: it is correct for
-    // the caller it has, which never has a window (ADR-007).
-    let parent_for_link = parent.as_ref().clone();
-    issues.connect_activated(move |_| {
-        gtk::UriLauncher::new(ISSUES_URL).launch(
-            Some(&parent_for_link),
-            gtk::gio::Cancellable::NONE,
-            |result| {
-                if let Err(e) = result {
-                    eprintln!("[cordial] could not open the issue tracker: {e}");
+    let refresh = {
+        let (group, row) = (group.downgrade(), row.downgrade());
+        move || {
+            let (Some(group), Some(row)) = (group.upgrade(), row.upgrade()) else { return glib::ControlFlow::Break };
+            match crate::live::running_summary() {
+                Some(r) => {
+                    row.set_title(&glib::markup_escape_text(&r.title));
+                    row.set_subtitle(&glib::markup_escape_text(&r.detail));
+                    group.set_visible(true);
                 }
-            },
-        );
-    });
-    where_group.add(&issues);
-    page.add(&where_group);
-
-    page
+                None => group.set_visible(false),
+            }
+            glib::ControlFlow::Continue
+        }
+    };
+    refresh();
+    glib::timeout_add_seconds_local(2, refresh);
 }
 
 fn build_general_page(
@@ -1125,12 +1312,18 @@ fn build_general_page(
         .name("general")
         .icon_name("preferences-other-symbolic")
         .build();
+    add_running_group(&page);
 
     let group = adw::PreferencesGroup::builder()
         .title("Graphics")
         // "The choice is settled before Roblox loads its renderer" is why it
         // needs a relaunch; the user only needs the "needs a relaunch".
-        .description("Takes effect the next time you press Roblox.")
+        // Says it for the rows that need it: the renderer, the graphics
+        // optimisation and frame pacing are settled before the engine draws
+        // anything. Controllers is not among them -- it takes effect while a
+        // game is running (ADR-044) -- so the sentence names what it covers
+        // instead of claiming the whole group.
+        .description("The renderer, optimisation mode and frame pacing apply at next launch.")
         .build();
 
     // **Not backed by `FStringDebugGraphicsPreferredBackend` any more.** That
@@ -1295,6 +1488,56 @@ fn build_general_page(
     }
     group.add(&present);
 
+    // Order has to match FrameRateLimit::index/from_index, so the model is
+    // built from `ALL` rather than listed a second time.
+    //
+    // Display refresh first and the default: on a 60 Hz output it sets nothing,
+    // and above 60 it holds the engine's target at the display's rate (it did
+    // not follow the display by itself). There is no recommendation to put
+    // first -- nothing on this project's hardware has measured a cap above 60,
+    // because the only output it has measured on is a 60 Hz one.
+    let frame_rate_labels: Vec<&str> =
+        crate::shell_config::FrameRateLimit::ALL.iter().map(|c| c.row_label()).collect();
+    let frame_rate_model = gtk::StringList::new(&frame_rate_labels);
+    let frame_rate = adw::ComboRow::builder()
+        .title("Frame rate limit")
+        // What a user can act on: what it does and the caveat that would
+        // otherwise read as the setting not working. Applies to a running game
+        // (ADR-044), so it carries no "next launch" note. The mechanics -- the
+        // flag, and putting it back after the engine's own settings refresh --
+        // are in `cordial_runtime::flag_reapply`.
+        .subtitle(
+            "Holds the engine's frame cap at this value. A value above your display's refresh \
+             needs a monitor that fast. Display refresh follows your monitor's rate. Going back to \
+             it can take up to two minutes.",
+        )
+        .model(&frame_rate_model)
+        .selected(config.borrow().frame_rate_limit.index())
+        .build();
+    frame_rate.set_subtitle_lines(3);
+    frame_rate.add_suffix(&detail(
+        "This is a different lever from Frame pacing above: Frame pacing decides whether a \
+         finished frame waits for your display's refresh, and this decides how fast the engine \
+         tries to produce one in the first place. Frame pacing on FIFO still queues each present \
+         against the display clock, so raising this alone will not get past your panel's rate.\n\n\
+         Roblox's own client refetches its settings about every two minutes and puts its own \
+         value back. Cordial hands the engine your choice again right after each refresh, so \
+         the limit holds for the whole session. Changing the row applies to a game that is \
+         already running. Picking another cap takes effect at once; going back to Display \
+         refresh waits for the next of those refreshes, because the engine does not unset a \
+         flag that Roblox's settings leave out.",
+    ));
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        frame_rate.connect_selected_notify(move |row| {
+            config.borrow_mut().frame_rate_limit =
+                crate::shell_config::FrameRateLimit::from_index(row.selected());
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&frame_rate);
+
     // A switch rather than a combo, because it is one question with two
     // answers, and it lives beside Frame pacing rather than under Performance
     // because it decides what Cordial tells the engine about the machine --
@@ -1329,6 +1572,48 @@ fn build_general_page(
         });
     }
     group.add(&gamepad);
+
+    // Two switches, because the sound is a separate decision. The first records
+    // every session from its first frame; F9 in the game window starts and stops
+    // a recording whether or not it is on. Both are read at launch.
+    let record = adw::SwitchRow::builder()
+        .title("Record gameplay")
+        .subtitle("Saves each session as a video. F9 in the game starts and stops one at any time.")
+        .active(config.borrow().record_session)
+        .build();
+    record.set_subtitle_lines(2);
+    record.add_suffix(&detail(
+        "Needs ffmpeg. Files go to Videos/Cordial, or to the profile's recordings \
+         folder inside the Flatpak, which cannot see Videos.\n\nThe engine's own \
+         Record Video button does nothing on Android, so this reads the frames \
+         Cordial presents. It costs a few milliseconds per captured frame.\n\n\
+         F9 in the game window starts and stops a recording, and the window \
+         title shows REC while one runs. CORDIAL_RECORD_KEY changes the key, or \
+         turns it off with the value off.",
+    ));
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        record.connect_active_notify(move |row| {
+            config.borrow_mut().record_session = row.is_active();
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&record);
+    let record_audio = adw::SwitchRow::builder()
+        .title("Record sound too")
+        .subtitle("The game's own sound. Other programs are not recorded.")
+        .active(config.borrow().record_audio)
+        .build();
+    {
+        let config = config.clone();
+        let config_path = config_path.clone();
+        record_audio.connect_active_notify(move |row| {
+            config.borrow_mut().record_audio = row.is_active();
+            persist(&config, &config_path);
+        });
+    }
+    group.add(&record_audio);
 
     page.add(&group);
     page.add(&build_audio_group(config.clone(), config_path.clone()));
@@ -1406,9 +1691,27 @@ fn capability_row_subtitle(cap: Capability, refused: bool) -> String {
 /// after they write, so the summary line never lags behind the file it
 /// describes — the same reasoning the single switch this replaced already
 /// had, extended to cover more than one control changing the same plugin.
-fn refresh_plugin_subtitle(expander: &adw::ExpanderRow, plugin: &Plugin, profile_dir: Option<&PathBuf>, enabled: bool) {
+fn refresh_plugin_subtitle(
+    expander: &adw::ExpanderRow,
+    plugin: &Plugin,
+    profile_dir: Option<&PathBuf>,
+    enabled: bool,
+    tier: Tier,
+) {
+    expander.set_subtitle(&plugin_row_subtitle(plugin, profile_dir, enabled, tier));
+}
+
+/// The summary line under a plugin's name. A development plugin leads with the
+/// folder it is loaded from, because that is the one thing that tells two
+/// working copies of the same plugin apart.
+fn plugin_row_subtitle(plugin: &Plugin, profile_dir: Option<&PathBuf>, enabled: bool, tier: Tier) -> String {
     let granted = profile_dir.map(|dir| grants::load(&grants::path_in(dir))).unwrap_or_default();
-    expander.set_subtitle(&capability_summary(plugin, granted.get(&plugin.manifest.id), enabled));
+    let status = capability_summary(plugin, granted.get(&plugin.manifest.id), enabled);
+    if tier == Tier::Development {
+        cordial_shell::plugin_listing::dev_subtitle(&plugin.dir.display().to_string(), &status)
+    } else {
+        status
+    }
 }
 
 /// One installed plugin's row: enable switch, one capability switch per
@@ -1424,6 +1727,7 @@ fn build_plugin_row(
     root: &Path,
     group: &adw::PreferencesGroup,
     tier: Tier,
+    consent: Option<&BuiltinConsent>,
 ) -> adw::ExpanderRow {
     let title = if plugin.manifest.name.is_empty() {
         plugin.manifest.id.clone()
@@ -1435,9 +1739,9 @@ fn build_plugin_row(
 
     let expander = adw::ExpanderRow::builder()
         .title(title.clone())
-        .subtitle(capability_summary(plugin, profile_dir.map(|dir| grants::load(&grants::path_in(dir))).unwrap_or_default().get(&id), enabled))
+        .subtitle(plugin_row_subtitle(plugin, profile_dir, enabled, tier))
         .build();
-    expander.set_subtitle_lines(2);
+    expander.set_subtitle_lines(if tier == Tier::Development { 3 } else { 2 });
 
     // **A plugin that failed says so on its own row.**
     //
@@ -1461,13 +1765,21 @@ fn build_plugin_row(
     if let Some(dir) = profile_dir {
         let failures = cordial_plugins::health::load(&cordial_plugins::health::path_in(dir));
         if let Some(failure) = failures.get(&id) {
-            let warning = gtk::Image::from_icon_name("dialog-error-symbolic");
-            warning.add_css_class("error");
+            // **An update waiting for approval is not a failure.** It is the
+            // reconciler declining to run a new version on a grant nobody
+            // gave it (ADR-038), and the way out is the switches below, so
+            // it gets the warning icon and no "Failed:" in front of it.
+            let approval = cordial_plugins::health::is_approval_notice(&failure.message);
+            let warning = gtk::Image::from_icon_name(if approval {
+                "dialog-warning-symbolic"
+            } else {
+                "dialog-error-symbolic"
+            });
+            warning.add_css_class(if approval { "warning" } else { "error" });
             warning.set_tooltip_text(Some(&failure.message));
-            warning.update_property(&[gtk::accessible::Property::Label(&format!(
-                "Failed: {}",
-                failure.message
-            ))]);
+            let label =
+                if approval { failure.message.clone() } else { format!("Failed: {}", failure.message) };
+            warning.update_property(&[gtk::accessible::Property::Label(&label)]);
             expander.add_suffix(&warning);
         }
     }
@@ -1483,6 +1795,16 @@ fn build_plugin_row(
     if tier == Tier::BuiltIn {
         let tag = gtk::Label::new(Some("Built-in"));
         tag.add_css_class("dim-label");
+        tag.add_css_class("caption");
+        tag.set_valign(gtk::Align::Center);
+        expander.add_suffix(&tag);
+    }
+    // Marked as what it is, in words: a development folder is not installed
+    // anywhere, and a row that looked like the installed ones beside it would
+    // suggest an uninstall and an update that do not exist.
+    if tier == Tier::Development {
+        let tag = gtk::Label::new(Some("Development"));
+        tag.add_css_class("accent");
         tag.add_css_class("caption");
         tag.set_valign(gtk::Align::Center);
         expander.add_suffix(&tag);
@@ -1646,7 +1968,7 @@ fn build_plugin_row(
                     return;
                 }
             }
-            refresh_plugin_subtitle(&expander, &plugin, dir.as_ref(), on);
+            refresh_plugin_subtitle(&expander, &plugin, dir.as_ref(), on, tier);
         });
     }
     expander.add_row(&enable_row);
@@ -1702,7 +2024,7 @@ fn build_plugin_row(
                     }
                     row.set_subtitle(&capability_row_subtitle(cap, false));
                 }
-                refresh_plugin_subtitle(&expander, &plugin, Some(&dir), enable_row.is_active());
+                refresh_plugin_subtitle(&expander, &plugin, Some(&dir), enable_row.is_active(), tier);
             });
         }
     } else {
@@ -1717,113 +2039,242 @@ fn build_plugin_row(
         );
     }
 
-    if tier == Tier::BuiltIn {
-        maybe_prompt_builtin_consent(parent, plugin, profile_dir, &expander, &enable_row, &cap_rows);
+    // A built-in does not ask here. It registers, and the one object that
+    // owns the question decides when to put it, for every built-in at once.
+    if let Some(consent) = consent {
+        consent.register(BuiltinEntry {
+            plugin: plugin.clone(),
+            expander: expander.clone(),
+            enable_row: enable_row.clone(),
+            cap_rows,
+        });
     }
 
     expander
 }
 
-/// Ask a built-in plugin's first-appearance consent question, if this profile
-/// has not already been asked and there is anything to ask about.
+/// One built-in plugin's row, as the first-appearance question needs to see it.
+struct BuiltinEntry {
+    plugin: Plugin,
+    expander: adw::ExpanderRow,
+    enable_row: adw::SwitchRow,
+    cap_rows: Vec<(Capability, adw::SwitchRow)>,
+}
+
+struct ConsentState {
+    /// Weak, because the dialog owns the closures that own this state. A
+    /// strong reference back would keep Settings alive after it was closed.
+    parent: glib::WeakRef<adw::PreferencesDialog>,
+    master: adw::SwitchRow,
+    profile_dir: Option<PathBuf>,
+    entries: RefCell<Vec<BuiltinEntry>>,
+    /// Whether a question is on screen. A second one waits for the first.
+    showing: Cell<bool>,
+}
+
+/// The one owner of every built-in plugin's first-appearance consent question.
 ///
-/// **When this asks, and why not on enabling instead.** A user-installed
-/// plugin has one clear moment to ask: the install button click, which
-/// happens exactly once and starts the plugin switched off (`consent::
-/// starts_disabled`) until somebody turns it on. A built-in has no such
-/// moment and, unless it is one of `enablement::SHIPS_DISABLED`, already
-/// ships *enabled* — so tying this to the Enabled switch's off-to-on
-/// transition would never fire for the common case, because there is no such
-/// transition: the plugin was already on the first time this row was ever
-/// built, silently running with nothing granted, which is the exact bug this
-/// change exists to close. Asking the first time this profile's Plugins page
-/// renders the row is the moment that actually happens for every profile,
-/// old or new.
+/// **One owner, because each row asking for itself is what stacked six
+/// dialogs.** Every built-in row used to build its own `AlertDialog` as the
+/// page was constructed, and the page is constructed when Settings opens, on
+/// whichever tab the user came for. A fresh profile therefore met a wall of
+/// permission dialogs over the Roblox tab, for plugins it had not looked at,
+/// one of which (`fps-flex`) was not even switched on. ADR-021's own argument
+/// against the third prompt applies to the fourth: a question put that many
+/// times is answered by reflex, which is a dialog that is no longer protecting
+/// anything.
 ///
-/// **This only ever touches capabilities, never `enablement`.** Built-ins are
-/// governed by `SHIPS_DISABLED`, a decision this file does not reopen (see
-/// the commit this landed in): consent here answers "may it do X", not
-/// "does it run at all", and conflating the two would make this prompt a
-/// second, competing policy for which built-ins start off.
-fn maybe_prompt_builtin_consent(
-    parent: &adw::PreferencesDialog,
-    plugin: &Plugin,
-    profile_dir: Option<&PathBuf>,
-    expander: &adw::ExpanderRow,
-    enable_row: &adw::SwitchRow,
-    cap_rows: &[(Capability, adw::SwitchRow)],
-) {
-    // Nowhere to record having asked, and nowhere to grant into — the same
-    // posture the capability switches above already take for an
-    // unresolvable profile.
-    let Some(dir) = profile_dir else { return };
-    let seen_path = consent::seen_path_in(dir);
-    let id = plugin.manifest.id.clone();
-    if consent::has_been_asked(&seen_path, &id) {
-        return;
+/// So rows register here and nothing asks until the question is due:
+///
+/// * only while the Plugins page is the one on screen, because that is where
+///   somebody can see what is being asked about;
+/// * only while Use Plugins is on, since with it off nothing runs;
+/// * only for built-ins that are switched on ([`consent::builtin_due`]), and
+///   again when one is switched on later;
+/// * and **in a single dialog** for however many are due, never a stack and
+///   never a run of them. Allowing is still the user's click, and the dialog
+///   says which plugins it covers and how to allow only some.
+///
+/// ADR-003's default deny is untouched: grants are written only by the allow
+/// response, through the same switches the rows already have. ADR-021 records
+/// the rule and why shipping the permissions granted was rejected.
+#[derive(Clone)]
+struct BuiltinConsent(Rc<ConsentState>);
+
+impl BuiltinConsent {
+    fn new(
+        parent: &adw::PreferencesDialog,
+        master: &adw::SwitchRow,
+        profile_dir: Option<&PathBuf>,
+    ) -> Self {
+        Self(Rc::new(ConsentState {
+            parent: parent.downgrade(),
+            master: master.clone(),
+            profile_dir: profile_dir.cloned(),
+            entries: RefCell::new(Vec::new()),
+            showing: Cell::new(false),
+        }))
     }
-    // `Silent` means no code and no capabilities requested -- nothing to run
-    // and nothing it could reach. `verdict` is a pure read of the manifest,
-    // so there is nothing worth persisting for this case; the check above
-    // costs one small file read on every Settings page open, which is the
-    // same price every other row on this page already pays for grants and
-    // enablement.
-    let consent::Verdict::Ask(prompt) = consent::verdict(plugin) else { return };
 
-    let dialog = adw::AlertDialog::builder()
-        .heading(prompt.heading())
-        .body(consent_body_for_builtin(&prompt))
-        .build();
-    dialog.add_response("skip", "Not now");
-    dialog.add_response("allow", "Allow");
-    dialog.set_response_appearance("allow", adw::ResponseAppearance::Suggested);
-    // The safe answer survives Escape, exactly as it does for a user install
-    // — ADR-003's default deny has to hold even when the dialog is dismissed
-    // rather than answered.
-    dialog.set_default_response(Some("skip"));
-    dialog.set_close_response("skip");
+    fn register(&self, entry: BuiltinEntry) {
+        // Switching a built-in on is the moment its question may become due,
+        // and the only one for a plugin that ships off.
+        let weak = Rc::downgrade(&self.0);
+        entry.enable_row.connect_active_notify(move |_| offer_soon(&weak));
+        self.0.entries.borrow_mut().push(entry);
+    }
 
-    let dir = dir.clone();
-    let cap_rows: Vec<(Capability, adw::SwitchRow)> = cap_rows.to_vec();
-    let expander = expander.clone();
-    let enable_row = enable_row.clone();
-    let plugin = plugin.clone();
-    dialog.connect_response(None, move |dialog, response| {
-        if response == "allow" {
-            // Each row's own `connect_active_notify` already does exactly
-            // what accepting this prompt means -- write the grant, clear any
-            // stale denial, refresh the summary line -- so flipping the
-            // switch is the grant, not a shortcut around it. This is the
-            // same mechanism the install flow uses, reached through the row
-            // that already exists here instead of a second copy of the
-            // grants::set loop that flow needs because it has no rows yet.
-            for (_, row) in &cap_rows {
-                row.set_active(true);
-            }
-            refresh_plugin_subtitle(&expander, &plugin, Some(&dir), enable_row.is_active());
+    /// Connect the moments the question can become due. Called once, after
+    /// every row has registered.
+    fn wire(&self, parent: &adw::PreferencesDialog) {
+        // Held strongly by the dialog's own handlers, which is what keeps this
+        // state alive for exactly as long as Settings is.
+        let strong = self.clone();
+        parent.connect_visible_page_name_notify(move |_| offer_soon(&Rc::downgrade(&strong.0)));
+        // Settings opened straight onto the Plugins page names it visible
+        // before it is on screen, so the first look happens at map.
+        let strong = self.clone();
+        parent.connect_map(move |_| offer_soon(&Rc::downgrade(&strong.0)));
+        let weak = Rc::downgrade(&self.0);
+        self.0.master.connect_active_notify(move |_| offer_soon(&weak));
+    }
+
+    /// Put the question, if it is due and nothing else is on screen.
+    fn offer(&self) {
+        let state = &self.0;
+        if state.showing.get() {
+            return;
         }
-        dialog.close();
-    });
+        // Nowhere to record having asked, and nowhere to grant into: the same
+        // posture the capability switches take for an unresolvable profile.
+        let Some(dir) = &state.profile_dir else { return };
+        let Some(parent) = state.parent.upgrade() else { return };
+        if !parent.is_mapped()
+            || parent.visible_page_name().as_deref() != Some("plugins")
+            || !state.master.is_active()
+        {
+            return;
+        }
 
-    // **Recorded when it is asked, not when it is answered.**
-    //
-    // This used to run inside the response handler, which only fires if the
-    // user actually answers *this* dialog. Every built-in row presents its own
-    // prompt as the page renders, so up to four stack at once; answer the top
-    // one and close Settings, and the rest are torn down with their parent
-    // without a response, nothing is recorded, and every one of them asks
-    // again the next time Settings is opened. Reported as the prompt coming up
-    // every time even after the plugins were enabled -- which it would, since
-    // flipping a capability switch is not an answer to this dialog.
-    //
-    // "Has this profile been asked" is true the moment the question is on
-    // screen, so that is when it is written. ADR-003's default deny is
-    // untouched: grants are still only written by the "allow" branch above, so
-    // a prompt that is dismissed grants nothing and simply does not nag.
-    if let Err(e) = consent::mark_asked(&seen_path, &id) {
-        eprintln!("shell: could not record that {id} has been asked about: {e}");
+        let seen_path = consent::seen_path_in(dir);
+        let granted = grants::load(&grants::path_in(dir));
+        let none = BTreeSet::new();
+        let entries = state.entries.borrow();
+        let due: Vec<(usize, consent::Prompt)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let id = &e.plugin.manifest.id;
+                consent::builtin_due(
+                    &e.plugin,
+                    e.enable_row.is_active(),
+                    granted.get(id).unwrap_or(&none),
+                    consent::has_been_asked(&seen_path, id),
+                )
+                .map(|prompt| (i, prompt))
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+
+        let prompts: Vec<consent::Prompt> = due.iter().map(|(_, p)| p.clone()).collect();
+        let (heading, body) = builtin_consent_text(&prompts);
+        let dialog = adw::AlertDialog::builder().heading(heading).body(body).build();
+        dialog.add_response("skip", "Not now");
+        dialog.add_response("allow", "Allow");
+        dialog.set_response_appearance("allow", adw::ResponseAppearance::Suggested);
+        // The safe answer survives Escape, exactly as it does for a user
+        // install: ADR-003's default deny has to hold even when the dialog is
+        // dismissed rather than answered.
+        dialog.set_default_response(Some("skip"));
+        dialog.set_close_response("skip");
+
+        // **Recorded when it is asked, not when it is answered.** Recording in
+        // the response handler asked again on every visit whenever the user
+        // closed Settings with the question open, and flipping a capability
+        // switch is not an answer to it. A declined question grants nothing and
+        // simply does not nag.
+        let ids: Vec<&str> =
+            due.iter().map(|(i, _)| entries[*i].plugin.manifest.id.as_str()).collect();
+        for id in &ids {
+            if let Err(e) = consent::mark_asked(&seen_path, id) {
+                eprintln!("shell: could not record that {id} has been asked about: {e}");
+            }
+        }
+        println!("  shell: consent dialog presented for built-ins {ids:?}");
+
+        state.showing.set(true);
+        let indices: Vec<usize> = due.iter().map(|(i, _)| *i).collect();
+        let this = self.clone();
+        let dir = dir.clone();
+        dialog.connect_response(None, move |dialog, response| {
+            if response == "allow" {
+                // Each row's own `connect_active_notify` already does exactly
+                // what accepting means -- write the grant, clear any stale
+                // denial, refresh the summary -- so flipping the switch is the
+                // grant, not a shortcut around it.
+                let entries = this.0.entries.borrow();
+                for &i in &indices {
+                    let e = &entries[i];
+                    for (_, row) in &e.cap_rows {
+                        row.set_active(true);
+                    }
+                    refresh_plugin_subtitle(
+                        &e.expander,
+                        &e.plugin,
+                        Some(&dir),
+                        e.enable_row.is_active(),
+                        Tier::BuiltIn,
+                    );
+                }
+            }
+            this.0.showing.set(false);
+            dialog.close();
+            // Something may have been switched on while this was up.
+            offer_soon(&Rc::downgrade(&this.0));
+        });
+        drop(entries);
+        dialog.present(Some(&parent));
     }
-    dialog.present(Some(parent));
+}
+
+/// Run [`BuiltinConsent::offer`] once the handler that asked has returned, so a
+/// switch or a page change finishes before a dialog goes up over it.
+fn offer_soon(state: &std::rc::Weak<ConsentState>) {
+    let weak = state.clone();
+    glib::idle_add_local_once(move || {
+        if let Some(state) = weak.upgrade() {
+            BuiltinConsent(state).offer();
+        }
+    });
+}
+
+/// The heading and body of the first-appearance dialog for the built-ins that
+/// are due: a single plugin gets its own wording, several share one dialog.
+fn builtin_consent_text(prompts: &[consent::Prompt]) -> (String, String) {
+    if let [one] = prompts {
+        return (one.heading(), consent_body_for_builtin(one));
+    }
+    let mut body = String::new();
+    for prompt in prompts {
+        body.push_str(&prompt.name);
+        body.push('\n');
+        for effect in &prompt.effects {
+            body.push_str("• ");
+            body.push_str(effect.description);
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+    body.push_str(
+        "These come with Cordial. Each one's own Enabled switch below governs whether it runs \
+         at all, separately from this — allowing something here does not turn it on, and \
+         refusing it does not turn it off. Allow covers every plugin listed. To allow only \
+         some, choose Not now and use the switches on each plugin's row. You can change any \
+         of these permissions at any time.",
+    );
+    ("Built-in plugins will be able to:".to_string(), body)
 }
 
 /// The body of a built-in's first-appearance prompt: the same itemised
@@ -1982,6 +2433,7 @@ fn build_install_group(
                         &root,
                         &installed_group,
                         Tier::User,
+                        None,
                     );
                     installed_group.add(&new_row);
                 }
@@ -2233,6 +2685,7 @@ fn build_marketplace_entry_row(
                                         &root,
                                         &installed_group,
                                         Tier::User,
+                                        None,
                                     );
                                     installed_group.add(&new_row);
                                 }
@@ -2444,15 +2897,39 @@ fn build_marketplace_groups(
 /// installed, or to find the one plugin they wanted to check on, without first
 /// turning plugins back on — and the state they are trying to reason about is
 /// exactly the one where plugins are off.
-/// Returns the page and the Installed group, because "Get Plugins" has to add
-/// a row to that exact group the moment an install succeeds. Handing the group
+/// Returns the page, the Installed group and the master switch, because "Get
+/// Plugins" has to add a row to that exact group the moment an install
+/// succeeds, and every group added to the page afterwards has to be governed
+/// by that switch too. Handing the group
 /// back is what keeps one `build_plugin_row` serving both — the alternative
 /// this project has already been bitten by is a second, similar-looking row
 /// built in the installer's callback that drifts from this one.
+struct PluginsPage {
+    page: adw::PreferencesPage,
+    /// Holds installed and development plugins alike.
+    installed: adw::PreferencesGroup,
+    master: adw::SwitchRow,
+}
+
+/// Make `group` follow the "Use Plugins" switch: insensitive whenever it is
+/// off, now and for any row added to the group later.
+///
+/// **A binding, not a closure that walks a list.** The switch used to grey two
+/// groups by calling `set_sensitive` on them from its own handler, and every
+/// group added to the page afterwards (installing from a file, the
+/// marketplace, the development folders, the runtime download) was left out
+/// because nobody remembered to extend the list: with plugins off, the page
+/// still offered to install one. Sensitivity is inherited by a group's rows,
+/// so governing the group covers a row added after the page is built.
+fn govern(master: &adw::SwitchRow, group: &impl IsA<gtk::Widget>) {
+    master.bind_property("active", group, "sensitive").sync_create().build();
+}
+
 fn build_plugins_page(
     parent: &adw::PreferencesDialog,
     config: Rc<RefCell<ShellConfig>>,
-) -> (adw::PreferencesPage, adw::PreferencesGroup) {
+    config_path: Rc<PathBuf>,
+) -> PluginsPage {
     let page = adw::PreferencesPage::builder()
         .title("Plugins")
         .name("plugins")
@@ -2512,6 +2989,7 @@ fn build_plugins_page(
         button.set_valign(gtk::Align::Center);
         row.add_suffix(&button);
         group.add(&row);
+        govern(&master, &group);
         page.add(&group);
 
         let row_for_click = row.clone();
@@ -2549,7 +3027,7 @@ fn build_plugins_page(
                 Ok(path) => {
                     row_for_click.set_title("Deno is installed");
                     row_for_click.set_subtitle(&format!(
-                        "{}. Plugins start with the client, so this takes effect at the next launch.",
+                        "{}. A running client starts the plugins that were waiting for it within a few seconds; no restart needed.",
                         path.display()
                     ));
                     button.set_visible(false);
@@ -2567,6 +3045,7 @@ fn build_plugins_page(
 
     // ---- built-in ---------------------------------------------------------
     let builtin_group = adw::PreferencesGroup::builder().title("Built-In").build();
+    let consent = BuiltinConsent::new(parent, &master, profile_dir.as_ref());
     if system.is_empty() {
         // Said rather than left as an empty group, and said without naming the
         // path: a user who has never installed Cordial from a package has no
@@ -2581,20 +3060,53 @@ fn build_plugins_page(
                 &system_root,
                 &builtin_group,
                 Tier::BuiltIn,
+                Some(&consent),
             );
             builtin_group.add(&row);
         }
     }
+    consent.wire(parent);
 
-    // ---- user-installed ---------------------------------------------------
+    // ---- user-installed, and the folders being developed ------------------
+    //
+    // One list. A plugin loaded from a working folder has a switch, permissions
+    // and a health line like any other, and a person looking for it does not
+    // know it is kept somewhere different. It sits after the installed ones and
+    // says "Development" on its row.
     let user_group = adw::PreferencesGroup::builder().title("Installed").build();
-    if user.is_empty() {
+    let taken: BTreeSet<String> =
+        system.iter().chain(user.iter()).map(|p| p.manifest.id.clone()).collect();
+    let development =
+        cordial_shell::plugin_listing::dev_entries(&config.borrow().unpacked_plugins, &taken);
+    let listing = cordial_shell::plugin_listing::merge(user, development);
+    if listing.is_empty() {
         user_group.add(&adw::ActionRow::builder().title("None yet").build());
-    } else {
-        for plugin in &user {
-            let row =
-                build_plugin_row(parent, plugin, profile_dir.as_ref(), &root, &user_group, Tier::User);
-            user_group.add(&row);
+    }
+    for item in &listing {
+        match item {
+            cordial_shell::plugin_listing::Listed::Installed(plugin) => {
+                let row = build_plugin_row(
+                    parent,
+                    plugin,
+                    profile_dir.as_ref(),
+                    &root,
+                    &user_group,
+                    Tier::User,
+                    None,
+                );
+                user_group.add(&row);
+            }
+            cordial_shell::plugin_listing::Listed::Development(entry) => {
+                let row = build_development_row(
+                    parent,
+                    &config,
+                    &config_path,
+                    profile_dir.as_ref(),
+                    entry,
+                    &user_group,
+                );
+                user_group.add(&row);
+            }
         }
     }
 
@@ -2616,13 +3128,8 @@ fn build_plugins_page(
     page.add(&user_group);
 
     // ---- what the master switch governs -----------------------------------
-    let governed = [builtin_group.clone(), user_group.clone()];
-    let apply = move |groups: &[adw::PreferencesGroup], on: bool| {
-        for g in groups {
-            g.set_sensitive(on);
-        }
-    };
-    apply(&governed, master.is_active());
+    govern(&master, &builtin_group);
+    govern(&master, &user_group);
     {
         let dir = profile_dir.clone();
         master.connect_active_notify(move |row| {
@@ -2631,13 +3138,12 @@ fn build_plugins_page(
                 if let Err(e) = enablement::set_plugins_allowed(dir, on) {
                     // Put back to what is on disk, the same posture the
                     // per-plugin switch takes: a switch resting somewhere the
-                    // file disagrees with is a lie the user cannot see.
+                    // file disagrees with is a lie the user cannot see. The
+                    // groups follow the switch, so they are put back with it.
                     eprintln!("shell: could not record that plugins are {}: {e}", if on { "on" } else { "off" });
                     row.set_active(!on);
-                    return;
                 }
             }
-            apply(&governed, on);
         });
     }
     if profile_dir.is_none() {
@@ -2645,7 +3151,7 @@ fn build_plugins_page(
         master.set_subtitle("This profile's directory could not be read, so nothing can be saved.");
     }
 
-    (page, user_group)
+    PluginsPage { page, installed: user_group, master }
 }
 
 /// "Get Plugins" — installing from a file, and the marketplace.
@@ -2678,62 +3184,46 @@ fn build_plugins_page(
 /// packaging step this removes.
 fn add_developer_group(
     parent: &impl IsA<gtk::Window>,
+    dialog: &adw::PreferencesDialog,
     config: Rc<RefCell<ShellConfig>>,
     config_path: Rc<PathBuf>,
     page: &adw::PreferencesPage,
+    installed_group: &adw::PreferencesGroup,
+    master: &adw::SwitchRow,
 ) {
     let group = adw::PreferencesGroup::builder()
         .title("Developing a plugin")
         .description(
-            "Load a plugin from the folder you are writing it in. It reloads as you edit, \
-             and is granted nothing until you grant it, like any other.",
+            "Load a plugin from the folder you are writing it in. It is listed under Installed, \
+             marked Development, and reloads as you edit. It is granted nothing until you \
+             grant it, like any other. Adding or removing a folder takes effect the next time \
+             you press Roblox.",
         )
         .build();
+    govern(master, &group);
 
-    for dir in config.borrow().unpacked_plugins.clone() {
-        let row = adw::ActionRow::builder().title(&dir).build();
-        row.set_subtitle_lines(2);
-        let remove = gtk::Button::from_icon_name("list-remove-symbolic");
-        remove.set_tooltip_text(Some("Stop loading this folder"));
-        remove.set_valign(gtk::Align::Center);
-        remove.add_css_class("flat");
-        {
-            let config = config.clone();
-            let config_path = config_path.clone();
-            let dir = dir.clone();
-            let row = row.clone();
-            remove.connect_clicked(move |_| {
-                config.borrow_mut().unpacked_plugins.retain(|d| *d != dir);
-                persist(&config, &config_path);
-                // Insensitive rather than removed from the list: rebuilding
-                // the page from here would mean rebuilding the whole dialog,
-                // and a row that visibly stops applying says the same thing.
-                row.set_sensitive(false);
-                row.set_subtitle("Removed. Takes effect the next time you press Roblox.");
-            });
-        }
-        row.add_suffix(&remove);
-        group.add(&row);
-    }
-
+    const PROMPT: &str = "Choose the folder containing that plugin's plugin.json";
     let add = adw::ActionRow::builder()
         .title("Add a plugin folder…")
-        .subtitle("Choose the folder containing that plugin's plugin.json")
+        .subtitle(PROMPT)
         .activatable(true)
         .build();
     {
         let config = config.clone();
         let config_path = config_path.clone();
         let parent = parent.as_ref().clone();
-        let group = group.clone();
+        let dialog = dialog.clone();
+        let installed_group = installed_group.clone();
         let add_row = add.clone();
         add.connect_activated(move |_| {
-            let dialog = gtk::FileDialog::builder().title("Plugin folder").build();
+            add_row.set_subtitle(PROMPT);
+            let picker = gtk::FileDialog::builder().title("Plugin folder").build();
             let config = config.clone();
             let config_path = config_path.clone();
-            let group = group.clone();
+            let dialog = dialog.clone();
+            let installed_group = installed_group.clone();
             let add_row = add_row.clone();
-            dialog.select_folder(Some(&parent), gtk::gio::Cancellable::NONE, move |result| {
+            picker.select_folder(Some(&parent), gtk::gio::Cancellable::NONE, move |result| {
                 let Ok(file) = result else { return };
                 let Some(path) = file.path() else { return };
                 // Refused here rather than at launch, because a folder with no
@@ -2752,23 +3242,199 @@ fn add_developer_group(
                 {
                     let mut cfg = config.borrow_mut();
                     if cfg.unpacked_plugins.contains(&text) {
+                        add_row.set_subtitle(&format!("{text} is already in the list."));
+                        add_row.set_subtitle_lines(3);
                         return;
                     }
                     cfg.unpacked_plugins.push(text.clone());
                 }
                 persist(&config, &config_path);
-                let row = adw::ActionRow::builder()
-                    .title(&text)
-                    .subtitle("Loads the next time you press Roblox.")
-                    .build();
-                row.set_subtitle_lines(2);
-                group.add(&row);
-                add_row.set_subtitle("Choose the folder containing that plugin's plugin.json");
+
+                // The same row the page builds for it at startup, so a folder
+                // added now can be switched, granted and removed without
+                // closing the window. The first version of this added a bare
+                // row with no way to remove it until the next time Settings
+                // was opened.
+                let profile_dir = cordial_shell::profile::dir(&config.borrow().profile).ok();
+                let entries = cordial_shell::plugin_listing::dev_entries(
+                    &config.borrow().unpacked_plugins,
+                    &installed_ids(),
+                );
+                if let Some(entry) = entries.iter().find(|e| e.dir == text) {
+                    let row = build_development_row(
+                        &dialog,
+                        &config,
+                        &config_path,
+                        profile_dir.as_ref(),
+                        entry,
+                        &installed_group,
+                    );
+                    installed_group.add(&row);
+                }
+                add_row.set_subtitle(&format!(
+                    "Added {text}. It is under Installed now and loads the next time you press Roblox."
+                ));
+                add_row.set_subtitle_lines(3);
             });
         });
     }
     group.add(&add);
     page.add(&group);
+}
+
+/// The ids the built-in and installed plugins hold, which a development folder
+/// cannot share.
+fn installed_ids() -> BTreeSet<String> {
+    let (system, user, _) = discover_tiers(&manifest::system_plugin_root(), &manifest::plugin_root());
+    system.iter().chain(user.iter()).map(|p| p.manifest.id.clone()).collect()
+}
+
+/// One development folder's row on the Installed list.
+///
+/// A folder that loads gets the full plugin row, marked Development. One that
+/// does not -- deleted since it was added, a manifest that no longer parses,
+/// an id somebody else already holds -- still gets a row, with the reason,
+/// because the alternative is a list entry that vanishes from the page while
+/// staying in `shell.json`, which is a thing nobody can remove. Either way it
+/// carries the remove control, and no update or uninstall, because neither
+/// exists for a folder.
+fn build_development_row(
+    dialog: &adw::PreferencesDialog,
+    config: &Rc<RefCell<ShellConfig>>,
+    config_path: &Rc<PathBuf>,
+    profile_dir: Option<&PathBuf>,
+    entry: &cordial_shell::plugin_listing::DevEntry,
+    group: &adw::PreferencesGroup,
+) -> adw::PreferencesRow {
+    use cordial_shell::plugin_listing::{DevState, Shadowing};
+
+    let (row, name): (adw::PreferencesRow, String) = match &entry.state {
+        DevState::Loaded(plugin) => {
+            let expander =
+                build_plugin_row(dialog, plugin, profile_dir, &plugin.dir, group, Tier::Development, None);
+            let name = display_name(plugin);
+            (expander.clone().upcast(), name)
+        }
+        DevState::Unusable(_) | DevState::Shadowed { .. } => {
+            let reason = match &entry.state {
+                DevState::Unusable(why) => format!("Not loaded: {why}"),
+                DevState::Shadowed { id, by: Shadowing::Installed } => format!(
+                    "Not used: a built-in or installed plugin already has the id {id}. Remove \
+                     that one, or change the id here."
+                ),
+                DevState::Shadowed { id, by: Shadowing::EarlierFolder } => format!(
+                    "Not used: an earlier folder in this list already has the id {id}."
+                ),
+                DevState::Loaded(_) => unreachable!(),
+            };
+            let name = Path::new(&entry.dir)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.dir.clone());
+            let action = adw::ActionRow::builder()
+                .title(&name)
+                .subtitle(cordial_shell::plugin_listing::dev_subtitle(&entry.dir, &reason))
+                .build();
+            action.set_subtitle_lines(4);
+            let tag = gtk::Label::new(Some("Development"));
+            tag.add_css_class("accent");
+            tag.add_css_class("caption");
+            tag.set_valign(gtk::Align::Center);
+            action.add_suffix(&tag);
+            (action.clone().upcast(), name)
+        }
+    };
+
+    let remove = gtk::Button::from_icon_name("list-remove-symbolic");
+    remove.set_valign(gtk::Align::Center);
+    remove.add_css_class("flat");
+    remove.set_tooltip_text(Some("Stop loading this folder. The folder is kept."));
+    remove.update_property(&[gtk::accessible::Property::Label("Stop loading this plugin folder")]);
+    if let Some(expander) = row.downcast_ref::<adw::ExpanderRow>() {
+        expander.add_suffix(&remove);
+    } else if let Some(action) = row.downcast_ref::<adw::ActionRow>() {
+        action.add_suffix(&remove);
+    }
+    {
+        let dialog = dialog.clone();
+        let config = config.clone();
+        let config_path = config_path.clone();
+        let group = group.clone();
+        let row = row.clone();
+        let dir = entry.dir.clone();
+        remove.connect_clicked(move |_| {
+            confirm_remove_dev_folder(&dialog, &config, &config_path, &group, &row, &name, &dir);
+        });
+    }
+    row
+}
+
+/// Ask, then take the folder out of Cordial's list. Never touches the folder.
+///
+/// **Applies at the next launch, and the dialog says so.** `unpacked_plugins`
+/// is classified next-launch in `live.rs` (ADR-044): the folder list is an
+/// environment variable of the client, and the hot-swap reconciler is built
+/// never to see unpacked plugins (ADR-038). A client already running keeps the
+/// plugin until it exits; saying "removed" without that would be the stub that
+/// reports success.
+fn confirm_remove_dev_folder(
+    window: &adw::PreferencesDialog,
+    config: &Rc<RefCell<ShellConfig>>,
+    config_path: &Rc<PathBuf>,
+    group: &adw::PreferencesGroup,
+    row: &adw::PreferencesRow,
+    name: &str,
+    dir: &str,
+) {
+    let alert = adw::AlertDialog::builder()
+        .heading(format!("Stop loading {name}?"))
+        .body(format!(
+            "Cordial forgets this folder. The folder itself and everything in it is kept:\n\n{dir}\n\n\
+             What you allowed the plugin to do stays on this profile. A game that is already \
+             running keeps the plugin until you quit it; it is gone the next time you press Roblox."
+        ))
+        .build();
+    alert.add_response("cancel", "Cancel");
+    alert.add_response("remove", "Stop Loading");
+    alert.set_default_response(Some("cancel"));
+    alert.set_close_response("cancel");
+
+    let window_for_error = window.clone();
+    let config = config.clone();
+    let config_path = config_path.clone();
+    let group = group.clone();
+    let row = row.clone();
+    let dir = dir.to_string();
+    alert.connect_response(None, move |alert, response| {
+        if response == "remove" {
+            let mut next = config.borrow().unpacked_plugins.clone();
+            // Already gone from the list (removed from a second window, or the
+            // file edited by hand): the row has nothing left to represent.
+            if !cordial_shell::plugin_listing::remove_folder(&mut next, &dir) {
+                group.remove(&row);
+            } else {
+                let previous = std::mem::replace(&mut config.borrow_mut().unpacked_plugins, next);
+                match shell_config::save(&config_path, &config.borrow()) {
+                    Ok(()) => group.remove(&row),
+                    Err(e) => {
+                        // Put back what is on disk, and say so: a row that
+                        // disappears while `shell.json` still lists the folder
+                        // would come back next launch with no explanation.
+                        config.borrow_mut().unpacked_plugins = previous;
+                        eprintln!("shell: could not save {}: {e}", config_path.display());
+                        let failed = adw::AlertDialog::builder()
+                            .heading("Could not remove it")
+                            .body(format!("Cordial could not save its settings: {e}"))
+                            .build();
+                        failed.add_response("ok", "OK");
+                        failed.present(Some(&window_for_error));
+                    }
+                }
+            }
+        }
+        alert.close();
+    });
+    alert.present(Some(window));
 }
 
 fn add_get_plugins_groups(
@@ -2778,15 +3444,23 @@ fn add_get_plugins_groups(
     config_path: Rc<PathBuf>,
     installed_group: &adw::PreferencesGroup,
     page: &adw::PreferencesPage,
+    master: &adw::SwitchRow,
 ) {
 
     let root = manifest::plugin_root();
     let profile_name = config.borrow().profile.clone();
     let profile_dir = cordial_shell::profile::dir(&profile_name).ok();
 
-    page.add(&build_install_group(parent, dialog, &root, profile_dir.clone(), installed_group));
+    let install = build_install_group(parent, dialog, &root, profile_dir.clone(), installed_group);
     let (marketplace_config, marketplace_listing) =
         build_marketplace_groups(parent, dialog, config, config_path, &root, profile_dir, installed_group);
+    // Every one of these is a plugin control, so every one follows "Use
+    // Plugins". Marketplace rows are added to `marketplace_listing` after the
+    // fact; the group's sensitivity covers them.
+    for group in [&install, &marketplace_config, &marketplace_listing] {
+        govern(master, group);
+    }
+    page.add(&install);
     page.add(&marketplace_config);
     page.add(&marketplace_listing);
 }
@@ -2807,7 +3481,7 @@ fn add_get_plugins_groups(
 pub(crate) const CONTENT_WIDTH: i32 = 640;
 pub(crate) const CONTENT_HEIGHT: i32 = 720;
 
-/// Builds the settings dialog: Roblox, Updates, General, Plugins, Report, one
+/// Builds the settings dialog: Roblox, Updates, Version, General, Plugins, FastFlags, one
 /// `AdwPreferencesPage` each.
 ///
 /// **`AdwPreferencesDialog`, not `AdwPreferencesWindow`.** The window form has
@@ -2835,12 +3509,17 @@ pub fn build_preferences_window(
     // First, because it is the one that has to be right before anything else
     // in this window matters: without a build there is nothing to launch, and
     // a renderer preference for a client that cannot start is decoration.
-    window.add(&build_roblox_page(parent, config.clone(), config_path.clone()));
+    window.add(&build_roblox_page(parent, config.clone()));
     // Second, next to the page about the build it is about.
     window.add(&crate::updater::build_update_page(config.clone(), config_path.clone()));
     // Beside Updates, because the question it answers -- which build, and can I
     // go back -- is the one somebody an update just broke arrives with.
     window.add(&crate::roblox_versions::build_version_page(config.clone()));
+    // Only where the Quest build can run, after the pages about the phone
+    // build: VR is a second way to play, not a setting of the first (ADR-053).
+    if cordial_shell::vr::HOST_SUPPORTED {
+        window.add(&crate::vr_settings::build_vr_page(&window, parent.upcast_ref(), config.clone(), config_path.clone()));
+    }
     // **Five pages where there were seven**, reported as "why are there so many
     // tabs". Appearance held two groups and Get Plugins three; neither was a
     // destination, and a tab per group makes somebody hunt through seven pages
@@ -2849,12 +3528,12 @@ pub fn build_preferences_window(
     add_appearance_groups(&general, config.clone(), config_path.clone());
     window.add(&general);
     let config_for_flags = config.clone();
-    let (plugins, installed) = build_plugins_page(&window, config.clone());
-    add_get_plugins_groups(parent, &window, config.clone(), config_path.clone(), &installed, &plugins);
-    add_developer_group(parent, config, config_path, &plugins);
+    let PluginsPage { page: plugins, installed, master } =
+        build_plugins_page(&window, config.clone(), config_path.clone());
+    add_get_plugins_groups(parent, &window, config.clone(), config_path.clone(), &installed, &plugins, &master);
+    add_developer_group(parent, &window, config, config_path, &plugins, &installed, &master);
     window.add(&plugins);
     window.add(&build_fastflags_page(config_for_flags, &window));
-    window.add(&build_report_page(parent));
 
     window
 }
@@ -2998,11 +3677,13 @@ fn build_fastflags_page(
     let group = adw::PreferencesGroup::builder()
         .title("Engine flag overrides")
         .description(
-            "The same format Bloxstrap uses, so a list pastes straight in. Applies the next \
-             time you press Roblox.",
+            "The same format Bloxstrap uses, so a list pastes straight in, and Import reads a \
+             Bloxstrap, Fishstrap or Sober list from a file. Applies the next time you press \
+             Roblox.",
         )
         .build();
 
+    let import = gtk::Button::with_label("Import…");
     let clear = gtk::Button::with_label("Clear all");
     let apply = gtk::Button::with_label("Apply");
     apply.add_css_class("suggested-action");
@@ -3066,6 +3747,7 @@ fn build_fastflags_page(
     // to the height of a wrapped path, which is the same mistake the header
     // suffix made one paragraph up.
     let actions = gtk::Box::builder().spacing(6).valign(gtk::Align::Center).build();
+    actions.append(&import);
     actions.append(&clear);
     actions.append(&apply);
 
@@ -3134,6 +3816,44 @@ fn build_fastflags_page(
     });
     refresh(&view.buffer());
 
+    // **Import merges into what is there and saves at once**, unlike the text
+    // box, which saves on Apply: choosing a file is the whole gesture, and a
+    // second press to confirm it would be the step people forget. What was in
+    // the box, saved or not, is kept and the file's flags land on top; the box
+    // then shows what was written. Per entry, so one value the check refuses
+    // costs that flag and not the list -- see `flag_document::import`.
+    {
+        let view = view.clone();
+        let dialog = dialog.clone();
+        let profile_dir = profile_dir.clone();
+        import.connect_clicked(move |button| {
+            let Some(dir) = profile_dir.clone() else {
+                dialog.add_toast(adw::Toast::new("There is no profile directory to save into."));
+                return;
+            };
+            let parent = button.root().and_downcast::<gtk::Window>();
+            let json = gtk::FileFilter::new();
+            json.set_name(Some("Flag lists (JSON)"));
+            json.add_suffix("json");
+            let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&json);
+            let view = view.clone();
+            let dialog = dialog.clone();
+            gtk::FileDialog::builder()
+                .title("Import FastFlags")
+                .filters(&filters)
+                .build()
+                .open(parent.as_ref(), gtk::gio::Cancellable::NONE, move |result| {
+                    // A dismissed picker is an error result too.
+                    let Ok(file) = result else { return };
+                    let Some(source) = file.path() else {
+                        dialog.add_toast(adw::Toast::new("That file has no path Cordial can read."));
+                        return;
+                    };
+                    import_flags_file(&view, &dialog, &dir, &source);
+                });
+        });
+    }
     {
         let view = view.clone();
         clear.connect_clicked(move |_| {
@@ -3191,8 +3911,110 @@ fn build_fastflags_page(
     page
 }
 
+/// The body of the FastFlags page's Import button: read `source`, merge it into
+/// the editor's current document, save, and say what happened.
+///
+/// Split from the button so the widget wiring stays a few lines. Everything that
+/// decides anything is `flag_document::import` and `merge`, which are tested;
+/// this only moves their results to the screen.
+fn import_flags_file(
+    view: &gtk::TextView,
+    dialog: &adw::PreferencesDialog,
+    profile_dir: &std::path::Path,
+    source: &std::path::Path,
+) {
+    use cordial_plugins::flag_document as fd;
+    use gtk::prelude::{TextBufferExt, TextViewExt};
+
+    let text = match std::fs::read_to_string(source) {
+        Ok(t) => t,
+        Err(e) => {
+            dialog.add_toast(adw::Toast::new(&format!("Could not read {}: {e}", source.display())));
+            return;
+        }
+    };
+    let imported = match fd::import(&text) {
+        Ok(i) => i,
+        Err(e) => {
+            dialog.add_toast(adw::Toast::new(&format!("Nothing imported: {e}")));
+            return;
+        }
+    };
+    let buffer = view.buffer();
+    let current = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+    // The box may hold a document that does not parse; merging into it would
+    // discard whatever is wrong with it.
+    let mut flags = match fd::parse(&current) {
+        Ok(f) => f,
+        Err(e) => {
+            dialog.add_toast(adw::Toast::new(&format!("Fix the editor first, then import: {e}")));
+            return;
+        }
+    };
+    let (added, changed) = fd::merge(&mut flags, &imported.flags);
+    if let Err(e) = fd::write(&fd::path_in(profile_dir), &flags) {
+        dialog.add_toast(adw::Toast::new(&format!("Could not save: {e}")));
+        return;
+    }
+    if let Ok(pretty) = serde_json::to_string_pretty(&flags) {
+        buffer.set_text(&format!("{pretty}\n"));
+    }
+    let summary = format!("{} Applies at the next launch.", fd::summary(&imported, added, changed));
+    if imported.skipped.is_empty() && imported.unrecognised.is_empty() {
+        dialog.add_toast(adw::Toast::new(&summary));
+        return;
+    }
+    // Skipped entries are named, in a dialog rather than a toast: a toast is
+    // gone in a few seconds and the list is the part somebody has to act on.
+    let mut body = String::new();
+    if !imported.skipped.is_empty() {
+        body.push_str(&format!("Not imported:\n{}", fd::describe_skipped(&imported)));
+    }
+    if !imported.unrecognised.is_empty() {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&format!(
+            "Imported, but these do not start with a FastFlag prefix, so check the spelling:\n{}",
+            imported.unrecognised.join("\n")
+        ));
+    }
+    let alert = adw::AlertDialog::new(Some(&summary), Some(&body));
+    alert.add_response("ok", "OK");
+    alert.present(Some(dialog));
+}
+
 #[cfg(test)]
 mod tests {
+    fn entry(version: &str, source: Option<cordial_update::store::Source>) -> cordial_update::store::Entry {
+        cordial_update::store::Entry {
+            version: version.into(),
+            dir: PathBuf::from("/x").join(version),
+            loaded_by: None,
+            bytes: 0,
+            complete: true,
+            content_hash: None,
+            signer: Some("ab".repeat(32)),
+            provenance: source.map(|source| cordial_update::store::Provenance { source, at: Some(1_791_081_816) }),
+            version_code: None,
+        }
+    }
+
+    #[test]
+    fn the_build_row_names_what_latest_runs_and_how_it_arrived() {
+        let sober = entry("2.738.0.1397", Some(cordial_update::store::Source::Sober));
+        let line = build_subtitle(Some(&sober), false);
+        assert!(line.contains("Roblox 2.738.0.1397 runs on profiles set to Latest"), "{line}");
+        assert!(line.contains("Imported from Sober on 4 Oct 2026"), "{line}");
+        assert!(!line.contains("depend"), "nothing on the page says Cordial depends on Sober: {line}");
+
+        let none = build_subtitle(None, false);
+        assert!(none.contains("Download Roblox"), "{none}");
+        assert!(!none.contains("launcher"), "it used to point at a screen that no longer says anything: {none}");
+
+        let overridden = build_subtitle(Some(&sober), true);
+        assert!(overridden.starts_with("CORDIAL_APK names the build for this run"), "{overridden}");
+    }
     use super::*;
 
     /// A manifest built for this test and nowhere near the UI. The distinction
@@ -3478,6 +4300,32 @@ mod tests {
         assert!(!body.contains("starts switched off"), "{body}");
         assert!(body.contains(Capability::PresenceSet.consequence()), "{body}");
         assert!(body.contains("Enabled switch"), "{body}");
+    }
+
+    #[test]
+    fn several_due_built_ins_share_one_dialog_that_names_each_and_says_how_to_allow_some() {
+        // The stack of six was one dialog per plugin. Several due at once are
+        // one dialog now, so it has to say whose permissions it covers, or
+        // Allow would be a grant the user could not attribute, and how to
+        // allow fewer than all.
+        let ask = |json: &str| {
+            let consent::Verdict::Ask(p) = consent::verdict(&fixture(json)) else { panic!("asks") };
+            p
+        };
+        let a = ask(r#"{"id":"a","name":"Alpha","entry":"m.ts","capabilities":["presence.set"]}"#);
+        let b = ask(r#"{"id":"b","name":"Beta","entry":"m.ts","capabilities":["flags.write"]}"#);
+
+        let (heading, body) = builtin_consent_text(&[a.clone(), b]);
+        assert!(heading.starts_with("Built-in plugins"), "{heading}");
+        assert!(body.contains("Alpha") && body.contains("Beta"), "{body}");
+        assert!(body.contains(Capability::PresenceSet.consequence()), "{body}");
+        assert!(body.contains(Capability::FlagsWrite.consequence()), "{body}");
+        assert!(body.contains("Not now"), "must say how to allow only some: {body}");
+        assert!(!body.contains("starts switched off"), "{body}");
+
+        // One plugin keeps its own wording.
+        let (heading, _) = builtin_consent_text(&[a]);
+        assert_eq!(heading, "Alpha will be able to:");
     }
 
     #[test]

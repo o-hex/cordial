@@ -25,7 +25,7 @@
 //         -I/usr/include/pipewire-0.3 -I/usr/include/spa-0.2 \
 //         native/opensles.cpp native/pipewire_backend.cpp native/aaudio.cpp \
 //         native/alsa_backend.cpp native/pulse_backend.cpp native/oss_backend.cpp \
-//         native/audio_probe.cpp -ldl -lpthread -o /tmp/audio_probe
+//         native/aaudio_input_callback.cpp native/audio_probe.cpp -ldl -lpthread -o /tmp/audio_probe
 //
 // The three backend files on the second line are not optional even though
 // this probe only ever exercises PipeWire: `pipewire_backend.cpp`'s own
@@ -286,6 +286,26 @@ void mark(const char* fmt, ...) {
     std::fflush(stdout);
 }
 
+/// Runs `$AUDIO_PROBE_SNAPSHOT <label>` through `sh -c` when that variable is
+/// set, and does nothing when it is not. The probe prints markers for an outside
+/// observer to line up against, but a `pw-dump` taken from another process a
+/// moment after a marker is a guess about timing; this makes the observer run at
+/// the marker, with the stream known to be open, so what it reads is the state
+/// the line above describes. It is how the microphone picker's "the stream
+/// landed on the source that was chosen" claim is read out of PipeWire's links.
+void snapshot(const char* label) {
+    const char* cmd = std::getenv("AUDIO_PROBE_SNAPSHOT");
+    if (!cmd || !*cmd) return;
+    mark("SNAPSHOT %s", label);
+    const std::string line = std::string("sh -c '") + cmd + "' probe " + label;
+    if (std::system(line.c_str()) != 0) mark("SNAPSHOT %s: the command failed", label);
+}
+
+/// Set by `--switch-source`; an empty string is "the system default". Only the
+/// OpenSL `record` command honours it.
+bool g_switch_source_set = false;
+std::string g_switch_source;
+
 SLObjectItf g_engine_obj = nullptr;
 SLEngineItf g_engine = nullptr;
 
@@ -306,6 +326,43 @@ bool create_engine() {
 }
 
 // ------------------------------------------------------------------ devices
+
+/// Drives `set_output_device` the way the live-settings socket does, one sink
+/// after another while a stream is playing, and says when each change has had
+/// time to settle so that an outside observer (`tools/audio-switch-e2e.py`, which
+/// reads the links out of `pw-dump`) knows when to look.
+///
+/// The probe cannot check the result itself: what matters is where PipeWire has
+/// linked the stream, and the stream's own view of that is exactly the reading
+/// that said "moved" while nothing had -- `pw_stream_update_properties` returned
+/// success and the link stayed put.
+///
+/// An empty step is the system default and is played at zero amplitude, so a
+/// check of "back to default" never makes a sound on whatever the desktop's
+/// default output happens to be.
+template <typename SetAmplitude>
+bool run_switch_steps(const std::vector<std::string>& steps, double hold_seconds,
+                      double amplitude, SetAmplitude set_amplitude) {
+    bool ok = true;
+    int index = 0;
+    // The starting point, so an observer can see where the stream began before
+    // anything moved it.
+    sleep_ms(1500);
+    mark("SETTLED -1 'initial'");
+    sleep_ms(static_cast<int>(hold_seconds * 1000));
+    for (const std::string& step : steps) {
+        set_amplitude(step.empty() ? 0.0 : amplitude);
+        const cordial::audio::OutputSwitch r = cordial::audio::set_output_device(step);
+        mark("SWITCH %d to '%s' -> moved %zu stream(s)%s%s", index, step.c_str(), r.moved,
+             r.note.empty() ? "" : "; note: ", r.note.c_str());
+        if (r.moved == 0) ok = false;
+        sleep_ms(1500);
+        mark("SETTLED %d '%s'", index, step.c_str());
+        sleep_ms(static_cast<int>(hold_seconds * 1000));
+        ++index;
+    }
+    return ok;
+}
 
 int cmd_devices() {
     auto devices = cordial::audio::enumerate_devices();
@@ -361,7 +418,8 @@ ToneFeeder g_feeder;
 
 void buffer_drained(SLAndroidSimpleBufferQueueItf, void*) { g_feeder.on_drained(); }
 
-int cmd_play(double seconds, double amplitude, double hz, bool silent) {
+int cmd_play(double seconds, double amplitude, double hz, bool silent,
+             const std::vector<std::string>& switch_steps = {}) {
     if (!create_engine()) return 1;
 
     SLObjectItf mix = nullptr;
@@ -429,7 +487,13 @@ int cmd_play(double seconds, double amplitude, double hz, bool silent) {
     r = (*play)->SetPlayState(play, SL_PLAYSTATE_PLAYING);
     mark("SetPlayState(PLAYING) -> %u", r);
 
-    sleep_ms(static_cast<int>(seconds * 1000));
+    bool switched_ok = true;
+    if (switch_steps.empty()) {
+        sleep_ms(static_cast<int>(seconds * 1000));
+    } else {
+        switched_ok = run_switch_steps(switch_steps, seconds, amplitude,
+                                       [](double a) { g_feeder.amplitude = a; });
+    }
 
     r = (*play)->SetPlayState(play, SL_PLAYSTATE_STOPPED);
     mark("PLAY-END SetPlayState(STOPPED) -> %u", r);
@@ -438,7 +502,7 @@ int cmd_play(double seconds, double amplitude, double hz, bool silent) {
     (*player)->Destroy(player);
     (*mix)->Destroy(mix);
     (*g_engine_obj)->Destroy(g_engine_obj);
-    return g_feeder.drains.load() > 0 ? 0 : 1;
+    return g_feeder.drains.load() > 0 && switched_ok ? 0 : 1;
 }
 
 // ----------------------------------------------------------------- recording
@@ -529,7 +593,20 @@ int cmd_record(double seconds) {
     r = (*record)->SetRecordState(record, SL_RECORDSTATE_RECORDING);
     mark("MIC-OPEN SetRecordState(RECORDING) -> %u  (capture streams open: %u)", r,
          cordial::audio::active_capture_streams());
+    // Long enough for the session manager to have linked the new node.
+    sleep_ms(700);
+    snapshot("opensl-open");
     sleep_ms(static_cast<int>(seconds * 1000));
+
+    if (g_switch_source_set) {
+        // The live path the Settings row uses: re-aim the stream that is open.
+        const cordial::audio::OutputSwitch moved =
+            cordial::audio::set_input_device(g_switch_source);
+        mark("SOURCE-SWITCH to '%s': %zu stream(s) moved, note '%s'", g_switch_source.c_str(),
+             moved.moved, moved.note.c_str());
+        sleep_ms(700);
+        snapshot("opensl-switched");
+    }
 
     SLuint32 state = 0;
     (*record)->GetRecordState(record, &state);
@@ -917,6 +994,8 @@ int cmd_aaudio_record(double seconds) {
     r = aa::requestStart(stream);
     mark("MIC-OPEN requestStart -> %d  (capture streams open: %u)", r,
          cordial::audio::active_capture_streams());
+    sleep_ms(700);
+    snapshot("aaudio-open");
     if (r != 0 || cordial::audio::active_capture_streams() != 1) {
         mark("FAIL requestStart did not open exactly one capture stream");
         ok = false;
@@ -1026,7 +1105,8 @@ int32_t aaudio_tone_callback(void*, void*, void* audioData, int32_t numFrames) {
     return 0; // AAUDIO_CALLBACK_RESULT_CONTINUE
 }
 
-int cmd_aaudio_play(double seconds, double amplitude, double hz) {
+int cmd_aaudio_play(double seconds, double amplitude, double hz,
+                    const std::vector<std::string>& switch_steps = {}) {
     if (!aa::resolve()) return 1;
     void* set_cb = aa::find("AAudioStreamBuilder_setDataCallback");
     if (!set_cb) return 1;
@@ -1052,6 +1132,26 @@ int cmd_aaudio_play(double seconds, double amplitude, double hz) {
 
     r = aa::requestStart(stream);
     mark("requestStart -> %d", r);
+    if (!switch_steps.empty()) {
+        // A sequence of sink changes instead of a fixed-length play. The frame
+        // count below still has to come out at the negotiated rate across all of
+        // them: a stream that was torn down and rebuilt to change sink would
+        // show a gap, and this one is not meant to.
+        const auto began = std::chrono::steady_clock::now();
+        const bool moved = run_switch_steps(switch_steps, seconds, amplitude,
+                                            [](double a) { g_aaudio_tone.amplitude = a; });
+        const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+        const uint64_t played = g_aaudio_tone.frames.load();
+        const bool continuous = rate > 0 && std::fabs(played / took - rate) < rate * 0.05;
+        mark("SWITCH-RUN %llu frame(s) in %.1f s (%.0f a second; negotiated %d): %s",
+             static_cast<unsigned long long>(played), took, played / took, rate,
+             continuous ? "no gap" : "GAP");
+        aa::requestStop(stream);
+        aa::closeStream(stream);
+        const bool ok = moved && continuous;
+        mark(ok ? "AAUDIO-SWITCH PASS" : "AAUDIO-SWITCH FAIL");
+        return ok ? 0 : 1;
+    }
     sleep_ms(static_cast<int>(seconds * 1000));
     const uint64_t frames = g_aaudio_tone.frames.load();
     mark("PLAYED %llu frame(s) in %.1f s (%.0f a second; the negotiated rate is %d), xruns %d",
@@ -1101,25 +1201,33 @@ int main(int argc, char** argv) {
     double seconds = 3.0;
     double amplitude = 1.0 / 512.0; // see the header: about -54 dBFS
     double hz = 440.0;
+    std::vector<std::string> steps;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--seconds" && i + 1 < argc) seconds = std::atof(argv[++i]);
         else if (a == "--amplitude" && i + 1 < argc) amplitude = std::atof(argv[++i]);
         else if (a == "--hz" && i + 1 < argc) hz = std::atof(argv[++i]);
+        // Repeatable; an empty value is the system default.
+        else if (a == "--switch" && i + 1 < argc) steps.push_back(argv[++i]);
+        else if (a == "--switch-source" && i + 1 < argc) {
+            g_switch_source_set = true;
+            g_switch_source = argv[++i];
+        }
     }
 
     if (cmd == "devices") return cmd_devices();
-    if (cmd == "play") return cmd_play(seconds, amplitude, hz, false);
+    if (cmd == "play") return cmd_play(seconds, amplitude, hz, false, steps);
     if (cmd == "silence") return cmd_play(seconds, amplitude, hz, true);
     if (cmd == "record") return cmd_record(seconds);
     if (cmd == "record-interlock") return cmd_record_interlock();
     if (cmd == "record-selfstop") return cmd_record_selfstop();
     if (cmd == "aaudio-record") return cmd_aaudio_record(seconds);
     if (cmd == "aaudio-record-never") return cmd_aaudio_record_never();
-    if (cmd == "aaudio-play") return cmd_aaudio_play(seconds, amplitude, hz);
+    if (cmd == "aaudio-play") return cmd_aaudio_play(seconds, amplitude, hz, steps);
     std::fprintf(stderr,
                   "usage: audio_probe devices|play|silence|record|record-interlock|"
                   "record-selfstop|aaudio-play|aaudio-record|aaudio-record-never "
-                  "[--seconds N] [--amplitude A] [--hz F]\n");
+                  "[--seconds N] [--amplitude A] [--hz F] [--switch SINK]... "
+                  "[--switch-source SOURCE]\n");
     return 2;
 }

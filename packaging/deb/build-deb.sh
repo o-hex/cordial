@@ -19,7 +19,7 @@
 # development headers README.md §3 names for Debian and Ubuntu:
 #
 #     apt install libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev \
-#         libpipewire-0.3-dev libpulse-dev libasound2-dev
+#         libpipewire-0.3-dev libpulse-dev libasound2-dev libboost-dev
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -64,9 +64,10 @@ export CORDIAL_GIT_SHA="$CORDIAL_SHORTHASH"
 # webview::open, and the binary carries no WebKitGTK at all -- silently: the
 # build still succeeds. This exact shape shipped once in the Flatpak and was
 # reported as "webview doesnt work in cordial flatpak". The readelf check
-# below is what catches it here instead.
+# below is what catches it here instead. `cordial-runtime/vr` is Play in VR
+# (ADR-053), and why the build needs libboost-dev.
 cargo build --release --locked \
-    --features cordial-shell/webview,cordial-runtime/webview
+    --features cordial-shell/webview,cordial-runtime/webview,cordial-runtime/vr
 
 readelf -d target/release/cordial-run | grep -qi webkit || {
     echo "cordial-run linked no WebKitGTK; the webview features did not take" >&2
@@ -146,6 +147,15 @@ install -Dm644 third_party/mcpelauncher-linker/LICENSE "$docdir/mcpelauncher-lin
 install -Dm644 third_party/mcpelauncher-linker/core/NOTICE "$docdir/aosp-NOTICE.txt"
 install -Dm644 third_party/libjnivm/LICENSE "$docdir/libjnivm-MIT.txt"
 install -Dm644 third_party/mocktail-webview/LICENSE "$docdir/mocktail-webview-Apache-2.0.txt"
+# dynarmic and the externals of it compiled in, for the VR translator. Only an
+# x86-64 build compiles them; they are installed on both, as one list.
+install -Dm644 third_party/dynarmic/LICENSE.txt "$docdir/dynarmic-0BSD.txt"
+install -Dm644 third_party/dynarmic/externals/fmt/LICENSE "$docdir/fmt-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/mcl/LICENSE "$docdir/mcl-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/robin-map/LICENSE "$docdir/robin-map-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/xbyak/COPYRIGHT "$docdir/xbyak-BSD-3-Clause.txt"
+install -Dm644 third_party/dynarmic/externals/zydis/LICENSE "$docdir/zydis-MIT.txt"
+install -Dm644 third_party/dynarmic/externals/zycore/LICENSE "$docdir/zycore-MIT.txt"
 install -Dm644 packaging/deb/copyright "$docdir/copyright"
 
 mkdir -p "$root/DEBIAN"

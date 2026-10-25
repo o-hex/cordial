@@ -28,6 +28,10 @@
 #include <vector>
 #include <memory>
 
+/// Set when the engine reports `gameDidLeave`; taken by `game_launch::tick`.
+static std::atomic<bool> g_game_left{false};
+extern "C" int cordial_take_game_left() { return g_game_left.exchange(false, std::memory_order_acq_rel) ? 1 : 0; }
+
 // ------------------------------------------------------- focused text box
 //
 // Which text box the engine currently has focus in, learned from
@@ -172,10 +176,16 @@ struct CordialTextBoxInfo {
     // from here. mocktail's constructor settles it by naming slot 13
     // `textWrapped` -- see the struct's doc comment.
     int multiline;
-    // Roblox's `Enum.TextXAlignment`/`Enum.TextYAlignment`: `Left`/`Top` = 0,
-    // `Center` = 1, `Right`/`Bottom` = 2. Confirmed via mocktail's
-    // `NativeTextBoxInfo` constructor field order -- see the struct's own doc
-    // comment above.
+    // Which slot is which is confirmed via mocktail's `NativeTextBoxInfo`
+    // constructor field order -- see the struct's own doc comment above --
+    // but the ordinal-to-name mapping mocktail's order says nothing about.
+    // `Enum.TextYAlignment` is `Top` = 0, `Center` = 1, `Bottom` = 2.
+    // `Enum.TextXAlignment` is `Left` = 0, `Right` = 1, `Center` = 2 --
+    // *not* the alphabetical `Left`/`Center`/`Right` this comment claimed
+    // until 2026-09-26, which nothing here had ever checked against a real
+    // `Right`- or `Center`-styled box (every capture so far reads `0`).
+    // See `RawTextBoxInfo::x_alignment` in
+    // `crates/cordial-linker-sys/src/lib.rs` for the sources.
     int x_alignment, y_alignment;
     int text_color;
     // Slots 9-11, named from the same constructor order as the two alignments.
@@ -213,6 +223,20 @@ std::atomic<unsigned> g_textbox_generation{0};
 /// this box last reported may be stale" from "nothing has happened", and skip
 /// its own poll interval when it has.
 std::atomic<unsigned> g_textbox_property_generation{0};
+/// The text `onLuaTextBoxChangedCallback` last delivered, the focus generation
+/// it arrived under, and a counter that moves each time one arrives. Guarded
+/// by `g_textbox_mutex` except the counter, which is read without it so the
+/// pump can ask "has anything arrived" every tick for the price of an atomic.
+///
+/// Kept apart from `g_textbox_text`: that is `showKeyboard`'s snapshot, taken
+/// once at focus and read when a box is reseeded, and an engine push overwriting
+/// it would change what a refocus seeds from. The generation tag is what lets
+/// the consumer drop a push that was meant for the previous box, which is a
+/// real ordering -- the engine can clear a chat box on the same tick the focus
+/// moves.
+std::string g_engine_text;
+unsigned g_engine_text_focus_generation = 0;
+std::atomic<unsigned> g_engine_text_generation{0};
 
 /// Every slot, named where a name has been earned and numbered where it has
 /// not. `textColor` is printed in hex because that is the form in which it
@@ -325,6 +349,47 @@ extern "C" void cordial_textbox_property_changed() {
     g_textbox_property_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
+/// Called from `onLuaTextBoxChangedCallback` below, and from devctl's
+/// `enginetext` verb, which is the only way to exercise the consumer without a
+/// signed-in session. Same rule as the property callback: it arrives on an
+/// engine worker thread, so it stores and bumps a counter and touches nothing
+/// else. Applying the text to a GTK widget happens on Cordial's own pump.
+extern "C" void cordial_textbox_engine_text_changed(const char* utf8) {
+    {
+        std::lock_guard<std::mutex> lock(g_textbox_mutex);
+        g_engine_text = utf8 ? utf8 : "";
+        g_engine_text_focus_generation =
+            g_textbox_generation.load(std::memory_order_acquire);
+    }
+    if (getenv("CORDIAL_TRACE_TEXT")) {
+        // Length only: this is as often a password box as a search bar.
+        fprintf(stderr, "[cordial] engine text arrived, %zu bytes\n",
+                utf8 ? strlen(utf8) : 0);
+    }
+    g_engine_text_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+extern "C" unsigned cordial_textbox_engine_text_generation() {
+    return g_engine_text_generation.load(std::memory_order_acquire);
+}
+
+/// Copy the engine's last pushed text into `buf` and report the focus
+/// generation it arrived under through `*focus_generation`. Returns the full
+/// byte length, which may exceed `n - 1`: the caller retries with a bigger
+/// buffer rather than this truncating a box's contents silently.
+extern "C" int cordial_textbox_engine_text(char* buf, int n,
+                                           unsigned* focus_generation) {
+    std::lock_guard<std::mutex> lock(g_textbox_mutex);
+    if (focus_generation) *focus_generation = g_engine_text_focus_generation;
+    const int full = static_cast<int>(g_engine_text.size());
+    if (buf && n > 0) {
+        const int len = full > n - 1 ? n - 1 : full;
+        memcpy(buf, g_engine_text.data(), static_cast<size_t>(len));
+        buf[len] = '\0';
+    }
+    return full;
+}
+
 /// How many times the engine has said a place finished loading, and which one.
 ///
 /// Two callbacks report it -- `NativeGLJavaInterface::gameLoadedCallback` and
@@ -341,6 +406,54 @@ extern "C" void cordial_note_game_loaded(long long place_id) {
 
 extern "C" unsigned cordial_games_loaded(void) {
     return g_games_loaded.load(std::memory_order_acquire);
+}
+
+/// How many times the engine has said an experience is starting, which is
+/// earlier than a load: it follows a press of Play by a moment and comes before
+/// the new DataModel's surface and its first frame. Counted for
+/// `input::NewGameSeed`, which wants to start offering input as soon as the new
+/// DataModel exists rather than once it has already decided what the movement
+/// controls are (#29).
+static std::atomic<unsigned> g_experience_starts{0};
+
+extern "C" void cordial_note_experience_start(void) {
+    g_experience_starts.fetch_add(1, std::memory_order_release);
+}
+
+extern "C" unsigned cordial_experience_starts(void) {
+    return g_experience_starts.load(std::memory_order_acquire);
+}
+
+/// Whether the engine has announced `Home` as ready. The first Lua app reaches
+/// Home a few hundred milliseconds after the surface is handed over, and the
+/// startup freeze (#92) is decided by whether Cordial's
+/// `postClientSettingsLoadedInitialization3` lands before or after the render
+/// job's first step, which follows that announcement by about 30 ms. Counted so
+/// the post can be held until after it.
+static std::atomic<unsigned> g_home_ready{0};
+
+extern "C" void cordial_note_home_ready(void) {
+    g_home_ready.fetch_add(1, std::memory_order_release);
+}
+
+extern "C" unsigned cordial_home_ready(void) {
+    return g_home_ready.load(std::memory_order_acquire);
+}
+
+/// How many times the engine has said its flag load failed. Cordial's own
+/// bootstrap delivers settings and flags and the engine answers
+/// `onFlagsFailed` when it has no usable flag cache; with a valid cache it
+/// answers `onFlagsLoaded` instead and starts its Lua app on its own at the
+/// first `onStart`, without waiting for the post-settings call. Which of the
+/// two a launch gets is what `CORDIAL_POST_AFTER_HOME_MS` must know (#92).
+static std::atomic<unsigned> g_flags_failed{0};
+
+extern "C" void cordial_note_flags_failed(void) {
+    g_flags_failed.fetch_add(1, std::memory_order_release);
+}
+
+extern "C" unsigned cordial_flags_failed(void) {
+    return g_flags_failed.load(std::memory_order_acquire);
 }
 
 extern "C" long long cordial_last_place(void) {
@@ -483,11 +596,21 @@ public:
 
     static std::shared_ptr<DeviceStaticParams> Create() {
         auto p = std::make_shared<DeviceStaticParams>();
-        // Desktop values, deliberately. Roblox reads this once and believes it for
-        // the session, so it is the single most load-bearing place to be honest
-        // about what Cordial is. Claiming to be a particular phone would invite
-        // device-specific workarounds that do not apply here.
-        p->osVersion       = str("15");
+        // Desktop values, deliberately, with one exception below. Roblox reads
+        // this once and believes it for the session, so it is the single most
+        // load-bearing place to be honest about what Cordial is. Claiming to be
+        // a particular phone would invite device-specific workarounds that do
+        // not apply here.
+        //
+        // `osVersion` is the exception: it is a compatibility gate, not a
+        // description, which is why `DeviceParams`' copy (`init_params.cpp`)
+        // is already "33". With "15" here, a startup path that reads this
+        // object's field logged `Mode 6 failed: Android version is too old to
+        // activate Vulkan` and never presented (5/5, 2026-09-23). 33 is the API
+        // level a real device reports, `docs/traces/waydroid-roblox-startup.log.gz`:
+        // `OS Ver. = 13, Lvl = 33`. The default path reached Vulkan with either
+        // value in two control runs.
+        p->osVersion       = str("33");
         p->deviceName      = str("Cordial");
         p->manufacturer    = str("Cordial");
         p->deviceSku       = str("cordial");
@@ -639,6 +762,20 @@ std::atomic<void (*)()> g_identity_logout_sink{nullptr};
 // flag here and does its work from the looper thread, which is the thread every
 // other native call in this process is made from.
 std::atomic<void (*)(const char*)> g_app_ready_sink{nullptr};
+
+// The screen the engine most recently reported with `APP_READY` (`Login`,
+// `ChallengeHybridWebView`, `Home`...). A sink is for acting on an event; this
+// is for the one reader that needs the *state* when something else happens --
+// `webview.rs` asks which screen is up at the moment the engine opens a web
+// window, because the screen is the only thing that says what the window is
+// for (#83). A string under a mutex rather than an atomic pointer: the engine's
+// thread writes it and the thread opening the window reads it.
+std::mutex g_app_screen_mutex;
+std::string g_app_screen;
+
+// App-bridge notifications that need the platform to act rather than merely be
+// told. Today that is `OPEN_CAPTCHA_VIEW` alone; the rest are still reports.
+std::atomic<void (*)(const char*, const char*)> g_app_bridge_sink{nullptr};
 } // namespace
 
 jlong identity_user_id() {
@@ -850,6 +987,10 @@ public:
         // is no such core event, and nothing subscribes. This is still the right
         // place for both, which is why the note stays.
         fprintf(stderr, "[roblox] gameDidLeave\n");
+        // On Android this reaches `ExperienceSession`, whose ending gives the
+        // app half its surface back. Under --app-bridge `game_launch::tick`
+        // plays that part, from the looper, when it sees this flag.
+        g_game_left.store(true, std::memory_order_release);
     }
     static void onAppShellReloadNeeded(ENV*, Class*) {}
 
@@ -869,15 +1010,28 @@ public:
     // no-op: a box that resizes or restyles mid-edit previously only refreshed
     // on `WaylandWindow::polled_textbox_info`'s 100ms poll.
     //
-    // `onLuaTextBoxChangedCallback(String)` stays a no-op deliberately.
-    // Writing engine-pushed text into a GTK `TextBuffer` the user may be
-    // actively typing into needs to guard against the widget's own
-    // `connect_editor_changed` echoing it straight back as a keystroke, decide
-    // whose edit wins when the two disagree, and preserve the caret and
-    // selection through the write — none of which exists yet. See
-    // `host_window.rs`'s note on `connect_editor_changed` for why a careless
-    // write there is worse than the stale text this leaves in place.
-    static void onLuaTextBoxChangedCallback(ENV*, Class*, std::shared_ptr<String>) {}
+    // `onLuaTextBoxChangedCallback(String)` hands the engine's text to the
+    // editor, and it was a no-op until it had somewhere safe to put it.
+    //
+    // What was missing is listed in the old version of this comment: a guard
+    // so the widget's own change signal does not echo the write straight back
+    // as a keystroke, a rule for whose edit wins, and a caret. All three now
+    // live on the pump side (`input::apply_engine_text`, under
+    // `host_window.rs`'s seeding guard); this only carries the string across,
+    // because it arrives on an engine worker thread -- see the property
+    // callback below for the measurement -- where no GTK call is allowed.
+    //
+    // The gap showed as a chat box that kept "ok" after Enter had sent it: the
+    // engine cleared its own TextBox, and the clear was never shown, so the
+    // next keystroke built on the stale text and sent it back.
+    //
+    // Idea, not code, from mocktail's `RobloxTextEditor::
+    // ReplaceFocusedTextFromEngine` (Apache-2.0): treat this callback as
+    // authoritative, and recognise the engine reflecting text Cordial itself
+    // just sent.
+    static void onLuaTextBoxChangedCallback(ENV*, Class*, std::shared_ptr<String> text) {
+        cordial_textbox_engine_text_changed(text ? text->c_str() : "");
+    }
     // Does not arrive on Cordial's GTK main loop, or even on the engine's
     // main thread -- confirmed 2026-09-16 by logging `gettid()` and the
     // calling thread's `pthread_getname_np` name under `CORDIAL_TRACE_TEXT=1`
@@ -948,10 +1102,37 @@ public:
     /// Resolving them is worth doing on its own account, because an unresolved
     /// JNI call leaves a pending exception that the next JNI call on the same
     /// thread trips over, which surfaces far away from the cause.
+    ///
+    /// **`OPEN_CAPTCHA_VIEW` is the exception, and its payload is withheld.**
+    /// It is how the engine asks for the sign-in security check (the
+    /// "bot verification" and security-code screens), and its data carries the
+    /// username, email or phone number being signed in with, so the size is
+    /// reported and the content is not. Printing it whole was the previous
+    /// behaviour, and it also did nothing else: the request was received and
+    /// dropped, so sign-in stopped at the verification step (#83). It now goes
+    /// to the sink, which opens the page.
     static void onAppBridgeNotification(ENV*, Class*, std::shared_ptr<String> type,
                                         std::shared_ptr<String> data) {
-        fprintf(stderr, "[roblox] app bridge: %s %s\n",
-                type ? type->c_str() : "(null)", data ? data->c_str() : "");
+        dispatchAppBridge(type ? static_cast<const std::string&>(*type) : std::string(),
+                          data ? static_cast<const std::string&>(*data) : std::string());
+    }
+
+    /// The body of the hook above, split out so `cordial_app_bridge_test_fire`
+    /// can run exactly this path without a JNI call to carry the arguments.
+    static void dispatchAppBridge(const std::string& kind, const std::string& payload) {
+        if (kind == "OPEN_CAPTCHA_VIEW") {
+            fprintf(stderr, "[roblox] app bridge: OPEN_CAPTCHA_VIEW <payload elided, %zu bytes>\n",
+                    payload.size());
+            if (auto* sink = g_app_bridge_sink.load(std::memory_order_acquire)) {
+                sink(kind.c_str(), payload.c_str());
+            } else {
+                fprintf(stderr,
+                        "[roblox] app bridge: nothing is listening for OPEN_CAPTCHA_VIEW, so the "
+                        "security check cannot be shown\n");
+            }
+            return;
+        }
+        fprintf(stderr, "[roblox] app bridge: %s %s\n", kind.c_str(), payload.c_str());
     }
 
     /// The one notification Cordial acts on rather than only prints.
@@ -1010,6 +1191,10 @@ public:
                 type ? type->c_str() : "(null)", payload.c_str());
 
         if (kind == "APP_READY") {
+            {
+                std::lock_guard<std::mutex> lock(g_app_screen_mutex);
+                g_app_screen = payload;
+            }
             if (auto* sink = g_app_ready_sink.load(std::memory_order_acquire)) {
                 sink(payload.c_str());
             }
@@ -1500,6 +1685,39 @@ extern "C" void cordial_identity_set_sinks(void (*on_login)(const char*),
 /// be mistaken for "the engine never called".
 extern "C" void cordial_app_ready_set_sink(void (*on_ready)(const char*)) {
     cordial::g_app_ready_sink.store(on_ready, std::memory_order_release);
+}
+
+/// The screen the engine last reported with `APP_READY`, copied into `buf`.
+///
+/// Returns the full length whether or not it fit, as `snprintf` does, and 0 when
+/// the engine has reported none yet. The payload is a screen name, not
+/// anything about the user.
+extern "C" size_t cordial_last_app_ready(char* buf, size_t n) {
+    std::lock_guard<std::mutex> lock(cordial::g_app_screen_mutex);
+    const std::string& screen = cordial::g_app_screen;
+    if (buf && n > 0) {
+        size_t copy = screen.size() < n - 1 ? screen.size() : n - 1;
+        screen.copy(buf, copy);
+        buf[copy] = '\0';
+    }
+    return screen.size();
+}
+
+/// Where `OPEN_CAPTCHA_VIEW` is delivered, or null to stop delivering it.
+///
+/// Same split as the sinks above: the class hook is registered unconditionally
+/// and the sink decides whether anything acts, so a silent sign-in cannot be
+/// confused with an engine that never asked.
+extern "C" void cordial_app_bridge_set_sink(void (*on_notification)(const char*, const char*)) {
+    cordial::g_app_bridge_sink.store(on_notification, std::memory_order_release);
+}
+
+/// Deliver an app-bridge notification as the engine's own call would, for the
+/// development trigger in `load.rs`. A real security check needs an account's
+/// credentials, so this is how the path from the hook to the web window is
+/// exercised without one.
+extern "C" void cordial_app_bridge_test_fire(const char* kind, const char* payload) {
+    cordial::NativeGLJavaInterface::dispatchAppBridge(kind ? kind : "", payload ? payload : "");
 }
 
 namespace cordial {

@@ -257,6 +257,45 @@ TOOLS = [
         },
     },
     {
+        "name": "cordial_tone",
+        "description": (
+            "Play a quiet sine of known frequency through Cordial's own audio path (the stream "
+            "AAudio uses, the recorder's tap and the host backend included), for checking what a "
+            "recording hears when the engine itself is silent, as it is on the landing page. "
+            "The level is capped at 0.05 by the client."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hz": {"type": "number", "description": "Frequency, 20 to 20000."},
+                "seconds": {"type": "number", "description": "How long, at most 30."},
+                "level": {"type": "number", "description": "Amplitude, default 0.03, at most 0.05."},
+            },
+            "required": ["hz", "seconds"],
+        },
+    },
+    {
+        "name": "cordial_record",
+        "description": (
+            "Record the game's own frames to a video file (ADR-059). action=start begins; "
+            "path is a directory, or a file ending .mp4/.webm/.mkv, or empty for the default "
+            "folder. action=stop finishes the file and reports frames written, frames dropped "
+            "and the milliseconds each capture cost on the present thread. action=status says "
+            "what is running. Needs ffmpeg on the client's PATH. Sound is chosen by "
+            "CORDIAL_RECORD_AUDIO on the client, not here: game (what Cordial plays), "
+            "desktop (everything the default output plays) or off. F9 toggles recording "
+            "too: cordial_key with code 67."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["start", "stop", "status"]},
+                "path": {"type": "string", "description": "For start: directory or file. Default: Videos/Cordial."},
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "cordial_info",
         "description": (
             "Live counters: presents, commands accepted, swapchain extent, pid. The present "
@@ -355,6 +394,36 @@ TOOLS = [
         },
     },
     {
+        "name": "cordial_paste",
+        "description": (
+            "Insert text at the focused box's caret in one edit, like Ctrl+V -- for a payload "
+            "too large to type one keystroke per character with cordial_text (which goes "
+            "through script_type). The existing text is not cleared; a selection is replaced, "
+            "same as a real paste. Ok(0) means no box has focus. 64 KB limit, same as a host "
+            "clipboard paste; newlines survive for multi-line boxes, other control characters "
+            "become spaces."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "cordial_settext",
+        "description": (
+            "Replace the focused box's whole contents in one edit. A test seam with no "
+            "user-reachable equivalent -- deliberately not select-all followed by "
+            "cordial_paste, so using this does not incidentally depend on select-all also "
+            "working. Same limits as cordial_paste."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
         "name": "cordial_scroll",
         "description": "Scroll at a coordinate, in wheel detents. Positive is away from the user.",
         "inputSchema": {
@@ -432,6 +501,22 @@ def tool_screenshot(c, args):
     return content
 
 
+def tool_record(c, args):
+    action = args.get("action", "status")
+    line = f"record {action}"
+    if action == "start" and args.get("path"):
+        line += f" {args['path']}"
+    # Stopping waits for the encoder to flush, which is longer than a frame.
+    return [{"type": "text", "text": c.send(line, timeout=60 if action == "stop" else 15)}]
+
+
+def tool_tone(c, args):
+    line = f"tone {float(args['hz'])} {float(args['seconds'])}"
+    if "level" in args:
+        line += f" {float(args['level'])}"
+    return [{"type": "text", "text": c.send(line)}]
+
+
 def tool_info(c, args):
     return [{"type": "text", "text": c.send("info")}]
 
@@ -471,6 +556,31 @@ def tool_key(c, args):
 def tool_text(c, args):
     c.send(f"text {args['text']}")
     return [{"type": "text", "text": f"sent {len(args['text'])} characters"}]
+
+
+def _replace_focused_text(c, verb, text):
+    # A file rather than the socket line itself: devctl's protocol is one
+    # command per line, and a multi-line or many-kilobyte payload cannot be
+    # sent as one line of it the way `cordial_text` sends a short string.
+    path = tempfile.mktemp(prefix="cordial-", suffix=".txt")
+    with open(path, "w") as f:
+        f.write(text)
+    try:
+        reply = c.send(f"{verb} {path}", timeout=15)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return [{"type": "text", "text": reply}]
+
+
+def tool_paste(c, args):
+    return _replace_focused_text(c, "paste", args["text"])
+
+
+def tool_settext(c, args):
+    return _replace_focused_text(c, "settext", args["text"])
 
 
 def tool_scroll(c, args):
@@ -630,6 +740,8 @@ def tool_gdb(c, args):
 
 HANDLERS = {
     "cordial_screenshot": tool_screenshot,
+    "cordial_record": tool_record,
+    "cordial_tone": tool_tone,
     "cordial_info": tool_info,
     "cordial_textbox": tool_textbox,
     "cordial_loopers": tool_loopers,
@@ -637,6 +749,8 @@ HANDLERS = {
     "cordial_move": tool_move,
     "cordial_key": tool_key,
     "cordial_text": tool_text,
+    "cordial_paste": tool_paste,
+    "cordial_settext": tool_settext,
     "cordial_scroll": tool_scroll,
     "cordial_fps": tool_fps,
     "cordial_backtrace": tool_backtrace,

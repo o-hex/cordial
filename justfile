@@ -58,6 +58,9 @@ build where="host":
     # and running outside it is unnecessary.
     case "{{ where }}" in
       host)
+        # No `cordial-runtime/vr`: it needs Boost's headers, which a host
+        # build should not have to have. Add `--features cordial-runtime/vr`
+        # to build Play in VR here.
         cargo build --release
         ;;
       distrobox)
@@ -88,7 +91,7 @@ build where="host":
         # the dependency was installed, the build succeeded, and `openWindow`
         # still did nothing.
         distrobox enter "$box" -- bash -lc \
-          'CARGO_TARGET_DIR=target-distrobox cargo build --release --features cordial-shell/webview,cordial-runtime/webview'
+          'CARGO_TARGET_DIR=target-distrobox cargo build --release --features cordial-shell/webview,cordial-runtime/webview,cordial-runtime/vr'
         echo "built into target-distrobox/release"
         ;;
       toolbox)
@@ -113,7 +116,7 @@ build where="host":
         #     gtk4-devel libadwaita-devel webkitgtk6.0-devel pipewire-devel \
         #     clang cmake gcc-c++ pkgconf-pkg-config openssl-devel \
         #     wayland-devel vulkan-loader-devel libxkbcommon-devel \
-        #     binutils llvm lld librsvg2-tools patchelf
+        #     binutils llvm lld boost-devel librsvg2-tools patchelf
         #
         # binutils is not optional and not obvious: clang arrives without `ar`,
         # and CMake's static-library step then fails with "Error running link
@@ -143,14 +146,14 @@ build where="host":
         # `readelf -d target-toolbox/release/cordial-run | grep -i webkit` is the
         # check that it actually linked.
         distrobox enter "$box" -- bash -lc \
-          'CARGO_TARGET_DIR=target-toolbox cargo build --release --features cordial-shell/webview,cordial-runtime/webview'
+          'CARGO_TARGET_DIR=target-toolbox cargo build --release --features cordial-shell/webview,cordial-runtime/webview,cordial-runtime/vr'
         echo "built into target-toolbox/release"
         ;;
       nix)
         # Unverified on an ostree host, where /nix is part of the read-only image
         # and nix-daemon is disabled. See CONTRIBUTING.md.
         nix develop --command bash -c \
-          'CARGO_TARGET_DIR=target-nix cargo build --release'
+          'CARGO_TARGET_DIR=target-nix cargo build --release --features cordial-runtime/vr'
         echo "built into target-nix/release"
         ;;
       *)

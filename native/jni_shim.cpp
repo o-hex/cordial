@@ -177,6 +177,34 @@ int cordial_jni_dump_classes(const char* path) {
 #endif
 }
 
+/// The calling thread's JNIEnv, attaching the thread if it has none -- the
+/// same route `cordial::process_env` takes, for the same reason. The arm64
+/// guest's JNI stubs (crates/cordial-runtime/src/guest_jni.rs) hand every
+/// call to libjnivm with this env in place of the guest's own.
+void* cordial_jni_thread_env() {
+    if (!g_real_vm) {
+        return nullptr;
+    }
+    JNIEnv* env = nullptr;
+    if (g_real_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+        return nullptr;
+    }
+    return env;
+}
+
+/// A jmethodID's JNI descriptor. libjnivm's method IDs are its `Method`
+/// objects (`(jmethodID)this` throughout method.cpp), and the descriptor is
+/// the only thing that says what a variadic Call*Method's arguments are.
+const char* cordial_jni_method_signature(void* method) {
+    return method ? static_cast<jnivm::Method*>(method)->signature.c_str() : nullptr;
+}
+
+/// A jmethodID's name, beside its descriptor, for the guest's call log: the
+/// descriptor alone cannot say which Java method a Play press reached.
+const char* cordial_jni_method_name(void* method) {
+    return method ? static_cast<jnivm::Method*>(method)->name.c_str() : nullptr;
+}
+
 /// Call `JNI_OnLoad` with the process JavaVM, containing any C++ exception.
 ///
 /// libjnivm reports misuse by throwing. Those exceptions originate inside

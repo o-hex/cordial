@@ -16,6 +16,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Grant workspace permissions to container
+        run: chmod -R 777 "${{ github.workspace }}"
+
       - name: Build inside Termux Docker container
         run: |
           docker run --rm \
@@ -52,6 +55,7 @@ jobs:
               # Extract debug symbols then strip binaries
               objcopy --only-keep-debug dist/termux/cordial-run dist/termux/cordial-run.dbg 2>/dev/null || true
               strip --strip-unneeded dist/termux/cordial-run dist/termux/cordial-shell 2>/dev/null || true
+              chmod -R 777 dist
             "
 
       - name: Upload Termux Binaries

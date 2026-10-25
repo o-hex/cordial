@@ -26,16 +26,17 @@ jobs:
               set -euo pipefail
               export DEBIAN_FRONTEND=noninteractive
               
-              echo 'Updating Termux package repositories...'
+              echo 'Updating and enabling repositories...'
               pkg update -y
               pkg install -y x11-repo tur-repo
+              pkg update -y
               
               echo 'Installing build toolchain and dependencies...'
               pkg install -y \
                 rust clang cmake make binutils pkg-config \
-                glib pango gdk-pixbuf cairo gtk4 libadwaita \
+                glib pango gdk-pixbuf libcairo gtk4 libadwaita \
                 libx11 libxinerama libxi pulseaudio \
-                mesa-vulkan-kgsl-turnip
+                vulkan-headers vulkan-loader-generic mesa
               
               echo 'Building cordial-runtime (cordial-run)...'
               cargo build --release -p cordial-runtime --bin cordial-run

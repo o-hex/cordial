@@ -113,14 +113,17 @@ static CAPTURED: AtomicBool = AtomicBool::new(false);
 /// `backtrace` is called once from a normal context before the signal is sent,
 /// so the lazy load of libgcc it does is not done under a handler.
 extern "C" fn on_capture_signal(_: libc::c_int) {
-    let mut buf = [std::ptr::null_mut::<libc::c_void>(); MAX_FRAMES];
-    // SAFETY: `buf` holds MAX_FRAMES pointers and MAX_FRAMES is passed as its size.
-    let n = unsafe { libc::backtrace(buf.as_mut_ptr(), MAX_FRAMES as libc::c_int) }.max(0) as usize;
-    for (slot, frame) in FRAMES.iter().zip(buf.iter()).take(n) {
-        slot.store(*frame as usize, Ordering::Relaxed);
+    #[cfg(not(target_os = "android"))]
+    {
+        let mut buf = [std::ptr::null_mut::<libc::c_void>(); MAX_FRAMES];
+        // SAFETY: `buf` holds MAX_FRAMES pointers and MAX_FRAMES is passed as its size.
+        let n = unsafe { libc::backtrace(buf.as_mut_ptr(), MAX_FRAMES as libc::c_int) }.max(0) as usize;
+        for (slot, frame) in FRAMES.iter().zip(buf.iter()).take(n) {
+            slot.store(*frame as usize, Ordering::Relaxed);
+        }
+        FRAME_COUNT.store(n, Ordering::Relaxed);
+        CAPTURED.store(true, Ordering::Release);
     }
-    FRAME_COUNT.store(n, Ordering::Relaxed);
-    CAPTURED.store(true, Ordering::Release);
 }
 
 /// One address as `module+0xoffset (symbol+0xoffset)`. A stripped or static
@@ -161,42 +164,50 @@ fn describe_frame(addr: usize) -> String {
 /// cost a healthy start pays. `None` when the thread did not answer in a
 /// second, which is itself worth knowing and is reported as such.
 pub fn thread_stack(tid: i64) -> Option<Vec<String>> {
-    // Load libgcc's unwinder here, in a normal context, so the handler does not.
-    let mut warm = [std::ptr::null_mut::<libc::c_void>(); 4];
-    // SAFETY: four slots, four requested.
-    unsafe { libc::backtrace(warm.as_mut_ptr(), 4) };
-    CAPTURED.store(false, Ordering::Release);
-    // SAFETY: a zeroed `sigaction` with a handler and an empty mask is valid.
-    let previous = unsafe {
-        let mut act: libc::sigaction = std::mem::zeroed();
-        act.sa_sigaction = on_capture_signal as extern "C" fn(libc::c_int) as usize;
-        libc::sigemptyset(&mut act.sa_mask);
-        act.sa_flags = libc::SA_RESTART;
-        let mut old: libc::sigaction = std::mem::zeroed();
-        if libc::sigaction(libc::SIGUSR2, &act, &mut old) != 0 {
+    #[cfg(target_os = "android")]
+    {
+        let _ = tid;
+        None
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        // Load libgcc's unwinder here, in a normal context, so the handler does not.
+        let mut warm = [std::ptr::null_mut::<libc::c_void>(); 4];
+        // SAFETY: four slots, four requested.
+        unsafe { libc::backtrace(warm.as_mut_ptr(), 4) };
+        CAPTURED.store(false, Ordering::Release);
+        // SAFETY: a zeroed `sigaction` with a handler and an empty mask is valid.
+        let previous = unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = on_capture_signal as extern "C" fn(libc::c_int) as usize;
+            libc::sigemptyset(&mut act.sa_mask);
+            act.sa_flags = libc::SA_RESTART;
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(libc::SIGUSR2, &act, &mut old) != 0 {
+                return None;
+            }
+            old
+        };
+        // SAFETY: `getpid` cannot fail; `tgkill` with a bad tid returns an error and does nothing.
+        let sent = unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid() as i64, tid, libc::SIGUSR2 as i64) } == 0;
+        let mut got = false;
+        if sent {
+            for _ in 0..50 {
+                if CAPTURED.load(Ordering::Acquire) {
+                    got = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // SAFETY: puts back exactly what `sigaction` returned above.
+        unsafe { libc::sigaction(libc::SIGUSR2, &previous, std::ptr::null_mut()) };
+        if !got {
             return None;
         }
-        old
-    };
-    // SAFETY: `getpid` cannot fail; `tgkill` with a bad tid returns an error and does nothing.
-    let sent = unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid() as i64, tid, libc::SIGUSR2 as i64) } == 0;
-    let mut got = false;
-    if sent {
-        for _ in 0..50 {
-            if CAPTURED.load(Ordering::Acquire) {
-                got = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let n = FRAME_COUNT.load(Ordering::Relaxed).min(MAX_FRAMES);
+        Some((0..n).map(|i| format!("#{i} {}", describe_frame(FRAMES[i].load(Ordering::Relaxed)))).collect())
     }
-    // SAFETY: puts back exactly what `sigaction` returned above.
-    unsafe { libc::sigaction(libc::SIGUSR2, &previous, std::ptr::null_mut()) };
-    if !got {
-        return None;
-    }
-    let n = FRAME_COUNT.load(Ordering::Relaxed).min(MAX_FRAMES);
-    Some((0..n).map(|i| format!("#{i} {}", describe_frame(FRAMES[i].load(Ordering::Relaxed)))).collect())
 }
 
 /// Start the watchdog. Call from the main thread, once the window is going to
@@ -297,6 +308,7 @@ mod tests {
     /// function gives a stack that names that function's module, and the one
     /// asking is not the one inspected.
     #[test]
+    #[cfg(not(target_os = "android"))]
     fn a_parked_thread_gives_a_stack_through_a_signal() {
         use std::sync::mpsc;
         let (tid_tx, tid_rx) = mpsc::channel();

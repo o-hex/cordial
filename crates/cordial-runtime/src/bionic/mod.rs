@@ -1485,6 +1485,7 @@ pub fn netdb_overrides() -> Vec<(&'static str, *mut c_void)> {
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub unsafe extern "C" fn memfd_create(name: *const c_char, flags: libc::c_uint) -> c_int {
-    libc::syscall(libc::SYS_memfd_create, name, flags) as c_int
+    // SAFETY: direct syscall forwarding.
+    unsafe { libc::syscall(libc::SYS_memfd_create, name, flags) as c_int }
 }
 

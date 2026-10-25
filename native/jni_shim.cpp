@@ -21,7 +21,9 @@ namespace cordial { jnivm::ENV* process_env(); }
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#ifndef __ANDROID__
 #include <execinfo.h>
+#endif
 #include <unistd.h>
 #include <stdexcept>
 #include <memory>
@@ -64,10 +66,12 @@ void dump_classes_now() {
             fprintf(stderr, "    non-standard exception\n");
         }
     }
+#ifndef __ANDROID__
     void* frames[32];
     int n = backtrace(frames, 32);
     fprintf(stderr, "    %d frames:\n", n);
     backtrace_symbols_fd(frames, n, 2);
+#endif
 
     // Dump before dying. Everything Roblox asked Java for up to this point is
     // the most valuable thing in the process, and it is about to be lost — the

@@ -226,6 +226,7 @@ extern "C" {
     // exported under the other name.
     #[link_name = "strerror_r"]
     fn glibc_gnu_strerror_r(errnum: c_int, buf: *mut c_char, buflen: usize) -> *mut c_char;
+    #[cfg(not(target_os = "android"))]
     fn __xpg_strerror_r(errnum: c_int, buf: *mut u8, buflen: usize) -> c_int;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     fn umask(mode: u32) -> u32;
@@ -421,9 +422,16 @@ extern "C" fn gnu_strerror_r(errnum: c_int, buf: *mut c_char, buflen: usize) -> 
 /// INFERRED for a caught exception: the abort was read off the 2.738.1397
 /// arm64 and x86-64 builds' `message()`, and observed only through a
 /// coredump of an uncaught one.
+#[cfg(not(target_os = "android"))]
 extern "C" fn bionic_strerror_r(errnum: c_int, buf: *mut c_char, buflen: usize) -> c_int {
     // SAFETY: caller-supplied buffer of at least `buflen` bytes.
     unsafe { __xpg_strerror_r(errnum, buf.cast(), buflen) }
+}
+
+#[cfg(target_os = "android")]
+extern "C" fn bionic_strerror_r(errnum: c_int, buf: *mut c_char, buflen: usize) -> c_int {
+    // SAFETY: caller-supplied buffer of at least `buflen` bytes.
+    unsafe { libc::strerror_r(errnum, buf, buflen) }
 }
 
 // The FORTIFY wrappers below are forwarded as they are, on purpose. Each is its
@@ -1472,5 +1480,11 @@ mod netdb_tests {
 #[cfg(target_os = "android")]
 pub fn netdb_overrides() -> Vec<(&'static str, *mut c_void)> {
     Vec::new()
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn memfd_create(name: *const c_char, flags: libc::c_uint) -> c_int {
+    libc::syscall(libc::SYS_memfd_create, name, flags) as c_int
 }
 

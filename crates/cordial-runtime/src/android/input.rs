@@ -1890,11 +1890,28 @@ pub fn keepalive_wanted(policy: ThrottleWhen, focused: Option<bool>, visible: Op
 }
 
 pub fn idle_keepalive() {
+    // Keep Roblox from dropping into its 1.0 FPS idle throttle while in the foreground.
+    // Without this, standing still or being idle drops framerate to 1 frame/sec (1000ms frame time),
+    // causing a +-0.5s delay when pressing a movement key from a stationary state.
+    // When keys are held, keepalive is sent on every tick; when no keys are held,
+    // rate-limit to ~60 Hz (>= 16 ms) to prevent idle spin while maintaining instant responsiveness.
+    static LAST_TICK: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let any_held = !KEYS_HELD.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
     if !any_held {
-        return;
+        let mut last = LAST_TICK.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if let Some(prev) = *last {
+            if now.duration_since(prev).as_millis() < 16 {
+                return;
+            }
+        }
+        *last = Some(now);
     }
-    if let Some((x, y)) = mouse_last_position() {
+    let pos = mouse_last_position().or_else(pointer_seen_at).or_else(|| {
+        let (w, h) = super::canvas_size();
+        (w > 0 && h > 0).then_some((w as f32 / 2.0, h as f32 / 2.0))
+    });
+    if let Some((x, y)) = pos {
         pass_mouse_move_delta(x, y, 0.0, 0.0);
     }
 }

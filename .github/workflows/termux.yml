@@ -73,8 +73,9 @@ jobs:
               cp target/release/cordial-run dist/termux/cordial-run
               cp target/release/cordial-shell dist/termux/cordial-shell
               
-              # Extract debug symbols then strip binaries
-              objcopy --only-keep-debug dist/termux/cordial-run dist/termux/cordial-run.dbg 2>/dev/null || true
+              # Strip binaries for release (debug symbols kept out of upload path)
+              mkdir -p dist/debug
+              objcopy --only-keep-debug dist/termux/cordial-run dist/debug/cordial-run.dbg 2>/dev/null || true
               strip --strip-unneeded dist/termux/cordial-run dist/termux/cordial-shell 2>/dev/null || true
               chmod -R 777 dist .cargo_cache .apt_cache target 2>/dev/null || true
             "

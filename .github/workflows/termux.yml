@@ -1,0 +1,61 @@
+name: Termux ARM64 Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-termux:
+    name: Build Termux Native (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build inside Termux Docker container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -w /workspace \
+            termux/termux-docker:aarch64 \
+            bash -c "
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              
+              echo 'Updating Termux package repositories...'
+              pkg update -y
+              pkg install -y x11-repo tur-repo
+              
+              echo 'Installing build toolchain and dependencies...'
+              pkg install -y \
+                rust clang cmake make binutils pkg-config \
+                glib pango gdk-pixbuf cairo gtk4 libadwaita \
+                libx11 libxinerama libxi pulseaudio \
+                mesa-vulkan-kgsl-turnip
+              
+              echo 'Building cordial-runtime (cordial-run)...'
+              cargo build --release -p cordial-runtime --bin cordial-run
+              
+              echo 'Building cordial-shell (cordial-shell)...'
+              cargo build --release -p cordial-shell --bin cordial-shell
+              
+              echo 'Preparing release artifacts...'
+              mkdir -p dist/termux
+              cp target/release/cordial-run dist/termux/cordial-run
+              cp target/release/cordial-shell dist/termux/cordial-shell
+              
+              # Extract debug symbols then strip binaries
+              objcopy --only-keep-debug dist/termux/cordial-run dist/termux/cordial-run.dbg 2>/dev/null || true
+              strip --strip-unneeded dist/termux/cordial-run dist/termux/cordial-shell 2>/dev/null || true
+            "
+
+      - name: Upload Termux Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordial-termux-aarch64
+          path: dist/termux/
+          if-no-files-found: error

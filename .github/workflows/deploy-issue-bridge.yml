@@ -13,20 +13,6 @@
 name: deploy the issue bridge
 
 on:
-  push:
-    branches: [main]
-    # Only its own files. The client is the overwhelming majority of commits
-    # here and none of them change the Worker; deploying on each would be noise
-    # and would burn a deployment for nothing.
-    paths:
-      - 'tools/discord-bridge/**'
-      - '.github/workflows/deploy-issue-bridge.yml'
-      # The forms are fetched at runtime rather than baked in, so editing one
-      # needs no deploy -- but `deno task check` is how a template that no
-      # longer fits a modal gets caught, and that is worth running here too.
-      - '.github/ISSUE_TEMPLATE/**'
-  # So a deploy can be forced without an empty commit, which is what people do
-  # otherwise.
   workflow_dispatch:
 
 concurrency:

@@ -65,7 +65,11 @@ fn main() {
     // archive only satisfies symbols from archives listed after it.
     println!("cargo:rustc-link-lib=static=logger");
     println!("cargo:rustc-link-lib=static=linker");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    if std::env::var("TARGET").map_or(false, |t| t.contains("android")) {
+        println!("cargo:rustc-link-lib=dylib=c++_shared");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
     println!("cargo:rustc-link-lib=dylib=z");
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=pthread");

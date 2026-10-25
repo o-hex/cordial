@@ -91,14 +91,6 @@
 name: Flatpak
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-    paths:
-      - 'packaging/**'
-      - '.github/workflows/flatpak.yml'
-      - 'Cargo.lock'
   workflow_dispatch:
 
 # `actions: read` is for "Fetch the apt repository" in the build job below,

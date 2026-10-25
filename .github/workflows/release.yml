@@ -66,45 +66,6 @@
 name: Native packages
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-    paths:
-      - 'crates/**'
-      - 'native/**'
-      - 'third_party/**'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'packaging/appimage/**'
-      - 'packaging/deb/**'
-      - 'packaging/rpm/**'
-      - 'packaging/aur/cordial/**'
-      - 'packaging/version.sh'
-      - 'packaging/icons/**'
-      - 'packaging/io.github.luohoa97.Cordial.desktop'
-      - 'packaging/io.github.luohoa97.Cordial.metainfo.xml'
-      - '.github/workflows/release.yml'
-  pull_request:
-    paths:
-      - 'crates/**'
-      - 'native/**'
-      - 'third_party/**'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'packaging/appimage/**'
-      - 'packaging/deb/**'
-      - 'packaging/rpm/**'
-      - 'packaging/aur/cordial/**'
-      - 'packaging/version.sh'
-      - 'packaging/icons/**'
-      - 'packaging/io.github.luohoa97.Cordial.desktop'
-      - 'packaging/io.github.luohoa97.Cordial.metainfo.xml'
-      - '.github/workflows/release.yml'
-  # **The way to start a release build by hand, and it is needed.** `paths`
-  # above applies to tag pushes as well as branch pushes, and a tag pointing at
-  # a commit already on main pushes no new commits -- so nothing matches the
-  # filter and no run happens at all. That is what left v0.11.0 tagged twice
-  # with no build and no release page.
   workflow_dispatch:
 
 # `contents: write` only where a job actually uploads to a release -- see

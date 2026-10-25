@@ -29,8 +29,6 @@
 name: Publish Arch packaging
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
